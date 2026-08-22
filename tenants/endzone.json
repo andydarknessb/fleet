@@ -2,7 +2,8 @@
   "name": "endzone",
   "repo": "C:\\Users\\Cory\\Endzone-Empire",
   "github": "andydarknessb/Endzone-Empire",
-  "defaultBranch": "main",
+  "defaultBranch": "integration",
+  "releaseBranch": "main",
   "readyLabel": "ready-for-agent",
   "escalationLabel": "needs-info",
   "branchPrefix": "fleet/",
@@ -23,7 +24,7 @@
   "ciGates": ["test-build", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
   "ignoredChecks": ["scan"],
   "notes": [
-    "main auto-publishes the client to Netlify; a merge is a deploy.",
+    "The fleet works on `integration` (defaultBranch): branch from it, open PRs against it, merge into it. `main` (releaseBranch) auto-publishes the client to Netlify, so only Cory promotes integration to main. Never push to or merge into main.",
     "The dev database is the shared Supabase production database. Never run migrations or destructive SQL from an IC.",
     "House style: no em-dashes in user-facing copy.",
     "test:server takes ~42 minutes (issue #80); do not run it per commit, run the targeted file.",

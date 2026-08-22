@@ -8,7 +8,7 @@ param([switch]$Apply)
 . "$PSScriptRoot\_common.ps1"
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 $now = (Get-Date).ToUniversalTime()
-$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); pause = $null; ok = @() }
+$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
 
 function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name } | Sort-Object startedAt -Descending | Select-Object -First 1 }
 function Heartbeat-Age {
@@ -96,6 +96,20 @@ if (Test-Paused) {
       if ($Apply) { & "$PSScriptRoot\pause.ps1" -Off | Out-Null }
       $report.pause = 'cleared: rate-limit window passed'
     }
+  }
+}
+
+# --- keep each tenant's defaultBranch fast-forwarded to its releaseBranch (pure ff only) ---
+$report.sync = @()
+foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
+  $t = Read-Json $tf.FullName
+  if (-not $t.releaseBranch -or $t.releaseBranch -eq $t.defaultBranch -or -not (Test-Path $t.repo)) { continue }
+  $raw = if ($Apply) { & "$PSScriptRoot\sync-integration.ps1" -Tenant $t.name -Apply | Out-String } else { & "$PSScriptRoot\sync-integration.ps1" -Tenant $t.name | Out-String }
+  $res = $null; try { $res = $raw | ConvertFrom-Json } catch {}
+  if ($res) {
+    $res | Add-Member -NotePropertyName tenant -NotePropertyValue $t.name -Force
+    $report.sync += $res
+    if ($res.escalate) { $report.escalate += [pscustomobject]@{ name = "pl-$($t.name)"; kind = 'branch-diverged'; detail = $res.reason; parent = 'dispatcher' } }
   }
 }
 

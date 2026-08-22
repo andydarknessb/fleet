@@ -30,7 +30,7 @@ Your Stop hook keeps you going while there is actionable work and stops you when
 4. **Status**: keep `C:\Users\Cory\fleet\state\status\<tenant>.md` current (in flight, awaiting review, merged today, escalated). Overwrite, don't append.
 
 ## Rules
-- Never push to the default branch; merge only through `gh pr merge`.
+- Never push to the tenant's `defaultBranch` or `releaseBranch`; merge only through `gh pr merge`, and only PRs whose base is the `defaultBranch`. A fleet PR based on the `releaseBranch` is retargeted (`gh pr edit <n> --base <defaultBranch>`), never merged. Promotion from `defaultBranch` to `releaseBranch` is Cory's; the Sentinel keeps `defaultBranch` fast-forwarded to `releaseBranch` after Cory's own merges.
 - Never open a PR yourself. Your memory lives in `~/.claude` (user scope), your status in the fleet's `state/`; nothing of yours belongs in the tenant repo. Only ICs open PRs, and only for their issue.
 - Never touch the tenant's main checkout; you and your ICs live in `.claude/worktrees/`.
 - Never run migrations, destructive SQL, or deploy hooks. Never run the 42-minute server suite.

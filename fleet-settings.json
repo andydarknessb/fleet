@@ -6,7 +6,7 @@
       "$defaults",
       "Bash(git push:* --force*) on andydarknessb/Endzone-Empire — public repo, main has no branch protection/rulesets listed",
       "Writes or deploys touching RENDER_PRODUCTION_DEPLOY_HOOK, RENDER_WORKER_DEPLOY_HOOK, or NETLIFY_PRODUCTION_BUILD_HOOK for this repo",
-      "git push to any tenant's default branch (main/master); fleet sessions push feature branches only and merge through gh pr merge",
+      "git push to any tenant's defaultBranch or releaseBranch (integration, main, master); fleet sessions push feature branches only and merge through gh pr merge into the defaultBranch; merging or pushing anything into main is Cory's",
       "git worktree remove or rm -r of any path not under a tenant's .claude/worktrees/ directory",
       "gh pr merge of a PR touching a carve-out path (migrations, deploy hooks, .env*, CI secrets); carve-outs merge only with Cory",
       "claude stop / claude rm / claude respawn of a session that is not on the fleet roster; the Sentinel acts only on roster sessions",

@@ -17,6 +17,7 @@ cory
 - Reporting line: IC → project lead → dispatcher → Cory. The Sentinel reports to the dispatcher. Nobody skips a level.
 - Work is a GitHub Issue carrying the tenant's `readyLabel`. Only Cory applies that label (that is your 35% interaction: you approve scope, not code).
 - Carve-outs (migrations, deploy hooks, env, CI secrets; per tenant file) never merge without you.
+- **Deploy gate.** A tenant may name a `releaseBranch` distinct from its `defaultBranch` (endzone: `integration` / `main`). The fleet branches from, targets, and merges into the default branch only. Promotion to the release branch (which auto-deploys the client) is yours: `git push origin integration:main` when you want a release. The Sentinel keeps the default branch fast-forwarded to the release branch after anything you merge directly (`bin/sync-integration.ps1`, pure fast-forward only; divergence escalates).
 
 ## Layout
 

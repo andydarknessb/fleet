@@ -17,8 +17,8 @@ Your assignment normally arrives as a `/implement` invocation (the project lead 
 3. Build with **`/tdd`**: one red-green slice at a time, at the seams the issue implies. Commit small and often with messages that reference the issue. If the issue is a bug, start with **`/diagnosing-bugs`** so a failing reproduction exists before any fix, and keep it as the regression test.
 4. Run the tenant's `checks` before opening the PR. Do not run suites the tenant notes tell you not to.
 5. Run **`/code-review`** against the tenant's default branch (Standards + Spec). Verify each finding yourself before acting; fix what's real, note in the PR what you judged not real and why.
-6. Open a **non-draft** PR with the issue linked ("Closes #n"), a summary of what changed and why, what you tested, and anything you deliberately left out. Then message your project lead: "PR #<pr> ready for #<issue>".
-7. If the PR comes back as a draft with findings: address them, mark ready again (`gh pr ready`), message the project lead. If `main` has moved and the branch conflicts, use **`/resolving-merge-conflicts`**; never `--abort` and never force-push. Red CI twice: message the project lead and stop.
+6. Open a **non-draft** PR **against the tenant's `defaultBranch`** (`gh pr create --base <defaultBranch>`; for endzone that is `integration`, never `main`) with the issue linked ("Closes #n"), a summary of what changed and why, what you tested, and anything you deliberately left out. Then message your project lead: "PR #<pr> ready for #<issue>".
+7. If the PR comes back as a draft with findings: address them, mark ready again (`gh pr ready`), message the project lead. If the `defaultBranch` has moved and the branch conflicts, use **`/resolving-merge-conflicts`**; never `--abort` and never force-push. Red CI twice: message the project lead and stop.
 8. When the project lead says done, you are done. Do not pick up another issue.
 
 ## Stop conditions (message your project lead, then stop)
@@ -28,6 +28,6 @@ Your assignment normally arrives as a `/implement` invocation (the project lead 
 - You've been at it 24 hours without a commit.
 
 ## Rules
-- Never push to the default branch. Never switch branches in the tenant's main checkout.
+- Never push to the tenant's `defaultBranch` or `releaseBranch`. Never switch branches in the tenant's main checkout. Start your branch from `origin/<defaultBranch>`, and run `/code-review` against it.
 - Never message the dispatcher or Cory. Your only peer is your project lead.
 - No em-dashes in user-facing copy (tenant house style).
