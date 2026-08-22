@@ -20,6 +20,8 @@
     "unit": "npm test -- --watchAll=false",
     "lint": "npx eslint src server --max-warnings=0"
   },
+  "ciGates": ["test-build", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
+  "ignoredChecks": ["scan"],
   "notes": [
     "main auto-publishes the client to Netlify; a merge is a deploy.",
     "The dev database is the shared Supabase production database. Never run migrations or destructive SQL from an IC.",
