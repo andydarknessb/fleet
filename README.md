@@ -64,8 +64,13 @@ Status files: `state/STATUS.md` (dispatcher's digest), `state/status/<tenant>.md
 3. `claude agents`, pin dispatcher, sentinel, and pl-endzone with Ctrl+T.
 4. Optional, survives reboot: `powershell -File C:\Users\Cory\fleet\bin\install-recovery-task.ps1`.
 
+## Skills the roles use
+
+The `mattpocock-skills` plugin is enabled at user scope, so every fleet session can invoke its model-invocable skills. The roles name the ones they rely on: ICs build with `/tdd`, review with `/code-review`, start bugs with `/diagnosing-bugs`, and untangle stale branches with `/resolving-merge-conflicts`; project leads review PRs with `/code-review` (its Standards + Spec sub-agents are the two review angles) and settle vocabulary with `/domain-modeling`; the dispatcher answers reading questions with `/research`. `/implement` is user-only, but a slash command at the head of a launch prompt counts as a user invocation in the new session (verified), so project leads launch ICs with `-Prompt "/mattpocock-skills:implement ..."` and the IC runs the real skill. `skills:` in a role file's frontmatter does **not** preload skill text into a `--agent` background session (verified, both spellings); skills are discovered from the listing and invoked on demand. `/triage`, `/to-spec`, `/to-tickets` and `/grill-with-docs` stay yours: they are scope decisions.
+
 ## Onboarding a tenant
 
+0. In the tenant repo, run `/setup-matt-pocock-skills` yourself first (it is user-only). The skills read `docs/agents/issue-tracker.md` and `docs/agents/triage-labels.md`; without them `/code-review` and friends have no tracker to talk to.
 1. Copy `tenants/endzone.json` to `tenants/<name>.json` and fill it in. The repo needs the ready label and an escalation label.
 2. Add a `pl-<name>` entry to `roster.json` (copy `pl-endzone`, change tenant, cwd, prompt).
 3. `launch.ps1 -FromRoster pl-<name>` (or just wait: the Sentinel's next check reports it as `launchNeeded` and launches it).
