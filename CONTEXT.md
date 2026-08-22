@@ -30,9 +30,19 @@ _Avoid_: agent, persona, profile
 ### Job titles
 
 **Lead**:
-A session with no project of its own. It is Cory's interface to the fleet,
-assigns projects to project leads, and watches the other lead.
+A session with no tenant of its own. There are exactly two, with different
+jobs, and each watches the other's liveness: the Dispatcher and the Sentinel.
 _Avoid_: orchestrator, manager, supervisor (the supervisor is the daemon)
+
+**Dispatcher**:
+The lead that is Cory's interface to the fleet: it assigns tenants to project
+leads, relays escalations upward, and produces the daily digest.
+_Avoid_: lead A, main agent, coordinator
+
+**Sentinel**:
+The lead that keeps the fleet alive and within its cap: it reads heartbeats,
+respawns sessions, sweeps stale worktrees, and never reasons about work.
+_Avoid_: lead B, watchdog, monitor, health checker
 
 **Project lead**:
 A session that owns exactly one project: it turns the project's issues into
@@ -46,6 +56,31 @@ A session that does one unit of work for one project and reports to that
 project's project lead. It never talks to a lead or to Cory directly.
 _Avoid_: agent, worker (a worker is a subagent; an IC is a session)
 
+### Keeping it alive
+
+**Roster**:
+The fleet's list of sessions that are supposed to exist: name, role, tenant,
+and who each reports to. The Sentinel compares the roster against what is
+actually running; anything on the roster and not running is a fault.
+_Avoid_: fleet config, session list, org chart
+
+**Heartbeat**:
+A timestamp a session records every time it finishes a turn. A stale heartbeat
+on a session that claims to be working is the signal for "alive but stuck".
+_Avoid_: ping, keepalive, health check
+
+**Cap**:
+The maximum number of fleet sessions allowed to exist at once. Workers do not
+count. Launching past the cap is refused, never queued.
+_Avoid_: limit, quota, concurrency
+
+**Escalation**:
+A condition an IC or project lead may not resolve on its own, handed one level
+up the reporting line until it reaches Cory: a permission prompt, red CI twice
+on one PR, scope drift, or a day without a commit. Escalations are the only
+events that page Cory.
+_Avoid_: alert, error, blocker, "off the rails"
+
 ### Work
 
 **Tenant**:
@@ -57,3 +92,9 @@ A GitHub Issue carrying the tenant's ready-for-agent label. The only thing an
 IC may be assigned. Project leads may file and spec issues; only Cory applies
 the label.
 _Avoid_: task, ticket, job
+
+**Carve-out**:
+A change that may never merge without Cory, however green it is: migrations,
+deploy hooks, environment and secrets. The list lives in the project lead's
+role, not in its judgement.
+_Avoid_: protected change, sensitive PR, exception
