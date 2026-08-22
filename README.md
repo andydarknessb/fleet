@@ -27,7 +27,8 @@ cory
 | `agents/*.md` | Role files. `~/.claude/agents` is a junction to this directory (`setup.ps1`), so `claude --agent <role>` finds them. Remove with `rmdir`, never `rm -r`. |
 | `fleet-settings.json` | Applied to every fleet session via `--settings`: inbound messaging accepted, auto mode, fleet soft-denies, the two hooks. |
 | `hooks/session-start.ps1` | Prints the session's identity, tenant, PAUSE state, and roster into its context. |
-| `hooks/stop.ps1` | Every session: writes a heartbeat. Project leads: exits 2 (keep going) while there is actionable work. |
+| `hooks/stop.ps1` | Every session: writes a heartbeat. Project leads: exits 2 (keep going) while there is actionable work: a non-draft `fleet/*` PR, or a **frontier** issue (ready label, no open blockers per GitHub issue dependencies via GraphQL `blockedBy`, not in `state/skip/<tenant>.json`, free cap + IC slot). |
+| `state/skip/<tenant>.json` | The project lead's "not launchable, and why" list (`{ "issues": { "<n>": "reason" } }`). The hook honours it; you triage it. |
 | `bin/launch.ps1` | **The only door.** Enforces PAUSE, cap, `maxIcs`, naming; writes per-session settings with `FLEET_*` env; records the session in `state/roster.json`. |
 | `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, rate-limit PAUSE. |
 | `bin/retire.ps1` | Stop and remove a finished IC; marks it retired in the live roster. |
