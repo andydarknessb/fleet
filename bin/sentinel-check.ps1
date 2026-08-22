@@ -45,8 +45,13 @@ foreach ($x in $expected) {
   }
   $state = "$($row.state)"
   if ($state -eq 'blocked') {
-    $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'blocked'; detail = "waiting on a prompt ($($row.waitingFor)); not respawned by design"; parent = $x.parent }
-    continue
+    # 'blocked' is also what a session reports when it is merely waiting on a human decision. Only a real
+    # dialog (the daemon's waitingFor) is a permission prompt worth escalating; otherwise treat as working.
+    if ("$($row.waitingFor)" -ne '') {
+      $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'blocked'; detail = "waiting on a prompt ($($row.waitingFor)); not respawned by design"; parent = $x.parent }
+      continue
+    }
+    $state = 'working'
   }
   if ($state -eq 'failed') { Do-Respawn $row $x 'state failed'; continue }
   if ($state -eq 'stopped') { Do-Respawn $row $x 'state stopped'; continue }

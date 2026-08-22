@@ -23,29 +23,34 @@ if ($role -ne 'project-lead') { exit 0 }
 # --- project lead continuation ---
 function ConvertFrom-JsonArray { param($Raw) try { $o = ($Raw | Out-String | ConvertFrom-Json); if ($null -eq $o) { return @() }; return @($o) } catch { return @() } }
 $counterPath = "$home_\state\continue\$name.json"
-$count = 0
+$count = 0; $lastReason = ''; $total = 0
 if (Test-Path $counterPath) {
-  try { $c = Get-Content $counterPath -Raw | ConvertFrom-Json; $count = [int]$c.count } catch {}
+  try { $c = Get-Content $counterPath -Raw | ConvertFrom-Json; $count = [int]$c.count; $lastReason = "$($c.continuedBecause)"; $total = [int]$c.total } catch {}
 }
 function Stop-Now {
   param($reason)
-  [IO.File]::WriteAllText($counterPath, (@{ count = 0; lastAt = $now; stoppedBecause = $reason } | ConvertTo-Json -Compress), $utf8)
+  [IO.File]::WriteAllText($counterPath, (@{ count = 0; total = 0; lastAt = $now; stoppedBecause = $reason } | ConvertTo-Json -Compress), $utf8)
   exit 0
 }
 function Continue-With {
   param($reason)
-  $script:count++
-  [IO.File]::WriteAllText($counterPath, (@{ count = $script:count; lastAt = $now; continuedBecause = $reason } | ConvertTo-Json -Compress), $utf8)
-  [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (continuation $script:count/30). If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking.")
+  # The loop guard counts CONSECUTIVE continuations for the SAME reason (a review that takes 12 turns is fine;
+  # 30 turns of "launch #111" without launching it is a loop). An absolute ceiling catches reason-hopping.
+  $key = ($reason -replace '\d+ cap slot.*$', '')
+  if ($key -eq $script:lastKey) { $script:count++ } else { $script:count = 1 }
+  $script:total++
+  [IO.File]::WriteAllText($counterPath, (@{ count = $script:count; total = $script:total; lastAt = $now; continuedBecause = $key } | ConvertTo-Json -Compress), $utf8)
+  [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (same-reason continuation $script:count/30, total $script:total/100 since last natural stop). If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking.")
   exit 2
 }
+$script:lastKey = $lastReason
 
 if (Test-Path "$home_\state\PAUSE") { Stop-Now 'PAUSE set' }
-if ($count -ge 30) {
+if ($count -ge 30 -or $total -ge 100) {
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-  $esc = @{ at = $now; from = $name; kind = 'loop-guard'; detail = 'project lead continued 30 times without stopping; possible loop' }
+  $esc = @{ at = $now; from = $name; kind = 'loop-guard'; detail = "project lead continued $count times for the same reason ('$lastReason'), $total in total, without a natural stop; possible loop" }
   [IO.File]::WriteAllText("$home_\state\escalations\$stamp-$name.json", ($esc | ConvertTo-Json -Compress), $utf8)
-  Stop-Now 'loop guard tripped (30 continuations); escalation filed'
+  Stop-Now "loop guard tripped (same-reason $count, total $total); escalation filed"
 }
 $t = $null
 try { $t = Get-Content "$home_\tenants\$tenant.json" -Raw | ConvertFrom-Json } catch {}
@@ -84,20 +89,26 @@ $candidates = @($ready | Where-Object { ($assigned -notcontains $_) -and (-not $
 $frontier = @()
 $blocked = @()
 if ($candidates.Count -gt 0) {
-  $aliases = ($candidates | ForEach-Object { "i$($_): issue(number:$_) { number blockedBy(first:20) { nodes { number state } } }" }) -join ' '
-  $q = "query { repository(owner:""$owner"", name:""$repoName"") { $aliases } }"
-  $gql = & gh api graphql -f query=$q 2>$null | Out-String
-  $parsed = $null; try { $parsed = $gql | ConvertFrom-Json } catch {}
-  if ($parsed -and $parsed.data.repository) {
+  # One REST call, no embedded quotes (PowerShell 5.1 strips them from native args, which broke the GraphQL form).
+  # issue_dependencies_summary.blocked_by counts OPEN blockers only.
+  $depRaw = & gh api "repos/$($t.github)/issues?labels=$($t.readyLabel)&state=open&per_page=100" 2>$null
+  $deps = @{}
+  $depOk = $false
+  foreach ($it in (ConvertFrom-JsonArray $depRaw)) {
+    if ($it.pull_request) { continue }
+    $depOk = $true
+    $bb = 0
+    if ($it.issue_dependencies_summary -and $null -ne $it.issue_dependencies_summary.blocked_by) { $bb = [int]$it.issue_dependencies_summary.blocked_by }
+    $deps[[int]$it.number] = $bb
+  }
+  if ($depOk) {
     foreach ($n in $candidates) {
-      $node = $parsed.data.repository."i$n"
-      $openBlockers = @()
-      if ($node -and $node.blockedBy -and $node.blockedBy.nodes) { $openBlockers = @($node.blockedBy.nodes | Where-Object { $_.state -eq 'OPEN' } | ForEach-Object { $_.number }) }
-      if ($openBlockers.Count -eq 0) { $frontier += $n } else { $blocked += "#$n(by #$($openBlockers -join ',#'))" }
+      $bb = 0; if ($deps.ContainsKey($n)) { $bb = $deps[$n] }
+      if ($bb -eq 0) { $frontier += $n } else { $blocked += "#$n(blocked_by=$bb)" }
     }
   } else {
-    # GraphQL unavailable: fall back to treating every candidate as frontier, but say so.
-    $frontier = $candidates
+    # Dependency data unavailable: the SAFE direction is to launch nothing, not everything.
+    Stop-Now "could not read issue dependencies from GitHub; not launching (candidates: #$($candidates -join ', #'))"
   }
 }
 
