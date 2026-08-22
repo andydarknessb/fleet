@@ -9,8 +9,8 @@ cory
  └─ dispatcher (opus)      your interface; relays escalations; daily digest; watches the sentinel
  └─ sentinel   (sonnet)    keeps the roster alive and under the cap; never reasons about work
      └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
-         └─ ic-<issue> (sonnet) one per issue; opens a PR; talks only to its project lead
-             └─ qa-reviewer (opus worker)   one-angle review, spawned by ICs (1) and project leads (2)
+         └─ ic-<issue> (sonnet) one per issue, launched with /implement; opens a PR; talks only to its project lead
+             └─ qa-reviewer (opus worker)   optional third review angle (UI, house style), spawned by the project lead
 ```
 
 - **Sessions** are background Claude Code sessions hosted by the daemon (`claude agents`). **Workers** are subagents inside a session. Cap counts sessions only.
