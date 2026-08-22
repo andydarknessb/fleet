@@ -16,6 +16,11 @@ if ($tenant -and (Test-Path "$home_\tenants\$tenant.json")) {
   Write-Output "Tenant file: $home_\tenants\$tenant.json"
 }
 if ($env:FLEET_ISSUE) { Write-Output "Your unit of work: issue #$($env:FLEET_ISSUE). Nothing else." }
+if (Test-Path "$home_\state\NOTICE.md") {
+  Write-Output "--- NOTICE from Cory (state/NOTICE.md) ---"
+  Get-Content "$home_\state\NOTICE.md" -Raw
+  Write-Output "--- end notice ---"
+}
 $roster = $null
 try { $roster = Get-Content "$home_\state\roster.json" -Raw | ConvertFrom-Json } catch {}
 if ($roster) {
