@@ -58,9 +58,32 @@ if (-not $t) { Stop-Now 'no tenant file' }
 $owner, $repoName = $t.github -split '/'
 
 # --- PRs awaiting review (checked first: cheapest, highest value) ---
-$prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName 2>$null
-$awaiting = @(ConvertFrom-JsonArray $prRaw | Where-Object { (-not $_.isDraft) -and $_.headRefName.StartsWith($t.branchPrefix) } | ForEach-Object { [int]$_.number })
-if ($awaiting.Count -gt 0) { Continue-With "PR(s) awaiting your review: #$($awaiting -join ', #')" }
+# Actionable = open, non-draft, fleet-prefixed, NOT held by the lead (state/skip/<tenant>.json "prs"), and with no
+# ciGates check still pending (a PR waiting on CI has nothing to act on; the lead schedules its own re-check).
+$skipAll = $null
+$skipPath = "$home_\state\skip\$tenant.json"
+if (Test-Path $skipPath) { try { $skipAll = Get-Content $skipPath -Raw | ConvertFrom-Json } catch {} }
+$heldPrs = @{}
+if ($skipAll -and $skipAll.prs) { foreach ($p in $skipAll.prs.PSObject.Properties) { $heldPrs[[int]$p.Name] = $p.Value } }
+$gates = @(); if ($t.ciGates) { $gates = @($t.ciGates) }
+$prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName,statusCheckRollup 2>$null
+$awaiting = @(); $waitingOnCi = @(); $held = @()
+foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
+  if ($pr.isDraft -or -not $pr.headRefName.StartsWith($t.branchPrefix)) { continue }
+  $n = [int]$pr.number
+  if ($heldPrs.ContainsKey($n)) { $held += $n; continue }
+  $pending = $false
+  foreach ($c in @($pr.statusCheckRollup)) {
+    $cname = "$($c.name)"; if (-not $cname) { $cname = "$($c.context)" }
+    if ($gates -contains $cname) {
+      $st = "$($c.status)"; $concl = "$($c.conclusion)"
+      if (($st -and $st -ne 'COMPLETED') -or ($concl -eq '' -and $st -ne 'COMPLETED')) { $pending = $true }
+    }
+  }
+  if ($pending) { $waitingOnCi += $n; continue }
+  $awaiting += $n
+}
+if ($awaiting.Count -gt 0) { Continue-With "PR(s) awaiting your review with CI settled: #$($awaiting -join ', #')" }
 
 # --- capacity ---
 $roster = $null
@@ -76,7 +99,12 @@ if ($roster) { $rosterNames += @($roster.sessions | Where-Object { $_.status -eq
 $liveFleet = @($liveNames | Where-Object { $rosterNames -contains $_ })
 $capFree = $cap - $liveFleet.Count
 $icFree = [int]$t.maxIcs - $activeIcs.Count
-if ($capFree -le 0 -or $icFree -le 0) { Stop-Now "no free slot (capFree=$capFree, icFree=$icFree); ICs will message you" }
+if ($capFree -le 0 -or $icFree -le 0) {
+  $msg = "no free slot (capFree=$capFree, icFree=$icFree)"
+  if ($waitingOnCi.Count -gt 0) { $msg += "; PR(s) waiting on CI gates: #$($waitingOnCi -join ', #') (schedule a one-shot CronCreate re-check if you have none)" }
+  if ($held.Count -gt 0) { $msg += "; held PR(s): #$($held -join ', #')" }
+  Stop-Now "$msg; ICs will message you"
+}
 
 # --- frontier: ready, unassigned, not skipped, no open blockers ---
 $readyRaw = & gh issue list -R $t.github --label $t.readyLabel --state open --limit 100 --json number 2>$null
@@ -115,4 +143,7 @@ if ($candidates.Count -gt 0) {
 if ($frontier.Count -gt 0) { Continue-With "frontier issue(s) #$($frontier -join ', #') (ready, unblocked, unassigned, not skipped) with $capFree cap slot(s) and $icFree IC slot(s) free; launch the next IC" }
 $why = "frontier empty (ready=$($ready.Count), assigned=$($assigned.Count), skipped=$($skip.Count), blocked=$($blocked.Count)"
 if ($blocked.Count -gt 0) { $why += ": $($blocked -join ' ')" }
-Stop-Now "$why); ICs will message you"
+$why += ")"
+if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (schedule a one-shot CronCreate re-check if you have none)" }
+if ($held.Count -gt 0) { $why += "; held PR(s): #$($held -join ', #')" }
+Stop-Now "$why; ICs will message you"

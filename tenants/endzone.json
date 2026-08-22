@@ -18,7 +18,7 @@
     "scripts/setup-worker-deploy-secrets.sh"
   ],
   "checks": {
-    "unit": "npm test -- --watchAll=false",
+    "unit": "npm test -- --watchAll=false --testMatch \"**/*.test.{js,jsx,ts,tsx}\"",
     "lint": "npx eslint src server --max-warnings=0"
   },
   "ciGates": ["test-build", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
@@ -27,6 +27,8 @@
     "The fleet works on `integration` (defaultBranch): branch from it, open PRs against it, merge into it. `main` (releaseBranch) auto-publishes the client to Netlify, so only Cory promotes integration to main. Never push to or merge into main.",
     "The dev database is the shared Supabase production database. Never run migrations or destructive SQL from an IC.",
     "House style: no em-dashes in user-facing copy.",
+    "Inside a .claude/worktrees/ checkout, plain `npm test` finds ZERO tests and exits 0 (the dot-directory is ignored by Jest's crawler). Always run checks.unit exactly as written (it carries --testMatch) and report the real suite/test counts.",
+    "Never use git stash in any form; commit work-in-progress to your own branch.",
     "test:server takes ~42 minutes (issue #80); do not run it per commit, run the targeted file.",
     "Never switch branches in C:\\Users\\Cory\\Endzone-Empire itself; fleet sessions live in .claude/worktrees/."
   ]
