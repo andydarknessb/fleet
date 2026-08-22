@@ -49,9 +49,9 @@ $t = $null
 try { $t = Get-Content "$home_\tenants\$tenant.json" -Raw | ConvertFrom-Json } catch {}
 if (-not $t) { Stop-Now 'no tenant file' }
 
+function ConvertFrom-JsonArray { param($Raw) try { $o = ($Raw | Out-String | ConvertFrom-Json); if ($null -eq $o) { return @() }; return @($o) } catch { return @() } }
 $readyRaw = & gh issue list -R $t.github --label $t.readyLabel --state open --limit 100 --json number 2>$null
-$ready = @()
-try { $ready = @(($readyRaw | Out-String | ConvertFrom-Json) | ForEach-Object { [int]$_.number }) } catch {}
+$ready = @(ConvertFrom-JsonArray $readyRaw | ForEach-Object { [int]$_.number })
 $roster = $null
 try { $roster = Get-Content "$home_\state\roster.json" -Raw | ConvertFrom-Json } catch {}
 $activeIcs = @()
@@ -62,8 +62,7 @@ $unassigned = @($ready | Where-Object { $assigned -notcontains $_ })
 $static = Get-Content "$home_\roster.json" -Raw | ConvertFrom-Json
 $cap = [int]$static.cap
 $liveRaw = & claude agents --json 2>$null
-$liveNames = @()
-try { $liveNames = @(($liveRaw | Out-String | ConvertFrom-Json) | ForEach-Object { $_.name }) } catch {}
+$liveNames = @(ConvertFrom-JsonArray $liveRaw | ForEach-Object { $_.name })
 $rosterNames = @($static.sessions | ForEach-Object { $_.name })
 if ($roster) { $rosterNames += @($roster.sessions | Where-Object { $_.status -eq 'active' } | ForEach-Object { $_.name }) }
 $liveFleet = @($liveNames | Where-Object { $rosterNames -contains $_ })
@@ -71,8 +70,7 @@ $capFree = $cap - $liveFleet.Count
 $icFree = [int]$t.maxIcs - $activeIcs.Count
 
 $prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName 2>$null
-$awaiting = @()
-try { $awaiting = @(($prRaw | Out-String | ConvertFrom-Json) | Where-Object { (-not $_.isDraft) -and $_.headRefName.StartsWith($t.branchPrefix) } | ForEach-Object { [int]$_.number }) } catch {}
+$awaiting = @(ConvertFrom-JsonArray $prRaw | Where-Object { (-not $_.isDraft) -and $_.headRefName.StartsWith($t.branchPrefix) } | ForEach-Object { [int]$_.number })
 
 if ($awaiting.Count -gt 0) { Continue-With "PR(s) awaiting your review: #$($awaiting -join ', #')" }
 if ($unassigned.Count -gt 0 -and $capFree -gt 0 -and $icFree -gt 0) { Continue-With "unassigned ready issue(s) #$($unassigned -join ', #') with $capFree cap slot(s) and $icFree IC slot(s) free; launch the next IC" }

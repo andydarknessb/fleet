@@ -15,10 +15,10 @@
   },
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\Cory\\fleet\\hooks\\session-start.ps1", "timeout": 30 } ] }
+      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/session-start.ps1", "timeout": 30 } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\Cory\\fleet\\hooks\\stop.ps1", "timeout": 60 } ] }
+      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/stop.ps1", "timeout": 60 } ] }
     ]
   }
 }

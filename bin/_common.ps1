@@ -16,7 +16,8 @@ function Save-LiveRoster { param($R) Write-Json "$FleetHome\state\roster.json" $
 function Get-DaemonSessions {
   param([switch]$All)
   $raw = if ($All) { & claude agents --json --all 2>$null } else { & claude agents --json 2>$null }
-  try { @(($raw | Out-String) | ConvertFrom-Json) } catch { @() }
+  # PS 5.1 quirk: ConvertFrom-Json emits a JSON array as ONE object; assign first so @() doesn't nest it.
+  try { $obj = ($raw | Out-String | ConvertFrom-Json); if ($null -eq $obj) { return @() }; return @($obj) } catch { return @() }
 }
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
 function Get-FleetNames {
