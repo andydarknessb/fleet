@@ -81,6 +81,20 @@ on one PR, scope drift, or a day without a commit. Escalations are the only
 events that page Cory.
 _Avoid_: alert, error, blocker, "off the rails"
 
+**Reporting line**:
+The fixed path a message takes: IC to project lead, project lead to
+dispatcher, dispatcher to Cory; the Sentinel reports to the dispatcher. A
+respawned session is told what it was doing by its parent on this line, never
+by the Sentinel. Nobody skips a level.
+_Avoid_: chain of command, hierarchy, org chart
+
+**Pause**:
+The fleet-wide switch that stops every launch and every project lead's loop
+until it is cleared. Set by Cory by hand or by the Sentinel on a rate-limit
+signal; sessions finish their current turn and go idle. It is the only way to
+stop the fleet without hunting sessions.
+_Avoid_: kill switch, freeze, stop-the-world, maintenance mode
+
 ### Work
 
 **Tenant**:

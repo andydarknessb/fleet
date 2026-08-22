@@ -1,0 +1,24 @@
+{
+  "crossSessionInbound": "accept",
+  "permissions": { "defaultMode": "auto" },
+  "autoMode": {
+    "soft_deny": [
+      "$defaults",
+      "Bash(git push:* --force*) on andydarknessb/Endzone-Empire — public repo, main has no branch protection/rulesets listed",
+      "Writes or deploys touching RENDER_PRODUCTION_DEPLOY_HOOK, RENDER_WORKER_DEPLOY_HOOK, or NETLIFY_PRODUCTION_BUILD_HOOK for this repo",
+      "git push to any tenant's default branch (main/master); fleet sessions push feature branches only and merge through gh pr merge",
+      "git worktree remove or rm -r of any path not under a tenant's .claude/worktrees/ directory",
+      "gh pr merge of a PR touching a carve-out path (migrations, deploy hooks, .env*, CI secrets); carve-outs merge only with Cory",
+      "claude stop / claude rm / claude respawn of a session that is not on the fleet roster; the Sentinel acts only on roster sessions",
+      "Editing C:\\Users\\Cory\\fleet\\roster.json, fleet-settings.json, or any file under agents/ from a fleet session; role and roster changes are Cory's"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\Cory\\fleet\\hooks\\session-start.ps1", "timeout": 30 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\Cory\\fleet\\hooks\\stop.ps1", "timeout": 60 } ] }
+    ]
+  }
+}

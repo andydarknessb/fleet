@@ -1,0 +1,29 @@
+{
+  "cap": 6,
+  "sessions": [
+    {
+      "name": "dispatcher",
+      "role": "dispatcher",
+      "tenant": null,
+      "parent": "cory",
+      "cwd": "C:\\Users\\Cory\\fleet",
+      "prompt": "You are the fleet's Dispatcher. Read C:\\Users\\Cory\\fleet\\README.md and your SessionStart context, then start your standing duties: schedule the daily digest, confirm the Sentinel and pl-endzone are alive via ListAgents, and wait for messages."
+    },
+    {
+      "name": "sentinel",
+      "role": "sentinel",
+      "tenant": null,
+      "parent": "dispatcher",
+      "cwd": "C:\\Users\\Cory\\fleet",
+      "prompt": "You are the fleet's Sentinel. Read C:\\Users\\Cory\\fleet\\README.md and your SessionStart context, then schedule your 15-minute check and run it once now."
+    },
+    {
+      "name": "pl-endzone",
+      "role": "project-lead",
+      "tenant": "endzone",
+      "parent": "dispatcher",
+      "cwd": "C:\\Users\\Cory\\Endzone-Empire",
+      "prompt": "You are the project lead for the tenant 'endzone'. Read C:\\Users\\Cory\\fleet\\README.md, C:\\Users\\Cory\\fleet\\tenants\\endzone.json, and the tenant's CLAUDE.md and CONTEXT.md. Then begin your loop: review any open fleet/* PRs, launch ICs for unassigned ready-for-agent issues up to the cap, and report to the dispatcher."
+    }
+  ]
+}

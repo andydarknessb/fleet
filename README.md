@@ -1,0 +1,81 @@
+# Fleet
+
+The standing crew of Claude Code sessions that runs Cory's projects between prompts. Vocabulary lives in [CONTEXT.md](CONTEXT.md); decisions in [docs/adr](docs/adr). This file is the operating guide. Every fleet session reads it at start.
+
+## Shape
+
+```
+cory
+ └─ dispatcher (opus)      your interface; relays escalations; daily digest; watches the sentinel
+ └─ sentinel   (sonnet)    keeps the roster alive and under the cap; never reasons about work
+     └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
+         └─ ic-<issue> (sonnet) one per issue; opens a PR; talks only to its project lead
+             └─ qa-reviewer (opus worker)   one-angle review, spawned by ICs (1) and project leads (2)
+```
+
+- **Sessions** are background Claude Code sessions hosted by the daemon (`claude agents`). **Workers** are subagents inside a session. Cap counts sessions only.
+- Reporting line: IC → project lead → dispatcher → Cory. The Sentinel reports to the dispatcher. Nobody skips a level.
+- Work is a GitHub Issue carrying the tenant's `readyLabel`. Only Cory applies that label (that is your 35% interaction: you approve scope, not code).
+- Carve-outs (migrations, deploy hooks, env, CI secrets; per tenant file) never merge without you.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `roster.json` | Static roster: the sessions that must always exist, the cap, their launch prompts. Cory edits. |
+| `tenants/<name>.json` | One per tenant: repo, GitHub slug, labels, branch prefix, `maxIcs`, carve-outs, checks, notes ICs must obey. |
+| `agents/*.md` | Role files. `~/.claude/agents` is a junction to this directory (`setup.ps1`), so `claude --agent <role>` finds them. Remove with `rmdir`, never `rm -r`. |
+| `fleet-settings.json` | Applied to every fleet session via `--settings`: inbound messaging accepted, auto mode, fleet soft-denies, the two hooks. |
+| `hooks/session-start.ps1` | Prints the session's identity, tenant, PAUSE state, and roster into its context. |
+| `hooks/stop.ps1` | Every session: writes a heartbeat. Project leads: exits 2 (keep going) while there is actionable work. |
+| `bin/launch.ps1` | **The only door.** Enforces PAUSE, cap, `maxIcs`, naming; writes per-session settings with `FLEET_*` env; records the session in `state/roster.json`. |
+| `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, rate-limit PAUSE. |
+| `bin/retire.ps1` | Stop and remove a finished IC; marks it retired in the live roster. |
+| `bin/pause.ps1` | Fleet-wide kill switch. `-Off` clears. |
+| `bin/status.ps1` | One-screen view. |
+| `bin/recover.ps1` | Bring the roster back after a reboot. `install-recovery-task.ps1` registers it at logon. |
+| `bin/pilot.ps1` | Launch sentinel, dispatcher, pl-endzone. `-DryRun` to check gates without starting anything. |
+| `state/` | Runtime only, gitignored: live roster, heartbeats, escalations, per-session settings, status files, PAUSE. |
+
+## Day to day
+
+```powershell
+# watch
+powershell -File C:\Users\Cory\fleet\bin\status.ps1
+claude agents                      # TUI: attach, peek, reply, pin (Ctrl+T pins a session so it is never idle-reaped)
+
+# talk to the dispatcher
+claude attach <job id>             # or from claude.ai/code / the mobile app: fleet sessions auto-connect to Remote Control
+
+# stop everything launching (sessions finish their turn and idle)
+powershell -File C:\Users\Cory\fleet\bin\pause.ps1 -Reason "going on holiday"
+powershell -File C:\Users\Cory\fleet\bin\pause.ps1 -Off
+
+# approve work
+gh issue edit <n> --add-label ready-for-agent
+```
+
+Status files: `state/STATUS.md` (dispatcher's digest), `state/status/<tenant>.md` (each project lead), `state/escalations/*.json` (anything that needs you).
+
+## Starting the pilot
+
+1. `powershell -File C:\Users\Cory\fleet\bin\setup.ps1` (junction, state dirs, version and label checks). Idempotent.
+2. `powershell -File C:\Users\Cory\fleet\bin\pilot.ps1 -DryRun`, then without `-DryRun`.
+3. `claude agents`, pin dispatcher, sentinel, and pl-endzone with Ctrl+T.
+4. Optional, survives reboot: `powershell -File C:\Users\Cory\fleet\bin\install-recovery-task.ps1`.
+
+## Onboarding a tenant
+
+1. Copy `tenants/endzone.json` to `tenants/<name>.json` and fill it in. The repo needs the ready label and an escalation label.
+2. Add a `pl-<name>` entry to `roster.json` (copy `pl-endzone`, change tenant, cwd, prompt).
+3. `launch.ps1 -FromRoster pl-<name>` (or just wait: the Sentinel's next check reports it as `launchNeeded` and launches it).
+
+## Things learned the hard way (verified 2026-08-22, Claude Code 2.1.239, Windows 11)
+
+- **`claude --bg --resume <sessionId>` forks a new session id and drops the name.** Recovery uses `claude respawn <job id>`, which keeps both. `launch.ps1` refuses to start a name that is already running for this reason.
+- **Background sessions see every peer in `ListAgents`; a desktop-app interactive session may not see them** (their inbox pipes live under `\\.\pipe\LOCAL\`). The fleet's internal messaging is unaffected. To reach a fleet session from your own session, use `claude attach`, the `claude agents` reply box, or Remote Control.
+- **A background-to-background `SendMessage` wakes an idle recipient into a new turn.** That is how an IC's "PR ready" reaches a sleeping project lead.
+- `claude rm <id>` also removes the session's worktree. `claude stop` does not.
+- Background sessions get an automatic worktree under `<repo>/.claude/worktrees/<name>`. The fleet never touches worktrees it didn't create; your hand-made `Endzone-Empire-*` worktrees are yours.
+- Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the Sentinel and dispatcher to recreate theirs.
+- Max 5x: rate limiting is a first-class state. The Sentinel sets a 60-minute PAUSE when a fleet job reports one and clears it after the window.
