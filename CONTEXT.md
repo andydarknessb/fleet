@@ -112,3 +112,12 @@ A change that may never merge without Cory, however green it is: migrations,
 deploy hooks, environment and secrets. The list lives in the project lead's
 role, not in its judgement.
 _Avoid_: protected change, sensitive PR, exception
+
+**Hold**:
+A pull request reviewed clean and parked for Cory's merge, recorded under
+`prs` in `state/skip/<tenant>.json` with its reason. A hold pages Cory once,
+through an escalation, and then waits; the IC that opened it waits with it
+and is neither retried nor respawned for being idle. Lifting the hold is
+Cory's merge, or Cory's instruction to the project lead.
+_Avoid_: blocked (a GitHub issue dependency), escalation (the page, not the
+state), parked

@@ -8,6 +8,8 @@
 param(
   [string]$Role, [string]$Name, [string]$Tenant, [string]$Parent, [string]$Prompt, [int]$Issue,
   [string]$FromRoster,
+  [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
+  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket)
   [switch]$Force,   # bypass the cap (Cory only)
   [switch]$DryRun   # do everything except start the session
 )
@@ -61,8 +63,11 @@ $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject
 $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
 Write-Json $settingsPath $settings
 
+$modelArgs = @()
+if ($Model) { $modelArgs = @('--model', $Model) }
+
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; cwd = $cwd; settings = $settingsPath; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role --settings $settingsPath <prompt>" } | ConvertTo-Json -Compress)
+  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; cwd = $cwd; settings = $settingsPath; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress)
   exit 0
 }
 
@@ -70,7 +75,7 @@ if ($DryRun) {
 $before = @($daemon | ForEach-Object { $_.sessionId })
 Push-Location $cwd
 try {
-  $out = & claude --bg --name $Name --agent $Role --settings $settingsPath $Prompt 2>&1 | Out-String
+  $out = & claude --bg --name $Name --agent $Role @modelArgs --settings $settingsPath $Prompt 2>&1 | Out-String
 } finally { Pop-Location }
 $row = $null
 for ($i = 0; $i -lt 20 -and -not $row; $i++) {
@@ -84,6 +89,7 @@ if (-not $row) {
 # --- record ---
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
+  model = $Model
   jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }

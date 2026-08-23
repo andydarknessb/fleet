@@ -5,7 +5,7 @@
   "defaultBranch": "integration",
   "releaseBranch": "main",
   "readyLabel": "ready-for-agent",
-  "escalationLabel": "needs-info",
+  "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",
   "maxIcs": 3,
   "carveOuts": [
@@ -18,7 +18,7 @@
     "scripts/setup-worker-deploy-secrets.sh"
   ],
   "checks": {
-    "unit": "npm test -- --watchAll=false --testMatch \"**/*.test.{js,jsx,ts,tsx}\"",
+    "unit": "npm test -- --watchAll=false --maxWorkers=50% --testMatch \"**/*.test.{js,jsx,ts,tsx}\"",
     "lint": "npx eslint src server --max-warnings=0"
   },
   "ciGates": ["test-build", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],

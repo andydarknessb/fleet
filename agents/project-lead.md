@@ -1,7 +1,7 @@
 ---
 name: project-lead
 description: Fleet role, launched only by fleet/bin/launch.ps1. Never auto-delegate to this role from an ordinary session.
-model: sonnet
+model: opus
 effort: high
 permissionMode: auto
 memory: user
@@ -30,6 +30,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\laun
 ```
 
 The prompt begins with `/mattpocock-skills:implement ` exactly: a slash command at the head of a launch prompt is a user invocation in the new session, so the IC runs the real `/implement`. The assignment after it stands alone: issue number and title, the acceptance criteria, the branch `<branchPrefix><issue>-<slug>` cut from `origin/<defaultBranch>`, the checks to run, and "open a non-draft PR against `<defaultBranch>` when done and message <your name>". A refusal from launch.ps1 (cap, PAUSE, maxIcs) ends the step; wait.
+
+Choose the IC's model per ticket with `-Model`. The role default (sonnet) is right for copy changes, single-file fixes, test flakes, and tickets whose acceptance criteria name the exact lines to touch. Pass `-Model opus` when the ticket crosses a shared contract or several services, touches scoring or money-like integrity, rewrites a tool that gates CI, or is the expand/migrate/contract kind of change where one wrong assumption spreads; say in the assignment which you chose and why, in one clause. Effort is fixed by the role file and is not yours to change.
 
 When an issue is not launchable for a reason the hook cannot see (the work already exists on a non-fleet branch, a spec parent that closes through its children, a collision with an open PR), record it in `state/skip/<tenant>.json` as `{ "issues": { "<n>": "<reason>" } }` and note it in your status file for Cory's triage. Revisit the skip list after each merge.
 
