@@ -25,7 +25,7 @@ function ConvertFrom-JsonArray { param($Raw) try { $o = ($Raw | Out-String | Con
 $counterPath = "$home_\state\continue\$name.json"
 $count = 0; $lastReason = ''; $total = 0
 if (Test-Path $counterPath) {
-  try { $c = Get-Content $counterPath -Raw | ConvertFrom-Json; $count = [int]$c.count; $lastReason = "$($c.continuedBecause)"; $total = [int]$c.total } catch {}
+  try { $c = Get-Content $counterPath -Raw -Encoding UTF8 | ConvertFrom-Json; $count = [int]$c.count; $lastReason = "$($c.continuedBecause)"; $total = [int]$c.total } catch {}
 }
 function Stop-Now {
   param($reason)
@@ -53,7 +53,7 @@ if ($count -ge 30 -or $total -ge 100) {
   Stop-Now "loop guard tripped (same-reason $count, total $total); escalation filed"
 }
 $t = $null
-try { $t = Get-Content "$home_\tenants\$tenant.json" -Raw | ConvertFrom-Json } catch {}
+try { $t = Get-Content "$home_\tenants\$tenant.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 if (-not $t) { Stop-Now 'no tenant file' }
 $owner, $repoName = $t.github -split '/'
 
@@ -62,7 +62,7 @@ $owner, $repoName = $t.github -split '/'
 # ciGates check still pending (a PR waiting on CI has nothing to act on; the lead schedules its own re-check).
 $skipAll = $null
 $skipPath = "$home_\state\skip\$tenant.json"
-if (Test-Path $skipPath) { try { $skipAll = Get-Content $skipPath -Raw | ConvertFrom-Json } catch {} }
+if (Test-Path $skipPath) { try { $skipAll = Get-Content $skipPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
 $heldPrs = @{}
 if ($skipAll -and $skipAll.prs) { foreach ($p in $skipAll.prs.PSObject.Properties) { $heldPrs[[int]$p.Name] = $p.Value } }
 $gates = @(); if ($t.ciGates) { $gates = @($t.ciGates) }
@@ -87,10 +87,10 @@ if ($awaiting.Count -gt 0) { Continue-With "PR(s) awaiting your review with CI s
 
 # --- capacity ---
 $roster = $null
-try { $roster = Get-Content "$home_\state\roster.json" -Raw | ConvertFrom-Json } catch {}
+try { $roster = Get-Content "$home_\state\roster.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 $activeIcs = @()
 if ($roster) { $activeIcs = @($roster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $tenant }) }
-$static = Get-Content "$home_\roster.json" -Raw | ConvertFrom-Json
+$static = Get-Content "$home_\roster.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 $cap = [int]$static.cap
 $liveRaw = & claude agents --json 2>$null
 $liveNames = @(ConvertFrom-JsonArray $liveRaw | ForEach-Object { $_.name })
@@ -112,7 +112,7 @@ $ready = @(ConvertFrom-JsonArray $readyRaw | ForEach-Object { [int]$_.number })
 $assigned = @($activeIcs | ForEach-Object { [int]$_.issue })
 $skip = @{}
 $skipPath = "$home_\state\skip\$tenant.json"
-if (Test-Path $skipPath) { try { $sk = Get-Content $skipPath -Raw | ConvertFrom-Json; foreach ($p in $sk.issues.PSObject.Properties) { $skip[[int]$p.Name] = $p.Value } } catch {} }
+if (Test-Path $skipPath) { try { $sk = Get-Content $skipPath -Raw -Encoding UTF8 | ConvertFrom-Json; foreach ($p in $sk.issues.PSObject.Properties) { $skip[[int]$p.Name] = $p.Value } } catch {} }
 $candidates = @($ready | Where-Object { ($assigned -notcontains $_) -and (-not $skip.ContainsKey($_)) })
 $frontier = @()
 $blocked = @()

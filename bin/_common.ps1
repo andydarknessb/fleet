@@ -1,7 +1,7 @@
 # Shared helpers for fleet scripts (dot-source).
 $script:FleetHome = Split-Path -Parent $PSScriptRoot
 $script:Utf8 = New-Object System.Text.UTF8Encoding $false
-function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw | ConvertFrom-Json } else { $null } }
+function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null } }
 function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
 function Get-LiveRoster {

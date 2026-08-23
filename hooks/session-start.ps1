@@ -22,7 +22,7 @@ if (Test-Path "$home_\state\NOTICE.md") {
   Write-Output "--- end notice ---"
 }
 $roster = $null
-try { $roster = Get-Content "$home_\state\roster.json" -Raw | ConvertFrom-Json } catch {}
+try { $roster = Get-Content "$home_\state\roster.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 if ($roster) {
   $active = @($roster.sessions | Where-Object { $_.status -eq 'active' })
   $names = @($active | ForEach-Object { "$($_.name)[$($_.role)]" }) -join ', '
