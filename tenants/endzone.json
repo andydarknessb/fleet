@@ -19,7 +19,7 @@
   ],
   "checks": {
     "unit": "npm test -- --watchAll=false --maxWorkers=50% --testMatch \"**/*.test.{js,jsx,ts,tsx}\"",
-    "lint": "npx eslint src server --max-warnings=0"
+    "lint": "npm run lint"
   },
   "ciGates": ["test-build", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
   "ignoredChecks": ["scan"],
