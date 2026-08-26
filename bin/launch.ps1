@@ -9,7 +9,7 @@ param(
   [string]$Role, [string]$Name, [string]$Tenant, [string]$Parent, [string]$Prompt, [int]$Issue,
   [string]$FromRoster,
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
-  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket)
+  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only)
   [switch]$DryRun   # do everything except start the session
 )
@@ -63,11 +63,30 @@ $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject
 $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
 Write-Json $settingsPath $settings
 
+# The friendly -Model token is passed to `claude --model`, but the bare 'opus'
+# alias tracks the latest Opus (currently Opus 5). ICs must run Opus 4.8, so pin
+# 'opus' to the concrete id; other tokens keep their CLI aliases (latest).
 $modelArgs = @()
-if ($Model) { $modelArgs = @('--model', $Model) }
+if ($Model) {
+  $resolvedModel = if ($Model -eq 'opus') { 'claude-opus-4-8' } else { $Model }
+  $modelArgs = @('--model', $resolvedModel)
+}
+
+# The role file frontmatter declares `effort:`, but `claude --agent` does NOT read
+# it for a top-level background session (it defaults every such session to high;
+# e.g. sentinel.md says low yet ran at high). So parse the role file ourselves and
+# pass the declared effort with --effort, the only lever that sticks for --bg.
+$effort = ''
+$roleFile = "$FleetHome\agents\$Role.md"
+if (Test-Path $roleFile) {
+  $m = Select-String -Path $roleFile -Pattern '^\s*effort:\s*(\S+)' | Select-Object -First 1
+  if ($m) { $effort = $m.Matches[0].Groups[1].Value }
+}
+$effortArgs = @()
+if ($effort -in @('low','medium','high','xhigh','max')) { $effortArgs = @('--effort', $effort) }
 
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; cwd = $cwd; settings = $settingsPath; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress)
+  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; effort = $effort; cwd = $cwd; settings = $settingsPath; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress)
   exit 0
 }
 
@@ -75,7 +94,7 @@ if ($DryRun) {
 $before = @($daemon | ForEach-Object { $_.sessionId })
 Push-Location $cwd
 try {
-  $out = & claude --bg --name $Name --agent $Role @modelArgs --settings $settingsPath $Prompt 2>&1 | Out-String
+  $out = & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath $Prompt 2>&1 | Out-String
 } finally { Pop-Location }
 $row = $null
 for ($i = 0; $i -lt 20 -and -not $row; $i++) {
@@ -89,7 +108,7 @@ if (-not $row) {
 # --- record ---
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
-  model = $Model
+  model = $Model; effort = $effort
   jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }
