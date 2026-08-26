@@ -27,9 +27,9 @@
     "The fleet works on `integration` (defaultBranch): branch from it, open PRs against it, merge into it. `main` (releaseBranch) auto-publishes the client to Netlify, so only Cory promotes integration to main. Never push to or merge into main.",
     "The dev database is the shared Supabase production database. Never run migrations or destructive SQL from an IC.",
     "House style: no em-dashes in user-facing copy.",
-    "Inside a .claude/worktrees/ checkout, plain `npm test` finds ZERO tests and exits 0 (the dot-directory is ignored by Jest's crawler). Always run checks.unit exactly as written (it carries --testMatch) and report the real suite/test counts.",
+    "Inside a .claude/worktrees/ checkout, run checks.unit exactly as written and report the real suite/test counts. (Before #220 landed 2026-08-23, plain `npm test` there found zero tests; jest.testMatch is pinned in package.json now, and the explicit --testMatch flag stays as belt-and-braces.)",
     "Never use git stash in any form; commit work-in-progress to your own branch.",
-    "test:server takes ~42 minutes (issue #80); do not run it per commit, run the targeted file.",
+    "`npm run test:server` is the FAST server set (scripts/run-server-tests.js, minutes) and is fine per commit or as the targeted file. `test:server:sweep` is the six backtest sweep files (~35 min) and `test:server:all` is everything (~42 min, issue #80): never run either per commit.",
     "Never switch branches in C:\\Users\\Cory\\Endzone-Empire itself; fleet sessions live in .claude/worktrees/."
   ]
 }

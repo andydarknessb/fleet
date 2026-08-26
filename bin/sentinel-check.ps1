@@ -45,13 +45,12 @@ foreach ($x in $expected) {
   }
   $state = "$($row.state)"
   if ($state -eq 'blocked') {
-    # 'blocked' is also what a session reports when it is merely waiting on a human decision. Only a real
-    # dialog (the daemon's waitingFor) is a permission prompt worth escalating; otherwise treat as working.
-    if ("$($row.waitingFor)" -ne '') {
-      $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'blocked'; detail = "waiting on a prompt ($($row.waitingFor)); not respawned by design"; parent = $x.parent }
-      continue
-    }
-    $state = 'working'
+    # 'blocked' covers a permission prompt, an AskUserQuestion and a plain wait on a human alike, and the daemon
+    # rows (`claude agents --json --all`, verified 2026-08-26: id,cwd,kind,startedAt,sessionId,name,state,pid,status)
+    # carry no field that says which. Report it as input-wait of unknown kind with the job's own detail text;
+    # never assert a cause this script did not measure. Never respawned: a respawn would discard the prompt.
+    $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'blocked'; detail = "waiting on input, kind unknown (daemon rows carry no prompt kind); job detail: $($js.detail); not respawned by design"; parent = $x.parent }
+    continue
   }
   if ($state -eq 'failed') { Do-Respawn $row $x 'state failed'; continue }
   if ($state -eq 'stopped') { Do-Respawn $row $x 'state stopped'; continue }
@@ -82,7 +81,7 @@ foreach ($x in $expected) {
 $fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$'
 $known = @($expected | ForEach-Object { $_.name })
 foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fleetPattern) -and ($known -notcontains $_.name) })) {
-  $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'stray'; detail = "fleet-named session not on the roster (job $($row.id)); bypassed launch.ps1" }
+  $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'stray'; detail = "fleet-named session not on the roster (job $($row.id)); cause not measured: launched outside launch.ps1, or its roster entry was lost or retired while the process lived" }
 }
 $liveFleet = @($daemon | Where-Object { $_.pid -and ($known -contains $_.name) })
 if ($liveFleet.Count -gt [int]$static.cap) { $report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'cap-exceeded'; detail = "$($liveFleet.Count) live fleet sessions, cap $($static.cap)" } }

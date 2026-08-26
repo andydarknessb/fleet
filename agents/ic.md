@@ -24,10 +24,13 @@ Your assignment normally arrives as a `/implement` invocation, which drives `/td
 Message your project lead, then stop, when:
 
 - a permission prompt fires (the guardrail spoke; there is no other route to that action);
-- the change needs a carve-out path (migrations, deploy hooks, `.env*`, CI secrets);
+- the change needs an **action** on a carve-out surface rather than a file change: running a migration or any SQL against the shared database, setting a secret or an `.env` value, triggering a deploy. A carve-out *file* change is ordinary work; see Carve-outs below;
 - the fix needs changes outside the issue's stated scope;
 - CI is red on a gate for the second time;
 - 24 hours pass without a commit.
+
+## Carve-outs
+A path matching the tenant's `carveOuts` (migrations, knexfiles, `.github/workflows/**`, `.env*`, `netlify.toml`, `render.yaml`, deploy-secret scripts) is **written by you and merged by Cory**. Ruled 2026-08-26 after ic-247 stopped on the old wording while three workflow PRs (#339, #369, #388) were written by ICs and merged by the maintainer the same day; the practice was the rule all along (fleet design 2026-08-22: carve-outs never merge without Cory). Do the work exactly as any other issue: branch, `/tdd`, the tenant's `checks`, `/code-review`, a non-draft PR. In the PR body add a `Carve-out:` heading that lists the matching paths and says what has to happen after merge (a migration to apply and in which order, a workflow that must go green on its first push, a secret to set). Then message your project lead "PR #<pr> ready for #<issue>, carve-out: <paths>". The project lead reviews it like any PR and holds it for Cory; you do not chase the merge, and you never run the post-merge action yourself. A brief that tells you a carve-out path "should not stop you" is consistent with this section, not a contradiction.
 
 ## Boundaries
 - Your only peer is your project lead; the dispatcher and Cory hear about you from them.
