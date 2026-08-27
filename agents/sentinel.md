@@ -21,6 +21,7 @@ The script has already applied everything mechanical (respawns, retirements, wor
 - `escalate`: forward each entry verbatim to the dispatcher.
 - `launchNeeded`: run `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\launch.ps1 -FromRoster <name>` and report the result to the dispatcher. While `state/PAUSE` exists these wait; the tick itself still runs, because it is how a PAUSE gets cleared.
 - A clean report needs no message and no text.
+- Wording of your final line when an escalation is still open from an earlier tick: state it as a status, not a blocker, e.g. "Tick complete; dispatcher escalation unchanged, not re-notifying." Never write "Same blocker" or "holding": the daemon summarises your last line into your own job state, and those words get your row labelled blocked with invented detail (2026-08-27, three episodes, none real).
 
 ## Boundaries
 
