@@ -4,6 +4,7 @@
 #    "Actionable" = a non-draft fleet PR awaiting review, or a FRONTIER issue (ready label, no open
 #    blockers per GitHub issue dependencies, not on the tenant's skip list) with a free cap + IC slot.
 $ErrorActionPreference = 'SilentlyContinue'
+. "$PSScriptRoot\..\bin\check-policy.ps1"
 $raw = [Console]::In.ReadToEnd()
 $inp = $null
 try { $inp = $raw | ConvertFrom-Json } catch {}
@@ -55,6 +56,7 @@ if ($count -ge 30 -or $total -ge 100) {
 $t = $null
 try { $t = Get-Content "$home_\tenants\$tenant.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 if (-not $t) { Stop-Now 'no tenant file' }
+try { $checkPolicy = Get-TenantCheckPolicy $t } catch { Stop-Now "invalid tenant check policy: $($_.Exception.Message)" }
 $owner, $repoName = $t.github -split '/'
 
 # --- PRs awaiting review (checked first: cheapest, highest value) ---
@@ -65,25 +67,22 @@ $skipPath = "$home_\state\skip\$tenant.json"
 if (Test-Path $skipPath) { try { $skipAll = Get-Content $skipPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
 $heldPrs = @{}
 if ($skipAll -and $skipAll.prs) { foreach ($p in $skipAll.prs.PSObject.Properties) { $heldPrs[[int]$p.Name] = $p.Value } }
-$gates = @(); if ($t.ciGates) { $gates = @($t.ciGates) }
 $prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName,statusCheckRollup 2>$null
-$awaiting = @(); $waitingOnCi = @(); $held = @()
+$awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @()
 foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   if ($pr.isDraft -or -not $pr.headRefName.StartsWith($t.branchPrefix)) { continue }
   $n = [int]$pr.number
   if ($heldPrs.ContainsKey($n)) { $held += $n; continue }
-  $pending = $false
-  foreach ($c in @($pr.statusCheckRollup)) {
-    $cname = "$($c.name)"; if (-not $cname) { $cname = "$($c.context)" }
-    if ($gates -contains $cname) {
-      $st = "$($c.status)"; $concl = "$($c.conclusion)"
-      if (($st -and $st -ne 'COMPLETED') -or ($concl -eq '' -and $st -ne 'COMPLETED')) { $pending = $true }
-    }
-  }
-  if ($pending) { $waitingOnCi += $n; continue }
+  $checkState = Get-CheckPolicyEvaluation $checkPolicy @($pr.statusCheckRollup)
+  foreach ($finding in $checkState.WatchedFindings) { $watchedFindings += "#$n/$($finding.Name)=$($finding.Conclusion)" }
+  if ($checkState.GatePending.Count -gt 0) { $waitingOnCi += $n; continue }
   $awaiting += $n
 }
-if ($awaiting.Count -gt 0) { Continue-With "PR(s) awaiting your review with CI settled: #$($awaiting -join ', #')" }
+if ($awaiting.Count -gt 0) {
+  $reason = "PR(s) awaiting your review with CI settled: #$($awaiting -join ', #')"
+  if ($watchedFindings.Count -gt 0) { $reason += "; watched finding(s), not gates: $($watchedFindings -join ', ')" }
+  Continue-With $reason
+}
 
 # --- capacity ---
 $roster = $null

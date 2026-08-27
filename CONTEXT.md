@@ -113,6 +113,13 @@ deploy hooks, environment and secrets. The list lives in the project lead's
 role, not in its judgement.
 _Avoid_: protected change, sensitive PR, exception
 
+**Watched check**:
+A tenant CI check whose executed failure the project lead must inspect and
+report as a finding, but which never satisfies or blocks a merge gate. Passing,
+pending, skipped, and missing watched checks have no gate effect. A check not
+listed as a gate, watched check, or ignored check is unclassified, not watched.
+_Avoid_: optional gate, ignored check, non-required check
+
 **Hold**:
 A pull request reviewed clean and parked for Cory's merge, recorded under
 `prs` in `state/skip/<tenant>.json` with its reason. A hold pages Cory once,
