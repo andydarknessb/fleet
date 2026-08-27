@@ -92,9 +92,15 @@ if ($DryRun) {
 
 # --- launch ---
 $before = @($daemon | ForEach-Object { $_.sessionId })
+$beforeJobIds = @(Get-DaemonSessions -All | ForEach-Object { $_.id })
 Push-Location $cwd
 try {
-  $out = & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath $Prompt 2>&1 | Out-String
+  # Windows PowerShell 5.1 re-parses embedded double quotes in a string passed
+  # as a native positional argument. Fleet briefs contain quoted issue titles,
+  # so argv delivery silently truncated every measured IC prompt. stdin is the
+  # CLI's prompt input as well, and preserves the exact string without another
+  # command-line parse.
+  $out = $Prompt | & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
 } finally { Pop-Location }
 $row = $null
 for ($i = 0; $i -lt 20 -and -not $row; $i++) {
@@ -102,7 +108,12 @@ for ($i = 0; $i -lt 20 -and -not $row; $i++) {
   $row = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
 }
 if (-not $row) {
-  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; output = $out } | ConvertTo-Json -Compress); exit 5
+  $failedRow = Get-DaemonSessions -All |
+    Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
+    Select-Object -First 1
+  $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
+  $detail = if ($jobState -and $jobState.detail) { "$($jobState.detail)" } else { $null }
+  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out } | ConvertTo-Json -Compress); exit 5
 }
 
 # --- record ---
