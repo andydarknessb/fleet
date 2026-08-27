@@ -1,5 +1,6 @@
 # One-time setup. Idempotent. Run: powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\setup.ps1
 . "$PSScriptRoot\_common.ps1"
+. "$PSScriptRoot\check-policy.ps1"
 $v = (& claude --version 2>$null | Out-String).Trim()
 Write-Output "claude: $v"
 if ($v -notmatch '(\d+)\.(\d+)\.(\d+)') { Write-Error 'claude not found'; exit 1 }
@@ -18,6 +19,7 @@ if (Test-Path $agentsLink) {
 }
 foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
   $tj = Read-Json $tf.FullName
+  try { $null = Get-TenantCheckPolicy $tj } catch { Write-Error "tenant $($tf.Name): invalid check policy: $($_.Exception.Message)"; exit 1 }
   $labels = (& gh label list -R $tj.github --limit 100 2>$null | Out-String)
   $ok = $labels -match [regex]::Escape($tj.readyLabel)
   $repoOk = 'MISSING'; if (Test-Path $tj.repo) { $repoOk = 'ok' }
