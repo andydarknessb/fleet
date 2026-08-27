@@ -22,6 +22,7 @@
     "lint": "npm run lint"
   },
   "ciGates": ["test-build", "guards", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
+  "watchedChecks": ["scan", "discover", "reproduce"],
   "ignoredChecks": [],
   "notes": [
     "The fleet works on `integration` (defaultBranch): branch from it, open PRs against it, merge into it. `main` (releaseBranch) auto-publishes the client to Netlify, so only Cory promotes integration to main. Never push to or merge into main.",

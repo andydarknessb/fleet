@@ -59,6 +59,16 @@ gh issue edit <n> --add-label ready-for-agent
 
 Status files: `state/STATUS.md` (dispatcher's digest), `state/status/<tenant>.md` (each project lead), `state/escalations/*.json` (anything that needs you).
 
+### Tenant check policy
+
+Each tenant classifies known CI checks in exactly one list:
+
+- `ciGates`: required checks whose pending state delays review and whose failure blocks merge.
+- `watchedChecks`: non-gating checks. An executed failure is surfaced to the project lead as a finding; passing, pending, skipped, or missing watched checks never satisfy or block a gate.
+- `ignoredChecks`: checks that have no fleet policy effect.
+
+The lists must be disjoint. `setup.ps1` and the stop hook reject an overlapping policy. A check absent from all three lists is unclassified, not implicitly watched.
+
 ## Starting the pilot
 
 1. `powershell -File C:\Users\Cory\fleet\bin\setup.ps1` (junction, state dirs, version and label checks). Idempotent.
