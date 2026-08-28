@@ -31,8 +31,8 @@ cory
 | `hooks/stop.ps1` | Every session: writes a heartbeat. Project leads: exits 2 (keep going) while there is actionable work: a non-draft `fleet/*` PR, or a **frontier** issue (ready label, no open blockers per GitHub issue dependencies via GraphQL `blockedBy`, not in `state/skip/<tenant>.json`, free cap + IC slot). |
 | `state/skip/<tenant>.json` | The project lead's "not launchable, and why" list (`{ "issues": { "<n>": "reason" } }`). The hook honours it; you triage it. |
 | `bin/launch.ps1` | **The only door.** Enforces PAUSE, cap, `maxIcs`, naming; writes per-session settings with `FLEET_*` env; records the session in `state/roster.json`. |
-| `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, rate-limit PAUSE. |
-| `bin/retire.ps1` | Stop and remove a finished IC; marks it retired in the live roster. |
+| `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, and rate-limit PAUSE. An IC waiting on an open PR or skip-list hold is never stale-heartbeat respawned. |
+| `bin/retire.ps1` | Mark a finished IC as retiring before stopping it, remove its job/worktrees, and report verified remaining worktree state. |
 | `bin/pause.ps1` | Fleet-wide kill switch. `-Off` clears. |
 | `bin/status.ps1` | One-screen view. |
 | `bin/recover.ps1` | Bring the roster back after a reboot. `install-recovery-task.ps1` registers it at logon. |

@@ -18,9 +18,20 @@ function Heartbeat-Age {
 }
 function Do-Respawn {
   param($row, $entry, $reason)
+  if (-not $entry.static) {
+    $current = Get-LiveRoster
+    $currentEntry = $current.sessions | Where-Object { $_.name -eq $entry.name } | Select-Object -First 1
+    if (-not $currentEntry -or "$($currentEntry.status)" -ne 'active') {
+      $currentStatus = if ($currentEntry) { "$($currentEntry.status)" } else { 'absent' }
+      $script:report.ok += [pscustomobject]@{ name = $row.name; detail = "respawn cancelled: live roster status is $currentStatus" }
+      return
+    }
+  }
   if ($Apply) { & claude respawn $row.id 2>&1 | Out-Null }
   $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
 }
+
+function Property-Names { param($obj) if ($null -eq $obj) { return @() }; return @($obj.PSObject.Properties.Name) }
 
 # --- roster sessions: static (always expected) + active ICs ---
 $expected = @()
@@ -70,7 +81,43 @@ foreach ($x in $expected) {
   }
   if ($state -eq 'working') {
     $age = Heartbeat-Age $x.name
-    if ($null -ne $age -and $age -gt 120 -and "$($row.status)" -ne 'busy') { Do-Respawn $row $x "heartbeat stale ($([int]$age) min) while state=working"; continue }
+    if ($null -ne $age -and $age -gt 120 -and "$($row.status)" -ne 'busy') {
+      if ($x.role -eq 'ic' -and $x.tenant) {
+        $t = Read-Json "$FleetHome\tenants\$($x.tenant).json"
+        $skip = Read-Json "$FleetHome\state\skip\$($x.tenant).json"
+        if ((Property-Names $skip.issues) -contains "$($x.issue)") {
+          $report.ok += [pscustomobject]@{ name = $x.name; detail = "waiting on issue #$($x.issue) skip-list hold" }
+          continue
+        }
+
+        $headPrefix = "$($t.branchPrefix)$($x.issue)-"
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+          $prRaw = @(& gh pr list -R $t.github --state open --search "head:$headPrefix" --json number,headRefName 2>&1)
+          $ghExit = $LASTEXITCODE
+        } finally {
+          $ErrorActionPreference = $previousErrorAction
+        }
+        if ($ghExit -ne 0) {
+          $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'pr-lookup-failed'; detail = "stale-heartbeat PR lookup failed for $($t.github): $($prRaw -join ' ')"; parent = $x.parent }
+          continue
+        }
+        try { $prs = @(($prRaw -join "`n") | ConvertFrom-Json) } catch {
+          $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'pr-lookup-failed'; detail = "stale-heartbeat PR lookup returned invalid JSON for $($t.github): $($_.Exception.Message)"; parent = $x.parent }
+          continue
+        }
+        $pr = $prs | Where-Object { ("$($_.headRefName)").StartsWith($headPrefix, [System.StringComparison]::Ordinal) } | Select-Object -First 1
+        if ($pr) {
+          $held = (Property-Names $skip.prs) -contains "$($pr.number)"
+          $suffix = if ($held) { ' (skip-list hold)' } else { '' }
+          $report.ok += [pscustomobject]@{ name = $x.name; detail = "waiting on PR #$($pr.number)$suffix" }
+          continue
+        }
+      }
+      Do-Respawn $row $x "heartbeat stale ($([int]$age) min), state=$state status=$($row.status), no open PR"
+      continue
+    }
     $report.ok += $x.name
     continue
   }

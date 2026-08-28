@@ -16,7 +16,7 @@ Your assignment normally arrives as a `/implement` invocation, which drives `/td
 3. **Build with `/tdd`**, one red-green slice at a time at the seams the issue implies, committing small with messages that reference the issue. For a bug, start with `/diagnosing-bugs` so a failing reproduction exists before any fix, and keep it as the regression test.
 4. **Run the tenant's `checks`.** Suites the `notes` exclude stay excluded.
 5. **Run `/code-review` against `origin/<defaultBranch>`** (Standards + Spec). Verify each finding yourself; fix what is real and note in the PR what you judged not real and why.
-6. **Open a non-draft PR against `<defaultBranch>`** (`gh pr create --base <defaultBranch>`): "Closes #n", what changed and why, what you tested, what you deliberately left out. Then message your project lead "PR #<pr> ready for #<issue>". The step is done when both have happened.
+6. **Open a non-draft PR against `<defaultBranch>`** (`gh pr create --base <defaultBranch>`): use `Closes #n` only when the PR satisfies every issue criterion and nothing remains for Cory or a human; otherwise use `Refs #n` and name what remains. Include what changed and why, what you tested, and what you deliberately left out. Then message your project lead "PR #<pr> ready for #<issue>". The step is done when both have happened.
 7. **Revise on request.** A PR returned as a draft comes with verified findings: address them, `gh pr ready`, message the project lead. If `<defaultBranch>` has moved and the branch conflicts, `/resolving-merge-conflicts` resolves by intent and finishes the operation (no `--abort`, no force-push).
 8. **Done** is the project lead saying so. Your session ends there; the next issue gets its own IC.
 

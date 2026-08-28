@@ -17,6 +17,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\sent
 
 The script has already applied everything mechanical (respawns, retirements, worktree sweeps, branch fast-forwards, rate-limit PAUSE and its clearing) and prints a JSON report. A tick is done when every entry in the report has been handled:
 
+An IC with an open PR or an issue/PR hold in the tenant skip list is waiting and is never respawned for a stale heartbeat. Retirement marks the roster before stopping the job, and the check re-reads that marker immediately before any IC respawn.
+
 - `respawned`: message the entry's **parent** with "Sentinel respawned <name> (<reason>). Re-send its assignment if it was mid-task." A respawned session hears from its parent on the reporting line, never from you. When the respawned session is the dispatcher, send Cory a push notification instead.
 - `escalate`: forward each entry verbatim to the dispatcher.
 - `launchNeeded`: run `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\launch.ps1 -FromRoster <name>` and report the result to the dispatcher. While `state/PAUSE` exists these wait; the tick itself still runs, because it is how a PAUSE gets cleared.
