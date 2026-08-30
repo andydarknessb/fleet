@@ -97,6 +97,25 @@ _Avoid_: kill switch, freeze, stop-the-world, maintenance mode
 
 ### Work
 
+**Fleet cycle**:
+The path one ready unit of work takes through assignment, implementation,
+review, merge or hold, and IC retirement. It excludes keeping sessions alive,
+respawning them, and reboot recovery.
+_Avoid_: dynamic workflow, workflow (unqualified)
+
+**Work record**:
+The active fleet-owned coordination state for one unit of work: its current
+state in the Fleet cycle, owning session, reservations, review progress, token
+budget and pending decisions. GitHub remains authoritative for the issue and
+pull request; the Work record is archived after IC retirement.
+_Avoid_: status file, task record, issue record
+
+**Fleet event**:
+An immutable statement that one Work record changed, naming the event type,
+actor, time and evidence pointer. Messages announce Fleet events but never
+replace them as state.
+_Avoid_: update, message, log entry
+
 **Tenant**:
 A project the fleet runs: one repository, one issue tracker, one project lead.
 _Avoid_: project (when the distinction from the fleet itself matters), workspace
@@ -119,6 +138,14 @@ report as a finding, but which never satisfies or blocks a merge gate. Passing,
 pending, skipped, and missing watched checks have no gate effect. A check not
 listed as a gate, watched check, or ignored check is unclassified, not watched.
 _Avoid_: optional gate, ignored check, non-required check
+
+**Frontier exclusion**:
+A ready Unit of work the fleet must not launch because an exceptional fleet
+fact that GitHub cannot express keeps it outside the assignment frontier. The
+exclusion is structured and names a reason, evidence pointer, and recheck event
+or expiry. GitHub labels, assignees, dependencies, and sub-issue structure take
+precedence whenever they can express the condition.
+_Avoid_: hold (a reviewed PR waiting for Cory), skip, blocked
 
 **Hold**:
 A pull request reviewed clean and parked for Cory's merge, recorded under
