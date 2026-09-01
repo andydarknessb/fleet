@@ -500,8 +500,9 @@ function transitionRecord(options = {}) {
     const to = String(options.to || '');
     const prNumber = options.prNumber ? Number(options.prNumber) : record.github?.prNumber;
     const githubObservation = to === 'merged'
-      ? (options.githubRepo ? reconcilePullRequest({ repo: options.githubRepo, prNumber })
-        : (options.testOnly ? (options.githubObservation || (options.githubState ? { state: options.githubState, mergedAt: options.githubMergedAt, evidence: options.githubEvidence } : null)) : null))
+      ? (options.githubRepo ? reconcilePullRequest({ repo: options.githubRepo, prNumber, executable: options.githubExecutable })
+        : (options.reconciledObservation && options.reconciledObservation.evidence ? options.reconciledObservation
+          : (options.testOnly ? (options.githubObservation || (options.githubState ? { state: options.githubState, mergedAt: options.githubMergedAt, evidence: options.githubEvidence } : null)) : null)))
       : null;
     validateTransition(record, to, { ...options, githubObservation });
     const now = isoNow(options.now);
@@ -542,6 +543,49 @@ function transitionRecord(options = {}) {
       killPoint: options.killPoint,
     });
     return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+  });
+}
+
+function observeRecord(options = {}) {
+  // Ticket 04: record a PR observation on an active record without a state change.
+  // The caller (the PR watcher) compares digests first, so this runs only when the
+  // observed value actually changed - an identical retry replays via its key.
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey);
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const record = active.records[String(options.id)];
+    if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const replay = replayIfKnown(record, key);
+    if (replay) return replay;
+    if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
+    if (Number(options.expectedRevision) !== record.revision) {
+      throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    }
+    const observation = options.observation;
+    if (!observation || typeof observation !== 'object' || !observation.digest) {
+      throw new WorkStateError('MISSING_OBSERVATION', 'observe requires an observation carrying a digest');
+    }
+    const now = isoNow(options.now);
+    const next = {
+      ...record,
+      revision: record.revision + 1,
+      eventSequence: record.eventSequence + 1,
+      updatedAt: now,
+      github: { ...record.github, ...(options.prNumber ? { prNumber: Number(options.prNumber) } : {}), observation },
+      idempotency: { ...record.idempotency },
+    };
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'pr-observed' };
+    const event = eventFor(next, {
+      type: 'pr-observed',
+      actor: options.actor,
+      at: now,
+      idempotencyKey: key,
+      evidence: options.evidence,
+      changes: { digest: observation.digest, changed: options.changed || null, wake: options.wake || null },
+    });
+    commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
+    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
   });
 }
 
@@ -705,10 +749,16 @@ function cli(argv) {
     githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'],
   });
   if (command === 'reconcile') return reconcilePullRequest({ repo: args.repo, prNumber: Number(args['pr-number']) });
+  if (command === 'observe') return observeRecord({
+    ...common, id: args.id, expectedRevision: Number(args['expected-revision']),
+    prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined,
+    observation: args.observation ? JSON.parse(args.observation) : undefined,
+    changed: args.changed ? JSON.parse(args.changed) : undefined, wake: args.wake,
+  });
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
   if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
-  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, get, shadow, project');
+  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, observe, get, shadow, project');
 }
 
 if (require.main === module) {
@@ -727,6 +777,7 @@ module.exports = {
   WorkStateError,
   createRecord,
   getRecord,
+  observeRecord,
   parseArgs,
   proofMatches,
   projectStatus,

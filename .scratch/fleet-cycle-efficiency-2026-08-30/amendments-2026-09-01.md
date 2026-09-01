@@ -31,8 +31,9 @@ baseline and sharpens the diagnosis:
 
 - Stage 1 - executed 2026-09-01 (this commit): context diet and paperwork;
   see "Stage 1" below.
-- Stage 2: 08a -> 04 -> 06. (08a implemented 2026-09-01 - see ticket 08's
-  Answer; its scheduled shadow log accrues toward 08b's 48-hour parity gate.)
+- Stage 2: 08a -> 04 -> 06. (08a and 04 implemented 2026-09-01 - see each
+  ticket's Answer; 08a's shadow log accrues toward 08b's 48-hour parity gate,
+  and 04's watcher runs shadow-only until 09 authorizes wake delivery.)
 - Stage 3: 05 -> 07 -> 08b -> 02/03 cutover (the shadow assignment path
   becomes authoritative) -> 09 last, as the verification gate. Ticket 01's
   seven-day observation window (collector running since 09-01) must have

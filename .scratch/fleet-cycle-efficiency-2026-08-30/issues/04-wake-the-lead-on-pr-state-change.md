@@ -44,4 +44,62 @@ decision.
 
 ## Answer
 
-Not implemented. Runtime work requires separate authorization.
+Implemented 2026-09-01 as `bin/pr-watch.js` (a deterministic watcher driving
+the ticket-02 state command in-process) with `bin/run-pr-watch.ps1` +
+`bin/install-pr-watch-task.ps1` (every 5 minutes while logged on; logon PT6M,
+behind recovery and the watchdog) and 18 node cases in
+`tests/pr-watch.tests.js` plus the installer test. `bin/work-state.js` gained
+`observe` (a PR observation event without a state change; the caller compares
+digests first, so identical polls never touch the store) and a
+`reconciledObservation` path so an observed merge satisfies the merged guard.
+
+Each run shadow-projects the roster, then per active record: discovers an
+implementing record's PR by branch prefix (-> pr-open), moves pr-open ->
+ci-wait on first observation, and on a changed digest appends exactly one
+event - settle with verified closing linkage -> review with wake
+`checks-settled`; a gate failure -> `pr-observed` with wake `checks-failed`;
+a settled PR without linkage -> escalated with wake `decision-needed` (the
+watcher has no issue-close path of any kind). A missing required gate is
+incomplete, never settled - a deliberate divergence from the legacy stop
+hook, which skips absent gates; classify it intentional at ticket 09.
+Closure linkage counts `closingIssuesReferences` OR a body closing keyword,
+because this tenant closes issues through the #330 close-merged-issues
+workflow, which parses the body (live PR #613 proved the native field stays
+empty while `Closes #601` sits in the body). Escalated records self-heal:
+linkage appearing resolves back to the prior state, and an observed human
+merge resolves through review -> merged. A GitHub failure retains every
+prior observation and lands in `state/watch/health.json`.
+
+Wakes are eligibility records only: one line each in
+`state/watch/wake-outbox.jsonl` plus a marker on the event. Nothing messages
+a session - delivery is ticket 07's notifier at cutover, and the legacy
+Stop-hook loop stays authoritative during shadow.
+
+Live verification (2026-09-01): across four scheduled-shape runs, the real
+record for #601 / PR #613 walked implementing -> pr-open -> ci-wait ->
+escalated (a true positive on the empty native linkage) -> review -> merged
+when the project lead merged it mid-verification, then steady-state runs
+with zero actions and zero events.
+
+Same-day /code-review (15 verified findings, all with executed repros)
+forced a redesign at the two altitudes it named. Idempotency keys are
+retry-dedupe only: every key is scoped to the revision it acts on, so
+novelty stays digest-vs-stored, recurrences re-wake, and nothing replays
+into a permanent wedge. Every multi-hop path (merged fast-forwards,
+escalation resolutions) is computed by BFS over the store's exported
+TRANSITIONS, never a hand-coded table. Further fixes: the watcher resolves
+only escalations carrying its own `[pr-watch]` mark (a human's hold is
+never touched; note the evidence string carries a `wake:<kind>; ` prefix,
+so provenance is containment, not prefix); linkage uses the tenant
+parser's grammar (colon, URL, and owner/repo forms; code stripped;
+same-line whitespace) and is re-verified every tick during review/hold;
+draft conversions and beyond-the-list open PRs are watched through the
+view, never mistaken for closed; `revision` joined the watch set; a
+per-record failure marks watcher health not-ok; the open list fetches
+headRefOid so a force-push changes the digest; merged chains refresh the
+final observation to match the merged reality; and the shadow projection
+runs at the END of a tick, so an advance is always recorded before a
+roster-dropped record is archived (a freshly launched IC is therefore
+watched from its second tick). The event ledger is the authoritative wake
+record; the outbox is a post-commit convenience cache whose crash window
+the ledger covers. 26 node cases.
