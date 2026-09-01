@@ -116,6 +116,12 @@ actor, time and evidence pointer. Messages announce Fleet events but never
 replace them as state.
 _Avoid_: update, message, log entry
 
+**Control plane**:
+The Dispatcher, project lead, Sentinel, and exceptional notifier work that
+routes, observes, or reports Fleet cycles rather than implementing a Unit of
+work. Its token usage is measured separately from IC delivery work.
+_Avoid_: management work, overhead (when the measured category is meant)
+
 **Tenant**:
 A project the fleet runs: one repository, one issue tracker, one project lead.
 _Avoid_: project (when the distinction from the fleet itself matters), workspace

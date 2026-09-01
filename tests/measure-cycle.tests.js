@@ -1,0 +1,367 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+const {
+  buildCycleRecords,
+  classifyTurns,
+  parseTranscript,
+  renderSummary,
+  buildReport,
+  collectFromFiles,
+} = require('../bin/measure-cycle');
+
+function line(value) {
+  return JSON.stringify(value);
+}
+
+function assistant({ uuid, timestamp, content, usage, model = 'claude-sonnet-5' }) {
+  return {
+    type: 'assistant',
+    uuid,
+    timestamp,
+    sessionId: 'session-1',
+    message: {
+      model,
+      role: 'assistant',
+      content,
+      usage: {
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cache_creation_input_tokens: usage.creation || 0,
+        cache_read_input_tokens: usage.read || 0,
+      },
+    },
+  };
+}
+
+function toolUse(id, command) {
+  return { type: 'tool_use', id, name: 'Bash', input: { command } };
+}
+
+function toolResult(id, content) {
+  return {
+    type: 'user',
+    sessionId: 'session-1',
+    timestamp: '2026-09-01T00:00:01.500Z',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content }] },
+  };
+}
+
+function fixtureTranscript() {
+  return [
+    { type: 'custom-title', customTitle: 'ic-42', sessionId: 'session-1' },
+    { type: 'agent-setting', agentSetting: 'ic', sessionId: 'session-1' },
+    { type: 'user', sessionId: 'session-1', message: { role: 'user', content: 'Implement issue #42.' } },
+    assistant({
+      uuid: 'a1',
+      timestamp: '2026-09-01T00:00:00.000Z',
+      content: [toolUse('t1', 'gh pr view 77 --json state')],
+      usage: { input: 10, output: 5, creation: 100 },
+    }),
+    toolResult('t1', 'OPEN'),
+    assistant({
+      uuid: 'a2',
+      timestamp: '2026-09-01T00:00:01.000Z',
+      content: [toolUse('t2', 'gh pr view 77 --json state')],
+      usage: { input: 11, output: 4, read: 50 },
+    }),
+    toolResult('t2', 'OPEN'),
+    assistant({
+      uuid: 'a3',
+      timestamp: '2026-09-01T00:00:02.000Z',
+      content: [toolUse('t3', 'gh pr checks 77')],
+      usage: { input: 12, output: 6 },
+    }),
+    toolResult('t3', 'test-build SUCCESS (changed)'),
+    assistant({
+      uuid: 'a4',
+      timestamp: '2026-09-01T00:00:03.000Z',
+      content: [{ type: 'text', text: 'Standards and Spec review passed. PR #77 merged.' }],
+      usage: { input: 13, output: 7 },
+    }),
+    {
+      type: 'system',
+      subtype: 'stop_hook_summary',
+      preventedContinuation: true,
+      timestamp: '2026-09-01T00:00:04.000Z',
+    },
+    { type: 'system', subtype: 'turn_duration', durationMs: 4000 },
+  ].map(line).join('\n');
+}
+
+test('parseTranscript records usage, model, messages, review, PR, and stop-hook evidence', () => {
+  const parsed = parseTranscript(fixtureTranscript(), 'fixture/session-1.jsonl');
+
+  assert.equal(parsed.name, 'ic-42');
+  assert.equal(parsed.role, 'ic');
+  assert.equal(parsed.model, 'claude-sonnet-5');
+  assert.equal(parsed.assistantMessages, 4);
+  assert.equal(parsed.userMessages, 1);
+  assert.equal(parsed.usage.inputTokens, 46);
+  assert.equal(parsed.usage.outputTokens, 22);
+  assert.equal(parsed.usage.cacheCreationInputTokens, 100);
+  assert.equal(parsed.usage.cacheReadInputTokens, 50);
+  assert.equal(parsed.firstUsefulTurnCacheCreationInputTokens, 100);
+  assert.equal(parsed.toolCallsByCommandClass['github-pr-view'], 2);
+  assert.equal(parsed.toolCallsByCommandClass['github-pr-checks'], 1);
+  assert.equal(parsed.pullRequests[0], 77);
+  assert.equal(parsed.merged, true);
+  assert.deepEqual(parsed.mergeEvents, [{ number: 77, timestamp: '2026-09-01T00:00:03.000Z', source: 'transcript', turnId: 'a4' }]);
+  assert.equal(parsed.forcedContinuationTurns, 1);
+  assert.equal(parsed.formalReviewPasses, 1);
+  assert.equal(parsed.wallTimeMs, 4000);
+});
+
+test('first useful turn skips an empty startup acknowledgement', () => {
+  const parsed = parseTranscript([
+    { type: 'custom-title', customTitle: 'ic-9', sessionId: 'session-9' },
+    assistant({
+      uuid: 'greeting', timestamp: '2026-09-01T00:00:00.000Z',
+      content: [{ type: 'text', text: 'I am ready.' }],
+      usage: { input: 1, output: 1, creation: 999 },
+    }),
+    assistant({
+      uuid: 'useful', timestamp: '2026-09-01T00:00:01.000Z',
+      content: [toolUse('useful-tool', 'gh pr view 9')],
+      usage: { input: 2, output: 1, creation: 100 },
+    }),
+    toolResult('useful-tool', 'OPEN'),
+  ].map(line).join('\n'), 'fixture/session-9.jsonl');
+
+  assert.equal(parsed.firstUsefulTurnCacheCreationInputTokens, 100);
+});
+
+test('command classes cover workflow categories and retain an explicit fallback', () => {
+  const parsed = parseTranscript([
+    { type: 'custom-title', customTitle: 'ic-9', sessionId: 'session-9' },
+    { type: 'agent-setting', agentSetting: 'ic', sessionId: 'session-9' },
+    assistant({
+      uuid: 'classes', timestamp: '2026-09-01T00:00:00.000Z',
+      content: [
+        { type: 'tool_use', id: 'a', name: 'SendMessage', input: {} },
+        { type: 'tool_use', id: 'b', name: 'Skill', input: {} },
+        { type: 'tool_use', id: 'c', name: 'Task', input: {} },
+        { type: 'tool_use', id: 'd', name: 'Bash', input: { command: 'gh pr merge 77' } },
+        { type: 'tool_use', id: 'e', name: 'Bash', input: { command: 'git status --short' } },
+        { type: 'tool_use', id: 'f', name: 'Bash', input: { command: 'npm test' } },
+        { type: 'tool_use', id: 'g', name: 'Bash', input: { command: 'powershell -File check.ps1' } },
+        { type: 'tool_use', id: 'h', name: 'Write', input: { file_path: 'artifact.md' } },
+      ],
+      usage: { input: 1, output: 1 },
+    }),
+  ].map(line).join('\n'), 'fixture/classes.jsonl');
+
+  assert.equal(parsed.toolCallsByCommandClass['send-message'], 1);
+  assert.equal(parsed.toolCallsByCommandClass.skill, 1);
+  assert.equal(parsed.toolCallsByCommandClass.worker, 1);
+  assert.equal(parsed.toolCallsByCommandClass['github-pr-mutation'], 1);
+  assert.equal(parsed.toolCallsByCommandClass['git-status'], 1);
+  assert.equal(parsed.toolCallsByCommandClass['test-or-build'], 1);
+  assert.equal(parsed.toolCallsByCommandClass.script, 1);
+  assert.equal(parsed.toolCallsByCommandClass.other, 1);
+});
+
+test('classifyTurns distinguishes repeated polling from a changed GitHub fact', () => {
+  const parsed = parseTranscript(fixtureTranscript(), 'fixture/session-1.jsonl');
+  const turns = classifyTurns(parsed.turns);
+
+  assert.equal(turns[0].pollingOnly, false);
+  assert.equal(turns[1].pollingOnly, true);
+  assert.equal(turns[2].pollingOnly, false);
+  assert.equal(turns.filter((turn) => turn.pollingOnly).length, 1);
+});
+
+test('classifyTurns does not hide review, event, transition, or artifact signals', () => {
+  const poll = (id, result, extraTools = []) => ({
+    id,
+    text: '',
+    toolCalls: [{ name: 'Bash', input: { command: 'gh pr view 77' }, resultText: result }, ...extraTools],
+    usage: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 },
+  });
+  const turns = classifyTurns([
+    poll('first', 'OPEN'),
+    poll('repeat', 'OPEN'),
+    poll('review', 'OPEN; new finding'),
+    poll('event', 'OPEN; Fleet event seq 2'),
+    poll('transition', 'OPEN; state transition'),
+    poll('artifact', 'OPEN', [{ name: 'Write', input: { file_path: 'report.md' }, resultText: 'written' }]),
+  ]);
+
+  assert.deepEqual(turns.map((turn) => turn.pollingOnly), [false, true, false, false, false, false]);
+});
+
+test('buildCycleRecords emits only complete retired units and reports exclusions', () => {
+  const transcript = parseTranscript(fixtureTranscript(), 'fixture/session-1.jsonl');
+  const roster = {
+    sessions: [
+      {
+        name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, model: 'sonnet',
+        status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1',
+      },
+      {
+        name: 'ic-43', role: 'ic', tenant: 'endzone', issue: 43,
+        status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'missing',
+      },
+    ],
+  };
+  const result = buildCycleRecords({
+    roster,
+    transcripts: [transcript],
+    pullRequestStates: { 'endzone:77': { state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z' } },
+  });
+
+  assert.equal(result.records.length, 1);
+  assert.equal(result.excluded.length, 1);
+  assert.equal(result.records[0].issue, 42);
+  assert.equal(result.records[0].tenant, 'endzone');
+  assert.deepEqual(result.records[0].pullRequests, [77]);
+  assert.equal(result.records[0].retiredAt, '2026-09-01T00:01:00.000Z');
+  assert.equal(result.records[0].metrics.pollingOnlyTurns, 1);
+});
+
+test('buildCycleRecords requires an authoritative merged PR state when supplied', () => {
+  const transcript = parseTranscript(fixtureTranscript(), 'fixture/session-1.jsonl');
+  const roster = {
+    sessions: [{
+      name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42,
+      status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1',
+    }],
+  };
+  const merged = buildCycleRecords({
+    roster,
+    transcripts: [transcript],
+    pullRequestStates: { 'endzone:77': { state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z' } },
+  });
+  const open = buildCycleRecords({
+    roster,
+    transcripts: [transcript],
+    pullRequestStates: { 'endzone:77': { state: 'OPEN', mergedAt: null } },
+    verificationErrors: { 'endzone:77': 'GitHub PR state is OPEN; mergedAt is required' },
+  });
+  const githubOnly = buildCycleRecords({
+    roster,
+    transcripts: [{ ...transcript, merged: false, mergeEvents: [] }],
+    pullRequestStates: { 'endzone:77': { state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z' } },
+  });
+  const unverified = buildCycleRecords({ roster, transcripts: [transcript] });
+
+  assert.equal(merged.records[0].mergeVerification, 'github');
+  assert.deepEqual(merged.records[0].mergeEvents, [{ number: 77, state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z', source: 'github' }]);
+  assert.equal(open.records.length, 0);
+  assert.equal(open.excluded[0].reason, 'github-merge-unverified');
+  assert.deepEqual(open.excluded[0].verificationErrors, ['GitHub PR state is OPEN; mergedAt is required']);
+  assert.equal(githubOnly.records.length, 1);
+  assert.equal(unverified.records.length, 0);
+  assert.equal(unverified.excluded[0].reason, 'github-merge-unverified');
+});
+
+test('buildReport and renderSummary keep cache-read tokens separate and are deterministic', () => {
+  const parsed = parseTranscript(fixtureTranscript(), 'fixture/session-1.jsonl');
+  const roster = {
+    sessions: [{
+      name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42,
+      status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1',
+    }],
+  };
+  const { records } = buildCycleRecords({
+    roster,
+    transcripts: [parsed],
+    pullRequestStates: { 'endzone:77': { state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z' } },
+  });
+  const options = { generatedAt: '2026-09-01T12:00:00.000Z', since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z' };
+  const first = buildReport(records, [], options);
+  const second = buildReport(records, [], options);
+
+  assert.deepEqual(first, second);
+  assert.equal(first.metrics.freshTokens, 168);
+  assert.equal(first.metrics.cacheReadTokens, 50);
+  assert.equal(first.metrics.controlPlaneFreshTokens, 0);
+  assert.equal(first.metrics.icFreshTokens, 168);
+  assert.equal(first.metrics.toolCallsByCommandClass['github-pr-view'], 2);
+  assert.equal(first.metrics.freshTokens + first.metrics.cacheReadTokens, 218);
+  assert.match(renderSummary(first), /cache-read tokens: 50/);
+  assert.match(renderSummary(first), /polling-only model turns: 1/);
+});
+
+test('buildCycleRecords and buildReport retain control-plane session metrics separately', () => {
+  const ic = parseTranscript(fixtureTranscript(), 'fixture/ic-42.jsonl');
+  const dispatcher = parseTranscript([
+    { type: 'custom-title', customTitle: 'dispatcher', sessionId: 'dispatcher-1' },
+    { type: 'agent-setting', agentSetting: 'dispatcher', sessionId: 'dispatcher-1' },
+    assistant({
+      uuid: 'd1', timestamp: '2026-09-01T00:00:00.000Z',
+      content: [{ type: 'text', text: 'Daily digest complete.' }],
+      usage: { input: 20, output: 2, creation: 3, read: 4 }, model: 'claude-sonnet-5',
+    }),
+  ].map(line).join('\n'), 'fixture/dispatcher-1.jsonl');
+  const roster = {
+    sessions: [{
+      name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42,
+      status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1',
+    }],
+  };
+  const cycles = buildCycleRecords({
+    roster,
+    transcripts: [ic, dispatcher],
+    pullRequestStates: { 'endzone:77': { state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z' } },
+  });
+  const report = buildReport(cycles.records, cycles.excluded, {
+    generatedAt: '2026-09-01T12:00:00.000Z',
+    since: '2026-09-01T00:00:00.000Z',
+    until: '2026-09-02T00:00:00.000Z',
+    sessionMetrics: cycles.sessionMetrics,
+  });
+
+  assert.equal(cycles.sessionMetrics.length, 2);
+  assert.equal(report.metrics.controlPlaneFreshTokens, 25);
+  assert.equal(report.metrics.controlPlaneCacheReadTokens, 4);
+  assert.equal(report.metrics.freshTokens, 193);
+  assert.equal(report.metrics.cacheReadTokens, 54);
+  assert.equal(report.roles.dispatcher.sessions, 1);
+  assert.equal(report.roles.dispatcher.metrics.freshTokens, 25);
+});
+
+test('collectFromFiles writes stable daily JSON and summary artifacts', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const transcripts = path.join(root, 'transcripts');
+  const output = path.join(root, 'output');
+  fs.mkdirSync(path.join(transcripts, 'project-worktree'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{
+    name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42,
+    status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1',
+  }] }));
+  fs.writeFileSync(path.join(transcripts, 'project-worktree', 'session-1.jsonl'), fixtureTranscript());
+  const options = {
+    transcriptsDir: transcripts,
+    rosterPath: path.join(root, 'roster.json'),
+    outputDir: output,
+    since: '2026-09-01T00:00:00.000Z',
+    until: '2026-09-02T00:00:00.000Z',
+    generatedAt: '2026-09-01T12:00:00.000Z',
+    verifyGithub: false,
+  };
+  const first = collectFromFiles(options);
+  const jsonFirst = fs.readFileSync(first.dailyArtifact, 'utf8');
+  const summaryFirst = fs.readFileSync(first.summaryArtifact, 'utf8');
+  const second = collectFromFiles(options);
+
+  assert.equal(first.report.sample.completedUnits, 1);
+  assert.equal(path.basename(first.dailyArtifact), 'daily-2026-09-02.json');
+  assert.equal(path.basename(first.summaryArtifact), 'seven-day-2026-09-02.md');
+  assert.equal(jsonFirst, fs.readFileSync(second.dailyArtifact, 'utf8'));
+  assert.equal(summaryFirst, fs.readFileSync(second.summaryArtifact, 'utf8'));
+
+  const inferred = collectFromFiles({
+    transcriptsDir: transcripts,
+    rosterPath: path.join(root, 'roster.json'),
+    outputDir: output,
+    verifyGithub: false,
+  });
+  const inferredDaily = JSON.parse(fs.readFileSync(inferred.dailyArtifact, 'utf8'));
+  assert.equal(inferredDaily.sample.completedUnits, 1);
+  assert.equal(inferredDaily.period.since, '2026-08-31T00:01:00.001Z');
+  assert.equal(inferred.report.period.since, '2026-08-25T00:01:00.001Z');
+});

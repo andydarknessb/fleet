@@ -33,11 +33,16 @@ cory
 | `bin/launch.ps1` | **The only door.** Enforces PAUSE, cap, `maxIcs`, naming; writes per-session settings with `FLEET_*` env; records the session in `state/roster.json`. |
 | `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, and rate-limit PAUSE. An IC waiting on an open PR or skip-list hold is never stale-heartbeat respawned. |
 | `bin/retire.ps1` | Mark a finished IC as retiring before stopping it, remove its job/worktrees, and report verified remaining worktree state. |
+| `bin/measure-cycle.js` | Read-only transcript/roster collector for daily JSON metrics and compact seven-day summaries; it never changes fleet decisions. |
 | `bin/pause.ps1` | Fleet-wide kill switch. `-Off` clears. |
 | `bin/status.ps1` | One-screen view. |
 | `bin/recover.ps1` | Bring the roster back after a reboot. `install-recovery-task.ps1` registers it at logon. |
 | `bin/pilot.ps1` | Launch sentinel, dispatcher, pl-endzone. `-DryRun` to check gates without starting anything. |
 | `state/` | Runtime only, gitignored: live roster, heartbeats, escalations, per-session settings, status files, PAUSE. |
+| `state/metrics/` | Generated measurement artifacts; cache-read tokens remain separate from fresh control-plane and IC tokens. |
+
+The collector verifies candidate merges against GitHub by default. `--no-verify-github`
+is reserved for deterministic fixture runs and must not be used for production baselines.
 
 ## Day to day
 
