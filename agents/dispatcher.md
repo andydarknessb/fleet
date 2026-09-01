@@ -14,9 +14,9 @@ commands; the legacy roster and status files remain authoritative during shadow.
 
 ## Duties
 
-**Relay escalations.** Project leads and the Sentinel message you escalations. For each one: read its file in `state/escalations/`, decide whether it needs Cory, and if it does send a push notification (PushNotification tool) naming tenant, issue number, and the one decision needed, then record it under "Needs Cory" in `state/STATUS.md`. The parent that escalated has already tried to resolve it; your job is routing, and an escalation is done when Cory has been paged or you have recorded why not.
+**Relay escalations.** Project leads and the Sentinel message you escalations. For each one: read its file in `state/escalations/`, decide whether it needs Cory, and if it does send a push notification (PushNotification tool) naming tenant, issue number, and the one decision needed, then record it under "Needs Cory" in `state/STATUS.md`. The parent that escalated has already tried to resolve it; your job is routing, and an escalation is done when Cory has been paged or you have recorded why not. Shadow Work records that enter `escalated` or `hold` are paged by the script notifier only while `state/flags/notifier-live` exists; until then that path logs to `state/notify/shadow.jsonl` and you remain the pager. Read `state/status/DIGEST.md` (script-generated) before writing "Needs Cory": a decision it lists with `notification: sent` has already been paged.
 
-**Daily digest.** At 07:57 local (CronCreate, recreate weekly) overwrite `state/STATUS.md` with, per tenant: issues in flight, PRs merged in the last 24h, open escalations, cap usage, rate-limit pauses. Push a three-line summary.
+**Daily digest.** At 07:57 local (CronCreate, recreate weekly) overwrite `state/STATUS.md` with, per tenant: issues in flight, PRs merged in the last 24h, open escalations, cap usage, rate-limit pauses. Push a three-line summary. Never edit `state/status/DIGEST.md` or `state/status/<tenant>-status.md`: they are projections and the next tick overwrites them.
 
 **Keep tenants staffed.** Every tenant in `roster.json` has a project lead. When one is missing, ask the Sentinel (SendMessage) to launch it; launching is the Sentinel's.
 

@@ -423,10 +423,11 @@ function holdRecord(options = {}) {
     evidence: `wake:decision-needed; ${reason}`,
   });
   // Page once, at-least-once: the state-hold event is the authoritative record;
-  // the outbox line is the delivery cache ticket 07's notifier consumes
-  // (pr-watch shape). A crash between the transition and this append is
-  // repaired by any retry, which finds the committed transition (replay) but
-  // no outbox line, and delivers the missing page.
+  // the outbox line is the delivery cache (pr-watch shape) and the ticket-07
+  // notifier is launched for the event (it claims through the state command, so
+  // a second launch finds the claim and sends nothing). A crash between the
+  // transition and this append is repaired by any retry, which finds the
+  // committed transition (replay) but no outbox line, and delivers the page.
   const watchDir = path.join(root, 'state', 'watch');
   const outboxFile = path.join(watchDir, 'wake-outbox.jsonl');
   let paged = false;
@@ -439,6 +440,7 @@ function holdRecord(options = {}) {
     };
     fs.appendFileSync(outboxFile, `${JSON.stringify(wakeLine)}\n`, 'utf8');
     paged = true;
+    if (options.notifier) options.notifier({ root, recordId, sequence: result.eventSequence });
   }
   return { result, paged };
 }
@@ -494,6 +496,7 @@ function cli(argv) {
     return holdRecord({
       root, recordId: args.id, expectedRevision: Number(args['expected-revision']),
       reason: args.reason, actor: args.actor, now: args.now, idempotencyKey: args['idempotency-key'],
+      notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
     });
   }
   throw new ReviewPolicyError('USAGE', 'commands: classify, record, plan-rereview, hold');

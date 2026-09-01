@@ -64,3 +64,20 @@ function Write-Escalation {
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
   Write-Json "$FleetHome\state\escalations\$stamp-$From.json" ([pscustomobject]@{ at = (Now-Iso); from = $From; kind = $Kind; detail = $Detail })
 }
+function Send-FleetToast {
+  # Windows toast through the PowerShell AppUserModelId (no BurntToast dependency).
+  # Returns $true only when Show() returned; a failed toast is recorded by the
+  # caller, never retried here.
+  param($Title, $Body)
+  try {
+    $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+    $t = [Security.SecurityElement]::Escape($Title)
+    $b = [Security.SecurityElement]::Escape($Body)
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml("<toast scenario=`"urgent`"><visual><binding template=`"ToastGeneric`"><text>$t</text><text>$b</text></binding></visual></toast>")
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
+    return $true
+  } catch { return $false }
+}

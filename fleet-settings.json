@@ -12,7 +12,7 @@
       "gh pr merge of a PR touching a carve-out path (migrations, deploy hooks, .env*, CI secrets); carve-outs merge only with Cory",
       "claude stop / claude rm / claude respawn of a session that is not on the fleet roster; the Sentinel acts only on roster sessions",
       "Editing C:\\Users\\Cory\\fleet\\roster.json, fleet-settings.json, or any file under agents/ from a fleet session; role and roster changes are Cory's",
-      "Writing into C:\\Users\\Cory\\fleet\\state\\work, state\\events, or state\\archive by ANY means, shell redirection and scripts included; bin/work-state.js is the only writer. Control-plane roles (dispatcher, project lead, sentinel) additionally never edit files inside a tenant repo by any tool: they review and merge, ICs write"
+      "Writing into C:\\Users\\Cory\\fleet\\state\\work, state\\events, state\\archive, or state\\exclusions by ANY means, shell redirection and scripts included; bin/work-state.js is the only writer of the first three and bin/exclusions.js of the last. Control-plane roles (dispatcher, project lead, sentinel) additionally never edit files inside a tenant repo by any tool: they review and merge, ICs write"
     ]
   },
   "hooks": {

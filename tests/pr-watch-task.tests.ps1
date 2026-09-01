@@ -18,5 +18,7 @@ Assert-True ($src -match 'AllowStartIfOnBatteries') 'the watcher must run on bat
 $wrapper = Get-Content "$sourceRoot\bin\run-pr-watch.ps1" -Raw
 Assert-True ($wrapper -match 'FLEET_NODE_PATH') 'the wrapper must honor FLEET_NODE_PATH like the collector'
 Assert-True ($wrapper -match 'pr-watch\.js') 'the wrapper must invoke pr-watch.js'
+Assert-True ($wrapper -match 'digest\.js') 'the wrapper must rebuild the ticket-07 projections after the tick'
+Assert-True ($wrapper -notmatch 'notify\.js') 'the wrapper never runs the notifier: a decision event launches it'
 
 Write-Output 'pr-watch task tests passed'

@@ -150,7 +150,9 @@ $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject
 
 # --- role tool contract (ticket 06). work-state.js stays the one validated door to
 # --- durable coordination state, so every role loses direct file-editing tools on
-# --- state/work|events|archive; control-plane roles additionally lose engineering
+# --- state/work|events|archive (and, since ticket 07, state/exclusions - bin/exclusions.js
+# --- is that ledger's door - plus the digest projections, which only bin/digest.js
+# --- writes); control-plane roles additionally lose engineering
 # --- edits in tenant repos (they review and merge, ICs write); ICs lose direct
 # --- edits anywhere in fleet state. Rollback: state/flags/tool-contract-off skips
 # --- the injection without touching any launch gate.
@@ -159,7 +161,7 @@ $denyRules = @()
 $toolContractOn = -not (Test-Path "$FleetHome\state\flags\tool-contract-off")
 if ($toolContractOn) {
   foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') {
-    foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
+    foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**', 'state/exclusions/**', 'state/status/DIGEST.md', 'state/status/*-status.md') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
     if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
   }
   if ($Role -in @('dispatcher', 'project-lead', 'sentinel')) {

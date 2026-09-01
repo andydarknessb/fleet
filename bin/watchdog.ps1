@@ -56,21 +56,6 @@ try {
     return $s
   }
 
-  function Show-Toast {
-    param($Title, $Body)
-    try {
-      $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-      $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-      $t = [Security.SecurityElement]::Escape($Title)
-      $b = [Security.SecurityElement]::Escape($Body)
-      $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-      $xml.LoadXml("<toast scenario=`"urgent`"><visual><binding template=`"ToastGeneric`"><text>$t</text><text>$b</text></binding></visual></toast>")
-      $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
-      [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
-      return $true
-    } catch { return $false }   # the banner is the guaranteed channel; a failed toast is recorded, not retried
-  }
-
   # --- run the mechanical check in shadow. The child writes its report to -ReportPath
   # --- (so the live Sentinel's state/sentinel/last-check.json stays untouched) and the
   # --- report FILE is the parse source: stdout/stderr may carry warnings and must not
@@ -264,7 +249,8 @@ try {
     Write-Json $pagedPath $nextPaged
     if (@($newConditions).Count -gt 0 -and -not $NoToast) {
       $body = (@($newConditions | ForEach-Object { $_.key }) -join ', ')
-      $toastDelivered = Show-Toast 'Fleet watchdog' "$body - run bin\status.ps1"
+      # Send-FleetToast (_common.ps1) is shared with the ticket-07 notifier; the banner is the guaranteed channel.
+      $toastDelivered = Send-FleetToast 'Fleet watchdog' "$body - run bin\status.ps1"
     }
   }
 

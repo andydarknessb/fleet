@@ -4,8 +4,9 @@
 // project-lead wake (checks-settled | checks-failed | decision-needed). The EVENT
 // LEDGER is the authoritative wake record (changes.wake on observations, a
 // `wake:<kind>; ` evidence prefix on transitions); state/watch/wake-outbox.jsonl is a
-// best-effort convenience cache written after commit. Delivery is ticket 07's
-// notifier - nothing here messages a session. Shadow: the legacy Stop-hook loop
+// best-effort convenience cache written after commit. A decision-needed wake also
+// launches the ticket-07 notifier (bin/notify.js: one detached process per decision
+// event, shadow unless state/flags/notifier-live) - nothing here messages a session. Shadow: the legacy Stop-hook loop
 // stays authoritative; this maintains the shadow records and parity evidence. Zero
 // model turns. Two deliberate spec-over-legacy choices: a required gate MISSING from
 // the rollup is incomplete (never settled), and closure linkage counts a body
@@ -306,7 +307,7 @@ function makeFetchers(repo, executable = 'gh') {
   };
 }
 
-function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true } = {}) {
+function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true, notifier = null } = {}) {
   const started = Date.now();
   const base = path.resolve(root || path.resolve(__dirname, '..'));
   const watchDir = path.join(base, 'state', 'watch');
@@ -405,6 +406,9 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
             eventSequence: acted.eventSequence, wake: action.wake, idempotencyKey: key, evidence: action.evidence,
           };
           fs.appendFileSync(path.join(watchDir, 'wake-outbox.jsonl'), `${JSON.stringify(wakeLine)}\n`, 'utf8');
+          if (action.wake === 'decision-needed' && notifier) {
+            try { notifier({ root: base, recordId: record.id, sequence: acted.eventSequence }); } catch (error) { health.actions.push(`${record.id}: notifier launch failed (${String(error.message || error).slice(0, 120)})`); }
+          }
         }
         if (action.kind === 'transition' && observation && !acted.replayed) {
           // Cache the observation on the moved record so identical polls short-circuit
@@ -441,6 +445,7 @@ function main(argv) {
     root: base, tenantName, tenantConfig,
     fetchers: makeFetchers(tenantConfig.github, args.gh || 'gh'),
     dryRun: args['dry-run'] === 'true',
+    notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
   });
   process.stdout.write(`${JSON.stringify(health)}\n`);
   if (!health.ok) process.exitCode = 1;

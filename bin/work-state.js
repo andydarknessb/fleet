@@ -23,6 +23,13 @@ const TRANSITIONS = Object.freeze({
   retired: [],
 });
 
+// Ticket 07: the events that mean "a human decision is needed". escalated is the
+// spec's decision state; hold is a reviewed PR parked for Cory's merge, which the
+// spec says pages once.
+const DECISION_EVENT_TYPES = Object.freeze(['state-escalated', 'state-hold']);
+const DECISION_STATES = Object.freeze(DECISION_EVENT_TYPES.map((type) => type.slice('state-'.length)));
+const NOTIFICATION_PHASES = Object.freeze(['claim', 'sent', 'failed', 'authorize-retry']);
+
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
 const LOCK_STALE_MS = 60 * 1000;
@@ -390,7 +397,7 @@ function reserveRecord(options = {}) {
     const event = eventFor(record, {
       type: 'assignment-reserved', actor: options.actor || 'assignment-planner', at: now,
       idempotencyKey: key, evidence: options.evidence,
-      changes: { state: 'assigned', reservations: record.reservations },
+      changes: { state: 'assigned', reservations: record.reservations, prNumber: record.github?.prNumber || null },
     });
     commitMutation(p, { recordId: id, beforeRecord: null, afterRecord: record, event, killPoint: options.killPoint });
     return { replayed: false, revision: 1, eventSequence: 1, record };
@@ -441,7 +448,7 @@ function createRecord(options = {}) {
       at: now,
       idempotencyKey: key,
       evidence: options.evidence,
-      changes: { state: record.state },
+      changes: { state: record.state, prNumber: record.github?.prNumber || null },
     });
     commitMutation(p, { recordId: record.id, beforeRecord: null, afterRecord: record, event, killPoint: options.killPoint });
     return { replayed: false, revision: 1, eventSequence: 1, record };
@@ -531,7 +538,7 @@ function transitionRecord(options = {}) {
       at: now,
       idempotencyKey: key,
       evidence: options.evidence,
-      changes: { from: record.state, to, prior_state: next.prior_state || null },
+      changes: { from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null },
     });
     const retiring = to === 'retired';
     const resultRecord = commitMutation(p, {
@@ -582,7 +589,7 @@ function observeRecord(options = {}) {
       at: now,
       idempotencyKey: key,
       evidence: options.evidence,
-      changes: { digest: observation.digest, changed: options.changed || null, wake: options.wake || null },
+      changes: { digest: observation.digest, changed: options.changed || null, wake: options.wake || null, prNumber: next.github?.prNumber || null },
     });
     commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
     return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
@@ -644,6 +651,97 @@ function recordReview(options = {}) {
       idempotencyKey: key,
       evidence: options.evidence,
       changes: { kind, headSha: entry.headSha, artifact: entry.artifact, tier: entry.tier, triggers: entry.triggers, priorArtifact: entry.priorArtifact },
+    });
+    commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
+    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
+  });
+}
+
+// Read-only view of the whole ledger (online partitions then archive), in ledger order.
+function readEvents(root) {
+  return eventLines(paths(root));
+}
+
+// The event that moved a record into its current state (highest sequence wins);
+// for a decision state this is the decision event the notifier and digest key on.
+function enteringEvent(events, recordId, state) {
+  return events
+    .filter((event) => event.recordId === recordId && event.type === `state-${state}`)
+    .sort((a, b) => b.sequence - a.sequence)[0] || null;
+}
+
+// tenants/<name>.json, keyed by name; a torn file only costs that tenant's config.
+function readTenantConfigs(root) {
+  const dir = path.join(asRoot(root), 'tenants');
+  const configs = {};
+  if (!fs.existsSync(dir)) return configs;
+  for (const file of fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort()) {
+    try { configs[path.basename(file, '.json')] = JSON.parse(fs.readFileSync(path.join(dir, file), 'utf8')); } catch { configs[path.basename(file, '.json')] = {}; }
+  }
+  return configs;
+}
+
+function notifyRecord(options = {}) {
+  // Ticket 07: delivery state for one decision event, keyed by that event's
+  // sequence. claim -> sent | failed; a failed delivery is visible and inert until
+  // authorize-retry (evidence required) re-arms exactly one more claim. The claim
+  // is taken under the store lock BEFORE anything is sent, so concurrent notifier
+  // starts cannot both page: one wins the revision, the rest read the claim.
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey);
+  const phase = String(options.phase || '');
+  if (!NOTIFICATION_PHASES.includes(phase)) throw new WorkStateError('INVALID_NOTIFICATION_PHASE', `unknown notification phase '${phase}'`);
+  const decisionSequence = Number(options.decisionSequence);
+  if (!Number.isInteger(decisionSequence) || decisionSequence <= 0) throw new WorkStateError('MISSING_DECISION_SEQUENCE', 'decisionSequence is required');
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const record = active.records[String(options.id)];
+    if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const replay = replayIfKnown(record, key);
+    if (replay) return replay;
+    if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
+    if (Number(options.expectedRevision) !== record.revision) {
+      throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    }
+    const decision = eventLines(p).find((event) => event.recordId === record.id && Number(event.sequence) === decisionSequence);
+    if (!decision || !DECISION_EVENT_TYPES.includes(decision.type)) {
+      throw new WorkStateError('NOT_A_DECISION_EVENT', `event ${decisionSequence} on ${record.id} is not a decision event`);
+    }
+    const decisionState = decision.type.slice('state-'.length);
+    const current = record.notifications?.[String(decisionSequence)] || null;
+    const now = isoNow(options.now);
+    let entry;
+    let type;
+    if (phase === 'claim') {
+      if (record.state !== decisionState) throw new WorkStateError('DECISION_RESOLVED', `record is ${record.state}; decision ${decisionSequence} (${decisionState}) no longer stands`);
+      if (current?.status === 'sent') throw new WorkStateError('NOTIFICATION_ALREADY_SENT', `decision ${decisionSequence} was already notified`);
+      if (current?.status === 'claimed') throw new WorkStateError('NOTIFICATION_ALREADY_CLAIMED', `decision ${decisionSequence} has a notification in flight (claimed ${current.at})`);
+      if (current?.status === 'failed' && !current.retryAuthorized) throw new WorkStateError('NOTIFICATION_RETRY_REQUIRES_AUTHORIZATION', `decision ${decisionSequence} failed delivery; a retry needs authorize-retry`);
+      entry = { status: 'claimed', attempt: (current?.attempt || 0) + 1, channel: options.channel || null, at: now, detail: null, retryAuthorized: false, actor: options.actor || 'unknown' };
+      type = 'notification-attempted';
+    } else if (phase === 'sent' || phase === 'failed') {
+      if (current?.status === 'sent') throw new WorkStateError('NOTIFICATION_ALREADY_SENT', `decision ${decisionSequence} was already notified`);
+      if (current?.status !== 'claimed') throw new WorkStateError('NOTIFICATION_NOT_CLAIMED', `decision ${decisionSequence} has no claim to settle`);
+      entry = { ...current, status: phase, at: now, detail: options.detail || null, actor: options.actor || current.actor };
+      type = `notification-${phase}`;
+    } else {
+      if (!options.evidence) throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'authorize-retry requires evidence');
+      if (current?.status !== 'failed') throw new WorkStateError('NOTIFICATION_NOT_FAILED', `decision ${decisionSequence} is ${current?.status || 'unnotified'}, not failed`);
+      entry = { ...current, retryAuthorized: true, retryEvidence: options.evidence, retryAuthorizedBy: options.actor || 'unknown', retryAuthorizedAt: now };
+      type = 'notification-retry-authorized';
+    }
+    const next = {
+      ...record,
+      revision: record.revision + 1,
+      eventSequence: record.eventSequence + 1,
+      updatedAt: now,
+      notifications: { ...(record.notifications || {}), [String(decisionSequence)]: entry },
+      idempotency: { ...record.idempotency },
+    };
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type };
+    const event = eventFor(next, {
+      type, actor: options.actor, at: now, idempotencyKey: key, evidence: options.evidence,
+      changes: { decisionSequence, decisionType: decision.type, status: entry.status, attempt: entry.attempt, channel: entry.channel, detail: entry.detail || null, retryAuthorized: entry.retryAuthorized },
     });
     commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
     return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
@@ -770,7 +868,7 @@ function shadowProject(options = {}) {
       record.idempotency[key] = { revision: 1, eventSequence: 1, type: 'shadow-projected' };
       const event = eventFor(record, {
         type: 'shadow-projected', actor: options.actor || 'shadow-projector', at: now,
-        idempotencyKey: key, evidence: record.evidence, changes: { state: record.state },
+        idempotencyKey: key, evidence: record.evidence, changes: { state: record.state, prNumber: null },
       });
       commitMutation(p, { recordId: id, beforeRecord: null, afterRecord: record, event, killPoint: options.killPoint });
       projected.push(record);
@@ -805,11 +903,19 @@ function cli(argv) {
     github: args['issue-url'] ? { issueNumber: Number(args.issue), issueUrl: args['issue-url'], bodyHash: args['body-hash'] } : undefined,
   });
   if (command === 'release') return releaseRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']) });
-  if (command === 'transition') return transitionRecord({
-    ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
-    prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined, githubRepo: args.repo,
-    githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'],
-  });
+  if (command === 'transition') {
+    const result = transitionRecord({
+      ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
+      prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined, githubRepo: args.repo,
+      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'],
+    });
+    // Ticket 07: a decision event launches its notifier from the door that wrote it
+    // (the watcher does the same for its own); a replay wrote nothing, so it launches nothing.
+    if (!result.replayed && DECISION_EVENT_TYPES.includes(`state-${args.to}`) && args['no-notifier'] !== 'true') {
+      result.notifier = require('./notify').spawnNotifier({ root: args.root, recordId: args.id, sequence: result.eventSequence });
+    }
+    return result;
+  }
   if (command === 'reconcile') return reconcilePullRequest({ repo: args.repo, prNumber: Number(args['pr-number']) });
   if (command === 'observe') return observeRecord({
     ...common, id: args.id, expectedRevision: Number(args['expected-revision']),
@@ -825,32 +931,41 @@ function cli(argv) {
       priorArtifact: args['prior-artifact'],
     },
   });
+  if (command === 'notify') {
+    const result = notifyRecord({
+      ...common, id: args.id, phase: args.phase, expectedRevision: Number(args['expected-revision']),
+      decisionSequence: Number(args['decision-sequence']), channel: args.channel, detail: args.detail,
+    });
+    // A retry authorization re-arms exactly one attempt; the door that wrote it launches it.
+    if (!result.replayed && args.phase === 'authorize-retry' && args['no-notifier'] !== 'true') {
+      result.notifier = require('./notify').spawnNotifier({ root: args.root, recordId: args.id, sequence: Number(args['decision-sequence']) });
+    }
+    return result;
+  }
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
   if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
-  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, observe, review, get, shadow, project');
-}
-
-if (require.main === module) {
-  try {
-    process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
-  } catch (error) {
-    process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message, currentRevision: error.currentRevision })}\n`);
-    process.exitCode = 1;
-  }
+  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, observe, review, notify, get, shadow, project');
 }
 
 module.exports = {
+  DECISION_EVENT_TYPES,
+  DECISION_STATES,
+  NOTIFICATION_PHASES,
   RESERVATION_FIELDS,
   STATES,
   TRANSITIONS,
   WorkStateError,
   createRecord,
+  enteringEvent,
   getRecord,
+  notifyRecord,
   observeRecord,
   parseArgs,
   proofMatches,
   projectStatus,
+  readEvents,
+  readTenantConfigs,
   reconcilePullRequest,
   recordReview,
   releaseRecord,
@@ -859,3 +974,14 @@ module.exports = {
   shadowProject,
   transitionRecord,
 };
+
+// The CLI runs after the exports are set: bin/notify.js is required lazily from
+// cli() and reads this module's exports while it is still the entry point.
+if (require.main === module) {
+  try {
+    process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
+  } catch (error) {
+    process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message, currentRevision: error.currentRevision })}\n`);
+    process.exitCode = 1;
+  }
+}

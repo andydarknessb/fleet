@@ -190,12 +190,17 @@ test('settled gates without linkage reach decision-needed with the watcher mark,
   const root = rootDir();
   seed(root);
   const f = fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'refs #42 only' }) });
-  watch(root, f);
+  const launches = [];
+  watch(root, f, { notifier: (launch) => launches.push(launch) });
   const rec = record(root);
   assert.equal(rec.state, 'escalated');
   assert.equal(rec.prior_state, 'ci-wait');
   assert.ok(String(rec.decisionEvidence).includes(WATCHER_MARK));
   assert.equal(outbox(root)[0].wake, 'decision-needed');
+  // Ticket 07: the decision event launches one notifier, pointed at that event.
+  assert.deepEqual(launches, [{ root, recordId: 'endzone:issue-42', sequence: outbox(root)[0].eventSequence }]);
+  watch(root, f, { notifier: (launch) => launches.push(launch) });
+  assert.equal(launches.length, 1, 'a steady-state tick launches nothing');
 });
 
 test('a human escalation is never resolved or touched by the watcher', () => {

@@ -57,11 +57,17 @@ function activeRecords(records) {
   return Object.values(records || {});
 }
 
-function localExclusionReasons(issue, skipIssues) {
+// Ticket 07: structured Frontier exclusions (bin/exclusions.js projection) are the
+// exclusion source; the legacy prose skip file is still honoured during shadow,
+// with `source` telling the two apart for the parity comparison.
+function localExclusionReasons(issue, skipIssues, exclusions) {
+  const reasons = (exclusions || [])
+    .filter((exclusion) => Number(exclusion.issue) === Number(issue.number))
+    .map((exclusion) => ({ code: 'frontier-exclusion', source: 'exclusion-ledger', detail: `${exclusion.id}: ${exclusion.reason}`, id: exclusion.id, owner: exclusion.owner, evidence: exclusion.evidence, recheck: exclusion.recheck }));
   const value = skipIssues?.issues?.[String(issue.number)] ?? skipIssues?.[String(issue.number)];
-  if (value === undefined) return [];
-  if (typeof value === 'string') return [{ code: 'frontier-exclusion', detail: value }];
-  return Object.entries(value || {}).map(([code, detail]) => ({ code, detail }));
+  if (value === undefined) return reasons;
+  if (typeof value === 'string') return [...reasons, { code: 'frontier-exclusion', source: 'legacy-skip', detail: value }];
+  return [...reasons, ...Object.entries(value || {}).map(([code, detail]) => ({ code, detail }))];
 }
 
 function reservationConflicts(issue, records) {
@@ -105,7 +111,7 @@ function buildLaunchPlan({ frontier, active = [], maxIcs = 3 } = {}) {
   return { assignments: selected, thirdProof };
 }
 
-function selectFrontier({ issues, readyLabel, skipIssues = {}, active = [], now } = {}) {
+function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], now } = {}) {
   if (!Array.isArray(issues)) throw new WorkStateError('INVALID_GITHUB_FIXTURE', 'issues must be an array');
   const normalized = issues.map(normalizeIssue);
   const activeByIssue = new Map(activeRecords(active).filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
@@ -119,7 +125,7 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, active = [], now 
     if (issue.unresolvedDependencies.length) reasons.push({ code: 'dependency-blocked', detail: issue.unresolvedDependencies.map((dependency) => dependency.number || dependency.id || dependency).join(', ') });
     if (issue.isSpecParent) reasons.push({ code: 'spec-parent', detail: 'sub-issues remain or issue is marked as a spec parent' });
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
-    reasons.push(...localExclusionReasons(issue, skipIssues));
+    reasons.push(...localExclusionReasons(issue, skipIssues, exclusions));
     if (activeByIssue.has(issue.number)) reasons.push({ code: 'reserved', detail: `active Work record ${activeByIssue.get(issue.number).id}` });
     reasons.push(...reservationConflicts(issue, active));
     if (reasons.length) excluded.push({ issue: issue.number, reasons });
@@ -236,8 +242,8 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
   };
 }
 
-function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = [], skipIssues = {}, readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, actor = 'assignment-planner', runner } = {}) {
-  const frontier = selectFrontier({ issues: [issue], readyLabel, active, skipIssues, now });
+function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, actor = 'assignment-planner', runner } = {}) {
+  const frontier = selectFrontier({ issues: [issue], readyLabel, active, skipIssues, exclusions, now });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
@@ -355,18 +361,20 @@ function cli(argv) {
   const args = parseArgs(rest);
   if (command === 'frontier') {
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: args.repo, readyLabel: args['ready-label'] || 'ready-for-agent', fetchDetails: true });
-    return selectFrontier({ issues, readyLabel: args['ready-label'] || 'ready-for-agent', active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant || 'endzone'}.json`)), now: args.now });
+    const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant: args.tenant || 'endzone', now: args.now });
+    return selectFrontier({ issues, readyLabel: args['ready-label'] || 'ready-for-agent', active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant || 'endzone'}.json`)), exclusions, now: args.now });
   }
   if (command === 'assign') {
     const config = readFixture(args['tenant-config'], {});
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github, readyLabel: config.readyLabel, fetchDetails: true });
     const active = readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json'));
     const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant}.json`));
-    const frontier = selectFrontier({ issues, readyLabel: config.readyLabel, active, skipIssues, now: args.now });
+    const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant: args.tenant, now: args.now });
+    const frontier = selectFrontier({ issues, readyLabel: config.readyLabel, active, skipIssues, exclusions, now: args.now });
     if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'no eligible issue', { excluded: frontier.excluded });
     if (args['base-sha'] && !args.fixture) throw new WorkStateError('BASE_RECONCILIATION_REQUIRED', 'production assignment must resolve base SHA from the fetched remote ref');
     const base = args['base-sha'] ? { remote: args.remote || 'origin', ref: args.ref || config.defaultBranch, sha: args['base-sha'] } : undefined;
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], tenant: args.tenant, tenantConfig: config, readyLabel: config.readyLabel, active, skipIssues, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
+    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], tenant: args.tenant, tenantConfig: config, readyLabel: config.readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });

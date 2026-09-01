@@ -9,7 +9,9 @@ const {
   WorkStateError,
   createRecord,
   getRecord,
+  notifyRecord,
   projectStatus,
+  readEvents,
   shadowProject,
   transitionRecord,
 } = require('../bin/work-state');
@@ -330,4 +332,98 @@ test('a risk review records in the pre-PR-ready states (implementing, revision, 
     review: { kind: 'risk', headSha: 'abc', artifact: 'state/reviews/endzone_issue-42/risk-001.json', tier: 'high-risk', triggers: ['auth'] },
   });
   assert.equal(inRevision.record.review.risk.headSha, 'abc');
+});
+
+// Ticket 07: the notification door. Delivery state lives on the record and in
+// typed events; claim-before-send is what makes "at most one page" hold across
+// concurrent notifier starts.
+function escalate(root) {
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 't-1', 'ack', '2026-09-01T05:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 't-2', 'PR #77', '2026-09-01T05:00:02.000Z');
+  move(root, 'endzone:issue-42', 3, 'ci-wait', 't-3', 'CI', '2026-09-01T05:00:03.000Z');
+  return move(root, 'endzone:issue-42', 4, 'escalated', 't-4', 'wake:decision-needed; [pr-watch] no closing linkage', '2026-09-01T05:00:04.000Z');
+}
+
+function notify(root, phase, revision, decisionSequence, extra = {}) {
+  return notifyRecord({
+    root, id: 'endzone:issue-42', phase, expectedRevision: revision, decisionSequence,
+    idempotencyKey: `n-${phase}-${decisionSequence}-${revision}`, actor: 'notifier', channel: 'toast',
+    now: `2026-09-01T06:00:0${revision}.000Z`, ...extra,
+  });
+}
+
+test('one decision event yields one claim and one notification-sent; repeats and later claims are refused', () => {
+  const root = rootDir();
+  const escalated = escalate(root);
+  assert.equal(escalated.eventSequence, 5);
+  const claimed = notify(root, 'claim', escalated.revision, 5);
+  assert.equal(claimed.record.notifications['5'].status, 'claimed');
+  assert.equal(claimed.record.notifications['5'].attempt, 1);
+  assert.throws(() => notify(root, 'claim', claimed.revision, 5), { code: 'NOTIFICATION_ALREADY_CLAIMED' });
+  const sent = notify(root, 'sent', claimed.revision, 5, { detail: 'toast delivered' });
+  assert.equal(sent.record.notifications['5'].status, 'sent');
+  assert.throws(() => notify(root, 'sent', sent.revision, 5), { code: 'NOTIFICATION_ALREADY_SENT' });
+  assert.throws(() => notify(root, 'claim', sent.revision, 5), { code: 'NOTIFICATION_ALREADY_SENT' });
+  assert.throws(() => notify(root, 'authorize-retry', sent.revision, 5, { evidence: 'cory said so' }), { code: 'NOTIFICATION_NOT_FAILED' });
+  const events = readEvents(root).filter((event) => event.recordId === 'endzone:issue-42' && event.type.startsWith('notification-'));
+  assert.deepEqual(events.map((event) => event.type), ['notification-attempted', 'notification-sent']);
+  assert.equal(events[1].changes.decisionSequence, 5);
+  assert.equal(events[1].changes.channel, 'toast');
+  const replay = notify(root, 'sent', claimed.revision, 5, { detail: 'toast delivered' });
+  assert.equal(replay.replayed, true);
+});
+
+test('a failed notification stays visible and never re-pages without explicit retry authorization', () => {
+  const root = rootDir();
+  const escalated = escalate(root);
+  const claimed = notify(root, 'claim', escalated.revision, 5);
+  const failed = notify(root, 'failed', claimed.revision, 5, { detail: 'toast api unavailable' });
+  assert.equal(failed.record.notifications['5'].status, 'failed');
+  assert.equal(failed.record.notifications['5'].detail, 'toast api unavailable');
+  assert.throws(() => notify(root, 'claim', failed.revision, 5), { code: 'NOTIFICATION_RETRY_REQUIRES_AUTHORIZATION' });
+  assert.throws(() => notify(root, 'authorize-retry', failed.revision, 5), { code: 'MISSING_DECISION_EVIDENCE' });
+  const authorized = notify(root, 'authorize-retry', failed.revision, 5, { actor: 'cory', evidence: 'retry after toast service restart' });
+  assert.equal(authorized.record.notifications['5'].retryAuthorized, true);
+  const second = notify(root, 'claim', authorized.revision, 5);
+  assert.equal(second.record.notifications['5'].attempt, 2);
+  assert.equal(second.record.notifications['5'].retryAuthorized, false);
+  assert.throws(() => notify(root, 'claim', second.revision, 5), { code: 'NOTIFICATION_ALREADY_CLAIMED' });
+  const types = readEvents(root).filter((event) => event.type.startsWith('notification-')).map((event) => event.type);
+  assert.deepEqual(types, ['notification-attempted', 'notification-failed', 'notification-retry-authorized', 'notification-attempted']);
+});
+
+test('a claim needs a decision event whose state the record still occupies', () => {
+  const root = rootDir();
+  const escalated = escalate(root);
+  assert.throws(() => notify(root, 'claim', escalated.revision, 4), { code: 'NOT_A_DECISION_EVENT' });
+  assert.throws(() => notify(root, 'claim', escalated.revision, 99), { code: 'NOT_A_DECISION_EVENT' });
+  assert.throws(() => notify(root, 'sent', escalated.revision, 5), { code: 'NOTIFICATION_NOT_CLAIMED' });
+  const resolved = move(root, 'endzone:issue-42', escalated.revision, 'ci-wait', 't-5', 'linkage restored', '2026-09-01T05:00:05.000Z');
+  assert.throws(() => notify(root, 'claim', resolved.revision, 5), { code: 'DECISION_RESOLVED' });
+  const held = (() => {
+    move(root, 'endzone:issue-42', resolved.revision, 'review', 't-6', 'settled', '2026-09-01T05:00:06.000Z');
+    return move(root, 'endzone:issue-42', resolved.revision + 1, 'hold', 't-7', 'carve-out needs Cory', '2026-09-01T05:00:07.000Z');
+  })();
+  const claimed = notify(root, 'claim', held.revision, held.eventSequence);
+  assert.equal(claimed.record.notifications[String(held.eventSequence)].status, 'claimed');
+  assert.equal(claimed.record.notifications['5'], undefined);
+});
+
+test('twenty concurrent claims for one decision event produce exactly one claim', () => {
+  const root = rootDir();
+  const escalated = escalate(root);
+  let wins = 0;
+  const conflicts = new Set();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      notifyRecord({ root, id: 'endzone:issue-42', phase: 'claim', expectedRevision: escalated.revision, decisionSequence: 5, idempotencyKey: `claim-${attempt}`, actor: `notifier-${attempt}`, channel: 'toast' });
+      wins += 1;
+    } catch (error) { conflicts.add(error.code); }
+  }
+  assert.equal(wins, 1);
+  assert.deepEqual([...conflicts].sort(), ['STALE_REVISION']);
+  const record = getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.notifications['5'].attempt, 1);
+  assert.equal(readEvents(root).filter((event) => event.type === 'notification-attempted').length, 1);
 });

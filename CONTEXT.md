@@ -186,10 +186,30 @@ _Avoid_: second reviewer, QA pass, extra review angle
 **Frontier exclusion**:
 A ready Unit of work the fleet must not launch because an exceptional fleet
 fact that GitHub cannot express keeps it outside the assignment frontier. The
-exclusion is structured and names a reason, evidence pointer, and recheck event
-or expiry. GitHub labels, assignees, dependencies, and sub-issue structure take
+exclusion is structured and names a reason, evidence pointer, owner, and
+recheck event or expiry; it lives in the tenant's exclusion ledger
+(`state/exclusions/<tenant>.jsonl`, append-only) and leaves the frontier by
+its owner's lift, its expiry, or the named Fleet event, keeping its history.
+GitHub labels, assignees, dependencies, and sub-issue structure take
 precedence whenever they can express the condition.
 _Avoid_: hold (a reviewed PR waiting for Cory), skip, blocked
+
+**Notifier**:
+The ephemeral process launched for one decision event (a Work record entering
+`escalated` or `hold`). It claims the event through the state command, sends
+one push, records the delivery as a Fleet event, and exits. A failed delivery
+is visible delivery state, not a reason to page again: only a retry
+authorization or a materially new decision event creates another attempt. Its
+message is a typed pointer (record id, revision, event sequence, artifact
+locations), never a copy of the issue, criteria, or findings.
+_Avoid_: pager, alerter, notification session, reminder
+
+**Digest**:
+The script projection of Work records, the event ledger, and the exclusion
+ledgers at a named offset: decisions needing Cory with their delivery state,
+active work, merges, frontier exclusions, and Cory's authority. Rebuilding the
+same offset gives the same bytes; nothing model-authored is appended to it.
+_Avoid_: status report (when the projection is meant), summary, board
 
 **Hold**:
 A pull request reviewed clean and parked for Cory's merge, recorded under

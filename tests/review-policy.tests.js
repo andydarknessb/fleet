@@ -300,13 +300,15 @@ test('a revision re-review links the prior findings and carries only unresolved 
 test('a clean carve-out reaches hold, pages exactly once, and cannot merge without an observed GitHub merge', () => {
   const root = rootDir();
   const revision = seedRecord(root);
+  const launches = [];
   const held = holdRecord({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
     reason: 'carve-out PR #77 reviewed clean; waits for Cory', actor: 'project-lead',
-    idempotencyKey: 'hold-1', now: '2026-09-01T03:00:00.000Z',
+    idempotencyKey: 'hold-1', now: '2026-09-01T03:00:00.000Z', notifier: (launch) => launches.push(launch),
   });
   assert.equal(held.result.record.state, 'hold');
   assert.equal(held.paged, true);
+  assert.deepEqual(launches, [{ root, recordId: 'endzone:issue-42', sequence: held.result.eventSequence }], 'the hold launches the ticket-07 notifier for its decision event');
   const outbox = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
   const lines = fs.readFileSync(outbox, 'utf8').trim().split('\n');
   assert.equal(lines.length, 1);
@@ -316,9 +318,10 @@ test('a clean carve-out reaches hold, pages exactly once, and cannot merge witho
   const replay = holdRecord({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
     reason: 'carve-out PR #77 reviewed clean; waits for Cory', actor: 'project-lead',
-    idempotencyKey: 'hold-1', now: '2026-09-01T03:01:00.000Z',
+    idempotencyKey: 'hold-1', now: '2026-09-01T03:01:00.000Z', notifier: (launch) => launches.push(launch),
   });
   assert.equal(replay.paged, false);
+  assert.equal(launches.length, 1, 'a replay launches no second notifier');
   assert.equal(fs.readFileSync(outbox, 'utf8').trim().split('\n').length, 1);
 
   // No automated or lead path to merged: the transition demands a reconciled GitHub MERGED observation.
