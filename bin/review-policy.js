@@ -9,12 +9,16 @@
 //                 trigger books the IC-hosted, read-only, Opus risk reviewer
 //                 (amendment 5: the risk reviewer is spawned by the IC,
 //                 pre-PR-ready, because a worker bills to its spawner and the
-//                 lead is the context under budget).
+//                 lead is the context under budget). Patterns fire on added
+//                 lines only, attributed per file, and never from files under
+//                 the configured prose excludes.
 //   record        store ONE findings artifact per review under state/reviews/
 //                 and reference it from the record and event ledger through
 //                 work-state's `review` door. Guards make "exactly one" a
 //                 machine fact: a duplicate formal review at the same head and
-//                 a risk review without a trigger are refused.
+//                 a risk review without a trigger are refused; an identical
+//                 retry replays. A revision bumped by a routine observation
+//                 (pr-watch) retries internally rather than losing the review.
 //   plan-rereview a revision re-review inspects the changed range and the
 //                 unresolved findings, never the settled material.
 //   hold          a clean carve-out (or any PR requiring Cory) parks in the
@@ -32,8 +36,13 @@ const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
 
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
-const DEFAULT_REVIEW_CONFIG = Object.freeze({ trivialMaxChangedLines: 25, trivialMaxFiles: 3 });
+const DEFAULT_REVIEW_CONFIG = Object.freeze({
+  trivialMaxChangedLines: 25,
+  trivialMaxFiles: 3,
+  patternExcludePaths: Object.freeze(['**/*.md', '**/*.txt', 'docs/**']),
+});
 const RESOLUTION_VALUES = Object.freeze(['resolved', 'still-open', 'not-real']);
+const STALE_RETRY_LIMIT = 5;
 
 class ReviewPolicyError extends Error {
   constructor(code, message, details = {}) {
@@ -80,14 +89,27 @@ function matchGlob(glob, filePath) {
 // --- classification ---
 
 function parseDiff(diffText) {
-  const addedLines = [];
+  const addedByFile = new Map();
+  let currentFile = null;
   let changedLines = 0;
   for (const line of String(diffText || '').split(/\r?\n/)) {
-    if (line.startsWith('+++') || line.startsWith('---')) continue;
-    if (line.startsWith('+')) { addedLines.push(line.slice(1)); changedLines += 1; }
-    else if (line.startsWith('-')) changedLines += 1;
+    if (line.startsWith('+++ ')) {
+      const named = line.slice(4).trim();
+      currentFile = named === '/dev/null' ? null : named.replace(/^b\//, '');
+      if (currentFile && !addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
+      continue;
+    }
+    if (line.startsWith('---')) continue;
+    if (line.startsWith('+')) {
+      changedLines += 1;
+      if (currentFile) addedByFile.get(currentFile).push(line.slice(1));
+      else {
+        if (!addedByFile.has(null)) addedByFile.set(null, []);
+        addedByFile.get(null).push(line.slice(1));
+      }
+    } else if (line.startsWith('-')) changedLines += 1;
   }
-  return { addedLines, changedLines };
+  return { addedByFile, changedLines };
 }
 
 function patternRegExp(pattern) {
@@ -96,21 +118,25 @@ function patternRegExp(pattern) {
   }
 }
 
-function evaluateTrigger(name, { paths: pathGlobs = [], patterns = [] }, files, addedLines) {
+function evaluateTrigger(name, { paths: pathGlobs = [], patterns = [] }, files, addedByFile, excludeGlobs) {
   const matches = [];
   for (const glob of pathGlobs) {
     for (const file of files) {
       if (matchGlob(glob, file)) matches.push({ file, glob });
     }
   }
+  const excluded = (file) => file !== null && excludeGlobs.some((glob) => matchGlob(glob, file));
   for (const pattern of patterns) {
     const regexp = patternRegExp(pattern);
-    for (const line of addedLines) {
-      if (regexp.test(line)) {
-        matches.push({ pattern, line: line.trim().slice(0, 200) });
-        break; // one match per pattern is evidence enough
+    let hit = null;
+    for (const [file, lines] of addedByFile) {
+      if (excluded(file)) continue;
+      for (const line of lines) {
+        if (regexp.test(line)) { hit = { pattern, file: file || undefined, line: line.trim().slice(0, 200) }; break; }
       }
+      if (hit) break;
     }
+    if (hit) matches.push(hit); // one match per pattern is evidence enough
   }
   return matches.length ? { class: name, matches } : null;
 }
@@ -118,16 +144,25 @@ function evaluateTrigger(name, { paths: pathGlobs = [], patterns = [] }, files, 
 function classifyChange(options = {}) {
   const tenant = options.tenant || {};
   const config = { ...DEFAULT_REVIEW_CONFIG, ...(options.config?.review || options.config || {}) };
+  const excludeGlobs = config.patternExcludePaths || [];
   const files = (options.files || []).map((file) => String(file).replace(/\\/g, '/'));
   const parsed = options.diffText !== undefined ? parseDiff(options.diffText) : null;
-  const addedLines = options.addedLines || parsed?.addedLines || [];
+  let addedByFile = parsed ? parsed.addedByFile : new Map();
+  if (options.addedLines) {
+    // Flat added lines with no per-file attribution: usable only when the file
+    // list itself is not entirely excluded prose.
+    addedByFile = new Map();
+    if (!files.length || files.some((file) => !excludeGlobs.some((glob) => matchGlob(glob, file)))) {
+      addedByFile.set(null, options.addedLines);
+    }
+  }
   const changedLines = Number.isFinite(options.changedLines) ? options.changedLines : (parsed ? parsed.changedLines : null);
 
   const triggers = [];
-  const carveOut = evaluateTrigger('carve-out', { paths: tenant.carveOuts || [] }, files, []);
+  const carveOut = evaluateTrigger('carve-out', { paths: tenant.carveOuts || [] }, files, new Map(), excludeGlobs);
   if (carveOut) triggers.push(carveOut);
   for (const [name, spec] of Object.entries(tenant.riskTriggers || {})) {
-    const hit = evaluateTrigger(name, spec || {}, files, addedLines);
+    const hit = evaluateTrigger(name, spec || {}, files, addedByFile, excludeGlobs);
     if (hit) triggers.push(hit);
   }
 
@@ -146,7 +181,7 @@ function classifyChange(options = {}) {
     reviewPlan: {
       formal: { owner: 'project-lead', count: 1 },
       risk: riskReview
-        ? { host: 'ic', agent: 'qa-reviewer', model: 'opus', readOnly: true, timing: 'pre-pr-ready' }
+        ? { host: 'ic', role: 'qa-reviewer', model: 'opus', readOnly: true, timing: 'pre-pr-ready' }
         : null,
     },
   };
@@ -176,24 +211,67 @@ function reviewsDir(root, recordId) {
   return path.join(path.resolve(root || DEFAULT_ROOT), 'state', 'reviews', safeRecordName(recordId));
 }
 
-function nextArtifactSequence(directory, kind) {
-  if (!fs.existsSync(directory)) return 1;
-  const pattern = new RegExp(`^${kind}-(\\d{3})\\.json$`);
-  const taken = fs.readdirSync(directory)
-    .map((name) => pattern.exec(name))
-    .filter(Boolean)
-    .map((match) => Number(match[1]));
-  return taken.length ? Math.max(...taken) + 1 : 1;
-}
-
 function readArtifact(root, relativePath) {
   const file = path.join(path.resolve(root || DEFAULT_ROOT), relativePath);
-  if (!fs.existsSync(file)) throw new ReviewPolicyError('ARTIFACT_MISSING', `review artifact not found: ${relativePath}`);
+  if (!fs.existsSync(file)) return null;
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
 function openFindings(artifact) {
   return (artifact.findings || []).filter((finding) => finding.status === 'open');
+}
+
+function writeArtifactExclusive(root, recordId, kind, buildContent) {
+  // Allocate the next free sequence with an exclusive create, so two concurrent
+  // writers can never share a filename (and never delete each other's file).
+  const directory = reviewsDir(root, recordId);
+  fs.mkdirSync(directory, { recursive: true });
+  const pattern = new RegExp(`^${kind}-(\\d{3})\\.json$`);
+  let sequence = 1;
+  for (const name of fs.readdirSync(directory)) {
+    const match = pattern.exec(name);
+    if (match) sequence = Math.max(sequence, Number(match[1]) + 1);
+  }
+  for (;;) {
+    const stamp = `${kind}-${String(sequence).padStart(3, '0')}`;
+    const relative = path.posix.join('state', 'reviews', safeRecordName(recordId), `${stamp}.json`);
+    const file = path.join(path.resolve(root || DEFAULT_ROOT), relative);
+    let handle;
+    try {
+      handle = fs.openSync(file, 'wx');
+    } catch (error) {
+      if (error.code === 'EEXIST') { sequence += 1; continue; }
+      throw error;
+    }
+    fs.writeFileSync(handle, `${JSON.stringify(buildContent(stamp, sequence, relative), null, 2)}\n`, 'utf8');
+    fs.closeSync(handle);
+    return { relative, file, stamp, sequence };
+  }
+}
+
+function buildFindings(stamp, suppliedFindings, priorArtifactData, priorArtifactPath, resolutions) {
+  // Caller fields never override the forced-open status: openFindings gates the
+  // unresolved-findings guard on it.
+  const findings = (suppliedFindings || []).map((finding, index) => ({
+    ...finding,
+    id: finding.id || `${stamp}-f${index + 1}`,
+    status: 'open',
+  }));
+  if (priorArtifactData) {
+    // Carry the still-open prior findings forward so the latest artifact is the
+    // complete unresolved set; resolved and not-real material is settled.
+    for (const finding of openFindings(priorArtifactData)) {
+      if (resolutions[finding.id] === 'still-open') {
+        findings.push({ ...finding, status: 'open', carriedFrom: priorArtifactPath });
+      }
+    }
+  }
+  const seen = new Set();
+  for (const finding of findings) {
+    if (seen.has(finding.id)) throw new ReviewPolicyError('DUPLICATE_FINDING_ID', `finding id '${finding.id}' appears more than once`);
+    seen.add(finding.id);
+  }
+  return findings;
 }
 
 function recordReviewArtifact(options = {}) {
@@ -202,95 +280,103 @@ function recordReviewArtifact(options = {}) {
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
   if (!['formal', 'risk'].includes(kind)) throw new ReviewPolicyError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
   const classification = options.classification || {};
-  const record = workState.getRecord({ root, id: recordId });
-  const prior = record.review?.[kind] || null;
+  const key = options.idempotencyKey || `${kind}:${recordId}:${headSha}`;
+  const pinnedRevision = options.expectedRevision !== undefined && Number.isInteger(Number(options.expectedRevision))
+    ? Number(options.expectedRevision) : null;
 
-  if (prior && prior.headSha === String(headSha)) {
-    throw new ReviewPolicyError('ALREADY_REVIEWED', `a ${kind} review is already recorded for ${recordId} at ${headSha}`, { artifact: prior.artifact });
-  }
-  if (kind === 'risk' && !(classification.triggers || []).length) {
-    throw new ReviewPolicyError('RISK_REVIEW_NOT_TRIGGERED', 'a risk review requires a configured trigger; a normal PR never launches the risk reviewer');
-  }
-
-  let priorArtifactData = null;
-  let range = null;
-  const resolutions = options.resolutions || null;
-  if (kind === 'formal' && prior) {
-    if (!options.priorArtifact || options.priorArtifact !== prior.artifact) {
-      throw new ReviewPolicyError('REREVIEW_REQUIRES_PRIOR', `a revision re-review must link the prior findings artifact ${prior.artifact}`, { priorArtifact: prior.artifact });
-    }
-    priorArtifactData = readArtifact(root, prior.artifact);
-    range = `${prior.headSha}..${headSha}`;
-    const open = openFindings(priorArtifactData);
-    for (const finding of open) {
-      const resolution = resolutions?.[finding.id];
-      if (!resolution) {
-        throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} has no resolution`, { unresolved: open.map((entry) => entry.id) });
-      }
-      if (!RESOLUTION_VALUES.includes(resolution)) {
-        throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
-      }
-    }
-  }
-
-  const directory = reviewsDir(root, recordId);
-  const sequence = nextArtifactSequence(directory, kind);
-  const stamp = `${kind}-${String(sequence).padStart(3, '0')}`;
-  const artifactRelative = path.posix.join('state', 'reviews', safeRecordName(recordId), `${stamp}.json`);
-
-  const findings = (options.findings || []).map((finding, index) => ({
-    id: finding.id || `${stamp}-f${index + 1}`,
-    status: 'open',
-    ...finding,
-  }));
-  if (priorArtifactData) {
-    // Carry the still-open prior findings forward so the latest artifact is the
-    // complete unresolved set; resolved and not-real material is settled.
-    for (const finding of openFindings(priorArtifactData)) {
-      if (resolutions[finding.id] === 'still-open') {
-        findings.push({ ...finding, status: 'open', carriedFrom: prior.artifact });
-      }
-    }
-  }
-
-  const artifact = {
-    schemaVersion: 1,
-    recordId,
-    kind,
-    sequence,
-    headSha: String(headSha),
-    range,
-    tier: classification.tier || null,
-    triggers: classification.triggers || [],
-    reviewer: actor || 'unknown',
-    at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
-    priorArtifact: prior ? prior.artifact : null,
-    resolutions,
-    findings,
-  };
-
-  fs.mkdirSync(directory, { recursive: true });
-  const artifactFile = path.join(root, artifactRelative);
-  fs.writeFileSync(artifactFile, `${JSON.stringify(artifact, null, 2)}\n`, 'utf8');
-  let result;
+  let written = null;
   try {
-    result = workState.recordReview({
-      root, id: recordId, expectedRevision: options.expectedRevision,
-      idempotencyKey: options.idempotencyKey || `${stamp}:${recordId}:${headSha}`,
-      actor, now: options.now, evidence: options.evidence,
-      review: {
-        kind, headSha, artifact: artifactRelative,
-        tier: classification.tier || null,
-        triggers: (classification.triggers || []).map((trigger) => trigger.class || trigger),
-        priorArtifact: prior ? prior.artifact : null,
-      },
-    });
+    for (let attempt = 0; ; attempt += 1) {
+      const record = workState.getRecord({ root, id: recordId });
+
+      // An identical retry replays: return the artifact the record references.
+      if (record.idempotency?.[key]) {
+        if (written) fs.rmSync(written.file, { force: true });
+        const artifact = record.review?.[kind]?.artifact || null;
+        return {
+          artifact,
+          result: { replayed: true, revision: record.idempotency[key].revision, eventSequence: record.idempotency[key].eventSequence, record },
+        };
+      }
+
+      const prior = record.review?.[kind] || null;
+      if (prior && prior.headSha === String(headSha)) {
+        throw new ReviewPolicyError('ALREADY_REVIEWED', `a ${kind} review is already recorded for ${recordId} at ${headSha}`, { artifact: prior.artifact });
+      }
+      if (kind === 'risk' && !(classification.triggers || []).length) {
+        throw new ReviewPolicyError('RISK_REVIEW_NOT_TRIGGERED', 'a risk review requires a configured trigger; a normal PR never launches the risk reviewer');
+      }
+
+      let priorArtifactData = null;
+      let priorArtifactMissing = false;
+      let range = null;
+      const resolutions = options.resolutions || null;
+      if (kind === 'formal' && prior) {
+        if (!options.priorArtifact || options.priorArtifact !== prior.artifact) {
+          throw new ReviewPolicyError('REREVIEW_REQUIRES_PRIOR', `a revision re-review must link the prior findings artifact ${prior.artifact}`, { priorArtifact: prior.artifact });
+        }
+        priorArtifactData = readArtifact(root, prior.artifact);
+        range = `${prior.headSha}..${headSha}`;
+        if (priorArtifactData === null) {
+          // The referenced file is gone (crash, hand cleanup, pruned tree):
+          // degrade honestly instead of wedging the record forever.
+          priorArtifactMissing = true;
+        } else {
+          const open = openFindings(priorArtifactData);
+          for (const finding of open) {
+            const resolution = resolutions?.[finding.id];
+            if (!resolution) {
+              throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} has no resolution`, { unresolved: open.map((entry) => entry.id) });
+            }
+            if (!RESOLUTION_VALUES.includes(resolution)) {
+              throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
+            }
+          }
+        }
+      }
+
+      if (!written) {
+        written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
+          schemaVersion: 1,
+          recordId,
+          kind,
+          headSha: String(headSha),
+          range,
+          tier: classification.tier || null,
+          triggers: classification.triggers || [],
+          reviewer: actor || 'unknown',
+          at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
+          priorArtifact: prior ? prior.artifact : null,
+          priorArtifactMissing: priorArtifactMissing || undefined,
+          resolutions,
+          findings: buildFindings(stamp, options.findings, priorArtifactData, prior ? prior.artifact : null, resolutions),
+        }));
+      }
+
+      try {
+        const result = workState.recordReview({
+          root, id: recordId, expectedRevision: pinnedRevision ?? record.revision,
+          idempotencyKey: key, actor, now: options.now, evidence: options.evidence,
+          review: {
+            kind, headSha, artifact: written.relative,
+            tier: classification.tier || null,
+            triggers: (classification.triggers || []).map((trigger) => trigger.class || trigger),
+            priorArtifact: prior ? prior.artifact : null,
+          },
+        });
+        return { artifact: written.relative, result };
+      } catch (error) {
+        // A routine concurrent bump (pr-watch observing the PR) is retried when
+        // the caller did not pin a revision; everything else is terminal.
+        if (error.code === 'STALE_REVISION' && pinnedRevision === null && attempt < STALE_RETRY_LIMIT) continue;
+        throw error;
+      }
+    }
   } catch (error) {
-    fs.rmSync(artifactFile, { force: true });
+    // Terminal failure: remove only the file this call created (exclusive name).
+    if (written) fs.rmSync(written.file, { force: true });
     throw error;
   }
-  if (result.replayed) fs.rmSync(artifactFile, { force: true });
-  return { artifact: result.replayed ? result.record.review[kind].artifact : artifactRelative, result };
 }
 
 function planRereview(options = {}) {
@@ -306,35 +392,52 @@ function planRereview(options = {}) {
     priorArtifact: prior.artifact,
     priorHeadSha: prior.headSha,
     range: `${prior.headSha}..${headSha}`,
-    unresolved: openFindings(artifact),
+    unresolved: artifact ? openFindings(artifact) : [],
+    ...(artifact === null ? { priorArtifactMissing: true } : {}),
   };
 }
 
 // --- hold: park a reviewed-clean PR for Cory, page once ---
 
+function outboxHasWake(outboxFile, recordId, idempotencyKey) {
+  if (!fs.existsSync(outboxFile)) return false;
+  return fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).some((line) => {
+    if (!line.trim()) return false;
+    try {
+      const entry = JSON.parse(line);
+      return entry.recordId === recordId && entry.idempotencyKey === idempotencyKey;
+    } catch { return false; }
+  });
+}
+
 function holdRecord(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, reason, actor } = options;
   if (!recordId || !reason) throw new ReviewPolicyError('USAGE', 'recordId and reason are required');
+  const key = options.idempotencyKey || `hold:${recordId}`;
   const result = workState.transitionRecord({
     root, id: recordId, to: 'hold',
     expectedRevision: options.expectedRevision,
-    idempotencyKey: options.idempotencyKey || `hold:${recordId}`,
+    idempotencyKey: key,
     actor, now: options.now,
     evidence: `wake:decision-needed; ${reason}`,
   });
+  // Page once, at-least-once: the state-hold event is the authoritative record;
+  // the outbox line is the delivery cache ticket 07's notifier consumes
+  // (pr-watch shape). A crash between the transition and this append is
+  // repaired by any retry, which finds the committed transition (replay) but
+  // no outbox line, and delivers the missing page.
+  const watchDir = path.join(root, 'state', 'watch');
+  const outboxFile = path.join(watchDir, 'wake-outbox.jsonl');
   let paged = false;
-  if (!result.replayed) {
-    // Page once: the state-hold event is the authoritative record, the outbox
-    // line is the delivery cache ticket 07's notifier consumes (pr-watch shape).
-    const watchDir = path.join(root, 'state', 'watch');
+  if (!result.replayed || !outboxHasWake(outboxFile, recordId, key)) {
     fs.mkdirSync(watchDir, { recursive: true });
     const wakeLine = {
       at: new Date(options.now || Date.now()).toISOString(), recordId, revision: result.revision,
       eventSequence: result.eventSequence, wake: 'decision-needed',
-      idempotencyKey: options.idempotencyKey || `hold:${recordId}`, evidence: reason,
+      idempotencyKey: key, evidence: reason,
     };
-    fs.appendFileSync(path.join(watchDir, 'wake-outbox.jsonl'), `${JSON.stringify(wakeLine)}\n`, 'utf8');
+    fs.appendFileSync(outboxFile, `${JSON.stringify(wakeLine)}\n`, 'utf8');
     paged = true;
   }
   return { result, paged };
@@ -374,7 +477,8 @@ function cli(argv) {
   }
   if (command === 'record') {
     return recordReviewArtifact({
-      root, recordId: args.id, expectedRevision: Number(args['expected-revision']),
+      root, recordId: args.id,
+      expectedRevision: args['expected-revision'] !== undefined ? Number(args['expected-revision']) : undefined,
       kind: args.kind, headSha: args['head-sha'], actor: args.actor, now: args.now,
       idempotencyKey: args['idempotency-key'], evidence: args.evidence,
       classification: args.classification ? JSON.parse(fs.existsSync(args.classification) ? fs.readFileSync(args.classification, 'utf8') : args.classification) : {},

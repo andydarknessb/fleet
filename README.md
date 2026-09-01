@@ -39,6 +39,10 @@ cory
 | `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, and rate-limit PAUSE. An IC waiting on an open PR or skip-list hold is never stale-heartbeat respawned. |
 | `bin/retire.ps1` | Mark a finished IC as retiring before stopping it, remove its job/worktrees, and report verified remaining worktree state. |
 | `bin/work-state.js` | Canonical shadow Work-record/event command; validates transitions, revisions, idempotency, projections, and retirement archival. |
+| `bin/review-policy.js` | Ticket-05 review policy: risk-tier classification from tenant `carveOuts` + `riskTriggers`, one findings artifact per review (recorded through the work-state `review` door), revision re-review scoping, and the hold-and-page-once path. |
+| `bin/suite-lock.js` | Host-wide semaphore for the tenant's `heavySuites`; a blocked attempt names the owning Work record; `run -- <cmd>` wraps acquire-exec-release. |
+| `state/reviews/` | One findings artifact per recorded review, per Work record; the event ledger references these paths. |
+| `state/suite/` | Live heavy-suite locks (owner pid + Work record). |
 | `bin/assignment.js` | Shadow frontier selector, reservation/manifest builder, base reconciliation, and single-door launch adapter. |
 | `bin/measure-cycle.js` | Read-only transcript/roster collector for daily JSON metrics and compact seven-day summaries; it never changes fleet decisions. |
 | `bin/run-cycle-collector.ps1` | Bounded daily collector runner used by Task Scheduler. |

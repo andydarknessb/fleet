@@ -58,8 +58,11 @@ and answers the tier (`trivial`/`normal` on `config/cycle.json` review
 thresholds, `high-risk` on any trigger), the merge authority (`cory-only` on a
 carve-out), and the review plan: every PR gets the project lead's one formal
 Standards+Spec review; only `riskReview: true` books the risk reviewer, named
-explicitly as `{host: 'ic', agent: 'qa-reviewer', model: 'opus', readOnly:
-true, timing: 'pre-pr-ready'}` - Opus is reserved for that path.
+explicitly as `{host: 'ic', role: 'qa-reviewer', model: 'opus', readOnly:
+true, timing: 'pre-pr-ready'}` - Opus is reserved for that path. Patterns fire
+on added lines only, attributed per file from the unified diff, and never from
+files under `review.patternExcludePaths` (markdown/docs), so prose about a
+risky thing books no Opus.
 `classifyFromGit` reads the range with `--name-only`, never `--stat`
 (2026-09-01 ruling). Bare-name carve-out globs (`.env*`) deliberately match by
 basename anywhere: a protective class over-matches rather than under-matches.
@@ -119,10 +122,63 @@ once. `agents/qa-reviewer.md` re-scoped as the risk reviewer (IC-spawned,
 trigger-only, read-only). `CONTEXT.md` gained **Risk reviewer**; README
 diagram and skills paragraph updated.
 
-Tests: `tests/review-policy.tests.js` (11 node cases: glob semantics, tiers,
-path/pattern triggers on added lines only, diff parsing, exactly-one-formal,
-risk-only-on-trigger, re-review linking and carry-forward, hold pages-once
-plus no-merge-path, PR-only hold), `tests/suite-lock.tests.js` (9 node cases
-including cross-process serialization and wait timeout), and 3 new
-work-state cases for the review door. Full run at landing: node suite 89/89,
-all 12 PowerShell suites pass unchanged.
+**Same-day review round** (Standards + Spec sub-agents plus an adversarial
+crash/race QA worker with executed repros; every acted-on claim verified).
+Fixed: `spawnSync('npm')` is ENOENT on Windows (no PATHEXT resolution), so the
+documented heavy-suite command could not run at all - spawnSuite now falls
+back to the shell with conservative quoting; the suite-lock wx-open zero-byte
+window let a second record read `{corrupt:true}` and break an in-progress
+lock (double-hold of a 40-minute suite) - lock files are now created
+atomically with their full payload via temp-write + linkSync, and an
+unreadable (foreign) lock gets a 5s grace window before breaking; EPERM from
+`process.kill(pid, 0)` now reads as alive, not dead; the dead-lock retry path
+is bounded by the timeout and sleeps; `run` has no default timeout (the fixed
+hour was shorter than two queued sweeps); a release refusal in run's cleanup
+warns instead of masking the suite's exit code. In review-policy: a routine
+concurrent revision bump (pr-watch observing the PR mid-review) no longer
+destroys the just-written findings artifact - `record` retries past
+STALE_REVISION when no revision was pinned, artifact filenames are allocated
+with exclusive creates so concurrent writers can never share (or delete each
+other's) files, and an identical retry replays instead of raising
+ALREADY_REVIEWED (the default idempotency key is now stable:
+`kind:record:head`); a caller-supplied `status` can no longer smuggle a
+finding past the unresolved-findings guard (status is forced open; duplicate
+finding ids are refused); a missing prior artifact degrades to an honest
+re-review (`priorArtifactMissing`) instead of wedging the record; a crash
+between the hold transition and the page is repaired by any retry, which
+finds the committed transition but no outbox line and delivers the missing
+page. Risk reviews narrowed to the pre-PR-ready states exactly
+(implementing, revision, pr-open) - ci-wait/review are refused, keeping the
+lead-hosted risk path closed while covering the revision cycle. Glossary
+fixes: `role:` not `agent:` in the review plan, "worker" not "subagent" in
+ic.md; README Layout gained the new rows; `.transaction(` dropped from the
+concurrency triggers (routine knex noise).
+
+**Deliberate deviations, to classify at ticket 09** (the pr-watch
+absent-gate precedent): the "exactly one formal review" criteria are enforced
+as an upper bound by machinery (duplicate refused) but the lower bound - no
+merge without a recorded formal review - is role-instruction only during
+shadow, because the shadow record must follow observed GitHub reality even
+for units nobody recorded a review on; enforcement belongs at the 02/03
+cutover. The risk-reviewer spawn itself is a session action the scripts
+cannot intercept - `classify` is the deterministic pre-spawn gate and
+`record` refuses an untriggered result, but the spawn decision is bound by
+ic.md, not code. `heavySuites` is configuration the IC instruction cites; the
+lock cannot detect a suite run outside it. Criterion 6's "cannot merge
+through a project-lead path" is machinery on the shadow record (merged
+demands a reconciled GitHub MERGED) but the live guard on the lead's own
+`gh pr merge` remains the role file plus the skip-file hold, as during all of
+shadow. The `trivial` tier is classification-only (amendment 5's mapping
+gives trivial and normal the same plan); it exists for status/artifact
+legibility and the 09 collector, not to change behavior.
+
+Tests: `tests/review-policy.tests.js` (17 node cases: glob semantics, tiers,
+path/pattern triggers with per-file attribution and prose excludes, diff
+parsing, exactly-one-formal, risk-only-on-trigger, stable-retry replay,
+stale-revision resilience, forced-open findings, duplicate-id refusal,
+re-review linking and carry-forward, missing-prior degradation, hold
+pages-once plus crash repair plus no-merge-path, PR-only hold),
+`tests/suite-lock.tests.js` (12 node cases including cross-process
+serialization, npm-on-Windows, fresh-vs-aged corrupt locks, and release
+masking), and 4 new work-state cases for the review door. Full run at
+landing: node suite 99/99, all 12 PowerShell suites pass unchanged.

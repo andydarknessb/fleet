@@ -9,7 +9,8 @@
   },
   "review": {
     "trivialMaxChangedLines": 25,
-    "trivialMaxFiles": 3
+    "trivialMaxFiles": 3,
+    "patternExcludePaths": ["**/*.md", "**/*.txt", "docs/**"]
   },
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },

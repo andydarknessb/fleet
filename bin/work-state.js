@@ -591,10 +591,11 @@ function observeRecord(options = {}) {
 
 const REVIEW_KINDS = Object.freeze({
   // Ticket 05: the project lead's one independent Standards+Spec review lands
-  // after gates settle; the IC-hosted risk review runs pre-PR-ready, so it may
-  // land while the record is still implementing.
+  // after gates settle; the IC-hosted risk review is pre-PR-ready ONLY
+  // (amendment 5) - implementing, a revision cycle, or a still-draft pr-open.
+  // ci-wait/review are excluded so the lead-hosted risk path stays closed.
   formal: ['review'],
-  risk: ['implementing', 'pr-open', 'ci-wait', 'review'],
+  risk: ['implementing', 'revision', 'pr-open'],
 });
 
 function recordReview(options = {}) {
@@ -780,9 +781,10 @@ function shadowProject(options = {}) {
 }
 
 function parseArgs(argv) {
-  const args = {};
+  const args = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
+    if (token === '--') { args._ = argv.slice(i + 1); break; }
     if (!token.startsWith('--')) continue;
     const key = token.slice(2);
     const next = argv[i + 1];

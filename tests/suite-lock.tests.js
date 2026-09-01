@@ -69,13 +69,50 @@ test('a lock whose owning process is dead is broken and re-acquired', () => {
   assert.equal(suiteStatus({ root, suite: 'sweep' }).owner.record, 'endzone:issue-42');
 });
 
-test('a corrupt lock file is quarantined, not a crash', () => {
+test('a corrupt lock file older than the grace window is broken, not a crash', () => {
   const root = rootDir();
   const lockDir = path.join(root, 'state', 'suite');
   fs.mkdirSync(lockDir, { recursive: true });
-  fs.writeFileSync(path.join(lockDir, 'sweep.lock'), 'not json', 'utf8');
+  const file = path.join(lockDir, 'sweep.lock');
+  fs.writeFileSync(file, 'not json', 'utf8');
+  const old = (Date.now() - 60 * 1000) / 1000;
+  fs.utimesSync(file, old, old);
   const result = acquireSuiteLock({ root, suite: 'sweep', record: 'endzone:issue-42' });
   assert.equal(result.acquired, true);
+});
+
+test('a fresh unreadable lock is treated as busy (a writer may be mid-write), never broken instantly', () => {
+  const root = rootDir();
+  const lockDir = path.join(root, 'state', 'suite');
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, 'sweep.lock'), '', 'utf8');
+  assert.throws(
+    () => acquireSuiteLock({ root, suite: 'sweep', record: 'endzone:issue-42', wait: true, timeoutMs: 400, pollMs: 100 }),
+    (error) => error.code === 'SUITE_BUSY',
+  );
+});
+
+test('runWithSuiteLock runs an npm command on this host (Windows .cmd shims resolve)', () => {
+  const root = rootDir();
+  const code = runWithSuiteLock({
+    root, suite: 'unit', record: 'endzone:issue-42',
+    command: 'npm', args: ['-v'], stdio: 'ignore',
+  });
+  assert.equal(code, 0);
+  assert.equal(suiteStatus({ root, suite: 'unit' }).held, false);
+});
+
+test('a release refusal in the run cleanup never masks the suite result', () => {
+  const root = rootDir();
+  const lockPath = path.join(root, 'state', 'suite', 'sweep.lock');
+  const script = 'const fs=require("node:fs");'
+    + `fs.writeFileSync(${JSON.stringify(lockPath)},JSON.stringify({suite:"sweep",record:"endzone:issue-99",pid:process.pid,at:new Date().toISOString()}));`
+    + 'process.exit(5);';
+  const code = runWithSuiteLock({
+    root, suite: 'sweep', record: 'endzone:issue-42',
+    command: process.execPath, args: ['-e', script], stdio: 'ignore',
+  });
+  assert.equal(code, 5);
 });
 
 test('suite names with shell-ish characters map to safe lock files', () => {

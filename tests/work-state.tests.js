@@ -308,3 +308,26 @@ test('review recording is idempotent and revision-guarded', () => {
     (error) => error.code === 'MISSING_REVIEW_EVIDENCE',
   );
 });
+
+test('a risk review records in the pre-PR-ready states (implementing, revision, pr-open) and nowhere later', () => {
+  const root = rootDir();
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'k-1', 'ack', '2026-09-01T04:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 'k-2', 'PR #77', '2026-09-01T04:00:02.000Z');
+  move(root, 'endzone:issue-42', 3, 'ci-wait', 'k-3', 'CI', '2026-09-01T04:00:03.000Z');
+  assert.throws(
+    () => recordReview({
+      root, id: 'endzone:issue-42', expectedRevision: 4, idempotencyKey: 'k-risk-ci', actor: 'ic-42',
+      review: { kind: 'risk', headSha: 'abc', artifact: 'state/reviews/x.json' },
+    }),
+    (error) => error.code === 'INVALID_REVIEW_STATE',
+  );
+  move(root, 'endzone:issue-42', 4, 'review', 'k-4', 'settled', '2026-09-01T04:00:04.000Z');
+  move(root, 'endzone:issue-42', 5, 'revision', 'k-5', 'returned', '2026-09-01T04:00:05.000Z');
+  const inRevision = recordReview({
+    root, id: 'endzone:issue-42', expectedRevision: 6, idempotencyKey: 'k-risk-rev', actor: 'ic-42',
+    now: '2026-09-01T04:00:06.000Z',
+    review: { kind: 'risk', headSha: 'abc', artifact: 'state/reviews/endzone_issue-42/risk-001.json', tier: 'high-risk', triggers: ['auth'] },
+  });
+  assert.equal(inRevision.record.review.risk.headSha, 'abc');
+});
