@@ -50,4 +50,42 @@ after verified shadow parity.
 
 ## Answer
 
-Not implemented. Runtime work requires separate authorization.
+08a implemented 2026-09-01: `bin/watchdog.ps1` (shadow supervisor + page path +
+launch retry cap), `bin/install-watchdog-task.ps1` (every 15 minutes while
+logged on, plus 4 min after logon, behind the recovery task), and
+`tests/watchdog.tests.ps1`. `sentinel-check.ps1` gained `-ReportPath` so shadow
+runs never touch the live Sentinel's `last-check.json`; `status.ps1` prints the
+red banner first. Shadow supervision runs with zero Claude turns, logs every
+proposed action set to `state/sentinel/shadow/` for the parity comparison, and
+pages (Windows toast + banner) only when self-healing is the casualty:
+check-failed, sentinel-stale or fleet-dead (45-minute heartbeat threshold), or
+a launch retry storm (cap 2 -> skip-hold carrying the recorded failure detail;
+a closed issue or an existing hold is logged as closed-stale/already-held, not
+paged). Staleness paging is suppressed while PAUSE is set (paused sessions
+idle by design; a rate-limit pause outlasts the threshold) and for a session
+whose daemon job started within the threshold (post-logon recovery grace); the
+shadowed check still performs its pre-existing read-only tenant `git fetch`.
+First live verify: healthy fleet, zero conditions; the two historical storms
+(ic-284 x5, ic-502 x2) root-caused to option-like tokens reaching `claude
+--bg` argv before the stdin-piping launcher fix (`--ext` is verbatim in #284's
+title; #502's `--jq` is the same failure class, but its carrying text was
+never recorded - the launch died before the roster stored a prompt), both
+classified closed-stale.
+
+Same-day adversarial QA found three blockers, all fixed and test-covered
+(20-case suite): a 24-hour retry window keeps immortal daemon history from
+resurrecting lifted holds or re-paging dead storms (timestamps parse as
+epoch-ms or ISO; a no-offset stamp reads as UTC, and a future-dated one as
+stale); the check's report FILE is the parse source, so child stderr can
+neither fake a check-failed page nor cost 08b its parity data, and a 180s
+timeout turns a wedged child into a page instead of a silent no-op; corrupt
+state (paged.json, heartbeats, rosters) quarantines or reads as stale rather
+than crashing the pager, and a crash banner prepends to - never masks - a
+standing condition banner; a human's unrelated skip-hold pages through as
+`held-other-paged` and is never overwritten. Accepted with documentation: a
+hold-write re-serializes the skip file BOM-less with PowerShell JSON escaping
+(every reader tolerates both), and the shadowed check's read-only tenant
+`git fetch` also runs under `-Verify`.
+
+08b (Sentinel removal) remains blocked by 07 and the 48-hour action/escalation
+parity gate; the shadow log accruing from the scheduled task is its evidence.

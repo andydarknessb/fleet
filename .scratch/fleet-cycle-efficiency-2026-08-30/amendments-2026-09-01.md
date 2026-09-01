@@ -31,7 +31,8 @@ baseline and sharpens the diagnosis:
 
 - Stage 1 - executed 2026-09-01 (this commit): context diet and paperwork;
   see "Stage 1" below.
-- Stage 2: 08a -> 04 -> 06.
+- Stage 2: 08a -> 04 -> 06. (08a implemented 2026-09-01 - see ticket 08's
+  Answer; its scheduled shadow log accrues toward 08b's 48-hour parity gate.)
 - Stage 3: 05 -> 07 -> 08b -> 02/03 cutover (the shadow assignment path
   becomes authoritative) -> 09 last, as the verification gate. Ticket 01's
   seven-day observation window (collector running since 09-01) must have
@@ -81,7 +82,12 @@ baseline and sharpens the diagnosis:
 8. **Metrics.** The spec's budgets are the token metrics. Two collaboration
    metrics join 08a/09 verification: a dead fleet pages Cory within one
    supervisor interval; false escalations are zero over a rolling week (the
-   08-27 daemon "blocked"-mislabel class counts as false).
+   08-27 daemon "blocked"-mislabel class counts as false). Precisely: a page
+   lands within one 15-minute supervisor interval of the 45-minute staleness
+   threshold being crossed - worst case ~60 minutes from death - and PAUSE or
+   a fresh relaunch suppresses staleness paging by design. False-page
+   measurement reads the shadow log's `newlyPaged` entries;
+   `state/watchdog/paged.json` holds only current conditions, not history.
 9. **Collector verification errors become terminal classifications** (ticket
    01 follow-through; code change deferred to the ticket): `CLOSED without
    mergedAt` -> `abandoned`; `PR not returned` -> `no-pr`. Excluded from
@@ -93,7 +99,9 @@ baseline and sharpens the diagnosis:
 11. **Glossary and ADRs.** `CONTEXT.md` gains **Rotation**; the **Sentinel**
     entry is rewritten at 08b cutover, not before; "dynamic workflow" was
     already an avoided synonym under **Fleet cycle**. ADR 0005 records the
-    bounded-lifetime decision.
+    bounded-lifetime decision. Post-QA 2026-09-01: **Watchdog** added as its
+    own term, and **Escalation**'s only-pager sentence scoped to the
+    reporting line (the Watchdog's out-of-band page is the exception).
 12. **Skip-file BOM handled reader-side only.** `state/skip/endzone.json`
     keeps its BOM (the classifier denies even Cory's session writes to that
     file); `bin/assignment.js` strips a leading BOM before `JSON.parse`

@@ -4,7 +4,7 @@
   worktree sweep (merged fleet branches, >7 days, unlocked), PAUSE on a rate-limit signal, clear a PAUSE it set once its window passes.
   Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC). The Sentinel session acts on those.
 #>
-param([switch]$Apply)
+param([switch]$Apply, [string]$ReportPath = '')
 . "$PSScriptRoot\_common.ps1"
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 $now = (Get-Date).ToUniversalTime()
@@ -182,5 +182,6 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
   }
 }
 
-Write-Json "$FleetHome\state\sentinel\last-check.json" ([pscustomobject]$report)
+if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
+Write-Json $ReportPath ([pscustomobject]$report)
 [pscustomobject]$report | ConvertTo-Json -Depth 6

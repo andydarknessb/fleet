@@ -78,7 +78,8 @@ _Avoid_: limit, quota, concurrency
 A condition an IC or project lead may not resolve on its own, handed one level
 up the reporting line until it reaches Cory: a permission prompt, red CI twice
 on one PR, scope drift, or a day without a commit. Escalations are the only
-events that page Cory.
+events that page Cory through the reporting line; the Watchdog's out-of-band
+page exists solely for when that line itself is down.
 _Avoid_: alert, error, blocker, "off the rails"
 
 **Reporting line**:
@@ -103,6 +104,14 @@ state - the roster, Work records, issues, and the skip file - never from its
 predecessor's transcript. A respawn is not a rotation: it re-pins the old
 flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
+
+**Watchdog**:
+The scheduled task, never a session, that shadows the mechanical check, keeps
+the parity log, and pages Cory out of band - a toast and a red banner in the
+status view - only when self-healing is the casualty: the check cannot run,
+the Sentinel is stale, every static heartbeat is stale, or launches of one
+name keep failing. It acts on nothing and launches nothing.
+_Avoid_: sentinel (a session), monitor, health checker
 
 ### Work
 

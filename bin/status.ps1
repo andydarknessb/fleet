@@ -1,6 +1,7 @@
 # One-screen view of the fleet.
 . "$PSScriptRoot\_common.ps1"
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
+if (Test-Path "$FleetHome\state\watchdog\banner.txt") { Write-Host (Get-Content "$FleetHome\state\watchdog\banner.txt" -Raw -Encoding UTF8) -ForegroundColor Red }
 if (Test-Paused) { Write-Output "PAUSE: $(Get-Content "$FleetHome\state\PAUSE" -Raw)" }
 $names = Get-FleetNames -Live $live -Static $static
 $rows = foreach ($n in $names) {
