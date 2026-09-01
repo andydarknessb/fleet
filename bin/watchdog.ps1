@@ -6,8 +6,20 @@
   casualty: the check cannot run or report, fleet state is unreadable, the Sentinel
   heartbeat is stale, every static heartbeat is stale, or a launch retry storm is
   detected (>= 2 consecutive failed launches of one name inside a 24h window ->
-  skip-hold + one page). It never acts on the fleet and never pages what the live
-  Sentinel will handle itself. Zero Claude turns. Registered by install-watchdog-task.ps1.
+  skip-hold + one page). While the rostered Sentinel is enabled it never acts on the fleet
+  and never pages what the live Sentinel will handle itself. Zero Claude turns.
+  Registered by install-watchdog-task.ps1.
+
+  Ticket 08b (live mode): once state/flags/sentinel-off stands (cutover-sentinel.ps1)
+  and no Sentinel session is running, the same run IS the supervisor: the check runs
+  with -Apply (respawns, retirements, sweeps, rate-limit PAUSE; ledger actor
+  'watchdog'), missing static sessions are launched through launch.ps1 -FromRoster
+  (never under a PAUSE), a respawn files an escalation
+  naming the parent, and check escalations of the configured kinds
+  (config/cycle.json supervisor.pageKinds) page once per new name:kind as a banner
+  condition plus one escalation file. `blocked` is recorded, never paged: the daemon's
+  label is a summary of a session's last line, not a measured wait. A Sentinel session
+  running under the flag is the double-actor condition: page, stay in shadow.
 #>
 [CmdletBinding()]
 param(
@@ -25,17 +37,6 @@ try {
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
-
-  function ConvertTo-UtcDateTime {
-    # Daemon rows carry startedAt as Int64 epoch ms; heartbeats carry ISO strings. A stamp
-    # with no offset is taken as UTC (fail-safe: local-time assumption reads hours fresh).
-    param($Value)
-    if ($null -eq $Value -or "$Value" -eq '') { return $null }
-    try {
-      if ("$Value" -match '^\d{12,14}$') { return [DateTimeOffset]::FromUnixTimeMilliseconds([long]$Value).UtcDateTime }
-      return [DateTimeOffset]::Parse("$Value", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime
-    } catch { return $null }
-  }
 
   function Get-HeartbeatAgeMinutes {
     # $null = no heartbeat recorded; unparseable or future-dated (skew) = stale, never fatal.
@@ -56,18 +57,44 @@ try {
     return $s
   }
 
-  # --- run the mechanical check in shadow. The child writes its report to -ReportPath
-  # --- (so the live Sentinel's state/sentinel/last-check.json stays untouched) and the
-  # --- report FILE is the parse source: stdout/stderr may carry warnings and must not
-  # --- fail a healthy run or cost 08b its parity data. Deleting the file first makes
-  # --- its existence proof of a fresh, completed check.
-  $shadowReportPath = if ($Verify) { Join-Path $env:TEMP 'fleet-watchdog-verify-check.json' } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
-  if (-not $Verify) { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null }
-  Remove-Item $shadowReportPath -ErrorAction SilentlyContinue
+  # --- mode (ticket 08b). Shadow while the rostered Sentinel is enabled. Live only when
+  # --- state/flags/sentinel-off stands AND no Sentinel session is running: two actors on
+  # --- one fleet is the one thing cutover must never produce, so a running Sentinel under
+  # --- the flag pages (double-actor) and this run stays in shadow. -Verify never applies.
+  $supervisorConfig = $null
+  try { $supervisorConfig = (Read-Json "$FleetHome\config\cycle.json").supervisor } catch {}
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged')
+  if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
+  # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
+  # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
+  # below tolerates the empty list as 08a did.
+  $daemon = @(); $daemonReadError = ''
+  try { $daemon = Get-DaemonSessions -All -Strict } catch { $daemonReadError = "$($_.Exception.Message)" }
+  $sentinelOff = Test-SentinelOff
+  function Get-SentinelRow { $daemon | Where-Object { "$($_.name)" -eq 'sentinel' -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1 }
+  $sentinelRow = Get-SentinelRow
+  $mode = 'shadow'; $modeReason = 'rostered Sentinel enabled'
+  if ($sentinelOff) {
+    if ($daemonReadError) { $modeReason = "sentinel-off stands but the daemon session list is unreadable ($daemonReadError); staying in shadow" }
+    elseif ($sentinelRow) { $modeReason = "sentinel-off stands but a Sentinel session is running (job $($sentinelRow.id)); staying in shadow" }
+    elseif ($Verify) { $modeReason = 'sentinel-off stands; -Verify never applies' }
+    else { $mode = 'live'; $modeReason = 'sentinel-off stands and no Sentinel session is running' }
+  }
+
+  # --- run the mechanical check. In shadow the child writes its report to -ReportPath
+  # --- (so the live Sentinel's state/sentinel/last-check.json stays untouched); live, it
+  # --- applies and owns that canonical report. Either way the report FILE is the parse
+  # --- source: stdout/stderr may carry warnings and must not fail a healthy run or cost
+  # --- 08b its parity data. Deleting the file first makes its existence proof of a
+  # --- fresh, completed check.
+  $reportPath = if ($Verify) { Join-Path $env:TEMP 'fleet-watchdog-verify-check.json' } elseif ($mode -eq 'live') { "$FleetHome\state\sentinel\last-check.json" } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
+  if (-not $Verify) { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; [IO.Directory]::CreateDirectory("$FleetHome\state\sentinel") | Out-Null }
+  Remove-Item $reportPath -ErrorAction SilentlyContinue
   $check = $null; $checkError = ''; $checkExit = $null
   $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
   try {
-    $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\sentinel-check.ps1`" -ReportPath `"$shadowReportPath`""
+    $applyArgs = if ($mode -eq 'live') { ' -Apply -Actor watchdog' } else { '' }
+    $childArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$PSScriptRoot\sentinel-check.ps1`" -ReportPath `"$reportPath`"$applyArgs"
     $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $childArgs -NoNewWindow -PassThru -RedirectStandardOutput $childOut -RedirectStandardError $childErr
     if (-not $p.WaitForExit($checkTimeoutSec * 1000)) {
       try { $p.Kill() } catch {}
@@ -75,13 +102,16 @@ try {
     } else { $checkExit = $p.ExitCode }
   } catch { $checkError = "sentinel-check could not start: $($_.Exception.Message)" }
   if (-not $checkError) {
-    if (Test-Path $shadowReportPath) { try { $check = Read-Json $shadowReportPath } catch {} }
+    if (Test-Path $reportPath) { try { $check = Read-Json $reportPath } catch {} }
     if (-not $check) {
       $errText = ''; try { $errText = Get-Content $childErr -Raw -ErrorAction SilentlyContinue } catch {}
-      $checkError = "exit=$checkExit; no readable report at $shadowReportPath; stderr: $(Get-OneLine $errText)"
+      $checkError = "exit=$checkExit; no readable report at $reportPath; stderr: $(Get-OneLine $errText)"
     }
   }
   Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue
+  # A live check just respawned or retired sessions; the staleness grace below must read
+  # the rows as they are now, not the pre-action snapshot, or the curing tick pages.
+  if ($mode -eq 'live') { try { $daemon = Get-DaemonSessions -All -Strict } catch {} }
 
   # --- self-healing staleness: page only when the healer, not the patient, is down.
   # --- A fresh daemon startedAt is grace for a stale/absent heartbeat: a session just
@@ -90,12 +120,13 @@ try {
   # --- staleness paging entirely: paused sessions idle by design, and a rate-limit
   # --- pause (60 min) outlasts the staleness threshold.
   $stateErrors = @()
-  $daemon = Get-DaemonSessions -All
   $paused = Test-Paused
   $static = $null
   try { $static = Get-StaticRoster } catch { $stateErrors += "static roster unreadable: $(Get-OneLine $_.Exception.Message 120)" }
   $staticNames = @()
-  if ($static) { $staticNames = @($static.sessions | ForEach-Object { "$($_.name)" } | Where-Object { $_ }) }
+  # Under sentinel-off the rostered Sentinel is not expected: no sentinel-stale, and
+  # fleet-dead is judged over the sessions that are.
+  if ($static) { $staticNames = @((Get-ExpectedStaticSessions $static) | ForEach-Object { "$($_.name)" } | Where-Object { $_ }) }
   $staleStatics = @()
   foreach ($n in $staticNames) {
     $age = Get-HeartbeatAgeMinutes $n
@@ -196,10 +227,68 @@ try {
     $tripEvals += $ev
   }
 
+  # --- live supervision (ticket 08b): what the Sentinel session used to do with the
+  # --- report. launchNeeded (a name the daemon has no job for) goes through the one
+  # --- door; PAUSE launches nothing (the check itself still ran, which is how a
+  # --- rate-limit PAUSE gets cleared). A failed launch leaves a failed daemon row, so
+  # --- the retry-cap page above is the bound on repeats, as for the Sentinel. A
+  # --- respawn files an escalation for the parent: a script cannot message a session,
+  # --- so the "re-send its assignment" nudge is visible decision evidence until wake
+  # --- delivery is authorized (ticket 09). A respawned dispatcher pages, as before. The
+  # --- same job respawned tick after tick (a session that will not stay up) is ONE
+  # --- condition: state/watchdog/notified.json holds the respawns of the previous tick,
+  # --- and a name:job seen there is neither re-filed nor re-toasted.
+  $launches = @(); $notified = @(); $waiting = @()
+  $notifiedPath = "$FleetHome\state\watchdog\notified.json"
+  $previouslyNotified = @()
+  try { $prevNotified = Read-Json $notifiedPath; if ($prevNotified) { $previouslyNotified = @($prevNotified.PSObject.Properties.Name) } } catch {}
+  $currentRespawnKeys = @()
+  if ($mode -eq 'live' -and $check) {
+    foreach ($need in @($check.launchNeeded)) {
+      $name = "$($need.name)"; if (-not $name) { continue }
+      $result = [pscustomobject]@{ name = $name; launched = $false; reason = ''; jobId = $null }
+      if ($paused) { $result.reason = 'PAUSE set; not launched' }
+      else {
+        try {
+          $raw = & "$PSScriptRoot\launch.ps1" -FromRoster $name 2>&1 | Out-String
+          $parsed = ConvertFrom-LastJsonLine $raw
+          if ($parsed -and $parsed.PSObject.Properties['launched']) {
+            $result.launched = [bool]$parsed.launched
+            $result.reason = if ($parsed.launched) { 'launched' } else { Get-OneLine $parsed.reason 200 }
+            if ($parsed.jobId) { $result.jobId = $parsed.jobId }
+          } else { $result.reason = "launch.ps1 returned no JSON: $(Get-OneLine $raw 200)" }
+        } catch { $result.reason = "launch.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
+      }
+      $launches += $result
+    }
+    foreach ($r in @($check.respawned)) {
+      $key = "respawned:$($r.name):$($r.jobId)"
+      $currentRespawnKeys += $key
+      if ($previouslyNotified -contains $key) { $waiting += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned-again'; detail = "job $($r.jobId) respawned again ($($r.reason)); already notified" }; continue }
+      $detail = "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task."
+      Write-Escalation -From 'supervisor' -Kind 'respawned' -Detail $detail -Name "$($r.name)" -Parent "$($r.parent)"
+      $toast = $null
+      if ("$($r.name)" -eq 'dispatcher' -and -not $NoToast) { $toast = Send-FleetToast 'Fleet supervisor' "dispatcher respawned ($($r.reason)) - run bin\status.ps1" }
+      $notified += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned'; parent = "$($r.parent)"; toastDelivered = $toast }
+    }
+    foreach ($e in @($check.escalate)) {
+      if ($pageKinds -notcontains "$($e.kind)") { $waiting += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; detail = Get-OneLine $e.detail 200 } }
+    }
+  }
+
   # --- page conditions ---
   $conditions = @()
   if ($checkError) { $conditions += [pscustomobject]@{ key = 'check-failed'; detail = "sentinel-check could not run or report: $(Get-OneLine $checkError 300)" } }
   foreach ($se in $stateErrors) { $conditions += [pscustomobject]@{ key = 'state-unreadable'; detail = $se } }
+  if ($sentinelOff -and $sentinelRow) {
+    $conditions += [pscustomobject]@{ key = 'double-actor'; detail = "state/flags/sentinel-off stands but a Sentinel session is running (job $($sentinelRow.id)); the supervisor stays in shadow so nothing acts twice. Stop that session (claude stop $($sentinelRow.id)) or run bin\rollback-sentinel.ps1" }
+  }
+  if ($mode -eq 'live' -and $check) {
+    foreach ($e in @($check.escalate)) {
+      if ($pageKinds -notcontains "$($e.kind)") { continue }
+      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e }
+    }
+  }
   $escCount = @(Get-ChildItem "$FleetHome\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count
   $checkEsc = 0; if ($check) { $checkEsc = @($check.escalate).Count }
   $pendingNote = "; $escCount escalation file(s) and $checkEsc check-reported escalation(s) have no live relay"
@@ -247,6 +336,18 @@ try {
       Remove-Item $bannerPath -ErrorAction SilentlyContinue
     }
     Write-Json $pagedPath $nextPaged
+    $nextNotified = [pscustomobject]@{}
+    foreach ($k in $currentRespawnKeys) { $nextNotified | Add-Member -NotePropertyName $k -NotePropertyValue (Now-Iso) -Force }
+    Write-Json $notifiedPath $nextNotified
+    # A check escalation pages once per new name:kind and leaves one escalation file
+    # (the evidence the Dispatcher role and status.ps1 already read); while it stands,
+    # the banner carries it and nothing is re-filed or re-sent.
+    foreach ($c in @($newConditions | Where-Object { $_.PSObject.Properties['escalation'] -and $_.escalation })) {
+      $e = $c.escalation
+      $parentName = ''; if ($e.PSObject.Properties['parent']) { $parentName = "$($e.parent)" }
+      Write-Escalation -From 'supervisor' -Kind "$($e.kind)" -Detail "$($e.detail)" -Name "$($e.name)" -Parent $parentName
+      $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
+    }
     if (@($newConditions).Count -gt 0 -and -not $NoToast) {
       $body = (@($newConditions | ForEach-Object { $_.key }) -join ', ')
       # Send-FleetToast (_common.ps1) is shared with the ticket-07 notifier; the banner is the guaranteed channel.
@@ -259,12 +360,16 @@ try {
   if ($check) {
     $proposed = [pscustomobject]@{
       respawned = $check.respawned; launchNeeded = $check.launchNeeded; escalate = $check.escalate
-      retired = $check.retired; worktrees = $check.worktrees; pause = $check.pause; okCount = @($check.ok).Count
+      retired = $check.retired; worktrees = $check.worktrees; sync = $check.sync; pause = $check.pause; okCount = @($check.ok).Count
     }
+    # A fail-closed tick proposed nothing because it could not see the fleet; parity must not count it as clean.
+    if ($check.PSObject.Properties['daemonReadError'] -and $check.daemonReadError) { $proposed | Add-Member -NotePropertyName daemonReadError -NotePropertyValue "$($check.daemonReadError)" }
   }
   $entry = [pscustomobject]@{
-    at = (Now-Iso); conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
+    at = (Now-Iso); mode = $mode; modeReason = $modeReason
+    conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
     toastDelivered = $toastDelivered; checkError = $checkError; proposed = $proposed
+    launches = $launches; notified = $notified; waiting = $waiting
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; paused = [bool]$paused; verify = [bool]$Verify
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)
@@ -272,6 +377,8 @@ try {
     $shadowDir = "$FleetHome\state\sentinel\shadow"
     [IO.Directory]::CreateDirectory($shadowDir) | Out-Null
     [IO.File]::AppendAllText("$shadowDir\$($now.ToString('yyyyMMdd')).jsonl", $line + [Environment]::NewLine, $Utf8)
+    # The supervisor's own heartbeat: status.ps1 shows it, the Dispatcher's watch reads it.
+    Write-Json "$FleetHome\state\watchdog\last-run.json" ([pscustomobject]@{ at = $entry.at; mode = $mode; modeReason = $modeReason; conditions = $entry.conditions; checkError = $checkError })
   }
   Write-Output $line
   exit 0

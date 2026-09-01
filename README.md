@@ -7,7 +7,7 @@ The standing crew of Claude Code sessions that runs Cory's projects between prom
 ```
 cory
  └─ dispatcher (opus)      your interface; relays escalations; daily digest; watches the sentinel
- └─ sentinel   (sonnet)    keeps the roster alive and under the cap; never reasons about work
+ └─ sentinel   (sonnet)    keeps the roster alive and under the cap; never reasons about work (until 08b cutover; then the watchdog task)
      └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
          └─ ic-<issue> (sonnet) one per issue, launched with /implement; opens a PR; talks only to its project lead
              └─ qa-reviewer (opus worker)   risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
@@ -15,6 +15,7 @@ cory
 
 - **Sessions** are background Claude Code sessions hosted by the daemon (`claude agents`). **Workers** are subagents inside a session. Cap counts sessions only.
 - Reporting line: IC → project lead → dispatcher → Cory. The Sentinel reports to the dispatcher. Nobody skips a level.
+- **Supervision** (ticket 08b). Until cutover the rostered Sentinel session runs the mechanical check every 15 minutes and the watchdog task shadows it, logging both sides for `bin/parity.js`. After `bin/cutover-sentinel.ps1` (gated on 48 continuous parity hours) the flag `state/flags/sentinel-off` stands, the watchdog task IS the supervisor (the same check with `-Apply`, launches through the one door, escalations as files + one page), and the Sentinel's `roster.json` entry stays for one release as the rollback path (`bin/rollback-sentinel.ps1`). `bin/status.ps1` says which is live.
 - Work is a GitHub Issue carrying the tenant's `readyLabel`. Only Cory applies that label (that is your 35% interaction: you approve scope, not code).
 - Carve-outs (migrations, deploy hooks, env, CI secrets; per tenant file) never merge without you.
 - **Deploy gate.** A tenant may name a `releaseBranch` distinct from its `defaultBranch` (endzone: `integration` / `main`). The fleet branches from, targets, and merges into the default branch only. Promotion to the release branch (which auto-deploys the client) is yours: `git push origin integration:main` when you want a release. The Sentinel keeps the default branch fast-forwarded to the release branch after anything you merge directly (`bin/sync-integration.ps1`, pure fast-forward only; divergence escalates).
@@ -35,8 +36,13 @@ cory
 | `bin/rotation-policy.js` | Read-only rotation policy: `evaluate` reports which standing sessions are past a threshold (roster age, `state-merged` events since launch, transcript job tokens); `offset` captures the event-ledger position. |
 | `bin/rotate.ps1` | Rotation driver: only at a safe boundary (daemon `status` not busy, no work-state lock or pending journal) it saves the offset intent to `state/rotation/<name>.json`, retires the session, reconciles Work records (one pr-watch tick per tenant), and relaunches through `launch.ps1 -FromRoster`. A crash between stop and launch resumes from the intent (`-Resume`/`-Auto`). `-Name X -Force` is Cory's hand. |
 | `bin/run-rotation.ps1` | Bounded rotation runner used by Task Scheduler (every 15 min); `install-rotation-task.ps1` registers it - run manually, the fleet never self-registers. |
-| `state/flags/` | Rollback flags, one file each, independent of launch gates: `legacy-notice` (restore `state/NOTICE.md` injection and unfiltered boards), `rotation-off` (disable auto rotation), `launch-ceiling-off` (disable the first-turn gate), `tool-contract-off` (skip the per-role deny injection); and the ticket-07 delivery gate `notifier-live` (ABSENT by default: the notifier runs in shadow and the Dispatcher relay stays the pager; create the file to let decision events page Cory directly). |
-| `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, and rate-limit PAUSE. An IC waiting on an open PR or skip-list hold is never stale-heartbeat respawned. |
+| `state/flags/` | Rollback flags, one file each, independent of launch gates: `legacy-notice` (restore `state/NOTICE.md` injection and unfiltered boards), `rotation-off` (disable auto rotation), `launch-ceiling-off` (disable the first-turn gate), `tool-contract-off` (skip the per-role deny injection); the ticket-07 delivery gate `notifier-live` (ABSENT by default: the notifier runs in shadow and the Dispatcher relay stays the pager; create the file to let decision events page Cory directly); and the ticket-08b cutover flag `sentinel-off` (written by `cutover-sentinel.ps1`, removed by `rollback-sentinel.ps1`, never by hand: the watchdog supervises while it stands, and the launch door refuses a Sentinel). |
+| `state/sentinel/` | `last-check.json` (the supervisor's latest applied report), `shadow/<day>.jsonl` (every watchdog tick: mode, proposed action set, conditions, launches, notifications), `applied/<day>.jsonl` (every `-Apply` tick by actor), `parity-approved.json` (Cory's approved intentional differences: `{class, category?, name?, kind?, note, by, at}`), `cutover.json` (cutover and rollback records). |
+| `bin/sentinel-check.ps1` | The mechanical check (the Sentinel's until cutover, the watchdog's after); `-Apply` performs respawns, retirements, worktree sweeps, and rate-limit PAUSE, and appends what it did to `state/sentinel/applied/<day>.jsonl` stamped with `-Actor` (`sentinel` by default, `watchdog` live). An IC waiting on an open PR or skip-list hold is never stale-heartbeat respawned. Under `state/flags/sentinel-off` the rostered Sentinel is not expected; one still running is a `stray`. |
+| `bin/watchdog.ps1` | The scheduled supervisor (tickets 08a/08b; `install-watchdog-task.ps1` registers it, every 15 min + 4 min after logon). Shadow while the Sentinel is enabled: runs the check read-only, logs the proposed action set to `state/sentinel/shadow/`, and pages (toast + red banner) only when self-healing itself is down (check-failed, sentinel-stale, fleet-dead, launch retry storm -> skip-hold). Live under `state/flags/sentinel-off` with no Sentinel session running: the check runs `-Apply -Actor watchdog`, `launchNeeded` goes through `launch.ps1 -FromRoster` (never under PAUSE), a respawn files a `respawned` escalation naming the parent, and check escalations of `config/cycle.json` `supervisor.pageKinds` page once per new `name:kind` (banner condition + one escalation file); `blocked` is recorded as waiting, never paged. A Sentinel session running under the flag is the `double-actor` condition: page, stay in shadow. Writes `state/watchdog/last-run.json` every run. |
+| `bin/parity.js` | The 08b gate: pairs shadow ticks with the Sentinel's applied ticks and classifies every difference in seven categories (respawned, launchNeeded, retired, worktrees, sync, pause, escalate). Expected by construction: `applied-next-tick` (the shadow proposed it, the next Sentinel tick applied it), `applied-before-shadow` (proposed by an unpaired shadow tick), `timing` (an escalation one tick early or late). Gating unless approved in `state/sentinel/parity-approved.json`: `unproposed-action` (the Sentinel acted, no shadow tick proposed it), `proposed-not-applied`, `report-drift`, `sentinel-tick-missing`, `shadow-tick-missing`, `shadow-check-failed`, `shadow-read-failed` / `sentinel-read-failed` (a fail-closed tick is not clean evidence). Passes when the most recent continuous paired run covers `supervisor.parityHours`. `--json` for scripts, text otherwise; exit 2 on fail. |
+| `bin/cutover-sentinel.ps1` | Cut the rostered Sentinel over: refuses unless parity passes, the watchdog task is registered and ticking, and the Sentinel is not mid-turn (`-Force` overrides the first two and is recorded; the turn boundary never); then writes the flag, retires the session through `retire.ps1`, records `state/sentinel/cutover.json`, prints the paperwork checklist. `-DryRun` evaluates only. |
+| `bin/rollback-sentinel.ps1` | Rollback within one release: removes the flag and launches the Sentinel through `launch.ps1 -FromRoster sentinel` from its retained entry; a failed launch puts the flag back. Touches no ledger or offset. |
 | `bin/retire.ps1` | Mark a finished IC as retiring before stopping it, remove its job/worktrees, and report verified remaining worktree state. |
 | `bin/work-state.js` | Canonical shadow Work-record/event command; validates transitions, revisions, idempotency, projections, and retirement archival. Ticket 07 added the `notify` door (`--phase claim|sent|failed|authorize-retry --decision-sequence <n>`): delivery state for one decision event lives on the record and in typed `notification-*` events; a failed page is inert until `authorize-retry` (evidence required), which re-arms exactly one attempt and launches it. A CLI `transition` to `escalated` or `hold` launches the notifier for its event (`--no-notifier` suppresses either). |
 | `bin/review-policy.js` | Ticket-05 review policy: risk-tier classification from tenant `carveOuts` + `riskTriggers`, one findings artifact per review (recorded through the work-state `review` door), revision re-review scoping, and the hold-and-page-once path. |
@@ -53,8 +59,8 @@ cory
 | `bin/install-cycle-collector-task.ps1` | Idempotently registers the daily collector task; run manually. |
 | `bin/pause.ps1` | Fleet-wide kill switch. `-Off` clears. |
 | `bin/status.ps1` | One-screen view. |
-| `bin/recover.ps1` | Bring the roster back after a reboot. `install-recovery-task.ps1` registers it at logon. |
-| `bin/pilot.ps1` | Launch sentinel, dispatcher, pl-endzone. `-DryRun` to check gates without starting anything. |
+| `bin/recover.ps1` | Bring the roster back after a reboot (a cut-over Sentinel is not recovered). `install-recovery-task.ps1` registers it at logon. |
+| `bin/pilot.ps1` | Launch sentinel, dispatcher, pl-endzone (the Sentinel is skipped under `state/flags/sentinel-off`). `-DryRun` to check gates without starting anything. |
 | `state/` | Runtime only, gitignored: live roster, heartbeats, escalations, per-session settings, status files, PAUSE. |
 | `state/metrics/` | Generated measurement artifacts; cache-read tokens remain separate from fresh control-plane and IC tokens. |
 | `state/work/` | Shadow Work records and crash-recovery journals; legacy actors remain authoritative until cutover. |
@@ -93,6 +99,11 @@ node C:\Users\Cory\fleet\bin\exclusions.js add --tenant endzone --issue <n> --ow
 node C:\Users\Cory\fleet\bin\exclusions.js lift --tenant endzone --id endzone:excl-<n>-1 --actor cory --evidence "..."
 node C:\Users\Cory\fleet\bin\work-state.js notify --id <tenant>:issue-<n> --phase authorize-retry --decision-sequence <seq> --expected-revision <r> --actor cory --evidence "..."   # re-arm ONE more page after a failed delivery
 New-Item C:\Users\Cory\fleet\state\flags\notifier-live               # cutover: decision events page you directly (toast)
+
+# ticket 08b: supervision parity and cutover
+node C:\Users\Cory\fleet\bin\parity.js                               # 48h parity report (text; --json for scripts)
+powershell -File C:\Users\Cory\fleet\bin\cutover-sentinel.ps1 -DryRun  # gates only; drop -DryRun to cut over
+powershell -File C:\Users\Cory\fleet\bin\rollback-sentinel.ps1         # restore the rostered Sentinel within one release
 ```
 
 ### Tenant check policy
@@ -111,6 +122,7 @@ The lists must be disjoint. `setup.ps1` and the stop hook reject an overlapping 
 2. `powershell -File C:\Users\Cory\fleet\bin\pilot.ps1 -DryRun`, then without `-DryRun`.
 3. `claude agents`, pin dispatcher, sentinel, and pl-endzone with Ctrl+T.
 4. Optional, survives reboot: `powershell -File C:\Users\Cory\fleet\bin\install-recovery-task.ps1`.
+5. `powershell -File C:\Users\Cory\fleet\bin\install-watchdog-task.ps1`: the scheduled supervisor (shadow until cutover, then live).
 
 ## Skills the roles use
 
@@ -121,7 +133,7 @@ The `mattpocock-skills` plugin is enabled at user scope, so every fleet session 
 0. In the tenant repo, run `/setup-matt-pocock-skills` yourself first (it is user-only). The skills read `docs/agents/issue-tracker.md` and `docs/agents/triage-labels.md`; without them `/code-review` and friends have no tracker to talk to.
 1. Copy `tenants/endzone.json` to `tenants/<name>.json` and fill it in. The repo needs the ready label and an escalation label.
 2. Add a `pl-<name>` entry to `roster.json` (copy `pl-endzone`, change tenant, cwd, prompt).
-3. `launch.ps1 -FromRoster pl-<name>` (or just wait: the Sentinel's next check reports it as `launchNeeded` and launches it).
+3. `launch.ps1 -FromRoster pl-<name>` (or just wait: the supervisor's next check reports it as `launchNeeded` and launches it).
 
 ## Things learned the hard way (verified 2026-08-22, Claude Code 2.1.239, Windows 11)
 
@@ -133,4 +145,4 @@ The `mattpocock-skills` plugin is enabled at user scope, so every fleet session 
 - **Hook commands run through a POSIX shell, even on Windows.** Backslashes in `fleet-settings.json` hook paths get eaten (`C:UsersCory...`). Use forward slashes: `-File C:/Users/Cory/fleet/hooks/stop.ps1`. PowerShell accepts them.
 - `--settings <file>` on `claude --bg` applies the file's `env` block and `hooks`; that is how a session learns who it is (`FLEET_*`). `respawnFlags` in the job's `state.json` records the settings path, so `claude respawn` keeps the identity.
 - Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the Sentinel and dispatcher to recreate theirs.
-- Max 5x: rate limiting is a first-class state. The Sentinel sets a 60-minute PAUSE when a fleet job reports one and clears it after the window.
+- Max 5x: rate limiting is a first-class state. The supervisor's applied check sets a 60-minute PAUSE when a fleet job reports one and clears it after the window.

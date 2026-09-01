@@ -3,7 +3,8 @@
 & claude daemon status 2>$null | Out-Null
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 $out = @()
-$wanted = @($static.sessions | ForEach-Object { [pscustomobject]@{ name = $_.name; fromRoster = $true; entry = $null } })
+# Ticket 08b: a cut-over Sentinel (state/flags/sentinel-off) is not recovered; the watchdog task supervises.
+$wanted = @((Get-ExpectedStaticSessions $static) | ForEach-Object { [pscustomobject]@{ name = $_.name; fromRoster = $true; entry = $null } })
 $wanted += @($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' } | ForEach-Object { [pscustomobject]@{ name = $_.name; fromRoster = $false; entry = $_ } })
 foreach ($w in $wanted) {
   $row = $daemon | Where-Object { $_.name -eq $w.name } | Sort-Object startedAt -Descending | Select-Object -First 1

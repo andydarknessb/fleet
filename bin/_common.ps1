@@ -4,6 +4,17 @@ $script:Utf8 = New-Object System.Text.UTF8Encoding $false
 function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null } }
 function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
+function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
+function Get-ExpectedStaticSessions {
+  # The static roster minus the rostered Sentinel while state/flags/sentinel-off stands
+  # (ticket 08b cutover): its roster.json entry stays as the rollback path, and nothing
+  # expects, launches, or recovers it until rollback-sentinel.ps1 removes the flag.
+  param($Static)
+  if (-not $Static) { $Static = Get-StaticRoster }
+  $sessions = @(); if ($Static -and $Static.sessions) { $sessions = @($Static.sessions) }
+  if (Test-SentinelOff) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'sentinel' -and "$($_.name)" -ne 'sentinel' }) }
+  return $sessions
+}
 function Get-LiveRoster {
   $p = "$FleetHome\state\roster.json"
   $r = Read-Json $p
@@ -38,9 +49,20 @@ function Get-DaemonSessions {
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
 function Get-FleetNames {
   param($Live, $Static)
-  $n = @($Static.sessions | ForEach-Object { $_.name })
+  $n = @((Get-ExpectedStaticSessions $Static) | ForEach-Object { $_.name })
   $n += @($Live.sessions | Where-Object { $_.status -eq 'active' } | ForEach-Object { $_.name })
   $n | Select-Object -Unique
+}
+function ConvertTo-UtcDateTime {
+  # Daemon rows carry startedAt as Int64 epoch ms; heartbeats and reports carry ISO
+  # strings. A stamp with no offset is taken as UTC (fail-safe: a local-time assumption
+  # reads hours fresh); anything unparseable is $null, never a throw.
+  param($Value)
+  if ($null -eq $Value -or "$Value" -eq '') { return $null }
+  try {
+    if ("$Value" -match '^\d{12,14}$') { return [DateTimeOffset]::FromUnixTimeMilliseconds([long]$Value).UtcDateTime }
+    return [DateTimeOffset]::Parse("$Value", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal).UtcDateTime
+  } catch { return $null }
 }
 function Test-Paused { Test-Path "$FleetHome\state\PAUSE" }
 function Now-Iso { (Get-Date).ToUniversalTime().ToString('o') }
@@ -60,9 +82,19 @@ function ConvertFrom-LastJsonLine {
   try { return ("$Text".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
 }
 function Write-Escalation {
-  param($From, $Kind, $Detail)
+  # -Name / -Parent (ticket 08b) name the session the escalation is about and who owns
+  # it on the reporting line; older callers omit them. The file name carries the kind
+  # and name so two escalations in one second do not collide.
+  param($From, $Kind, $Detail, $Name = '', $Parent = '')
+  [IO.Directory]::CreateDirectory("$FleetHome\state\escalations") | Out-Null
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-  Write-Json "$FleetHome\state\escalations\$stamp-$From.json" ([pscustomobject]@{ at = (Now-Iso); from = $From; kind = $Kind; detail = $Detail })
+  $obj = [ordered]@{ at = (Now-Iso); from = $From; kind = $Kind; detail = $Detail }
+  $suffix = ''
+  if ($Name) { $obj.name = $Name; $suffix = "-$(($Name -replace '[^a-zA-Z0-9_.-]', '_'))" }
+  if ($Parent) { $obj.parent = $Parent }
+  if ($Name -and $Kind) { $suffix = "$suffix-$(($Kind -replace '[^a-zA-Z0-9_.-]', '_'))" }
+  $file = "$FleetHome\state\escalations\$stamp-$From$suffix.json"
+  Write-Json $file ([pscustomobject]$obj)
 }
 function Send-FleetToast {
   # Windows toast through the PowerShell AppUserModelId (no BurntToast dependency).

@@ -4,10 +4,41 @@
   worktree sweep (merged fleet branches, >7 days, unlocked), PAUSE on a rate-limit signal, clear a PAUSE it set once its window passes.
   Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC). The Sentinel session acts on those.
 #>
-param([switch]$Apply, [string]$ReportPath = '')
+param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel')
 . "$PSScriptRoot\_common.ps1"
+function Write-AppliedLedger {
+  # Ticket 08b parity evidence: every -Apply tick appends what it did to
+  # state/sentinel/applied/<day>.jsonl, the legacy side bin/parity.js pairs with the
+  # watchdog's shadow log. Read-only runs (no -Apply) leave no ledger line.
+  param($Report)
+  if (-not $Apply) { return }
+  try {
+    $dir = "$FleetHome\state\sentinel\applied"
+    [IO.Directory]::CreateDirectory($dir) | Out-Null
+    $okCount = 0; if ($Report.ok) { $okCount = @($Report.ok).Count }
+    $line = [ordered]@{
+      at = $Report.at; actor = $Actor; applied = $true
+      respawned = @($Report.respawned); launchNeeded = @($Report.launchNeeded); escalate = @($Report.escalate)
+      retired = @($Report.retired); worktrees = @($Report.worktrees); sync = @($Report.sync); pause = $Report.pause; okCount = $okCount
+    }
+    if ($Report.daemonReadError) { $line.daemonReadError = $Report.daemonReadError }
+    $day = (ConvertTo-UtcDateTime $Report.at).ToString('yyyyMMdd')
+    [IO.File]::AppendAllText("$dir\$day.jsonl", (([pscustomobject]$line | ConvertTo-Json -Compress -Depth 8) + [Environment]::NewLine), $Utf8)
+  } catch { Write-Warning "applied ledger append failed: $($_.Exception.Message)" }
+}
 $static = Get-StaticRoster; $live = Get-LiveRoster
 $now = (Get-Date).ToUniversalTime()
+# Ticket 08b: once the rostered Sentinel is cut over, its own -Apply is refused here, not
+# in prose. A Sentinel cron that fires between the flag write and its retirement, or a
+# rolled-forward session, applies nothing; the watchdog (Actor watchdog) is the actor.
+if ($Apply -and $Actor -eq 'sentinel' -and (Test-SentinelOff)) {
+  $refused = [ordered]@{
+    at = (Now-Iso); applied = $false; refused = 'state/flags/sentinel-off stands: the rostered Sentinel is retired and the watchdog task supervises; nothing applied'
+    respawned = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
+  }
+  [pscustomobject]$refused | ConvertTo-Json -Depth 6
+  exit 0
+}
 # Fail closed on a bad daemon read: an unreadable session list is indistinguishable
 # from an empty fleet, and reporting launchNeeded for every name off one glitched
 # read is exactly the state that also disarms launch.ps1's guards (2026-09-01
@@ -21,6 +52,7 @@ try { $daemon = Get-DaemonSessions -All -Strict } catch {
   }
   if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
   Write-Json $ReportPath ([pscustomobject]$errorReport)
+  Write-AppliedLedger $errorReport
   [pscustomobject]$errorReport | ConvertTo-Json -Depth 6
   exit 0
 }
@@ -51,7 +83,7 @@ function Property-Names { param($obj) if ($null -eq $obj) { return @() }; return
 
 # --- roster sessions: static (always expected) + active ICs ---
 $expected = @()
-foreach ($s in $static.sessions) { $expected += [pscustomobject]@{ name = $s.name; role = $s.role; parent = $s.parent; tenant = $s.tenant; issue = $null; static = $true } }
+foreach ($s in (Get-ExpectedStaticSessions $static)) { $expected += [pscustomobject]@{ name = $s.name; role = $s.role; parent = $s.parent; tenant = $s.tenant; issue = $null; static = $true } }
 foreach ($e in ($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' })) { $expected += [pscustomobject]@{ name = $e.name; role = $e.role; parent = $e.parent; tenant = $e.tenant; issue = $e.issue; static = $false } }
 
 foreach ($x in $expected) {
@@ -200,4 +232,5 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
 
 if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
 Write-Json $ReportPath ([pscustomobject]$report)
+Write-AppliedLedger $report
 [pscustomobject]$report | ConvertTo-Json -Depth 6

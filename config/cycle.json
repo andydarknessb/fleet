@@ -15,5 +15,12 @@
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },
     "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 }
+  },
+  "supervisor": {
+    "parityHours": 48,
+    "pairWindowMinutes": 10,
+    "maxGapMinutes": 35,
+    "tickMinutes": 15,
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged"]
   }
 }

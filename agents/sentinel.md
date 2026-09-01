@@ -29,6 +29,10 @@ An IC with an open PR or an issue/PR hold in the tenant skip list is waiting and
 - A clean report needs no message and no text.
 - Wording of your final line when an escalation is still open from an earlier tick: state it as a status, not a blocker, e.g. "Tick complete; dispatcher escalation unchanged, not re-notifying." Never write "Same blocker" or "holding": the daemon summarises your last line into your own job state, and those words get your row labelled blocked with invented detail (2026-08-27, three episodes, none real).
 
+## Cutover (ticket 08b)
+
+When `C:\Users\Cory\fleet\state\flags\sentinel-off` exists you are retired: the watchdog task supervises, `sentinel-check.ps1 -Apply` refuses you mechanically, and `cutover-sentinel.ps1` is stopping this session. Do not launch, respawn, or recreate your cron; end your turn with "Sentinel retired by cutover; nothing to do." Your roster entry and this role file stay for one release as the rollback path (`bin\rollback-sentinel.ps1`).
+
 ## Boundaries
 
 - You act on sessions named in `roster.json` or `state/roster.json`; anything else you report.

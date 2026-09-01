@@ -27,7 +27,7 @@ try {
 
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" '@echo off
 if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9
-if "%1"=="agents" echo [{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":900,"startedAt":"2026-08-28T00:00:00Z"}]
+if "%MOCK_SENTINEL_ROW%"=="1" (if "%1"=="agents" echo [{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":900,"startedAt":"2026-08-28T00:00:00Z"},{"id":"job-s","name":"sentinel","state":"working","status":"idle","pid":12,"startedAt":"2026-08-28T00:00:00Z"}]) else (if "%1"=="agents" echo [{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":900,"startedAt":"2026-08-28T00:00:00Z"}])
 exit /b 0
 '
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" '@echo off
@@ -72,6 +72,51 @@ exit /b 0
   Assert-True (@($badRead.respawned).Count -eq 0) 'an unreadable list must respawn nothing'
   Remove-Item Env:MOCK_CLAUDE_FAIL
 
+  # Ticket 08b: read-only runs leave no applied ledger; -Apply ticks append one line each,
+  # stamped with the actor, so bin/parity.js can pair the Sentinel's ticks with the shadow log.
+  Assert-True (-not (Test-Path "$testRoot\state\sentinel\applied")) 'read-only checks must write no applied ledger'
+  $env:MOCK_PR = '0'
+  $applied1 = (& "$testRoot\bin\sentinel-check.ps1" -Apply | Out-String) | ConvertFrom-Json
+  Assert-True (@($applied1.respawned).Count -eq 1) 'the -Apply run must still respawn the stale IC'
+  $applied2 = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
+  $ledgerFiles = @(Get-ChildItem "$testRoot\state\sentinel\applied" -Filter *.jsonl)
+  Assert-True ($ledgerFiles.Count -eq 1) 'one applied ledger file per day'
+  $ledger = @(Get-Content $ledgerFiles[0].FullName | ForEach-Object { $_ | ConvertFrom-Json })
+  Assert-True ($ledger.Count -eq 2) 'each -Apply tick must append exactly one ledger line'
+  Assert-True ($ledger[0].actor -eq 'sentinel' -and $ledger[0].applied -eq $true) 'the default actor is the rostered Sentinel'
+  Assert-True (@($ledger[0].respawned)[0].name -eq 'ic-900') 'the ledger line must carry the applied action set'
+  Assert-True ($ledger[0].okCount -ge 0 -and $null -ne $ledger[0].PSObject.Properties['okCount']) 'the ledger line must carry okCount'
+  Assert-True ($ledger[1].actor -eq 'watchdog') '-Actor must stamp the line'
+  $env:MOCK_CLAUDE_FAIL = '1'
+  $null = (& "$testRoot\bin\sentinel-check.ps1" -Apply | Out-String)
+  Remove-Item Env:MOCK_CLAUDE_FAIL
+  $ledger = @(Get-Content $ledgerFiles[0].FullName | ForEach-Object { $_ | ConvertFrom-Json })
+  Assert-True ($ledger.Count -eq 3 -and "$($ledger[2].daemonReadError)" -match 'unreadable') 'a fail-closed tick still leaves a ledger line naming the read error'
+
+  # Ticket 08b: while state/flags/sentinel-off stands, the rostered Sentinel is neither expected
+  # nor launched (its roster.json entry stays as the rollback path); a Sentinel session that is
+  # nevertheless running is a stray, the double-actor evidence.
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"sentinel","role":"sentinel","parent":"dispatcher","cwd":"C:\\fleet","prompt":"p"}]}'
+  $expected = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True (@($expected.launchNeeded | Where-Object { $_.name -eq 'sentinel' }).Count -eq 1) 'without the flag a missing rostered Sentinel is launchNeeded'
+  [IO.Directory]::CreateDirectory("$testRoot\state\flags") | Out-Null
+  Write-Utf8 "$testRoot\state\flags\sentinel-off" 'cut over by test'
+  $off = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True (@($off.launchNeeded).Count -eq 0) 'with sentinel-off the rostered Sentinel is not expected'
+  $env:MOCK_SENTINEL_ROW = '1'
+  $stray = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Remove-Item Env:MOCK_SENTINEL_ROW
+  Assert-True (@($stray.escalate | Where-Object { $_.name -eq 'sentinel' -and $_.kind -eq 'stray' }).Count -eq 1) 'a running Sentinel under sentinel-off is a stray'
+  # The retired actor's own -Apply is refused mechanically; the watchdog's is not.
+  $ledgerBefore = @(Get-Content $ledgerFiles[0].FullName).Count
+  $refused = (& "$testRoot\bin\sentinel-check.ps1" -Apply | Out-String) | ConvertFrom-Json
+  Assert-True ($refused.applied -eq $false -and "$($refused.refused)" -match 'sentinel-off') 'a Sentinel -Apply under the flag must be refused'
+  Assert-True (@($refused.respawned).Count -eq 0) 'a refused apply must act on nothing'
+  Assert-True (@(Get-Content $ledgerFiles[0].FullName).Count -eq $ledgerBefore) 'a refused apply leaves no ledger line'
+  $watchdogApply = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
+  Assert-True ($watchdogApply.applied -eq $true) 'the watchdog actor still applies under the flag'
+  Remove-Item "$testRoot\state\flags\sentinel-off"
+
   Write-Output 'sentinel respawn tests passed'
 } finally {
   $env:PATH = $oldPath
@@ -79,6 +124,7 @@ exit /b 0
   Remove-Item Env:MOCK_PR -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_SENTINEL_ROW -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-sentinel-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

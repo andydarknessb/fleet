@@ -32,7 +32,8 @@ _Avoid_: agent, persona, profile
 **Lead**:
 A session with no tenant of its own. There are exactly two, with different
 jobs, and each watches the other's liveness: the Dispatcher and the Sentinel.
-_Avoid_: orchestrator, manager, supervisor (the supervisor is the daemon)
+_Avoid_: orchestrator, manager, supervisor (the supervisor is the daemon
+until the 08b cutover, then the Watchdog task; a lead is never one)
 
 **Dispatcher**:
 The lead that is Cory's interface to the fleet: it assigns tenants to project
@@ -78,8 +79,11 @@ _Avoid_: limit, quota, concurrency
 A condition an IC or project lead may not resolve on its own, handed one level
 up the reporting line until it reaches Cory: a permission prompt, red CI twice
 on one PR, scope drift, or a day without a commit. Escalations are the only
-events that page Cory through the reporting line; the Watchdog's out-of-band
-page exists solely for when that line itself is down.
+events that page Cory through the reporting line. While the rostered Sentinel
+is enabled the Watchdog's out-of-band page exists solely for when that line
+itself is down; after the 08b cutover the Watchdog is the top of the
+mechanical line and files the check's escalations itself, one page per new
+one, never a repeat.
 _Avoid_: alert, error, blocker, "off the rails"
 
 **Reporting line**:
@@ -116,11 +120,18 @@ flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
 
 **Watchdog**:
-The scheduled task, never a session, that shadows the mechanical check, keeps
-the parity log, and pages Cory out of band - a toast and a red banner in the
-status view - only when self-healing is the casualty: the check cannot run,
+The scheduled task, never a session, that runs the mechanical check every
+fifteen minutes. While the rostered Sentinel is enabled it shadows: it keeps
+the parity log and pages Cory out of band - a toast and a red banner in the
+status view - only when self-healing is the casualty (the check cannot run,
 the Sentinel is stale, every static heartbeat is stale, or launches of one
-name keep failing. It acts on nothing and launches nothing.
+name keep failing), and acts on nothing. After cutover
+(`state/flags/sentinel-off`) it is the supervisor: the check applies, a
+missing static session launches through the one door, and a respawn or a
+new escalation of a paging kind leaves one escalation file and pages once;
+`blocked` is recorded, never paged. Two actors never run: a Sentinel session
+alive under the flag is the double-actor condition, and the Watchdog stays in
+shadow until it is gone.
 _Avoid_: sentinel (a session), monitor, health checker
 
 ### Work

@@ -44,6 +44,13 @@ if ($FromRoster) {
 }
 foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req -ValueOnly)) { Write-Error "missing -$req"; exit 4 } }
 if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$') { Write-Error "name '$Name' does not match the fleet naming scheme"; exit 4 }
+# Ticket 08b: while the rostered Sentinel is cut over, the one door refuses to start a
+# second supervisor (not even with -Force: two actors is the failure cutover exists to
+# prevent). rollback-sentinel.ps1 removes the flag first, then comes through here. A
+# dry run still evaluates the other gates so rollback can be rehearsed.
+if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
+  Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live); use bin\rollback-sentinel.ps1 to restore it' } | ConvertTo-Json -Compress); exit 3
+}
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $t) { Write-Error "no tenant file for '$Tenant'"; exit 4 }

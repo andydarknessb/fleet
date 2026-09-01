@@ -212,11 +212,145 @@ try {
   Assert-True ((Get-Content "$testRoot\state\watchdog\paged.json" -Raw) -eq $pagedBefore) '-Verify must not touch paged state'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\banner.txt")) '-Verify must not write the banner'
 
+  # ===== Ticket 08b: live supervision under state/flags/sentinel-off =====
+  # A mock launch door records every call and answers like launch.ps1.
+  Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
+  function Get-LaunchCalls { if (Test-Path "$testRoot\launch-calls.txt") { @(Get-Content "$testRoot\launch-calls.txt") } else { @() } }
+  function Get-EscalationFiles { param([string]$Pattern) @(Get-ChildItem "$testRoot\state\escalations" -Filter $Pattern -ErrorAction SilentlyContinue) }
+  function Get-AppliedLines { $f = Get-ChildItem "$testRoot\state\sentinel\applied" -Filter *.jsonl -ErrorAction SilentlyContinue; if ($f) { @(Get-Content $f.FullName) } else { @() } }
+  $dispRow = '{"id":"job-d","name":"dispatcher","state":"working","status":"idle","pid":11,"startedAt":' + (Get-EpochMs $oldStart) + '}'
+  $plRow = '{"id":"job-p","name":"pl-test","state":"working","status":"busy","pid":13,"startedAt":' + (Get-EpochMs $oldStart.AddSeconds(2)) + '}'
+  $noSentinelRows = "[$dispRow,$plRow]"
+  foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }
+  Set-AgentsRows $healthyRows
+  $null = Run-Watchdog
+
+  # Case 9: the flag with a Sentinel session still running -> double-actor page, shadow, nothing applied.
+  [IO.Directory]::CreateDirectory("$testRoot\state\flags") | Out-Null
+  Write-Utf8 "$testRoot\state\flags\sentinel-off" 'cutover test'
+  $r9 = Run-Watchdog
+  Assert-True ($r9.mode -eq 'shadow') 'a running Sentinel under the flag must keep the run in shadow'
+  Assert-True (@($r9.conditions) -contains 'double-actor') 'a running Sentinel under the flag is the double-actor condition'
+  Assert-True (@($r9.newlyPaged) -contains 'double-actor') 'double-actor must page'
+  Assert-True (@(Get-AppliedLines).Count -eq 0) 'shadow must apply nothing'
+  Assert-True ((Get-Content "$testRoot\state\sentinel\last-check.json" -Raw) -match 'live-sentinel-untouched') 'shadow must not own the canonical report'
+
+  # Case 10: the flag with no Sentinel session -> live: the check applies, owns the canonical
+  # report, and no sentinel-stale is raised for the retired actor.
+  Remove-Item "$testRoot\state\heartbeats\sentinel.json"
+  Set-AgentsRows $noSentinelRows
+  $r10 = Run-Watchdog
+  Assert-True ($r10.mode -eq 'live') 'the flag with no Sentinel session must go live'
+  Assert-True (@($r10.conditions).Count -eq 0) "live with a healthy fleet must raise nothing (got: $(@($r10.conditions) -join ','))"
+  $applied10 = @(Get-AppliedLines)
+  Assert-True ($applied10.Count -eq 1) 'a live tick must append one applied ledger line'
+  Assert-True (($applied10[0] | ConvertFrom-Json).actor -eq 'watchdog') 'the live ledger line must name the watchdog as actor'
+  Assert-True ((Get-Content "$testRoot\state\sentinel\last-check.json" -Raw) -match '"applied":\s*true') 'live must own state/sentinel/last-check.json'
+  $lastRun = (Get-Content "$testRoot\state\watchdog\last-run.json" -Raw) | ConvertFrom-Json
+  Assert-True ($lastRun.mode -eq 'live') 'last-run.json must record the mode'
+
+  # Case 10b: a missing static session is launched through the one door.
+  Set-AgentsRows "[$dispRow]"
+  $r10b = Run-Watchdog
+  Assert-True (@($r10b.launches | Where-Object { $_.name -eq 'pl-test' -and $_.launched -eq $true }).Count -eq 1) 'launchNeeded must launch through launch.ps1'
+  Assert-True (@(Get-LaunchCalls) -contains 'FromRoster=pl-test') 'the launch must go through -FromRoster'
+  Assert-True (@($r10b.launches | Where-Object { $_.name -eq 'sentinel' }).Count -eq 0) 'the retired Sentinel must never be launched'
+
+  # Case 10c: PAUSE launches nothing, and the run still applies (how a rate-limit PAUSE clears).
+  Write-Utf8 "$testRoot\state\PAUSE" 'reason=test; setAt=now; until='
+  $callsBefore = @(Get-LaunchCalls).Count
+  $r10c = Run-Watchdog
+  Remove-Item "$testRoot\state\PAUSE"
+  Assert-True (@($r10c.launches | Where-Object { $_.name -eq 'pl-test' -and $_.launched -eq $false -and $_.reason -match 'PAUSE' }).Count -eq 1) 'PAUSE must record the un-launch with its reason'
+  Assert-True (@(Get-LaunchCalls).Count -eq $callsBefore) 'PAUSE must not call the launch door'
+  Assert-True ($r10c.mode -eq 'live') 'PAUSE does not demote the supervisor to shadow'
+
+  # Case 10d: a check escalation of a paging kind pages once and files one escalation; a standing one is quiet; clearing clears.
+  $strayRow = '{"id":"job-x","name":"ic-777","state":"working","status":"idle","pid":77,"startedAt":' + (Get-EpochMs $oldStart) + '}'
+  Set-AgentsRows "[$dispRow,$plRow,$strayRow]"
+  $r10d = Run-Watchdog
+  Assert-True (@($r10d.conditions) -contains 'escalation:ic-777:stray') 'a stray must become an escalation condition'
+  Assert-True (@($r10d.newlyPaged) -contains 'escalation:ic-777:stray') 'a new escalation pages'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-777-stray.json').Count -eq 1) 'a new escalation leaves one escalation file'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'ic-777') 'the banner carries the escalation'
+  $r10d2 = Run-Watchdog
+  Assert-True (@($r10d2.newlyPaged).Count -eq 0) 'a standing escalation must not page again'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-777-stray.json').Count -eq 1) 'a standing escalation must not be re-filed'
+  Set-AgentsRows $noSentinelRows
+  $r10d3 = Run-Watchdog
+  Assert-True (-not (@($r10d3.conditions) -contains 'escalation:ic-777:stray')) 'a cleared escalation leaves the conditions'
+  Assert-True (-not (Test-Path "$testRoot\state\watchdog\banner.txt")) 'a cleared escalation clears the banner'
+
+  # Case 10e: `blocked` is recorded as waiting, never paged, never filed.
+  $blockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
+  Set-AgentsRows "[$blockedDisp,$plRow]"
+  $r10e = Run-Watchdog
+  Assert-True (@($r10e.waiting | Where-Object { $_.name -eq 'dispatcher' -and $_.kind -eq 'blocked' }).Count -eq 1) 'blocked must be recorded under waiting'
+  Assert-True (@($r10e.conditions).Count -eq 0) 'blocked must not page'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-dispatcher-blocked.json').Count -eq 0) 'blocked must not be filed'
+
+  # Case 10f: pageKinds is configurable; naming blocked makes it page.
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  Write-Utf8 "$testRoot\config\cycle.json" '{"supervisor":{"pageKinds":["stray","blocked"]}}'
+  $r10f = Run-Watchdog
+  Assert-True (@($r10f.conditions) -contains 'escalation:dispatcher:blocked') 'a configured kind must page'
+  Remove-Item "$testRoot\config\cycle.json"
+  Set-AgentsRows $noSentinelRows
+  $null = Run-Watchdog
+
+  # Case 10g: a respawn files an escalation naming the parent (the re-send nudge the Sentinel used to message).
+  $stoppedPl = $plRow.Replace('"state":"working"', '"state":"stopped"')
+  Set-AgentsRows "[$dispRow,$stoppedPl]"
+  $r10g = Run-Watchdog
+  Assert-True (@($r10g.proposed.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'a stopped static session is respawned by the applied check'
+  Assert-True (@($r10g.notified | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawned' -and $_.parent -eq 'dispatcher' }).Count -eq 1) 'the respawn must be recorded as notified to the parent'
+  $respawnFiles = @(Get-EscalationFiles '*-supervisor-pl-test-respawned.json')
+  Assert-True ($respawnFiles.Count -eq 1) 'a respawn must leave one escalation file'
+  $respawnEsc = (Get-Content $respawnFiles[0].FullName -Raw) | ConvertFrom-Json
+  Assert-True ($respawnEsc.parent -eq 'dispatcher' -and $respawnEsc.detail -match 're-send') 'the respawn escalation must name the parent and the nudge'
+  # A session that will not stay up is respawned again next tick: one condition, no second file.
+  $r10g2 = Run-Watchdog
+  Assert-True (@($r10g2.proposed.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'the check still respawns the stopped session'
+  Assert-True (@($r10g2.notified).Count -eq 0) 'an unchanged respawn must not be re-notified'
+  Assert-True (@($r10g2.waiting | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawned-again' }).Count -eq 1) 'the repeat must be recorded as waiting'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-pl-test-respawned.json').Count -eq 1) 'a repeated respawn must not file again'
+  Set-AgentsRows $noSentinelRows
+  $null = Run-Watchdog
+  Set-AgentsRows "[$dispRow,$stoppedPl]"
+  $r10g3 = Run-Watchdog
+  Assert-True (@($r10g3.notified | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'a respawn after a clean tick is a new event and notifies again'
+  Set-AgentsRows $noSentinelRows
+
+  # Case 10g-strict: an unreadable daemon list under the flag must not read as "no Sentinel running".
+  $env:MOCK_CLAUDE_FAIL = '1'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
+  $appliedBefore = @(Get-AppliedLines).Count
+  $r10s = Run-Watchdog
+  Remove-Item Env:MOCK_CLAUDE_FAIL
+  Assert-True ($r10s.mode -eq 'shadow' -and $r10s.modeReason -match 'unreadable') 'a failed daemon read must keep the run in shadow'
+  Assert-True (@(Get-AppliedLines).Count -eq $appliedBefore) 'a failed daemon read must apply nothing'
+
+  # Case 10h: -Verify under the flag never applies.
+  $appliedBefore = @(Get-AppliedLines).Count
+  $r10h = Run-Watchdog -Verify
+  Assert-True ($r10h.mode -eq 'shadow') '-Verify must not go live'
+  Assert-True (@(Get-AppliedLines).Count -eq $appliedBefore) '-Verify must apply nothing'
+
+  # Case 10i: removing the flag returns the run to shadow and re-expects the Sentinel.
+  Remove-Item "$testRoot\state\flags\sentinel-off"
+  $appliedBefore = @(Get-AppliedLines).Count
+  $r10i = Run-Watchdog
+  Assert-True ($r10i.mode -eq 'shadow') 'without the flag the run is shadow again'
+  Assert-True (@($r10i.proposed.launchNeeded | Where-Object { $_.name -eq 'sentinel' }).Count -eq 1) 'without the flag the missing Sentinel is launchNeeded again'
+  Assert-True (@(Get-AppliedLines).Count -eq $appliedBefore) 'shadow applies nothing'
+  Assert-True (@($r10i.launches).Count -eq 0) 'shadow launches nothing'
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-watchdog-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

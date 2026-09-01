@@ -1,4 +1,5 @@
-# Register the fleet watchdog (ticket 08a): shadow supervision + external page path.
+# Register the fleet watchdog (ticket 08a shadow supervision + page path; ticket 08b live
+# supervision once state/flags/sentinel-off stands - same task, same script).
 # Run manually; the fleet never self-registers tasks. Runs only while the user is
 # logged on (interactive session; toasts need it), consistent with ADR-0003.
 [CmdletBinding()]
@@ -25,7 +26,7 @@ if ($DryRun) {
   exit 0
 }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($repeat, $logon) -Settings $settings -Description 'Fleet 08a shadow supervisor: parity log + page path (toast/banner) + launch retry cap' -Force | Out-Null
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($repeat, $logon) -Settings $settings -Description 'Fleet supervisor: shadow (parity log + page path + launch retry cap) until state/flags/sentinel-off, then live' -Force | Out-Null
 Write-Output "Registered '$taskName' (every 15 minutes; 4 min after logon)."
 Write-Output "Run now: Start-ScheduledTask -TaskName '$taskName'"
 Write-Output "Remove with: Unregister-ScheduledTask -TaskName '$taskName' -Confirm:0"

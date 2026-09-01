@@ -3,6 +3,13 @@
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 if (Test-Path "$FleetHome\state\watchdog\banner.txt") { Write-Host (Get-Content "$FleetHome\state\watchdog\banner.txt" -Raw -Encoding UTF8) -ForegroundColor Red }
 if (Test-Paused) { Write-Output "PAUSE: $(Get-Content "$FleetHome\state\PAUSE" -Raw)" }
+# Who supervises (ticket 08b): the rostered Sentinel until cutover, the watchdog task after.
+$lastRun = $null; try { $lastRun = Read-Json "$FleetHome\state\watchdog\last-run.json" } catch {}
+$lastRunText = 'no watchdog run recorded'
+$lastRunAt = if ($lastRun) { ConvertTo-UtcDateTime $lastRun.at } else { $null }
+if ($lastRunAt) { $lastRunText = "last watchdog tick $([int]((Get-Date).ToUniversalTime() - $lastRunAt).TotalMinutes) min ago ($($lastRun.mode))" }
+if (Test-SentinelOff) { Write-Output "supervisor: watchdog task (state/flags/sentinel-off; rollback: bin\rollback-sentinel.ps1); $lastRunText" }
+else { Write-Output "supervisor: rostered sentinel session (watchdog in shadow); $lastRunText" }
 $names = Get-FleetNames -Live $live -Static $static
 $rows = foreach ($n in $names) {
   $d = $daemon | Where-Object { $_.name -eq $n } | Sort-Object startedAt -Descending | Select-Object -First 1
