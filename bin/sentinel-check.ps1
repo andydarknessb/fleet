@@ -6,8 +6,24 @@
 #>
 param([switch]$Apply, [string]$ReportPath = '')
 . "$PSScriptRoot\_common.ps1"
-$static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
+$static = Get-StaticRoster; $live = Get-LiveRoster
 $now = (Get-Date).ToUniversalTime()
+# Fail closed on a bad daemon read: an unreadable session list is indistinguishable
+# from an empty fleet, and reporting launchNeeded for every name off one glitched
+# read is exactly the state that also disarms launch.ps1's guards (2026-09-01
+# near-miss). Propose nothing this tick; the next cron sees a healthy read.
+$daemon = $null
+try { $daemon = Get-DaemonSessions -All -Strict } catch {
+  $errorReport = [ordered]@{
+    at = (Now-Iso); applied = [bool]$Apply; daemonReadError = "$($_.Exception.Message)"
+    respawned = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null
+    ok = @([pscustomobject]@{ name = 'daemon-read'; detail = 'session list unreadable; proposing nothing this tick (a bad read must not look like an empty fleet)' })
+  }
+  if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
+  Write-Json $ReportPath ([pscustomobject]$errorReport)
+  [pscustomobject]$errorReport | ConvertTo-Json -Depth 6
+  exit 0
+}
 $report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
 
 function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name } | Sort-Object startedAt -Descending | Select-Object -First 1 }

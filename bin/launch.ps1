@@ -96,11 +96,33 @@ if ((Test-Paused) -and -not $Force) {
   $p = Get-Content "$FleetHome\state\PAUSE" -Raw
   Write-Output (@{ launched = $false; reason = "PAUSE set: $p" } | ConvertTo-Json -Compress); exit 3
 }
-$daemon = Get-DaemonSessions
+# The duplicate-name guard and the cap read the same daemon list the caller may have
+# acted on; a glitched read must refuse the launch, never pass the guards empty.
+$daemon = $null
+try { $daemon = Get-DaemonSessions -Strict } catch {
+  Write-Output (@{ launched = $false; reason = "refusing to launch, fail closed: $($_.Exception.Message)" } | ConvertTo-Json -Compress); exit 3
+}
 $fleetNames = Get-FleetNames -Live $live -Static $static
 $liveFleet = @($daemon | Where-Object { $fleetNames -contains $_.name })
 if (@($liveFleet | ForEach-Object { $_.name }) -contains $Name) {
   Write-Output (@{ launched = $false; reason = "a session named '$Name' is already running; use claude respawn" } | ConvertTo-Json -Compress); exit 3
+}
+# The list can also read WRONG (empty or partial) while the CLI exits 0. The roster's
+# job record is an independent on-disk source: if it says this name's job is still
+# working and recently updated (45 min = the fleet staleness threshold), refuse the
+# duplicate rather than trust the list that omitted it. A stale or stopped job state
+# stays launchable, so crash recovery is not blocked.
+$rosterEntry = $live.sessions | Where-Object { $_.name -eq $Name -and $_.status -eq 'active' } | Select-Object -First 1
+if ($rosterEntry -and $rosterEntry.jobId) {
+  $jobState = $null
+  try { $jobState = Get-JobState $rosterEntry.jobId } catch {}
+  if ($jobState -and "$($jobState.state)" -eq 'working') {
+    $updatedAge = $null
+    try { $updatedAge = ((Get-Date).ToUniversalTime() - ([DateTimeOffset]::Parse("$($jobState.updatedAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)).UtcDateTime).TotalMinutes } catch {}
+    if ($null -ne $updatedAge -and $updatedAge -le 45) {
+      Write-Output (@{ launched = $false; reason = "job $($rosterEntry.jobId) for '$Name' is working per its on-disk state (updated $([int]$updatedAge) min ago) though the daemon list omits it; suspected bad read, refusing a duplicate launch" } | ConvertTo-Json -Compress); exit 3
+    }
+  }
 }
 if (-not $Force -and $liveFleet.Count -ge [int]$static.cap) {
   Write-Output (@{ launched = $false; reason = "cap reached ($($liveFleet.Count)/$($static.cap))" } | ConvertTo-Json -Compress); exit 3

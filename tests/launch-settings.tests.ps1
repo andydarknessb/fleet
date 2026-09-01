@@ -9,6 +9,7 @@ function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllTex
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-launch-settings-test-" + [guid]::NewGuid().ToString('N'))
 $oldPath = $env:PATH
+$oldProfile = $env:USERPROFILE
 
 function Run-Launch {
   param([string[]]$Arguments)
@@ -33,8 +34,10 @@ try {
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   $repoPath = "$testRoot\repo"
   Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,"repo":' + ($repoPath | ConvertTo-Json) + '}')
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-disp") | Out-Null
   $env:PATH = "$testRoot\mock-bin;$oldPath"
+  $env:USERPROFILE = "$testRoot\profile"
   $repoFwd = $repoPath.Replace('\', '/')
   $rootFwd = $testRoot.Replace('\', '/')
 
@@ -100,9 +103,35 @@ exit $LASTEXITCODE
   $r4b = Run-Big @('-WithForce')
   Assert-True ($r4b.dryRun -eq $true) '-Force must override the ceiling gate'
 
+  # Case 5: an unreadable daemon list refuses the launch outright (fail closed).
+  $env:MOCK_CLAUDE_FAIL = '1'
+  $r5 = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  Assert-True ($script:lastExit -eq 3) 'an unreadable daemon list must refuse with exit 3'
+  Assert-True ($r5.launched -eq $false -and "$($r5.reason)" -match 'fail closed') 'the refusal must say it failed closed'
+  Remove-Item Env:MOCK_CLAUDE_FAIL
+
+  # Case 6: the CLI list reads empty while the roster's on-disk job state says the
+  # session is alive and fresh: the independent source wins, no duplicate launches.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-disp","sessionId":"sess-disp"}]}'
+  $freshAt = (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o')
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-disp\state.json" ('{"state":"working","updatedAt":"' + $freshAt + '"}')
+  $r6 = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($r6.reason)" -match 'suspected bad read') 'a fresh working job state must refuse the duplicate'
+
+  # Case 6b: a stale or stopped job state stays launchable (crash recovery).
+  $staleAt = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o')
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-disp\state.json" ('{"state":"working","updatedAt":"' + $staleAt + '"}')
+  $r6b = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  Assert-True ($r6b.dryRun -eq $true) 'a stale working job state must not block recovery'
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-disp\state.json" ('{"state":"stopped","updatedAt":"' + $freshAt + '"}')
+  $r6c = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  Assert-True ($r6c.dryRun -eq $true) 'a stopped job state must not block a relaunch'
+
   Write-Output 'launch settings tests passed'
 } finally {
   $env:PATH = $oldPath
+  $env:USERPROFILE = $oldProfile
+  Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-launch-settings-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

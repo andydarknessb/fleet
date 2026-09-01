@@ -14,10 +14,26 @@ function Get-LiveRoster {
 }
 function Save-LiveRoster { param($R) Write-Json "$FleetHome\state\roster.json" $R }
 function Get-DaemonSessions {
-  param([switch]$All)
+  # A failed read and an empty fleet are different facts. Without -Strict both still
+  # collapse to @() (read-only callers tolerate it); with -Strict a nonzero exit,
+  # empty output, or unparseable JSON throws so actuators can fail CLOSED. The
+  # 2026-09-01 near-miss: one glitched read told the Sentinel every session was
+  # missing while the same source disarmed launch.ps1's duplicate and cap guards.
+  param([switch]$All, [switch]$Strict)
   $raw = if ($All) { & claude agents --json --all 2>$null } else { & claude agents --json 2>$null }
+  $exit = $LASTEXITCODE
+  $text = ($raw | Out-String).Trim()
+  if ($exit -ne 0 -or -not $text) {
+    if ($Strict) { $shape = if ($text) { 'nonempty' } else { 'empty' }; throw "daemon session list unreadable (claude agents exit $exit, output $shape)" }
+    return @()
+  }
   # PS 5.1 quirk: ConvertFrom-Json emits a JSON array as ONE object; assign first so @() doesn't nest it.
-  try { $obj = ($raw | Out-String | ConvertFrom-Json); if ($null -eq $obj) { return @() }; return @($obj) } catch { return @() }
+  try { $obj = ($text | ConvertFrom-Json) } catch {
+    if ($Strict) { throw "daemon session list unparseable: $(($text -replace '\s+', ' ').Substring(0, [Math]::Min(120, $text.Length)))" }
+    return @()
+  }
+  if ($null -eq $obj) { return @() }
+  return @($obj)
 }
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
 function Get-FleetNames {

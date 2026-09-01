@@ -76,7 +76,7 @@ const fs = require('node:fs'), path = require('node:path');
 fs.appendFileSync(path.join(__dirname, '..', 'reconcile-calls.log'), process.argv.slice(2).join(' ') + '\n');
 console.log(JSON.stringify({ ok: true }));
 '@
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
   $env:PATH = "$testRoot\mock-bin;$oldPath"
 
   $young = (Get-Date).ToUniversalTime().AddHours(-2).ToString('o')
@@ -183,6 +183,16 @@ console.log(JSON.stringify({ ok: true }));
   $r7b = Run-Rotate @('-Auto')
   Assert-True (@($r7b.rotated) -contains 'dispatcher') 'the next auto run must complete the interrupted rotation'
 
+  # Case 7b: an unreadable daemon list defers the rotation (a bad read must not
+  # look like an idle boundary).
+  Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
+  $env:MOCK_CLAUDE_FAIL = '1'
+  $r7c = Run-Rotate @('-Auto')
+  Assert-True ($script:lastExit -eq 0) 'an unreadable-list deferral is not a failure'
+  Assert-True (@($r7c.deferred).Count -eq 1 -and "$($r7c.deferred)" -match 'unreadable') 'an unreadable daemon list must defer, naming the cause'
+  Assert-True (-not (Test-Path "$testRoot\retire-calls.log")) 'nothing may be stopped off an unreadable list'
+  Remove-Item Env:MOCK_CLAUDE_FAIL
+
   # Case 8: -DryRun reports and writes nothing; unknown names are refused.
   Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
   $r8 = Run-Rotate @('-Auto', '-DryRun')
@@ -195,7 +205,7 @@ console.log(JSON.stringify({ ok: true }));
   Write-Output 'rotation tests passed'
 } finally {
   $env:PATH = $oldPath
-  Remove-Item Env:MOCK_LAUNCH_FAIL, Env:MOCK_RETIRE_FAIL -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_LAUNCH_FAIL, Env:MOCK_RETIRE_FAIL, Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-rotation-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

@@ -44,7 +44,12 @@ function Get-IntentPath { param([string]$SessionName) "$rotationDir\$SessionName
 
 function Test-SafeBoundary {
   param([string]$SessionName)
-  $row = Get-DaemonSessions | Where-Object { $_.name -eq $SessionName } | Select-Object -First 1
+  # Strict read: an unreadable session list must defer the rotation, not read as
+  # "idle" - stopping a session mid-turn off a glitched list is the same fail-open
+  # class as the 2026-09-01 launch near-miss.
+  $row = $null
+  try { $row = Get-DaemonSessions -Strict | Where-Object { $_.name -eq $SessionName } | Select-Object -First 1 }
+  catch { return [pscustomobject]@{ safe = $false; reason = "daemon session list unreadable ($($_.Exception.Message)); deferring" } }
   if ($row -and "$($row.status)" -eq 'busy') { return [pscustomobject]@{ safe = $false; reason = 'session is mid-turn (status busy)' } }
   if (Test-Path "$FleetHome\state\work\.lock") { return [pscustomobject]@{ safe = $false; reason = 'work-state lock is held (mutation in flight)' } }
   $pending = @(Get-ChildItem "$FleetHome\state\work\pending" -Filter *.json -ErrorAction SilentlyContinue)
@@ -154,7 +159,9 @@ function Resume-Incomplete {
       $results += $dry
       continue
     }
-    $liveRow = Get-DaemonSessions | Where-Object { $_.name -eq $intent.name } | Select-Object -First 1
+    $liveRow = $null
+    try { $liveRow = Get-DaemonSessions -Strict | Where-Object { $_.name -eq $intent.name } | Select-Object -First 1 }
+    catch { $results += New-Outcome $intent.name 'deferred' "daemon session list unreadable ($($_.Exception.Message)); resume deferred"; continue }
     if ($liveRow -and "$($liveRow.sessionId)" -eq "$($intent.oldSessionId)") {
       # Crash mid-stop: the predecessor is still alive; finish retiring it first.
       $retire = Invoke-RetireSession $intent.name "rotation (resumed): $(@($intent.reasons) -join '; ')"

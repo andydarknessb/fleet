@@ -26,6 +26,7 @@ try {
   & git -C "$testRoot\repo" init --quiet
 
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" '@echo off
+if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9
 if "%1"=="agents" echo [{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":900,"startedAt":"2026-08-28T00:00:00Z"}]
 exit /b 0
 '
@@ -60,12 +61,24 @@ exit /b 0
   Assert-True (@($failed.respawned).Count -eq 0) 'a failed PR lookup must fail safe without respawning'
   Assert-True (@($failed.escalate | Where-Object { $_.kind -eq 'pr-lookup-failed' }).Count -eq 1) 'a failed PR lookup must escalate'
 
+  # A launchNeeded/ic-vanished burst off one glitched daemon read was the 2026-09-01
+  # near-miss: an unreadable list must propose nothing, not report everyone missing.
+  $env:MOCK_GH_FAIL = '0'
+  $env:MOCK_CLAUDE_FAIL = '1'
+  $badRead = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ("$($badRead.daemonReadError)" -match 'unreadable') 'a failed daemon read must be named in the report'
+  Assert-True (@($badRead.launchNeeded).Count -eq 0) 'an unreadable list must produce no launchNeeded'
+  Assert-True (@($badRead.escalate).Count -eq 0) 'an unreadable list must produce no vanished-IC escalations'
+  Assert-True (@($badRead.respawned).Count -eq 0) 'an unreadable list must respawn nothing'
+  Remove-Item Env:MOCK_CLAUDE_FAIL
+
   Write-Output 'sentinel respawn tests passed'
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
   Remove-Item Env:MOCK_PR -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-sentinel-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {
