@@ -589,6 +589,66 @@ function observeRecord(options = {}) {
   });
 }
 
+const REVIEW_KINDS = Object.freeze({
+  // Ticket 05: the project lead's one independent Standards+Spec review lands
+  // after gates settle; the IC-hosted risk review runs pre-PR-ready, so it may
+  // land while the record is still implementing.
+  formal: ['review'],
+  risk: ['implementing', 'pr-open', 'ci-wait', 'review'],
+});
+
+function recordReview(options = {}) {
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey);
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const record = active.records[String(options.id)];
+    if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const replay = replayIfKnown(record, key);
+    if (replay) return replay;
+    if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
+    if (Number(options.expectedRevision) !== record.revision) {
+      throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    }
+    const review = options.review || {};
+    const kind = String(review.kind || '');
+    if (!REVIEW_KINDS[kind]) throw new WorkStateError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
+    if (!review.headSha || !review.artifact) throw new WorkStateError('MISSING_REVIEW_EVIDENCE', 'a review requires headSha and artifact');
+    if (!REVIEW_KINDS[kind].includes(record.state)) {
+      throw new WorkStateError('INVALID_REVIEW_STATE', `a ${kind} review cannot be recorded while ${record.state}`);
+    }
+    const now = isoNow(options.now);
+    const entry = {
+      headSha: String(review.headSha),
+      artifact: String(review.artifact),
+      tier: review.tier || null,
+      triggers: review.triggers || [],
+      priorArtifact: review.priorArtifact || null,
+      at: now,
+      actor: options.actor || 'unknown',
+    };
+    const next = {
+      ...record,
+      revision: record.revision + 1,
+      eventSequence: record.eventSequence + 1,
+      updatedAt: now,
+      review: { ...record.review, progress: `${kind}-recorded`, [kind]: entry },
+      idempotency: { ...record.idempotency },
+    };
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'review-recorded' };
+    const event = eventFor(next, {
+      type: 'review-recorded',
+      actor: options.actor,
+      at: now,
+      idempotencyKey: key,
+      evidence: options.evidence,
+      changes: { kind, headSha: entry.headSha, artifact: entry.artifact, tier: entry.tier, triggers: entry.triggers, priorArtifact: entry.priorArtifact },
+    });
+    commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
+    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
+  });
+}
+
 function getRecord(options = {}) {
   const root = asRoot(options.root);
   return withLock(root, (p) => {
@@ -755,10 +815,18 @@ function cli(argv) {
     observation: args.observation ? JSON.parse(args.observation) : undefined,
     changed: args.changed ? JSON.parse(args.changed) : undefined, wake: args.wake,
   });
+  if (command === 'review') return recordReview({
+    ...common, id: args.id, expectedRevision: Number(args['expected-revision']),
+    review: {
+      kind: args.kind, headSha: args['head-sha'], artifact: args.artifact, tier: args.tier,
+      triggers: args.triggers ? JSON.parse(args.triggers) : [],
+      priorArtifact: args['prior-artifact'],
+    },
+  });
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
   if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
-  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, observe, get, shadow, project');
+  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, observe, review, get, shadow, project');
 }
 
 if (require.main === module) {
@@ -782,6 +850,7 @@ module.exports = {
   proofMatches,
   projectStatus,
   reconcilePullRequest,
+  recordReview,
   releaseRecord,
   reservationConflicts,
   reserveRecord,

@@ -21,6 +21,37 @@
     "unit": "npm test -- --watchAll=false --maxWorkers=50% --testMatch \"**/*.test.{js,jsx,ts,tsx}\"",
     "lint": "npm run lint"
   },
+  "riskTriggers": {
+    "auth": {
+      "paths": ["server/middleware/**", "server/services/leagueRole*", "server/routes/auth*"],
+      "patterns": ["requireMember", "isMember\\(", "leagueRole", "jwt", "JWT_SECRET"]
+    },
+    "security": {
+      "paths": [],
+      "patterns": ["dangerouslySetInnerHTML", "child_process", "execSync", "eval\\(", "innerHTML"]
+    },
+    "data-integrity": {
+      "paths": ["server/db/**", "server/services/scoring*"],
+      "patterns": ["ON DELETE", "dropColumn", "alterTable\\("]
+    },
+    "concurrency": {
+      "paths": [],
+      "patterns": ["FOR UPDATE", "advisory", "\\.transaction\\("]
+    },
+    "destructive": {
+      "paths": [],
+      "patterns": ["DROP TABLE", "TRUNCATE", "DELETE FROM", "dropTableIfExists", "rm -rf"]
+    },
+    "accessibility": {
+      "paths": [],
+      "patterns": ["aria-", "tabIndex", "<dialog", "onKeyDown", "focus-trap"]
+    }
+  },
+  "heavySuites": {
+    "unit": "checks.unit runs jest at --maxWorkers=50%; two ICs at once own the whole host",
+    "test:server:sweep": "six backtest sweep files, ~35 min (issue #80)",
+    "test:server:all": "everything, ~42 min; never per commit"
+  },
   "ciGates": ["test-build", "guards", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
   "watchedChecks": ["scan", "discover", "reproduce"],
   "ignoredChecks": [],

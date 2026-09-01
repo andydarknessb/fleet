@@ -10,7 +10,7 @@ cory
  └─ sentinel   (sonnet)    keeps the roster alive and under the cap; never reasons about work
      └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
          └─ ic-<issue> (sonnet) one per issue, launched with /implement; opens a PR; talks only to its project lead
-             └─ qa-reviewer (opus worker)   optional third review angle (UI, house style), spawned by the project lead
+             └─ qa-reviewer (opus worker)   risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
 ```
 
 - **Sessions** are background Claude Code sessions hosted by the daemon (`claude agents`). **Workers** are subagents inside a session. Cap counts sessions only.
@@ -96,7 +96,7 @@ The lists must be disjoint. `setup.ps1` and the stop hook reject an overlapping 
 
 ## Skills the roles use
 
-The `mattpocock-skills` plugin is enabled at user scope, so every fleet session can invoke its model-invocable skills. The roles name the ones they rely on: ICs build with `/tdd`, review with `/code-review`, start bugs with `/diagnosing-bugs`, and untangle stale branches with `/resolving-merge-conflicts`; project leads review PRs with `/code-review` (its Standards + Spec sub-agents are the two review angles) and settle vocabulary with `/domain-modeling`; the dispatcher answers reading questions with `/research`. `/implement` is user-only, but a slash command at the head of a launch prompt counts as a user invocation in the new session (verified), so project leads launch ICs with `-Prompt "/mattpocock-skills:implement ..."` and the IC runs the real skill. `skills:` in a role file's frontmatter does **not** preload skill text into a `--agent` background session (verified, both spellings); skills are discovered from the listing and invoked on demand. `/triage`, `/to-spec`, `/to-tickets` and `/grill-with-docs` stay yours: they are scope decisions.
+The `mattpocock-skills` plugin is enabled at user scope, so every fleet session can invoke its model-invocable skills. The roles name the ones they rely on: ICs build with `/tdd`, start bugs with `/diagnosing-bugs`, and untangle stale branches with `/resolving-merge-conflicts`; project leads review PRs with `/code-review` (its Standards + Spec sub-agents are the two review angles - the PR's single formal review; the IC's own check is a targeted self-check, not `/code-review`, per ticket 05) and settle vocabulary with `/domain-modeling`; the dispatcher answers reading questions with `/research`. `/implement` is user-only, but a slash command at the head of a launch prompt counts as a user invocation in the new session (verified), so project leads launch ICs with `-Prompt "/mattpocock-skills:implement ..."` and the IC runs the real skill. `skills:` in a role file's frontmatter does **not** preload skill text into a `--agent` background session (verified, both spellings); skills are discovered from the listing and invoked on demand. `/triage`, `/to-spec`, `/to-tickets` and `/grill-with-docs` stay yours: they are scope decisions.
 
 ## Onboarding a tenant
 

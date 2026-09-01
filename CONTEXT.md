@@ -173,6 +173,16 @@ pending, skipped, and missing watched checks have no gate effect. A check not
 listed as a gate, watched check, or ignored check is unclassified, not watched.
 _Avoid_: optional gate, ignored check, non-required check
 
+**Risk reviewer**:
+An ephemeral, read-only `qa-reviewer` worker added to a Unit of work only when
+a configured risk trigger fires (carve-out, auth, security, data integrity,
+concurrency, destructive behavior, material accessibility). The IC hosts it
+pre-PR-ready; its findings land once, in the unit's review artifact, and the
+spawning session verifies every claim. Every PR still gets the project lead's
+one formal Standards and Spec review; a diff without a trigger never gets a
+risk reviewer.
+_Avoid_: second reviewer, QA pass, extra review angle
+
 **Frontier exclusion**:
 A ready Unit of work the fleet must not launch because an exceptional fleet
 fact that GitHub cannot express keeps it outside the assignment frontier. The

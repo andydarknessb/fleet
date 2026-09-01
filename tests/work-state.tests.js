@@ -234,3 +234,77 @@ test('old event partitions move to the archive after thirty days', () => {
   getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(fs.existsSync(path.join(root, 'state', 'events', 'archive', '2026-07-01.jsonl')), true);
 });
+
+// Ticket 05: review recording through the one state door.
+const { recordReview } = require('../bin/work-state');
+
+function seedToReview(root) {
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'r-1', 'ack', '2026-09-01T01:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 'r-2', 'PR #77', '2026-09-01T01:00:02.000Z');
+  move(root, 'endzone:issue-42', 3, 'ci-wait', 'r-3', 'CI pending', '2026-09-01T01:00:03.000Z');
+  move(root, 'endzone:issue-42', 4, 'review', 'r-4', 'CI settled', '2026-09-01T01:00:04.000Z');
+  return 5;
+}
+
+test('a formal review is recorded on a record in review state, with the artifact referenced from the event', () => {
+  const root = rootDir();
+  const revision = seedToReview(root);
+  const result = recordReview({
+    root, id: 'endzone:issue-42', expectedRevision: revision,
+    idempotencyKey: 'rev-1', actor: 'project-lead', now: '2026-09-01T01:00:05.000Z',
+    review: { kind: 'formal', headSha: 'abc1234', artifact: 'state/reviews/endzone_issue-42/formal-001.json', tier: 'normal', triggers: [] },
+  });
+  assert.equal(result.replayed, false);
+  assert.equal(result.record.review.progress, 'formal-recorded');
+  assert.equal(result.record.review.formal.headSha, 'abc1234');
+  assert.equal(result.record.review.formal.artifact, 'state/reviews/endzone_issue-42/formal-001.json');
+  const events = fs.readFileSync(path.join(root, 'state', 'events', '2026-09-01.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line));
+  const reviewEvent = events.find((event) => event.type === 'review-recorded');
+  assert.ok(reviewEvent, 'review-recorded event exists');
+  assert.equal(reviewEvent.changes.artifact, 'state/reviews/endzone_issue-42/formal-001.json');
+  assert.equal(reviewEvent.changes.kind, 'formal');
+});
+
+test('a formal review outside the review state is refused; a risk review is allowed pre-PR-ready', () => {
+  const root = rootDir();
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'r-1', 'ack', '2026-09-01T01:00:01.000Z');
+  assert.throws(
+    () => recordReview({
+      root, id: 'endzone:issue-42', expectedRevision: 2, idempotencyKey: 'rev-x', actor: 'project-lead',
+      review: { kind: 'formal', headSha: 'abc', artifact: 'state/reviews/x.json' },
+    }),
+    (error) => error.code === 'INVALID_REVIEW_STATE',
+  );
+  const risk = recordReview({
+    root, id: 'endzone:issue-42', expectedRevision: 2, idempotencyKey: 'rev-risk', actor: 'ic-42',
+    now: '2026-09-01T01:00:02.000Z',
+    review: { kind: 'risk', headSha: 'abc', artifact: 'state/reviews/endzone_issue-42/risk-001.json', tier: 'high-risk', triggers: ['carve-out'] },
+  });
+  assert.equal(risk.record.review.risk.artifact, 'state/reviews/endzone_issue-42/risk-001.json');
+  assert.equal(risk.record.review.progress, 'risk-recorded');
+});
+
+test('review recording is idempotent and revision-guarded', () => {
+  const root = rootDir();
+  const revision = seedToReview(root);
+  const review = { kind: 'formal', headSha: 'abc1234', artifact: 'state/reviews/a.json' };
+  const first = recordReview({ root, id: 'endzone:issue-42', expectedRevision: revision, idempotencyKey: 'rev-1', actor: 'pl', now: '2026-09-01T01:00:05.000Z', review });
+  const replay = recordReview({ root, id: 'endzone:issue-42', expectedRevision: revision, idempotencyKey: 'rev-1', actor: 'pl', now: '2026-09-01T01:00:06.000Z', review });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.revision, first.revision);
+  assert.throws(
+    () => recordReview({ root, id: 'endzone:issue-42', expectedRevision: revision, idempotencyKey: 'rev-2', actor: 'pl', review }),
+    (error) => error.code === 'STALE_REVISION',
+  );
+  assert.throws(
+    () => recordReview({ root, id: 'endzone:issue-42', expectedRevision: first.revision, idempotencyKey: 'rev-3', actor: 'pl', review: { kind: 'nonsense', headSha: 'a', artifact: 'b' } }),
+    (error) => error.code === 'INVALID_REVIEW_KIND',
+  );
+  assert.throws(
+    () => recordReview({ root, id: 'endzone:issue-42', expectedRevision: first.revision, idempotencyKey: 'rev-4', actor: 'pl', review: { kind: 'formal', headSha: '', artifact: '' } }),
+    (error) => error.code === 'MISSING_REVIEW_EVIDENCE',
+  );
+});

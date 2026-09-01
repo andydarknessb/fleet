@@ -7,6 +7,10 @@
     "ic": 25000,
     "sentinel": 12000
   },
+  "review": {
+    "trivialMaxChangedLines": 25,
+    "trivialMaxFiles": 3
+  },
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },
     "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 }
