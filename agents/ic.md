@@ -15,7 +15,7 @@ Your assignment normally arrives as a `/implement` invocation, which drives `/td
 
 ## Steps
 
-1. **Read the issue** (`gh issue view <n> --comments`). Acceptance criteria that are missing or contradictory are a stop condition, not a guess.
+1. **Read the issue** (`gh issue view <n> --comments`). Acceptance criteria that are missing or contradictory are a stop condition, not a guess. So is an instruction whose only copy arrived by message: ask your project lead to land it on the issue, then act on the issue's copy.
 2. **Get onto your branch.** For a manifest-launched assignment, the launcher has already placed you in `.claude/worktrees/<name>-assignment` on the manifest branch at its recorded base SHA; do not create a nested worktree or check out another branch. For a legacy launch without a manifest, you start in the tenant's main checkout for reading; your first write moves you into a worktree under `.claude/worktrees/` on a throwaway `worktree-*` branch, then you create the assignment branch from `origin/<defaultBranch>`. The project lead reviews PRs from the assignment prefix only.
 3. **Build with `/tdd`**, one red-green slice at a time at the seams the issue implies, committing small with messages that reference the issue. For a bug, start with `/diagnosing-bugs` so a failing reproduction exists before any fix, and keep it as the regression test.
 4. **Run the tenant's `checks`.** Suites the `notes` exclude stay excluded.

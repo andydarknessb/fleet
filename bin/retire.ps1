@@ -51,6 +51,15 @@ if ($e.jobId) {
 }
 $e.status = 'retired'
 $e | Add-Member -NotePropertyName retiredAt -NotePropertyValue (Now-Iso) -Force
+# A retired entry's prompt has no reader (recovery replays active ICs only); archive the full row, then drop it so the roster stays small.
+# Strip only after the archive append succeeded; a re-retire (prompt already gone) appends nothing.
+if ($e.PSObject.Properties['prompt']) {
+  try {
+    [IO.Directory]::CreateDirectory("$FleetHome\state\archive") | Out-Null
+    [IO.File]::AppendAllText("$FleetHome\state\archive\roster-retired-full.jsonl", (($e | ConvertTo-Json -Compress -Depth 8) + [Environment]::NewLine), $Utf8)
+    $e.PSObject.Properties.Remove('prompt')
+  } catch { Write-Warning "prompt archive failed ($_); prompt kept on the roster row" }
+}
 Save-LiveRoster $live
 Remove-Item "$FleetHome\state\heartbeats\$Name.json" -ErrorAction SilentlyContinue
 $ownedAfter = @(Get-OwnedWorktrees)

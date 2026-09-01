@@ -17,9 +17,18 @@ if ($tenant -and (Test-Path "$home_\tenants\$tenant.json")) {
 }
 if ($env:FLEET_ISSUE) { Write-Output "Your unit of work: issue #$($env:FLEET_ISSUE). Nothing else." }
 if (Test-Path "$home_\state\NOTICE.md") {
-  Write-Output "--- NOTICE from Cory (state/NOTICE.md) ---"
-  Get-Content "$home_\state\NOTICE.md" -Raw
+  Write-Output "--- NOTICE from Cory (state/NOTICE.md; RETIRED PATH - move this into state/notices/<all|role>.md) ---"
+  Get-Content "$home_\state\NOTICE.md" -Raw -Encoding UTF8
   Write-Output "--- end notice ---"
+}
+foreach ($noticeScope in @('all', $role)) {
+  if (-not $noticeScope) { continue }
+  $noticePath = "$home_\state\notices\$noticeScope.md"
+  if (Test-Path $noticePath) {
+    Write-Output "--- NOTICE from Cory (state/notices/$noticeScope.md) ---"
+    Get-Content $noticePath -Raw -Encoding UTF8
+    Write-Output "--- end notice ---"
+  }
 }
 $roster = $null
 try { $roster = Get-Content "$home_\state\roster.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}

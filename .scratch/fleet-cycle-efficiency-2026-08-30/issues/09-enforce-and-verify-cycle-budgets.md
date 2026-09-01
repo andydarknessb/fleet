@@ -1,7 +1,8 @@
 # Enforce budgets and verify the efficient Fleet cycle
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 03, 04, 05, 06, 07, 08
+Authorized 2026-09-01; sequencing and amendments: `../amendments-2026-09-01.md`.
 
 ## Outcome
 

@@ -1,7 +1,11 @@
 # Supervise one fleet cycle without a Claude Sentinel turn
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 07
+Authorized 2026-09-01; sequencing and amendments: `../amendments-2026-09-01.md`.
+Amendment: split into 08a (shadow supervisor + external page path + launch
+retry cap; no 07 dependency, leads Stage 2) and 08b (Sentinel removal; keeps
+this Blocked-by and the 48h parity gate).
 
 ## Outcome
 

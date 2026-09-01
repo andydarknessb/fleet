@@ -1,7 +1,8 @@
 # Turn one decision event into one digest entry and at most one page
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 02, 04, 06
+Authorized 2026-09-01; sequencing and amendments: `../amendments-2026-09-01.md`.
 
 ## Outcome
 

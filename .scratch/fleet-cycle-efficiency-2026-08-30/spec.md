@@ -1,6 +1,6 @@
 # Token-efficient Fleet cycle
 
-Status: design approved; runtime implementation not authorized
+Status: design approved; runtime implementation AUTHORIZED 2026-09-01 - amendments and sequencing in `amendments-2026-09-01.md`
 
 ## Goal
 
@@ -160,10 +160,15 @@ must read.
 
 - Mechanical scripts receive no tenant prose and invoke no model.
 - Dispatcher: Sonnet/low, tracker/messaging/state tools only, fresh daily.
+  (Amended 2026-09-01: the standing session retires after tickets 07+08 land;
+  on-demand launches thereafter.)
 - Project lead: Sonnet/high, tracker/review/messaging/state tools only.
+  (Amended 2026-09-01: staged descent - Opus with effort high first, a Sonnet
+  trial only after rotation and wake-on-change soak; see amendments.)
 - IC: engineering tools selected by manifest risk; no fleet-state write access.
 - Risk reviewer: ephemeral, read-only review tools; Opus only for a configured
-  high-risk trigger.
+  high-risk trigger. (Amended 2026-09-01: the risk reviewer is spawned by the
+  IC pre-PR-ready, not by the project lead; see amendments.)
 
 The Dispatcher reconstructs from state on its daily launch. The project lead
 rotates only at a turn boundary with no active mutation: write the last consumed
@@ -219,6 +224,7 @@ tested rollback for every flag.
 | 08 | One scheduled supervisor cycle matches Sentinel without a model turn | 07 |
 | 09 | Shadow evidence enables bounded cutover and verifies the target budgets | 03-08 |
 
-Tickets are self-contained under `issues/`. Their status is `needs-triage`
-because the design is approved but runtime implementation has not been
-authorized.
+Tickets are self-contained under `issues/`. Runtime implementation was
+authorized 2026-09-01; tickets 04-09 are `ready-for-agent` in the staged order
+recorded in `amendments-2026-09-01.md`. (If the Status line at the top still
+reads "not authorized", `apply-stage1-pending.js` has not run yet.)

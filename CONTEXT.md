@@ -95,6 +95,15 @@ signal; sessions finish their current turn and go idle. It is the only way to
 stop the fleet without hunting sessions.
 _Avoid_: kill switch, freeze, stop-the-world, maintenance mode
 
+**Rotation**:
+The bounded lifetime of a control-plane session: at a set boundary (merges
+delivered, hours alive, or cumulative job tokens) it retires and a replacement
+launches through the one door, reconstructing its position from canonical
+state - the roster, Work records, issues, and the skip file - never from its
+predecessor's transcript. A respawn is not a rotation: it re-pins the old
+flags and keeps the old transcript.
+_Avoid_: restart, refresh, recycle
+
 ### Work
 
 **Fleet cycle**:

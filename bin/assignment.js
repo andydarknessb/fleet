@@ -341,7 +341,7 @@ function parseArgs(argv) {
 }
 
 function readFixture(file, fallback) {
-  return file ? JSON.parse(fs.readFileSync(path.resolve(file), 'utf8')) : fallback;
+  return file ? JSON.parse(fs.readFileSync(path.resolve(file), 'utf8').replace(/^\uFEFF/, '')) : fallback;
 }
 
 function readStateFixture(file, fallback, root, relative) {

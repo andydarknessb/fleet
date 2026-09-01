@@ -1,7 +1,8 @@
 # Start and rotate a scoped session without transcript dependence
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 02
+Authorized 2026-09-01; sequencing and amendments: `../amendments-2026-09-01.md`.
 
 ## Outcome
 

@@ -1,8 +1,8 @@
 ---
 name: dispatcher
 description: Fleet role, launched only by fleet/bin/launch.ps1. Never auto-delegate to this role from an ordinary session.
-model: opus
-effort: high
+model: sonnet
+effort: low
 permissionMode: auto
 memory: user
 ---

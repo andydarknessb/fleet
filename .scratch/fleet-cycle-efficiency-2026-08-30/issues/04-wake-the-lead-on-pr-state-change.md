@@ -1,7 +1,8 @@
 # Wake the project lead only when an active PR changes state
 
-Status: needs-triage
+Status: ready-for-agent
 Blocked by: 02
+Authorized 2026-09-01; sequencing and amendments: `../amendments-2026-09-01.md`.
 
 ## Outcome
 
