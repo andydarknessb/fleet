@@ -50,6 +50,12 @@ exit /b 0
   Assert-True (@($withoutPr.respawned).Count -eq 1) 'a stale idle IC with no PR or hold must remain respawnable'
   Assert-True ($withoutPr.respawned[0].reason -match 'state=working status=idle, no open PR') 'the respawn reason must report measured state and status'
 
+  # The Max-plan session-limit wording (seen live 2026-09-01) must read as a rate-limit signal.
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"You''ve hit your session limit · resets 5:50pm (America/Chicago)","waitingFor":""}'
+  $limited = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ("$($limited.pause)" -match 'rate-limit signal on ic-900') 'a session-limit detail must propose the rate-limit PAUSE'
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"","waitingFor":""}'
+
   Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"900":"held"},"prs":{}}'
   $env:MOCK_GH_FAIL = '1'
   $held = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json

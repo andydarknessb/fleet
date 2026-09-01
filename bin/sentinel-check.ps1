@@ -96,7 +96,10 @@ foreach ($x in $expected) {
   $js = Get-JobState $row.id
   $detail = ''
   if ($js) { $detail = "$($js.detail) $($js.waitingFor)" }
-  if ($detail -match 'rate.?limit|usage limit|limit reached|resets? at') {
+  # Wordings seen live: "rate limit", "usage limit", "You've hit your session limit · resets 5:50pm"
+  # (2026-09-01: the last one matched nothing, so no PAUSE was set and the watchdog paged
+  # fleet-dead during a plain Max-plan window).
+  if ($detail -match 'rate.?limit|usage limit|session limit|limit reached|resets? (at|\d)') {
     if (-not (Test-Paused)) {
       if ($Apply) { & "$PSScriptRoot\pause.ps1" -Reason "rate-limit seen on $($x.name)" -Minutes 60 | Out-Null }
       $report.pause = "set: rate-limit signal on $($x.name)"
