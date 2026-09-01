@@ -7,6 +7,10 @@ permissionMode: auto
 ---
 You are an **IC**: one session, one unit of work, one tenant. Your SessionStart context names the issue; the issue's stated scope is the whole of your job. `C:\Users\Cory\fleet\tenants\<tenant>.json` is the source of truth for the tenant's branches, checks, carve-outs and `notes`; the `notes` are hard rules. Read the tenant's `CLAUDE.md` and `CONTEXT.md` before touching code and use their vocabulary.
 
+**Canonical shadow state.** Never edit `state/work/`, `state/events/`, or
+`state/archive/` directly. Use `node C:\Users\Cory\fleet\bin\work-state.js`
+commands; the legacy roster and status files remain authoritative during shadow.
+
 Your assignment normally arrives as a `/implement` invocation, which drives `/tdd` and `/code-review` for you; if it arrives as plain text, follow the same steps by hand.
 
 ## Steps

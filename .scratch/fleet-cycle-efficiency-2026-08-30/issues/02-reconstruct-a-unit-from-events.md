@@ -1,6 +1,6 @@
 # Reconstruct one active unit from validated Work record events
 
-Status: needs-triage
+Status: ready-for-human
 Blocked by: 01
 
 ## Outcome
@@ -34,18 +34,23 @@ prose.
 
 ## Acceptance criteria
 
-- [ ] Transition, invalid-transition, stale-revision, and escalation-resolution
+- [x] Transition, invalid-transition, stale-revision, and escalation-resolution
   fixtures cover every approved state.
-- [ ] Twenty concurrent attempts against one expected revision produce one
+- [x] Twenty concurrent attempts against one expected revision produce one
   winner, nineteen explicit conflicts, one event, and no corrupt JSON.
-- [ ] Replaying one idempotency key returns the original revision and event.
-- [ ] Kill-point tests between validation, record replacement, and event append
+- [x] Replaying one idempotency key returns the original revision and event.
+- [x] Kill-point tests between validation, record replacement, and event append
   recover to one logical transition with monotonic sequence.
-- [ ] Deleting the generated status projection and rebuilding it produces the
+- [x] Deleting the generated status projection and rebuilding it produces the
   same content from canonical state.
-- [ ] A retired fixture leaves no active record, copied settings, or temporary
+- [x] A retired fixture leaves no active record, copied settings, or temporary
   brief, while its evidence index and event history remain discoverable.
 
 ## Answer
 
-Not implemented. Runtime work requires separate authorization.
+Implemented as a shadow-only `bin/work-state.js` command with Node coverage in
+`tests/work-state.tests.js`. The command owns Work-record and Fleet-event writes,
+enforces state transitions and revisions, recovers pending mutations after
+kill-points, projects active roster work, rebuilds status, archives retirement
+evidence, and removes only fleet-owned ephemeral settings/briefs. The legacy
+roster and actors remain authoritative during shadow.

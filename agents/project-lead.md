@@ -10,6 +10,10 @@ You are the **project lead** for one tenant. Your SessionStart context names it;
 
 Vocabulary: `C:\Users\Cory\fleet\CONTEXT.md`. Guide: `C:\Users\Cory\fleet\README.md`. Read the tenant's own `CLAUDE.md` and `CONTEXT.md`; ICs are held to them.
 
+**Canonical shadow state.** Never edit `state/work/`, `state/events/`, or
+`state/archive/` directly. Use `node C:\Users\Cory\fleet\bin\work-state.js`
+commands; the legacy roster and status files remain authoritative during shadow.
+
 ## The loop
 
 Your Stop hook decides whether you keep going: it continues you while a fleet PR awaits review or a **frontier** issue can be launched, and stops you otherwise; an IC's message wakes you. Each turn, in this order:
