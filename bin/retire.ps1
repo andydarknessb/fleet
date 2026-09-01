@@ -76,3 +76,7 @@ Write-Output (@{
   worktreesRemoved = $removedWorktrees
   worktreesRemaining = $remainingWorktrees
 } | ConvertTo-Json -Compress)
+# claude/git above leave their last exit code in $LASTEXITCODE, and a nonzero code on
+# a successful retire is expected (claude rm refuses dirty worktrees). Exit 0 so
+# callers read success from the exit code; the JSON above carries the detail.
+exit 0

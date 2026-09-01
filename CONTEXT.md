@@ -96,6 +96,16 @@ signal; sessions finish their current turn and go idle. It is the only way to
 stop the fleet without hunting sessions.
 _Avoid_: kill switch, freeze, stop-the-world, maintenance mode
 
+**Notice**:
+One paragraph of operator instruction on a scoped board -
+`state/notices/all.md`, `<role>.md`, or `tenant-<tenant>.md` - injected at
+session start only for the sessions its scope names. A notice carries its own
+end: `[until YYYY-MM-DD]`, `[cleared-by <work-record-id> <state>]`, or Cory's
+hand. The retired global board `state/NOTICE.md` is injected only under the
+rollback flag `state/flags/legacy-notice`; a standing rule belongs in a role
+file, not on a board.
+_Avoid_: broadcast, announcement, memo
+
 **Rotation**:
 The bounded lifetime of a control-plane session: at a set boundary (merges
 delivered, hours alive, or cumulative job tokens) it retires and a replacement

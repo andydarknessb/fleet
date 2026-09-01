@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "firstTurnCeilings": {
+    "baselineTokens": 0,
+    "dispatcher": 12000,
+    "project-lead": 20000,
+    "ic": 25000,
+    "sentinel": 12000
+  },
+  "rotation": {
+    "dispatcher": { "maxAgeHours": 24 },
+    "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 }
+  }
+}

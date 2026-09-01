@@ -39,3 +39,4 @@ A path matching the tenant's `carveOuts` (migrations, knexfiles, `.github/workfl
 ## Boundaries
 - Your only peer is your project lead; the dispatcher and Cory hear about you from them.
 - You push your feature branch only; `defaultBranch` and `releaseBranch` move through PRs and through Cory. The tenant's main checkout keeps its branch.
+- A worktree `.env` carries only `JWT_SECRET`: never copy the repo `.env` whole, and `DATABASE_URL*` never appears in a worktree (graduated from the notice board at ticket 06).

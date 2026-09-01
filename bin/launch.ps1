@@ -125,6 +125,36 @@ if ($Manifest) {
   $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
 }
 $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
+
+# --- role tool contract (ticket 06). work-state.js stays the one validated door to
+# --- durable coordination state, so every role loses direct file-editing tools on
+# --- state/work|events|archive; control-plane roles additionally lose engineering
+# --- edits in tenant repos (they review and merge, ICs write); ICs lose direct
+# --- edits anywhere in fleet state. Rollback: state/flags/tool-contract-off skips
+# --- the injection without touching any launch gate.
+$fleetFwd = $FleetHome.Replace('\', '/')
+$denyRules = @()
+$toolContractOn = -not (Test-Path "$FleetHome\state\flags\tool-contract-off")
+if ($toolContractOn) {
+  foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') {
+    foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
+    if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
+  }
+  if ($Role -in @('dispatcher', 'project-lead', 'sentinel')) {
+    foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
+      $tenantRepo = $null
+      try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
+      if ($tenantRepo) { foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') { $denyRules += "$deniedTool($($tenantRepo.Replace('\', '/'))/**)" } }
+    }
+  }
+}
+if ($denyRules.Count -gt 0) {
+  if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
+  $existingDeny = @()
+  if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
+  $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $denyRules) | Select-Object -Unique)) -Force
+}
+
 $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
 Write-Json $settingsPath $settings
 
@@ -150,8 +180,52 @@ if (Test-Path $roleFile) {
 $effortArgs = @()
 if ($effort -in @('low','medium','high','xhigh','max')) { $effortArgs = @('--effort', $effort) }
 
+# --- first-turn ceiling (ticket 06): a launch that would start over its role's
+# --- config/cycle.json budget fails before assignment and reports the token
+# --- contribution by source. The estimate counts the fleet-injected sources
+# --- (prompt, role file, simulated session-start injection, settings) at ~4
+# --- chars/token plus the configured baselineTokens; calibrating baselineTokens
+# --- against measured cache creation is ticket 09's verification. Rollback:
+# --- state/flags/launch-ceiling-off, or -Force.
+$budget = $null
+$ceiling = 0
+$ceilings = $null
+try { $ceilings = (Read-Json "$FleetHome\config\cycle.json").firstTurnCeilings } catch {}
+if ($ceilings -and $ceilings.PSObject.Properties[$Role]) { $ceiling = [int]$ceilings.$Role }
+if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-off")) {
+  $hookChars = 0
+  $hookPath = "$FleetHome\hooks\session-start.ps1"
+  if (Test-Path $hookPath) {
+    $savedEnv = @{}
+    foreach ($pair in $envBlock.GetEnumerator()) { $savedEnv[$pair.Key] = [Environment]::GetEnvironmentVariable($pair.Key) }
+    try {
+      foreach ($pair in $envBlock.GetEnumerator()) { [Environment]::SetEnvironmentVariable($pair.Key, "$($pair.Value)") }
+      $hookChars = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File $hookPath 2>$null | Out-String).Length
+    } catch {} finally {
+      foreach ($savedKey in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($savedKey, $savedEnv[$savedKey]) }
+    }
+  }
+  $roleChars = 0
+  if (Test-Path $roleFile) { $roleChars = (Get-Content $roleFile -Raw).Length }
+  $baseline = 0
+  if ($ceilings.PSObject.Properties['baselineTokens']) { $baseline = [int]$ceilings.baselineTokens }
+  $sources = [ordered]@{
+    baseline = $baseline
+    prompt = [int][Math]::Ceiling("$Prompt".Length / 4)
+    roleFile = [int][Math]::Ceiling($roleChars / 4)
+    sessionStartInjection = [int][Math]::Ceiling($hookChars / 4)
+    settings = [int][Math]::Ceiling((Get-Content $settingsPath -Raw).Length / 4)
+  }
+  $estimate = 0
+  foreach ($sourceTokens in $sources.Values) { $estimate += $sourceTokens }
+  $budget = [pscustomobject]@{ role = $Role; ceiling = $ceiling; estimatedTokens = $estimate; sources = [pscustomobject]$sources }
+  if ($estimate -gt $ceiling -and -not $Force) {
+    Write-Output (@{ launched = $false; reason = "first-turn ceiling exceeded for role '$Role': $estimate estimated tokens > $ceiling (see budget.sources)"; budget = $budget } | ConvertTo-Json -Compress -Depth 6); exit 6
+  }
+}
+
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; effort = $effort; cwd = $cwd; settings = $settingsPath; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress)
+  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; effort = $effort; cwd = $cwd; settings = $settingsPath; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
   exit 0
 }
 

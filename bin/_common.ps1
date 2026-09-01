@@ -28,6 +28,21 @@ function Get-FleetNames {
 }
 function Test-Paused { Test-Path "$FleetHome\state\PAUSE" }
 function Now-Iso { (Get-Date).ToUniversalTime().ToString('o') }
+function Get-NodeExe {
+  # FLEET_NODE_PATH first (Task Scheduler runs without the login PATH), then PATH.
+  $nodePath = $env:FLEET_NODE_PATH
+  if ($nodePath) {
+    if (Test-Path -LiteralPath $nodePath -PathType Leaf) { return $nodePath }
+    throw "FLEET_NODE_PATH does not point to a Node executable: $nodePath"
+  }
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) { throw 'Node was not found. Set FLEET_NODE_PATH to the node.exe used by the fleet.' }
+  return $node.Source
+}
+function ConvertFrom-LastJsonLine {
+  param($Text)
+  try { return ("$Text".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
+}
 function Write-Escalation {
   param($From, $Kind, $Detail)
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
