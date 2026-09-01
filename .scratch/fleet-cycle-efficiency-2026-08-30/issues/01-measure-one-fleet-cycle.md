@@ -1,6 +1,6 @@
 # Measure one Fleet cycle without changing its behavior
 
-Status: ready-for-review
+Status: ready-for-human
 Blocked by: none
 
 ## Outcome
