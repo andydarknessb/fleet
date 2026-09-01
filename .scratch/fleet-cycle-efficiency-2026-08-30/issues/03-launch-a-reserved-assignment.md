@@ -1,6 +1,6 @@
 # Turn one ready issue into a reserved, acknowledged assignment
 
-Status: needs-triage
+Status: ready-for-human
 Blocked by: 02
 
 ## Outcome
@@ -36,20 +36,24 @@ acknowledgment without duplicating the issue body in messages.
 
 ## Acceptance criteria
 
-- [ ] A shuffled GitHub fixture produces the same ordered frontier on every run.
-- [ ] Assignees, unresolved dependencies, spec parents, collisions, and each
+- [x] A shuffled GitHub fixture produces the same ordered frontier on every run.
+- [x] Assignees, unresolved dependencies, spec parents, collisions, and each
   Frontier-exclusion reason have explicit exclusion evidence.
-- [ ] Two simultaneous reservation attempts for the same component or migration
+- [x] Two simultaneous reservation attempts for the same component or migration
   prefix result in one owner and one conflict.
-- [ ] The prompt, manifest, messages, and IC acknowledgment contain only one
+- [x] The prompt, manifest, messages, and IC acknowledgment contain only one
   copy of the acceptance criteria: the GitHub issue remains authoritative.
-- [ ] A changed issue body before acknowledgment invalidates the manifest and
+- [x] A changed issue body before acknowledgment invalidates the manifest and
   prevents work against stale criteria.
-- [ ] A fixture with a stale local base creates the worktree from the fetched
+- [x] A fixture with a stale local base creates the worktree from the fetched
   remote base SHA recorded in the manifest.
-- [ ] No path launches a session outside `launch.ps1` or bypasses fleet and
+- [x] No path launches a session outside `launch.ps1` or bypasses fleet and
   per-tenant capacity gates.
 
 ## Answer
 
-Not implemented. Runtime work requires separate authorization.
+Implemented as an opt-in shadow assignment planner in `bin/assignment.js` with
+state-command-owned reservations, deterministic frontier evidence, immutable
+manifests, GitHub/base reconciliation, stale-manifest invalidation, and a
+manifest-aware `launch.ps1` adapter. Legacy selection and launch remain
+authoritative during shadow; no automatic cutover is enabled.

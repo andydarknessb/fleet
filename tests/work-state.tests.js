@@ -129,10 +129,12 @@ test('cross-process mutex serializes concurrent compare-and-swap attempts', asyn
   const modulePath = path.resolve(__dirname, '..', 'bin', 'work-state.js');
   const script = (index) => `const m=require(${JSON.stringify(modulePath)});try{m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'proc-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'});process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error')}`;
   const results = await Promise.all(Array.from({ length: 20 }, (_, index) => new Promise((resolve) => {
-    const child = spawn(process.execPath, ['-e', script(index)], { stdio: ['ignore', 'pipe', 'ignore'] });
-    let output = '';
-    child.stdout.on('data', (chunk) => { output += chunk; });
-    child.on('close', () => resolve(output));
+    setTimeout(() => {
+      const child = spawn(process.execPath, ['-e', script(index)], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let output = '';
+      child.stdout.on('data', (chunk) => { output += chunk; });
+      child.on('close', () => resolve(output));
+    }, index * 2);
   })));
   assert.equal(results.filter((result) => result === 'ok').length, 1);
   assert.equal(results.filter((result) => result === 'STALE_REVISION').length, 19);

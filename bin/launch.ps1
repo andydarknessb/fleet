@@ -7,7 +7,7 @@
 [CmdletBinding()]
 param(
   [string]$Role, [string]$Name, [string]$Tenant, [string]$Parent, [string]$Prompt, [int]$Issue,
-  [string]$FromRoster,
+  [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only)
@@ -18,6 +18,25 @@ $static = Get-StaticRoster
 $live = Get-LiveRoster
 $cwd = $null
 $t = $null
+$worktreePath = $null
+if ($Manifest) {
+  if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Write-Error "manifest '$Manifest' was not found"; exit 4 }
+  $assignment = Read-Json $Manifest
+  if (-not $assignment -or $assignment.status -ne 'pending-ack') { Write-Error "manifest '$Manifest' is not pending acknowledgment"; exit 4 }
+  if ($WorkRecordId -and $assignment.workRecordId -ne $WorkRecordId) { Write-Error "manifest Work record does not match -WorkRecordId"; exit 4 }
+  $WorkRecordId = $assignment.workRecordId
+  $Role = 'ic'
+  $Name = "ic-$($assignment.issue.number)"
+  $Tenant = $assignment.tenant
+  $Parent = $assignment.parent
+  $Issue = [int]$assignment.issue.number
+  $Model = [string]$assignment.model
+  $Prompt = "Read the assignment manifest at $Manifest. Emit assignment-started for Work record $WorkRecordId in your first useful turn, then follow the manifest pointers without restating the issue criteria."
+  $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
+  if (-not $tenantConfig) { Write-Error "no tenant file for '$Tenant'"; exit 4 }
+  $cwd = $tenantConfig.repo
+  if (Test-Path -LiteralPath "$Manifest.invalidated.json") { Write-Error "manifest '$Manifest' was invalidated"; exit 4 }
+}
 if ($FromRoster) {
   $e = $static.sessions | Where-Object { $_.name -eq $FromRoster }
   if (-not $e) { Write-Error "no static roster entry named '$FromRoster'"; exit 4 }
@@ -31,6 +50,46 @@ if ($Tenant) {
   if (-not $cwd) { $cwd = $t.repo }
 }
 if (-not $cwd) { $cwd = $FleetHome }
+
+if ($Manifest) {
+  $activeState = Read-Json "$FleetHome\state\work\active.json"
+  $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
+  if (-not $recordProperty -or $recordProperty.Value.state -ne 'assigned') { Write-Error "Work record '$WorkRecordId' is not assigned"; exit 4 }
+  $activeAssignments = @($activeState.records.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.manifestPath -and $_.state -ne 'retired' -and $_.id -ne $WorkRecordId })
+  if ($activeAssignments.Count -ge 3) { Write-Error 'a fourth assignment is not permitted'; exit 4 }
+  if ($activeAssignments.Count -ge 2) {
+    $proof = $assignment.independenceProof
+    $expectedCandidates = @($activeAssignments | ForEach-Object { [int]$_.issue }) + @([int]$Issue) | Sort-Object
+    $actualCandidates = @($proof.candidates | ForEach-Object { [int]$_ }) | Sort-Object
+    $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
+    $actualFields = @($proof.checkedFields | ForEach-Object { [string]$_ }) | Sort-Object
+    $proofValid = $proof -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
+    if (-not $proofValid) { Write-Error 'a third assignment requires a verified independent machine-readable proof'; exit 4 }
+  }
+}
+
+function Invalidate-Manifest {
+  param([string]$Reason)
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) { throw 'node is required to release the assignment reservation' }
+  & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId'" }
+  Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = $assignment.id; invalidatedAt = (Now-Iso); reason = $Reason })
+}
+
+if ($Manifest -and -not $DryRun) {
+  $issueRaw = (& gh issue view $Issue -R $t.github --json state,body 2>&1 | Out-String)
+  if ($LASTEXITCODE -ne 0) { Write-Error "could not reconcile issue #$Issue before launch"; exit 4 }
+  try { $currentIssue = $issueRaw | ConvertFrom-Json } catch { Write-Error "GitHub issue reconciliation returned invalid JSON"; exit 4 }
+  if ([string]$currentIssue.state -ne 'OPEN') { Invalidate-Manifest "issue #$Issue is no longer open"; Write-Error "issue #$Issue is no longer open"; exit 4 }
+  $hash = [Security.Cryptography.SHA256]::Create()
+  $actualBodyHash = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$currentIssue.body))).Replace('-', '').ToLowerInvariant()
+  if ($actualBodyHash -ne [string]$assignment.issue.bodyHash) {
+    Invalidate-Manifest 'issue body hash changed before acknowledgment'
+    Write-Error "issue #$Issue changed after the manifest was created; assignment invalidated"
+    exit 4
+  }
+}
 
 # --- gates ---
 if ((Test-Paused) -and -not $Force) {
@@ -59,6 +118,12 @@ if ($Role -eq 'ic') {
 $settings = Read-Json "$FleetHome\fleet-settings.json"
 $envBlock = [ordered]@{ FLEET_HOME = $FleetHome; FLEET_NAME = $Name; FLEET_ROLE = $Role; FLEET_TENANT = "$Tenant"; FLEET_PARENT = $Parent }
 if ($Issue) { $envBlock.FLEET_ISSUE = "$Issue" }
+if ($Manifest) {
+  $envBlock.FLEET_ASSIGNMENT_MANIFEST = (Resolve-Path -LiteralPath $Manifest).Path
+  $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId
+  $envBlock.FLEET_BASE_SHA = [string]$assignment.base.sha
+  $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
+}
 $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
 $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
 Write-Json $settingsPath $settings
@@ -90,24 +155,58 @@ if ($DryRun) {
   exit 0
 }
 
+$worktreePath = $null
+if ($Manifest) {
+  $baseRemote = [string]$assignment.base.remote
+  $baseRef = [string]$assignment.base.ref
+  $expectedBase = [string]$assignment.base.sha
+  if (-not $baseRemote -or -not $baseRef -or $expectedBase -notmatch '^[0-9a-fA-F]{40}$') { Write-Error "manifest '$Manifest' has an invalid base precondition"; exit 4 }
+  & git -C $cwd fetch $baseRemote $baseRef --prune 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { Write-Error "could not fetch $baseRemote/$baseRef for manifest '$Manifest'"; exit 4 }
+  $resolvedBase = (& git -C $cwd rev-parse "refs/remotes/$baseRemote/$baseRef" 2>$null | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0 -or $resolvedBase -ne $expectedBase) { Invalidate-Manifest "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; Write-Error "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; exit 4 }
+  $worktreeParent = Join-Path $cwd '.claude\worktrees'
+  $worktreePath = Join-Path $worktreeParent "$Name-assignment"
+  if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
+  New-Item -ItemType Directory -Force $worktreeParent | Out-Null
+  & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
+  $cwd = $worktreePath
+}
+
 # --- launch ---
 $before = @($daemon | ForEach-Object { $_.sessionId })
 $beforeJobIds = @(Get-DaemonSessions -All | ForEach-Object { $_.id })
-Push-Location $cwd
+$locationPushed = $false
 try {
+  Push-Location $cwd
+  $locationPushed = $true
   # Windows PowerShell 5.1 re-parses embedded double quotes in a string passed
   # as a native positional argument. Fleet briefs contain quoted issue titles,
   # so argv delivery silently truncated every measured IC prompt. stdin is the
   # CLI's prompt input as well, and preserves the exact string without another
   # command-line parse.
   $out = $Prompt | & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
-} finally { Pop-Location }
+} catch {
+  if ($locationPushed) { Pop-Location; $locationPushed = $false }
+  if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+    & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null
+    & git -C $t.repo worktree prune 2>$null | Out-Null
+  }
+  throw
+} finally {
+  if ($locationPushed) { Pop-Location }
+}
 $row = $null
 for ($i = 0; $i -lt 20 -and -not $row; $i++) {
   Start-Sleep -Milliseconds 750
   $row = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
 }
 if (-not $row) {
+  if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
+    & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null
+    & git -C $t.repo worktree prune 2>$null | Out-Null
+  }
   $failedRow = Get-DaemonSessions -All |
     Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
     Select-Object -First 1
@@ -120,7 +219,7 @@ if (-not $row) {
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
   model = $Model; effort = $effort
-  jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath
+  jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $Manifest; workRecordId = $WorkRecordId
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }
 $live.sessions = @($live.sessions | Where-Object { $_.name -ne $Name }) + @($entry)

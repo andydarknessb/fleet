@@ -300,7 +300,7 @@ function sanitizeGithub(github, issue) {
   return Object.fromEntries(allowed.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]).concat(source.issueNumber === undefined ? [['issueNumber', Number(issue)]] : []));
 }
 
-function baseRecord({ id, tenant, issue, owner, state, github, reservations, evidence, settingsPath, briefPath, now }) {
+function baseRecord({ id, tenant, issue, owner, state, github, reservations, evidence, settingsPath, briefPath, manifestPath, assignment, now }) {
   if (!id || !tenant || !Number.isInteger(Number(issue)) || Number(issue) <= 0) {
     throw new WorkStateError('INVALID_RECORD', 'id, tenant, and positive issue are required');
   }
@@ -316,16 +316,108 @@ function baseRecord({ id, tenant, issue, owner, state, github, reservations, evi
     eventSequence: 1,
     owner: owner || null,
     github: sanitizeGithub(github, issue),
-    reservations: reservations || { components: [], migrationPrefixes: [] },
+    reservations: {
+      components: [], migrationPrefixes: [], schemaAreas: [], testResources: [],
+      ...(reservations || {}),
+    },
     budget: { cumulativeTokens: 0, extension: null },
     review: { progress: 'not-started' },
     evidence: evidence || null,
     settingsPath: settingsPath || null,
     briefPath: briefPath || null,
+    manifestPath: manifestPath || null,
+    assignment: assignment || null,
     createdAt: now,
     updatedAt: now,
     idempotency: {},
   };
+}
+
+const RESERVATION_FIELDS = Object.freeze(['components', 'migrationPrefixes', 'schemaAreas', 'testResources']);
+
+function reservationConflicts(records, reservations, ignoreRecordId = null) {
+  const requested = reservations || {};
+  const conflicts = [];
+  for (const record of Object.values(records)) {
+    if (record.id === ignoreRecordId) continue;
+    for (const field of RESERVATION_FIELDS) {
+      const values = new Set((record.reservations?.[field] || []).map(String));
+      for (const value of (requested[field] || []).map(String)) {
+        if (values.has(value)) conflicts.push({ recordId: record.id, issue: record.issue, field, value });
+      }
+    }
+  }
+  return conflicts;
+}
+
+function proofMatches(expected, supplied) {
+  return Boolean(supplied?.independent)
+    && JSON.stringify([...(supplied.candidates || [])].map(Number).sort((a, b) => a - b)) === JSON.stringify([...expected.candidates].map(Number).sort((a, b) => a - b))
+    && JSON.stringify([...(supplied.checkedFields || [])].map(String).sort()) === JSON.stringify([...expected.checkedFields].map(String).sort())
+    && !(supplied.conflicts || []).length;
+}
+
+function reserveRecord(options = {}) {
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey || `reserve-${options.id || ''}`);
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const id = String(options.id);
+    const existing = active.records[id];
+    if (existing) {
+      const replay = replayIfKnown(existing, key);
+      if (replay) return replay;
+      throw new WorkStateError('RECORD_EXISTS', `record '${id}' already exists`);
+    }
+    if (fs.existsSync(archiveFile(p, id))) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is archived and cannot be reused`);
+    const activeAssignments = Object.values(active.records).filter((record) => record.manifestPath && record.state !== 'retired');
+    const expectedProof = {
+      independent: true,
+      candidates: [...activeAssignments.map((record) => Number(record.issue)), Number(options.issue)],
+      checkedFields: [...RESERVATION_FIELDS],
+      conflicts: [],
+    };
+    if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof))) {
+      throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires an independent machine-readable proof');
+    }
+    const conflicts = reservationConflicts(active.records, options.reservations);
+    if (conflicts.length) {
+      throw new WorkStateError('RESERVATION_CONFLICT', `reservation conflicts with ${conflicts[0].recordId}`, { conflicts });
+    }
+    const now = isoNow(options.now);
+    const record = baseRecord({ ...options, state: 'assigned', now });
+    record.idempotency[key] = { revision: 1, eventSequence: 1, type: 'assignment-reserved' };
+    const event = eventFor(record, {
+      type: 'assignment-reserved', actor: options.actor || 'assignment-planner', at: now,
+      idempotencyKey: key, evidence: options.evidence,
+      changes: { state: 'assigned', reservations: record.reservations },
+    });
+    commitMutation(p, { recordId: id, beforeRecord: null, afterRecord: record, event, killPoint: options.killPoint });
+    return { replayed: false, revision: 1, eventSequence: 1, record };
+  });
+}
+
+function releaseRecord(options = {}) {
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey);
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const record = active.records[String(options.id)];
+    if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const replay = replayIfKnown(record, key);
+    if (replay) return replay;
+    if (record.state !== 'assigned') throw new WorkStateError('INVALID_RELEASE', `only assigned records can release reservations (was ${record.state})`);
+    if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    const now = isoNow(options.now);
+    const next = { ...record, state: 'retired', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'assignment-released' };
+    const event = eventFor(next, {
+      type: 'assignment-released', actor: options.actor || 'assignment-planner', at: now,
+      idempotencyKey: key, evidence: options.evidence, changes: { from: 'assigned', to: 'retired' },
+    });
+    const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, archiveRecord: next, event, killPoint: options.killPoint });
+    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+  });
 }
 
 function createRecord(options = {}) {
@@ -600,6 +692,13 @@ function cli(argv) {
   const args = parseArgs(rest);
   const common = { root: args.root, now: args.now, actor: args.actor, evidence: args.evidence, idempotencyKey: args['idempotency-key'] };
   if (command === 'create') return createRecord({ ...common, id: args.id, tenant: args.tenant, issue: Number(args.issue), state: args.state || 'assigned', github: args['pr-number'] ? { issueNumber: Number(args.issue), prNumber: Number(args['pr-number']) } : undefined });
+  if (command === 'reserve') return reserveRecord({
+    ...common, id: args.id, tenant: args.tenant, issue: Number(args.issue), manifestPath: args.manifest,
+    reservations: JSON.parse(args.reservations || '{}'), assignment: args.assignment ? JSON.parse(args.assignment) : undefined,
+    independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined,
+    github: args['issue-url'] ? { issueNumber: Number(args.issue), issueUrl: args['issue-url'], bodyHash: args['body-hash'] } : undefined,
+  });
+  if (command === 'release') return releaseRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']) });
   if (command === 'transition') return transitionRecord({
     ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
     prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined, githubRepo: args.repo,
@@ -609,7 +708,7 @@ function cli(argv) {
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
   if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
-  throw new WorkStateError('USAGE', 'commands: create, transition, reconcile, get, shadow, project');
+  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, get, shadow, project');
 }
 
 if (require.main === module) {
@@ -622,14 +721,19 @@ if (require.main === module) {
 }
 
 module.exports = {
+  RESERVATION_FIELDS,
   STATES,
   TRANSITIONS,
   WorkStateError,
   createRecord,
   getRecord,
   parseArgs,
+  proofMatches,
   projectStatus,
   reconcilePullRequest,
+  releaseRecord,
+  reservationConflicts,
+  reserveRecord,
   shadowProject,
   transitionRecord,
 };

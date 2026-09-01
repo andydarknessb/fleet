@@ -34,6 +34,7 @@ cory
 | `bin/sentinel-check.ps1` | The Sentinel's mechanical check; `-Apply` performs respawns, retirements, worktree sweeps, and rate-limit PAUSE. An IC waiting on an open PR or skip-list hold is never stale-heartbeat respawned. |
 | `bin/retire.ps1` | Mark a finished IC as retiring before stopping it, remove its job/worktrees, and report verified remaining worktree state. |
 | `bin/work-state.js` | Canonical shadow Work-record/event command; validates transitions, revisions, idempotency, projections, and retirement archival. |
+| `bin/assignment.js` | Shadow frontier selector, reservation/manifest builder, base reconciliation, and single-door launch adapter. |
 | `bin/measure-cycle.js` | Read-only transcript/roster collector for daily JSON metrics and compact seven-day summaries; it never changes fleet decisions. |
 | `bin/run-cycle-collector.ps1` | Bounded daily collector runner used by Task Scheduler. |
 | `bin/install-cycle-collector-task.ps1` | Idempotently registers the daily collector task; run manually. |
@@ -44,6 +45,7 @@ cory
 | `state/` | Runtime only, gitignored: live roster, heartbeats, escalations, per-session settings, status files, PAUSE. |
 | `state/metrics/` | Generated measurement artifacts; cache-read tokens remain separate from fresh control-plane and IC tokens. |
 | `state/work/` | Shadow Work records and crash-recovery journals; legacy actors remain authoritative until cutover. |
+| `state/manifests/` | Immutable shadow assignment manifests and invalidation evidence. |
 | `state/events/` | Date-partitioned shadow Fleet events; partitions older than 30 days move to `state/events/archive/`. |
 | `state/archive/` | Compact retired Work-record evidence indexes. |
 
@@ -104,7 +106,7 @@ The `mattpocock-skills` plugin is enabled at user scope, so every fleet session 
 - **Background sessions see every peer in `ListAgents`; a desktop-app interactive session may not see them** (their inbox pipes live under `\\.\pipe\LOCAL\`). The fleet's internal messaging is unaffected. To reach a fleet session from your own session, use `claude attach`, the `claude agents` reply box, or Remote Control.
 - **A background-to-background `SendMessage` wakes an idle recipient into a new turn.** That is how an IC's "PR ready" reaches a sleeping project lead.
 - `claude rm <id>` also removes the session's worktree. `claude stop` does not.
-- **Worktree isolation is lazy.** A background session starts in the repo's main checkout (reads only) and is moved into `<repo>/.claude/worktrees/<name>-<slug>` on a `worktree-*` branch the first time it writes. The main checkout is never dirtied. ICs then create their `fleet/<issue>-<slug>` branch inside that worktree. `claude rm` removes the worktree and its branch. The fleet never touches worktrees it didn't create; your hand-made `Endzone-Empire-*` worktrees are yours.
+- **Worktree isolation is lazy for legacy launches.** A background session starts in the repo's main checkout (reads only) and is moved into `<repo>/.claude/worktrees/<name>-<slug>` on a `worktree-*` branch the first time it writes. The main checkout is never dirtied. ICs then create their `fleet/<issue>-<slug>` branch inside that worktree. Manifest-launched assignments are the exception: `launch.ps1` creates `<name>-assignment` directly from the manifest base SHA on the manifest branch, so the IC must not create a nested worktree or switch branches. `claude rm` removes the worktree and its branch. The fleet never touches worktrees it didn't create; your hand-made `Endzone-Empire-*` worktrees are yours.
 - **Hook commands run through a POSIX shell, even on Windows.** Backslashes in `fleet-settings.json` hook paths get eaten (`C:UsersCory...`). Use forward slashes: `-File C:/Users/Cory/fleet/hooks/stop.ps1`. PowerShell accepts them.
 - `--settings <file>` on `claude --bg` applies the file's `env` block and `hooks`; that is how a session learns who it is (`FLEET_*`). `respawnFlags` in the job's `state.json` records the settings path, so `claude respawn` keeps the identity.
 - Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the Sentinel and dispatcher to recreate theirs.
