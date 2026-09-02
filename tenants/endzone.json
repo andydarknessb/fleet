@@ -54,7 +54,7 @@
   },
   "ciGates": ["test-build", "guards", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
   "watchedChecks": ["scan", "discover", "reproduce"],
-  "ignoredChecks": [],
+  "ignoredChecks": ["Supabase Preview"],
   "notes": [
     "The fleet works on `integration` (defaultBranch): branch from it, open PRs against it, merge into it. `main` (releaseBranch) auto-publishes the client to Netlify, so only Cory promotes integration to main. Never push to or merge into main.",
     "The dev database is the shared Supabase production database. Never run migrations or destructive SQL from an IC.",
