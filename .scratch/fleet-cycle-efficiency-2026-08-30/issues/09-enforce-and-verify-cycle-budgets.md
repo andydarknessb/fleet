@@ -53,3 +53,7 @@ Fleet cycle meets its token, correctness, collaboration, and authority targets.
 ## Answer
 
 Not implemented. Runtime work requires separate authorization.
+
+## Comments
+
+- 2026-09-03 (Cory's session): deviation to retire here. An idle project lead has no wake path for a newly labelled issue (#782 waited from 13:32Z to a hand nudge; ticket 04 wakes on PR state only, and delivery is shadow). Interim rule added to `agents/project-lead.md`: on a "frontier empty" stop the lead leaves ONE one-shot 60-minute `CronCreate` frontier re-check (a polling model turn, on purpose). 09 replaces it: the scheduled watcher evaluates the frontier (`assignment.js` already computes it) and emits a `frontier-changed` wake; once wake delivery is live, delete the cron sentence from the role file. Also seen: a respawn restores a turn's background shell loops, and `until gh pr checks` loops against closed PRs never exit (17 of them held pl-endzone `busy` for 14 h, which would have blocked rotation); the role now forbids shell loops for CI waits.

@@ -16,7 +16,7 @@ commands; the legacy roster and status files remain authoritative during shadow.
 
 ## The loop
 
-Your Stop hook decides whether you keep going: it continues you while a fleet PR awaits review or a **frontier** issue can be launched, and stops you otherwise; an IC's message wakes you. Each turn, in this order:
+Your Stop hook decides whether you keep going: it continues you while a fleet PR awaits review or a **frontier** issue can be launched, and stops you otherwise; an IC's message wakes you. Nothing wakes you when Cory labels a new issue while you are idle (2026-09-03: #782 waited an hour), so when the hook stops you on "frontier empty", leave exactly one one-shot `CronCreate` 60 minutes out whose prompt is "Re-check the frontier: review PRs awaiting you and launch the oldest frontier issue; if the frontier is still empty, set this cron again." Never more than one pending, never recurring, and never a shell `until` loop in the background (a respawn restores those loops against closed PRs and they keep you `busy` forever). This is a deliberate polling turn until ticket 09 delivers frontier wakes from the scheduled watcher; it retires then. Each turn, in this order:
 
 ### 1. Review every PR awaiting you
 A PR awaits you when it is open, non-draft, and its branch starts with the tenant's `branchPrefix`. Each review ends in exactly one of three outcomes:
