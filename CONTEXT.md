@@ -196,6 +196,27 @@ one formal Standards and Spec review; a diff without a trigger never gets a
 risk reviewer.
 _Avoid_: second reviewer, QA pass, extra review angle
 
+**Frontier**:
+The ordered set of ready Units of work the fleet may launch next: open,
+carrying the tenant's ready label, unassigned, with no open blockers, not a
+spec parent, not marked ready for human work, not reserved by an active Work
+record, and not under a Frontier exclusion; oldest first. The assignment
+planner (`bin/assignment.js`) computes it from GitHub facts; the project
+lead's Stop hook records its own legacy computation beside it for parity
+(`bin/assignment-parity.js`) and, once `state/flags/assignment-live` stands,
+decides from the planner's answer.
+_Avoid_: queue, backlog, ready list
+
+**Assignment manifest**:
+The immutable, compact record of one reserved assignment: issue URL and body
+hash, base SHA resolved from the fetched remote ref, branch, tenant, model,
+risk class, token budget, the CONTEXT.md headings and ADR paths the IC must
+read, the test plan and CI gates, and the reservations. Its Work record starts
+`assigned` and becomes `implementing` when the IC acknowledges it; a changed
+issue body or base before acknowledgment invalidates it. It points at the
+issue and never restates the acceptance criteria.
+_Avoid_: brief (the legacy prompt payload), assignment prompt, ticket copy
+
 **Frontier exclusion**:
 A ready Unit of work the fleet must not launch because an exceptional fleet
 fact that GitHub cannot express keeps it outside the assignment frontier. The

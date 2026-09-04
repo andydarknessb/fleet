@@ -809,7 +809,15 @@ function shadowProject(options = {}) {
       desired.set(id, { row, rosterStatus });
     }
     for (const record of Object.values(active.records)) {
-      if (record.evidence?.roster !== rosterEvidence || desired.has(record.id)) continue;
+      if (desired.has(record.id)) continue;
+      // 02/03 cutover: a manifest-reserved record belongs to the assignment path, not
+      // to this projection, so its retirement is completed here only once its IC has
+      // left the roster with the unit merged (or already retiring). Any other record
+      // without a roster row (assigned, implementing, pr-open, review, hold,
+      // escalated) is the lead's to judge; a projector never archives it.
+      const manifestRetirement = Boolean(record.manifestPath) && ['merged', 'retiring'].includes(record.state);
+      if (record.evidence?.roster !== rosterEvidence && !manifestRetirement) continue;
+      const eventType = manifestRetirement ? 'assignment-retired' : 'shadow-retired';
       const now = isoNow(options.now);
       const next = {
         ...record,
@@ -819,11 +827,11 @@ function shadowProject(options = {}) {
         updatedAt: now,
         idempotency: { ...record.idempotency },
       };
-      const key = `shadow-retired:${record.id}:${next.revision}`;
-      next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'shadow-retired' };
+      const key = `${eventType}:${record.id}:${next.revision}`;
+      next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: eventType };
       const event = eventFor(next, {
-        type: 'shadow-retired', actor: options.actor || 'shadow-projector', at: now,
-        idempotencyKey: key, evidence: { roster: rosterEvidence },
+        type: eventType, actor: options.actor || 'shadow-projector', at: now,
+        idempotencyKey: key, evidence: manifestRetirement ? { roster: rosterEvidence, rosterRowAbsent: true, manifest: record.manifestPath } : { roster: rosterEvidence },
         changes: { from: record.state, to: 'retired' },
       });
       commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, event, archiveRecord: next });

@@ -78,6 +78,19 @@ if ($tenant -and (Test-Path "$home_\tenants\$tenant.json")) {
   Write-Output "Tenant file: $home_\tenants\$tenant.json"
 }
 if ($env:FLEET_ISSUE) { Write-Output "Your unit of work: issue #$($env:FLEET_ISSUE). Nothing else." }
+# 02/03 cutover: a manifest-launched IC learns its manifest, Work record, and the
+# acknowledgment command here, with the record's current revision read at hook time
+# so the first useful turn can acknowledge without a lookup.
+if ($env:FLEET_ASSIGNMENT_MANIFEST -and $env:FLEET_WORK_RECORD_ID) {
+  $ackRevision = $null
+  try {
+    $activeWork = Get-Content "$home_\state\work\active.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+    $ackRecord = $activeWork.records.PSObject.Properties[$env:FLEET_WORK_RECORD_ID]
+    if ($ackRecord) { $ackRevision = [int]$ackRecord.Value.revision }
+  } catch {}
+  $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $home_ + '\bin\work-state.js get --root ' + $home_ + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
+  Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue stays the only copy of the criteria; the manifest carries pointers. In your first useful turn acknowledge it: node $home_\bin\assignment.js ack --root $home_ --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
+}
 # The handoff goes only to the session the rotation itself launched: the intent's
 # newSessionId must match this session's id, so a later respawn or manual launch of
 # the same name never inherits a stale offset (the expired-context class).

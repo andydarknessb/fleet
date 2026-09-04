@@ -5,6 +5,9 @@ function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw 
 function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
 function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
+# 02/03 cutover: while this flag stands the assignment planner (bin/assignment.js) is the
+# authoritative frontier and launch path for ICs; the launch door refuses a legacy IC launch.
+function Test-AssignmentLive { Test-Path "$FleetHome\state\flags\assignment-live" }
 function Get-ExpectedStaticSessions {
   # The static roster minus the rostered Sentinel while state/flags/sentinel-off stands
   # (ticket 08b cutover): its roster.json entry stays as the rollback path, and nothing

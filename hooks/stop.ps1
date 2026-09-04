@@ -139,6 +139,52 @@ if ($candidates.Count -gt 0) {
   }
 }
 
+# --- 02/03 cutover: the assignment planner's frontier, observed beside this one at every
+# --- launch decision (state/assignment/shadow/, the parity evidence for bin/assignment-parity.js).
+# --- While state/flags/assignment-live stands the planner's answer is the decision and the
+# --- lead reserves and launches through assignment.js; a planner failure then launches
+# --- nothing (fail closed), it never falls back to the legacy frontier silently.
+$assignmentLive = Test-Path "$home_\state\flags\assignment-live"
+$planner = $null
+# Same resolution as _common.ps1 Get-NodeExe: FLEET_NODE_PATH wins, and a wrong one is no node (never a silent PATH fallback).
+$nodeExe = $null
+if ($env:FLEET_NODE_PATH) { if (Test-Path -LiteralPath $env:FLEET_NODE_PATH -PathType Leaf) { $nodeExe = $env:FLEET_NODE_PATH } }
+else { $nodeCmd = Get-Command node -ErrorAction SilentlyContinue; if ($nodeCmd) { $nodeExe = $nodeCmd.Source } }
+if ($nodeExe -and (Test-Path "$home_\bin\assignment-parity.js")) {
+  # PowerShell 5.1 drops an empty native argument, so an empty frontier travels as 'none'.
+  $hookList = if ($frontier.Count -gt 0) { ($frontier -join ',') } else { 'none' }
+  $hookWhy = "ready=$($ready.Count) assigned=$($assigned.Count) skipped=$($skip.Count) blocked=$($blocked.Count) capFree=$capFree icFree=$icFree"
+  try {
+    $obsRaw = & $nodeExe "$home_\bin\assignment-parity.js" observe --root $home_ --tenant $tenant --repo $t.github --ready-label $t.readyLabel --hook-frontier $hookList --hook-reason $hookWhy 2>$null | Out-String
+    try { $planner = ("$obsRaw".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { $planner = $null }
+  } catch { $planner = $null }
+}
+if ($assignmentLive) {
+  $plannerFailure = $null
+  if (-not $planner) { $plannerFailure = 'bin/assignment-parity.js observe produced no report' }
+  elseif ($planner.plannerError) { $plannerFailure = "$($planner.plannerError)" }
+  if ($plannerFailure) {
+    # Fail closed AND visible: the lead stops looking launchable, so the supervisor line
+    # must hear it. One open escalation of this kind per lead; the digest and dispatcher
+    # read state/escalations/.
+    $escDir = "$home_\state\escalations"
+    $already = @(Get-ChildItem $escDir -Filter "*-$name.json" -ErrorAction SilentlyContinue | Where-Object { try { ((Get-Content $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json).kind -eq 'assignment-planner-failed') } catch { $false } })
+    if ($already.Count -eq 0) {
+      $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+      $esc = @{ at = $now; from = $name; kind = 'assignment-planner-failed'; tenant = $tenant; detail = "the assignment planner failed while state/flags/assignment-live stands ($plannerFailure); the project lead launches nothing until it answers; legacy frontier would be: #$($frontier -join ', #'); rollback: bin\rollback-assignment.ps1" }
+      [IO.Directory]::CreateDirectory($escDir) | Out-Null
+      [IO.File]::WriteAllText("$escDir\$stamp-$name.json", ($esc | ConvertTo-Json -Compress), $utf8)
+    }
+    Stop-Now "assignment planner failed ($plannerFailure) while state/flags/assignment-live stands; launching nothing, escalation filed (legacy frontier would be: #$($frontier -join ', #'))"
+  }
+  $plannerFrontier = @($planner.plannerFrontier | ForEach-Object { [int]$_ })
+  if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch' (state/flags/assignment-live stands: launch.ps1 refuses a legacy IC prompt)" }
+  $why = "assignment frontier empty (planner; legacy frontier: #$($frontier -join ', #'); ready=$($ready.Count), assigned=$($assigned.Count), skipped=$($skip.Count), blocked=$($blocked.Count))"
+  if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (schedule a one-shot CronCreate re-check if you have none)" }
+  if ($held.Count -gt 0) { $why += "; held PR(s): #$($held -join ', #')" }
+  Stop-Now "$why; ICs will message you"
+}
+
 if ($frontier.Count -gt 0) { Continue-With "frontier issue(s) #$($frontier -join ', #') (ready, unblocked, unassigned, not skipped) with $capFree cap slot(s) and $icFree IC slot(s) free; launch the next IC" }
 $why = "frontier empty (ready=$($ready.Count), assigned=$($assigned.Count), skipped=$($skip.Count), blocked=$($blocked.Count)"
 if ($blocked.Count -gt 0) { $why += ": $($blocked -join ' ')" }

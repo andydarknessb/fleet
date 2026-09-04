@@ -12,6 +12,7 @@ const {
   notifyRecord,
   projectStatus,
   readEvents,
+  reserveRecord,
   shadowProject,
   transitionRecord,
 } = require('../bin/work-state');
@@ -426,4 +427,42 @@ test('twenty concurrent claims for one decision event produce exactly one claim'
   const record = getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(record.notifications['5'].attempt, 1);
   assert.equal(readEvents(root).filter((event) => event.type === 'notification-attempted').length, 1);
+});
+
+// 02/03 cutover: a manifest-reserved record is not the roster projector's (its
+// evidence is the manifest), so the projector never retired it: after two or three
+// merged assignments the planner's active-assignment count would refuse every
+// launch. Once the IC has left the roster and the record is merged or retiring,
+// the projector completes the retirement; an in-flight record without a roster
+// row is left for the lead to judge.
+test('shadow projection retires a merged manifest record once its IC has left the roster, and leaves an in-flight one alone', () => {
+  const root = rootDir();
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  const manifestPath = path.join(root, 'state', 'manifests', 'assignment-endzone-issue-600.json');
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, '{}');
+  for (const issue of [600, 601]) {
+    reserveRecord({ root, id: `endzone:issue-${issue}`, tenant: 'endzone', issue, manifestPath, reservations: {}, idempotencyKey: `reserve-${issue}`, now: '2026-09-04T00:00:00.000Z' });
+    transitionRecord({ root, id: `endzone:issue-${issue}`, expectedRevision: 1, to: 'implementing', idempotencyKey: `ack-${issue}`, now: '2026-09-04T00:00:01.000Z' });
+  }
+  for (const [revision, to] of [[2, 'pr-open'], [3, 'review'], [4, 'merged']]) {
+    transitionRecord({ root, id: 'endzone:issue-600', expectedRevision: revision, to, idempotencyKey: `m-600-${to}`, now: '2026-09-04T00:00:02.000Z', prNumber: 9000, githubState: 'MERGED', githubMergedAt: '2026-09-04T00:00:02.000Z', testOnly: true });
+  }
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [
+    { name: 'ic-600', role: 'ic', tenant: 'endzone', issue: 600, status: 'active', sessionId: 's600' },
+    { name: 'ic-601', role: 'ic', tenant: 'endzone', issue: 601, status: 'active', sessionId: 's601' },
+  ] }));
+  shadowProject({ root, rosterPath, now: '2026-09-04T00:01:00.000Z' });
+  assert.equal(getRecord({ root, id: 'endzone:issue-600' }).state, 'merged');
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [] }));
+  const result = shadowProject({ root, rosterPath, now: '2026-09-04T00:02:00.000Z' });
+  assert.equal(result.projected.length, 0);
+  const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+  assert.deepEqual(Object.keys(active.records), ['endzone:issue-601']);
+  const archived = JSON.parse(fs.readFileSync(path.join(root, 'state', 'archive', 'work-endzone_issue-600.json'), 'utf8'));
+  assert.equal(archived.record.state, 'retired');
+  const events = readEvents(root).filter((event) => event.recordId === 'endzone:issue-600');
+  assert.equal(events[events.length - 1].type, 'assignment-retired');
+  assert.equal(shadowProject({ root, rosterPath, now: '2026-09-04T00:03:00.000Z' }).projected.length, 0);
 });

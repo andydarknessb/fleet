@@ -10,7 +10,7 @@ param(
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, see $modelArgs below
-  [switch]$Force,   # bypass the cap (Cory only)
+  [switch]$Force,   # bypass the cap and the assignment-live legacy-IC refusal (Cory only)
   [switch]$DryRun   # do everything except start the session
 )
 . "$PSScriptRoot\_common.ps1"
@@ -31,7 +31,9 @@ if ($Manifest) {
   $Parent = $assignment.parent
   $Issue = [int]$assignment.issue.number
   $Model = [string]$assignment.model
-  $Prompt = "Read the assignment manifest at $Manifest. Emit assignment-started for Work record $WorkRecordId in your first useful turn, then follow the manifest pointers without restating the issue criteria."
+  # A slash command at the head of a launch prompt is a user invocation in the new
+  # session, so the IC runs the real /implement (the same convention as a legacy brief).
+  $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $FleetHome\bin\assignment.js ack), then follow the manifest pointers without restating the issue criteria."
   $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $tenantConfig) { Write-Error "no tenant file for '$Tenant'"; exit 4 }
   $cwd = $tenantConfig.repo
@@ -50,6 +52,14 @@ if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$') { Write-E
 # dry run still evaluates the other gates so rollback can be rehearsed.
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
   Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live); use bin\rollback-sentinel.ps1 to restore it' } | ConvertTo-Json -Compress); exit 3
+}
+# 02/03 cutover: while the assignment planner is authoritative, an IC starts only from
+# a reserved manifest (assignment.js assign, then launch). A legacy -Prompt launch of
+# an IC is refused so no unit runs without a Work record and reservations; -Force
+# (Cory's hand) and a dry run still pass so rollback and rehearsal keep working.
+# rollback-assignment.ps1 removes the flag first, then legacy launches come through.
+if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and (Test-AssignmentLive) -and -not $Force -and -not $DryRun) {
+  Write-Output (@{ launched = $false; reason = 'legacy IC launches are disabled by state/flags/assignment-live (the assignment planner is authoritative): reserve a manifest with bin\assignment.js assign and launch it with assignment.js launch; bin\rollback-assignment.ps1 restores the legacy path' } | ConvertTo-Json -Compress); exit 3
 }
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"
@@ -275,7 +285,7 @@ if ($Manifest) {
   if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
   New-Item -ItemType Directory -Force $worktreeParent | Out-Null
   & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
+  if ($LASTEXITCODE -ne 0) { try { Invalidate-Manifest "launch failed: could not create the assignment worktree from $expectedBase" } catch {}; Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
   $cwd = $worktreePath
 }
 
@@ -317,7 +327,12 @@ if (-not $row) {
     Select-Object -First 1
   $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
   $detail = if ($jobState -and $jobState.detail) { "$($jobState.detail)" } else { $null }
-  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out } | ConvertTo-Json -Compress); exit 5
+  # A manifest whose launch produced no session must not keep its reservation: the
+  # planner would exclude the issue as `reserved` and a fresh assign would hit
+  # RESERVATION_CONFLICT. Release it so the next decision can reserve again.
+  $released = $false
+  if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($detail)"; $released = $true } catch {} }
+  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released } | ConvertTo-Json -Compress); exit 5
 }
 
 # --- record ---

@@ -15,7 +15,7 @@ const workState = require('./work-state');
 const { readExclusions, projectExclusions } = require('./exclusions');
 
 const CREATION_TYPES = Object.freeze(['assignment-reserved', 'work-created', 'shadow-projected']);
-const RETIRED_TYPES = Object.freeze(['assignment-released', 'shadow-retired']);
+const RETIRED_TYPES = Object.freeze(['assignment-released', 'assignment-retired', 'shadow-retired']);
 const { DECISION_STATES } = workState;
 const ACTIVE_STATES = Object.freeze(workState.STATES.filter((state) => state !== 'retired'));
 const MERGED_LIMIT = 10;

@@ -1,6 +1,6 @@
 # Reconstruct one active unit from validated Work record events
 
-Status: ready-for-human
+Status: DONE in shadow; 02/03 cutover mechanism landed 2026-09-04 (`bin/cutover-assignment.ps1`, gated on frontier parity; the flag flip is Cory's hand after the gate)
 Blocked by: 01
 
 ## Outcome

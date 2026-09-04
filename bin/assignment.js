@@ -364,22 +364,45 @@ function cli(argv) {
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant: args.tenant || 'endzone', now: args.now });
     return selectFrontier({ issues, readyLabel: args['ready-label'] || 'ready-for-agent', active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant || 'endzone'}.json`)), exclusions, now: args.now });
   }
-  if (command === 'assign') {
+  if (command === 'assign' || command === 'proof') {
+    // One loader for both doors: the tenant file names the repo and ready label, the
+    // fleet state supplies active records, the skip file, and the exclusion ledger.
     const config = readFixture(args['tenant-config'], {});
-    const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github, readyLabel: config.readyLabel, fetchDetails: true });
+    const tenant = args.tenant || config.name || 'endzone';
+    const readyLabel = config.readyLabel || args['ready-label'] || 'ready-for-agent';
+    const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github || args.repo, readyLabel, fetchDetails: true });
     const active = readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json'));
-    const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant}.json`));
-    const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant: args.tenant, now: args.now });
-    const frontier = selectFrontier({ issues, readyLabel: config.readyLabel, active, skipIssues, exclusions, now: args.now });
+    const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`));
+    const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
+    const frontier = selectFrontier({ issues, readyLabel, active, skipIssues, exclusions, now: args.now });
     if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'no eligible issue', { excluded: frontier.excluded });
+    if (command === 'proof') {
+      // The machine-readable independence proof a third assignment must carry: the
+      // frontier head checked against every active assignment's reservations. It is
+      // computed here and passed back verbatim to `assign --independence-proof`; a
+      // proof that reports conflicts is refused by reserve, never trimmed.
+      const activeAssignments = activeRecords(active).filter((record) => record.manifestPath && record.state !== 'retired');
+      const head = args.issue ? frontier.eligible.find((issue) => issue.number === Number(args.issue)) : frontier.eligible[0];
+      if (!head) throw new WorkStateError('NO_FRONTIER', `issue #${args.issue} is not on the frontier`, { excluded: frontier.excluded });
+      return { issue: head.number, activeAssignments: activeAssignments.map((record) => record.id), proof: independenceProof([...activeAssignments, head]) };
+    }
     if (args['base-sha'] && !args.fixture) throw new WorkStateError('BASE_RECONCILIATION_REQUIRED', 'production assignment must resolve base SHA from the fetched remote ref');
     const base = args['base-sha'] ? { remote: args.remote || 'origin', ref: args.ref || config.defaultBranch, sha: args['base-sha'] } : undefined;
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], tenant: args.tenant, tenantConfig: config, readyLabel: config.readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
+    // 02/03 cutover: the manifest's test plan and CI gates come from the tenant file
+    // (checks and ciGates), so the IC's pointers match what the lead's review requires;
+    // context headings and ADR paths are the lead's per-ticket call. A bare flag with no
+    // value is a mistake, not an empty list.
+    const given = (key) => args[key] !== undefined && args[key] !== 'true';
+    const list = (key) => (given(key) ? String(args[key]).split(',').map((item) => item.trim()).filter(Boolean) : []);
+    for (const key of ['test-plan', 'ci-gates', 'context-headings', 'adr-paths']) { if (args[key] === 'true') throw new WorkStateError('USAGE', `--${key} needs a comma-separated value`); }
+    const testPlan = given('test-plan') ? list('test-plan') : Object.entries(config.checks || {}).map(([name, command]) => `${name}: ${command}`);
+    const ciGates = given('ci-gates') ? list('ci-gates') : [...(config.ciGates || [])];
+    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });
   if (command === 'ack') return acknowledgeAssignment({ root: args.root, workRecordId: args['work-record-id'], expectedRevision: Number(args['expected-revision']), now: args.now, evidence: args.evidence });
-  throw new WorkStateError('USAGE', 'commands: frontier, assign, validate, launch, ack');
+  throw new WorkStateError('USAGE', 'commands: frontier, assign, proof, validate, launch, ack');
 }
 
 if (require.main === module) {

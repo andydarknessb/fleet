@@ -22,5 +22,10 @@
     "maxGapMinutes": 35,
     "tickMinutes": 15,
     "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged"]
+  },
+  "assignment": {
+    "parityEvaluations": 20,
+    "parityDistinctFrontiers": 5,
+    "parityHours": 48
   }
 }

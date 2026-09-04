@@ -10,6 +10,13 @@ $lastRunAt = if ($lastRun) { ConvertTo-UtcDateTime $lastRun.at } else { $null }
 if ($lastRunAt) { $lastRunText = "last watchdog tick $([int]((Get-Date).ToUniversalTime() - $lastRunAt).TotalMinutes) min ago ($($lastRun.mode))" }
 if (Test-SentinelOff) { Write-Output "supervisor: watchdog task (state/flags/sentinel-off; rollback: bin\rollback-sentinel.ps1); $lastRunText" }
 else { Write-Output "supervisor: rostered sentinel session (watchdog in shadow); $lastRunText" }
+# Who assigns (02/03 cutover): the lead's Stop-hook frontier plus a legacy brief until cutover,
+# the assignment planner (manifests + Work-record reservations) after.
+$pendingManifests = 0
+try { $pendingManifests = @(Get-ChildItem "$FleetHome\state\manifests" -Filter *.json -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.(invalidated|acknowledged)\.json$' -and -not (Test-Path "$($_.FullName).acknowledged.json") -and -not (Test-Path "$($_.FullName).invalidated.json") }).Count } catch {}
+$assignmentText = "$pendingManifests manifest(s) pending acknowledgment"
+if (Test-AssignmentLive) { Write-Output "assignment: planner authoritative (state/flags/assignment-live; rollback: bin\rollback-assignment.ps1); $assignmentText" }
+else { Write-Output "assignment: legacy Stop-hook frontier (planner observed in shadow: bin\assignment-parity.js report); $assignmentText" }
 $names = Get-FleetNames -Live $live -Static $static
 $rows = foreach ($n in $names) {
   $d = $daemon | Where-Object { $_.name -eq $n } | Sort-Object startedAt -Descending | Select-Object -First 1

@@ -1,0 +1,187 @@
+'use strict';
+// 02/03 cutover: the parity gate between the Stop hook's legacy frontier and the
+// assignment planner's frontier. The hook logs one evaluation per launch decision
+// (state/assignment/shadow/); this tool classifies every difference and reports
+// whether the most recent evaluations agree, with every difference approved in
+// state/assignment/parity-approved.json.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const {
+  classifyEvaluation,
+  compareAssignmentParity,
+  observeFrontier,
+  readShadow,
+} = require('../bin/assignment-parity');
+
+const T0 = Date.parse('2026-09-04T00:00:00.000Z');
+const MIN = 60 * 1000;
+
+function rootDir(config) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-assignment-parity-'));
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ assignment: { parityEvaluations: 4, parityDistinctFrontiers: 2, parityHours: 0, ...(config || {}) } }));
+  return root;
+}
+
+test('classifyEvaluation keeps the planner head first while comparing as sets', () => {
+  const result = classifyEvaluation({ hookFrontier: [12, 30], planner: planner([30, 12]) });
+  assert.equal(result.agree, true);
+  assert.deepEqual(result.plannerFrontier, [30, 12]);
+});
+
+test('compareAssignmentParity requires the evaluations to span the configured hours', () => {
+  const root = rootDir({ parityHours: 1 });
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + 10 * MIN, [2], planner([2]));
+  evaluate(root, T0 + 20 * MIN, [3], planner([3]));
+  evaluate(root, T0 + 30 * MIN, [4], planner([4]));
+  const short = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(short.pass, false);
+  assert.match(short.reasons.join(' '), /window 0\.5 h < required 1 h/);
+  evaluate(root, T0 + 70 * MIN, [5], planner([5]));
+  const long = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(long.pass, true, long.reasons.join('; '));
+  assert.equal(long.spanHours, 1);
+});
+
+function iso(ms) { return new Date(ms).toISOString(); }
+
+function planner(frontier, excluded = [], error = null) {
+  return { eligible: frontier.map((number) => ({ number })), excluded, error };
+}
+
+function evaluate(root, ms, hookFrontier, plannerResult, extra = {}) {
+  return observeFrontier({ root, tenant: 'endzone', hookFrontier, hookReason: 'test', planner: plannerResult, now: iso(ms), ...extra });
+}
+
+test('classifyEvaluation: identical sets in any order are identical', () => {
+  const result = classifyEvaluation({ hookFrontier: [3, 1, 2], planner: planner([1, 2, 3]) });
+  assert.equal(result.agree, true);
+  assert.deepEqual(result.differences, []);
+  assert.equal(result.class, 'identical');
+  assert.equal(classifyEvaluation({ hookFrontier: [1], planner: planner([]) }).class, null);
+});
+
+test('classifyEvaluation: an issue the planner excludes carries its exclusion codes', () => {
+  const result = classifyEvaluation({ hookFrontier: [10, 11], planner: planner([10], [{ issue: 11, reasons: [{ code: 'spec-parent' }, { code: 'assigned' }] }]) });
+  assert.equal(result.agree, false);
+  assert.deepEqual(result.differences, [{ class: 'planner-excludes', issue: 11, codes: ['spec-parent', 'assigned'] }]);
+});
+
+test('classifyEvaluation: an issue only the planner would launch is planner-includes', () => {
+  const result = classifyEvaluation({ hookFrontier: [10], planner: planner([10, 12]) });
+  assert.deepEqual(result.differences, [{ class: 'planner-includes', issue: 12, codes: [] }]);
+});
+
+test('classifyEvaluation: a planner failure is one planner-failed difference, never an agreement', () => {
+  const result = classifyEvaluation({ hookFrontier: [], planner: planner([], [], 'GITHUB_QUERY_FAILED: boom') });
+  assert.equal(result.agree, false);
+  assert.deepEqual(result.differences, [{ class: 'planner-failed', issue: null, codes: [], detail: 'GITHUB_QUERY_FAILED: boom' }]);
+});
+
+test('classifyEvaluation: an unknown excluded issue reads as code unknown, not as agreement', () => {
+  const result = classifyEvaluation({ hookFrontier: [5], planner: planner([]) });
+  assert.deepEqual(result.differences, [{ class: 'planner-excludes', issue: 5, codes: ['unknown'] }]);
+});
+
+test('observeFrontier appends one day-partitioned line with both sides and the mode from the flag', () => {
+  const root = rootDir();
+  const line = evaluate(root, T0, [7], planner([7]));
+  assert.equal(line.mode, 'shadow');
+  assert.equal(line.agree, true);
+  assert.deepEqual(line.hook.frontier, [7]);
+  assert.deepEqual(line.planner.frontier, [7]);
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'assignment-live'), 'live');
+  const live = evaluate(root, T0 + MIN, [7], planner([7]));
+  assert.equal(live.mode, 'live');
+  const file = path.join(root, 'state', 'assignment', 'shadow', '20260904.jsonl');
+  const lines = fs.readFileSync(file, 'utf8').trim().split('\n').map((entry) => JSON.parse(entry));
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1].mode, 'live');
+  assert.equal(readShadow(root, 'endzone').length, 2);
+  assert.equal(readShadow(root, 'other').length, 0);
+});
+
+test('compareAssignmentParity fails below the required evaluation count', () => {
+  const root = rootDir();
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + MIN, [2], planner([2]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, false);
+  assert.match(result.reasons.join(' '), /evaluations 2 < required 4/);
+});
+
+test('compareAssignmentParity passes on identical recent evaluations with enough distinct frontiers', () => {
+  const root = rootDir();
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + MIN, [1], planner([1]));
+  evaluate(root, T0 + 2 * MIN, [], planner([]));
+  evaluate(root, T0 + 3 * MIN, [1, 2], planner([2, 1]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, true, result.reasons.join('; '));
+  assert.equal(result.evaluations, 4);
+  assert.equal(result.distinctFrontiers, 3);
+  assert.equal(result.classes.identical, 4);
+  assert.deepEqual(result.unapproved, []);
+});
+
+test('compareAssignmentParity fails when the recent evaluations are one frontier repeated', () => {
+  const root = rootDir();
+  for (let index = 0; index < 5; index += 1) evaluate(root, T0 + index * MIN, [1], planner([1]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, false);
+  assert.match(result.reasons.join(' '), /distinct frontiers 1 < required 2/);
+});
+
+test('compareAssignmentParity: an unapproved difference inside the window fails, an older one does not', () => {
+  const root = rootDir();
+  evaluate(root, T0 - 10 * MIN, [9], planner([], [{ issue: 9, reasons: [{ code: 'ready-for-human' }] }]));
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + MIN, [2], planner([2]));
+  evaluate(root, T0 + 2 * MIN, [3], planner([3]));
+  evaluate(root, T0 + 3 * MIN, [4], planner([4]));
+  assert.equal(compareAssignmentParity({ root, tenant: 'endzone' }).pass, true);
+  evaluate(root, T0 + 4 * MIN, [5, 6], planner([5], [{ issue: 6, reasons: [{ code: 'spec-parent' }] }]));
+  const failed = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(failed.pass, false);
+  assert.equal(failed.unapproved.length, 1);
+  assert.equal(failed.unapproved[0].issue, 6);
+  assert.equal(failed.unapproved[0].at, iso(T0 + 4 * MIN));
+});
+
+test('compareAssignmentParity: approvals match by class and code, and a planner failure is never approvable by code alone', () => {
+  const root = rootDir();
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + MIN, [2, 8], planner([2], [{ issue: 8, reasons: [{ code: 'spec-parent' }] }]));
+  evaluate(root, T0 + 2 * MIN, [3], planner([3]));
+  evaluate(root, T0 + 3 * MIN, [4], planner([4], [], 'boom'));
+  fs.mkdirSync(path.join(root, 'state', 'assignment'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'assignment', 'parity-approved.json'), JSON.stringify([
+    { class: 'planner-excludes', code: 'spec-parent', note: 'the planner reads sub-issues; the hook cannot', by: 'cory', at: iso(T0) },
+  ]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, false);
+  assert.equal(result.unapproved.length, 1);
+  assert.equal(result.unapproved[0].class, 'planner-failed');
+  const approved = result.differences.find((diff) => diff.class === 'planner-excludes');
+  assert.equal(approved.approved, true);
+  assert.equal(approved.approvedBy, 'cory');
+});
+
+test('compareAssignmentParity ignores a torn line and a BOM in the approvals file', () => {
+  const root = rootDir();
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + MIN, [2], planner([2]));
+  evaluate(root, T0 + 2 * MIN, [3], planner([3]));
+  evaluate(root, T0 + 3 * MIN, [4], planner([4]));
+  fs.appendFileSync(path.join(root, 'state', 'assignment', 'shadow', '20260904.jsonl'), '{"at":"2026-09-04T00:09:00.000Z","ten');
+  fs.mkdirSync(path.join(root, 'state', 'assignment'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'assignment', 'parity-approved.json'), '﻿[]');
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, true, result.reasons.join('; '));
+  assert.equal(result.evaluations, 4);
+});
