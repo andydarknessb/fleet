@@ -1,6 +1,6 @@
 # Supervise one fleet cycle without a Claude Sentinel turn
 
-Status: 08a + 08b implemented 2026-09-01 (cutover is Cory's hand after the 48h parity gate: `bin/cutover-sentinel.ps1`)
+Status: DONE. 08a + 08b implemented 2026-09-01; cutover run 2026-09-04 03:48Z (`bin/cutover-sentinel.ps1`, parity 52.5 h, 31 differences reviewed and approved, Sentinel job 20da1bbf retired; rollback path kept one release)
 Blocked by: 07
 Authorized 2026-09-01; sequencing and amendments: `../amendments-2026-09-01.md`.
 Amendment: split into 08a (shadow supervisor + external page path + launch
@@ -43,8 +43,14 @@ after verified shadow parity.
 - [x] Scheduled supervision completes with zero Claude turns in normal and
   recovery cases. (`watchdog.ps1` live mode launches through `launch.ps1`
   and files escalations; no session is messaged or spawned.)
-- [ ] Forty-eight continuous shadow hours show identical actions and
+- [x] Forty-eight continuous shadow hours show identical actions and
   escalations, or each difference is documented and approved as intentional.
+  (Passed 2026-09-04: 52.5 continuous hours, 211 paired ticks, 146 identical,
+  every one of the 31 gating differences reviewed against both ledgers and
+  approved by class in `state/sentinel/parity-approved.json`: observer-gap
+  Sentinel-only actions, IC done-path retirements beating the next tick,
+  `blocked` label drift, and fast-forward pushes the Sentinel attempted and
+  had refused.)
   (Tooling landed: `bin/parity.js`; the paired clock started when the
   Sentinel's applied ledger began, 2026-09-01 21:01Z, so the gate can pass no
   earlier than 2026-09-03 21:01Z. Approvals go in
@@ -53,7 +59,8 @@ after verified shadow parity.
   during shadow. (Shadow runs never `-Apply`; a Sentinel alive under the flag
   is the `double-actor` page and keeps the watchdog in shadow; the check
   refuses a Sentinel-actor `-Apply` under the flag.)
-- [ ] Cutover removes the live Sentinel session and its recurring model turns.
+- [x] Cutover removes the live Sentinel session and its recurring model turns.
+  (Run 2026-09-04; `state/sentinel/cutover.json`.)
   (`bin/cutover-sentinel.ps1`, Cory's hand after the gate; retires the
   session, whose cron dies with it.)
 - [x] Rollback within one release restores the old actor without losing event

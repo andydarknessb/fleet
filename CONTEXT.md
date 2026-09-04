@@ -41,9 +41,11 @@ leads, relays escalations upward, and produces the daily digest.
 _Avoid_: lead A, main agent, coordinator
 
 **Sentinel**:
-The lead that keeps the fleet alive and within its cap: it reads heartbeats,
-respawns sessions, sweeps stale worktrees, and never reasons about work.
-_Avoid_: lead B, watchdog, monitor, health checker
+The retired lead that kept the fleet alive and within its cap as a rostered
+session until the 08b cutover (2026-09-04); the Watchdog task now does that
+work. Its roster entry and role file remain for one release as the rollback
+path and are then deleted.
+_Avoid_: watchdog (the task), monitor, health checker
 
 **Project lead**:
 A session that owns exactly one project: it turns the project's issues into

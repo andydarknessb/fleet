@@ -6,19 +6,19 @@ The standing crew of Claude Code sessions that runs Cory's projects between prom
 
 ```
 cory
- └─ dispatcher (opus)      your interface; relays escalations; daily digest; watches the sentinel
- └─ sentinel   (sonnet)    keeps the roster alive and under the cap; never reasons about work (until 08b cutover; then the watchdog task)
+ └─ dispatcher (sonnet)    your interface; relays escalations; daily digest; reads the supervisor's escalation files
+ └─ Fleet watchdog (task)  the supervisor: keeps the roster alive and under the cap; never reasons about work (cut over from the sentinel session 2026-09-04; rollback path kept one release)
      └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
          └─ ic-<issue> (sonnet) one per issue, launched with /implement; opens a PR; talks only to its project lead
              └─ qa-reviewer (opus worker)   risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
 ```
 
 - **Sessions** are background Claude Code sessions hosted by the daemon (`claude agents`). **Workers** are subagents inside a session. Cap counts sessions only.
-- Reporting line: IC → project lead → dispatcher → Cory. The Sentinel reports to the dispatcher. Nobody skips a level.
-- **Supervision** (ticket 08b). Until cutover the rostered Sentinel session runs the mechanical check every 15 minutes and the watchdog task shadows it, logging both sides for `bin/parity.js`. After `bin/cutover-sentinel.ps1` (gated on 48 continuous parity hours) the flag `state/flags/sentinel-off` stands, the watchdog task IS the supervisor (the same check with `-Apply`, launches through the one door, escalations as files + one page), and the Sentinel's `roster.json` entry stays for one release as the rollback path (`bin/rollback-sentinel.ps1`). `bin/status.ps1` says which is live.
+- Reporting line: IC → project lead → dispatcher → Cory. The supervisor files escalations for the dispatcher. Nobody skips a level.
+- **Supervision** (ticket 08b, CUT OVER 2026-09-04). The `Fleet watchdog` scheduled task is the supervisor: the flag `state/flags/sentinel-off` stands (`bin/cutover-sentinel.ps1` passed the 48-hour parity gate, 52.5 h, 31 approved differences in `state/sentinel/parity-approved.json`; record in `state/sentinel/cutover.json`), the watchdog runs the same check with `-Apply` (the same check with `-Apply`, launches through the one door, escalations as files + one page), and the Sentinel's `roster.json` entry stays for one release as the rollback path (`bin/rollback-sentinel.ps1`). `bin/status.ps1` says which is live.
 - Work is a GitHub Issue carrying the tenant's `readyLabel`. Only Cory applies that label (that is your 35% interaction: you approve scope, not code).
 - Carve-outs (migrations, deploy hooks, env, CI secrets; per tenant file) never merge without you.
-- **Deploy gate.** A tenant may name a `releaseBranch` distinct from its `defaultBranch` (endzone: `integration` / `main`). The fleet branches from, targets, and merges into the default branch only. Promotion to the release branch (which auto-deploys the client) is yours: `git push origin integration:main` when you want a release. The Sentinel keeps the default branch fast-forwarded to the release branch after anything you merge directly (`bin/sync-integration.ps1`, pure fast-forward only; divergence escalates).
+- **Deploy gate.** A tenant may name a `releaseBranch` distinct from its `defaultBranch` (endzone: `integration` / `main`). The fleet branches from, targets, and merges into the default branch only. Promotion to the release branch (which auto-deploys the client) is yours: `git push origin integration:main` when you want a release. The supervisor keeps the default branch fast-forwarded to the release branch after anything you merge directly (`bin/sync-integration.ps1`, pure fast-forward only; divergence escalates).
 
 ## Layout
 
@@ -120,7 +120,7 @@ The lists must be disjoint. `setup.ps1` and the stop hook reject an overlapping 
 
 1. `powershell -File C:\Users\Cory\fleet\bin\setup.ps1` (junction, state dirs, version and label checks). Idempotent.
 2. `powershell -File C:\Users\Cory\fleet\bin\pilot.ps1 -DryRun`, then without `-DryRun`.
-3. `claude agents`, pin dispatcher, sentinel, and pl-endzone with Ctrl+T.
+3. `claude agents`, pin dispatcher and pl-endzone with Ctrl+T.
 4. Optional, survives reboot: `powershell -File C:\Users\Cory\fleet\bin\install-recovery-task.ps1`.
 5. `powershell -File C:\Users\Cory\fleet\bin\install-watchdog-task.ps1`: the scheduled supervisor (shadow until cutover, then live).
 
@@ -144,5 +144,5 @@ The `mattpocock-skills` plugin is enabled at user scope, so every fleet session 
 - **Worktree isolation is lazy for legacy launches.** A background session starts in the repo's main checkout (reads only) and is moved into `<repo>/.claude/worktrees/<name>-<slug>` on a `worktree-*` branch the first time it writes. The main checkout is never dirtied. ICs then create their `fleet/<issue>-<slug>` branch inside that worktree. Manifest-launched assignments are the exception: `launch.ps1` creates `<name>-assignment` directly from the manifest base SHA on the manifest branch, so the IC must not create a nested worktree or switch branches. `claude rm` removes the worktree and its branch. The fleet never touches worktrees it didn't create; your hand-made `Endzone-Empire-*` worktrees are yours.
 - **Hook commands run through a POSIX shell, even on Windows.** Backslashes in `fleet-settings.json` hook paths get eaten (`C:UsersCory...`). Use forward slashes: `-File C:/Users/Cory/fleet/hooks/stop.ps1`. PowerShell accepts them.
 - `--settings <file>` on `claude --bg` applies the file's `env` block and `hooks`; that is how a session learns who it is (`FLEET_*`). `respawnFlags` in the job's `state.json` records the settings path, so `claude respawn` keeps the identity.
-- Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the Sentinel and dispatcher to recreate theirs.
+- Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the dispatcher to recreate its own.
 - Max 5x: rate limiting is a first-class state. The supervisor's applied check sets a 60-minute PAUSE when a fleet job reports one and clears it after the window.
