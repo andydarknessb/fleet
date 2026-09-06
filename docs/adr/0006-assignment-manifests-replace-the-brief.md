@@ -156,6 +156,53 @@ found, and what it changed:
   is a claim, not a measurement. A rehearsal on one real issue should precede
   the flag.
 
+## Status note - rehearsal against the live tenant, 2026-09-06
+
+The assignment path was run end to end against real GitHub and the real
+`origin/integration`, in a scratch fleet root (its own `state/`, tenant file
+and roster) so the live fleet's records, frontier and roster were untouched -
+verified after: no manifests directory, no `932`/`933` events, active records
+unchanged, working tree clean. It stopped short of `claude --bg`, because the
+frontier was empty and the tenant was at 3 of 3 ICs, so no real session could
+be started without displacing live work.
+
+What ran, on real issue #932 (`bug`, open, unassigned):
+
+- `assign` selected it, fetched `origin/integration` and resolved the base to
+  `3836f221`, matching the real remote exactly; wrote a **1,186-byte**
+  manifest (branch, base, model, risk, token budget, the tenant's two checks
+  as the test plan, its three CI gates, one ADR path, one context heading) and
+  reserved `endzone:issue-932` at revision 1 with an `assignment-reserved`
+  event.
+- `launch.ps1 -Manifest -DryRun` derived the identity, accepted the record
+  state, applied the tool contract (21 deny rules), and estimated the IC's
+  first turn at **4,596 tokens against the 25,000 ceiling, of which the prompt
+  is 144** - the manifest pointer replacing a brief that used to carry the
+  whole acceptance criteria. The env block carried all four assignment
+  variables.
+- `assignment.js launch --dry-run` re-queried live GitHub, re-resolved the
+  base, and found both unchanged.
+- `ack` moved the record to `implementing` at revision 2 with a
+  `state-implementing` event and wrote the `.acknowledged.json` sidecar; a
+  replay returned the same revision and wrote nothing; a second launch of an
+  acknowledged manifest refused with `ASSIGNMENT_ALREADY_ACKNOWLEDGED`.
+
+Both guards were then exercised against live GitHub rather than a fixture:
+
+- **Stale criteria.** A manifest built from a deliberately altered body for
+  real issue #933 was refused at launch with `MANIFEST_PRECONDITION_CHANGED`,
+  its reservation released (record `retired`) and an `.invalidated.json`
+  sidecar written. No IC can be started against criteria that have moved.
+- **Rollback.** With the flag set, `rollback-assignment.ps1` removed it,
+  released nothing that was already acknowledged, and left #932 at
+  `implementing` revision 2, as documented.
+
+Still unrehearsed, and the only remaining unknown: `claude --bg` actually
+starting from a manifest, the assignment worktree being created on the real
+repo at the recorded base, and an IC session performing the acknowledgment
+itself from its SessionStart context. That needs one free IC slot and one
+ready issue.
+
 ## Status note - the two rulings, 2026-09-06
 
 **The assignee rule is scoped to a foreign assignee.** `tenants/<tenant>.json`
