@@ -156,6 +156,30 @@ found, and what it changed:
   is a claim, not a measurement. A rehearsal on one real issue should precede
   the flag.
 
+## Status note - the reservation lag is closed, 2026-09-06
+
+`planner-includes` was not a set of historical differences waiting to age out of
+the window: it was being manufactured, roughly one per legacy IC launch. The
+count went from 10 to 11 during the review when ic-928 launched. The cause is
+the ordering, not the planner: a legacy launch writes the roster entry, so the
+Stop hook stops offering the issue immediately, while the Work record only
+appeared when the next `Fleet PR watch` tick projected the roster, up to five
+minutes later. In that gap the planner still offered an issue an IC was already
+working. So the gate could never converge while the legacy path ran, and the
+gap was itself the double-launch window the reservation exists to close.
+
+`launch.ps1` now runs the projection itself, immediately after it writes the
+roster entry, for an IC launch. The record therefore exists before the hook's
+next evaluation and the two frontiers agree. It is never fatal: a failed
+projection leaves the unit launched and the next tick still picks it up, and
+the result line reports `projected`. A manifest launch is already reserved by
+`assignment.js assign`, and the projection leaves that record alone.
+
+With this in place the remaining `planner-includes` differences (#863, #864,
+#865, #872, #874, #883, #904, #928) are genuinely historical and age out of the
+trailing window on their own, as do the two `planner-excludes` on #891 and #892
+that the `fleetIdentity` ruling already settled.
+
 ## Status note - rehearsal against the live tenant, 2026-09-06
 
 The assignment path was run end to end against real GitHub and the real

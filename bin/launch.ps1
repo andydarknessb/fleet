@@ -349,5 +349,22 @@ $entry = [pscustomobject]@{
 }
 $live.sessions = @($live.sessions | Where-Object { $_.name -ne $Name }) + @($entry)
 Save-LiveRoster $live
-Write-Output (@{ launched = $true; name = $Name; jobId = $row.id; sessionId = $row.sessionId; cwd = $cwd } | ConvertTo-Json -Compress)
+
+# 02/03: reserve the unit before returning. The roster entry now exists, so the projection
+# derives the Work record from it immediately instead of leaving it to the next pr-watch
+# tick up to five minutes later. In that gap the Stop hook had already dropped the issue
+# (it reads the roster) while the planner had not (it reads Work records), so every legacy
+# launch manufactured a planner-includes parity difference - and, worse, left a window in
+# which the planner would offer an issue an IC was already working. A manifest launch is
+# already reserved by `assignment.js assign`, and the projection leaves that record alone.
+# Never fatal: the unit is launched either way, and the next tick still projects it.
+$projected = $false
+if ($Role -eq 'ic') {
+  try {
+    $node = Get-NodeExe
+    & $node "$PSScriptRoot\work-state.js" shadow --root $FleetHome --actor launch 2>&1 | Out-Null
+    $projected = ($LASTEXITCODE -eq 0)
+  } catch { $projected = $false }
+}
+Write-Output (@{ launched = $true; name = $Name; jobId = $row.id; sessionId = $row.sessionId; cwd = $cwd; projected = $projected } | ConvertTo-Json -Compress)
 exit 0
