@@ -30,6 +30,10 @@ function Run-Node {
   try { return ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
 }
 function Get-Hash { param([string]$Path) (Get-FileHash $Path -Algorithm SHA256).Hash }
+# Events are written to a file named for the EVENT DATE, so a fixture that seeds one dated
+# ledger and then counts real-now events in it only works on that calendar day. Count across
+# every ledger file instead; the seeded file stays as the immutability check.
+function Get-EventLines { @(Get-ChildItem (Join-Path $testRoot 'state\events') -Filter *.jsonl -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { Get-Content $_.FullName } | Where-Object { $_ }) }
 function Write-Evaluations {
   # Twenty agreeing evaluations over five distinct frontiers, the config default.
   param([int]$Count = 20)
@@ -51,7 +55,7 @@ try {
   foreach ($dir in 'bin','hooks','agents','tenants','config','state','state/sessions','state/notices','state/work','state/events','state/rotation','state/flags','state/heartbeats','state/manifests','state/exclusions','mock-bin','repo') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','launch.ps1','cutover-assignment.ps1','rollback-assignment.ps1','assignment.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','launch.ps1','recover.ps1','cutover-assignment.ps1','rollback-assignment.ps1','assignment.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body for ic."
@@ -113,6 +117,19 @@ try {
   Assert-True ($lastExit -eq 0 -and $r7b.dryRun -eq $true) 'a dry run of a legacy IC launch must still evaluate under the flag'
   $r7c = Run-Script 'launch.ps1' @('-Role', 'pl-test', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r7c.dryRun -eq $true) 'a control-plane launch is not the flag''s business'
+  # The refusal keys on the name as well as the role, the way the sibling Sentinel gate does.
+  $r7d = Run-Script 'launch.ps1' @('-Role', 'sonnet-ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy')
+  Assert-True ($lastExit -eq 3 -and $r7d.reason -match 'assignment-live') "an ic-named launch must be refused whatever its -Role: $lastOut"
+  # Reboot recovery relaunches an IC that is ALREADY on the live roster, so its unit is already
+  # reserved: -Recover is exempt from this guard, or a reboot strands in-flight work.
+  $r7e = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover', '-DryRun')
+  Assert-True ($lastExit -eq 0 -and $r7e.dryRun -eq $true) "a -Recover relaunch must pass the assignment-live guard: $lastOut"
+  Assert-True ((Get-Content "$testRoot\bin\recover.ps1" -Raw) -match '-Prompt \$e\.prompt -Recover') 'recover.ps1 must pass -Recover when it relaunches an IC'
+  # -Recover exempts ONLY this guard: PAUSE still stops it.
+  Write-Utf8 "$testRoot\state\PAUSE" 'testing'
+  $r7f = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover')
+  Assert-True ($lastExit -eq 3 -and $r7f.reason -match 'PAUSE') "-Recover must not bypass PAUSE: $lastOut"
+  Remove-Item "$testRoot\state\PAUSE"
 
   # Case 8: a manifest reserved by the planner launches through the door under the flag (dry run),
   # and the manifest carries the tenant's checks and CI gates as pointers.
@@ -126,7 +143,7 @@ try {
   $r8b = Run-Script 'launch.ps1' @('-Manifest', $r8.manifestPath, '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r8b.dryRun -eq $true -and $r8b.name -eq 'ic-101') "a manifest launch must pass the door under the flag: $lastOut"
   Assert-True ((Get-Content "$testRoot\state\sessions\ic-101.settings.json" -Raw) -match 'FLEET_WORK_RECORD_ID') 'the manifest launch must carry the Work record identity into the session'
-  $eventsAfterReserve = @(Get-Content $eventsFile).Count
+  $eventsAfterReserve = @(Get-EventLines).Count
 
   # Case 9: rollback -DryRun lists the pending manifest and changes nothing.
   $r9 = Run-Script 'rollback-assignment.ps1' @('-DryRun')
@@ -142,7 +159,7 @@ try {
   Assert-True (Test-Path "$testRoot\state\flags\assignment-live") 'the flag must be back after a failed release'
   Assert-True ((Get-Content "$testRoot\state\flags\assignment-live" -Raw) -match 'rollback-assignment') 'the restored flag keeps its text'
   Assert-True (-not (Test-Path "$($r8.manifestPath).invalidated.json")) 'a failed release must not invalidate the manifest'
-  Assert-True (@(Get-Content $eventsFile).Count -eq $eventsAfterReserve) 'a failed release must append no event'
+  Assert-True (@(Get-EventLines).Count -eq $eventsAfterReserve) 'a failed release must append no event'
 
   # Case 10: rollback removes the flag and releases the pending manifest through the state door.
   $r10 = Run-Script 'rollback-assignment.ps1'
@@ -152,9 +169,9 @@ try {
   $activeAfter = (Get-Content "$testRoot\state\work\active.json" -Raw) | ConvertFrom-Json
   Assert-True ($null -eq $activeAfter.records.PSObject.Properties['test:issue-101']) 'the released record must leave active state'
   Assert-True (Test-Path "$testRoot\state\archive\work-test_issue-101.json") 'the released record must be archived'
-  $eventLines = @(Get-Content $eventsFile)
+  $eventLines = @(Get-EventLines)
   Assert-True ($eventLines.Count -eq ($eventsAfterReserve + 1) -and $eventLines[-1] -match '"type":"assignment-released"') 'rollback must append exactly one assignment-released event'
-  Assert-True ($eventLines[0] -match 'work-created') 'rollback must not rewrite earlier ledger lines'
+  Assert-True ($eventLines[0] -match 'work-created' -and (Get-Hash $eventsFile) -eq $eventsHash) 'rollback must not rewrite earlier ledger lines'
   $record2 = (Get-Content "$testRoot\state\assignment\cutover.json" -Raw) | ConvertFrom-Json
   Assert-True (@($record2.rollbacks).Count -eq 2 -and $record2.rollbacks[0].flagRestored -eq $true -and @($record2.rollbacks[1].released) -contains 'test:issue-101') 'rollback must append a record for the failed attempt and the successful one'
   $r10b = Run-Script 'rollback-assignment.ps1'

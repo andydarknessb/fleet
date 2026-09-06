@@ -466,3 +466,27 @@ test('shadow projection retires a merged manifest record once its IC has left th
   assert.equal(events[events.length - 1].type, 'assignment-retired');
   assert.equal(shadowProject({ root, rosterPath, now: '2026-09-04T00:03:00.000Z' }).projected.length, 0);
 });
+
+// A record the projection did not create (the lead's own `work-state.js create`, or a
+// manifest reservation) used to be skipped forever: its evidence.roster never matches, so
+// once merged it sat in active state and pinned its issue `reserved` in the planner's
+// frontier. Four such records were found stranded in the live fleet on 2026-09-06.
+test('shadow projection retires a merged record it did not create once no roster row claims it', () => {
+  const root = rootDir();
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [] }));
+  createRecord({ root, id: 'endzone:issue-838', tenant: 'endzone', issue: 838, state: 'implementing', idempotencyKey: 'c-838', now: '2026-09-04T00:00:00.000Z' });
+  createRecord({ root, id: 'endzone:issue-799', tenant: 'endzone', issue: 799, state: 'implementing', idempotencyKey: 'c-799', now: '2026-09-04T00:00:00.000Z' });
+  for (const [revision, to] of [[1, 'pr-open'], [2, 'review'], [3, 'merged']]) {
+    transitionRecord({ root, id: 'endzone:issue-838', expectedRevision: revision, to, idempotencyKey: `t-838-${to}`, now: '2026-09-04T00:00:01.000Z', prNumber: 8380, githubState: 'MERGED', githubMergedAt: '2026-09-04T00:00:01.000Z', testOnly: true });
+  }
+  const result = shadowProject({ root, rosterPath, now: '2026-09-06T00:00:00.000Z' });
+  assert.equal(result.projected.length, 0);
+  const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+  assert.deepEqual(Object.keys(active.records), ['endzone:issue-799'], 'only the merged one is archived; the in-flight one is the lead-s to judge');
+  const archived = JSON.parse(fs.readFileSync(path.join(root, 'state', 'archive', 'work-endzone_issue-838.json'), 'utf8'));
+  assert.equal(archived.record.state, 'retired');
+  const events = readEvents(root).filter((event) => event.recordId === 'endzone:issue-838');
+  assert.equal(events[events.length - 1].type, 'shadow-retired');
+});

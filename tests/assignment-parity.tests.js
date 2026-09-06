@@ -185,3 +185,31 @@ test('compareAssignmentParity ignores a torn line and a BOM in the approvals fil
   assert.equal(result.pass, true, result.reasons.join('; '));
   assert.equal(result.evaluations, 4);
 });
+
+test('approvals: `code` matches by membership, `codes` requires the exact set', () => {
+  const root = rootDir({ parityEvaluations: 2, parityDistinctFrontiers: 1, parityHours: 0 });
+  // Two differences on one evaluation: a bare `assigned`, and `assigned` compounded with a
+  // dependency-read divergence, which is the difference the gate most needs to surface.
+  evaluate(root, T0, [11, 12], planner([], [
+    { issue: 11, reasons: [{ code: 'assigned' }] },
+    { issue: 12, reasons: [{ code: 'assigned' }, { code: 'dependency-blocked' }] },
+  ]));
+  evaluate(root, T0 + MIN, [13], planner([13]));
+  const approvalsPath = path.join(root, 'state', 'assignment', 'parity-approved.json');
+  const write = (entries) => fs.writeFileSync(approvalsPath, JSON.stringify(entries));
+
+  write([{ class: 'planner-excludes', code: 'assigned', note: 'loose', by: 'cory', at: iso(T0) }]);
+  const loose = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(loose.unapproved.length, 0, 'the membership form blesses the compound difference too');
+
+  write([{ class: 'planner-excludes', codes: ['assigned'], note: 'exact', by: 'cory', at: iso(T0) }]);
+  const exact = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(exact.unapproved.length, 1);
+  assert.equal(exact.unapproved[0].issue, 12);
+  assert.deepEqual(exact.unapproved[0].codes, ['assigned', 'dependency-blocked']);
+
+  write([{ class: 'planner-excludes', codes: ['dependency-blocked', 'assigned'], note: 'order does not matter', by: 'cory', at: iso(T0) }]);
+  const reordered = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(reordered.unapproved.length, 1);
+  assert.equal(reordered.unapproved[0].issue, 11);
+});

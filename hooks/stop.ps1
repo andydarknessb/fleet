@@ -107,6 +107,10 @@ if ($capFree -le 0 -or $icFree -le 0) {
 
 # --- frontier: ready, unassigned, not skipped, no open blockers ---
 $readyRaw = & gh issue list -R $t.github --label $t.readyLabel --state open --limit 100 --json number 2>$null
+# A failed read is not an empty frontier. The dependency read below already fails closed;
+# this one used to fail OPEN, reporting "frontier empty" whenever gh was down or rate-limited,
+# which also fed a false agreement to the 02/03 parity ledger.
+if ($LASTEXITCODE -ne 0) { Stop-Now "could not read ready issues from GitHub (gh issue list exited $LASTEXITCODE); not launching" }
 $ready = @(ConvertFrom-JsonArray $readyRaw | ForEach-Object { [int]$_.number })
 $assigned = @($activeIcs | ForEach-Object { [int]$_.issue })
 $skip = @{}

@@ -810,13 +810,16 @@ function shadowProject(options = {}) {
     }
     for (const record of Object.values(active.records)) {
       if (desired.has(record.id)) continue;
-      // 02/03 cutover: a manifest-reserved record belongs to the assignment path, not
-      // to this projection, so its retirement is completed here only once its IC has
-      // left the roster with the unit merged (or already retiring). Any other record
-      // without a roster row (assigned, implementing, pr-open, review, hold,
-      // escalated) is the lead's to judge; a projector never archives it.
-      const manifestRetirement = Boolean(record.manifestPath) && ['merged', 'retiring'].includes(record.state);
-      if (record.evidence?.roster !== rosterEvidence && !manifestRetirement) continue;
+      // 02/03 cutover: a record this projection did not create (a manifest reservation, or
+      // one the lead created by hand) still has to be able to finish. Once its IC has left
+      // the roster with the unit merged (or already retiring), the projection completes the
+      // retirement whatever created it; otherwise such a record sits in active state forever
+      // and pins its issue `reserved` in the planner's frontier. Any other record without a
+      // roster row (assigned, implementing, pr-open, review, hold, escalated) is still the
+      // lead's to judge; a projector never archives one of those.
+      const terminalRetirement = ['merged', 'retiring'].includes(record.state);
+      if (record.evidence?.roster !== rosterEvidence && !terminalRetirement) continue;
+      const manifestRetirement = terminalRetirement && Boolean(record.manifestPath);
       const eventType = manifestRetirement ? 'assignment-retired' : 'shadow-retired';
       const now = isoNow(options.now);
       const next = {

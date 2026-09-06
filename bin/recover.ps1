@@ -16,7 +16,10 @@ foreach ($w in $wanted) {
     continue
   }
   $e = $w.entry
-  $r = (& "$PSScriptRoot\launch.ps1" -Role $e.role -Name $e.name -Tenant $e.tenant -Parent $e.parent -Issue $e.issue -Prompt $e.prompt | Out-String).Trim()
+  # -Recover: this IC is already on the live roster, so its unit is already reserved. Without it
+  # the 02/03 launch door refuses every IC relaunch while state/flags/assignment-live stands, and
+  # a reboot silently strands in-flight work.
+  $r = (& "$PSScriptRoot\launch.ps1" -Role $e.role -Name $e.name -Tenant $e.tenant -Parent $e.parent -Issue $e.issue -Prompt $e.prompt -Recover | Out-String).Trim()
   $out += "$($w.name): relaunched -> $r"
 }
 $out | ForEach-Object { Write-Output $_ }

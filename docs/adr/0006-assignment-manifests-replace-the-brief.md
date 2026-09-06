@@ -102,3 +102,56 @@ Mechanism landed; the flag flip is Cory's hand after the gate, as for 08b.
 - Paperwork after one release: retire the legacy launch block from
   `agents/project-lead.md` and the legacy frontier from `hooks/stop.ps1`, and
   drop the `-Prompt` IC path from `launch.ps1`.
+
+## Status note - approval review 2026-09-06 (NOT approved; cutover still blocked)
+
+The first ten gating differences (four `planner-excludes` with code `assigned`
+on #891/#892, six `planner-includes` on #872/#874/#883/#904) were reviewed for
+approval and **refused**. Nine independent reviews agreed. What the review
+found, and what it changed:
+
+- **Approving by `code` approved far more than it said.** `approvalMatches`
+  matched a difference whose code set merely CONTAINED the approved code, so
+  `{class: "planner-excludes", code: "assigned"}` would also have blessed
+  `["assigned","dependency-blocked"]` and `["assigned","reserved"]`. The
+  dependency codes are the two frontiers reading blockers from two different
+  GitHub APIs (the hook's REST `issue_dependencies_summary.blocked_by`, the
+  planner's GraphQL `blockedBy`) with nothing else cross-checking them: the
+  most valuable divergence this gate can catch, silently waived. A seeded
+  divergence flipped the gate from FAIL to PASS to prove it. `approvalMatches`
+  now also accepts `codes: [...]`, matching only when the difference's code set
+  is EXACTLY that. Prefer `codes`; `code` remains for a deliberate "anything
+  mentioning this code" approval.
+- **`assigned` is a one-way ratchet, and it is the fleet's own habit.** The
+  tenant's `docs/agents/issue-tracker.md` tells a session to claim its issue
+  with `gh issue edit <n> --add-assignee @me` as its first write, and nothing
+  ever removes an assignee. So once a record retires, `reserved` decays away
+  and `assigned` remains forever: the issue is open, ready, unblocked, and
+  permanently invisible to the authoritative frontier, with the gate reporting
+  the difference as approved. On 2026-09-05 thirteen issues (#891-#903) were
+  excluded for `assigned` at one evaluation, and for ~28 minutes nine of them
+  were simultaneously open, ready, unblocked and assigned. **This needs Cory's
+  ruling before any cutover**: either the planner ignores an assignee that is
+  the fleet's own identity, or the release path clears the assignee it set, or
+  the hook learns the same rule. It is not approvable as written.
+- **`planner-includes` carries no codes by construction**, so the only approval
+  shape that clears it is the bare class, which permanently blinds the gate to
+  the planner proposing work the hook refuses - including a human's skip-file
+  hold and the double-launch the reservation exists to prevent. Refused.
+- Three live defects were found and fixed: `recover.ps1` relaunched a crashed
+  IC through the legacy `-Prompt` path, which the new guard refused, so a
+  reboot after cutover would have stranded every in-flight IC (`launch.ps1`
+  gained `-Recover`, exempt from this guard only, and the guard now keys on the
+  name as well as the role); `hooks/stop.ps1` read the ready list fail-OPEN, so
+  a gh outage reported "frontier empty" and fed a false agreement to this
+  ledger; and the roster projection skipped any record it had not created, so
+  four merged records (#838, #799, #854, #853) sat in active state pinning
+  their issues `reserved` in the planner's frontier. All four cleared on the
+  next tick once the projection learned to finish a merged record whatever
+  created it.
+- **Nothing downstream of frontier selection has ever run.** No manifest has
+  been reserved, launched, acknowledged or retired against the live tenant. The
+  evidence to date compares two frontier computations and nothing else, which
+  is why the "the cutover closes this window" argument for `planner-includes`
+  is a claim, not a measurement. A rehearsal on one real issue should precede
+  the flag.

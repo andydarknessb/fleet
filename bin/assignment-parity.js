@@ -133,11 +133,22 @@ function readApprovals(root) {
   } catch { return []; }
 }
 
+// `code` matches when the difference's code set CONTAINS it, so `code: "assigned"` also
+// covers ["assigned","dependency-blocked"] and would silently bless a dependency-read
+// divergence that happens to land on an assigned issue. `codes` is the exact-set form:
+// it matches only when the difference's codes are exactly those, which is what a reader
+// of "approve the assignee rule" actually means. Prefer `codes`; `code` stays for a
+// deliberate "any difference mentioning this code" approval.
 function approvalMatches(approval, diff) {
   if (approval.class !== diff.class) return false;
-  if (diff.class === 'planner-failed') return approval.issue === undefined && approval.code === undefined ? true : false;
+  if (diff.class === 'planner-failed') return approval.issue === undefined && approval.code === undefined && approval.codes === undefined;
   if (approval.issue !== undefined && approval.issue !== null && Number(approval.issue) !== diff.issue) return false;
   if (approval.code !== undefined && approval.code !== null && !(diff.codes || []).includes(String(approval.code))) return false;
+  if (approval.codes !== undefined && approval.codes !== null) {
+    const wanted = [...new Set(approval.codes.map(String))].sort();
+    const actual = [...new Set((diff.codes || []).map(String))].sort();
+    if (wanted.length !== actual.length || wanted.some((code, index) => code !== actual[index])) return false;
+  }
   return true;
 }
 
