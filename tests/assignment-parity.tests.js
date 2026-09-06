@@ -41,7 +41,7 @@ test('compareAssignmentParity requires the evaluations to span the configured ho
   evaluate(root, T0 + 30 * MIN, [4], planner([4]));
   const short = compareAssignmentParity({ root, tenant: 'endzone' });
   assert.equal(short.pass, false);
-  assert.match(short.reasons.join(' '), /window 0\.5 h < required 1 h/);
+  assert.match(short.reasons.join(" "), /spans 0.5 h of the 1 h window/);
   evaluate(root, T0 + 70 * MIN, [5], planner([5]));
   const long = compareAssignmentParity({ root, tenant: 'endzone' });
   assert.equal(long.pass, true, long.reasons.join('; '));
@@ -137,9 +137,10 @@ test('compareAssignmentParity fails when the recent evaluations are one frontier
   assert.match(result.reasons.join(' '), /distinct frontiers 1 < required 2/);
 });
 
-test('compareAssignmentParity: an unapproved difference inside the window fails, an older one does not', () => {
+// Window exclusion has its own case below; this one is about a difference gating at all.
+test('compareAssignmentParity: an unapproved difference fails the gate', () => {
   const root = rootDir();
-  evaluate(root, T0 - 10 * MIN, [9], planner([], [{ issue: 9, reasons: [{ code: 'ready-for-human' }] }]));
+  evaluate(root, T0 - 10 * MIN, [9], planner([9]));
   evaluate(root, T0, [1], planner([1]));
   evaluate(root, T0 + MIN, [2], planner([2]));
   evaluate(root, T0 + 2 * MIN, [3], planner([3]));
@@ -212,4 +213,44 @@ test('approvals: `code` matches by membership, `codes` requires the exact set', 
   const reordered = compareAssignmentParity({ root, tenant: 'endzone' });
   assert.equal(reordered.unapproved.length, 1);
   assert.equal(reordered.unapproved[0].issue, 11);
+});
+
+// 02/03 review 2026-09-06: the window was the last N evaluations, required to span
+// parityHours. A working lead appends evaluations faster than the span grows, so the
+// trailing-N window kept shrinking back and the gate could not be reached by operating
+// normally (measured: ~8 h under normal cadence, 30 h only after a 23 h idle stretch).
+// The window is now the trailing parityHours of evaluations: new work no longer pushes
+// the old evidence out, so the gate converges.
+test('the window is the trailing parityHours, so a busy lead cannot shrink it back', () => {
+  const root = rootDir({ parityHours: 10, parityEvaluations: 4, parityDistinctFrontiers: 2 });
+  // Evidence spread across 12 hours, then a burst of agreeing evaluations in the last minutes.
+  evaluate(root, T0, [1], planner([1]));
+  evaluate(root, T0 + 4 * 60 * MIN, [2], planner([2]));
+  evaluate(root, T0 + 8 * 60 * MIN, [3], planner([3]));
+  for (let index = 0; index < 30; index += 1) evaluate(root, T0 + 12 * 60 * MIN + index * MIN, [4], planner([4]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, true, result.reasons.join('; '));
+  assert.equal(result.evaluations, 32, 'every evaluation inside the trailing window counts, not just the last N');
+  assert.ok(result.spanHours >= 8, `the burst must not shrink the window (span ${result.spanHours} h)`);
+});
+
+test('a burst of evaluations inside one short stretch fails the span requirement', () => {
+  const root = rootDir({ parityHours: 10, parityEvaluations: 4, parityDistinctFrontiers: 2 });
+  for (let index = 0; index < 40; index += 1) evaluate(root, T0 + index * MIN, [index % 3], planner([index % 3]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.pass, false);
+  assert.match(result.reasons.join(' '), /spans/);
+});
+
+test('evaluations older than the window neither count nor gate', () => {
+  const root = rootDir({ parityHours: 10, parityEvaluations: 3, parityDistinctFrontiers: 2 });
+  // An unapproved difference from before the window must not block a clean window.
+  evaluate(root, T0, [8, 9], planner([8], [{ issue: 9, reasons: [{ code: 'spec-parent' }] }]));
+  evaluate(root, T0 + 30 * 60 * MIN, [1], planner([1]));
+  evaluate(root, T0 + 35 * 60 * MIN, [2], planner([2]));
+  evaluate(root, T0 + 40 * 60 * MIN, [3], planner([3]));
+  const result = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.equal(result.evaluations, 3, 'the stale evaluation is outside the trailing window');
+  assert.deepEqual(result.unapproved, [], 'and its difference does not gate');
+  assert.equal(result.pass, true, result.reasons.join('; '));
 });

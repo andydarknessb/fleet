@@ -152,3 +152,26 @@ test('a third assignment requires and records an independence proof', () => {
   assert.equal(plan.thirdProof.independent, true);
   assert.throws(() => reserveAssignment({ root: rootDir(), issue: issue(53), tenant: 'endzone', active, readyLabel: 'ready-for-agent', base: { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) } }), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
 });
+
+// 02/03 review 2026-09-06: this tenant runs the fleet under the same GitHub account that
+// works it by hand, so an assignee cannot tell "a person claimed this" from "a fleet
+// session claimed it", and nothing ever removes one. Excluding on a self-assignment made
+// an issue permanently invisible to the frontier. `fleetIdentity` scopes the rule to a
+// genuinely foreign assignee; a tenant with real multi-account ownership leaves it unset
+// and keeps the original behaviour.
+test('frontier excludes an issue assigned to someone else, not one the fleet assigned itself', () => {
+  const mine = issue(60, { assignees: [{ login: 'andydarknessb' }] });
+  const theirs = issue(61, { assignees: [{ login: 'someone-else' }] });
+  const both = issue(62, { assignees: [{ login: 'andydarknessb' }, { login: 'someone-else' }] });
+
+  const scoped = selectFrontier({ issues: [mine, theirs, both], readyLabel: 'ready-for-agent', fleetIdentity: 'AndyDarknessB' });
+  assert.deepEqual(scoped.eligible.map((entry) => entry.number), [60], 'a self-assignment must not park an issue forever');
+  const scopedCodes = Object.fromEntries(scoped.excluded.map((entry) => [entry.issue, entry.reasons.map((reason) => reason.code)]));
+  assert.deepEqual(scopedCodes[61], ['assigned']);
+  assert.deepEqual(scopedCodes[62], ['assigned'], 'a foreign assignee still excludes even alongside the fleet identity');
+  assert.match(scoped.excluded.find((entry) => entry.issue === 62).reasons[0].detail, /someone-else/);
+  assert.doesNotMatch(scoped.excluded.find((entry) => entry.issue === 62).reasons[0].detail, /andydarknessb/);
+
+  const unscoped = selectFrontier({ issues: [mine, theirs], readyLabel: 'ready-for-agent' });
+  assert.deepEqual(unscoped.eligible.map((entry) => entry.number), [], 'without a fleet identity every assignee still excludes');
+});

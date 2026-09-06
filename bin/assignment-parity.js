@@ -24,6 +24,12 @@ const path = require('node:path');
 
 const DEFAULTS = Object.freeze({ parityEvaluations: 20, parityDistinctFrontiers: 5, parityHours: 48 });
 const MIN = 60 * 1000;
+// The evidence must reach back across at least this fraction of the window. It is not
+// higher because the lead evaluates in bursts separated by long idle stretches (a 23 h gap
+// is normal overnight), so the oldest evaluation inside the window rarely sits near its
+// edge. The point of the check is to reject a burst that looks like days of evidence, not
+// to demand a regular cadence the lead does not have.
+const COVERAGE = 0.75;
 const CLASSES = Object.freeze(['identical', 'planner-excludes', 'planner-includes', 'planner-failed']);
 
 function baseOf(root) {
@@ -160,8 +166,18 @@ function compareAssignmentParity({ root, tenant } = {}) {
   const config = readConfig(root);
   const required = Number(config.parityEvaluations);
   const requiredDistinct = Number(config.parityDistinctFrontiers);
+  const requiredHours = Number(config.parityHours);
   const all = readShadow(root, tenant);
-  const recent = all.slice(-required);
+  // The window is the trailing parityHours of evaluations, anchored on the newest one, NOT
+  // the last N. A trailing-N window shrinks whenever the lead is busy - each new evaluation
+  // pushes an older one out - so its span could sit hours below the requirement forever and
+  // the gate could not be reached by working normally (reviewed 2026-09-06, ADR 0006).
+  // A time window only grows as evidence accumulates, so it converges.
+  // parityHours <= 0 disables the time requirement entirely: every evaluation is in the
+  // window and only the count, the distinct frontiers and the approvals gate.
+  const newestMs = all.length ? Date.parse(all[all.length - 1].at) : null;
+  const cutoffMs = newestMs === null || requiredHours <= 0 ? null : newestMs - requiredHours * 60 * MIN;
+  const recent = cutoffMs === null ? all : all.filter((line) => Date.parse(line.at) >= cutoffMs);
   const approvals = readApprovals(root);
   const classes = Object.fromEntries(CLASSES.map((cls) => [cls, 0]));
   const differences = [];
@@ -179,13 +195,14 @@ function compareAssignmentParity({ root, tenant } = {}) {
   }
   const unapproved = differences.filter((diff) => !diff.approved);
   const distinctFrontiers = new Set(recent.map(frontierKey)).size;
-  // A time floor as well as a count: the lead can stop twenty times on one idle hour,
-  // and the 08b precedent required 48 continuous hours (ADR 0004).
-  const requiredHours = Number(config.parityHours);
+  // The evidence has to reach back across the window, not cluster in one busy hour of it.
+  // The oldest evaluation in the window is by construction no older than parityHours, so
+  // the requirement is that it sits in the window's first tenth.
   const spanHours = recent.length ? Math.round(((Date.parse(recent[recent.length - 1].at) - Date.parse(recent[0].at)) / (60 * MIN)) * 100) / 100 : 0;
+  const requiredSpanHours = Math.round(requiredHours * COVERAGE * 100) / 100;
   const reasons = [];
-  if (recent.length < required) reasons.push(`evaluations ${recent.length} < required ${required}`);
-  if (recent.length > 0 && spanHours < requiredHours) reasons.push(`evaluation window ${spanHours} h < required ${requiredHours} h`);
+  if (recent.length < required) reasons.push(`evaluations ${recent.length} < required ${required} in the last ${requiredHours} h`);
+  if (requiredHours > 0 && recent.length > 0 && spanHours < requiredSpanHours) reasons.push(`evidence spans ${spanHours} h of the ${requiredHours} h window, under the required ${requiredSpanHours} h`);
   if (recent.length > 0 && distinctFrontiers < requiredDistinct) reasons.push(`distinct frontiers ${distinctFrontiers} < required ${requiredDistinct}`);
   if (unapproved.length > 0) reasons.push(`${unapproved.length} unapproved difference(s) inside the window`);
   return {
@@ -198,6 +215,7 @@ function compareAssignmentParity({ root, tenant } = {}) {
     requiredDistinct,
     spanHours,
     requiredHours,
+    requiredSpanHours,
     window: recent.length ? { start: recent[0].at, end: recent[recent.length - 1].at } : null,
     totals: { evaluations: all.length },
     classes,
@@ -208,8 +226,8 @@ function compareAssignmentParity({ root, tenant } = {}) {
 
 function renderText(result) {
   const lines = [];
-  lines.push(`ASSIGNMENT PARITY: ${result.pass ? 'PASS' : 'FAIL'} (required ${result.required} evaluations spanning ${result.requiredHours} h over ${result.requiredDistinct} distinct frontiers)`);
-  lines.push(`evaluations: ${result.evaluations} of ${result.totals.evaluations} recorded${result.window ? ` (${result.window.start} .. ${result.window.end}, ${result.spanHours} h)` : ''}; distinct frontiers: ${result.distinctFrontiers}`);
+  lines.push(`ASSIGNMENT PARITY: ${result.pass ? 'PASS' : 'FAIL'} (the last ${result.requiredHours} h must hold ${result.required} evaluations reaching back ${result.requiredSpanHours} h over ${result.requiredDistinct} distinct frontiers)`);
+  lines.push(`evaluations in window: ${result.evaluations} of ${result.totals.evaluations} recorded${result.window ? ` (${result.window.start} .. ${result.window.end}, spanning ${result.spanHours} h)` : ''}; distinct frontiers: ${result.distinctFrontiers}`);
   lines.push(`classes: ${Object.entries(result.classes).map(([cls, n]) => `${cls}=${n}`).join(', ')}`);
   for (const reason of result.reasons) lines.push(`reason: ${reason}`);
   if (result.differences.length) {
@@ -272,6 +290,9 @@ function cli(argv) {
         active: readState(path.join('state', 'work', 'active.json'), []),
         skipIssues: readState(path.join('state', 'skip', `${tenant}.json`), {}),
         exclusions: exclusions.activeExclusions({ root: args.root, tenant, now: args.now }),
+        // The observer must apply exactly the rules the planner will apply when it is
+        // authoritative, or the ledger records a difference the live path would not make.
+        fleetIdentity: assignment.readTenantConfig(args.root, tenant).fleetIdentity,
         now: args.now,
       });
     } catch (error) {

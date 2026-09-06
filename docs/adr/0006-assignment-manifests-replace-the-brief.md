@@ -155,3 +155,34 @@ found, and what it changed:
   is why the "the cutover closes this window" argument for `planner-includes`
   is a claim, not a measurement. A rehearsal on one real issue should precede
   the flag.
+
+## Status note - the two rulings, 2026-09-06
+
+**The assignee rule is scoped to a foreign assignee.** `tenants/<tenant>.json`
+gains `fleetIdentity`: the GitHub login the fleet acts as. `selectFrontier`
+excludes on an assignee only when at least one assignee is not that login.
+Endzone sets it to `andydarknessb`, which is the only assignee the repo has
+ever had and the same account the fleet's own `gh` runs as, so in this tenant
+an assignee carries no information about who owns the issue and the rule is
+inert. A tenant whose issues are really owned by several accounts leaves
+`fleetIdentity` unset and keeps the original behaviour. The rule stays in the
+planner (ticket 03 requires it) instead of being deleted, and the observed
+incident loses nothing: Cory's hold on those issues was the skip file, written
+in parallel with the assignments, which both frontiers already honour.
+
+**The parity window is a trailing time window, not the last N evaluations.**
+It was "the most recent `parityEvaluations` must span `parityHours`", which a
+working lead can never satisfy: every new evaluation pushes an older one out,
+so the span stays near the lead's own cadence. Measured on the live ledger it
+sat at ~8 h against a 48 h requirement, and only reached 30 h because the lead
+idled for 23 hours. A gate that operating normally cannot pass is a defect in
+the gate. It is now: every evaluation in the trailing `parityHours` (48), of
+which there must be at least `parityEvaluations` (20), reaching back across at
+least 75% of the window (36 h) over `parityDistinctFrontiers` (5) distinct
+frontiers, with every difference approved. The coverage fraction is 75% rather
+than 100% because the lead evaluates in bursts separated by long idle
+stretches; its job is to reject a burst that looks like days of evidence, not
+to demand a cadence the lead does not have. `parityHours: 0` disables the time
+requirement (fixtures). On the live ledger the window immediately became 71
+evaluations spanning 47.52 h over 11 distinct frontiers, so only real
+differences gate now.

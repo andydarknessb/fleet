@@ -111,7 +111,14 @@ function buildLaunchPlan({ frontier, active = [], maxIcs = 3 } = {}) {
   return { assignments: selected, thirdProof };
 }
 
-function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], now } = {}) {
+// `fleetIdentity` is the GitHub login the fleet itself acts as. An assignee equal to it is
+// not evidence that someone else owns the issue: in a single-account tenant the fleet and
+// the human are the same login, nothing in either repo ever removes an assignee, and
+// excluding on it made an issue permanently invisible to the frontier (reviewed 2026-09-06,
+// ADR 0006). A genuinely foreign assignee still excludes. Leave it unset for a tenant whose
+// issues are really owned by several accounts.
+function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, now } = {}) {
+  const foreign = (assignee) => !fleetIdentity || String(assignee).toLowerCase() !== String(fleetIdentity).toLowerCase();
   if (!Array.isArray(issues)) throw new WorkStateError('INVALID_GITHUB_FIXTURE', 'issues must be an array');
   const normalized = issues.map(normalizeIssue);
   const activeByIssue = new Map(activeRecords(active).filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
@@ -121,7 +128,8 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     const reasons = [];
     if (issue.state !== 'OPEN') reasons.push({ code: 'not-open', detail: `GitHub state is ${issue.state}` });
     if (readyLabel && !issue.labels.includes(readyLabel)) reasons.push({ code: 'not-ready', detail: `missing ${readyLabel}` });
-    if (issue.assignees.length) reasons.push({ code: 'assigned', detail: issue.assignees.join(', ') });
+    const foreignAssignees = issue.assignees.filter(foreign);
+    if (foreignAssignees.length) reasons.push({ code: 'assigned', detail: foreignAssignees.join(', ') });
     if (issue.unresolvedDependencies.length) reasons.push({ code: 'dependency-blocked', detail: issue.unresolvedDependencies.map((dependency) => dependency.number || dependency.id || dependency).join(', ') });
     if (issue.isSpecParent) reasons.push({ code: 'spec-parent', detail: 'sub-issues remain or issue is marked as a spec parent' });
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
@@ -243,7 +251,7 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
 }
 
 function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, actor = 'assignment-planner', runner } = {}) {
-  const frontier = selectFrontier({ issues: [issue], readyLabel, active, skipIssues, exclusions, now });
+  const frontier = selectFrontier({ issues: [issue], readyLabel, active, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
@@ -356,25 +364,34 @@ function readStateFixture(file, fallback, root, relative) {
   return fs.existsSync(candidate) ? readFixture(candidate, fallback) : fallback;
 }
 
+// The tenant file is the source of truth for readyLabel, repo and fleetIdentity; every door
+// that computes a frontier reads it so the rules cannot drift between them.
+function readTenantConfig(root, tenant, file) {
+  if (file) return readFixture(file, {});
+  return readStateFixture(null, {}, root, path.join('tenants', `${tenant || 'endzone'}.json`));
+}
+
 function cli(argv) {
   const [command, ...rest] = argv;
   const args = parseArgs(rest);
   if (command === 'frontier') {
-    const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: args.repo, readyLabel: args['ready-label'] || 'ready-for-agent', fetchDetails: true });
+    const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
+    const readyLabel = args['ready-label'] || config.readyLabel || 'ready-for-agent';
+    const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: args.repo || config.github, readyLabel, fetchDetails: true });
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant: args.tenant || 'endzone', now: args.now });
-    return selectFrontier({ issues, readyLabel: args['ready-label'] || 'ready-for-agent', active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant || 'endzone'}.json`)), exclusions, now: args.now });
+    return selectFrontier({ issues, readyLabel, active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant || 'endzone'}.json`)), exclusions, fleetIdentity: config.fleetIdentity, now: args.now });
   }
   if (command === 'assign' || command === 'proof') {
     // One loader for both doors: the tenant file names the repo and ready label, the
     // fleet state supplies active records, the skip file, and the exclusion ledger.
-    const config = readFixture(args['tenant-config'], {});
+    const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
     const tenant = args.tenant || config.name || 'endzone';
     const readyLabel = config.readyLabel || args['ready-label'] || 'ready-for-agent';
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github || args.repo, readyLabel, fetchDetails: true });
     const active = readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json'));
     const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`));
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
-    const frontier = selectFrontier({ issues, readyLabel, active, skipIssues, exclusions, now: args.now });
+    const frontier = selectFrontier({ issues, readyLabel, active, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, now: args.now });
     if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'no eligible issue', { excluded: frontier.excluded });
     if (command === 'proof') {
       // The machine-readable independence proof a third assignment must carry: the
@@ -423,6 +440,7 @@ module.exports = {
   launchReservedAssignment,
   parseArgs,
   normalizeIssue,
+  readTenantConfig,
   queryGithubIssues,
   resolveRemoteBase,
   reserveAssignment,

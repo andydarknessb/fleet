@@ -5,6 +5,7 @@
   "defaultBranch": "integration",
   "releaseBranch": "main",
   "readyLabel": "ready-for-agent",
+  "fleetIdentity": "andydarknessb",
   "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",
   "maxIcs": 3,

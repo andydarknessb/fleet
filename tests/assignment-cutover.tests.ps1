@@ -35,16 +35,17 @@ function Get-Hash { param([string]$Path) (Get-FileHash $Path -Algorithm SHA256).
 # every ledger file instead; the seeded file stays as the immutability check.
 function Get-EventLines { @(Get-ChildItem (Join-Path $testRoot 'state\events') -Filter *.jsonl -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { Get-Content $_.FullName } | Where-Object { $_ }) }
 function Write-Evaluations {
-  # Twenty agreeing evaluations over five distinct frontiers, the config default.
-  param([int]$Count = 20)
+  # Agreeing evaluations over five distinct frontiers, inside the trailing 48 h window and
+  # reaching back past the 36 h coverage requirement: 24 of them two hours apart spans 46 h.
+  param([int]$Count = 24)
   $dir = "$testRoot\state\assignment\shadow"
   [IO.Directory]::CreateDirectory($dir) | Out-Null
   Remove-Item "$dir\*" -ErrorAction SilentlyContinue
   $frontiers = @('[]', '[101]', '[101,102]', '[103]', '[104,105]')
   $lines = @()
   for ($i = 0; $i -lt $Count; $i++) {
-    # Nineteen gaps of 160 minutes = 50.7 hours, clear of the 48-hour floor.
-    $at = (Get-Date).ToUniversalTime().AddMinutes(-(($Count - $i) * 160)).ToString('o')
+    # Gaps of 120 minutes: 24 evaluations span 46 h, inside the 48 h window and past the 36 h floor.
+    $at = (Get-Date).ToUniversalTime().AddMinutes(-(($Count - $i) * 120)).ToString('o')
     $f = $frontiers[$i % $frontiers.Count]
     $lines += ('{"at":"' + $at + '","tenant":"test","mode":"shadow","hook":{"frontier":' + $f + ',"reason":"fixture"},"planner":{"frontier":' + $f + ',"excluded":[],"error":null},"agree":true,"differences":[]}')
   }
@@ -89,7 +90,7 @@ try {
   Write-Evaluations
   $r3 = Run-Script 'cutover-assignment.ps1' @('-Tenant', 'test', '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r3.dryRun -eq $true -and $r3.cutover -eq $false) "a dry run must report the plan and exit 0: $lastOut"
-  Assert-True ($r3.gates.parity.pass -eq $true -and $r3.gates.parity.evaluations -eq 20 -and $r3.gates.parity.distinctFrontiers -eq 5) 'the dry run must show the passing parity gate'
+  Assert-True ($r3.gates.parity.pass -eq $true -and $r3.gates.parity.evaluations -eq 24 -and $r3.gates.parity.distinctFrontiers -eq 5) 'the dry run must show the passing parity gate'
   Assert-True (-not (Test-Path "$testRoot\state\flags\assignment-live")) 'a dry run must not write the flag'
 
   # Case 4: a legacy IC launch passes the door before cutover (dry run).
@@ -102,7 +103,7 @@ try {
   Assert-True (Test-Path "$testRoot\state\flags\assignment-live") 'cutover must write the flag'
   Assert-True ((Get-Content "$testRoot\state\flags\assignment-live" -Raw) -match 'rollback-assignment') 'the flag must name the rollback path'
   $record = (Get-Content "$testRoot\state\assignment\cutover.json" -Raw) | ConvertFrom-Json
-  Assert-True ($record.parity.evaluations -eq 20 -and $record.forced -eq $false) 'the cutover record must carry the parity evidence'
+  Assert-True ($record.parity.evaluations -eq 24 -and $record.forced -eq $false) 'the cutover record must carry the parity evidence'
   Assert-True ($lastOut -match 'status.ps1') 'cutover must print the paperwork checklist'
   Assert-True ((Get-Hash $eventsFile) -eq $eventsHash) 'cutover must not touch the event ledger'
 
