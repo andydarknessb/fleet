@@ -9,7 +9,7 @@ cory
  └─ dispatcher (sonnet)    your interface; relays escalations; daily digest; reads the supervisor's escalation files
  └─ Fleet watchdog (task)  the supervisor: keeps the roster alive and under the cap; never reasons about work (cut over from the sentinel session 2026-09-04; rollback path kept one release)
      └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
-         └─ ic-<issue> (sonnet) one per issue, launched with /implement; opens a PR; talks only to its project lead
+         └─ ic-<issue> (haiku or sonnet, high) one per issue, launched from a manifest with /implement; opens a PR; talks only to its project lead
              └─ qa-reviewer (opus worker)   risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
 ```
 

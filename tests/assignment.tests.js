@@ -175,3 +175,18 @@ test('frontier excludes an issue assigned to someone else, not one the fleet ass
   const unscoped = selectFrontier({ issues: [mine, theirs], readyLabel: 'ready-for-agent' });
   assert.deepEqual(unscoped.eligible.map((entry) => entry.number), [], 'without a fleet identity every assignee still excludes');
 });
+
+// Amendment 14 (2026-09-09): an IC is haiku or sonnet at effort high, never opus. The
+// planner is the live launch path, so the rule is enforced where the manifest is made.
+test('assignment refuses an IC model outside haiku/sonnet and defaults to sonnet', () => {
+  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
+  assert.throws(
+    () => reserveAssignment({ root: rootDir(), issue: issue(70), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'opus' }),
+    (error) => error.code === 'INVALID_IC_MODEL' && /haiku|sonnet/.test(error.message),
+  );
+  const haiku = reserveAssignment({ root: rootDir(), issue: issue(71), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'haiku' });
+  assert.equal(haiku.manifest.model, 'haiku');
+  const defaulted = reserveAssignment({ root: rootDir(), issue: issue(72), tenant: 'endzone', readyLabel: 'ready-for-agent', base });
+  assert.equal(defaulted.manifest.model, 'sonnet');
+  assert.equal(reserveAssignment({ root: rootDir(), issue: issue(73), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'Sonnet' }).manifest.model, 'sonnet', 'case is not a distinction');
+});

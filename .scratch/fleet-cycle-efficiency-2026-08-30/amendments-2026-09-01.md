@@ -110,6 +110,20 @@ baseline and sharpens the diagnosis:
 13. **Tenant-side note (Endzone, not fleet):** `docs/adr/` numbering
     collides - two files prefixed 0010, and 0012 duplicates a 0010 title.
     The fix travels as an ordinary tenant PR.
+14. **IC tiering: haiku or sonnet, never opus** (ruled by Cory 2026-09-09 at
+    ticket 09; supersedes amendment 4). The project lead assigns `haiku` to a
+    ticket whose criteria already carry the judgment (copy, single-file
+    fixes, flakes, verbatim moves, exact files/lines/greps named) and
+    `sonnet` to the rest (shared contracts, several services, scoring or
+    money-like integrity, CI-gating tools, expand/migrate/contract changes,
+    design left to the IC). Both at effort high. Opus is no longer an IC
+    model; the IC-hosted risk reviewer stays the one opus worker (amendment
+    5). `launch.ps1` keeps its `opus` pin for Cory's own `-Force` launches.
+    Rationale: the 02/03 rehearsal measured an IC first turn at 4,596 tokens
+    with a manifest pointer replacing the brief, and #943 (a verbatim move)
+    completed on sonnet; the sharper the ticket, the cheaper the model it
+    needs, and ticket 09's per-unit budgets are met by routing, not by a
+    bigger model.
 
 ## Stage 1 - landed by the implementing session
 

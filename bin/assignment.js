@@ -220,7 +220,19 @@ function writeManifest(root, manifest) {
   return file;
 }
 
+// Amendment 14 (2026-09-09): an IC is haiku or sonnet, never opus. The only opus worker in
+// an IC's world is the risk reviewer it hosts on a trigger. Enforced where the manifest is
+// made, because the manifest is what the launch door starts.
+const IC_MODELS = Object.freeze(['haiku', 'sonnet']);
+
+function icModel(model) {
+  const value = String(model === undefined || model === null || model === '' ? 'sonnet' : model).toLowerCase();
+  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as haiku or sonnet, not '${model}' (amendment 14; the risk reviewer is the only opus worker)`);
+  return value;
+}
+
 function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, now, workRecordId } = {}) {
+  model = icModel(model);
   const normalized = normalizeIssue(issue);
   const createdAt = now || new Date().toISOString();
   const id = `assignment-${tenant}-issue-${normalized.number}-${normalized.bodyHash.slice(0, 12)}`;
@@ -432,6 +444,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  IC_MODELS,
   acknowledgeAssignment,
   buildManifest,
   buildLaunchPlan,
