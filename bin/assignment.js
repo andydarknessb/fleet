@@ -89,7 +89,7 @@ function independenceProof(issues) {
       if (!independentPair(issues[left], issues[right])) conflicts.push({ left: issues[left].number, right: issues[right].number });
     }
   }
-  return { independent: conflicts.length === 0, candidates: issues.map((issue) => issue.number), checkedFields: [...RESERVATION_FIELDS], conflicts };
+  return { independent: conflicts.length === 0, candidates: issues.map((issue) => issue.number ?? issue.issue), checkedFields: [...RESERVATION_FIELDS], conflicts };
 }
 
 function buildLaunchPlan({ frontier, active = [], maxIcs = 3 } = {}) {
