@@ -1,6 +1,6 @@
 # Reconstruct one active unit from validated Work record events
 
-Status: DONE in shadow; 02/03 cutover mechanism landed 2026-09-04 (`bin/cutover-assignment.ps1`, gated on frontier parity; the flag flip is Cory's hand after the gate)
+Status: DONE and CUT OVER 2026-09-09 10:17Z (`state/flags/assignment-live`; Work records and manifests are authoritative for assignment; rollback path kept one release)
 Blocked by: 01
 
 ## Outcome

@@ -1,6 +1,6 @@
 # Turn one ready issue into a reserved, acknowledged assignment
 
-Status: DONE in shadow; 02/03 cutover mechanism landed 2026-09-04 (`bin/cutover-assignment.ps1`, gated on frontier parity; the flag flip is Cory's hand after the gate)
+Status: DONE and CUT OVER 2026-09-09 10:17Z (`state/flags/assignment-live`; the planner is the authoritative frontier and IC launch path; full cycle ran live on #943 / PR #971 before the flip; rollback path kept one release)
 Blocked by: 02
 
 ## Outcome

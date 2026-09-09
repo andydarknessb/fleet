@@ -156,6 +156,29 @@ found, and what it changed:
   is a claim, not a measurement. A rehearsal on one real issue should precede
   the flag.
 
+## Status note - CUT OVER 2026-09-09 10:17Z
+
+`bin/cutover-assignment.ps1` ran on Cory's approval with every gate holding
+and nothing overridden: parity PASS on 35 evaluations spanning 47.7 h across
+12 distinct frontiers, the only two differences the approved #966/#989 ledger
+exclusions, zero `planner-includes` in the 64 hours since the reservation lag
+closed. The moment was clean: no IC running, no active Work record, no pending
+manifest, no PAUSE. `state/flags/assignment-live` stands; the record is
+`state/assignment/cutover.json`.
+
+Verified immediately after: `status.ps1` reads "assignment: planner
+authoritative"; the launch door refuses a legacy IC prompt launch naming the
+flag and the rollback; the planner's frontier is what the lead's next
+Stop-hook evaluation will decide from. The full cycle had already run live
+once before the flip (#943, PR #971).
+
+Paperwork after one release (a release = one merged unit through the planner
+path under the flag): retire the legacy launch block from
+`agents/project-lead.md`, the legacy frontier and its parity observation from
+`hooks/stop.ps1`, and the `-Prompt` IC path from `launch.ps1`; then delete the
+rollback script and the flag reader. Until then `bin/rollback-assignment.ps1`
+is the way back.
+
 ## Status note - the reservation lag is closed, 2026-09-06
 
 `planner-includes` was not a set of historical differences waiting to age out of
