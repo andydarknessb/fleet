@@ -49,6 +49,10 @@ $digestLevel = if ($digestExit -eq 0) { 'INFO' } else { 'ERROR' }
 $budgetOutput = & $nodeExecutable "$FleetHome\bin\budget.js" --root $FleetHome 2>&1 | Out-String
 $budgetLevel = if ($LASTEXITCODE -eq 0) { 'INFO' } else { 'ERROR' }
 [IO.File]::AppendAllText($logPath, "$(Now-Iso) $budgetLevel budget exit=$LASTEXITCODE`r`n$budgetOutput`r`n", $Utf8)
+# Ticket 09 telemetry: the unified budget summary (state/budget/summary.md and .json) folds
+# every crossing in the ledger with the latest measurements, by day and by model.
+$summaryOutput = & $nodeExecutable "$FleetHome\bin\budget-report.js" --root $FleetHome 2>&1 | Out-String
+[IO.File]::AppendAllText($logPath, "$(Now-Iso) $(if ($LASTEXITCODE -eq 0) { 'INFO' } else { 'ERROR' }) budget-report exit=$LASTEXITCODE`r`n$summaryOutput`r`n", $Utf8)
 
 # Ticket 09: the ledger verifier (bin/verify-events.js) writes state/verify/last.json, the
 # verdict the 30-day event archival consults before it moves anything. Exit 2 = findings;

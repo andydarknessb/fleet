@@ -203,7 +203,9 @@ Work record gets one warning event at the warning threshold and is escalated
 at the escalation threshold unless an approved extension, granted by Cory
 through the state command with an amount and a reason, raises the line. The
 measurement is a projection (`state/budget/last.json`); only the crossings are
-Fleet events. Shadow until `state/flags/budget-live` stands.
+Fleet events. Live behind `state/flags/budget-live`; with the escalation
+threshold set to null it is warning-only (the soak ruled 2026-09-09), and
+`state/budget/summary.md` is the one place to read it.
 _Avoid_: quota, allowance, token limit (unqualified), cost
 
 **Frontier**:

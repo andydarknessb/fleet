@@ -22,7 +22,8 @@ $budgetLast = $null; try { $budgetLast = Read-Json "$FleetHome\state\budget\last
 if ($budgetLast) {
   $rows = @($budgetLast.records)
   $counts = "measured $(@($rows | Where-Object { $null -ne $_.jobTokens }).Count), warn $(@($rows | Where-Object { $_.decision -eq 'warn' }).Count), escalate $(@($rows | Where-Object { $_.decision -eq 'escalate' }).Count), unmeasured $(@($rows | Where-Object { $_.decision -eq 'unmeasured' }).Count)"
-  Write-Output "budget: $($budgetLast.mode) (warn $($budgetLast.config.warnTokens) / escalate $($budgetLast.config.escalateTokens) job tokens; flag state/flags/budget-live); $counts; last $($budgetLast.at)"
+  $escalateText = if ($null -eq $budgetLast.config.escalateTokens) { 'OFF (warning-only soak)' } else { "$($budgetLast.config.escalateTokens)" }
+  Write-Output "budget: $($budgetLast.mode) (warn $($budgetLast.config.warnTokens) / escalate $escalateText job tokens; flag state/flags/budget-live; summary state/budget/summary.md); $counts; last $($budgetLast.at)"
 } else { Write-Output 'budget: no run recorded (state/budget/last.json)' }
 $verifyLast = $null; try { $verifyLast = Read-Json "$FleetHome\state\verify\last.json" } catch {}
 if ($verifyLast) { Write-Output "ledger: $(if ($verifyLast.pass) { 'verified' } else { 'FINDINGS' }) ($($verifyLast.totals.events) events, $($verifyLast.totals.records) records; archival $(if ($verifyLast.pass) { 'permitted' } else { 'held' })); last $($verifyLast.at)" }

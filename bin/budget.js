@@ -33,9 +33,12 @@ function readJson(file, fallback) {
   try { return JSON.parse(stripBom(fs.readFileSync(file, 'utf8'))); } catch { return fallback; }
 }
 
+// `escalateTokens: null` is the warning-only mode (the soak Cory ruled 2026-09-09):
+// warnings are recorded, nothing is ever escalated, and the summary says so.
 function budgetConfig(root) {
   const ic = readJson(path.join(baseOf(root), 'config', 'cycle.json'), {}).ic || {};
-  return { warnTokens: Number(ic.warnTokens ?? DEFAULTS.warnTokens), escalateTokens: Number(ic.escalateTokens ?? DEFAULTS.escalateTokens) };
+  const escalate = ic.escalateTokens === null ? null : Number(ic.escalateTokens ?? DEFAULTS.escalateTokens);
+  return { warnTokens: Number(ic.warnTokens ?? DEFAULTS.warnTokens), escalateTokens: escalate };
 }
 
 function isLive({ root, live } = {}) {
@@ -60,10 +63,11 @@ function rosterSession(root, tenant, issue) {
 // is reported as ineffective rather than silently honoured or silently ignored.
 function decide({ jobTokens, record, config }) {
   const extension = record.budget?.extension;
-  const extensionIneffective = Boolean(extension) && !(Number(extension.tokens) > config.escalateTokens);
-  const line = extension && !extensionIneffective ? Number(extension.tokens) : config.escalateTokens;
-  const base = { extension: extension || null, extensionIneffective };
-  if (jobTokens >= line) return { ...base, decision: 'escalate', threshold: line };
+  const warningOnly = config.escalateTokens === null || config.escalateTokens === undefined;
+  const extensionIneffective = Boolean(extension) && !warningOnly && !(Number(extension.tokens) > config.escalateTokens);
+  const line = warningOnly ? null : (extension && !extensionIneffective ? Number(extension.tokens) : config.escalateTokens);
+  const base = { extension: extension || null, extensionIneffective, warningOnly };
+  if (!warningOnly && jobTokens >= line) return { ...base, decision: 'escalate', threshold: line };
   if (jobTokens >= config.warnTokens) return { ...base, decision: 'warn', threshold: config.warnTokens };
   return { ...base, decision: 'none', threshold: null };
 }
@@ -93,6 +97,7 @@ async function applyBudgets({ root, claudeHome, tenant, now, live, actor = 'budg
     entry.threshold = verdict.threshold;
     entry.extension = verdict.extension ? { tokens: verdict.extension.tokens, by: verdict.extension.by } : null;
     entry.extensionIneffective = verdict.extensionIneffective;
+    entry.warningOnly = verdict.warningOnly;
     entry.warnedAt = record.budget?.warnedAt || null;
     if (mode === 'live' && verdict.decision !== 'none') {
       try {

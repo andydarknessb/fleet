@@ -198,3 +198,21 @@ test('records outside the budget states, without a roster session, or without a 
   assert.equal(getRecord({ root, id: noTranscript }).state, 'implementing');
   assert.equal(readEvents(root).filter((e) => e.type === 'state-escalated').length, 0);
 });
+
+// The warning-only soak: escalateTokens null records warnings and escalates nothing.
+test('warning-only: escalateTokens null warns, never escalates, and reports the mode', async () => {
+  const root = rootDir({ escalateTokens: null });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'budget-live'), 'x');
+  rosterIc(root, 53, 's53'); transcript(root, 's53', [[200000, 50000]]);
+  const id = unit(root, 53, 'review');
+  assert.equal(budgetConfig(root).escalateTokens, null);
+  const result = await run(root);
+  assert.equal(result.records[0].decision, 'warn');
+  assert.equal(result.records[0].warningOnly, true);
+  assert.equal(result.records[0].applied, true);
+  const record = getRecord({ root, id });
+  assert.equal(record.state, 'review', '250000 job tokens and still not escalated');
+  assert.equal(record.budget.cumulativeTokens, 250000);
+  assert.equal(readEvents(root).filter((e) => e.type === 'state-escalated').length, 0);
+  assert.equal(readEvents(root).filter((e) => e.type === 'budget-warning').length, 1);
+});

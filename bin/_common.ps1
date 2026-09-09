@@ -8,6 +8,33 @@ function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
 # 02/03 cutover: while this flag stands the assignment planner (bin/assignment.js) is the
 # authoritative frontier and launch path for ICs; the launch door refuses a legacy IC launch.
 function Test-AssignmentLive { Test-Path "$FleetHome\state\flags\assignment-live" }
+# Ticket 09: a high-priority alert for the actions Cory audits in real time (a watchdog
+# frontier wake). Three channels, none of them fatal: the Windows toast, a webhook POST
+# (Slack-compatible {"text": ...}) to the URL in FLEET_ALERT_WEBHOOK or
+# state/alerts/webhook.url (state/ is not committed, so the URL never lands in git), and
+# an append-only audit line in state/alerts/alerts.jsonl, which is the channel that
+# always works. Returns what was delivered so the caller can record it.
+function Send-FleetAlert {
+  param([string]$Kind, [string]$Title, [string]$Body, $Detail = $null, [switch]$NoToast)
+  $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; toast = $null; webhook = $null; webhookError = $null }
+  # -NoToast (tests) skips the toast only: the webhook and the audit line always run.
+  if ($NoToast) { $result.toast = 'skipped' } else { try { $result.toast = Send-FleetToast $Title $Body } catch { $result.toast = $false } }
+  $url = $env:FLEET_ALERT_WEBHOOK
+  if (-not $url) { try { $url = (Get-Content "$FleetHome\state\alerts\webhook.url" -Raw -ErrorAction Stop).Trim() } catch { $url = $null } }
+  if ($url) {
+    try {
+      $payload = @{ text = "[$Kind] $Title`n$Body"; kind = $Kind; title = $Title; body = $Body; detail = $Detail; at = $result.at } | ConvertTo-Json -Compress -Depth 6
+      $null = Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 15
+      $result.webhook = $true
+    } catch { $result.webhook = $false; $result.webhookError = "$($_.Exception.Message)" }
+  } else { $result.webhook = 'unconfigured' }
+  try {
+    [IO.Directory]::CreateDirectory("$FleetHome\state\alerts") | Out-Null
+    $line = [ordered]@{}; foreach ($k in $result.Keys) { $line[$k] = $result[$k] }; $line.detail = $Detail
+    [IO.File]::AppendAllText("$FleetHome\state\alerts\alerts.jsonl", (($line | ConvertTo-Json -Compress -Depth 6) + [Environment]::NewLine), $script:Utf8)
+  } catch {}
+  return [pscustomobject]$result
+}
 function Get-ExpectedStaticSessions {
   # The static roster minus the rostered Sentinel while state/flags/sentinel-off stands
   # (ticket 08b cutover): its roster.json entry stays as the rollback path, and nothing

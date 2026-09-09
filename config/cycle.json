@@ -9,7 +9,13 @@
   },
   "ic": {
     "warnTokens": 50000,
-    "escalateTokens": 75000
+    "escalateTokens": null,
+    "escalateTokensAfterSoak": 75000,
+    "soakUntil": "2026-09-16T00:00:00Z"
+  },
+  "frontierWake": {
+    "cooldownMinutes": 60,
+    "sources": ["frontier", "outbox"]
   },
   "budgets": {
     "baselineControlPlaneFreshPerCompletedUnit": 201505,

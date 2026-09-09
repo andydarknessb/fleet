@@ -82,14 +82,32 @@ found zero findings and zero orphans.
 - The project lead resolves a budget escalation only after Cory has granted an
   extension, or winds the unit down; a warning is information for its status
   file, never an action.
-- Two rulings remain Cory's and are not defaulted here. (1) When to create
-  `state/flags/budget-live`: as specced, now that ICs are haiku or sonnet; or
-  warning-only for a week first; or hold. (2) Whether the watchdog may relaunch
-  an idle project lead when the planner's frontier turns non-empty. No script in
-  this fleet can message a session, so that relaunch is the only wake a script
-  can deliver, and it is the only way the lead's hourly frontier cron (six
-  polling turns in seven days, against a target of zero) retires. It is also the
-  largest new authority any script here would hold.
+- Two rulings were Cory's, both made 2026-09-09. (1) `state/flags/budget-live`
+  is set, WARNING-ONLY for a seven-day soak: `ic.escalateTokens` is `null`
+  until `ic.soakUntil` (2026-09-16), so warnings are recorded on records and
+  nothing is escalated while the running opus ICs drain; `escalateTokensAfterSoak`
+  (75,000) is the value to restore then. `bin/budget-report.js` folds every
+  crossing with the live and completed-unit measurements by day and by model
+  into `state/budget/summary.md`, rebuilt every watch tick, which is where the
+  sonnet and haiku floors are read at the end of the soak. (2) The watchdog may
+  wake an idle lead. No script in this fleet can message a session, so the wake
+  is a rotation: when a tenant's lead is idle at a turn boundary and there is
+  work it cannot see (the planner's frontier is non-empty with a free IC slot,
+  or the PR watcher recorded a checks-settled, checks-failed or decision-needed
+  wake since the lead's session started), `rotate.ps1 -Wake` stops it at the
+  boundary, reconciles, and relaunches it through the one door. Guards: one wake
+  per tenant per tick, never twice for the same evidence inside
+  `frontierWake.cooldownMinutes` (60), the boundary and PAUSE and
+  `rotation-off` inside rotate.ps1, and `state/flags/frontier-wake-off` as the
+  rollback. Every executed wake is a high-priority alert (`Send-FleetAlert`:
+  Windows toast, a Slack-compatible webhook POST when `FLEET_ALERT_WEBHOOK` or
+  `state/alerts/webhook.url` is set, and always an audit line in
+  `state/alerts/alerts.jsonl`), so its behaviour can be audited in real time
+  and a loop would be visible as repeated lines. With the wake live the lead's
+  two polling instructions (the hourly frontier cron and the CI re-check cron)
+  are deleted from its role file: it stops when the hook stops it, and it is
+  woken. That is the ticket's "zero polling-only turns" criterion, and the
+  reason Cory accepted the authority is that the ledger verifier fails closed.
 
 ## Status note - 2026-09-09
 
@@ -105,7 +123,17 @@ verifier failing open on an unreadable state file, `--sample` being inert,
 orphaned records not failing the verdict, `review-dedup-off` defeated by the
 default replay key, and the per-model split quoted from a hand computation. `bin/run-pr-watch.ps1` runs
 the budget actor and the verifier after every watch tick; `bin/status.ps1`
-prints a `budget:` and a `ledger:` line. Not done, and stated in the ticket:
-shadow parity for notifications and reservations (no evidence can exist before
-those paths are live), zero polling turns (needs ruling 2), and the IC budget
-armed (ruling 1).
+prints a `budget:` and a `ledger:` line.
+
+Same day, on Cory's directives: the wedged lead (busy since 04:07Z, the
+stuck-turn class) was retired by hand and relaunched through the door; the
+`main`/`integration` divergence (#1082 merged straight to `main`) was
+reconciled by a human merge PR into `integration`; `budget-live` was created
+warning-only for the soak; the frontier wake landed in `watchdog.ps1` with
+`rotate.ps1 -Wake`, `Send-FleetAlert`, `frontierWake` config, the
+`frontier-wake-off` flag, and drills in the rotation and watchdog suites; and
+`bin/budget-report.js` became the unified budget summary. Not done, and stated
+in the ticket: shadow parity for notifications and reservations (no evidence
+can exist before those paths are live). The IC budget escalation is armed on
+2026-09-16 by restoring `ic.escalateTokens` from `escalateTokensAfterSoak`,
+after the summary has been read.

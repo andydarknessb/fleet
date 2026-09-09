@@ -276,6 +276,106 @@ try {
     }
   }
 
+  # --- frontier wake (ticket 09, ruling 2, Cory 2026-09-09). No script can message a
+  # --- session, so the only wake a script can deliver is a relaunch: when a tenant's lead
+  # --- is idle at a turn boundary and there is work it cannot see (the planner's frontier
+  # --- is non-empty with a free IC slot, or the PR watcher recorded a checks-settled /
+  # --- checks-failed / decision-needed wake since the lead's current session started), the
+  # --- lead is rotated NOW through rotate.ps1 -Wake: stop at the boundary, reconcile,
+  # --- relaunch through the one door, so the replacement reconstructs from state exactly as
+  # --- a rotated lead does. This retires the lead's hourly polling cron. Loop guards: one
+  # --- wake per tenant per tick; never twice for the same evidence inside
+  # --- frontierWake.cooldownMinutes; the boundary, PAUSE and rotation-off still apply
+  # --- inside rotate.ps1; state/flags/frontier-wake-off disables it. Every executed wake is
+  # --- a high-priority alert (Send-FleetAlert: toast + webhook + state/alerts/alerts.jsonl).
+  $frontierWakes = @()
+  $wakeConfig = $null; try { $wakeConfig = (Read-Json "$FleetHome\config\cycle.json").frontierWake } catch {}
+  $wakeCooldown = 60; if ($wakeConfig -and $wakeConfig.PSObject.Properties['cooldownMinutes']) { $wakeCooldown = [int]$wakeConfig.cooldownMinutes }
+  $wakeSources = @('frontier', 'outbox'); if ($wakeConfig -and $wakeConfig.PSObject.Properties['sources']) { $wakeSources = @($wakeConfig.sources | ForEach-Object { "$_" }) }
+  $wakeStatePath = "$FleetHome\state\watchdog\frontier-wake.json"
+  $wakeState = $null; try { $wakeState = Read-Json $wakeStatePath } catch {}
+  if (-not $wakeState) { $wakeState = [pscustomobject]@{ tenants = [pscustomobject]@{} } }
+  if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
+  $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
+  if ($mode -eq 'live' -and -not $Verify -and -not $paused -and -not $wakeOff) {
+    $nodeExe = $null; try { $nodeExe = Get-NodeExe } catch {}
+    $liveRoster = $null; try { $liveRoster = Get-LiveRoster } catch {}
+    $cap = 0; try { $cap = [int]$static.cap } catch {}
+    $liveCount = @($daemon | Where-Object { $_.pid -and ($staticNames -contains "$($_.name)" -or "$($_.name)" -match '^ic-') }).Count
+    foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
+      $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
+      if (-not $tenant) { continue }
+      $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
+      $leadName = "pl-$tenantName"
+      $wake = [ordered]@{ tenant = $tenantName; lead = $leadName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null }
+      $leadRow = $daemon | Where-Object { "$($_.name)" -eq $leadName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      if (-not $leadRow) { $wake.reason = 'no running lead session (launchNeeded covers a missing one)'; $frontierWakes += [pscustomobject]$wake; continue }
+      if ("$($leadRow.status)" -ne 'idle') { $wake.reason = "lead is $($leadRow.status), not idle"; $frontierWakes += [pscustomobject]$wake; continue }
+      $leadStartedAt = ConvertTo-UtcDateTime $leadRow.startedAt
+      # Source 1: the planner's frontier, with an IC slot and a cap slot to launch into.
+      if ($wakeSources -contains 'frontier' -and $nodeExe) {
+        $activeIcs = 0; if ($liveRoster) { $activeIcs = @($liveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $tenantName }).Count }
+        $maxIcs = 0; try { $maxIcs = [int]$tenant.maxIcs } catch {}
+        if ($activeIcs -lt $maxIcs -and $liveCount -lt $cap) {
+          try {
+            $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $tenantName)
+            if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
+            $frontierRaw = & $nodeExe "$PSScriptRoot\assignment.js" @frontierArgs 2>$null | Out-String
+            $frontier = ConvertFrom-LastJsonLine $frontierRaw
+            $eligible = @(); if ($frontier -and $frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
+            if ($eligible.Count -gt 0) { $wake.evidence += "frontier #$($eligible -join ', #')" }
+          } catch {}
+        } else { $wake.reason = "no slot (ICs $activeIcs/$maxIcs, cap $liveCount/$cap)" }
+      }
+      # Source 2: PR-watcher wakes recorded since this lead session started and not yet delivered.
+      if ($wakeSources -contains 'outbox') {
+        $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
+        $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
+        $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
+        if (Test-Path $outboxPath) {
+          $kinds = @{}
+          foreach ($rawLine in (Get-Content $outboxPath -ErrorAction SilentlyContinue)) {
+            if (-not $rawLine) { continue }
+            $o = $null; try { $o = $rawLine | ConvertFrom-Json } catch { continue }
+            if (-not $o -or -not $o.at -or "$($o.recordId)" -notlike "$tenantName`:*") { continue }
+            $atUtc = ConvertTo-UtcDateTime $o.at
+            if (-not $atUtc) { continue }
+            if ($leadStartedAt -and $atUtc -le $leadStartedAt) { continue }
+            if ($consumedThrough -and $atUtc -le $consumedThrough) { continue }
+            if (@('checks-settled', 'checks-failed', 'decision-needed') -notcontains "$($o.wake)") { continue }
+            $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
+          }
+          if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
+        }
+      }
+      if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
+      # Cooldown: the same evidence within the window means the last wake did not clear it; do not loop.
+      $digest = ($wake.evidence -join '; ')
+      $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
+      if ($tenantState -and "$($tenantState.digest)" -eq $digest -and $tenantState.lastAt) {
+        $lastAt = ConvertTo-UtcDateTime $tenantState.lastAt
+        if ($lastAt -and ($now - $lastAt).TotalMinutes -lt $wakeCooldown) {
+          $wake.decision = 'cooldown'; $wake.reason = "same evidence woken at $($tenantState.lastAt); cooldown $wakeCooldown min"
+          $frontierWakes += [pscustomobject]$wake; continue
+        }
+      }
+      $wake.decision = 'wake'
+      $rotateRaw = ''; $rotateOut = $null
+      try { $rotateRaw = & "$PSScriptRoot\rotate.ps1" -Name $leadName -Wake $digest 2>&1 | Out-String; $rotateOut = ConvertFrom-LastJsonLine $rotateRaw } catch { $wake.reason = "rotate.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
+      $rotated = $false
+      if ($rotateOut -and $rotateOut.PSObject.Properties['rotated']) { $rotated = (@($rotateOut.rotated) -contains $leadName) }
+      $wake.outcome = if ($rotateOut -and $rotateOut.PSObject.Properties['outcomes']) { @($rotateOut.outcomes | Where-Object { $_.name -eq $leadName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $rotateRaw 200 }
+      if ($rotated) {
+        $wake.decision = 'woken'
+        $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = (Now-Iso) }) -Force
+        # The alert always runs: -NoToast only skips the toast; the webhook and the audit line are the record.
+        try { $wake.alert = Send-FleetAlert 'frontier-wake' 'Fleet watchdog: frontier wake' "$leadName relaunched for $digest" ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; outcome = $wake.outcome }) -NoToast:$NoToast } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+      } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
+      $frontierWakes += [pscustomobject]$wake
+    }
+    try { Write-Json $wakeStatePath $wakeState } catch {}
+  }
+
   # --- page conditions ---
   $conditions = @()
   if ($checkError) { $conditions += [pscustomobject]@{ key = 'check-failed'; detail = "sentinel-check could not run or report: $(Get-OneLine $checkError 300)" } }
@@ -369,7 +469,7 @@ try {
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
     toastDelivered = $toastDelivered; checkError = $checkError; proposed = $proposed
-    launches = $launches; notified = $notified; waiting = $waiting
+    launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; paused = [bool]$paused; verify = [bool]$Verify
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

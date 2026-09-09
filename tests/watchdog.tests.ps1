@@ -345,6 +345,95 @@ try {
   Assert-True (@(Get-AppliedLines).Count -eq $appliedBefore) 'shadow applies nothing'
   Assert-True (@($r10i.launches).Count -eq 0) 'shadow launches nothing'
 
+
+  # ===== Ticket 09 ruling 2: the frontier wake =====
+  # A mock rotate.ps1 records every -Wake call and answers like the real one; the planner
+  # runs for real against a fixture issue file (FLEET_GITHUB_ISSUES_FIXTURE).
+  foreach ($f in 'assignment.js','work-state.js','exclusions.js','notify.js','assignment-parity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
+  [IO.Directory]::CreateDirectory("$testRoot\state\work") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\state\watch") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  Write-Utf8 "$testRoot\config\cycle.json" '{"supervisor":{"pageKinds":["stray"]},"frontierWake":{"cooldownMinutes":60,"sources":["frontier","outbox"]}}'
+  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'if ($env:MOCK_ROTATE_DEFER -eq "1") { Write-Output (@{ rotated = @(); deferred = @("$Name`: session is mid-turn (status busy)"); outcomes = @(@{ name = $Name; status = "deferred"; reason = "session is mid-turn (status busy)" }) } | ConvertTo-Json -Compress -Depth 6); exit 0 }' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
+  function Get-RotateCalls { if (Test-Path "$testRoot\rotate-calls.txt") { @(Get-Content "$testRoot\rotate-calls.txt") } else { @() } }
+  function Get-AlertLines { if (Test-Path "$testRoot\state\alerts\alerts.jsonl") { @(Get-Content "$testRoot\state\alerts\alerts.jsonl" | Where-Object { $_ }) } else { @() } }
+  $wakeFixture = "$testRoot\issues-fixture.json"
+  Write-Utf8 $wakeFixture '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = $wakeFixture
+  # Live supervision is the precondition (a rollback case above removed the flag).
+  Write-Utf8 (Join-Path $testRoot 'state\flags\sentinel-off') 'wake test'
+  Remove-Item (Join-Path $testRoot 'state\heartbeats\sentinel.json') -ErrorAction SilentlyContinue
+  Remove-Item (Join-Path $testRoot 'state\watchdog\paged.json') -ErrorAction SilentlyContinue
+  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName readyLabel -NotePropertyValue 'ready-for-agent' -Force; $_ | Add-Member -NotePropertyName maxIcs -NotePropertyValue 2 -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  $leadStart = Get-EpochMs (Get-Date).AddHours(-2)
+  $idleLeadRows = '[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + $leadStart + '}]'
+  $busyLeadRows = $idleLeadRows.Replace('"status":"idle","pid":13', '"status":"busy","pid":13')
+  Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
+
+  # Case W1: idle lead + non-empty frontier + a free slot -> one wake through rotate.ps1 -Wake, one alert line.
+  Set-AgentsRows $idleLeadRows
+  $w1 = Run-Watchdog
+  $wake1 = @($w1.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake1.decision -eq 'woken') "an idle lead with a frontier must be woken (got $($wake1.decision): $($wake1.reason)) mode=$($w1.mode) why=$($w1.modeReason) wakes=$(($w1.frontierWakes | ConvertTo-Json -Compress -Depth 5)) conditions=$(@($w1.conditions) -join ',')"
+  Assert-True ((@($wake1.evidence) -join ' ') -match 'frontier #501') 'the wake evidence must name the frontier'
+  Assert-True (@(Get-RotateCalls) -contains 'pl-test|frontier #501') 'the wake must go through rotate.ps1 -Wake with the evidence'
+  $alerts1 = @(Get-AlertLines)
+  Assert-True ($alerts1.Count -eq 1 -and ($alerts1[0] | ConvertFrom-Json).kind -eq 'frontier-wake') 'every executed wake must write one alert audit line'
+  Assert-True ((Test-Path "$testRoot\state\watchdog\frontier-wake.json")) 'the wake state must be recorded'
+
+  # Case W2: same evidence again inside the cooldown -> no second wake, no second alert.
+  $w2 = Run-Watchdog
+  $wake2 = @($w2.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake2.decision -eq 'cooldown') "the same evidence inside the cooldown must not wake again (got $($wake2.decision))"
+  Assert-True (@(Get-RotateCalls).Count -eq 1) 'no second rotate call inside the cooldown'
+  Assert-True (@(Get-AlertLines).Count -eq 1) 'no second alert inside the cooldown'
+
+  # Case W3: a busy lead is never woken; the boundary belongs to rotate.ps1 and the watchdog does not even ask.
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows $busyLeadRows
+  $w3 = Run-Watchdog
+  $wake3 = @($w3.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake3.decision -eq 'none' -and $wake3.reason -match 'busy') 'a busy lead must not be woken'
+  Assert-True (@(Get-RotateCalls).Count -eq 1) 'a busy lead must not reach rotate.ps1'
+
+  # Case W4: rotate.ps1 deferring (its own boundary check) is recorded as deferred, no alert, no state.
+  Set-AgentsRows $idleLeadRows
+  $env:MOCK_ROTATE_DEFER = '1'
+  $w4 = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_DEFER
+  $wake4 = @($w4.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake4.decision -eq 'deferred') "a deferred rotation must be recorded as deferred (got $($wake4.decision))"
+  Assert-True (@(Get-AlertLines).Count -eq 1) 'a deferred wake must not alert'
+
+  # Case W5: no slot -> no wake even with a frontier.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1","role":"ic","tenant":"test","status":"active"},{"name":"ic-2","role":"ic","tenant":"test","status":"active"}]}'
+  $w5 = Run-Watchdog
+  $wake5 = @($w5.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake5.decision -eq 'none' -and $wake5.reason -match 'no slot') "without an IC slot the frontier must not wake (got $($wake5.decision): $($wake5.reason))"
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  # Case W6: an empty frontier but an undelivered outbox wake newer than the lead's session -> wake on the outbox.
+  Write-Utf8 $wakeFixture '[]'
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ('{"at":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '","recordId":"test:issue-7","wake":"checks-settled"}' + "`n" + '{"at":"' + (Get-Date).ToUniversalTime().AddHours(-5).ToString('o') + '","recordId":"test:issue-8","wake":"checks-settled"}' + "`n")
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  $w6 = Run-Watchdog
+  $wake6 = @($w6.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake6.decision -eq 'woken' -and ((@($wake6.evidence) -join ' ') -match 'outbox checks-settled x1')) "an undelivered outbox wake must wake the lead, and only the one newer than the session counts (got $($wake6.decision): $(@($wake6.evidence) -join ' '))"
+  $w6b = Run-Watchdog
+  $wake6b = @($w6b.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake6b.decision -eq 'none') 'a consumed outbox wake must not wake again'
+
+  # Case W7: state/flags/frontier-wake-off disables the wake entirely.
+  Write-Utf8 $wakeFixture '[{"number":502,"title":"Ready","url":"https://github.com/owner/repo/issues/502","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\flags\frontier-wake-off" 'x'
+  $callsBefore = @(Get-RotateCalls).Count
+  $w7 = Run-Watchdog
+  Assert-True (@($w7.frontierWakes).Count -eq 0 -and @(Get-RotateCalls).Count -eq $callsBefore) 'the flag must disable the wake'
+  Remove-Item "$testRoot\state\flags\frontier-wake-off"
+  Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath

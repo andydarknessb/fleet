@@ -16,6 +16,8 @@ param(
   [switch]$Auto,          # resume incomplete rotations, then rotate every due session
   [switch]$Resume,        # only resume incomplete rotations
   [switch]$Force,         # skip the threshold check and the rotation-off flag, and pass -Force to launch.ps1 (Cory's hand)
+  [string]$Wake,          # ticket 09 frontier wake (the watchdog): rotate -Name now for this reason; the safe
+                          # boundary, PAUSE and rotation-off all still apply, and launch.ps1 keeps its gates
   [switch]$DryRun,        # evaluate and report; no stop, no launch, no writes
   [switch]$NoReconcile    # skip the pr-watch reconcile pass (tests)
 )
@@ -191,6 +193,11 @@ try {
     if (-not ($static.sessions | Where-Object { $_.name -eq $Name })) { Write-Error "'$Name' is not a static roster session; rotation only replaces standing sessions"; exit 4 }
     if ($Force) {
       $outcomes += Start-Rotation $Name @('forced by operator')
+    } elseif ($Wake) {
+      # A wake is a rotation whose reason is "there is work and the lead is idle": the
+      # same stop-at-a-boundary, reconcile, relaunch-through-the-door path, so the
+      # replacement reconstructs from state exactly as a rotated lead does.
+      $outcomes += Start-Rotation $Name @("frontier-wake: $Wake")
     } else {
       $evaluation = Invoke-Policy evaluate
       $due = $evaluation.sessions | Where-Object { $_.name -eq $Name } | Select-Object -First 1

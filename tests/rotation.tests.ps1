@@ -202,6 +202,25 @@ console.log(JSON.stringify({ ok: true }));
   $null = Run-Rotate @('-Name', 'nobody', '-Force')
   Assert-True ($script:lastExit -eq 4) 'a name off the static roster must be refused'
 
+
+  # Ticket 09 ruling 2: -Wake rotates now for the given reason, at the boundary only, without -Force.
+  Set-LiveRoster $young; Set-AgentsRows $idleRow; Reset-Markers
+  $rw = Run-Rotate @('-Name', 'dispatcher', '-Wake', 'frontier #501', '-NoReconcile')
+  Assert-True (@($rw.rotated) -contains 'dispatcher') "a -Wake must rotate a young idle session: $lastOut"
+  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'dispatcher') 'a wake must relaunch through launch.ps1 without -Force'
+  $intentW = (Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw) | ConvertFrom-Json
+  Assert-True ((@($intentW.reasons) -join ' ') -match 'frontier-wake: frontier #501') 'the intent must carry the wake reason'
+  Set-LiveRoster $young; Set-AgentsRows $busyRow; Reset-Markers
+  $rwb = Run-Rotate @('-Name', 'dispatcher', '-Wake', 'frontier #501', '-NoReconcile')
+  Assert-True ((@($rwb.deferred) -join ' ') -match 'busy') 'a wake must defer at a busy boundary like any rotation'
+  Write-Utf8 "$testRoot\state\flags\rotation-off" 'x'
+  Set-LiveRoster $young; Set-AgentsRows $idleRow; Reset-Markers
+  $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  $rwc = Run-Rotate @('-Name', 'dispatcher', '-Wake', 'frontier #501', '-NoReconcile')
+  $ErrorActionPreference = $eap2
+  Assert-True (-not (Test-Path "$testRoot\launch-calls.log") -or (Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq '') 'rotation-off must stop a wake too'
+  Remove-Item "$testRoot\state\flags\rotation-off"
+
   Write-Output 'rotation tests passed'
 } finally {
   $env:PATH = $oldPath
