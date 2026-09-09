@@ -118,7 +118,7 @@ test('live: a failed delivery is recorded, visible, and inert until retry is aut
   let record = workState.getRecord({ root, id });
   assert.equal(record.notifications[String(sequence)].status, 'failed');
   assert.equal(record.notifications[String(sequence)].detail, 'toast api unavailable');
-  workState.notifyRecord({ root, id, phase: 'authorize-retry', expectedRevision: record.revision, decisionSequence: sequence, idempotencyKey: 'auth-1', actor: 'cory', evidence: 'toast service restarted' });
+  workState.notifyRecord({ root, id, phase: 'authorize-retry', expectedRevision: record.revision, decisionSequence: sequence, idempotencyKey: 'auth-1', actor: 'cory', evidence: 'toast service restarted', now: at() });
   const ok = sender();
   const retried = runNotifier({ root, live: true, send: ok, now: at() });
   assert.deepEqual(retried.handled.map((h) => h.outcome), ['sent']);

@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { verifyLedger, verifyRecordEvents, stateAfter } = require('../bin/verify-events');
-const { createRecord, transitionRecord, readEvents } = require('../bin/work-state');
+const { createRecord, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
 
 function rootDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-verify-')); }
 function unit(root, issue, chain = []) {
@@ -31,8 +31,20 @@ test('stateAfter reads a state change from every event shape that makes one', ()
   assert.equal(stateAfter({ type: 'shadow-projected', changes: { state: 'implementing' } }), 'implementing');
   assert.equal(stateAfter({ type: 'shadow-retired' }), 'retired');
   assert.equal(stateAfter({ type: 'assignment-retired' }), 'retired');
+  assert.equal(stateAfter({ type: 'assignment-released' }), 'released');
   assert.equal(stateAfter({ type: 'pr-observed' }), null);
   assert.equal(stateAfter({ type: 'budget-warning' }), null);
+});
+
+test('a released untouched reservation is verified separately from terminal archives', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-18', tenant: 'endzone', issue: 18, idempotencyKey: 'reserve-18', now: '2026-09-09T00:00:00.000Z' });
+  releaseRecord({ root, id: 'endzone:issue-18', expectedRevision: 1, idempotencyKey: 'release-18', now: '2026-09-09T00:01:00.000Z' });
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, true);
+  assert.equal(result.totals.released, 1);
+  assert.equal(result.totals.archived, 0);
+  assert.equal(result.totals.orphanedRecordIds, 0);
 });
 
 test('a clean ledger with active and archived records passes and reconstructs every state', () => {

@@ -6,7 +6,7 @@ const { execFileSync } = require('node:child_process');
 
 const STATES = Object.freeze([
   'assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision',
-  'hold', 'merged', 'retiring', 'retired', 'escalated',
+  'hold', 'merged', 'retiring', 'retired', 'released', 'escalated',
 ]);
 
 const TRANSITIONS = Object.freeze({
@@ -21,6 +21,7 @@ const TRANSITIONS = Object.freeze({
   retiring: ['retired', 'escalated'],
   escalated: STATES.filter((state) => state !== 'escalated'),
   retired: [],
+  released: [],
 });
 
 // Ticket 07: the events that mean "a human decision is needed". escalated is the
@@ -64,13 +65,14 @@ function paths(root) {
     lock: path.join(base, 'state', 'work', '.lock'),
     events: path.join(base, 'state', 'events'),
     archive: path.join(base, 'state', 'archive'),
+    releases: path.join(base, 'state', 'releases'),
     status: path.join(base, 'state', 'status'),
   };
 }
 
 function ensureLayout(root) {
   const p = paths(root);
-  for (const directory of [p.state, p.work, p.pending, p.events, p.archive, p.status]) {
+  for (const directory of [p.state, p.work, p.pending, p.events, p.archive, p.releases, p.status]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   if (!fs.existsSync(p.active)) writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
@@ -228,6 +230,16 @@ function archiveFile(p, recordId) {
   return path.join(p.archive, `work-${safe}.json`);
 }
 
+function releaseFile(p, recordId) {
+  const safe = String(recordId).replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return path.join(p.releases, `work-${safe}.json`);
+}
+
+function releaseHistoryFile(p, record) {
+  const safe = String(record.id).replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return path.join(p.releases, 'history', `work-${safe}-through-${record.eventSequence}.json`);
+}
+
 function isWithin(child, parent) {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -242,21 +254,68 @@ function cleanupEphemeral(p, record) {
   }
 }
 
-function archiveRecord(p, record) {
+function recordEventFiles(p, record) {
   const events = eventLines(p).filter((event) => event.recordId === record.id);
-  const eventFiles = [...new Set(events.flatMap((event) => {
+  return [...new Set(events.flatMap((event) => {
     const name = `${String(event.at).slice(0, 10)}.jsonl`;
     const online = eventFile(p, event.at);
     const archived = path.join(p.events, 'archive', name);
     return [path.relative(p.base, online), path.relative(p.base, archived)];
   }))];
+}
+
+function archiveRecord(p, record) {
   writeAtomicJson(archiveFile(p, record.id), {
     schemaVersion: 1,
     archivedAt: record.updatedAt,
     record,
-    eventFiles,
+    eventFiles: recordEventFiles(p, record),
   });
   cleanupEphemeral(p, record);
+}
+
+function storeReleasedRecord(p, record) {
+  writeAtomicJson(releaseFile(p, record.id), {
+    schemaVersion: 1,
+    releasedAt: record.updatedAt,
+    record,
+    eventFiles: recordEventFiles(p, record),
+  });
+  cleanupEphemeral(p, record);
+}
+
+function preserveReusableSnapshot(p, reusable) {
+  if (!reusable) return;
+  const source = reusable.kind === 'legacy-archive' ? archiveFile(p, reusable.record.id) : releaseFile(p, reusable.record.id);
+  const destination = releaseHistoryFile(p, reusable.record);
+  if (!fs.existsSync(source)) {
+    if (fs.existsSync(destination)) return;
+    throw new WorkStateError('RELEASE_SNAPSHOT_MISSING', `reusable release snapshot for '${reusable.record.id}' disappeared`);
+  }
+  if (fs.existsSync(destination)) throw new WorkStateError('RELEASE_HISTORY_EXISTS', `release history already exists for '${reusable.record.id}' sequence ${reusable.record.eventSequence}`);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.renameSync(source, destination);
+}
+
+function untouchedReservation(record, events, { legacy = false } = {}) {
+  if (!record || !['released', ...(legacy ? ['retired'] : [])].includes(record.state)) return false;
+  if (legacy && Number(record.eventSequence) > 2) return false;
+  if (Number(record.budget?.cumulativeTokens || 0) !== 0 || record.budget?.extension) return false;
+  if (record.github?.prNumber || record.github?.prUrl || record.github?.headSha) return false;
+  if (record.review?.progress && record.review.progress !== 'not-started') return false;
+  const lineage = events.filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
+  if (lineage.length !== Number(record.eventSequence) || lineage.length < 2) return false;
+  if (lineage.some((event) => !['assignment-reserved', 'assignment-released'].includes(event.type))) return false;
+  return lineage[lineage.length - 1].type === 'assignment-released';
+}
+
+function reusableReleasedRecord(p, recordId) {
+  const events = eventLines(p);
+  const released = readJson(releaseFile(p, recordId));
+  if (released?.record && untouchedReservation(released.record, events)) return { kind: 'release', record: released.record };
+  const archived = readJson(archiveFile(p, recordId));
+  if (archived?.record && untouchedReservation(archived.record, events, { legacy: true })) return { kind: 'legacy-archive', record: archived.record };
+  return null;
 }
 
 function recoverPendingUnlocked(p) {
@@ -274,14 +333,16 @@ function recoverPendingUnlocked(p) {
     else if (!existing || existing.revision < journal.afterRecord.revision) active.records[journal.recordId] = journal.afterRecord;
     saveActive(p, active);
     appendEvent(p, journal.event);
+    if (journal.supersedeReusable) preserveReusableSnapshot(p, journal.supersedeReusable);
+    if (journal.releasedRecord) storeReleasedRecord(p, journal.releasedRecord);
     if (journal.archiveRecord) archiveRecord(p, journal.archiveRecord);
     fs.rmSync(journalPath, { force: true });
   }
 }
 
-function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive = null, killPoint }) {
+function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive = null, releasedRecord = null, supersedeReusable = null, killPoint }) {
   const journalPath = pendingFile(p, recordId, event.idempotencyKey);
-  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive });
+  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, supersedeReusable });
   if (killPoint === 'after-journal') throw new WorkStateError('KILL_POINT', 'stopped after journal write');
   const active = activeState(p);
   if (afterRecord === null) delete active.records[recordId];
@@ -290,9 +351,11 @@ function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archive
   if (killPoint === 'after-record') throw new WorkStateError('KILL_POINT', 'stopped after record replacement');
   appendEvent(p, event);
   if (killPoint === 'after-event') throw new WorkStateError('KILL_POINT', 'stopped after event append');
+  if (supersedeReusable) preserveReusableSnapshot(p, supersedeReusable);
+  if (releasedRecord) storeReleasedRecord(p, releasedRecord);
   if (recordToArchive) archiveRecord(p, recordToArchive);
   fs.rmSync(journalPath, { force: true });
-  return afterRecord || recordToArchive;
+  return afterRecord || releasedRecord || recordToArchive;
 }
 
 function requireIdempotency(value) {
@@ -384,6 +447,21 @@ function proofMatches(expected, supplied) {
     && !(supplied.conflicts || []).length;
 }
 
+function reservationBaseline(options = {}) {
+  const root = asRoot(options.root);
+  return withLock(root, (p) => {
+    const id = String(options.id);
+    const active = activeState(p);
+    if (active.records[id]) throw new WorkStateError('RECORD_EXISTS', `record '${id}' already exists`);
+    const reusable = reusableReleasedRecord(p, id);
+    if (fs.existsSync(archiveFile(p, id)) && !reusable) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is terminally archived and cannot be reused`);
+    if (fs.existsSync(releaseFile(p, id)) && !reusable) throw new WorkStateError('RELEASE_NOT_REUSABLE', `released record '${id}' does not prove an untouched reservation`);
+    return reusable
+      ? { revision: reusable.record.revision + 1, eventSequence: reusable.record.eventSequence + 1, reused: true }
+      : { revision: 1, eventSequence: 1, reused: false };
+  });
+}
+
 function reserveRecord(options = {}) {
   const root = asRoot(options.root);
   const key = requireIdempotency(options.idempotencyKey || `reserve-${options.id || ''}`);
@@ -396,7 +474,9 @@ function reserveRecord(options = {}) {
       if (replay) return replay;
       throw new WorkStateError('RECORD_EXISTS', `record '${id}' already exists`);
     }
-    if (fs.existsSync(archiveFile(p, id))) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is archived and cannot be reused`);
+    const reusable = reusableReleasedRecord(p, id);
+    if (fs.existsSync(archiveFile(p, id)) && !reusable) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is terminally archived and cannot be reused`);
+    if (fs.existsSync(releaseFile(p, id)) && !reusable) throw new WorkStateError('RELEASE_NOT_REUSABLE', `released record '${id}' does not prove an untouched reservation`);
     const activeAssignments = Object.values(active.records).filter((record) => record.manifestPath && record.state !== 'retired');
     const expectedProof = {
       independent: true,
@@ -413,14 +493,19 @@ function reserveRecord(options = {}) {
     }
     const now = isoNow(options.now);
     const record = baseRecord({ ...options, state: 'assigned', now });
-    record.idempotency[key] = { revision: 1, eventSequence: 1, type: 'assignment-reserved' };
+    if (reusable) {
+      record.revision = reusable.record.revision + 1;
+      record.eventSequence = reusable.record.eventSequence + 1;
+      record.createdAt = reusable.record.createdAt;
+    }
+    record.idempotency[key] = { revision: record.revision, eventSequence: record.eventSequence, type: 'assignment-reserved' };
     const event = eventFor(record, {
       type: 'assignment-reserved', actor: options.actor || 'assignment-planner', at: now,
       idempotencyKey: key, evidence: options.evidence,
       changes: { state: 'assigned', reservations: record.reservations, prNumber: record.github?.prNumber || null },
     });
-    commitMutation(p, { recordId: id, beforeRecord: null, afterRecord: record, event, killPoint: options.killPoint });
-    return { replayed: false, revision: 1, eventSequence: 1, record };
+    commitMutation(p, { recordId: id, beforeRecord: null, afterRecord: record, event, supersedeReusable: reusable, killPoint: options.killPoint });
+    return { replayed: false, revision: record.revision, eventSequence: record.eventSequence, record };
   });
 }
 
@@ -435,14 +520,21 @@ function releaseRecord(options = {}) {
     if (replay) return replay;
     if (record.state !== 'assigned') throw new WorkStateError('INVALID_RELEASE', `only assigned records can release reservations (was ${record.state})`);
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    const events = eventLines(p);
+    const currentAttemptIsUntouched = Number(record.budget?.cumulativeTokens || 0) === 0
+      && !record.budget?.extension
+      && !record.github?.prNumber && !record.github?.prUrl && !record.github?.headSha
+      && (!record.review?.progress || record.review.progress === 'not-started')
+      && events.filter((event) => event.recordId === record.id).every((event) => ['assignment-reserved', 'assignment-released'].includes(event.type));
+    if (!currentAttemptIsUntouched) throw new WorkStateError('INVALID_RELEASE', `record '${record.id}' does not prove an untouched reservation`);
     const now = isoNow(options.now);
-    const next = { ...record, state: 'retired', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
+    const next = { ...record, state: 'released', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
     next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'assignment-released' };
     const event = eventFor(next, {
       type: 'assignment-released', actor: options.actor || 'assignment-planner', at: now,
-      idempotencyKey: key, evidence: options.evidence, changes: { from: 'assigned', to: 'retired' },
+      idempotencyKey: key, evidence: options.evidence, changes: { from: 'assigned', to: 'released' },
     });
-    const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, archiveRecord: next, event, killPoint: options.killPoint });
+    const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, releasedRecord: next, event, killPoint: options.killPoint });
     return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
   });
 }
@@ -459,6 +551,7 @@ function createRecord(options = {}) {
       throw new WorkStateError('RECORD_EXISTS', `record '${options.id}' already exists`);
     }
     if (fs.existsSync(archiveFile(p, options.id))) throw new WorkStateError('RECORD_ARCHIVED', `record '${options.id}' is archived and cannot be reused`);
+    if (fs.existsSync(releaseFile(p, options.id))) throw new WorkStateError('RECORD_RELEASED', `record '${options.id}' was released; only reserve can reuse it`);
     const now = isoNow(options.now);
     const record = baseRecord({ ...options, now });
     record.idempotency[key] = { revision: 1, eventSequence: 1, type: options.shadow ? 'shadow-projected' : 'work-created' };
@@ -832,6 +925,8 @@ function getRecord(options = {}) {
     if (active.records[id]) return active.records[id];
     const archived = readJson(archiveFile(p, id));
     if (archived) return archived.record;
+    const released = readJson(releaseFile(p, id));
+    if (released) return released.record;
     throw new WorkStateError('NOT_FOUND', `record '${id}' was not found`);
   });
 }
@@ -846,6 +941,12 @@ function projectStatus(options = {}) {
       for (const file of fs.readdirSync(p.archive).filter((name) => name.endsWith('.json'))) {
         const archived = readJson(path.join(p.archive, file));
         if (archived?.record) tenantsByRecord.set(archived.record.id, archived.record.tenant);
+      }
+    }
+    if (fs.existsSync(p.releases)) {
+      for (const file of fs.readdirSync(p.releases).filter((name) => name.endsWith('.json'))) {
+        const released = readJson(path.join(p.releases, file));
+        if (released?.record) tenantsByRecord.set(released.record.id, released.record.tenant);
       }
     }
     const records = Object.values(active.records)
@@ -1058,6 +1159,7 @@ module.exports = {
   recordBudget,
   recordReview,
   releaseRecord,
+  reservationBaseline,
   reservationConflicts,
   reserveRecord,
   shadowProject,

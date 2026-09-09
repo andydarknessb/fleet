@@ -111,9 +111,18 @@ test('changed criteria invalidate the manifest and release reservations', () => 
   const invalid = validateManifest({ manifest: JSON.parse(fs.readFileSync(result.manifestPath, 'utf8')), issue: issue(43, { body: 'changed criteria' }), base: { sha: 'b'.repeat(40) } });
   assert.equal(invalid.valid, false);
   const released = invalidateManifest({ root, manifest: JSON.parse(fs.readFileSync(result.manifestPath, 'utf8')), currentRevision: 1, reason: invalid.mismatches, now: '2026-09-01T00:01:00.000Z' });
-  assert.equal(released.released.record.state, 'retired');
+  assert.equal(released.released.record.state, 'released');
   assert.equal(fs.existsSync(released.invalidationPath), true);
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: 'endzone:issue-43', dryRun: true }), (error) => error.code === 'MANIFEST_INVALIDATED');
+
+  const retry = reserveAssignment({
+    root, issue: issue(43), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'b'.repeat(40) }, now: '2026-09-01T00:02:00.000Z',
+  });
+  assert.equal(retry.manifest.workRecordRevision, 3);
+  assert.match(retry.manifest.id, /-r3$/);
+  assert.equal(retry.reservation.revision, 3);
+  assert.equal(getRecord({ root, id: 'endzone:issue-43' }).state, 'assigned');
 });
 
 test('base resolution fetches the remote ref before reading its SHA', () => {

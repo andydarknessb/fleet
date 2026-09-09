@@ -148,7 +148,9 @@ _Avoid_: dynamic workflow, workflow (unqualified)
 The active fleet-owned coordination state for one unit of work: its current
 state in the Fleet cycle, owning session, reservations, review progress, token
 budget and pending decisions. GitHub remains authoritative for the issue and
-pull request; the Work record is archived after IC retirement.
+pull request. A Work record is terminally archived after IC retirement; an
+assignment returned before implementation is stored as a reusable release and
+the next reservation continues its revision and event sequence.
 _Avoid_: status file, task record, issue record
 
 **Fleet event**:

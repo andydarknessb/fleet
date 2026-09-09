@@ -169,7 +169,8 @@ try {
   Assert-True (Test-Path "$($r8.manifestPath).invalidated.json") 'rollback must invalidate the released manifest'
   $activeAfter = (Get-Content "$testRoot\state\work\active.json" -Raw) | ConvertFrom-Json
   Assert-True ($null -eq $activeAfter.records.PSObject.Properties['test:issue-101']) 'the released record must leave active state'
-  Assert-True (Test-Path "$testRoot\state\archive\work-test_issue-101.json") 'the released record must be archived'
+  Assert-True (Test-Path "$testRoot\state\releases\work-test_issue-101.json") 'the unused reservation must be stored as released, not terminally archived'
+  Assert-True (-not (Test-Path "$testRoot\state\archive\work-test_issue-101.json")) 'an unused reservation must not consume the terminal archive key'
   $eventLines = @(Get-EventLines)
   Assert-True ($eventLines.Count -eq ($eventsAfterReserve + 1) -and $eventLines[-1] -match '"type":"assignment-released"') 'rollback must append exactly one assignment-released event'
   Assert-True ($eventLines[0] -match 'work-created' -and (Get-Hash $eventsFile) -eq $eventsHash) 'rollback must not rewrite earlier ledger lines'

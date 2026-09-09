@@ -12,6 +12,8 @@ const {
   notifyRecord,
   projectStatus,
   readEvents,
+  releaseRecord,
+  reservationBaseline,
   reserveRecord,
   shadowProject,
   transitionRecord,
@@ -106,6 +108,83 @@ test('idempotency replay returns the original revision and event', () => {
   assert.equal(movedAgain.eventSequence, moved.eventSequence);
   const events = fs.readFileSync(path.join(root, 'state', 'events', '2026-09-01.jsonl'), 'utf8').trim().split(/\r?\n/);
   assert.equal(events.length, 2);
+});
+
+test('an untouched assignment release is reusable and continues the record lineage', () => {
+  const root = rootDir();
+  const options = {
+    root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43,
+    manifestPath: path.join(root, 'state', 'manifests', 'assignment-43.json'),
+    github: { issueNumber: 43, bodyHash: 'a'.repeat(64) },
+    reservations: { components: ['docs/adr'] },
+    idempotencyKey: 'reserve-43-a', now: '2026-09-01T00:00:00.000Z',
+  };
+  const first = reserveRecord(options);
+  const released = releaseRecord({ root, id: options.id, expectedRevision: first.revision, idempotencyKey: 'release-43-a', now: '2026-09-01T00:00:01.000Z' });
+  assert.equal(released.record.state, 'released');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-43.json')), false);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-43.json')), true);
+  assert.deepEqual(reservationBaseline({ root, id: options.id }), { revision: 3, eventSequence: 3, reused: true });
+
+  const second = reserveRecord({ ...options, manifestPath: path.join(root, 'state', 'manifests', 'assignment-43-r3.json'), idempotencyKey: 'reserve-43-b', now: '2026-09-01T00:00:02.000Z' });
+  assert.equal(second.revision, 3);
+  assert.equal(second.eventSequence, 3);
+  assert.equal(second.record.state, 'assigned');
+  assert.equal(second.record.createdAt, first.record.createdAt);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-43.json')), false);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'history', 'work-endzone_issue-43-through-2.json')), true);
+  assert.deepEqual(readEvents(root).filter((event) => event.recordId === options.id).map((event) => event.sequence), [1, 2, 3]);
+});
+
+test('pending journals recover release storage and reusable-snapshot supersession', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-46';
+  reserveRecord({ root, id, tenant: 'endzone', issue: 46, idempotencyKey: 'reserve-46-a', now: '2026-09-01T00:00:00.000Z' });
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: 1, idempotencyKey: 'release-46-a', now: '2026-09-01T00:00:01.000Z', killPoint: 'after-event' }),
+    (error) => error.code === 'KILL_POINT',
+  );
+  assert.equal(getRecord({ root, id }).state, 'released');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-46.json')), true);
+
+  assert.throws(
+    () => reserveRecord({ root, id, tenant: 'endzone', issue: 46, idempotencyKey: 'reserve-46-b', now: '2026-09-01T00:00:02.000Z', killPoint: 'after-event' }),
+    (error) => error.code === 'KILL_POINT',
+  );
+  const recovered = getRecord({ root, id });
+  assert.equal(recovered.state, 'assigned');
+  assert.equal(recovered.revision, 3);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-46.json')), false);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'history', 'work-endzone_issue-46-through-2.json')), true);
+});
+
+test('a legacy sequence-two archive is recoverable only when it proves no work ran', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-45';
+  reserveRecord({ root, id, tenant: 'endzone', issue: 45, idempotencyKey: 'reserve-45-a', now: '2026-09-01T00:00:00.000Z' });
+  releaseRecord({ root, id, expectedRevision: 1, idempotencyKey: 'release-45-a', now: '2026-09-01T00:00:01.000Z' });
+  const releasedPath = path.join(root, 'state', 'releases', 'work-endzone_issue-45.json');
+  const archivePath = path.join(root, 'state', 'archive', 'work-endzone_issue-45.json');
+  const legacy = JSON.parse(fs.readFileSync(releasedPath, 'utf8'));
+  legacy.record.state = 'retired';
+  legacy.archivedAt = legacy.releasedAt;
+  delete legacy.releasedAt;
+  fs.writeFileSync(archivePath, `${JSON.stringify(legacy, null, 2)}\n`);
+  fs.rmSync(releasedPath);
+
+  const recovered = reserveRecord({ root, id, tenant: 'endzone', issue: 45, idempotencyKey: 'reserve-45-b', now: '2026-09-01T00:00:02.000Z' });
+  assert.equal(recovered.revision, 3);
+  assert.equal(fs.existsSync(archivePath), false);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'history', 'work-endzone_issue-45-through-2.json')), true);
+});
+
+test('release refuses an assigned record that is not an untouched assignment reservation', () => {
+  const root = rootDir();
+  createRecord({ root, id: 'endzone:issue-44', tenant: 'endzone', issue: 44, state: 'assigned', idempotencyKey: 'create-44', now: '2026-09-01T00:00:00.000Z' });
+  assert.throws(
+    () => releaseRecord({ root, id: 'endzone:issue-44', expectedRevision: 1, idempotencyKey: 'release-44' }),
+    (error) => error.code === 'INVALID_RELEASE' && /untouched reservation/.test(error.message),
+  );
 });
 
 test('twenty compare-and-swap attempts yield one winner and nineteen conflicts', () => {

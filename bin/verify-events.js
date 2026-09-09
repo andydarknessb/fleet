@@ -32,7 +32,8 @@ function stateAfter(event) {
   if (type.startsWith('state-')) return type.slice('state-'.length);
   if (['assignment-reserved'].includes(type)) return event.changes?.state || 'assigned';
   if (['work-created', 'shadow-projected'].includes(type)) return event.changes?.state || null;
-  if (['assignment-released', 'assignment-retired', 'shadow-retired'].includes(type)) return TERMINAL;
+  if (type === 'assignment-released') return 'released';
+  if (['assignment-retired', 'shadow-retired'].includes(type)) return TERMINAL;
   if (type === 'shadow-retiring') return 'retiring';
   return null;
 }
@@ -89,6 +90,15 @@ function verifyLedger({ root, now, sample } = {}) {
       archived.push({ file: path.join(archiveDir, name), ...read.value });
     }
   }
+  const releaseDir = path.join(base, 'state', 'releases');
+  const released = [];
+  if (fs.existsSync(releaseDir)) {
+    for (const name of fs.readdirSync(releaseDir).filter((entry) => /^work-.*\.json$/.test(entry))) {
+      const read = readJsonStrict(path.join(releaseDir, name));
+      if (read.error) { globalFindings.push({ kind: 'release-entry-unreadable', file: name, detail: read.error }); continue; }
+      released.push({ file: path.join(releaseDir, name), ...read.value });
+    }
+  }
   const records = [];
   for (const record of Object.values(active)) {
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
@@ -109,9 +119,22 @@ function verifyLedger({ root, now, sample } = {}) {
     if (record.state !== TERMINAL) result.findings.push({ kind: 'archived-not-retired', state: record.state });
     records.push(result);
   }
+  for (const entry of released) {
+    const record = entry.record || {};
+    const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
+    result.where = 'release';
+    const listed = Array.isArray(entry.eventFiles) ? entry.eventFiles : [];
+    if (listed.length === 0) result.findings.push({ kind: 'evidence-index-empty' });
+    const present = listed.map((relative) => path.join(base, relative)).filter((file) => fs.existsSync(file));
+    if (present.length === 0 && listed.length > 0) result.findings.push({ kind: 'evidence-files-missing', listed });
+    const holds = present.some((file) => fs.readFileSync(file, 'utf8').includes(`"recordId":"${record.id}"`));
+    if (present.length > 0 && !holds) result.findings.push({ kind: 'evidence-files-do-not-hold-record', files: present.map((f) => path.relative(base, f)) });
+    if (record.state !== 'released') result.findings.push({ kind: 'release-not-released', state: record.state });
+    records.push(result);
+  }
   // Events for a record that is neither active nor archived mean state was lost: that is
   // exactly the corruption archival must not compound, so an orphan fails the verdict.
-  const orphaned = [...byRecord.keys()].filter((id) => !active[id] && !archived.some((entry) => entry.record?.id === id));
+  const orphaned = [...byRecord.keys()].filter((id) => !active[id] && !archived.some((entry) => entry.record?.id === id) && !released.some((entry) => entry.record?.id === id));
   // --sample N checks only the N most recently touched records (a spot check); the
   // verdict then speaks for that sample and says so in totals.sampled.
   const checked = Number.isInteger(sample) && sample > 0 ? records.slice(-sample) : records;
@@ -120,7 +143,7 @@ function verifyLedger({ root, now, sample } = {}) {
   const result = {
     at,
     pass: allFindings.length === 0,
-    totals: { events: events.length, records: records.length, active: Object.keys(active).length, archived: archived.length, orphanedRecordIds: orphaned.length, sampled: checked.length },
+    totals: { events: events.length, records: records.length, active: Object.keys(active).length, archived: archived.length, released: released.length, orphanedRecordIds: orphaned.length, sampled: checked.length },
     findingsByKind: allFindings.reduce((acc, f) => { acc[f.kind] = (acc[f.kind] || 0) + 1; return acc; }, {}),
     globalFindings,
     orphanedRecordIds: orphaned,
@@ -139,7 +162,7 @@ if (require.main === module) {
     if (args.json === 'true') process.stdout.write(`${JSON.stringify(result)}\n`);
     else {
       process.stdout.write(`EVENT VERIFICATION: ${result.pass ? 'PASS' : 'FAIL'}\n`);
-      process.stdout.write(`events ${result.totals.events}, records ${result.totals.records} (active ${result.totals.active}, archived ${result.totals.archived}), orphaned record ids ${result.totals.orphanedRecordIds}\n`);
+      process.stdout.write(`events ${result.totals.events}, records ${result.totals.records} (active ${result.totals.active}, archived ${result.totals.archived}, released ${result.totals.released}), orphaned record ids ${result.totals.orphanedRecordIds}\n`);
       if (!result.pass) {
         process.stdout.write(`findings: ${Object.entries(result.findingsByKind).map(([k, n]) => `${k}=${n}`).join(', ')}\n`);
         for (const record of result.records.slice(0, 40)) process.stdout.write(`  ${record.recordId} (${record.where}): ${record.findings.map((f) => f.kind).join(', ')}\n`);

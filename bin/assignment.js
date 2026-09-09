@@ -10,6 +10,7 @@ const {
   getRecord,
   proofMatches,
   releaseRecord,
+  reservationBaseline,
   reservationConflicts: workReservationConflicts,
   reserveRecord,
   transitionRecord,
@@ -231,11 +232,12 @@ function icModel(model) {
   return value;
 }
 
-function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, now, workRecordId } = {}) {
+function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, now, workRecordId, workRecordRevision = 1 } = {}) {
   model = icModel(model);
   const normalized = normalizeIssue(issue);
   const createdAt = now || new Date().toISOString();
-  const id = `assignment-${tenant}-issue-${normalized.number}-${normalized.bodyHash.slice(0, 12)}`;
+  const retrySuffix = workRecordRevision > 1 ? `-r${workRecordRevision}` : '';
+  const id = `assignment-${tenant}-issue-${normalized.number}-${normalized.bodyHash.slice(0, 12)}${retrySuffix}`;
   const branch = `${tenantConfig.branchPrefix || 'fleet/'}${normalized.number}-${slug(normalized.title)}`;
   return {
     schemaVersion: 1,
@@ -243,7 +245,7 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
     status: 'pending-ack',
     createdAt,
     workRecordId: workRecordId || `${tenant}:issue-${normalized.number}`,
-    workRecordRevision: 1,
+    workRecordRevision,
     readyLabel: readyLabel || tenantConfig.readyLabel || null,
     issue: { number: normalized.number, url: normalized.url || null, bodyHash: normalized.bodyHash },
     base: { remote: base.remote, ref: base.ref, sha: base.sha },
@@ -268,10 +270,11 @@ function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = []
   const normalized = frontier.eligible[0];
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
   const workRecordId = `${tenant}:issue-${normalized.number}`;
+  const baseline = reservationBaseline({ root, id: workRecordId });
   const activeAssignments = activeRecords(active).filter((record) => record.manifestPath && record.state !== 'retired');
   const expectedProof = independenceProof([...activeAssignments, normalized]);
   if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, proof))) throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires a verified independent machine-readable proof');
-  const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, workRecordId });
+  const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, workRecordId, workRecordRevision: baseline.revision });
   const manifestPath = writeManifest(root, manifest);
   try {
     const reserved = reserveRecord({
@@ -280,6 +283,7 @@ function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = []
       evidence: { github: `gh issue view ${normalized.number}`, manifest: path.relative(path.resolve(root), manifestPath) },
       idempotencyKey: `assignment-reserved:${manifest.id}`, actor, now,
     });
+    if (reserved.revision !== manifest.workRecordRevision) throw new WorkStateError('RESERVATION_BASELINE_CHANGED', `manifest expected Work record revision ${manifest.workRecordRevision}, reserved ${reserved.revision}`);
     return { frontier, manifest, manifestPath, reservation: reserved };
   } catch (error) {
     fs.rmSync(manifestPath, { force: true });
