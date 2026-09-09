@@ -100,7 +100,13 @@ function Invalidate-Manifest {
 }
 
 if ($Manifest -and -not $DryRun) {
-  $issueRaw = (& gh issue view $Issue -R $t.github --json state,body 2>&1 | Out-String)
+  $previousOutputEncoding = [Console]::OutputEncoding
+  try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $issueRaw = (& gh issue view $Issue -R $t.github --json state,body 2>&1 | Out-String)
+  } finally {
+    [Console]::OutputEncoding = $previousOutputEncoding
+  }
   if ($LASTEXITCODE -ne 0) { Write-Error "could not reconcile issue #$Issue before launch"; exit 4 }
   try { $currentIssue = $issueRaw | ConvertFrom-Json } catch { Write-Error "GitHub issue reconciliation returned invalid JSON"; exit 4 }
   if ([string]$currentIssue.state -ne 'OPEN') { Invalidate-Manifest "issue #$Issue is no longer open"; Write-Error "issue #$Issue is no longer open"; exit 4 }
