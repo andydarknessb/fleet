@@ -266,6 +266,12 @@ test('the watcher has no issue-close path of any kind', () => {
 test('a merged PR fast-forwards to merged and the final observation matches the merged reality', () => {
   const root = rootDir();
   seed(root);
+  // Ticket 09: a merge on a record with no formal review recorded carries a decision-needed
+  // wake (the ticket-05 lower bound). This case is the reviewed path, so record one first.
+  const activePath = path.join(root, 'state', 'work', 'active.json');
+  const active = JSON.parse(fs.readFileSync(activePath, 'utf8'));
+  active.records['endzone:issue-42'].review = { ...(active.records['endzone:issue-42'].review || {}), formal: { headSha: 'abc', artifact: 'state/reviews/x.json' } };
+  fs.writeFileSync(activePath, JSON.stringify(active));
   watch(root, fetchers({ open: [], viewResult: view({ state: 'MERGED', mergedAt: '2026-09-01T01:00:00Z' }) }));
   const rec = record(root);
   assert.equal(rec.state, 'merged');
@@ -399,4 +405,53 @@ test('the end-of-run shadow projection archives a record only after its merge wa
   assert.ok(evs.indexOf('state-pr-open') >= 0, 'the advance must be recorded');
   assert.ok(evs.indexOf('shadow-retired') >= 0, 'the roster-dropped record is archived');
   assert.ok(evs.indexOf('state-pr-open') < evs.indexOf('shadow-retired'), 'the advance must precede the archive');
+});
+
+// Ticket 09: the ticket-05 lower bound (no merge without a recorded formal review) cannot
+// be blocked by a script, but an observed merge on a record with no formal review carries
+// a decision-needed wake so it pages once instead of passing silently.
+test('an observed merge without a recorded formal review carries a decision-needed wake; with one it is silent', () => {
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-60', issue: 60, state: 'review', prNumber: 160 });
+  const record = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-60'];
+  const merged = view({ number: 160, state: 'MERGED', mergedAt: '2026-09-09T00:00:00.000Z', isDraft: false });
+  const policy = { ciGates: [], watchedChecks: [], ignoredChecks: [] };
+  const unreviewed = planRecord({ record, openPr: null, viewPr: merged, policy, branchPrefix: 'fleet/', repo: 'owner/repo' });
+  const last = unreviewed.actions[unreviewed.actions.length - 1];
+  assert.equal(last.to, 'merged');
+  assert.equal(last.wake, 'decision-needed');
+  assert.match(last.evidence, /without a recorded formal review/);
+  assert.ok(unreviewed.actions.slice(0, -1).every((a) => a.wake === null), 'only the merged hop wakes');
+  const withFormal = { ...record, review: { ...record.review, formal: { headSha: 'abc', artifact: 'state/reviews/x.json' } } };
+  const reviewed = planRecord({ record: withFormal, openPr: null, viewPr: merged, policy, branchPrefix: 'fleet/', repo: 'owner/repo' });
+  assert.equal(reviewed.actions[reviewed.actions.length - 1].wake, null);
+  assert.doesNotMatch(reviewed.actions[reviewed.actions.length - 1].evidence, /without a recorded formal review/);
+  // Its rollback flag: the merge completes silently.
+  const off = planRecord({ record, openPr: null, viewPr: merged, policy, branchPrefix: 'fleet/', repo: 'owner/repo', formalReviewWake: false });
+  assert.equal(off.actions[off.actions.length - 1].wake, null);
+  const flagged = rootDir();
+  seed(flagged, { id: 'endzone:issue-62', issue: 62, state: 'review', prNumber: 162 });
+  fs.mkdirSync(path.join(flagged, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(flagged, 'state', 'flags', 'merge-review-wake-off'), 'x');
+  watch(flagged, fetchers({ open: [], viewResult: view({ number: 162, state: 'MERGED', mergedAt: '2026-09-09T00:00:00Z', isDraft: false }) }));
+  assert.equal(workState.getRecord({ root: flagged, id: 'endzone:issue-62' }).state, 'merged');
+  assert.equal(outbox(flagged).length, 0, 'under the flag no wake is written');
+});
+
+test('state/flags/pr-watch-off makes the tick skip without touching state', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-61', issue: 61, state: 'ci-wait', prNumber: 161 });
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', branchPrefix: 'fleet/', ciGates: [] }));
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'pr-watch-off'), 'x');
+  const before = fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8');
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'pr-watch.js'), '--root', root, '--tenant', 'endzone', '--gh', 'no-such-gh-binary'], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  const out = JSON.parse(run.stdout.trim().split('\n').pop());
+  assert.equal(out.skipped, true);
+  assert.match(out.reason, /pr-watch-off/);
+  assert.equal(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'), before, 'nothing moved');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'watch', 'health.json')), false, 'no tick ran');
 });

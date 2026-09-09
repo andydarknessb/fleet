@@ -503,3 +503,37 @@ test('a crash between the hold transition and the page is repaired by the retry'
   assert.equal(retry.paged, true, 'the retry notices the missing page and delivers it');
   assert.equal(fs.readFileSync(outbox, 'utf8').trim().split('\n').length, 1);
 });
+
+// Ticket 09: review deduplication has its own rollback flag.
+test('state/flags/review-dedup-off records a second formal review at the same head instead of refusing it', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [],
+    idempotencyKey: 'formal-a', now: '2026-09-09T02:00:00.000Z',
+  });
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'review-dedup-off'), 'x');
+  // No explicit key and no prior link: exactly what a legacy second pass looks like.
+  const second = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+    kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [],
+    now: '2026-09-09T02:01:00.000Z',
+  });
+  assert.equal(second.result.replayed, false, 'the flag must beat the default replay key');
+  assert.notEqual(second.artifact, first.artifact, 'the duplicate is written, not refused');
+  fs.rmSync(path.join(root, 'state', 'flags', 'review-dedup-off'));
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
+      kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [],
+      idempotencyKey: 'formal-c', now: '2026-09-09T02:02:00.000Z', priorArtifact: second.artifact,
+    }),
+    (error) => error instanceof ReviewPolicyError && error.code === 'ALREADY_REVIEWED',
+    'the flag removed, deduplication is back',
+  );
+});

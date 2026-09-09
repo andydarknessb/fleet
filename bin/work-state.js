@@ -176,9 +176,29 @@ function eventLines(p) {
   return events;
 }
 
+// Ticket 09: archival runs only after the ledger has been verified whole (bin/verify-events.js
+// writes state/verify/last.json). No verdict, a failing verdict, or a verdict older than
+// the newest event file all mean "leave the online ledger alone": moving a file the
+// verifier has not blessed is how a gap becomes permanent.
+function archivalPermitted(p, now) {
+  let verdict;
+  try { verdict = JSON.parse(fs.readFileSync(path.join(p.state, 'verify', 'last.json'), 'utf8')); } catch { return false; }
+  if (!verdict || verdict.pass !== true) return false;
+  const verdictMs = Date.parse(verdict.at);
+  if (Number.isNaN(verdictMs)) return false;
+  // The verdict must post-date the newest WRITE to the online ledger, not the newest
+  // file's date: a verdict at 00:05 must not bless a whole day of later events.
+  let newestWriteMs = 0;
+  for (const name of fs.readdirSync(p.events).filter((entry) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry))) {
+    try { newestWriteMs = Math.max(newestWriteMs, fs.statSync(path.join(p.events, name)).mtimeMs); } catch { return false; }
+  }
+  return verdictMs >= newestWriteMs;
+}
+
 function archiveExpiredEvents(p, now) {
   const cutoff = new Date(isoNow(now)).getTime() - 30 * 24 * 60 * 60 * 1000;
   const archiveDir = path.join(p.events, 'archive');
+  if (!archivalPermitted(p, now)) return;
   for (const file of fs.readdirSync(p.events).filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))) {
     const date = new Date(`${file.slice(0, 10)}T23:59:59.999Z`).getTime();
     if (date >= cutoff) continue;
@@ -681,6 +701,62 @@ function readTenantConfigs(root) {
   return configs;
 }
 
+// Ticket 09: the budget door. Two phases, each one event: `warn` records the measured
+// cumulative job tokens at the moment the warning threshold was crossed (once per record;
+// bin/budget.js decides when), and `extend` records an approved extension (amount,
+// grantor, reason). Nothing is written between crossings: the live per-record figure is a
+// projection (state/budget/last.json), so a 5-minute measurement cadence does not bloat
+// the ledger. The escalation itself goes through transitionRecord like any other.
+function recordBudget(options = {}) {
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey);
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const record = active.records[String(options.id)];
+    if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const replay = replayIfKnown(record, key);
+    if (replay) return replay;
+    if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
+    if (Number(options.expectedRevision) !== record.revision) {
+      throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    }
+    const phase = String(options.phase || '');
+    const tokens = Number(options.tokens);
+    const now = isoNow(options.now);
+    const budget = { ...(record.budget || { cumulativeTokens: 0, extension: null }) };
+    let type;
+    let changes;
+    if (phase === 'warn') {
+      if (!Number.isFinite(tokens) || tokens < 0) throw new WorkStateError('INVALID_BUDGET', 'a warning needs the measured token count');
+      budget.cumulativeTokens = tokens;
+      budget.warnedAt = now;
+      type = 'budget-warning';
+      changes = { cumulativeTokens: tokens, threshold: options.threshold ?? null };
+    } else if (phase === 'extend') {
+      if (!Number.isFinite(tokens) || tokens <= 0) throw new WorkStateError('INVALID_BUDGET', 'an extension needs a positive token amount');
+      if (!options.by) throw new WorkStateError('INVALID_BUDGET', 'an extension names who granted it');
+      if (!options.reason) throw new WorkStateError('INVALID_BUDGET', 'an extension carries a reason');
+      budget.extension = { tokens, by: String(options.by), reason: String(options.reason), at: now };
+      type = 'budget-extended';
+      changes = { extension: budget.extension };
+    } else {
+      throw new WorkStateError('INVALID_BUDGET', `unknown budget phase '${phase}' (warn | extend)`);
+    }
+    const next = {
+      ...record,
+      revision: record.revision + 1,
+      eventSequence: record.eventSequence + 1,
+      updatedAt: now,
+      budget,
+      idempotency: { ...record.idempotency },
+    };
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type };
+    const event = eventFor(next, { type, actor: options.actor || 'budget', at: now, idempotencyKey: key, evidence: options.evidence, changes });
+    const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
+    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+  });
+}
+
 function notifyRecord(options = {}) {
   // Ticket 07: delivery state for one decision event, keyed by that event's
   // sequence. claim -> sent | failed; a failed delivery is visible and inert until
@@ -953,6 +1029,7 @@ function cli(argv) {
     }
     return result;
   }
+  if (command === 'budget') return recordBudget({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']), phase: args.phase, tokens: args.tokens !== undefined ? Number(args.tokens) : undefined, by: args.by, reason: args.reason, threshold: args.threshold !== undefined ? Number(args.threshold) : undefined });
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
   if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
@@ -978,6 +1055,7 @@ module.exports = {
   readEvents,
   readTenantConfigs,
   reconcilePullRequest,
+  recordBudget,
   recordReview,
   releaseRecord,
   reservationConflicts,

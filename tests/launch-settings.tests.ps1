@@ -55,7 +55,7 @@ try {
   Assert-True ($deny1 -contains "Edit($repoFwd/**)") 'a control-plane role must lose engineering edits in tenant repos'
   Assert-True ($settings1.permissions.defaultMode -eq 'auto') 'existing permission settings must survive the merge'
   Assert-True ($null -ne $r1.budget -and $r1.budget.estimatedTokens -gt 0) 'the dry run must report the first-turn budget'
-  Assert-True ($r1.budget.ceiling -eq 12000) 'the dispatcher ceiling must come from config/cycle.json'
+  Assert-True ($r1.budget.ceiling -eq ((Get-Content "$testRoot\config\cycle.json" -Raw | ConvertFrom-Json).firstTurnCeilings.dispatcher)) 'the dispatcher ceiling must come from config/cycle.json'
 
   # Case 2: an IC keeps tenant-repo tools but loses every direct fleet-state write.
   $r2 = Run-Launch @('-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'Implement issue 42.', '-DryRun')

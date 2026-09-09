@@ -1,11 +1,21 @@
 {
   "schemaVersion": 1,
   "firstTurnCeilings": {
-    "baselineTokens": 0,
-    "dispatcher": 12000,
-    "project-lead": 20000,
-    "ic": 25000,
-    "sentinel": 12000
+    "baselineTokens": 10000,
+    "dispatcher": 22000,
+    "project-lead": 30000,
+    "ic": 35000,
+    "sentinel": 22000
+  },
+  "ic": {
+    "warnTokens": 50000,
+    "escalateTokens": 75000
+  },
+  "budgets": {
+    "baselineControlPlaneFreshPerCompletedUnit": 201505,
+    "controlPlaneFreshReduction": 0.7,
+    "projectLeadFreshPerMergedPr": 25000,
+    "icJobTokensMedian": 60000
   },
   "review": {
     "trivialMaxChangedLines": 25,

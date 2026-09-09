@@ -229,11 +229,16 @@ test('status projection rebuilds deterministically and retirement cleans ephemer
   assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-42.json')), true);
 });
 
-test('old event partitions move to the archive after thirty days', () => {
+test('old event partitions move to the archive after thirty days, once the ledger is verified', () => {
   const root = rootDir();
   makeRecord(root, { now: '2026-07-01T00:00:00.000Z' });
   const old = path.join(root, 'state', 'events', '2026-07-01.jsonl');
   assert.equal(fs.existsSync(old), true);
+  getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(fs.existsSync(old), true, 'ticket 09: no verified ledger, no archival');
+  // A fresh passing verdict from bin/verify-events.js permits the move.
+  fs.mkdirSync(path.join(root, 'state', 'verify'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'verify', 'last.json'), JSON.stringify({ pass: true, at: new Date().toISOString() }));
   getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(fs.existsSync(path.join(root, 'state', 'events', 'archive', '2026-07-01.jsonl')), true);
 });
@@ -427,6 +432,25 @@ test('twenty concurrent claims for one decision event produce exactly one claim'
   const record = getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(record.notifications['5'].attempt, 1);
   assert.equal(readEvents(root).filter((event) => event.type === 'notification-attempted').length, 1);
+});
+
+// Ticket 09 (amendment 10): retirement cleanup can only ever reach state/sessions and
+// state/tmp. A record pointing its settings or brief at a user-owned file elsewhere
+// (h.tmp, bin/memory-link-audit.js) leaves that file untouched.
+test('retirement cleanup never removes a file outside state/sessions and state/tmp', () => {
+  const root = rootDir();
+  const userOwned = path.join(root, 'h.tmp');
+  const stray = path.join(root, 'bin', 'memory-link-audit.js');
+  fs.mkdirSync(path.dirname(stray), { recursive: true });
+  fs.writeFileSync(userOwned, 'user-owned');
+  fs.writeFileSync(stray, 'user-owned');
+  makeRecord(root, { settingsPath: userOwned, briefPath: stray });
+  move(root, 'endzone:issue-42', 1, 'implementing', 'u-1', 'ack', '2026-09-01T00:00:01.000Z');
+  for (const [revision, to] of [[2, 'pr-open'], [3, 'review'], [4, 'merged'], [5, 'retiring'], [6, 'retired']]) {
+    transitionRecord({ root, id: 'endzone:issue-42', expectedRevision: revision, to, idempotencyKey: `u-${to}`, now: '2026-09-01T00:00:02.000Z', prNumber: 77, githubState: 'MERGED', githubMergedAt: '2026-09-01T00:00:02.000Z', testOnly: true });
+  }
+  assert.equal(fs.existsSync(userOwned), true, 'h.tmp survives retirement');
+  assert.equal(fs.existsSync(stray), true, 'bin/memory-link-audit.js survives retirement');
 });
 
 // 02/03 cutover: a manifest-reserved record is not the roster projector's (its

@@ -362,15 +362,28 @@ function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allo
       const errors = transcript.pullRequests
         .map((number) => verificationErrors[`${identity.tenant}:${number}`])
         .filter(Boolean);
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'github-merge-unverified', verificationErrors: errors, evidence: transcript.sourcePath });
+      // Amendment 9: a unit whose every PR GitHub reports CLOSED without a merge is
+      // `abandoned`; one whose PRs GitHub does not return at all is `no-pr`. Both are
+      // terminal classifications, excluded from budget denominators and never re-reported
+      // as verification errors. Anything else stays `github-merge-unverified` (a real read
+      // failure, retried next run).
+      const observed = transcript.pullRequests.map((number) => pullRequestStates[`${identity.tenant}:${number}`]).filter(Boolean);
+      const isClosed = (s) => String(s.state).toUpperCase() === 'CLOSED' && !s.mergedAt;
+      const isUnreturned = (s) => /not returned/i.test(String(s.error || ''));
+      const noneReturned = observed.length > 0 && observed.every(isUnreturned);
+      // Every PR either closed unmerged or never returned, with at least one closed: the
+      // unit was abandoned. Every PR unreturned: it never had one GitHub knows about.
+      const allClosed = !noneReturned && observed.length > 0 && observed.every((s) => isClosed(s) || isUnreturned(s)) && observed.some(isClosed);
+      const reason = allClosed ? 'abandoned' : (noneReturned ? 'no-pr' : 'github-merge-unverified');
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason, terminal: reason !== 'github-merge-unverified', verificationErrors: reason === 'github-merge-unverified' ? errors : [], pullRequests: transcript.pullRequests, evidence: transcript.sourcePath });
       continue;
     }
     if (!pullRequestStates && !allowTranscriptEvidence) {
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'github-merge-unverified', evidence: transcript.sourcePath });
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'github-merge-unverified', pullRequests: transcript.pullRequests, evidence: transcript.sourcePath });
       continue;
     }
     if (!pullRequestStates && !transcript.merged) {
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'missing-merge-evidence', evidence: transcript.sourcePath });
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'missing-merge-evidence', pullRequests: transcript.pullRequests, evidence: transcript.sourcePath });
       continue;
     }
     const mergeEvents = pullRequestStates
@@ -406,11 +419,59 @@ function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allo
   return { records, excluded, sessionMetrics };
 }
 
+// A true median at 0.5 (the mean of the two middle values on an even count); other
+// fractions are the nearest-rank percentile.
+function percentile(values, fraction) {
+  const sorted = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  if (fraction === 0.5 && sorted.length % 2 === 0) return Math.round((sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))];
+}
+
+// Ticket 09: the per-unit figures the spec's budgets are stated in, and their verdicts.
+// A unit is a completed (merged and retired) IC record in the window; a merged PR is one
+// per completed unit; the project lead's overhead is its fresh tokens over that count.
+function unitMetrics(units, roles, budgets) {
+  const completed = units.length;
+  const cp = roles && Object.entries(roles).filter(([role]) => CONTROL_PLANE_ROLES.has(role));
+  const controlPlaneFresh = cp ? cp.reduce((t, [, r]) => t + asNumber(r.metrics.freshTokens), 0) : 0;
+  const plFresh = asNumber(roles?.['project-lead']?.metrics?.freshTokens);
+  const icJob = units.map((u) => asNumber(u.metrics?.jobTokens));
+  const icFresh = units.map((u) => asNumber(u.metrics?.freshTokens));
+  // Merged pull requests are counted, not asserted: a unit can merge more than one PR.
+  const mergedPrs = new Set(units.flatMap((u) => (u.mergeEvents || []).filter((e) => e && e.mergedAt && e.number !== undefined).map((e) => `${u.tenant}:${e.number}`))).size || completed;
+  const per = (value) => (completed > 0 ? Math.round(value / completed) : null);
+  const perPr = (value) => (mergedPrs > 0 ? Math.round(value / mergedPrs) : null);
+  const metrics = {
+    completedUnits: completed,
+    mergedPullRequests: mergedPrs,
+    controlPlaneFreshPerCompletedUnit: per(controlPlaneFresh),
+    projectLeadFreshTokens: plFresh,
+    projectLeadFreshPerCompletedUnit: per(plFresh),
+    projectLeadFreshPerMergedPr: perPr(plFresh),
+    icJobTokensMedian: percentile(icJob, 0.5),
+    icJobTokensP90: percentile(icJob, 0.9),
+    icFreshTokensMedian: percentile(icFresh, 0.5),
+  };
+  const b = budgets || {};
+  const verdict = (value, limit, kind) => (value === null || limit === undefined || limit === null ? null : (kind === 'max' ? value <= limit : value < limit));
+  const baseline = Number(b.baselineControlPlaneFreshPerCompletedUnit);
+  const reductionTarget = Number(b.controlPlaneFreshReduction);
+  const reduction = Number.isFinite(baseline) && baseline > 0 && metrics.controlPlaneFreshPerCompletedUnit !== null ? 1 - metrics.controlPlaneFreshPerCompletedUnit / baseline : null;
+  metrics.controlPlaneFreshReductionVsBaseline = reduction === null ? null : Math.round(reduction * 1000) / 1000;
+  metrics.budgets = {
+    controlPlaneFreshReduction: { target: Number.isFinite(reductionTarget) ? reductionTarget : null, actual: metrics.controlPlaneFreshReductionVsBaseline, pass: reduction === null || !Number.isFinite(reductionTarget) ? null : reduction >= reductionTarget },
+    projectLeadFreshPerMergedPr: { limit: b.projectLeadFreshPerMergedPr ?? null, actual: metrics.projectLeadFreshPerMergedPr, pass: verdict(metrics.projectLeadFreshPerMergedPr, b.projectLeadFreshPerMergedPr, 'lt') },
+    icJobTokensMedian: { limit: b.icJobTokensMedian ?? null, actual: metrics.icJobTokensMedian, pass: verdict(metrics.icJobTokensMedian, b.icJobTokensMedian, 'lt') },
+  };
+  return metrics;
+}
+
 function sum(records, selector) {
   return records.reduce((total, record) => total + asNumber(selector(record)), 0);
 }
 
-function buildReport(records, excluded, { generatedAt, since, until, sessionMetrics = [], verificationErrors = [] } = {}) {
+function buildReport(records, excluded, { generatedAt, since, until, sessionMetrics = [], verificationErrors = [], budgets = null } = {}) {
   const units = records || [];
   const controlPlaneSessions = (sessionMetrics || []).filter((session) => CONTROL_PLANE_ROLES.has(session.role));
   const observed = [
@@ -461,9 +522,13 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
       freshTokens: 'input + output + cache-creation tokens; cache-read tokens are excluded',
       jobTokens: 'input + output tokens only; cache fields are reported separately',
       controlPlaneFreshTokens: 'fresh tokens from Dispatcher, project-lead, Sentinel, and notifier sessions',
+      controlPlaneFreshPerCompletedUnit: 'control-plane fresh tokens divided by completed units in the window',
+      projectLeadFreshPerMergedPr: 'project-lead fresh tokens divided by merged pull requests (one per completed unit) in the window',
+      icJobTokensMedian: 'median over completed units of the IC session job tokens (input + output; the rotation and budget definition)',
     },
-    sample: { completedUnits: units.length, excludedUnits: (excluded || []).length },
+    sample: { completedUnits: units.length, excludedUnits: (excluded || []).length, excludedByReason: (excluded || []).reduce((acc, item) => { acc[item.reason] = (acc[item.reason] || 0) + 1; return acc; }, {}) },
     metrics,
+    unitMetrics: unitMetrics(units, roles, budgets),
     sessions: sessionMetrics || [],
     roles,
     units,
@@ -493,9 +558,20 @@ function renderSummary(report) {
     `cross-session messages: ${report.metrics.crossSessionMessages}`,
     `wall time (ms): ${report.metrics.wallTimeMs}`,
     '',
-    '## Exclusions',
+    '## Per unit (ticket 09 budgets)',
     '',
   ];
+  const u = report.unitMetrics || {};
+  const b = u.budgets || {};
+  const show = (v) => (v === null || v === undefined ? 'n/a' : v);
+  const pct = (v) => (v === null || v === undefined ? 'n/a' : `${Math.floor(v * 1000) / 10}%`);
+  const mark = (p) => (p === null || p === undefined ? '' : (p ? ' PASS' : ' FAIL'));
+  lines.push(`control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (reduction vs baseline ${pct(u.controlPlaneFreshReductionVsBaseline)}, target ${pct(b.controlPlaneFreshReduction?.target)})${mark(b.controlPlaneFreshReduction?.pass)}`);
+  lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (limit ${show(b.projectLeadFreshPerMergedPr?.limit)}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
+  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; limit ${show(u.budgets?.icJobTokensMedian?.limit)})${mark(u.budgets?.icJobTokensMedian?.pass)}`);
+  lines.push(`IC fresh tokens median: ${show(u.icFreshTokensMedian)}`);
+  lines.push(`exclusions by reason: ${JSON.stringify(report.sample.excludedByReason || {})}`);
+  lines.push('', '## Exclusions', '');
   if (report.excluded.length === 0) lines.push('None.');
   else for (const item of report.excluded) lines.push(`- ${item.tenant || 'unknown'} #${item.issue} — ${item.reason} (${item.evidence})`);
   return `${lines.join('\n')}\n`;
@@ -591,7 +667,12 @@ function verifyPullRequests(records, tenantConfigs) {
   return { states, errors };
 }
 
-function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigsDir, since, until, generatedAt, verifyGithub = true } = {}) {
+function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigsDir, since, until, generatedAt, verifyGithub = true, configPath } = {}) {
+  let budgets = null;
+  try {
+    const raw = fs.readFileSync(path.resolve(configPath || path.join(__dirname, '..', 'config', 'cycle.json')), 'utf8');
+    budgets = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw).budgets || null;
+  } catch { budgets = null; }
   const resolvedRoster = path.resolve(rosterPath || path.join(__dirname, '..', 'state', 'roster.json'));
   const resolvedTranscripts = path.resolve(transcriptsDir || defaultTranscriptsDir());
   const resolvedOutput = path.resolve(outputDir || path.join(__dirname, '..', 'state', 'metrics'));
@@ -607,7 +688,11 @@ function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigs
   let verificationErrors = [];
   if (verifyGithub) {
     const tenantConfigs = loadTenantConfigs(tenantConfigsDir || path.join(__dirname, '..', 'tenants'));
-    const verification = verifyPullRequests(cycles.records, tenantConfigs);
+    // Every unit that names a pull request is verified, including the ones the transcript
+    // pass excluded for lacking merge evidence: GitHub, not the transcript, decides whether
+    // a unit completed, was abandoned, or never had a PR.
+    const withPrs = [...cycles.records, ...cycles.excluded.filter((item) => Array.isArray(item.pullRequests) && item.pullRequests.length > 0)];
+    const verification = verifyPullRequests(withPrs, tenantConfigs);
     verificationErrors = verification.errors;
     const errorsByKey = Object.fromEntries(verification.errors.map((item) => [item.key, item.error]));
     cycles = buildCycleRecords({ roster, transcripts, pullRequestStates: verification.states, verificationErrors: errorsByKey });
@@ -645,22 +730,30 @@ function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigs
   };
   const dailyWindow = filterWindow(dailyLower);
   const summaryWindow = filterWindow(summaryLower);
-  const reportOptions = (window, lower) => ({
+  // The period line names the window the data actually covers: the daily report keeps a
+  // requested --since, the seven-day report is always the trailing seven days (it used to
+  // print the 24-hour --since over seven days of data).
+  const reportOptions = (window, lower, honourSince) => ({
     generatedAt: generatedAt || effectiveUntil,
-    since: since || new Date(lower).toISOString(),
+    since: (honourSince && since) || new Date(lower).toISOString(),
     until: until || effectiveUntil,
     sessionMetrics: window.filteredSessions,
     verificationErrors,
+    budgets,
   });
-  const dailyReport = buildReport(dailyWindow.filtered, dailyWindow.filteredExcluded, reportOptions(dailyWindow, dailyLower));
-  const summaryReport = buildReport(summaryWindow.filtered, summaryWindow.filteredExcluded, reportOptions(summaryWindow, summaryLower));
+  const dailyReport = buildReport(dailyWindow.filtered, dailyWindow.filteredExcluded, reportOptions(dailyWindow, dailyLower, true));
+  const summaryReport = buildReport(summaryWindow.filtered, summaryWindow.filteredExcluded, reportOptions(summaryWindow, summaryLower, false));
   fs.mkdirSync(resolvedOutput, { recursive: true });
   const date = String(effectiveUntil).slice(0, 10);
   const dailyArtifact = path.join(resolvedOutput, `daily-${date}.json`);
   const summaryArtifact = path.join(resolvedOutput, `seven-day-${date}.md`);
+  const summaryJsonArtifact = path.join(resolvedOutput, `seven-day-${date}.json`);
   fs.writeFileSync(dailyArtifact, `${JSON.stringify(dailyReport, null, 2)}\n`, 'utf8');
   fs.writeFileSync(summaryArtifact, renderSummary(summaryReport), 'utf8');
-  return { report: summaryReport, dailyReport, summaryReport, dailyArtifact, summaryArtifact };
+  // The seven-day report is persisted as JSON too, so its per-unit ratios can be re-read
+  // without re-running the collector.
+  fs.writeFileSync(summaryJsonArtifact, `${JSON.stringify(summaryReport, null, 2)}\n`, 'utf8');
+  return { report: summaryReport, dailyReport, summaryReport, dailyArtifact, summaryArtifact, summaryJsonArtifact };
 }
 
 if (require.main === module) {
@@ -688,6 +781,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  unitMetrics,
+  percentile,
   buildCycleRecords,
   buildReport,
   classifyTurns,

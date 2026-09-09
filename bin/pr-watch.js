@@ -150,10 +150,17 @@ function escalatedHopsTo(priorState, target) {
   return best;
 }
 
-function mergedChain(hops, viewPr, prNumber, evidencePrefix) {
+// Ticket 09 (the ticket-05 lower bound, due at the 02/03 cutover): "no merge without a
+// recorded formal review" cannot be blocked by a script - the lead merges through gh -
+// but it can be seen. A merge observed on a record with no formal review recorded
+// completes as a fact (GitHub is authoritative) and carries a decision-needed wake, so it
+// pages once and stands in the digest instead of passing silently.
+// state/flags/merge-review-wake-off is its rollback: the merge still completes, silently.
+function mergedChain(hops, viewPr, prNumber, evidencePrefix, { formalReviewMissing = false } = {}) {
   return (hops || []).map((to, index) => ({
     kind: 'transition', to,
-    evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})`, wake: null,
+    evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})${to === 'merged' && formalReviewMissing ? '; merged without a recorded formal review (ticket 05 lower bound)' : ''}`,
+    wake: to === 'merged' && formalReviewMissing ? 'decision-needed' : null,
     reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, evidence: `gh pr view ${prNumber}` } : null,
     observe: index === hops.length - 1 ? { pr: viewPr, evaluation: evaluateChecks({ ciGates: [], watchedChecks: [], ignoredChecks: [] }, viewPr.statusCheckRollup), closing: null } : null,
   }));
@@ -161,8 +168,9 @@ function mergedChain(hops, viewPr, prNumber, evidencePrefix) {
 
 // Pure planner. One step per run per record, except merged fast-forwards, which
 // complete in one run so a record never trails a finished reality.
-function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo }) {
+function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formalReviewWake = true }) {
   const state = record.state;
+  const reviewMissing = formalReviewWake && !record.review?.formal;
   const prNumber = record.github?.prNumber || null;
   const prevDigest = record.github?.observation?.digest || null;
   const viewIsOpen = viewPr && String(viewPr.state).toUpperCase() === 'OPEN';
@@ -177,7 +185,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo }) {
     if (!prNumber) return { actions: [] };
     if (!viewPr) return { actions: [], ghNeeds: 'view' };
     if (!openPr && String(viewPr.state).toUpperCase() === 'MERGED') {
-      return { actions: mergedChain(escalatedHopsTo(record.prior_state, 'merged'), viewPr, prNumber, 'escalation resolved by an observed merge') };
+      return { actions: mergedChain(escalatedHopsTo(record.prior_state, 'merged'), viewPr, prNumber, 'escalation resolved by an observed merge', { formalReviewMissing: reviewMissing }) };
     }
     if (livePr && closingLinked(viewPr, record.issue, repo)) {
       const back = record.prior_state && record.prior_state !== 'escalated' ? record.prior_state : 'ci-wait';
@@ -208,7 +216,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo }) {
     if (!prNumber) return { actions: [] };
     if (!viewPr) return { actions: [], ghNeeds: 'view' };
     if (String(viewPr.state).toUpperCase() === 'MERGED') {
-      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged') };
+      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing }) };
     }
     return { actions: [] };   // closed (await a replacement PR) or draft (paused work)
   }
@@ -218,7 +226,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo }) {
   if (!livePr) {
     if (!viewPr) return { actions: [], ghNeeds: 'view' };
     if (String(viewPr.state).toUpperCase() === 'MERGED') {
-      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged') };
+      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing }) };
     }
     if (viewIsOpen && viewPr.isDraft) return { actions: [] };   // paused work, not a decision
     return {
@@ -331,6 +339,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     return health;
   };
 
+  const formalReviewWake = !fs.existsSync(path.join(base, 'state', 'flags', 'merge-review-wake-off'));
   let active;
   try { active = JSON.parse(fs.readFileSync(path.join(base, 'state', 'work', 'active.json'), 'utf8')); } catch { active = { records: {} }; }
   const records = Object.values(active.records || {})
@@ -360,7 +369,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
       openPr = openPrs.find((pr) => !pr.isDraft && String(pr.headRefName || '').startsWith(`${prefix}${record.issue}-`)) || null;
     }
     let viewPr = null;
-    let plan = planRecord({ record, openPr, viewPr, policy, branchPrefix: prefix, repo });
+    let plan = planRecord({ record, openPr, viewPr, policy, branchPrefix: prefix, repo, formalReviewWake });
     if (plan.ghNeeds === 'view') {
       try {
         viewPr = fetchers.viewPr(prNumber);
@@ -370,7 +379,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
         health.actions.push(`${record.id}: view failed, retained (${String(error.message || error).slice(0, 120)})`);
         continue;
       }
-      plan = planRecord({ record, openPr, viewPr, policy, branchPrefix: prefix, repo });
+      plan = planRecord({ record, openPr, viewPr, policy, branchPrefix: prefix, repo, formalReviewWake });
     }
     if (!plan.actions.length) continue;
 
@@ -430,9 +439,19 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
   return finish();
 }
 
+// Ticket 09: CI watching has its own rollback flag. With state/flags/pr-watch-off the tick
+// touches nothing and says so; the lead falls back to its own gh reads.
+function isWatchOff(root) {
+  return fs.existsSync(path.join(path.resolve(root || path.resolve(__dirname, '..')), 'state', 'flags', 'pr-watch-off'));
+}
+
 function main(argv) {
   const args = workState.parseArgs(argv);
   const base = path.resolve(args.root || path.resolve(__dirname, '..'));
+  if (isWatchOff(base)) {
+    process.stdout.write(`${JSON.stringify({ ok: true, skipped: true, reason: 'state/flags/pr-watch-off stands: CI watching is disabled; remove the flag to resume' })}\n`);
+    return;
+  }
   const tenantDir = path.join(base, 'tenants');
   let tenantName = args.tenant || null;
   if (!tenantName) {
@@ -460,5 +479,5 @@ if (require.main === module) {
 
 module.exports = {
   evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
-  stableStringify, closingLinked, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK,
+  stableStringify, closingLinked, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain,
 };

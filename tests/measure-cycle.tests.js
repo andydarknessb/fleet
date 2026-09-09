@@ -365,3 +365,83 @@ test('collectFromFiles writes stable daily JSON and summary artifacts', () => {
   assert.equal(inferredDaily.period.since, '2026-08-31T00:01:00.001Z');
   assert.equal(inferred.report.period.since, '2026-08-25T00:01:00.001Z');
 });
+
+// Ticket 09: the per-unit figures the spec's budgets are stated in, and their verdicts.
+test('buildReport computes per-unit ratios, the IC median, and budget verdicts', () => {
+  const unitOf = (issue, job, fresh) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: fresh, jobTokens: job, cacheReadInputTokens: 0 } });
+  const units = [unitOf(1, 40000, 100000), unitOf(2, 55000, 120000), unitOf(3, 70000, 200000)];
+  const sessions = [
+    { sessionId: 'pl', name: 'pl-endzone', role: 'project-lead', metrics: { freshTokens: 60000, cacheReadInputTokens: 5 } },
+    { sessionId: 'd', name: 'dispatcher', role: 'dispatcher', metrics: { freshTokens: 30000, cacheReadInputTokens: 5 } },
+  ];
+  const report = buildReport(units, [{ reason: 'abandoned' }, { reason: 'abandoned' }, { reason: 'no-pr' }], {
+    sessionMetrics: sessions,
+    budgets: { baselineControlPlaneFreshPerCompletedUnit: 200000, controlPlaneFreshReduction: 0.7, projectLeadFreshPerMergedPr: 25000, icJobTokensMedian: 60000 },
+  });
+  const u = report.unitMetrics;
+  assert.equal(u.completedUnits, 3);
+  assert.equal(u.controlPlaneFreshPerCompletedUnit, 30000, '(60000 + 30000) / 3');
+  assert.equal(u.projectLeadFreshPerMergedPr, 20000);
+  assert.equal(u.icJobTokensMedian, 55000);
+  assert.equal(u.icJobTokensP90, 70000);
+  assert.equal(u.icFreshTokensMedian, 120000);
+  assert.equal(u.controlPlaneFreshReductionVsBaseline, 0.85);
+  assert.equal(u.budgets.controlPlaneFreshReduction.pass, true);
+  assert.equal(u.budgets.projectLeadFreshPerMergedPr.pass, true);
+  assert.equal(u.budgets.icJobTokensMedian.pass, true);
+  assert.deepEqual(report.sample.excludedByReason, { abandoned: 2, 'no-pr': 1 });
+  const empty = buildReport([], [], { sessionMetrics: sessions, budgets: { icJobTokensMedian: 60000 } });
+  assert.equal(empty.unitMetrics.controlPlaneFreshPerCompletedUnit, null, 'no units: no ratio, no verdict');
+  assert.equal(empty.unitMetrics.budgets.icJobTokensMedian.pass, null);
+  const text = renderSummary(report);
+  assert.match(text, /IC job tokens median: 55000 \(p90 70000; limit 60000\) PASS/);
+  assert.match(text, /project-lead fresh per merged PR: 20000 over 3 merged PR\(s\) \(limit 25000; per completed unit 20000\) PASS/);
+  assert.match(text, /reduction vs baseline 85%, target 70%/);
+  // Merged PRs are counted from merge events, and the median is a true median on an even count.
+  const withPrs = [
+    { ...unitOf(4, 10, 10), mergeEvents: [{ number: 900, mergedAt: 'x' }, { number: 901, mergedAt: 'x' }] },
+    { ...unitOf(5, 90, 10), mergeEvents: [{ number: 902, mergedAt: 'x' }] },
+  ];
+  const counted = buildReport(withPrs, [], { sessionMetrics: sessions, budgets: {} });
+  assert.equal(counted.unitMetrics.mergedPullRequests, 3);
+  assert.equal(counted.unitMetrics.projectLeadFreshPerMergedPr, 20000, '60000 / 3 PRs');
+  assert.equal(counted.unitMetrics.projectLeadFreshPerCompletedUnit, 30000, '60000 / 2 units');
+  assert.equal(counted.unitMetrics.icJobTokensMedian, 50, 'mean of the two middle values');
+});
+
+// Amendment 9: terminal classifications instead of a permanent "unverified" bucket.
+test('buildCycleRecords classifies a closed-unmerged unit as abandoned and an unreturned PR as no-pr', () => {
+  const transcript = parseTranscript(fixtureTranscript(), 'C:/t/session-1.jsonl');
+  const [prNumber] = transcript.pullRequests;
+  assert.ok(prNumber, 'the fixture transcript names a pull request');
+  const roster = { sessions: [
+    { name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1' },
+  ] };
+  const key = `endzone:${prNumber}`;
+  const closed = buildCycleRecords({ roster, transcripts: [transcript], pullRequestStates: { [key]: { state: 'CLOSED', mergedAt: null } }, verificationErrors: { [key]: 'GitHub PR state is CLOSED; mergedAt is required' } });
+  assert.equal(closed.records.length, 0);
+  assert.equal(closed.excluded[0].reason, 'abandoned');
+  assert.equal(closed.excluded[0].terminal, true);
+  assert.deepEqual(closed.excluded[0].verificationErrors, []);
+  const missing = buildCycleRecords({ roster, transcripts: [transcript], pullRequestStates: { [key]: { state: 'UNKNOWN', mergedAt: null, error: 'PR not returned by GitHub' } }, verificationErrors: { [key]: 'PR not returned by GitHub' } });
+  assert.equal(missing.excluded[0].reason, 'no-pr');
+  const readFailed = buildCycleRecords({ roster, transcripts: [transcript], pullRequestStates: { [key]: { state: 'UNKNOWN', mergedAt: null, error: 'gh exited 1' } }, verificationErrors: { [key]: 'gh exited 1' } });
+  assert.equal(readFailed.excluded[0].reason, 'github-merge-unverified', 'a read failure is retried, not classified');
+  assert.equal(readFailed.excluded[0].terminal, false);
+});
+
+test('the seven-day report names its own window and is persisted as JSON', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const transcripts = path.join(root, 'transcripts');
+  fs.mkdirSync(path.join(transcripts, 'p'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{ name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1' }] }));
+  fs.writeFileSync(path.join(transcripts, 'p', 'session-1.jsonl'), fixtureTranscript());
+  fs.writeFileSync(path.join(root, 'cycle.json'), JSON.stringify({ budgets: { icJobTokensMedian: 60000 } }));
+  const result = collectFromFiles({ transcriptsDir: transcripts, rosterPath: path.join(root, 'roster.json'), outputDir: path.join(root, 'out'), since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', generatedAt: '2026-09-01T12:00:00.000Z', verifyGithub: false, configPath: path.join(root, 'cycle.json') });
+  assert.equal(result.dailyReport.period.since, '2026-09-01T00:00:00.000Z', 'the daily report keeps the requested since');
+  assert.equal(result.report.period.since, '2026-08-26T00:00:00.000Z', 'the seven-day report names its real seven-day window');
+  assert.equal(path.basename(result.summaryJsonArtifact), 'seven-day-2026-09-02.json');
+  const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
+  assert.equal(json.unitMetrics.completedUnits, 1);
+  assert.equal(json.unitMetrics.budgets.icJobTokensMedian.limit, 60000);
+});

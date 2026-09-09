@@ -280,7 +280,12 @@ function recordReviewArtifact(options = {}) {
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
   if (!['formal', 'risk'].includes(kind)) throw new ReviewPolicyError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
   const classification = options.classification || {};
-  const key = options.idempotencyKey || `${kind}:${recordId}:${headSha}`;
+  // Ticket 09: with state/flags/review-dedup-off every review pass is written down (the
+  // legacy behaviour). The default replay key is kind:record:head, which would make a
+  // second pass at the same head replay the first, so under the flag the default key
+  // carries the moment too, and a same-head formal pass is not held to the re-review link.
+  const dedupOff = fs.existsSync(path.join(root, 'state', 'flags', 'review-dedup-off'));
+  const key = options.idempotencyKey || `${kind}:${recordId}:${headSha}${dedupOff ? `:${new Date(options.now || Date.now()).toISOString()}` : ''}`;
   const pinnedRevision = options.expectedRevision !== undefined && Number.isInteger(Number(options.expectedRevision))
     ? Number(options.expectedRevision) : null;
 
@@ -300,7 +305,7 @@ function recordReviewArtifact(options = {}) {
       }
 
       const prior = record.review?.[kind] || null;
-      if (prior && prior.headSha === String(headSha)) {
+      if (prior && prior.headSha === String(headSha) && !dedupOff) {
         throw new ReviewPolicyError('ALREADY_REVIEWED', `a ${kind} review is already recorded for ${recordId} at ${headSha}`, { artifact: prior.artifact });
       }
       if (kind === 'risk' && !(classification.triggers || []).length) {
@@ -311,7 +316,8 @@ function recordReviewArtifact(options = {}) {
       let priorArtifactMissing = false;
       let range = null;
       const resolutions = options.resolutions || null;
-      if (kind === 'formal' && prior) {
+      const sameHeadPassUnderFlag = dedupOff && prior && prior.headSha === String(headSha) && !options.priorArtifact;
+      if (kind === 'formal' && prior && !sameHeadPassUnderFlag) {
         if (!options.priorArtifact || options.priorArtifact !== prior.artifact) {
           throw new ReviewPolicyError('REREVIEW_REQUIRES_PRIOR', `a revision re-review must link the prior findings artifact ${prior.artifact}`, { priorArtifact: prior.artifact });
         }

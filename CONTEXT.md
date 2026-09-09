@@ -196,6 +196,16 @@ one formal Standards and Spec review; a diff without a trigger never gets a
 risk reviewer.
 _Avoid_: second reviewer, QA pass, extra review angle
 
+**Budget**:
+The token line a Unit of work is measured against: job tokens (input plus
+output, never cache fields) summed over the IC session's transcript. The
+Work record gets one warning event at the warning threshold and is escalated
+at the escalation threshold unless an approved extension, granted by Cory
+through the state command with an amount and a reason, raises the line. The
+measurement is a projection (`state/budget/last.json`); only the crossings are
+Fleet events. Shadow until `state/flags/budget-live` stands.
+_Avoid_: quota, allowance, token limit (unqualified), cost
+
 **Frontier**:
 The ordered set of ready Units of work the fleet may launch next: open,
 carrying the tenant's ready label, unassigned, with no open blockers, not a

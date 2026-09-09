@@ -42,4 +42,18 @@ foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -Err
 }
 $digestLevel = if ($digestExit -eq 0) { 'INFO' } else { 'ERROR' }
 [IO.File]::AppendAllText($logPath, "$(Now-Iso) $digestLevel digest exit=$digestExit`r`n$digestOutput`r`n", $Utf8)
+
+# Ticket 09: the IC budget actor rides the same tick (bin/budget.js). Shadow unless
+# state/flags/budget-live exists; either way it measures every active IC and writes
+# state/budget/last.json. Its exit never turns the watcher red: the budget reports itself.
+$budgetOutput = & $nodeExecutable "$FleetHome\bin\budget.js" --root $FleetHome 2>&1 | Out-String
+$budgetLevel = if ($LASTEXITCODE -eq 0) { 'INFO' } else { 'ERROR' }
+[IO.File]::AppendAllText($logPath, "$(Now-Iso) $budgetLevel budget exit=$LASTEXITCODE`r`n$budgetOutput`r`n", $Utf8)
+
+# Ticket 09: the ledger verifier (bin/verify-events.js) writes state/verify/last.json, the
+# verdict the 30-day event archival consults before it moves anything. Exit 2 = findings;
+# they stand in the verdict file and the digest, never in the watcher's exit code.
+$verifyOutput = & $nodeExecutable "$FleetHome\bin\verify-events.js" --root $FleetHome 2>&1 | Out-String
+$verifyLevel = if ($LASTEXITCODE -eq 0) { 'INFO' } else { 'WARN' }
+[IO.File]::AppendAllText($logPath, "$(Now-Iso) $verifyLevel verify exit=$LASTEXITCODE`r`n$verifyOutput`r`n", $Utf8)
 if ($exitCode -ne 0) { exit $exitCode }

@@ -17,6 +17,16 @@ try { $pendingManifests = @(Get-ChildItem "$FleetHome\state\manifests" -Filter *
 $assignmentText = "$pendingManifests manifest(s) pending acknowledgment"
 if (Test-AssignmentLive) { Write-Output "assignment: planner authoritative (state/flags/assignment-live; rollback: bin\rollback-assignment.ps1); $assignmentText" }
 else { Write-Output "assignment: legacy Stop-hook frontier (planner observed in shadow: bin\assignment-parity.js report); $assignmentText" }
+# Ticket 09: IC budgets (bin/budget.js, shadow until state/flags/budget-live) and the ledger verdict.
+$budgetLast = $null; try { $budgetLast = Read-Json "$FleetHome\state\budget\last.json" } catch {}
+if ($budgetLast) {
+  $rows = @($budgetLast.records)
+  $counts = "measured $(@($rows | Where-Object { $null -ne $_.jobTokens }).Count), warn $(@($rows | Where-Object { $_.decision -eq 'warn' }).Count), escalate $(@($rows | Where-Object { $_.decision -eq 'escalate' }).Count), unmeasured $(@($rows | Where-Object { $_.decision -eq 'unmeasured' }).Count)"
+  Write-Output "budget: $($budgetLast.mode) (warn $($budgetLast.config.warnTokens) / escalate $($budgetLast.config.escalateTokens) job tokens; flag state/flags/budget-live); $counts; last $($budgetLast.at)"
+} else { Write-Output 'budget: no run recorded (state/budget/last.json)' }
+$verifyLast = $null; try { $verifyLast = Read-Json "$FleetHome\state\verify\last.json" } catch {}
+if ($verifyLast) { Write-Output "ledger: $(if ($verifyLast.pass) { 'verified' } else { 'FINDINGS' }) ($($verifyLast.totals.events) events, $($verifyLast.totals.records) records; archival $(if ($verifyLast.pass) { 'permitted' } else { 'held' })); last $($verifyLast.at)" }
+else { Write-Output 'ledger: never verified (bin\verify-events.js); 30-day archival held' }
 $names = Get-FleetNames -Live $live -Static $static
 $rows = foreach ($n in $names) {
   $d = $daemon | Where-Object { $_.name -eq $n } | Sort-Object startedAt -Descending | Select-Object -First 1
