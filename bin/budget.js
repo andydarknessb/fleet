@@ -27,6 +27,28 @@ const DEFAULTS = Object.freeze({ warnTokens: 50000, escalateTokens: 75000 });
 // hold is Cory's state and escalated is already a decision; merged and later are done.
 const BUDGET_STATES = Object.freeze(['implementing', 'revision', 'pr-open', 'ci-wait', 'review']);
 
+class BudgetError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'BudgetError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+// fleet#4: budget.js is a single-command binary - run-pr-watch.ps1 and status.ps1
+// (the only callers) invoke it as `node budget.js --root <path>`, with no subcommand
+// word - so FLAGS has exactly one entry, kept as a command-keyed object per the
+// fleet#4 convention the other binaries share. Before this a typo'd flag (e.g.
+// --tenent, --leave instead of --live, --claude_home) fell into
+// workState.parseArgs's unschema'd bucket and was silently ignored: applyBudgets
+// ran anyway against the defaults, measuring and - under budget-live - escalating
+// real Work records on a mistyped invocation. Dangerous in exactly one direction
+// on the watch tick, so a wrong flag must refuse before any measurement or write.
+const FLAGS = Object.freeze({
+  tick: Object.freeze(['root', 'tenant', 'claude-home', 'now', 'live', 'no-notifier']),
+});
+
 function baseOf(root) { return path.resolve(root || path.join(__dirname, '..')); }
 function stripBom(text) { return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text; }
 function readJson(file, fallback) {
@@ -141,8 +163,22 @@ async function applyBudgets({ root, claudeHome, tenant, now, live, actor = 'budg
   return summary;
 }
 
-async function main(argv) {
-  const args = parseArgs(argv);
+function parseCliArgs(argv) {
+  const command = 'tick';
+  const flags = FLAGS[command];
+  if (!flags) throw new BudgetError('USAGE', `unknown command '${command}'; commands: ${Object.keys(FLAGS).join(', ')}`);
+  try {
+    return parseArgs(argv, flags);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new BudgetError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
+}
+
+async function cli(argv) {
+  // Refuse before any measurement or write (fleet#4): parseCliArgs runs and
+  // either throws or returns before applyBudgets does any I/O.
+  const args = parseCliArgs(argv);
   const base = baseOf(args.root);
   let tenant = args.tenant || null;
   if (!tenant) {
@@ -151,14 +187,24 @@ async function main(argv) {
   }
   const home = args['claude-home'] || path.join(process.env.USERPROFILE || process.env.HOME || '', '.claude');
   const summary = await applyBudgets({ root: base, claudeHome: home, tenant, now: args.now, live: args.live === 'true', notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier });
-  process.stdout.write(`${JSON.stringify({ at: summary.at, mode: summary.mode, measured: summary.records.filter((r) => r.jobTokens !== null).length, unmeasured: summary.records.filter((r) => r.decision === 'unmeasured').length, warn: summary.records.filter((r) => r.decision === 'warn').length, escalate: summary.records.filter((r) => r.decision === 'escalate').length, applied: summary.records.filter((r) => r.applied).length, errors: summary.records.filter((r) => r.error).map((r) => `${r.id}: ${r.error}`) })}\n`);
+  return { at: summary.at, mode: summary.mode, measured: summary.records.filter((r) => r.jobTokens !== null).length, unmeasured: summary.records.filter((r) => r.decision === 'unmeasured').length, warn: summary.records.filter((r) => r.decision === 'warn').length, escalate: summary.records.filter((r) => r.decision === 'escalate').length, applied: summary.records.filter((r) => r.applied).length, errors: summary.records.filter((r) => r.error).map((r) => `${r.id}: ${r.error}`) };
 }
 
 if (require.main === module) {
-  main(process.argv.slice(2)).catch((error) => {
+  cli(process.argv.slice(2)).then((digest) => {
+    process.stdout.write(`${JSON.stringify(digest)}\n`);
+  }).catch((error) => {
+    if (error.code === 'USAGE') {
+      // A refused invocation writes nothing to stdout and exits 2, so a caller
+      // reading only the status cannot mistake it for a measured tick (fleet#4,
+      // mirroring review-policy.js classify's fleet#2 fix).
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+      process.exitCode = 2;
+      return;
+    }
     process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
     process.exitCode = 1;
   });
 }
 
-module.exports = { BUDGET_STATES, applyBudgets, budgetConfig, decide, isLive, rosterSession };
+module.exports = { BUDGET_STATES, BudgetError, FLAGS, applyBudgets, budgetConfig, cli, decide, isLive, rosterSession };
