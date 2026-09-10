@@ -445,12 +445,32 @@ function isWatchOff(root) {
   return fs.existsSync(path.join(path.resolve(root || path.resolve(__dirname, '..')), 'state', 'flags', 'pr-watch-off'));
 }
 
-function main(argv) {
-  const args = workState.parseArgs(argv);
+class PrWatchError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'PrWatchError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+// fleet#4: the flags each command accepts, so a typo'd flag is refused instead of
+// falling into a bucket nothing reads. `watch` is the only command this binary has
+// (it is invoked with flags only, never a subcommand word); it is still spelled out
+// as a per-command map, matching review-policy.js's CLASSIFY_FLAGS shape, so a
+// second command has somewhere to declare its own flags rather than widening this one.
+const FLAGS = {
+  watch: ['root', 'tenant', 'gh', 'dry-run', 'no-notifier'],
+};
+
+function commandList() {
+  return Object.keys(FLAGS).join(', ');
+}
+
+function runWatchCommand(args) {
   const base = path.resolve(args.root || path.resolve(__dirname, '..'));
   if (isWatchOff(base)) {
-    process.stdout.write(`${JSON.stringify({ ok: true, skipped: true, reason: 'state/flags/pr-watch-off stands: CI watching is disabled; remove the flag to resume' })}\n`);
-    return;
+    return { ok: true, skipped: true, reason: 'state/flags/pr-watch-off stands: CI watching is disabled; remove the flag to resume' };
   }
   const tenantDir = path.join(base, 'tenants');
   let tenantName = args.tenant || null;
@@ -460,24 +480,54 @@ function main(argv) {
     tenantName = path.basename(files[0], '.json');
   }
   const tenantConfig = JSON.parse(fs.readFileSync(path.join(tenantDir, `${tenantName}.json`), 'utf8'));
-  const health = runWatch({
+  return runWatch({
     root: base, tenantName, tenantConfig,
     fetchers: makeFetchers(tenantConfig.github, args.gh || 'gh'),
     dryRun: args['dry-run'] === 'true',
     notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
   });
-  process.stdout.write(`${JSON.stringify(health)}\n`);
-  if (!health.ok) process.exitCode = 1;
+}
+
+// No caller ever passes a command word (every invocation is flags only), so a
+// leading non-flag token is only ever a typo; anything else defaults to `watch`.
+function cli(argv) {
+  const first = argv[0];
+  const hasCommand = typeof first === 'string' && first !== '' && !first.startsWith('--');
+  const command = hasCommand ? first : 'watch';
+  const rest = hasCommand ? argv.slice(1) : argv;
+  const flags = FLAGS[command];
+  if (!flags) throw new PrWatchError('USAGE', `unknown command '${command}'; commands: ${commandList()}`);
+  let args;
+  try {
+    args = workState.parseArgs(rest, flags);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new PrWatchError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
+  if (command === 'watch') return runWatchCommand(args);
+  throw new PrWatchError('USAGE', `unknown command '${command}'; commands: ${commandList()}`);
 }
 
 if (require.main === module) {
-  try { main(process.argv.slice(2)); } catch (error) {
-    process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
-    process.exitCode = 1;
+  try {
+    const health = cli(process.argv.slice(2));
+    process.stdout.write(`${JSON.stringify(health)}\n`);
+    if (health && health.ok === false) process.exitCode = 1;
+  } catch (error) {
+    if (error.code === 'USAGE') {
+      // A refused invocation exits 2 so the watcher (a scheduled tick) never mistakes
+      // a usage refusal for a tick failure - the two must stay distinguishable (fleet#4).
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+      process.exitCode = 2;
+    } else {
+      process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
+      process.exitCode = 1;
+    }
   }
 }
 
 module.exports = {
   evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
   stableStringify, closingLinked, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain,
+  cli, FLAGS, PrWatchError,
 };
