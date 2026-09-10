@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError } = require('../bin/verify-events');
-const { createRecord, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
+const { abandonRecord, createRecord, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
 
 function rootDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-verify-')); }
 function unit(root, issue, chain = []) {
@@ -32,6 +32,7 @@ test('stateAfter reads a state change from every event shape that makes one', ()
   assert.equal(stateAfter({ type: 'shadow-retired' }), 'retired');
   assert.equal(stateAfter({ type: 'assignment-retired' }), 'retired');
   assert.equal(stateAfter({ type: 'assignment-released' }), 'released');
+  assert.equal(stateAfter({ type: 'assignment-abandoned' }), 'abandoned');
   assert.equal(stateAfter({ type: 'pr-observed' }), null);
   assert.equal(stateAfter({ type: 'budget-warning' }), null);
 });
@@ -43,6 +44,19 @@ test('a released untouched reservation is verified separately from terminal arch
   const result = verifyLedger({ root });
   assert.equal(result.pass, true);
   assert.equal(result.totals.released, 1);
+  assert.equal(result.totals.archived, 0);
+  assert.equal(result.totals.orphanedRecordIds, 0);
+});
+
+test('an audited abandonment is verified separately from releases and terminal archives', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-19', tenant: 'endzone', issue: 19, manifestPath: 'm19', idempotencyKey: 'reserve-19', now: '2026-09-09T00:00:00.000Z' });
+  transitionRecord({ root, id: 'endzone:issue-19', expectedRevision: 1, to: 'implementing', idempotencyKey: 'ack-19', now: '2026-09-09T00:01:00.000Z' });
+  abandonRecord({ root, id: 'endzone:issue-19', expectedRevision: 2, idempotencyKey: 'abandon-19', reason: 'session ended', now: '2026-09-09T00:02:00.000Z' });
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, true, JSON.stringify(result.records));
+  assert.equal(result.totals.abandoned, 1);
+  assert.equal(result.totals.released, 0);
   assert.equal(result.totals.archived, 0);
   assert.equal(result.totals.orphanedRecordIds, 0);
 });

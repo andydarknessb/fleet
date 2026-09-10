@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -7,6 +7,7 @@ const test = require('node:test');
 
 const {
   WorkStateError,
+  abandonRecord,
   createRecord,
   getRecord,
   notifyRecord,
@@ -185,6 +186,102 @@ test('release refuses an assigned record that is not an untouched assignment res
     () => releaseRecord({ root, id: 'endzone:issue-44', expectedRevision: 1, idempotencyKey: 'release-44' }),
     (error) => error.code === 'INVALID_RELEASE' && /untouched reservation/.test(error.message),
   );
+});
+
+test('an escalated touched assignment can be abandoned and reserved again with a fresh lineage step', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1136';
+  const first = reserveRecord({
+    root, id, tenant: 'endzone', issue: 1136, manifestPath: 'assignment-1136-a.json',
+    reservations: { components: ['src/game-center'] }, idempotencyKey: 'reserve-1136-a', now: '2026-09-10T04:58:36.000Z',
+  });
+  move(root, id, first.revision, 'implementing', 'ack-1136', 'assignment acknowledged', '2026-09-10T04:58:52.000Z');
+  move(root, id, 2, 'escalated', 'escalate-1136', 'account usage limit', '2026-09-10T04:59:54.000Z');
+
+  const abandoned = abandonRecord({
+    root, id, expectedRevision: 3, idempotencyKey: 'abandon-1136', actor: 'cory',
+    reason: 'IC stopped on an account usage limit before writing code', evidence: 'endzone#1136 ruling', now: '2026-09-10T14:07:41.000Z',
+  });
+
+  assert.equal(abandoned.record.state, 'abandoned');
+  assert.equal(abandoned.record.abandonment.from, 'escalated');
+  assert.equal(abandoned.record.abandonment.reason, 'IC stopped on an account usage limit before writing code');
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records), []);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'abandons', 'work-endzone_issue-1136.json')), true);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-1136.json')), false);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-1136.json')), false);
+  assert.equal(getRecord({ root, id }).state, 'abandoned');
+  assert.deepEqual(reservationBaseline({ root, id }), { revision: 5, eventSequence: 5, reused: true });
+
+  const second = reserveRecord({
+    root, id, tenant: 'endzone', issue: 1136, manifestPath: 'assignment-1136-r5.json',
+    reservations: { components: ['src/game-center'] }, idempotencyKey: 'reserve-1136-b', now: '2026-09-10T14:10:00.000Z',
+  });
+  assert.equal(second.revision, 5);
+  assert.equal(second.eventSequence, 5);
+  assert.equal(second.record.state, 'assigned');
+  assert.equal(second.record.createdAt, first.record.createdAt);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'abandons', 'work-endzone_issue-1136.json')), false);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'abandons', 'history', 'work-endzone_issue-1136-through-4.json')), true);
+  const events = readEvents(root).filter((event) => event.recordId === id);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5]);
+  assert.equal(events[3].type, 'assignment-abandoned');
+  assert.equal(events[3].changes.reason, 'IC stopped on an account usage limit before writing code');
+});
+
+test('abandon requires a touched attempt and a reason, while the abandoned attempt consumes no assignment slot', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-40';
+  reserveRecord({ root, id, tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: { components: ['a'] }, idempotencyKey: 'reserve-40', now: '2026-09-10T00:00:00.000Z' });
+  assert.throws(
+    () => abandonRecord({ root, id, expectedRevision: 1, idempotencyKey: 'abandon-untouched', reason: 'no work ran' }),
+    (error) => error.code === 'INVALID_ABANDON' && /must be released/.test(error.message),
+  );
+  move(root, id, 1, 'implementing', 'ack-40', 'ack', '2026-09-10T00:00:01.000Z');
+  assert.throws(
+    () => move(root, id, 2, 'abandoned', 'transition-abandon-40', 'bypass', '2026-09-10T00:00:01.500Z'),
+    (error) => error.code === 'INVALID_TRANSITION',
+  );
+  assert.throws(
+    () => abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-no-reason' }),
+    (error) => error.code === 'MISSING_ABANDON_REASON',
+  );
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-40', reason: 'worker ended', now: '2026-09-10T00:00:02.000Z' });
+
+  reserveRecord({ root, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: { components: ['b'] }, idempotencyKey: 'reserve-41', now: '2026-09-10T00:00:03.000Z' });
+  reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['c'] }, idempotencyKey: 'reserve-42', now: '2026-09-10T00:00:04.000Z' });
+  const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+  assert.deepEqual(Object.keys(active.records).sort(), ['endzone:issue-41', 'endzone:issue-42']);
+});
+
+test('abandonment journal recovery stores one reusable snapshot and replays the same command', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-46';
+  reserveRecord({ root, id, tenant: 'endzone', issue: 46, manifestPath: 'm46', idempotencyKey: 'reserve-46', now: '2026-09-10T00:00:00.000Z' });
+  move(root, id, 1, 'implementing', 'ack-46', 'ack', '2026-09-10T00:00:01.000Z');
+  assert.throws(
+    () => abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-46', reason: 'worker stopped', now: '2026-09-10T00:00:02.000Z', killPoint: 'after-event' }),
+    (error) => error.code === 'KILL_POINT',
+  );
+  assert.equal(getRecord({ root, id }).state, 'abandoned');
+  const replay = abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-46', reason: 'worker stopped' });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.eventSequence, 3);
+  assert.equal(readEvents(root).filter((event) => event.recordId === id && event.type === 'assignment-abandoned').length, 1);
+});
+
+test('the CLI abandon door records the reason and permits a fresh reservation', () => {
+  const root = rootDir();
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  const run = (...args) => JSON.parse(execFileSync(process.execPath, [script, ...args], { encoding: 'utf8' }));
+  const first = run('reserve', '--root', root, '--id', 'endzone:issue-47', '--tenant', 'endzone', '--issue', '47', '--manifest', 'm47', '--idempotency-key', 'reserve-47');
+  const started = run('transition', '--root', root, '--id', 'endzone:issue-47', '--to', 'implementing', '--expected-revision', String(first.revision), '--idempotency-key', 'ack-47');
+  const abandoned = run('abandon', '--root', root, '--id', 'endzone:issue-47', '--expected-revision', String(started.revision), '--idempotency-key', 'abandon-47', '--actor', 'cory', '--reason', 'session ended', '--evidence', 'fleet#11');
+  const second = run('reserve', '--root', root, '--id', 'endzone:issue-47', '--tenant', 'endzone', '--issue', '47', '--manifest', 'm47-r4', '--idempotency-key', 'reserve-47-b');
+  assert.equal(abandoned.record.state, 'abandoned');
+  assert.equal(abandoned.record.abandonment.reason, 'session ended');
+  assert.equal(second.record.state, 'assigned');
+  assert.equal(second.revision, 4);
 });
 
 test('twenty compare-and-swap attempts yield one winner and nineteen conflicts', () => {
@@ -592,4 +689,23 @@ test('shadow projection retires a merged record it did not create once no roster
   assert.equal(archived.record.state, 'retired');
   const events = readEvents(root).filter((event) => event.recordId === 'endzone:issue-838');
   assert.equal(events[events.length - 1].type, 'shadow-retired');
+});
+
+test('shadow projection cannot resurrect an abandoned attempt from its stale roster row', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1136';
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [
+    { name: 'ic-1136', role: 'ic', tenant: 'endzone', issue: 1136, status: 'active', sessionId: 'dead-session' },
+  ] }));
+  reserveRecord({ root, id, tenant: 'endzone', issue: 1136, manifestPath: 'm1136', idempotencyKey: 'reserve-1136', now: '2026-09-10T00:00:00.000Z' });
+  move(root, id, 1, 'implementing', 'ack-1136', 'ack', '2026-09-10T00:00:01.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1136', reason: 'session died', now: '2026-09-10T00:00:02.000Z' });
+
+  const result = shadowProject({ root, rosterPath, now: '2026-09-10T00:00:03.000Z' });
+  assert.deepEqual(result.projected, []);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records), []);
+  assert.equal(getRecord({ root, id }).state, 'abandoned');
+  assert.equal(readEvents(root).filter((event) => event.recordId === id).length, 3);
 });

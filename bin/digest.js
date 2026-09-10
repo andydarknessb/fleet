@@ -29,7 +29,7 @@ class DigestError extends Error {
 const DIGEST_FLAGS = ['root', 'tenant', 'output', 'now', 'offset', 'exclusions-offset', 'dry-run', 'print'];
 
 const { DECISION_STATES } = workState;
-const ACTIVE_STATES = Object.freeze(workState.STATES.filter((state) => state !== 'retired'));
+const ACTIVE_STATES = Object.freeze(workState.STATES.filter((state) => !['retired', 'released', 'abandoned'].includes(state)));
 const MERGED_LIMIT = 10;
 
 function baseOf(root) {
@@ -68,6 +68,7 @@ function foldLedger(events, { supplement = {} } = {}) {
     if (changes.prNumber) row.prNumber = changes.prNumber;
     if (CREATION_TYPES.includes(event.type)) { row.state = changes.state || row.state; row.enteredStateAt = event.at; }
     else if (RETIRED_TYPES.includes(event.type)) { row.state = 'retired'; row.enteredStateAt = event.at; }
+    else if (event.type === 'assignment-abandoned') { row.state = 'abandoned'; row.enteredStateAt = event.at; }
     else if (event.type === 'shadow-retiring') { row.state = 'retiring'; row.enteredStateAt = event.at; }
     else if (event.type.startsWith('state-')) {
       row.state = event.type.slice('state-'.length);

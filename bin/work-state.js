@@ -6,7 +6,7 @@ const { execFileSync } = require('node:child_process');
 
 const STATES = Object.freeze([
   'assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision',
-  'hold', 'merged', 'retiring', 'retired', 'released', 'escalated',
+  'hold', 'merged', 'retiring', 'retired', 'released', 'abandoned', 'escalated',
 ]);
 
 const TRANSITIONS = Object.freeze({
@@ -19,9 +19,10 @@ const TRANSITIONS = Object.freeze({
   hold: ['merged', 'escalated'],
   merged: ['retiring', 'escalated'],
   retiring: ['retired', 'escalated'],
-  escalated: STATES.filter((state) => state !== 'escalated'),
+  escalated: STATES.filter((state) => !['escalated', 'abandoned'].includes(state)),
   retired: [],
   released: [],
+  abandoned: [],
 });
 
 // Ticket 07: the events that mean "a human decision is needed". escalated is the
@@ -66,13 +67,14 @@ function paths(root) {
     events: path.join(base, 'state', 'events'),
     archive: path.join(base, 'state', 'archive'),
     releases: path.join(base, 'state', 'releases'),
+    abandons: path.join(base, 'state', 'abandons'),
     status: path.join(base, 'state', 'status'),
   };
 }
 
 function ensureLayout(root) {
   const p = paths(root);
-  for (const directory of [p.state, p.work, p.pending, p.events, p.archive, p.releases, p.status]) {
+  for (const directory of [p.state, p.work, p.pending, p.events, p.archive, p.releases, p.abandons, p.status]) {
     fs.mkdirSync(directory, { recursive: true });
   }
   if (!fs.existsSync(p.active)) writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
@@ -240,6 +242,16 @@ function releaseHistoryFile(p, record) {
   return path.join(p.releases, 'history', `work-${safe}-through-${record.eventSequence}.json`);
 }
 
+function abandonFile(p, recordId) {
+  const safe = String(recordId).replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return path.join(p.abandons, `work-${safe}.json`);
+}
+
+function abandonHistoryFile(p, record) {
+  const safe = String(record.id).replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return path.join(p.abandons, 'history', `work-${safe}-through-${record.eventSequence}.json`);
+}
+
 function isWithin(child, parent) {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
@@ -284,15 +296,31 @@ function storeReleasedRecord(p, record) {
   cleanupEphemeral(p, record);
 }
 
+function storeAbandonedRecord(p, record) {
+  writeAtomicJson(abandonFile(p, record.id), {
+    schemaVersion: 1,
+    abandonedAt: record.updatedAt,
+    record,
+    eventFiles: recordEventFiles(p, record),
+  });
+  cleanupEphemeral(p, record);
+}
+
 function preserveReusableSnapshot(p, reusable) {
   if (!reusable) return;
-  const source = reusable.kind === 'legacy-archive' ? archiveFile(p, reusable.record.id) : releaseFile(p, reusable.record.id);
-  const destination = releaseHistoryFile(p, reusable.record);
+  const source = reusable.kind === 'legacy-archive'
+    ? archiveFile(p, reusable.record.id)
+    : reusable.kind === 'abandonment' ? abandonFile(p, reusable.record.id) : releaseFile(p, reusable.record.id);
+  const destination = reusable.kind === 'abandonment'
+    ? abandonHistoryFile(p, reusable.record)
+    : releaseHistoryFile(p, reusable.record);
+  const missingCode = reusable.kind === 'abandonment' ? 'ABANDON_SNAPSHOT_MISSING' : 'RELEASE_SNAPSHOT_MISSING';
+  const historyCode = reusable.kind === 'abandonment' ? 'ABANDON_HISTORY_EXISTS' : 'RELEASE_HISTORY_EXISTS';
   if (!fs.existsSync(source)) {
     if (fs.existsSync(destination)) return;
-    throw new WorkStateError('RELEASE_SNAPSHOT_MISSING', `reusable release snapshot for '${reusable.record.id}' disappeared`);
+    throw new WorkStateError(missingCode, `reusable ${reusable.kind} snapshot for '${reusable.record.id}' disappeared`);
   }
-  if (fs.existsSync(destination)) throw new WorkStateError('RELEASE_HISTORY_EXISTS', `release history already exists for '${reusable.record.id}' sequence ${reusable.record.eventSequence}`);
+  if (fs.existsSync(destination)) throw new WorkStateError(historyCode, `reusable ${reusable.kind} history already exists for '${reusable.record.id}' sequence ${reusable.record.eventSequence}`);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.renameSync(source, destination);
 }
@@ -318,6 +346,24 @@ function reusableReleasedRecord(p, recordId) {
   return null;
 }
 
+function reusableAbandonedRecord(p, recordId) {
+  const events = eventLines(p);
+  const abandoned = readJson(abandonFile(p, recordId));
+  const record = abandoned?.record;
+  if (!record || record.state !== 'abandoned' || !record.abandonment?.reason) return null;
+  const lineage = events.filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
+  const last = lineage[lineage.length - 1];
+  if (lineage.length !== Number(record.eventSequence)
+    || last?.type !== 'assignment-abandoned'
+    || Number(last.sequence) !== Number(record.eventSequence)
+    || last.changes?.to !== 'abandoned') return null;
+  return { kind: 'abandonment', record };
+}
+
+function reusableWorkRecord(p, recordId) {
+  return reusableReleasedRecord(p, recordId) || reusableAbandonedRecord(p, recordId);
+}
+
 function recoverPendingUnlocked(p) {
   const files = fs.readdirSync(p.pending).filter((name) => name.endsWith('.json')).sort();
   for (const file of files) {
@@ -335,14 +381,15 @@ function recoverPendingUnlocked(p) {
     appendEvent(p, journal.event);
     if (journal.supersedeReusable) preserveReusableSnapshot(p, journal.supersedeReusable);
     if (journal.releasedRecord) storeReleasedRecord(p, journal.releasedRecord);
+    if (journal.abandonedRecord) storeAbandonedRecord(p, journal.abandonedRecord);
     if (journal.archiveRecord) archiveRecord(p, journal.archiveRecord);
     fs.rmSync(journalPath, { force: true });
   }
 }
 
-function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive = null, releasedRecord = null, supersedeReusable = null, killPoint }) {
+function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive = null, releasedRecord = null, abandonedRecord = null, supersedeReusable = null, killPoint }) {
   const journalPath = pendingFile(p, recordId, event.idempotencyKey);
-  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, supersedeReusable });
+  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable });
   if (killPoint === 'after-journal') throw new WorkStateError('KILL_POINT', 'stopped after journal write');
   const active = activeState(p);
   if (afterRecord === null) delete active.records[recordId];
@@ -353,9 +400,10 @@ function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archive
   if (killPoint === 'after-event') throw new WorkStateError('KILL_POINT', 'stopped after event append');
   if (supersedeReusable) preserveReusableSnapshot(p, supersedeReusable);
   if (releasedRecord) storeReleasedRecord(p, releasedRecord);
+  if (abandonedRecord) storeAbandonedRecord(p, abandonedRecord);
   if (recordToArchive) archiveRecord(p, recordToArchive);
   fs.rmSync(journalPath, { force: true });
-  return afterRecord || releasedRecord || recordToArchive;
+  return afterRecord || releasedRecord || abandonedRecord || recordToArchive;
 }
 
 function requireIdempotency(value) {
@@ -453,9 +501,10 @@ function reservationBaseline(options = {}) {
     const id = String(options.id);
     const active = activeState(p);
     if (active.records[id]) throw new WorkStateError('RECORD_EXISTS', `record '${id}' already exists`);
-    const reusable = reusableReleasedRecord(p, id);
+    const reusable = reusableWorkRecord(p, id);
     if (fs.existsSync(archiveFile(p, id)) && !reusable) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is terminally archived and cannot be reused`);
     if (fs.existsSync(releaseFile(p, id)) && !reusable) throw new WorkStateError('RELEASE_NOT_REUSABLE', `released record '${id}' does not prove an untouched reservation`);
+    if (fs.existsSync(abandonFile(p, id)) && !reusable) throw new WorkStateError('ABANDON_NOT_REUSABLE', `abandoned record '${id}' does not have a valid audited abandonment`);
     return reusable
       ? { revision: reusable.record.revision + 1, eventSequence: reusable.record.eventSequence + 1, reused: true }
       : { revision: 1, eventSequence: 1, reused: false };
@@ -474,9 +523,10 @@ function reserveRecord(options = {}) {
       if (replay) return replay;
       throw new WorkStateError('RECORD_EXISTS', `record '${id}' already exists`);
     }
-    const reusable = reusableReleasedRecord(p, id);
+    const reusable = reusableWorkRecord(p, id);
     if (fs.existsSync(archiveFile(p, id)) && !reusable) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is terminally archived and cannot be reused`);
     if (fs.existsSync(releaseFile(p, id)) && !reusable) throw new WorkStateError('RELEASE_NOT_REUSABLE', `released record '${id}' does not prove an untouched reservation`);
+    if (fs.existsSync(abandonFile(p, id)) && !reusable) throw new WorkStateError('ABANDON_NOT_REUSABLE', `abandoned record '${id}' does not have a valid audited abandonment`);
     const activeAssignments = Object.values(active.records).filter((record) => record.manifestPath && record.state !== 'retired');
     const expectedProof = {
       independent: true,
@@ -539,6 +589,49 @@ function releaseRecord(options = {}) {
   });
 }
 
+function abandonRecord(options = {}) {
+  const root = asRoot(options.root);
+  const key = requireIdempotency(options.idempotencyKey);
+  return withLock(root, (p) => {
+    const active = activeState(p);
+    const record = active.records[String(options.id)];
+    if (!record) {
+      const abandoned = readJson(abandonFile(p, options.id))?.record;
+      const replay = abandoned && replayIfKnown(abandoned, key);
+      if (replay) return replay;
+      throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    }
+    const replay = replayIfKnown(record, key);
+    if (replay) return replay;
+    if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
+    const reason = String(options.reason || '').trim();
+    if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
+    if (['merged', 'retiring'].includes(record.state)) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state} and must complete retirement`);
+    const lineage = eventLines(p).filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
+    const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
+    const currentAttemptEvents = lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
+    if (currentAttemptEvents.length === 0) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
+    const now = isoNow(options.now);
+    const actor = options.actor || 'fleet-operator';
+    const next = {
+      ...record,
+      state: 'abandoned',
+      revision: record.revision + 1,
+      eventSequence: record.eventSequence + 1,
+      updatedAt: now,
+      abandonment: { from: record.state, reason, actor, at: now },
+      idempotency: { ...record.idempotency },
+    };
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'assignment-abandoned' };
+    const event = eventFor(next, {
+      type: 'assignment-abandoned', actor, at: now, idempotencyKey: key,
+      evidence: options.evidence, changes: { from: record.state, to: 'abandoned', reason },
+    });
+    const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, abandonedRecord: next, event, killPoint: options.killPoint });
+    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+  });
+}
+
 function createRecord(options = {}) {
   const root = asRoot(options.root);
   const key = requireIdempotency(options.idempotencyKey || `create-${options.id || ''}`);
@@ -552,6 +645,7 @@ function createRecord(options = {}) {
     }
     if (fs.existsSync(archiveFile(p, options.id))) throw new WorkStateError('RECORD_ARCHIVED', `record '${options.id}' is archived and cannot be reused`);
     if (fs.existsSync(releaseFile(p, options.id))) throw new WorkStateError('RECORD_RELEASED', `record '${options.id}' was released; only reserve can reuse it`);
+    if (fs.existsSync(abandonFile(p, options.id))) throw new WorkStateError('RECORD_ABANDONED', `record '${options.id}' was abandoned; only reserve can reuse it`);
     const now = isoNow(options.now);
     const record = baseRecord({ ...options, now });
     record.idempotency[key] = { revision: 1, eventSequence: 1, type: options.shadow ? 'shadow-projected' : 'work-created' };
@@ -927,6 +1021,8 @@ function getRecord(options = {}) {
     if (archived) return archived.record;
     const released = readJson(releaseFile(p, id));
     if (released) return released.record;
+    const abandoned = readJson(abandonFile(p, id));
+    if (abandoned) return abandoned.record;
     throw new WorkStateError('NOT_FOUND', `record '${id}' was not found`);
   });
 }
@@ -947,6 +1043,12 @@ function projectStatus(options = {}) {
       for (const file of fs.readdirSync(p.releases).filter((name) => name.endsWith('.json'))) {
         const released = readJson(path.join(p.releases, file));
         if (released?.record) tenantsByRecord.set(released.record.id, released.record.tenant);
+      }
+    }
+    if (fs.existsSync(p.abandons)) {
+      for (const file of fs.readdirSync(p.abandons).filter((name) => name.endsWith('.json'))) {
+        const abandoned = readJson(path.join(p.abandons, file));
+        if (abandoned?.record) tenantsByRecord.set(abandoned.record.id, abandoned.record.tenant);
       }
     }
     const records = Object.values(active.records)
@@ -1044,6 +1146,10 @@ function shadowProject(options = {}) {
         projected.push(active.records[id]);
         continue;
       }
+      // An abandoned attempt stays ended even if its dead IC's roster row is
+      // stale. A later assignment re-enters through reserve first, so it has an
+      // active record by the time the new session can appear here.
+      if (fs.existsSync(abandonFile(p, id))) continue;
       const now = isoNow(options.now);
       const key = `shadow:${id}:${row.sessionId || row.name || 'unknown'}`;
       const record = baseRecord({
@@ -1107,6 +1213,7 @@ function cli(argv) {
     github: args['issue-url'] ? { issueNumber: Number(args.issue), issueUrl: args['issue-url'], bodyHash: args['body-hash'] } : undefined,
   });
   if (command === 'release') return releaseRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']) });
+  if (command === 'abandon') return abandonRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']), reason: args.reason, killPoint: args['kill-point'] });
   if (command === 'transition') {
     const result = transitionRecord({
       ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
@@ -1150,7 +1257,7 @@ function cli(argv) {
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
   if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
-  throw new WorkStateError('USAGE', 'commands: create, reserve, release, transition, reconcile, observe, review, notify, get, shadow, project');
+  throw new WorkStateError('USAGE', 'commands: create, reserve, release, abandon, transition, reconcile, observe, review, notify, get, shadow, project');
 }
 
 module.exports = {
@@ -1161,6 +1268,7 @@ module.exports = {
   STATES,
   TRANSITIONS,
   WorkStateError,
+  abandonRecord,
   createRecord,
   enteringEvent,
   getRecord,

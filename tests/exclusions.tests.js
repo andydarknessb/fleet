@@ -117,7 +117,7 @@ test('a recheck issue is scoped to the exclusion tenant; another tenant merging 
 test('a recheck event must be a type the ledger can carry', () => {
   const root = rootDir();
   assert.throws(() => addExclusion({ root, tenant: 'endzone', ...BASE, recheck: { event: { type: 'state-mergd' } } }), { code: 'EXCLUSION_INVALID' });
-  for (const type of ['state-merged', 'state-retired', 'exclusion-lifted', 'shadow-retired', 'assignment-released']) {
+  for (const type of ['state-merged', 'state-retired', 'exclusion-lifted', 'shadow-retired', 'assignment-released', 'assignment-abandoned']) {
     addExclusion({ root, tenant: 'endzone', issue: 1000 + type.length, reason: 'r', evidence: 'e', owner: 'o', actor: 'test', recheck: { event: { type } } });
   }
 });
