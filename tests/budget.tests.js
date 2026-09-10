@@ -10,7 +10,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { applyBudgets, budgetConfig, isLive, BUDGET_STATES } = require('../bin/budget');
+const { spawnSync } = require('node:child_process');
+const { applyBudgets, budgetConfig, isLive, BUDGET_STATES, cli, FLAGS, BudgetError } = require('../bin/budget');
 const { createRecord, transitionRecord, getRecord, readEvents, recordBudget } = require('../bin/work-state');
 
 function rootDir(config) {
@@ -200,6 +201,90 @@ test('records outside the budget states, without a roster session, or without a 
 });
 
 // The warning-only soak: escalateTokens null records warnings and escalates nothing.
+// --- fleet#4: budget.js refuses unknown flags with a per-command schema ----
+// budget.js is a single-command binary (FLAGS.tick is its one entry - the
+// binary runs unconditionally off the watch tick, with no subcommand word).
+// Before this a typo'd flag (e.g. --tenant-name for --tenant, --live-mode for
+// --live) fell into workState.parseArgs's unschema'd bucket and applyBudgets
+// ran anyway against the defaults, on the tick that escalates real Work
+// records under budget-live. Every case goes through `cli`, the same door
+// require.main uses.
+//
+// Red-tell: revert bin/budget.js and `cli`/`FLAGS`/`BudgetError` are no
+// longer exported, so every case below fails instead of asserting USAGE.
+
+function budgetCliRoot() {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone' }));
+  return root;
+}
+
+test('cli: an unknown flag is refused as USAGE naming the flag and the accepted set, nothing written', async () => {
+  const root = budgetCliRoot();
+  await assert.rejects(
+    cli(['--root', root, '--tenant', 'endzone', '--tenant-name', 'endzone']),
+    (error) => {
+      assert.ok(error instanceof BudgetError, `expected BudgetError, got ${error && error.name}: ${error && error.message}`);
+      assert.equal(error.code, 'USAGE');
+      assert.match(error.message, /unknown flag --tenant-name/);
+      assert.equal(error.flag, 'tenant-name');
+      assert.deepEqual(error.accepted, FLAGS.tick);
+      return true;
+    },
+  );
+  assert.equal(fs.existsSync(path.join(root, 'state', 'budget', 'last.json')), false, 'a refused invocation writes nothing, not even the projection');
+  assert.equal(readEvents(root).length, 0, 'a refused invocation writes no events');
+});
+
+test('cli: a second confusable flag (--live-mode for --live) is also refused', async () => {
+  const root = budgetCliRoot();
+  await assert.rejects(cli(['--root', root, '--tenant', 'endzone', '--live-mode', 'true']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --live-mode/);
+    return true;
+  });
+  assert.equal(fs.existsSync(path.join(root, 'state', 'budget', 'last.json')), false);
+});
+
+test('cli: the refusal names every flag in FLAGS.tick', async () => {
+  const root = budgetCliRoot();
+  await assert.rejects(cli(['--root', root, '--nope', 'x']), (error) => {
+    for (const flag of FLAGS.tick) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: a correct invocation still runs the tick and returns the same digest shape as before', async () => {
+  const root = budgetCliRoot();
+  rosterIc(root, 60, 's60'); transcript(root, 's60', [[10000, 5000]]);
+  const id = unit(root, 60);
+  const digest = await cli(['--root', root, '--tenant', 'endzone', '--claude-home', claudeHome(root), '--now', '2026-09-09T01:00:00.000Z']);
+  assert.equal(digest.mode, 'shadow');
+  assert.equal(digest.measured, 1);
+  assert.equal(digest.unmeasured, 0);
+  assert.equal(digest.warn, 0);
+  assert.equal(digest.escalate, 0);
+  assert.equal(digest.applied, 0);
+  assert.deepEqual(digest.errors, []);
+  const last = JSON.parse(fs.readFileSync(path.join(root, 'state', 'budget', 'last.json'), 'utf8'));
+  assert.equal(last.records[0].id, id);
+});
+
+test('cli: the process exits 2 on a typo and writes the refusal to stderr, nothing on stdout', () => {
+  const root = budgetCliRoot();
+  const bin = path.join(__dirname, '..', 'bin', 'budget.js');
+  const typo = spawnSync(process.execPath, [bin, '--root', root, '--tenant', 'endzone', '--tenant-name', 'endzone'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stdout, '');
+  const parsed = JSON.parse(typo.stderr);
+  assert.equal(parsed.code, 'USAGE');
+  assert.match(parsed.message, /unknown flag --tenant-name/);
+  const ok = spawnSync(process.execPath, [bin, '--root', root, '--tenant', 'endzone'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(ok.status, 0);
+  assert.equal(JSON.parse(ok.stdout).mode, 'shadow');
+});
+
 test('warning-only: escalateTokens null warns, never escalates, and reports the mode', async () => {
   const root = rootDir({ escalateTokens: null });
   fs.writeFileSync(path.join(root, 'state', 'flags', 'budget-live'), 'x');
