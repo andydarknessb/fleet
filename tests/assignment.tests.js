@@ -10,10 +10,12 @@ const {
   buildLaunchPlan,
   invalidateManifest,
   launchReservedAssignment,
+  normalizeIssue,
   queryGithubIssues,
   resolveRemoteBase,
   reserveAssignment,
   selectFrontier,
+  sha256,
   validateManifest,
 } = require('../bin/assignment');
 const { getRecord, reserveRecord } = require('../bin/work-state');
@@ -90,9 +92,14 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'));
   assert.equal(manifest.issue.body, undefined);
   assert.equal(manifest.issue.bodyHash.length, 64);
+  assert.equal(manifest.issue.criteriaHash.length, 64);
+  assert.equal(manifest.issue.commentCount, 0);
   assert.equal(manifest.workRecordId, 'endzone:issue-42');
   assert.equal(manifest.base.sha, 'a'.repeat(40));
-  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'assigned');
+  const record = getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.state, 'assigned');
+  assert.equal(record.github.criteriaHash, manifest.issue.criteriaHash);
+  assert.equal(record.github.commentCount, 0);
   assert.throws(() => fs.writeFileSync(result.manifestPath, '{}', { flag: 'wx' }), /EEXIST/);
   const launch = launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true });
   assert.equal(launch.dryRun, true);
@@ -137,29 +144,107 @@ test('base resolution fetches the remote ref before reading its SHA', () => {
   assert.equal(calls[1][1][2], 'rev-parse');
 });
 
+test('a comment-only correction invalidates the manifest criteria', () => {
+  const root = rootDir();
+  const original = issue(44, { comments: [{ id: 'comment-1', createdAt: '2026-09-01T00:00:00Z', body: 'Use the original ruling.' }] });
+  const result = reserveAssignment({
+    root, issue: original, tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'b'.repeat(40) }, now: '2026-09-01T00:00:00.000Z',
+  });
+  const corrected = issue(44, { comments: [{ id: 'comment-1', createdAt: '2026-09-01T00:00:00Z', body: 'CORRECTION: use the replacement ruling.' }] });
+  const validation = validateManifest({ manifest: result.manifest, issue: corrected, base: { sha: 'b'.repeat(40) } });
+  assert.equal(validation.valid, false);
+  assert.deepEqual(validation.mismatches.map((mismatch) => mismatch.field), ['issue.criteriaHash']);
+});
+
 test('GitHub detail query carries dependency and sub-issue signals into selection', () => {
   const runner = (executable, args) => {
     assert.equal(args[0], 'api');
+    assert.match(args.find((arg) => String(arg).startsWith('query=')), /comments\(first:100\)/);
     return JSON.stringify({ data: { repository: { issues: { nodes: [{
       number: 44, title: 'Issue 44', url: 'https://github.com/example/repo/issues/44', body: 'criteria', createdAt: '2026-09-01T00:00:00Z', state: 'OPEN',
       labels: { nodes: [{ name: 'ready-for-agent' }] }, assignees: { nodes: [] }, blockedBy: { nodes: [{ number: 12, state: 'OPEN' }] }, subIssues: { nodes: [] },
+      comments: { nodes: [{ id: 'comment-1', createdAt: '2026-09-01T01:00:00Z', body: 'Correction' }], pageInfo: { hasNextPage: false } },
     }] } } } });
   };
   const issues = queryGithubIssues({ repo: 'example/repo', readyLabel: 'ready-for-agent', runner, fetchDetails: true });
   assert.equal(issues[0].dependencies[0].number, 12);
   assert.equal(issues[0].bodyHash.length, 64);
+  assert.equal(issues[0].criteriaHash.length, 64);
+  assert.equal(issues[0].comments[0].body, 'Correction');
+});
+
+test('frontier fails closed when the issue comment thread is truncated', () => {
+  const result = selectFrontier({ issues: [issue(45, { commentsTruncated: true })], readyLabel: 'ready-for-agent' });
+  assert.equal(result.eligible.length, 0);
+  assert.deepEqual(result.excluded[0].reasons.map((reason) => reason.code), ['issue-comments-truncated']);
 });
 
 test('a third assignment requires and records an independence proof', () => {
-  const frontier = { eligible: [issue(50), issue(51), issue(52)] };
+  const frontier = { eligible: [issue(50, { components: ['src/50.js'] }), issue(51, { components: ['src/51.js'] }), issue(52, { components: ['src/52.js'] })] };
   const active = [
-    { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', reservations: {} },
-    { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', reservations: {} },
+    { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', reservations: { components: ['src/40.js'] } },
+    { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', reservations: { components: ['src/41.js'] } },
   ];
   const plan = buildLaunchPlan({ frontier, active, maxIcs: 3 });
   assert.equal(plan.assignments.length, 1);
   assert.equal(plan.thirdProof.independent, true);
   assert.throws(() => reserveAssignment({ root: rootDir(), issue: issue(53), tenant: 'endzone', active, readyLabel: 'ready-for-agent', base: { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) } }), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
+});
+
+test('issue criteria derive typed reservations from body and comment paths', () => {
+  const normalized = normalizeIssue(issue(54, {
+    body: 'Change `src/entities/roster/model/lineupModel.js` and migration `server/db/migrations/20260910000001_roster.js`.',
+    comments: [{ body: 'Export it from `shared/ui`, pin it in `src/entities/roster/model/lineupModel.test.js`, and update the `players` table. Findings artifact: `state/reviews/endzone_issue-54/formal-001.json`.' }],
+  }));
+
+  assert.deepEqual(normalized.reservations, {
+    components: ['src/entities/roster/model/lineupModel.js', 'src/shared/ui'],
+    migrationPrefixes: ['20260910000001'],
+    schemaAreas: ['players'],
+    testResources: ['src/entities/roster/model/lineupModel.test.js'],
+  });
+});
+
+test('legacy active records use matching GitHub criteria for third-assignment proof and conflicts', () => {
+  const activeIssues = [
+    issue(40, { body: 'Owns `src/entities/activity/model/activityModel.js`.' }),
+    issue(41, { body: 'Owns `src/components/common/AbbreviationTooltip.jsx`.' }),
+  ];
+  const active = [
+    { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', github: { bodyHash: sha256(activeIssues[0].body) }, reservations: {} },
+    { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', github: { bodyHash: sha256(activeIssues[1].body) }, reservations: {} },
+  ];
+  const independent = issue(50, { body: 'Owns `docs/adr/0031-island.md`.' });
+  const conflict = issue(51, { body: 'Also changes `src/entities/activity/model/activityModel.js`.' });
+
+  const independentPlan = buildLaunchPlan({ frontier: { eligible: [independent] }, active, issues: [...activeIssues, independent], maxIcs: 3 });
+  assert.equal(independentPlan.assignments.length, 1);
+  assert.equal(independentPlan.thirdProof.independent, true);
+  assert.deepEqual(independentPlan.thirdProof.missingReservations, []);
+
+  const conflictPlan = buildLaunchPlan({ frontier: { eligible: [conflict] }, active, issues: [...activeIssues, conflict], maxIcs: 3 });
+  assert.equal(conflictPlan.assignments.length, 0);
+  assert.equal(conflictPlan.thirdProof.independent, false);
+  assert.deepEqual(conflictPlan.thirdProof.conflicts, [{ left: 40, right: 51 }]);
+
+  const staleActive = [{ ...active[0], github: { bodyHash: '0'.repeat(64) } }, active[1]];
+  const stalePlan = buildLaunchPlan({ frontier: { eligible: [independent] }, active: staleActive, issues: [...activeIssues, independent], maxIcs: 3 });
+  assert.equal(stalePlan.assignments.length, 0);
+  assert.deepEqual(stalePlan.thirdProof.missingReservations, [40]);
+});
+
+test('third-assignment proof still fails closed when criteria name no reservable surface', () => {
+  const issues = [issue(40, { body: 'Change `src/a.js`.' }), issue(41, { body: 'Change `src/b.js`.' }), issue(52, { body: 'Improve the experience.' })];
+  const active = [
+    { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', github: { bodyHash: sha256(issues[0].body) }, reservations: {} },
+    { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', github: { bodyHash: sha256(issues[1].body) }, reservations: {} },
+  ];
+  const plan = buildLaunchPlan({ frontier: { eligible: [issues[2]] }, active, issues, maxIcs: 3 });
+
+  assert.equal(plan.assignments.length, 0);
+  assert.equal(plan.thirdProof.independent, false);
+  assert.deepEqual(plan.thirdProof.missingReservations, [52]);
 });
 
 // 02/03 review 2026-09-06: this tenant runs the fleet under the same GitHub account that

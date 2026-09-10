@@ -35,7 +35,7 @@ if ($Manifest) {
   $Model = [string]$assignment.model
   # A slash command at the head of a launch prompt is a user invocation in the new
   # session, so the IC runs the real /implement (the same convention as a legacy brief).
-  $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $FleetHome\bin\assignment.js ack), then follow the manifest pointers without restating the issue criteria."
+  $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest and the GitHub issue body and comments. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $FleetHome\bin\assignment.js ack), then follow the manifest pointers without restating the issue criteria."
   $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $tenantConfig) { Write-Error "no tenant file for '$Tenant'"; exit 4 }
   $cwd = $tenantConfig.repo
@@ -85,7 +85,7 @@ if ($Manifest) {
     $actualCandidates = @($proof.candidates | ForEach-Object { [int]$_ }) | Sort-Object
     $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
     $actualFields = @($proof.checkedFields | ForEach-Object { [string]$_ }) | Sort-Object
-    $proofValid = $proof -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
+    $proofValid = $proof -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and @($proof.missingReservations).Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
     if (-not $proofValid) { Write-Error 'a third assignment requires a verified independent machine-readable proof'; exit 4 }
   }
 }
@@ -103,7 +103,7 @@ if ($Manifest -and -not $DryRun) {
   $previousOutputEncoding = [Console]::OutputEncoding
   try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    $issueRaw = (& gh issue view $Issue -R $t.github --json state,body 2>&1 | Out-String)
+    $issueRaw = (& gh issue view $Issue -R $t.github --json state,body,comments 2>&1 | Out-String)
   } finally {
     [Console]::OutputEncoding = $previousOutputEncoding
   }
@@ -115,6 +115,18 @@ if ($Manifest -and -not $DryRun) {
   if ($actualBodyHash -ne [string]$assignment.issue.bodyHash) {
     Invalidate-Manifest 'issue body hash changed before acknowledgment'
     Write-Error "issue #$Issue changed after the manifest was created; assignment invalidated"
+    exit 4
+  }
+  $criteriaParts = @([string]$currentIssue.body)
+  foreach ($comment in @($currentIssue.comments | Sort-Object createdAt,id)) {
+    $criteriaParts += @([string]$comment.id, [string]$comment.createdAt, [string]$comment.body)
+  }
+  $criteriaText = $criteriaParts -join [char]0
+  $criteriaHash = [Security.Cryptography.SHA256]::Create()
+  $actualCriteriaHash = [BitConverter]::ToString($criteriaHash.ComputeHash([Text.Encoding]::UTF8.GetBytes($criteriaText))).Replace('-', '').ToLowerInvariant()
+  if ($assignment.issue.criteriaHash -and $actualCriteriaHash -ne [string]$assignment.issue.criteriaHash) {
+    Invalidate-Manifest 'issue criteria changed before acknowledgment'
+    Write-Error "issue #$Issue criteria changed after the manifest was created; assignment invalidated"
     exit 4
   }
 }

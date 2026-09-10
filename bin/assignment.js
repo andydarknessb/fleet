@@ -8,6 +8,7 @@ const {
   RESERVATION_FIELDS,
   WorkStateError,
   getRecord,
+  hasReservationEvidence,
   proofMatches,
   releaseRecord,
   reservationBaseline,
@@ -24,7 +25,44 @@ function normalizeLabels(labels) {
   return (labels || []).map((label) => typeof label === 'string' ? label : label.name).filter(Boolean).map(String);
 }
 
+function normalizeComments(comments) {
+  const values = Array.isArray(comments) ? comments : comments?.nodes || [];
+  return values.map((comment) => ({
+    id: String(comment.id || ''),
+    createdAt: String(comment.createdAt || ''),
+    body: String(comment.body || ''),
+  })).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+}
+
+function criteriaHash(issue) {
+  const parts = [String(issue.body || '')];
+  for (const comment of normalizeComments(issue.comments)) parts.push(comment.id, comment.createdAt, comment.body);
+  return sha256(parts.join('\u0000'));
+}
+
+function derivedReservations(issue) {
+  const reservations = Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, []]));
+  const text = [issue.body, ...normalizeComments(issue.comments).map((comment) => comment.body)].filter(Boolean).join('\n');
+  const pathPattern = /(?:\.github|src|server|docs|bin|hooks|tests|config|tenants|state|scripts|entities|features|widgets|pages|shared)[\\/][A-Za-z0-9_.\-/*{}\[\]\\]+/gi;
+  for (const match of text.matchAll(pathPattern)) {
+    const rawValue = match[0].replaceAll('\\', '/').replace(/[.,;:!?]+$/, '');
+    const value = /^(?:entities|features|widgets|pages|shared)\//i.test(rawValue) ? `src/${rawValue}` : rawValue;
+    if (/^state\/reviews\//i.test(value)) continue;
+    const migration = value.match(/^server\/db\/migrations\/(\d+)/i);
+    if (migration) reservations.migrationPrefixes.push(migration[1]);
+    else if (/(?:^|\/)(?:tests?\/|[^/]*\.tests?\.)/i.test(value)) reservations.testResources.push(value);
+    else reservations.components.push(value);
+  }
+  const tablePatterns = [/(?:the\s+)?`([A-Za-z_][A-Za-z0-9_]*)`\s+table\b/gi, /\btable\s+`([A-Za-z_][A-Za-z0-9_]*)`/gi];
+  for (const pattern of tablePatterns) {
+    for (const match of text.matchAll(pattern)) reservations.schemaAreas.push(match[1]);
+  }
+  return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set(reservations[field])].sort()]));
+}
+
 function normalizeReservations(issue) {
+  const explicit = issue.reservations !== undefined || RESERVATION_FIELDS.some((field) => (issue[field] || []).length);
+  if (!explicit) return derivedReservations(issue);
   const source = issue.reservations || issue;
   return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((source[field] || []).map(String))].sort()]));
 }
@@ -32,6 +70,7 @@ function normalizeReservations(issue) {
 function normalizeIssue(issue) {
   const labels = normalizeLabels(issue.labels);
   const dependencies = issue.dependencies || issue.blockedBy || [];
+  const comments = normalizeComments(issue.comments);
   const unresolvedDependencies = dependencies.filter((dependency) => {
     if (dependency.resolved === true) return false;
     return !['CLOSED', 'MERGED', 'RESOLVED'].includes(String(dependency.state || '').toUpperCase());
@@ -47,7 +86,10 @@ function normalizeIssue(issue) {
     unresolvedDependencies,
     isSpecParent,
     bodyHash: issue.bodyHash || sha256(issue.body || ''),
-    reservations: normalizeReservations(issue),
+    criteriaHash: issue.criteriaHash || criteriaHash({ ...issue, comments }),
+    comments,
+    commentsTruncated: Boolean(issue.commentsTruncated || issue.comments?.pageInfo?.hasNextPage),
+    reservations: normalizeReservations({ ...issue, comments }),
     createdAt: issue.createdAt || '9999-12-31T23:59:59.999Z',
   };
 }
@@ -85,17 +127,32 @@ function independentPair(left, right) {
 
 function independenceProof(issues) {
   const conflicts = [];
+  const issueNumber = (issue) => issue.number ?? issue.issue;
+  const missingReservations = issues.filter((issue) => !hasReservationEvidence(issue.reservations)).map(issueNumber);
   for (let left = 0; left < issues.length; left += 1) {
     for (let right = left + 1; right < issues.length; right += 1) {
-      if (!independentPair(issues[left], issues[right])) conflicts.push({ left: issues[left].number, right: issues[right].number });
+      if (!independentPair(issues[left], issues[right])) conflicts.push({ left: issueNumber(issues[left]), right: issueNumber(issues[right]) });
     }
   }
-  return { independent: conflicts.length === 0, candidates: issues.map((issue) => issue.number ?? issue.issue), checkedFields: [...RESERVATION_FIELDS], conflicts };
+  return { independent: conflicts.length === 0 && missingReservations.length === 0, candidates: issues.map(issueNumber), checkedFields: [...RESERVATION_FIELDS], conflicts, missingReservations };
 }
 
-function buildLaunchPlan({ frontier, active = [], maxIcs = 3 } = {}) {
+function hydrateActiveReservations(active, issues = []) {
+  const byIssue = new Map(issues.map(normalizeIssue).map((issue) => [issue.number, issue]));
+  return activeRecords(active).map((record) => {
+    if (hasReservationEvidence(record.reservations)) return record;
+    const issue = byIssue.get(Number(record.issue));
+    if (!issue || issue.commentsTruncated || !hasReservationEvidence(issue.reservations)) return record;
+    const matchesPin = record.github?.criteriaHash
+      ? record.github.criteriaHash === issue.criteriaHash
+      : record.github?.bodyHash && record.github.bodyHash === issue.bodyHash;
+    return matchesPin ? { ...record, reservations: issue.reservations } : record;
+  });
+}
+
+function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3 } = {}) {
   const candidates = (frontier?.eligible || []).map(normalizeIssue);
-  const activeAssignments = activeRecords(active).filter((record) => record.manifestPath && record.state !== 'retired');
+  const activeAssignments = hydrateActiveReservations(active, issues).filter((record) => record.manifestPath && record.state !== 'retired');
   const selected = [];
   for (const candidate of candidates) {
     if (activeAssignments.length + selected.length >= Math.min(2, maxIcs)) break;
@@ -133,6 +190,7 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (foreignAssignees.length) reasons.push({ code: 'assigned', detail: foreignAssignees.join(', ') });
     if (issue.unresolvedDependencies.length) reasons.push({ code: 'dependency-blocked', detail: issue.unresolvedDependencies.map((dependency) => dependency.number || dependency.id || dependency).join(', ') });
     if (issue.isSpecParent) reasons.push({ code: 'spec-parent', detail: 'sub-issues remain or issue is marked as a spec parent' });
+    if (issue.commentsTruncated) reasons.push({ code: 'issue-comments-truncated', detail: 'the complete issue comment thread could not be pinned' });
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
     reasons.push(...localExclusionReasons(issue, skipIssues, exclusions));
     if (activeByIssue.has(issue.number)) reasons.push({ code: 'reserved', detail: `active Work record ${activeByIssue.get(issue.number).id}` });
@@ -150,7 +208,7 @@ function queryGithubIssues({ repo, readyLabel, executable = 'gh', runner = execF
     if (fetchDetails) {
       const [owner, name] = String(repo).split('/');
       if (!owner || !name) throw new Error(`repo must be owner/name when fetching issue details: ${repo}`);
-      const query = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,state,labels(first:20){nodes{name}},assignees(first:20){nodes{login}},blockedBy(first:100){nodes{number,state} pageInfo{hasNextPage}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}}} pageInfo{hasNextPage,endCursor}}}}';
+      const query = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,state,labels(first:20){nodes{name}},assignees(first:20){nodes{login}},blockedBy(first:100){nodes{number,state} pageInfo{hasNextPage}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(first:100){nodes{id,body,createdAt} pageInfo{hasNextPage}}} pageInfo{hasNextPage,endCursor}}}}';
       const nodes = [];
       let cursor = null;
       do {
@@ -166,13 +224,14 @@ function queryGithubIssues({ repo, readyLabel, executable = 'gh', runner = execF
         if (next && next === cursor) throw new Error('GitHub GraphQL issue query repeated its cursor');
         cursor = next;
       } while (cursor);
-      return nodes.map((issue) => ({
+      return nodes.map((issue) => normalizeIssue({
         ...issue,
         labels: issue.labels?.nodes || issue.labels,
         assignees: issue.assignees?.nodes || issue.assignees,
         dependencies: [...(issue.blockedBy?.nodes || []), ...(issue.blockedBy?.pageInfo?.hasNextPage ? [{ number: 'additional dependencies', state: 'OPEN' }] : [])],
         subIssuesSummary: { total: (issue.subIssues?.nodes?.length || 0) + (issue.subIssues?.pageInfo?.hasNextPage ? 1 : 0), completed: (issue.subIssues?.nodes || []).filter((subIssue) => String(subIssue.state).toUpperCase() === 'CLOSED').length, truncated: Boolean(issue.subIssues?.pageInfo?.hasNextPage) },
-        bodyHash: sha256(issue.body || ''),
+        comments: issue.comments?.nodes || [],
+        commentsTruncated: Boolean(issue.comments?.pageInfo?.hasNextPage),
       }));
     }
     const raw = runner(executable, ['issue', 'list', '-R', String(repo), '--state', 'open', '--limit', '100', '--json', 'number,title,url,body,createdAt,state,labels,assignees'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 });
@@ -235,9 +294,10 @@ function icModel(model) {
 function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, now, workRecordId, workRecordRevision = 1 } = {}) {
   model = icModel(model);
   const normalized = normalizeIssue(issue);
+  if (normalized.commentsTruncated) throw new WorkStateError('INCOMPLETE_ISSUE_CRITERIA', `issue #${normalized.number} has more comments than the assignment query can pin`);
   const createdAt = now || new Date().toISOString();
   const retrySuffix = workRecordRevision > 1 ? `-r${workRecordRevision}` : '';
-  const id = `assignment-${tenant}-issue-${normalized.number}-${normalized.bodyHash.slice(0, 12)}${retrySuffix}`;
+  const id = `assignment-${tenant}-issue-${normalized.number}-${normalized.criteriaHash.slice(0, 12)}${retrySuffix}`;
   const branch = `${tenantConfig.branchPrefix || 'fleet/'}${normalized.number}-${slug(normalized.title)}`;
   return {
     schemaVersion: 1,
@@ -247,7 +307,7 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
     workRecordId: workRecordId || `${tenant}:issue-${normalized.number}`,
     workRecordRevision,
     readyLabel: readyLabel || tenantConfig.readyLabel || null,
-    issue: { number: normalized.number, url: normalized.url || null, bodyHash: normalized.bodyHash },
+    issue: { number: normalized.number, url: normalized.url || null, bodyHash: normalized.bodyHash, criteriaHash: normalized.criteriaHash, commentCount: normalized.comments.length },
     base: { remote: base.remote, ref: base.ref, sha: base.sha },
     branch,
     tenant,
@@ -264,14 +324,15 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
   };
 }
 
-function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, actor = 'assignment-planner', runner } = {}) {
-  const frontier = selectFrontier({ issues: [issue], readyLabel, active, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
+function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, actor = 'assignment-planner', runner } = {}) {
+  const proofRecords = hydrateActiveReservations(active, issues);
+  const frontier = selectFrontier({ issues: [issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
   const workRecordId = `${tenant}:issue-${normalized.number}`;
   const baseline = reservationBaseline({ root, id: workRecordId });
-  const activeAssignments = activeRecords(active).filter((record) => record.manifestPath && record.state !== 'retired');
+  const activeAssignments = proofRecords.filter((record) => record.manifestPath && record.state !== 'retired');
   const expectedProof = independenceProof([...activeAssignments, normalized]);
   if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, proof))) throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires a verified independent machine-readable proof');
   const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, workRecordId, workRecordRevision: baseline.revision });
@@ -279,7 +340,7 @@ function reserveAssignment({ root, issue, tenant, tenantConfig = {}, active = []
   try {
     const reserved = reserveRecord({
       root, id: workRecordId, tenant, issue: normalized.number, manifestPath, assignment: { manifestId: manifest.id, branch: manifest.branch, baseSha: manifest.base.sha, independenceProof: proof || null },
-      github: { issueNumber: normalized.number, issueUrl: normalized.url, bodyHash: normalized.bodyHash }, reservations: normalized.reservations, independenceProof: proof,
+      github: { issueNumber: normalized.number, issueUrl: normalized.url, bodyHash: normalized.bodyHash, criteriaHash: normalized.criteriaHash, commentCount: normalized.comments.length }, reservations: normalized.reservations, proofRecords: activeAssignments, independenceProof: proof,
       evidence: { github: `gh issue view ${normalized.number}`, manifest: path.relative(path.resolve(root), manifestPath) },
       idempotencyKey: `assignment-reserved:${manifest.id}`, actor, now,
     });
@@ -295,6 +356,8 @@ function validateManifest({ manifest, issue, base } = {}) {
   const current = normalizeIssue(issue);
   const mismatches = [];
   if (current.bodyHash !== manifest.issue.bodyHash) mismatches.push({ field: 'issue.bodyHash', expected: manifest.issue.bodyHash, actual: current.bodyHash });
+  if (manifest.issue.criteriaHash && current.criteriaHash !== manifest.issue.criteriaHash) mismatches.push({ field: 'issue.criteriaHash', expected: manifest.issue.criteriaHash, actual: current.criteriaHash });
+  if (current.commentsTruncated) mismatches.push({ field: 'issue.commentsComplete', expected: true, actual: false });
   if (base && base.sha !== manifest.base.sha) mismatches.push({ field: 'base.sha', expected: manifest.base.sha, actual: base.sha });
   return { valid: mismatches.length === 0, mismatches };
 }
@@ -405,16 +468,17 @@ function cli(argv) {
     const readyLabel = config.readyLabel || args['ready-label'] || 'ready-for-agent';
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github || args.repo, readyLabel, fetchDetails: true });
     const active = readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json'));
+    const reservationRecords = hydrateActiveReservations(active, issues);
     const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`));
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
-    const frontier = selectFrontier({ issues, readyLabel, active, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, now: args.now });
+    const frontier = selectFrontier({ issues, readyLabel, active: reservationRecords, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, now: args.now });
     if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'no eligible issue', { excluded: frontier.excluded });
     if (command === 'proof') {
       // The machine-readable independence proof a third assignment must carry: the
       // frontier head checked against every active assignment's reservations. It is
       // computed here and passed back verbatim to `assign --independence-proof`; a
       // proof that reports conflicts is refused by reserve, never trimmed.
-      const activeAssignments = activeRecords(active).filter((record) => record.manifestPath && record.state !== 'retired');
+      const activeAssignments = reservationRecords.filter((record) => record.manifestPath && record.state !== 'retired');
       const head = args.issue ? frontier.eligible.find((issue) => issue.number === Number(args.issue)) : frontier.eligible[0];
       if (!head) throw new WorkStateError('NO_FRONTIER', `issue #${args.issue} is not on the frontier`, { excluded: frontier.excluded });
       return { issue: head.number, activeAssignments: activeAssignments.map((record) => record.id), proof: independenceProof([...activeAssignments, head]) };
@@ -430,7 +494,7 @@ function cli(argv) {
     for (const key of ['test-plan', 'ci-gates', 'context-headings', 'adr-paths']) { if (args[key] === 'true') throw new WorkStateError('USAGE', `--${key} needs a comma-separated value`); }
     const testPlan = given('test-plan') ? list('test-plan') : Object.entries(config.checks || {}).map(([name, command]) => `${name}: ${command}`);
     const ciGates = given('ci-gates') ? list('ci-gates') : [...(config.ciGates || [])];
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
+    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });
@@ -452,6 +516,9 @@ module.exports = {
   acknowledgeAssignment,
   buildManifest,
   buildLaunchPlan,
+  criteriaHash,
+  derivedReservations,
+  hydrateActiveReservations,
   invalidateManifest,
   independenceProof,
   launchReservedAssignment,

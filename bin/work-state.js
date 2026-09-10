@@ -434,7 +434,7 @@ function replayIfKnown(record, key) {
 
 function sanitizeGithub(github, issue) {
   const source = github || {};
-  const allowed = ['issueNumber', 'prNumber', 'issueUrl', 'prUrl', 'baseSha', 'bodyHash', 'headSha', 'lastObservedState', 'mergedAt', 'evidence'];
+  const allowed = ['issueNumber', 'prNumber', 'issueUrl', 'prUrl', 'baseSha', 'bodyHash', 'criteriaHash', 'commentCount', 'headSha', 'lastObservedState', 'mergedAt', 'evidence'];
   return Object.fromEntries(allowed.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]).concat(source.issueNumber === undefined ? [['issueNumber', Number(issue)]] : []));
 }
 
@@ -473,6 +473,10 @@ function baseRecord({ id, tenant, issue, owner, state, github, reservations, evi
 
 const RESERVATION_FIELDS = Object.freeze(['components', 'migrationPrefixes', 'schemaAreas', 'testResources']);
 
+function hasReservationEvidence(reservations) {
+  return RESERVATION_FIELDS.some((field) => (reservations?.[field] || []).length > 0);
+}
+
 function reservationConflicts(records, reservations, ignoreRecordId = null) {
   const requested = reservations || {};
   const conflicts = [];
@@ -489,10 +493,34 @@ function reservationConflicts(records, reservations, ignoreRecordId = null) {
 }
 
 function proofMatches(expected, supplied) {
-  return Boolean(supplied?.independent)
+  return Boolean(expected?.independent)
+    && Boolean(supplied?.independent)
     && JSON.stringify([...(supplied.candidates || [])].map(Number).sort((a, b) => a - b)) === JSON.stringify([...expected.candidates].map(Number).sort((a, b) => a - b))
     && JSON.stringify([...(supplied.checkedFields || [])].map(String).sort()) === JSON.stringify([...expected.checkedFields].map(String).sort())
+    && !(expected.conflicts || []).length
+    && !(expected.missingReservations || []).length
+    && !(supplied.missingReservations || []).length
     && !(supplied.conflicts || []).length;
+}
+
+function proofFor(records) {
+  const conflicts = [];
+  const missingReservations = records.filter((record) => !hasReservationEvidence(record.reservations)).map((record) => Number(record.issue));
+  for (let left = 0; left < records.length; left += 1) {
+    for (let right = left + 1; right < records.length; right += 1) {
+      if (RESERVATION_FIELDS.some((field) => {
+        const rightValues = new Set((records[right].reservations?.[field] || []).map(String));
+        return (records[left].reservations?.[field] || []).some((value) => rightValues.has(String(value)));
+      })) conflicts.push({ left: Number(records[left].issue), right: Number(records[right].issue) });
+    }
+  }
+  return {
+    independent: conflicts.length === 0 && missingReservations.length === 0,
+    candidates: records.map((record) => Number(record.issue)),
+    checkedFields: [...RESERVATION_FIELDS],
+    conflicts,
+    missingReservations,
+  };
 }
 
 function reservationBaseline(options = {}) {
@@ -527,17 +555,20 @@ function reserveRecord(options = {}) {
     if (fs.existsSync(archiveFile(p, id)) && !reusable) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is terminally archived and cannot be reused`);
     if (fs.existsSync(releaseFile(p, id)) && !reusable) throw new WorkStateError('RELEASE_NOT_REUSABLE', `released record '${id}' does not prove an untouched reservation`);
     if (fs.existsSync(abandonFile(p, id)) && !reusable) throw new WorkStateError('ABANDON_NOT_REUSABLE', `abandoned record '${id}' does not have a valid audited abandonment`);
-    const activeAssignments = Object.values(active.records).filter((record) => record.manifestPath && record.state !== 'retired');
-    const expectedProof = {
-      independent: true,
-      candidates: [...activeAssignments.map((record) => Number(record.issue)), Number(options.issue)],
-      checkedFields: [...RESERVATION_FIELDS],
-      conflicts: [],
-    };
+    const activeRecords = Object.values(active.records);
+    const activeAssignments = activeRecords.filter((record) => record.manifestPath && record.state !== 'retired');
+    const suppliedSubjects = new Map((Array.isArray(options.proofRecords) ? options.proofRecords : []).map((record) => [String(record.id), record]));
+    const reservationSubjects = activeRecords.map((record) => {
+      if (hasReservationEvidence(record.reservations)) return record;
+      const supplied = suppliedSubjects.get(record.id);
+      return supplied && Number(supplied.issue) === Number(record.issue) ? { ...record, reservations: supplied.reservations } : record;
+    });
+    const proofSubjects = reservationSubjects.filter((record) => record.manifestPath && record.state !== 'retired');
+    const expectedProof = proofFor([...proofSubjects, { issue: Number(options.issue), reservations: options.reservations }]);
     if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof))) {
       throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires an independent machine-readable proof');
     }
-    const conflicts = reservationConflicts(active.records, options.reservations);
+    const conflicts = reservationConflicts(Object.fromEntries(reservationSubjects.map((record) => [record.id, record])), options.reservations);
     if (conflicts.length) {
       throw new WorkStateError('RESERVATION_CONFLICT', `reservation conflicts with ${conflicts[0].recordId}`, { conflicts });
     }
@@ -1272,6 +1303,7 @@ module.exports = {
   createRecord,
   enteringEvent,
   getRecord,
+  hasReservationEvidence,
   notifyRecord,
   observeRecord,
   parseArgs,

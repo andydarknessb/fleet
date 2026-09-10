@@ -48,11 +48,12 @@ launch (body hash, base SHA) means no IC works against stale criteria.
   merged (or already retiring), so the planner's active-assignment count
   cannot pin the frontier shut after two or three merges. An in-flight record
   without a roster row is never archived by a projector.
-- Reservations are only as good as what issues declare. Today no issue carries
-  component, schema, migration-prefix, or test-resource reservations, so the
-  independence proof for a third assignment is vacuously true and the
-  effective cap is the tenant's `maxIcs`, as on the legacy path. Teaching the
-  planner to read declared reservations from the issue body is a follow-up.
+- The planner derives component, schema, migration-prefix, and test-resource
+  reservations from paths and table names in the issue body and comments. It
+  pins that complete criteria snapshot in the manifest, rehydrates older active
+  records only when their stored hash still matches, and refuses a third
+  assignment when any subject has no reservation evidence. Review-artifact
+  paths under `state/reviews/` are provenance, not work reservations.
 
 ## Status note - 02/03 cutover (2026-09-04)
 

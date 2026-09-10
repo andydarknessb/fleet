@@ -111,6 +111,39 @@ test('idempotency replay returns the original revision and event', () => {
   assert.equal(events.length, 2);
 });
 
+test('a direct third reservation cannot forge independence over empty active reservations', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: {}, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
+  reserveRecord({ root, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: {}, idempotencyKey: 'reserve-41', now: '2026-09-01T00:00:01.000Z' });
+  const forged = { independent: true, candidates: [40, 41, 42], checkedFields: ['components', 'migrationPrefixes', 'schemaAreas', 'testResources'], conflicts: [], missingReservations: [] };
+
+  assert.throws(
+    () => reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['src/c.js'] }, independenceProof: forged, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' }),
+    (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF',
+  );
+});
+
+test('a third reservation accepts verified legacy reservation subjects and rejects their conflicts', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: {}, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
+  reserveRecord({ root, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: {}, idempotencyKey: 'reserve-41', now: '2026-09-01T00:00:01.000Z' });
+  const proofRecords = [
+    { id: 'endzone:issue-40', issue: 40, reservations: { components: ['src/a.js'] } },
+    { id: 'endzone:issue-41', issue: 41, reservations: { components: ['src/b.js'] } },
+  ];
+  const proof = { independent: true, candidates: [40, 41, 42], checkedFields: ['components', 'migrationPrefixes', 'schemaAreas', 'testResources'], conflicts: [], missingReservations: [] };
+  const third = reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['src/c.js'] }, proofRecords, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' });
+  assert.equal(third.record.issue, 42);
+
+  const otherRoot = rootDir();
+  reserveRecord({ root: otherRoot, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: {}, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
+  reserveRecord({ root: otherRoot, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: {}, idempotencyKey: 'reserve-41', now: '2026-09-01T00:00:01.000Z' });
+  assert.throws(
+    () => reserveRecord({ root: otherRoot, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['src/a.js'] }, proofRecords, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' }),
+    (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF' || error.code === 'RESERVATION_CONFLICT',
+  );
+});
+
 test('an untouched assignment release is reusable and continues the record lineage', () => {
   const root = rootDir();
   const options = {
