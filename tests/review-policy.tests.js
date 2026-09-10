@@ -917,6 +917,8 @@ test('a duplicate finding id is refused before any artifact file exists', () => 
   );
   const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
   assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'no 0-byte orphan artifact');
+});
+
 // --- fleet#19: a body-only revision can be re-recorded at an unchanged head ---
 // The replay key was kind:record:head, so a second formal pass at the same
 // head always replayed the first, exit 0, discarding the findings and the
@@ -978,6 +980,18 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   assert.deepEqual(stored.findings, []);
   assert.equal(second.result.record.review.formal.artifact, second.artifact);
   assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: 'f91ba70' }).unresolved, []);
+
+  // A linked third pass at the same head has nothing open to resolve: it is not a re-review.
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
+      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'still clean',
+      priorArtifact: second.artifact, idempotencyKey: 'formal-3-linked', now: '2026-09-10T19:32:30.000Z',
+    }),
+    (error) => error.code === 'ALREADY_REVIEWED' && /nothing open to resolve/.test(error.message),
+  );
+  assert.equal(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')).length, 2, 'no same-head pileup');
 
   // A retry of the same re-review replays it; an unlinked third pass is still refused.
   const retry = recordReviewArtifact({

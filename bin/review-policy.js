@@ -343,6 +343,13 @@ function recordReviewArtifact(options = {}) {
         }
         priorArtifactData = readArtifact(root, prior.artifact);
         range = `${prior.headSha}..${headSha}`;
+        // fleet#19: a re-review at an unchanged head exists to resolve prior
+        // findings. With nothing open (or no readable prior) there is nothing
+        // to re-review at this head, and a linked chain of clean same-head
+        // artifacts would only look like N reviews; that is one review.
+        if (prior.headSha === String(headSha) && (priorArtifactData === null || !openFindings(priorArtifactData).length)) {
+          throw new ReviewPolicyError('ALREADY_REVIEWED', `a formal review is already recorded for ${recordId} at ${headSha} and ${prior.artifact} has nothing open to resolve; a re-review at an unchanged head needs an open prior finding`, { artifact: prior.artifact });
+        }
         if (priorArtifactData === null) {
           // The referenced file is gone (crash, hand cleanup, pruned tree):
           // degrade honestly instead of wedging the record forever.
@@ -392,6 +399,8 @@ function recordReviewArtifact(options = {}) {
           kind,
           headSha: String(headSha),
           range,
+          // Descriptive only: under review-dedup-off a same-head pass skips the
+          // linked re-review checks, so sameHead does not imply resolutions ran.
           sameHead: prior && prior.headSha === String(headSha) ? true : undefined,
           tier: classification.tier || null,
           triggers: classification.triggers || [],

@@ -69,7 +69,10 @@ preconditions still bind (the link must name the recorded prior, every open
 prior finding needs a resolution). A retry of that same re-review still
 replays. The artifact marks `sameHead: true` and its `range` is honest
 (`X..X`). An unlinked second pass at the same head is still refused, and a
-risk review at the same head is still one review.
+risk review at the same head is still one review. A linked pass at the same
+head whose prior has nothing open (or no readable prior) is refused too: a
+re-review at an unchanged head exists to resolve prior findings, so once the
+chain is clean at a head it is one review at that head, never a pileup.
 
 A replay says what it did not write: the result carries `ignored:
 {findings, resolutions}` when the caller supplied either, and the CLI prints
