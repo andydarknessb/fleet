@@ -145,12 +145,14 @@ respawning them, and reboot recovery.
 _Avoid_: dynamic workflow, workflow (unqualified)
 
 **Work record**:
-The active fleet-owned coordination state for one unit of work: its current
-state in the Fleet cycle, owning session, reservations, review progress, token
-budget and pending decisions. GitHub remains authoritative for the issue and
-pull request. A Work record is terminally archived after IC retirement; an
-assignment returned before implementation is stored as a reusable release and
-the next reservation continues its revision and event sequence.
+The fleet-owned coordination state for one unit of work: its current state in
+the Fleet cycle, owning session, reservations, review progress, token budget
+and pending decisions. GitHub remains authoritative for the issue and pull
+request. A Work record is terminally archived after IC retirement; an
+assignment returned before implementation is stored as a reusable release. A
+touched attempt that cannot continue is stored as a reusable abandonment with
+its reason. The next reservation continues the record's revision and event
+sequence in either reusable case.
 _Avoid_: status file, task record, issue record
 
 **Fleet event**:

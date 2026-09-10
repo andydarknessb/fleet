@@ -1,7 +1,7 @@
 'use strict';
 // Ticket 09: event verification. The ledger is the fleet's memory of every unit; before
 // anything is archived or a budget is trusted, this proves the memory is whole. For every
-// record (active and archived) it replays that record's events and checks: the sequence
+// record (active, archived, released, and abandoned) it replays that record's events and checks: the sequence
 // is 1..n with no gap and no duplicate; timestamps never go backwards; every event's
 // revision is monotonic; the state the events end in is the state the record claims; and
 // every file an archived record's evidence index points at exists and actually holds that
@@ -47,6 +47,7 @@ function stateAfter(event) {
   if (['assignment-reserved'].includes(type)) return event.changes?.state || 'assigned';
   if (['work-created', 'shadow-projected'].includes(type)) return event.changes?.state || null;
   if (type === 'assignment-released') return 'released';
+  if (type === 'assignment-abandoned') return 'abandoned';
   if (['assignment-retired', 'shadow-retired'].includes(type)) return TERMINAL;
   if (type === 'shadow-retiring') return 'retiring';
   return null;
@@ -113,6 +114,15 @@ function verifyLedger({ root, now, sample } = {}) {
       released.push({ file: path.join(releaseDir, name), ...read.value });
     }
   }
+  const abandonDir = path.join(base, 'state', 'abandons');
+  const abandoned = [];
+  if (fs.existsSync(abandonDir)) {
+    for (const name of fs.readdirSync(abandonDir).filter((entry) => /^work-.*\.json$/.test(entry))) {
+      const read = readJsonStrict(path.join(abandonDir, name));
+      if (read.error) { globalFindings.push({ kind: 'abandon-entry-unreadable', file: name, detail: read.error }); continue; }
+      abandoned.push({ file: path.join(abandonDir, name), ...read.value });
+    }
+  }
   const records = [];
   for (const record of Object.values(active)) {
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
@@ -146,9 +156,22 @@ function verifyLedger({ root, now, sample } = {}) {
     if (record.state !== 'released') result.findings.push({ kind: 'release-not-released', state: record.state });
     records.push(result);
   }
+  for (const entry of abandoned) {
+    const record = entry.record || {};
+    const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
+    result.where = 'abandonment';
+    const listed = Array.isArray(entry.eventFiles) ? entry.eventFiles : [];
+    if (listed.length === 0) result.findings.push({ kind: 'evidence-index-empty' });
+    const present = listed.map((relative) => path.join(base, relative)).filter((file) => fs.existsSync(file));
+    if (present.length === 0 && listed.length > 0) result.findings.push({ kind: 'evidence-files-missing', listed });
+    const holds = present.some((file) => fs.readFileSync(file, 'utf8').includes(`"recordId":"${record.id}"`));
+    if (present.length > 0 && !holds) result.findings.push({ kind: 'evidence-files-do-not-hold-record', files: present.map((f) => path.relative(base, f)) });
+    if (record.state !== 'abandoned') result.findings.push({ kind: 'abandon-not-abandoned', state: record.state });
+    records.push(result);
+  }
   // Events for a record that is neither active nor archived mean state was lost: that is
   // exactly the corruption archival must not compound, so an orphan fails the verdict.
-  const orphaned = [...byRecord.keys()].filter((id) => !active[id] && !archived.some((entry) => entry.record?.id === id) && !released.some((entry) => entry.record?.id === id));
+  const orphaned = [...byRecord.keys()].filter((id) => !active[id] && !archived.some((entry) => entry.record?.id === id) && !released.some((entry) => entry.record?.id === id) && !abandoned.some((entry) => entry.record?.id === id));
   // --sample N checks only the N most recently touched records (a spot check); the
   // verdict then speaks for that sample and says so in totals.sampled.
   const checked = Number.isInteger(sample) && sample > 0 ? records.slice(-sample) : records;
@@ -157,7 +180,7 @@ function verifyLedger({ root, now, sample } = {}) {
   const result = {
     at,
     pass: allFindings.length === 0,
-    totals: { events: events.length, records: records.length, active: Object.keys(active).length, archived: archived.length, released: released.length, orphanedRecordIds: orphaned.length, sampled: checked.length },
+    totals: { events: events.length, records: records.length, active: Object.keys(active).length, archived: archived.length, released: released.length, abandoned: abandoned.length, orphanedRecordIds: orphaned.length, sampled: checked.length },
     findingsByKind: allFindings.reduce((acc, f) => { acc[f.kind] = (acc[f.kind] || 0) + 1; return acc; }, {}),
     globalFindings,
     orphanedRecordIds: orphaned,
@@ -187,7 +210,7 @@ if (require.main === module) {
     if (json) process.stdout.write(`${JSON.stringify(result)}\n`);
     else {
       process.stdout.write(`EVENT VERIFICATION: ${result.pass ? 'PASS' : 'FAIL'}\n`);
-      process.stdout.write(`events ${result.totals.events}, records ${result.totals.records} (active ${result.totals.active}, archived ${result.totals.archived}, released ${result.totals.released}), orphaned record ids ${result.totals.orphanedRecordIds}\n`);
+      process.stdout.write(`events ${result.totals.events}, records ${result.totals.records} (active ${result.totals.active}, archived ${result.totals.archived}, released ${result.totals.released}, abandoned ${result.totals.abandoned}), orphaned record ids ${result.totals.orphanedRecordIds}\n`);
       if (!result.pass) {
         process.stdout.write(`findings: ${Object.entries(result.findingsByKind).map(([k, n]) => `${k}=${n}`).join(', ')}\n`);
         for (const record of result.records.slice(0, 40)) process.stdout.write(`  ${record.recordId} (${record.where}): ${record.findings.map((f) => f.kind).join(', ')}\n`);

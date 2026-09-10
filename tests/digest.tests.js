@@ -46,6 +46,18 @@ function section(content, heading) {
   return content.slice(start, next < 0 ? undefined : next);
 }
 
+test('an abandoned assignment is neither active work nor a pending decision', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-11';
+  workState.reserveRecord({ root, id, tenant: 'endzone', issue: 11, manifestPath: 'm11', idempotencyKey: 'reserve-11', now: at() });
+  workState.transitionRecord({ root, id, expectedRevision: 1, to: 'implementing', idempotencyKey: 'ack-11', now: at() });
+  workState.abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-11', reason: 'session ended', now: at() });
+  const content = projectDigest({ root, now: '2026-09-01T08:00:00.000Z' }).content;
+  assert.doesNotMatch(section(content, 'Active work'), /endzone #11/);
+  assert.doesNotMatch(section(content, 'Needs Cory'), /endzone #11/);
+  assert.equal(foldLedger(workState.readEvents(root)).get(id).state, 'abandoned');
+});
+
 test('the digest rebuilt from the same event offset is byte-stable, even after the ledger grows', () => {
   const root = rootDir();
   walk(root, 1, ['pr-open', 'ci-wait', 'escalated']);

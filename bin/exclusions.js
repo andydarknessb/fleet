@@ -18,7 +18,7 @@ const LIFT_ONLY_RECHECK_EVENTS = Object.freeze(['exclusion-lifted']);
 // that would make an exclusion undischargeable by accident.
 const LEDGER_EVENT_TYPES = Object.freeze([
   ...STATES.map((state) => `state-${state}`),
-  'assignment-reserved', 'assignment-released', 'work-created', 'shadow-projected', 'shadow-retiring', 'shadow-retired',
+  'assignment-reserved', 'assignment-released', 'assignment-abandoned', 'work-created', 'shadow-projected', 'shadow-retiring', 'shadow-retired',
   'pr-observed', 'review-recorded', 'notification-attempted', 'notification-sent', 'notification-failed', 'notification-retry-authorized',
 ]);
 const RECHECK_EVENT_TYPES = Object.freeze([...LIFT_ONLY_RECHECK_EVENTS, ...LEDGER_EVENT_TYPES]);
