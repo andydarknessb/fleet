@@ -155,6 +155,15 @@ test('a third reservation accepts verified legacy reservation subjects and rejec
   );
 });
 
+test('a third reservation accepts populated non-overlapping evidence', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: { components: ['bin/a.js'] }, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
+  reserveRecord({ root, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: { components: ['bin/b.js'] }, idempotencyKey: 'reserve-41', now: '2026-09-01T00:00:01.000Z' });
+  const proof = { independent: true, candidates: [40, 41, 42], checkedFields: ['components', 'migrationPrefixes', 'schemaAreas', 'testResources'], conflicts: [], missingReservations: [] };
+  const third = reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['bin/c.js'] }, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' });
+  assert.equal(third.record.issue, 42);
+});
+
 test('an untouched assignment release is reusable and continues the record lineage', () => {
   const root = rootDir();
   const options = {
@@ -447,6 +456,61 @@ test('status projection rebuilds deterministically and retirement cleans ephemer
   assert.equal(fs.existsSync(settings), false);
   assert.equal(fs.existsSync(brief), false);
   assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-42.json')), true);
+});
+
+test('status projection without --output answers on stdout and leaves state/status untouched', () => {
+  // fleet: eleven recorded clobbers of the lead's hand-written state/status/<tenant>.md.
+  const root = rootDir();
+  makeRecord(root);
+  const statusDir = path.join(root, 'state', 'status');
+  const handWritten = path.join(statusDir, 'endzone.md');
+  fs.mkdirSync(statusDir, { recursive: true });
+  fs.writeFileSync(handWritten, '# endzone - project lead status\nhand-written, must survive\n');
+  const result = projectStatus({ root, tenant: 'endzone', now: '2026-09-01T12:00:00.000Z' });
+  assert.equal(result.output, null);
+  assert.match(result.content, /^# Fleet status/);
+  assert.equal(fs.readFileSync(handWritten, 'utf8'), '# endzone - project lead status\nhand-written, must survive\n');
+  assert.deepEqual(fs.readdirSync(statusDir), ['endzone.md']);
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  const viaCli = JSON.parse(execFileSync(process.execPath, [script, 'project', '--root', root, '--tenant', 'endzone', '--now', '2026-09-01T12:00:00.000Z'], { encoding: 'utf8' }));
+  assert.equal(viaCli.output, null);
+  assert.equal(viaCli.content, result.content);
+  assert.equal(fs.readFileSync(handWritten, 'utf8'), '# endzone - project lead status\nhand-written, must survive\n');
+  const untenanted = projectStatus({ root, now: '2026-09-01T12:00:00.000Z' });
+  assert.equal(untenanted.output, null);
+  assert.deepEqual(fs.readdirSync(statusDir), ['endzone.md']);
+});
+
+test('status projection refuses to overwrite a file it did not generate', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const handWritten = path.join(root, 'state', 'status', 'endzone.md');
+  fs.mkdirSync(path.dirname(handWritten), { recursive: true });
+  fs.writeFileSync(handWritten, '# endzone - project lead status\nhand-written, must survive\n');
+  assert.throws(
+    () => projectStatus({ root, tenant: 'endzone', output: handWritten, now: '2026-09-01T12:00:00.000Z' }),
+    (error) => error instanceof WorkStateError && error.code === 'OUTPUT_NOT_GENERATED',
+  );
+  assert.equal(fs.readFileSync(handWritten, 'utf8'), '# endzone - project lead status\nhand-written, must survive\n');
+  const generated = path.join(root, 'state', 'status', 'STATUS.md');
+  const first = projectStatus({ root, output: generated, now: '2026-09-01T12:00:00.000Z' });
+  assert.equal(first.output, generated);
+  const second = projectStatus({ root, output: generated, now: '2026-09-01T12:00:00.000Z' });
+  assert.equal(fs.readFileSync(generated, 'utf8'), second.content);
+});
+
+test('status projection rejects a misspelled output flag instead of falling through', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  let failure;
+  try {
+    execFileSync(process.execPath, [script, 'project', '--root', root, '--tenant', 'endzone', '--out', path.join(root, 'x.md')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) { failure = error; }
+  assert.ok(failure, 'expected a USAGE failure');
+  assert.equal(JSON.parse(failure.stderr).code, 'USAGE');
+  assert.match(JSON.parse(failure.stderr).message, /--out;/);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'status', 'endzone.md')), false);
 });
 
 test('old event partitions move to the archive after thirty days, once the ledger is verified', () => {

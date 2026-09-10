@@ -1074,6 +1074,9 @@ function getRecord(options = {}) {
   });
 }
 
+const STATUS_MARKER = '# Fleet status';
+const PROJECT_FLAGS = Object.freeze(['root', 'tenant', 'now', 'output']);
+
 function projectStatus(options = {}) {
   const root = asRoot(options.root);
   return withLock(root, (p) => {
@@ -1107,15 +1110,25 @@ function projectStatus(options = {}) {
     const canonicalTimes = [...records.map((record) => record.updatedAt), ...events.map((event) => event.at)]
       .filter(Boolean).sort();
     const generatedAt = isoNow(options.now || canonicalTimes[canonicalTimes.length - 1] || '1970-01-01T00:00:00.000Z');
-    const lines = [`# Fleet status`, '', `generated: ${generatedAt}`, '', '## Active work', ''];
+    const lines = [STATUS_MARKER, '', `generated: ${generatedAt}`, '', '## Active work', ''];
     if (records.length === 0) lines.push('None.');
     else for (const record of records) lines.push(`- ${record.tenant} #${record.issue} - ${record.state} - revision ${record.revision} - ${record.owner?.session || record.owner?.name || 'unassigned'}`);
     lines.push('', '## Recent events', '');
     if (events.length === 0) lines.push('None.');
     else for (const event of events) lines.push(`- ${event.at} - ${event.recordId} - ${event.type} - seq ${event.sequence}`);
-    const output = options.output || path.join(p.status, tenant ? `${tenant}.md` : 'STATUS.md');
-    writeAtomicText(output, `${lines.join('\n')}\n`);
-    return { output, content: `${lines.join('\n')}\n` };
+    const content = `${lines.join('\n')}\n`;
+    // The projection answers on stdout unless --output names a file. It used to default
+    // to state/status/<tenant>.md, the same path the project lead hand-writes, and
+    // clobbered that file eleven recorded times. A named file is only overwritten when
+    // it is one this projector generated (or absent).
+    const output = options.output ? path.resolve(options.output) : null;
+    if (output) {
+      if (fs.existsSync(output) && !fs.readFileSync(output, 'utf8').startsWith(STATUS_MARKER)) {
+        throw new WorkStateError('OUTPUT_NOT_GENERATED', `refusing to overwrite ${output}: not a file this projection generated (it does not start with ${JSON.stringify(STATUS_MARKER)})`, { output });
+      }
+      writeAtomicText(output, content);
+    }
+    return { output, content };
   });
 }
 
@@ -1303,7 +1316,10 @@ function cli(argv) {
   if (command === 'budget') return recordBudget({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']), phase: args.phase, tokens: args.tokens !== undefined ? Number(args.tokens) : undefined, by: args.by, reason: args.reason, threshold: args.threshold !== undefined ? Number(args.threshold) : undefined });
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
-  if (command === 'project') return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
+  if (command === 'project') {
+    const strict = parseArgs(rest, PROJECT_FLAGS);
+    return projectStatus({ root: strict.root, tenant: strict.tenant, now: strict.now, output: strict.output });
+  }
   throw new WorkStateError('USAGE', 'commands: create, reserve, release, abandon, transition, reconcile, observe, review, notify, get, shadow, project');
 }
 
