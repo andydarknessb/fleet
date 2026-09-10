@@ -9,6 +9,7 @@ const {
   WorkStateError,
   getRecord,
   hasReservationEvidence,
+  parseArgs,
   proofMatches,
   releaseRecord,
   reservationBaseline,
@@ -422,16 +423,31 @@ function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, acto
   return result;
 }
 
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith('--')) continue;
-    const key = token.slice(2);
-    const next = argv[index + 1];
-    args[key] = next && !next.startsWith('--') ? argv[++index] : 'true';
-  }
-  return args;
+// fleet#4: adopt work-state's parseArgs flag schema (fleet#2's fix), one binary
+// per change, so a typo'd flag is refused instead of falling into a bucket
+// nothing reads. This binary went last (ruling 1) because it shares the
+// confusable names: `--repo` is the GitHub owner/name, `--repo-path` the local
+// checkout, `--tenant-config` the tenant file; review-policy.js classify spells
+// the first two `--repo` and `--tenant`. Declared per command: each list is
+// every `args.xxx` / `args['xxx']` that command's handler actually consumes.
+// The old local parser accepted anything, so `assign --base bbb` reserved from
+// the remote as if no base had been given and `launch --repo owner/name`
+// launched with no GitHub repo at all.
+const FRONTIER_FLAGS = ['root', 'tenant', 'tenant-config', 'ready-label', 'fixture', 'repo', 'active', 'skip', 'now'];
+const FLAGS = Object.freeze({
+  frontier: FRONTIER_FLAGS,
+  proof: [...FRONTIER_FLAGS, 'issue'],
+  assign: [
+    ...FRONTIER_FLAGS, 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'risk', 'token-budget',
+    'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof',
+  ],
+  validate: ['manifest', 'issue', 'base-sha'],
+  launch: ['root', 'manifest', 'work-record-id', 'launch-script', 'repo-path', 'github-repo', 'dry-run'],
+  ack: ['root', 'work-record-id', 'expected-revision', 'now', 'evidence'],
+});
+
+function usage(message) {
+  return new WorkStateError('USAGE', `${message}\ncommands: ${Object.keys(FLAGS).join(', ')}`);
 }
 
 function readFixture(file, fallback) {
@@ -453,7 +469,12 @@ function readTenantConfig(root, tenant, file) {
 
 function cli(argv) {
   const [command, ...rest] = argv;
-  const args = parseArgs(rest);
+  if (!Object.prototype.hasOwnProperty.call(FLAGS, command)) {
+    throw usage(`unknown command '${command}'`);
+  }
+  // parseArgs throws work-state's error class, which is also this binary's, so
+  // a USAGE built there and one built here are the same to every caller.
+  const args = parseArgs(rest, FLAGS[command]);
   if (command === 'frontier') {
     const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
     const readyLabel = args['ready-label'] || config.readyLabel || 'ready-for-agent';
@@ -508,15 +529,21 @@ if (require.main === module) {
     process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message, excluded: error.excluded })}\n`);
-    process.exitCode = 1;
+    // A refused invocation exits 2 so a caller reading only the status cannot
+    // take it for a failed reservation, let alone for an answer (fleet#2's
+    // rule); every other error keeps exit 1 (NO_FRONTIER, RESERVATION_CONFLICT,
+    // THIRD_ASSIGNMENT_REQUIRES_PROOF, MANIFEST_PRECONDITION_CHANGED...).
+    process.exitCode = error.code === 'USAGE' ? 2 : 1;
   }
 }
 
 module.exports = {
+  FLAGS,
   IC_MODELS,
   acknowledgeAssignment,
   buildManifest,
   buildLaunchPlan,
+  cli,
   criteriaHash,
   derivedReservations,
   hydrateActiveReservations,
