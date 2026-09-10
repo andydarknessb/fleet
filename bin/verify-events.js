@@ -196,11 +196,12 @@ if (require.main === module) {
     process.exitCode = result.pass ? 0 : 2;
   } catch (error) {
     if (error.code === 'USAGE') {
-      // fleet#4: a refused invocation exits 2, the same status a genuine FAIL verdict
-      // uses (no spare code was carved out for this binary) - `--json` output being
-      // empty and `{code:"USAGE"}` on stderr is what distinguishes the two.
+      // fleet#4: this binary exits 2 for a genuine FAIL verdict ("exit 2 on findings"),
+      // so a refused (typo) invocation must not share it - EX_USAGE (64) keeps a typo
+      // and a real ledger finding distinguishable by status alone, the same carve-out
+      // parity.js and assignment-parity.js make.
       process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
-      process.exitCode = 2;
+      process.exitCode = 64;
     } else {
       process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
       process.exitCode = 1;

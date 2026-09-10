@@ -184,3 +184,12 @@ test('cli: a correct invocation still works, matching the direct call', () => {
   assert.equal(json, true);
   assert.deepEqual(result, verifyLedger({ root, now }));
 });
+
+test('verify-events: a refused invocation exits 64 (EX_USAGE), never the FAIL verdict status 2', () => {
+  const { spawnSync } = require('node:child_process');
+  const bin = path.join(__dirname, '..', 'bin', 'verify-events.js');
+  const typo = spawnSync(process.execPath, [bin, '--root-dir', os.tmpdir()], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 64);
+  assert.equal(typo.stdout, '');
+  assert.equal(JSON.parse(typo.stderr).code, 'USAGE');
+});
