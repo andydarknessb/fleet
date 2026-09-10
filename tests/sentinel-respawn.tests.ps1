@@ -14,6 +14,7 @@ try {
   }
   [IO.File]::Copy("$sourceRoot\bin\_common.ps1", "$testRoot\bin\_common.ps1")
   [IO.File]::Copy("$sourceRoot\bin\sentinel-check.ps1", "$testRoot\bin\sentinel-check.ps1")
+  [IO.File]::Copy("$sourceRoot\bin\pause.ps1", "$testRoot\bin\pause.ps1")
 
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-900","role":"ic","tenant":"test","parent":"pl-test","issue":900,"cwd":"REPO","status":"active","jobId":"job-900"}]}'
@@ -122,6 +123,38 @@ exit /b 0
   $watchdogApply = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
   Assert-True ($watchdogApply.applied -eq $true) 'the watchdog actor still applies under the flag'
   Remove-Item "$testRoot\state\flags\sentinel-off"
+
+  # Rate-limit PAUSE, 2026-09-10 (three re-arms in 14h). The detail line is a level, not an
+  # event: the same wording stood for 12 hours and re-armed a PAUSE one tick after each manual
+  # clear. And the 60-minute window phase-locked to the 15-minute tick: until landed ~100 ms
+  # after the +60 tick's frozen clock, so only the +75 tick cleared it.
+  $pauseFile = "$testRoot\state\PAUSE"
+  $signalFile = "$testRoot\state\sentinel\rate-limit-signal.json"
+  Write-Utf8 "$testRoot\state\heartbeats\ic-900.json" (ConvertTo-Json @{ at = (Get-Date).ToUniversalTime().ToString('o') } -Compress)
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"You''ve hit your session limit · resets 1:20am (America/Chicago)","waitingFor":""}'
+  $set1 = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
+  Assert-True ("$($set1.pause)" -match 'set: rate-limit signal on ic-900' -and (Test-Path $pauseFile)) 'a session-limit detail must set the PAUSE under -Apply'
+  $null = (Get-Content $pauseFile -Raw) -match 'until=(\S+)'
+  $until = [datetime]::Parse($Matches[1]).ToUniversalTime()
+  $tickPlus60 = ([datetime]::Parse($set1.at)).ToUniversalTime().AddMinutes(60)
+  Assert-True ($until -le $tickPlus60) "the window must end inside the tick one hour after the setting tick (until $($until.ToString('o')) vs tick+60m $($tickPlus60.ToString('o')))"
+  Assert-True ($until -gt $tickPlus60.AddMinutes(-5)) 'the window must still be about an hour, not collapsed'
+  Assert-True (Test-Path $signalFile) 'the setting tick must record the wording it paused on'
+  Remove-Item $pauseFile
+  $rearm = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
+  Assert-True (-not (Test-Path $pauseFile)) 'the same unchanged wording must not re-arm the PAUSE after a clear'
+  Assert-True ($null -eq $rearm.pause) 'a held signal proposes no pause'
+  Assert-True (@($rearm.ok | Where-Object { $_.name -eq 'ic-900' -and "$($_.detail)" -match 'wording unchanged' }).Count -eq 1) 'the hold must be named under ok'
+  $readOnly = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ($null -eq $readOnly.pause) 'a read-only tick honours the recorded wording too'
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"You''ve hit your session limit · resets 5:50pm (America/Chicago)","waitingFor":""}'
+  $set2 = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
+  Assert-True ("$($set2.pause)" -match 'set: rate-limit signal on ic-900' -and (Test-Path $pauseFile)) 'a new limit wording (new reset time) must pause again'
+  Write-Utf8 $pauseFile 'reason=rate-limit seen on ic-900; setAt=2026-01-01T00:00:00Z; until=2026-01-01T00:59:00Z'
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"","waitingFor":""}'
+  $swept = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
+  Assert-True ("$($swept.pause)" -match 'cleared: rate-limit window passed' -and -not (Test-Path $pauseFile)) 'a passed rate-limit window is still cleared'
+  Remove-Item $signalFile
 
   Write-Output 'sentinel respawn tests passed'
 } finally {
