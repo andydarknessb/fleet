@@ -8,6 +8,7 @@ const {
   acknowledgeAssignment,
   buildManifest,
   buildLaunchPlan,
+  independenceProof,
   invalidateManifest,
   launchReservedAssignment,
   normalizeIssue,
@@ -149,6 +150,19 @@ test('changed criteria invalidate the manifest and release reservations', () => 
   assert.equal(getRecord({ root, id: 'endzone:issue-43' }).state, 'assigned');
 });
 
+test('a comment-only correction invalidates the manifest criteria', () => {
+  const root = rootDir();
+  const original = issue(44, { comments: [{ id: 'comment-1', createdAt: '2026-09-01T00:00:00Z', body: 'Use the original ruling.' }] });
+  const result = reserveAssignment({
+    root, issue: original, tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'b'.repeat(40) }, now: '2026-09-01T00:00:00.000Z',
+  });
+  const corrected = issue(44, { comments: [{ id: 'comment-1', createdAt: '2026-09-01T00:00:00Z', body: 'CORRECTION: use the replacement ruling.' }] });
+  const validation = validateManifest({ manifest: result.manifest, issue: corrected, base: { sha: 'b'.repeat(40) } });
+  assert.equal(validation.valid, false);
+  assert.deepEqual(validation.mismatches.map((mismatch) => mismatch.field), ['issue.criteriaHash']);
+});
+
 test('base resolution fetches the remote ref before reading its SHA', () => {
   const calls = [];
   const runner = (executable, args) => {
@@ -207,6 +221,36 @@ test('a third assignment requires and records an independence proof', () => {
   assert.equal(plan.assignments.length, 1);
   assert.equal(plan.thirdProof.independent, true);
   assert.throws(() => reserveAssignment({ root: rootDir(), issue: issue(53), tenant: 'endzone', active, readyLabel: 'ready-for-agent', base: { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) } }), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
+});
+
+test('a third assignment fails closed without reservation evidence', () => {
+  const frontier = { eligible: [issue(50), issue(51), issue(52)] };
+  const active = [
+    { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', reservations: {} },
+    { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', reservations: {} },
+  ];
+  const plan = buildLaunchPlan({ frontier, active, maxIcs: 3 });
+  assert.equal(plan.assignments.length, 0);
+  assert.equal(plan.thirdProof.independent, false);
+  assert.deepEqual(plan.thirdProof.missingReservations, [40, 41, 50]);
+  assert.throws(() => reserveAssignment({ root: rootDir(), issue: issue(53), tenant: 'endzone', active, readyLabel: 'ready-for-agent', base: { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) } }), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
+  const forged = { independent: true, candidates: [40, 41, 53], checkedFields: ['components', 'migrationPrefixes', 'schemaAreas', 'testResources'], conflicts: [] };
+  assert.throws(() => reserveAssignment({ root: rootDir(), issue: issue(53), tenant: 'endzone', active, readyLabel: 'ready-for-agent', base: { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) }, independenceProof: forged }), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
+});
+
+test('a third assignment is proven only by populated non-overlapping reservations', () => {
+  const active = [
+    { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', reservations: { components: ['bin/a.js'] } },
+    { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', reservations: { components: ['bin/b.js'] } },
+  ];
+  const plan = buildLaunchPlan({ frontier: { eligible: [issue(52, { components: ['bin/c.js'] })] }, active, maxIcs: 3 });
+  assert.equal(plan.assignments.length, 1);
+  assert.equal(plan.thirdProof.independent, true);
+  assert.deepEqual(plan.thirdProof.missingReservations, []);
+
+  const conflict = independenceProof([...active, normalizeIssue(issue(53, { components: ['bin/a.js'] }))]);
+  assert.equal(conflict.independent, false);
+  assert.deepEqual(conflict.conflicts, [{ left: 40, right: 53 }]);
 });
 
 test('issue criteria derive typed reservations from body and comment paths', () => {

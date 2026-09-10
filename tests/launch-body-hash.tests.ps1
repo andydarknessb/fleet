@@ -52,7 +52,7 @@ exit /b %errorlevel%
   $manifestPath = "$testRoot\state\manifests\assignment-test-1098.json"
   $manifest = [ordered]@{
     schemaVersion = 1; status = 'pending-ack'; id = 'assignment-test-1098'; workRecordId = 'test:issue-1098'; workRecordRevision = 1
-    issue = [ordered]@{ number = 1098; bodyHash = $bodyHash }; base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = ('a' * 40) }
+    issue = [ordered]@{ number = 1098; bodyHash = $bodyHash; criteriaHash = $bodyHash; commentCount = 0 }; base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = ('a' * 40) }
     branch = 'fleet/1098-test'; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
   }
   Write-Utf8 $manifestPath ($manifest | ConvertTo-Json -Depth 8)

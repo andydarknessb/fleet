@@ -81,11 +81,13 @@ if ($Manifest) {
   if ($activeAssignments.Count -ge 3) { Write-Error 'a fourth assignment is not permitted'; exit 4 }
   if ($activeAssignments.Count -ge 2) {
     $proof = $assignment.independenceProof
+    $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
     $expectedCandidates = @($activeAssignments | ForEach-Object { [int]$_.issue }) + @([int]$Issue) | Sort-Object
     $actualCandidates = @($proof.candidates | ForEach-Object { [int]$_ }) | Sort-Object
-    $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
     $actualFields = @($proof.checkedFields | ForEach-Object { [string]$_ }) | Sort-Object
-    $proofValid = $proof -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and @($proof.missingReservations).Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
+    $missingReservationIssues = @($proof.missingReservations)
+    $proofHasMissingReservations = $proof -and $proof.PSObject.Properties.Name -contains 'missingReservations'
+    $proofValid = $proof -and $proofHasMissingReservations -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and $missingReservationIssues.Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
     if (-not $proofValid) { Write-Error 'a third assignment requires a verified independent machine-readable proof'; exit 4 }
   }
 }
@@ -124,7 +126,7 @@ if ($Manifest -and -not $DryRun) {
   $criteriaText = $criteriaParts -join [char]0
   $criteriaHash = [Security.Cryptography.SHA256]::Create()
   $actualCriteriaHash = [BitConverter]::ToString($criteriaHash.ComputeHash([Text.Encoding]::UTF8.GetBytes($criteriaText))).Replace('-', '').ToLowerInvariant()
-  if ($assignment.issue.criteriaHash -and $actualCriteriaHash -ne [string]$assignment.issue.criteriaHash) {
+  if (-not $assignment.issue.criteriaHash -or $actualCriteriaHash -ne [string]$assignment.issue.criteriaHash) {
     Invalidate-Manifest 'issue criteria changed before acknowledgment'
     Write-Error "issue #$Issue criteria changed after the manifest was created; assignment invalidated"
     exit 4
