@@ -20,6 +20,29 @@ const { DECISION_STATES } = workState;
 const MAX_BODY_CHARS = 600;
 const MAX_BODY_LINES = 6;
 
+class NotifyError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'NotifyError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+// notify.js is a single-purpose binary (one process per decision event, or a
+// manual/scripted sweep): unlike review-policy.js or exclusions.js it takes no
+// command word in argv, so there is exactly one command, `notify`, and it
+// declares its flags the same way a per-command schema would (fleet#4).
+// --root/--record/--sequence are the three spawnNotifier ever builds (called
+// from pr-watch's decision-needed wake, review-policy.js hold, work-state.js
+// transition, and budget.js's escalation path - grepped: none pass anything
+// else); --tenant/--live/--dry-run/--now are read by main() for a manual or
+// scripted full sweep and by the tests that drive runNotifier's options
+// through the same names.
+const NOTIFY_FLAGS = Object.freeze({
+  notify: ['root', 'tenant', 'record', 'sequence', 'live', 'dry-run', 'now'],
+});
+
 function baseOf(root) {
   return path.resolve(root || path.resolve(__dirname, '..'));
 }
@@ -239,26 +262,51 @@ function spawnNotifier({ root, recordId, sequence, node = process.execPath } = {
   }
 }
 
-function main(argv) {
-  const args = workState.parseArgs(argv);
-  const result = runNotifier({
+// `notify` is the only command this binary has; a typo'd flag is refused
+// before anything is touched (findPendingDecisions/notifyRecord run only once
+// parseArgs has returned), so a refusal can never surface as a recorded
+// failed delivery.
+function cli(argv) {
+  let args;
+  try {
+    args = workState.parseArgs(argv, NOTIFY_FLAGS.notify);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new NotifyError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
+  return runNotifier({
     root: args.root, tenant: args.tenant, recordId: args.record,
     sequence: args.sequence ? Number(args.sequence) : undefined,
     live: args.live === 'true' ? true : undefined, dryRun: args['dry-run'] === 'true', now: args.now,
   });
+}
+
+function main(argv) {
+  const result = cli(argv);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
 if (require.main === module) {
   try { main(process.argv.slice(2)); } catch (error) {
-    process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
-    process.exitCode = 1;
+    if (error.code === 'USAGE') {
+      // A refused invocation exits 2 so a caller reading only the status
+      // cannot take it for a failed delivery, let alone a completed one
+      // (fleet#2's rule, adopted here per fleet#4).
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message, flag: error.flag, accepted: error.accepted })}\n`);
+      process.exitCode = 2;
+    } else {
+      process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
+      process.exitCode = 1;
+    }
   }
 }
 
 module.exports = {
   DECISION_STATES,
+  NOTIFY_FLAGS,
+  NotifyError,
   buildPointerMessage,
+  cli,
   findPendingDecisions,
   isLive,
   runNotifier,

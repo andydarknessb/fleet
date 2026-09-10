@@ -5,8 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { execFileSync } = require('node:child_process');
-const { buildPointerMessage, validatePointerMessage, findPendingDecisions, runNotifier, isLive, spawnNotifier } = require('../bin/notify');
+const { execFileSync, spawnSync } = require('node:child_process');
+const { buildPointerMessage, validatePointerMessage, findPendingDecisions, runNotifier, isLive, spawnNotifier, cli, NOTIFY_FLAGS, NotifyError } = require('../bin/notify');
 const workState = require('../bin/work-state');
 
 function rootDir() {
@@ -229,4 +229,93 @@ test('a notifier that cannot be launched is a visible failed delivery, not silen
   assert.match(entry.detail, /notifier launch failed/);
   const types = workState.readEvents(root).filter((event) => event.type.startsWith('notification-')).map((event) => event.type);
   assert.deepEqual(types, ['notification-attempted', 'notification-failed']);
+});
+
+// --- fleet#4: notify refuses unknown flags ---------------------------------
+// notify.js has one command (`notify`, the whole binary - there is no
+// subcommand word); before this a typo'd flag fell into a bucket nothing
+// reads and the sweep silently ran with that option missing. `--id` and
+// `--decision-sequence` are `work-state.js notify`'s names for the same two
+// things this binary calls `--record`/`--sequence` - the confusable pair
+// fleet#2 warned about, this time between two commands in the same repo
+// rather than two repos.
+//
+// Red-tell: with the bin change stashed, every case below either fails to
+// throw (the old parseArgs(argv) with no schema accepts anything) or throws
+// a plain Error/WorkStateError instead of a NotifyError with code USAGE.
+// Refs #4.
+
+function notifyRoot() {
+  const root = rootDir();
+  return root;
+}
+
+function refusesUsage(argv, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof NotifyError, `expected NotifyError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('notify: --id (work-state.js notify command name) is refused as an unknown flag, not read as no target', () => {
+  const root = notifyRoot();
+  const { id, sequence } = seed(root);
+  const activeBefore = fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8');
+  const eventsBefore = workState.readEvents(root);
+  refusesUsage(['--root', root, '--id', id, '--sequence', String(sequence), '--live'], /unknown flag --id/);
+  assert.equal(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'), activeBefore, 'the record file is untouched by a refused invocation');
+  assert.deepEqual(workState.readEvents(root), eventsBefore, 'no event, including a notification-failed, is appended for a refusal');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'shadow.jsonl')), false);
+});
+
+test('notify: --decision-sequence (work-state.js notify command name) is refused as an unknown flag', () => {
+  const root = notifyRoot();
+  const { id, sequence } = seed(root);
+  refusesUsage(['--root', root, '--record', id, '--decision-sequence', String(sequence)], /unknown flag --decision-sequence/);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'shadow.jsonl')), false, 'a refused invocation never runs the shadow sweep either');
+});
+
+test('notify: the unknown-flag refusal names the accepted set', () => {
+  assert.throws(() => cli(['--root', notifyRoot(), '--nope', 'x']), (error) => {
+    for (const flag of NOTIFY_FLAGS.notify) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    assert.equal(error.flag, 'nope');
+    assert.deepEqual(error.accepted, NOTIFY_FLAGS.notify);
+    return true;
+  });
+});
+
+test('notify: a correct invocation through cli() still runs the shadow sweep unchanged', () => {
+  const root = notifyRoot();
+  const { id, sequence } = seed(root);
+  const result = cli(['--root', root]);
+  assert.deepEqual(result.handled.map((h) => [h.recordId, h.sequence, h.outcome]), [[id, sequence, 'shadow']]);
+  const shadow = fs.readFileSync(path.join(root, 'state', 'notify', 'shadow.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(shadow.length, 1);
+  assert.equal(shadow[0].recordId, id);
+  assert.equal(workState.readEvents(root).filter((event) => event.type.startsWith('notification-')).length, 0);
+});
+
+test('notify: a targeted correct invocation through cli() passes --record/--sequence/--dry-run through to runNotifier unharmed', () => {
+  const root = notifyRoot();
+  const { id, sequence } = seed(root);
+  const result = cli(['--root', root, '--record', id, '--sequence', String(sequence), '--dry-run']);
+  assert.deepEqual(result.handled.map((h) => [h.recordId, h.sequence, h.outcome]), [[id, sequence, 'shadow']]);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'notify.log.jsonl')), false, '--dry-run reached runNotifier: the sweep log was never written');
+});
+
+test('notify: the process exits 2 on a refusal and writes the refusal to stderr, no JSON answer on stdout', () => {
+  const bin = path.join(__dirname, '..', 'bin', 'notify.js');
+  const root = notifyRoot();
+  const { id, sequence } = seed(root);
+  const typo = spawnSync(process.execPath, [bin, '--root', root, '--id', id, '--sequence', String(sequence)], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stdout, '');
+  const err = JSON.parse(typo.stderr);
+  assert.equal(err.code, 'USAGE');
+  assert.match(err.message, /unknown flag --id/);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'shadow.jsonl')), false);
+  const ok = execFileSync(process.execPath, [bin, '--root', root], { encoding: 'utf8', windowsHide: true });
+  assert.deepEqual(JSON.parse(ok).handled.map((h) => [h.recordId, h.sequence, h.outcome]), [[id, sequence, 'shadow']]);
 });
