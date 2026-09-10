@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { evaluateChecks, planRecord, runWatch, closingLinked, hopsTo, escalatedHopsTo, WATCHER_MARK } = require('../bin/pr-watch');
+const { evaluateChecks, planRecord, runWatch, closingLinked, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
 const workState = require('../bin/work-state');
 
 function rootDir() {
@@ -454,4 +454,50 @@ test('state/flags/pr-watch-off makes the tick skip without touching state', () =
   assert.match(out.reason, /pr-watch-off/);
   assert.equal(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'), before, 'nothing moved');
   assert.equal(fs.existsSync(path.join(root, 'state', 'watch', 'health.json')), false, 'no tick ran');
+});
+
+// fleet#4: pr-watch.js is invoked with flags only (never a subcommand word) by every
+// PowerShell caller (bin/rotate.ps1, bin/run-pr-watch.ps1) and by the tests above, so
+// `watch` is the sole entry in FLAGS - but a typo'd flag must still be refused rather
+// than falling into a bucket nothing reads (that used to mean e.g. --dryrun silently
+// running for real, or --tenatn silently falling back to tenant auto-discovery).
+
+test('cli refuses a typo\'d flag for the watch command, naming the flag and the accepted set', () => {
+  assert.throws(() => cli(['--root', 'r', '--tenant', 'endzone', '--dryrun', 'true']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /--dryrun/);
+    for (const flag of FLAGS.watch) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli refuses an unknown command, listing the known commands', () => {
+  assert.throws(() => cli(['bogus-command']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /bogus-command/);
+    assert.match(error.message, /watch/);
+    return true;
+  });
+});
+
+test('cli watch still runs a correct invocation exactly as before (the pr-watch-off skip)', () => {
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-63', issue: 63, state: 'ci-wait', prNumber: 163 });
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', branchPrefix: 'fleet/', ciGates: [] }));
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'pr-watch-off'), 'x');
+  const result = cli(['--root', root, '--tenant', 'endzone', '--gh', 'no-such-gh-binary']);
+  assert.deepEqual(result, { ok: true, skipped: true, reason: 'state/flags/pr-watch-off stands: CI watching is disabled; remove the flag to resume' });
+});
+
+test('a typo\'d flag on the command line exits 2 with an empty stdout and USAGE JSON on stderr', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = rootDir();
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'pr-watch.js'), '--root', root, '--tenant', 'endzone', '--dryrun', 'true'], { encoding: 'utf8' });
+  assert.equal(run.status, 2);
+  assert.equal(run.stdout, '');
+  const err = JSON.parse(run.stderr.trim());
+  assert.equal(err.code, 'USAGE');
+  assert.match(err.message, /--dryrun/);
 });
