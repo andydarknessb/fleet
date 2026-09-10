@@ -16,6 +16,18 @@ const { readExclusions, projectExclusions } = require('./exclusions');
 
 const CREATION_TYPES = Object.freeze(['assignment-reserved', 'work-created', 'shadow-projected']);
 const RETIRED_TYPES = Object.freeze(['assignment-released', 'assignment-retired', 'shadow-retired']);
+// fleet#4: refuse an unknown flag rather than silently ignore it.
+class DigestError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'DigestError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+const DIGEST_FLAGS = ['root', 'tenant', 'output', 'now', 'offset', 'exclusions-offset', 'dry-run', 'print'];
+
 const { DECISION_STATES } = workState;
 const ACTIVE_STATES = Object.freeze(workState.STATES.filter((state) => state !== 'retired'));
 const MERGED_LIMIT = 10;
@@ -211,8 +223,14 @@ function projectDigest(options = {}) {
   return { output, content, offset };
 }
 
-function main(argv) {
-  const args = workState.parseArgs(argv);
+function cli(argv) {
+  let args;
+  try {
+    args = workState.parseArgs(argv, DIGEST_FLAGS);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new DigestError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
   const result = projectDigest({
     root: args.root, tenant: args.tenant, output: args.output, now: args.now,
     offset: args.offset ? Number(args.offset) : undefined, exclusionsOffset: args['exclusions-offset'] ? Number(args['exclusions-offset']) : undefined,
@@ -220,13 +238,19 @@ function main(argv) {
   });
   if (args.print === 'true') process.stdout.write(result.content);
   else process.stdout.write(`${JSON.stringify({ output: result.output, offset: result.offset, bytes: Buffer.byteLength(result.content, 'utf8') })}\n`);
+  return result;
 }
 
 if (require.main === module) {
-  try { main(process.argv.slice(2)); } catch (error) {
-    process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
-    process.exitCode = 1;
+  try { cli(process.argv.slice(2)); } catch (error) {
+    if (error.code === 'USAGE') {
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+      process.exitCode = 2;
+    } else {
+      process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
+      process.exitCode = 1;
+    }
   }
 }
 
-module.exports = { foldLedger, projectDigest, render };
+module.exports = { foldLedger, projectDigest, render, cli, DIGEST_FLAGS, DigestError };

@@ -10,7 +10,18 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
-const { parseArgs } = workState;
+
+// fleet#4: refuse an unknown flag rather than silently ignore it.
+class BudgetReportError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'BudgetReportError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+const BUDGET_REPORT_FLAGS = ['root', 'now'];
 
 function baseOf(root) { return path.resolve(root || path.join(__dirname, '..')); }
 function stripBom(text) { return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text; }
@@ -144,15 +155,30 @@ function render(s) {
   return `${lines.join('\n')}\n`;
 }
 
+function cli(argv) {
+  let args;
+  try {
+    args = workState.parseArgs(argv, BUDGET_REPORT_FLAGS);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new BudgetReportError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
+  return buildSummary({ root: args.root, now: args.now });
+}
+
 if (require.main === module) {
   try {
-    const args = parseArgs(process.argv.slice(2));
-    const summary = buildSummary({ root: args.root, now: args.now });
+    const summary = cli(process.argv.slice(2));
     process.stdout.write(`${JSON.stringify({ at: summary.at, totals: summary.totals, live: Object.fromEntries(Object.entries(summary.live.byModel).map(([m, b]) => [m, { measured: b.measured, warn: b.warn, escalate: b.escalate, median: b.medianJobTokens }])) })}\n`);
   } catch (error) {
-    process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
-    process.exitCode = 1;
+    if (error.code === 'USAGE') {
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+      process.exitCode = 2;
+    } else {
+      process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
+      process.exitCode = 1;
+    }
   }
 }
 
-module.exports = { buildSummary, family, median, render };
+module.exports = { buildSummary, family, median, render, cli, BUDGET_REPORT_FLAGS, BudgetReportError };

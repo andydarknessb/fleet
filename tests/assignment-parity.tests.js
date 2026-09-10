@@ -10,11 +10,15 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
+  AssignmentParityError,
+  ASSIGNMENT_PARITY_FLAGS,
   classifyEvaluation,
+  cli,
   compareAssignmentParity,
   observeFrontier,
   readShadow,
 } = require('../bin/assignment-parity');
+const { spawnSync } = require('node:child_process');
 
 const T0 = Date.parse('2026-09-04T00:00:00.000Z');
 const MIN = 60 * 1000;
@@ -253,4 +257,65 @@ test('evaluations older than the window neither count nor gate', () => {
   assert.equal(result.evaluations, 3, 'the stale evaluation is outside the trailing window');
   assert.deepEqual(result.unapproved, [], 'and its difference does not gate');
   assert.equal(result.pass, true, result.reasons.join('; '));
+});
+
+// --- fleet#4: the seven read-only reporters adopt the parseArgs flag schema --------
+// Red-tell: with bin/assignment-parity.js reverted to its old hand-rolled parseArgs
+// (no schema, no per-command dispatch guard), every case below either fails to throw
+// or throws the wrong thing.
+
+function refusesUsage(argv, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof AssignmentParityError, `expected AssignmentParityError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('cli: observe refuses --repo-path (the assignment.js name) as an unknown flag, naming the accepted set', () => {
+  const root = rootDir();
+  refusesUsage(['observe', '--root', root, '--tenant', 'endzone', '--repo-path', '/e/repo'], /unknown flag --repo-path/);
+  assert.throws(() => cli(['observe', '--root', root, '--repo-path', '/e/repo']), (error) => {
+    for (const flag of ASSIGNMENT_PARITY_FLAGS.observe) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: report refuses --tenant-name as an unknown flag, naming the accepted set', () => {
+  const root = rootDir();
+  refusesUsage(['report', '--root', root, '--tenant-name', 'endzone'], /unknown flag --tenant-name/);
+  assert.throws(() => cli(['report', '--root', root, '--tenant-name', 'endzone']), (error) => {
+    for (const flag of ASSIGNMENT_PARITY_FLAGS.report) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: an unknown command is a usage error naming the known commands', () => {
+  refusesUsage(['obseve', '--root', 'x'], /unknown command 'obseve'; commands: observe, report/);
+});
+
+test('cli: a correct report invocation still works, matching the direct call', () => {
+  const root = rootDir();
+  evaluate(root, T0, [1], planner([1]));
+  const viaCli = cli(['report', '--root', root, '--tenant', 'endzone', '--json', 'true']);
+  const direct = compareAssignmentParity({ root, tenant: 'endzone' });
+  assert.deepEqual(viaCli, direct);
+});
+
+test('spawnSync: a typo on `report` exits 64 (EX_USAGE) with nothing on stdout, distinct from a FAILED gate (exit 2)', () => {
+  const bin = path.join(__dirname, '..', 'bin', 'assignment-parity.js');
+  const root = rootDir();
+  evaluate(root, T0, [1], planner([1]));
+
+  const typo = spawnSync(process.execPath, [bin, 'report', '--root', root, '--tenant-name', 'endzone'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 64);
+  assert.equal(typo.stdout, '');
+  assert.equal(JSON.parse(typo.stderr).code, 'USAGE');
+
+  // A correct invocation over the same (necessarily thin) evidence fails the GATE, not
+  // the flag schema: exit 2, distinct from the typo's exit 64.
+  const ok = spawnSync(process.execPath, [bin, 'report', '--root', root, '--tenant', 'endzone', '--json', 'true'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(ok.status, 2);
+  assert.equal(JSON.parse(ok.stdout).pass, false);
 });

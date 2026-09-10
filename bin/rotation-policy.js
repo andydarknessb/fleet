@@ -6,6 +6,22 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline');
+const workState = require('./work-state');
+
+// fleet#4: refuse an unknown command or flag rather than silently ignore it.
+class RotationPolicyError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'RotationPolicyError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+const ROTATION_POLICY_FLAGS = {
+  evaluate: ['root', 'claude-home', 'now'],
+  offset: ['root', 'now'],
+};
 
 // Spec fallbacks ("Outcomes and budgets"); config/cycle.json overrides.
 const DEFAULT_ROTATION = Object.freeze({
@@ -194,33 +210,35 @@ async function evaluate({ root, claudeHome, now } = {}) {
   return { schemaVersion: 1, evaluatedAt, sessions };
 }
 
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith('--')) continue;
-    const key = token.slice(2);
-    const next = argv[index + 1];
-    args[key] = next && !next.startsWith('--') ? argv[++index] : 'true';
-  }
-  return args;
-}
-
 async function cli(argv) {
   const [command, ...rest] = argv;
-  const args = parseArgs(rest);
+  const commands = Object.keys(ROTATION_POLICY_FLAGS);
+  if (!ROTATION_POLICY_FLAGS[command]) {
+    throw new RotationPolicyError('USAGE', `unknown command '${command}'; commands: ${commands.join(', ')}`);
+  }
+  let args;
+  try {
+    args = workState.parseArgs(rest, ROTATION_POLICY_FLAGS[command]);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new RotationPolicyError('USAGE', error.message, { flag: error.flag, accepted: error.accepted, command });
+    throw error;
+  }
   if (command === 'evaluate') return evaluate({ root: args.root, claudeHome: args['claude-home'], now: args.now });
-  if (command === 'offset') return captureOffset({ root: args.root, now: args.now });
-  throw new Error('usage: rotation-policy.js <evaluate|offset> [--root DIR] [--claude-home DIR] [--now ISO]');
+  return captureOffset({ root: args.root, now: args.now });
 }
 
 if (require.main === module) {
   cli(process.argv.slice(2))
     .then((result) => process.stdout.write(`${JSON.stringify(result)}\n`))
     .catch((error) => {
-      process.stderr.write(`${JSON.stringify({ error: String(error.message || error) })}\n`);
-      process.exitCode = 1;
+      if (error.code === 'USAGE') {
+        process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+        process.exitCode = 2;
+      } else {
+        process.stderr.write(`${JSON.stringify({ error: String(error.message || error) })}\n`);
+        process.exitCode = 1;
+      }
     });
 }
 
-module.exports = { captureOffset, evaluate, findTranscript, sumTranscriptTokens, countMerges, rotationConfig, parseArgs };
+module.exports = { captureOffset, evaluate, findTranscript, sumTranscriptTokens, countMerges, rotationConfig, cli, ROTATION_POLICY_FLAGS, RotationPolicyError };

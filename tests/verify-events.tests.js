@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { verifyLedger, verifyRecordEvents, stateAfter } = require('../bin/verify-events');
+const { verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError } = require('../bin/verify-events');
 const { createRecord, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
 
 function rootDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-verify-')); }
@@ -159,4 +159,28 @@ test('the 30-day archival moves nothing until a fresh passing verdict exists', (
   assert.equal(fs.existsSync(old), false, 'a fresh passing verdict: the 30-day-old file is archived');
   assert.equal(fs.existsSync(path.join(root, 'state', 'events', 'archive', '2026-07-01.jsonl')), true);
   assert.equal(readEvents(root).some((e) => e.sequence === 99), true, 'archived events are still read');
+});
+
+// --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
+// Red-tell: with bin/verify-events.js reverted to its old hand-rolled parseArgs (no
+// schema), --samples is silently ignored instead of throwing.
+
+test('cli: refuses --samples (confusable with --sample) as an unknown flag, naming the accepted set', () => {
+  const root = rootDir();
+  assert.throws(() => cli(['--root', root, '--samples', '1']), (error) => {
+    assert.ok(error instanceof VerifyEventsError, `expected VerifyEventsError, got ${error && error.name}`);
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --samples\b/);
+    for (const flag of VERIFY_EVENTS_FLAGS) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: a correct invocation still works, matching the direct call', () => {
+  const root = rootDir();
+  unit(root, 20, ['pr-open']);
+  const now = '2026-09-09T05:00:00.000Z';
+  const { result, json } = cli(['--root', root, '--now', now, '--json', 'true']);
+  assert.equal(json, true);
+  assert.deepEqual(result, verifyLedger({ root, now }));
 });

@@ -15,7 +15,21 @@ const workState = require('./work-state');
 
 const TERMINAL = 'retired';
 
-const { parseArgs } = workState;
+// fleet#4: a typo'd flag must be refused, not silently ignored (the parity of this
+// with a genuine FAIL verdict matters: both currently exit 2, so a caller reading only
+// the status cannot yet tell a refused invocation from a real ledger finding - unlike
+// parity.js/assignment-parity.js, this binary has no spare exit code carved out for it
+// today, so it keeps exit 2 for both per the fleet#4 ruling; --json still tells them apart).
+class VerifyEventsError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'VerifyEventsError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+const VERIFY_EVENTS_FLAGS = ['root', 'now', 'sample', 'json'];
 
 function baseOf(root) { return path.resolve(root || path.join(__dirname, '..')); }
 function stripBom(text) { return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text; }
@@ -155,11 +169,22 @@ function verifyLedger({ root, now, sample } = {}) {
   return result;
 }
 
+function cli(argv) {
+  let args;
+  try {
+    args = workState.parseArgs(argv, VERIFY_EVENTS_FLAGS);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new VerifyEventsError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
+  const result = verifyLedger({ root: args.root, now: args.now, sample: args.sample ? Number(args.sample) : undefined });
+  return { result, json: args.json === 'true' };
+}
+
 if (require.main === module) {
   try {
-    const args = parseArgs(process.argv.slice(2));
-    const result = verifyLedger({ root: args.root, now: args.now, sample: args.sample ? Number(args.sample) : undefined });
-    if (args.json === 'true') process.stdout.write(`${JSON.stringify(result)}\n`);
+    const { result, json } = cli(process.argv.slice(2));
+    if (json) process.stdout.write(`${JSON.stringify(result)}\n`);
     else {
       process.stdout.write(`EVENT VERIFICATION: ${result.pass ? 'PASS' : 'FAIL'}\n`);
       process.stdout.write(`events ${result.totals.events}, records ${result.totals.records} (active ${result.totals.active}, archived ${result.totals.archived}, released ${result.totals.released}), orphaned record ids ${result.totals.orphanedRecordIds}\n`);
@@ -170,9 +195,17 @@ if (require.main === module) {
     }
     process.exitCode = result.pass ? 0 : 2;
   } catch (error) {
-    process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
-    process.exitCode = 1;
+    if (error.code === 'USAGE') {
+      // fleet#4: a refused invocation exits 2, the same status a genuine FAIL verdict
+      // uses (no spare code was carved out for this binary) - `--json` output being
+      // empty and `{code:"USAGE"}` on stderr is what distinguishes the two.
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+      process.exitCode = 2;
+    } else {
+      process.stderr.write(`${JSON.stringify({ ok: false, error: String(error.message || error) })}\n`);
+      process.exitCode = 1;
+    }
   }
 }
 
-module.exports = { verifyLedger, verifyRecordEvents, stateAfter };
+module.exports = { verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError };

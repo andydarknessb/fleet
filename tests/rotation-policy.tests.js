@@ -194,3 +194,47 @@ test('evaluate falls back to spec thresholds when config/cycle.json is absent', 
   assert.equal(dispatcher.due, true);
   assert.equal(dispatcher.thresholds.maxAgeHours, 24);
 });
+
+// --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
+// Red-tell: with bin/rotation-policy.js reverted to its old hand-rolled parseArgs (no
+// schema, no per-command dispatch guard), the typo cases below stop throwing.
+
+test('cli: evaluate refuses --claudehome (confusable with --claude-home) as an unknown flag', async () => {
+  const root = rootDir();
+  await assert.rejects(() => policy.cli(['evaluate', '--root', root, '--claudehome', 'x']), (error) => {
+    assert.ok(error instanceof policy.RotationPolicyError, `expected RotationPolicyError, got ${error && error.name}`);
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --claudehome\b/);
+    for (const flag of policy.ROTATION_POLICY_FLAGS.evaluate) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: offset refuses --roots (confusable with --root) as an unknown flag', async () => {
+  await assert.rejects(() => policy.cli(['offset', '--roots', 'x']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --roots\b/);
+    for (const flag of policy.ROTATION_POLICY_FLAGS.offset) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: an unknown command is a usage error naming the known commands', async () => {
+  await assert.rejects(() => policy.cli(['evaluat', '--root', 'x']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown command 'evaluat'; commands: evaluate, offset/);
+    return true;
+  });
+});
+
+test('cli: a correct invocation still works for both commands', async () => {
+  const root = rootDir();
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z', name: 'dispatcher', role: 'dispatcher', tenant: null, sessionId: 'd1' });
+  const viaCli = await policy.cli(['evaluate', '--root', root, '--claude-home', path.join(root, 'no-claude'), '--now', NOW]);
+  const direct = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
+  assert.deepEqual(viaCli, direct);
+
+  const offsetViaCli = await policy.cli(['offset', '--root', root, '--now', NOW]);
+  const offsetDirect = policy.captureOffset({ root, now: NOW });
+  assert.deepEqual(offsetViaCli, offsetDirect);
+});

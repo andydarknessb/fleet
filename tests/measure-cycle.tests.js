@@ -10,7 +10,10 @@ const {
   parseTranscript,
   renderSummary,
   buildReport,
+  cli,
   collectFromFiles,
+  MEASURE_CYCLE_FLAGS,
+  MeasureCycleError,
 } = require('../bin/measure-cycle');
 
 function line(value) {
@@ -444,4 +447,44 @@ test('the seven-day report names its own window and is persisted as JSON', () =>
   const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
   assert.equal(json.unitMetrics.completedUnits, 1);
   assert.equal(json.unitMetrics.budgets.icJobTokensMedian.limit, 60000);
+});
+
+// --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
+// Red-tell: with bin/measure-cycle.js reverted to its old hand-rolled parseArgs (no
+// schema), --transcript (singular, confusable with --transcripts) is silently ignored
+// instead of throwing.
+
+test('cli: refuses --transcript (confusable with --transcripts) as an unknown flag', () => {
+  assert.throws(() => cli(['--transcript', 'x', '--no-verify-github', 'true']), (error) => {
+    assert.ok(error instanceof MeasureCycleError, `expected MeasureCycleError, got ${error && error.name}`);
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --transcript\b/);
+    for (const flag of MEASURE_CYCLE_FLAGS) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: a correct invocation still works, matching the direct call', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const transcripts = path.join(root, 'transcripts');
+  const output = path.join(root, 'output');
+  fs.mkdirSync(path.join(transcripts, 'project-worktree'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{
+    name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42,
+    status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1',
+  }] }));
+  fs.writeFileSync(path.join(transcripts, 'project-worktree', 'session-1.jsonl'), fixtureTranscript());
+  const argv = [
+    '--transcripts', transcripts,
+    '--roster', path.join(root, 'roster.json'),
+    '--out', output,
+    '--since', '2026-09-01T00:00:00.000Z',
+    '--until', '2026-09-02T00:00:00.000Z',
+    '--now', '2026-09-01T12:00:00.000Z',
+    '--no-verify-github', 'true',
+  ];
+  const viaCli = cli(argv);
+  assert.equal(viaCli.report.sample.completedUnits, 1);
+  assert.equal(path.basename(viaCli.dailyArtifact), 'daily-2026-09-02.json');
+  assert.equal(path.basename(viaCli.summaryArtifact), 'seven-day-2026-09-02.md');
 });

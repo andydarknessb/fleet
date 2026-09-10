@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { buildSummary, family, median } = require('../bin/budget-report');
+const { buildSummary, family, median, cli, BUDGET_REPORT_FLAGS, BudgetReportError } = require('../bin/budget-report');
 const { createRecord, transitionRecord, recordBudget } = require('../bin/work-state');
 
 function rootDir() {
@@ -77,4 +77,28 @@ test('an empty fleet renders an honest empty summary', () => {
   const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
   assert.match(md, /No crossings recorded/);
   assert.match(md, /No active IC measured/);
+});
+
+// --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
+// Red-tell: with bin/budget-report.js reverted to its old hand-rolled parseArgs (no
+// schema), --root-dir is silently ignored instead of throwing.
+
+test('cli: refuses --root-dir (confusable with --root) as an unknown flag, naming the accepted set', () => {
+  const root = rootDir();
+  assert.throws(() => cli(['--root-dir', root]), (error) => {
+    assert.ok(error instanceof BudgetReportError, `expected BudgetReportError, got ${error && error.name}`);
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --root-dir\b/);
+    for (const flag of BUDGET_REPORT_FLAGS) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: a correct invocation still works, matching the direct call', () => {
+  const root = rootDir();
+  unit(root, 1);
+  const now = '2026-09-09T04:00:00.000Z';
+  const viaCli = cli(['--root', root, '--now', now]);
+  const direct = buildSummary({ root, now });
+  assert.deepEqual(viaCli, direct);
 });
