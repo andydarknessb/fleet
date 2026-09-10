@@ -213,9 +213,36 @@ function runWithSuiteLock(options = {}) {
   }
 }
 
+// fleet#4: adopt work-state's parseArgs flag schema (fleet#2's fix, applied here)
+// so a typo'd flag is refused instead of falling into a bucket nothing reads.
+// Declared per command: each list is every `args.xxx` / `args['xxx']` that
+// command's handler (directly or via `common`) actually consumes.
+const FLAGS = Object.freeze({
+  acquire: ['root', 'suite', 'record', 'pid', 'wait', 'timeout-ms', 'poll-ms'],
+  release: ['root', 'suite', 'record', 'force'],
+  status: ['root', 'suite'],
+  run: ['root', 'suite', 'record', 'pid', 'wait', 'timeout-ms', 'poll-ms', 'shell'],
+});
+
+function usage(message) {
+  return new SuiteLockError('USAGE', `${message}\ncommands: ${Object.keys(FLAGS).join(', ')} -- <command...>`);
+}
+
 function cli(argv) {
   const [command, ...rest] = argv;
-  const args = workState.parseArgs(rest);
+  if (!Object.prototype.hasOwnProperty.call(FLAGS, command)) {
+    throw usage(`unknown command '${command}'; commands: ${Object.keys(FLAGS).join(', ')}`);
+  }
+  let args;
+  try {
+    args = workState.parseArgs(rest, FLAGS[command]);
+  } catch (error) {
+    // parseArgs throws work-state's own error class; re-throw as this
+    // binary's, same code/message/details, so every USAGE case here is a
+    // SuiteLockError regardless of which layer built it.
+    if (error.code === 'USAGE') throw new SuiteLockError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
   const common = {
     root: args.root, suite: args.suite, record: args.record,
     pid: args.pid ? Number(args.pid) : undefined,
@@ -226,13 +253,11 @@ function cli(argv) {
   if (command === 'acquire') return acquireSuiteLock(common);
   if (command === 'release') return releaseSuiteLock({ root: args.root, suite: args.suite, record: args.record, force: args.force === 'true' });
   if (command === 'status') return suiteStatus({ root: args.root, suite: args.suite });
-  if (command === 'run') {
-    const [runCommand, ...runArgs] = args._;
-    const code = runWithSuiteLock({ ...common, wait: args.wait !== 'false', command: runCommand, args: runArgs, shell: args.shell === 'true' });
-    process.exitCode = code;
-    return { exitCode: code };
-  }
-  throw new SuiteLockError('USAGE', 'commands: acquire, release, status, run -- <command...>');
+  // command === 'run'
+  const [runCommand, ...runArgs] = args._;
+  const code = runWithSuiteLock({ ...common, wait: args.wait !== 'false', command: runCommand, args: runArgs, shell: args.shell === 'true' });
+  process.exitCode = code;
+  return { exitCode: code };
 }
 
 if (require.main === module) {
@@ -240,13 +265,19 @@ if (require.main === module) {
     process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message, owner: error.owner || null })}\n`);
-    process.exitCode = 1;
+    // A refused invocation exits 2 so a caller reading only the status cannot
+    // take it for a failed lock attempt (fleet#2's rule, applied here); every
+    // other error keeps its existing exit code (1), including SUITE_BUSY /
+    // NOT_OWNER, which callers read as "held", not "usage".
+    process.exitCode = error.code === 'USAGE' ? 2 : 1;
   }
 }
 
 module.exports = {
+  FLAGS,
   SuiteLockError,
   acquireSuiteLock,
+  cli,
   releaseSuiteLock,
   runWithSuiteLock,
   suiteStatus,

@@ -1,14 +1,16 @@
 'use strict';
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
 const {
+  FLAGS,
   SuiteLockError,
   acquireSuiteLock,
+  cli,
   releaseSuiteLock,
   suiteStatus,
   runWithSuiteLock,
@@ -175,4 +177,129 @@ test('a waiter that times out exits nonzero and still names the owner', async ()
   assert.match(stderr, /SUITE_BUSY/);
   assert.match(stderr, /endzone:issue-42/);
   assert.equal(suiteStatus({ root, suite: 'sweep' }).owner.record, 'endzone:issue-42');
+});
+
+// --- fleet#4: suite-lock adopts the parseArgs flag schema -------------------
+// Before this, `cli()` parsed every command's flags with no schema (fleet#2
+// fixed the same hole in review-policy.js's `classify`, one binary at a time).
+// A typo'd flag - `--suite-name` for `--suite`, `--forced` for `--force`,
+// `--timeout` for `--timeout-ms` - fell into a bucket nothing read: `common`
+// picked up `undefined` for the real flag and the command ran anyway (an
+// acquire with no suite threw the generic "suite and record are required",
+// but a release/status typo silently answered against `undefined`, and a run
+// typo silently ran unlocked). Every case below goes through `cli`, the same
+// door bin/*.ps1 and the IC use.
+//
+// Red-tell: with bin/suite-lock.js stashed back to parseArgs(rest) (no
+// schema) and no per-command FLAGS, every USAGE case below fails - the typo
+// cases resolve `undefined` instead of throwing, and `require('../bin/suite-lock')`
+// no longer exports `cli`/`FLAGS` at all.
+
+function usageError(argv, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof SuiteLockError, `expected SuiteLockError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('cli: acquire refuses a typo\'d --suite-name, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  usageError(
+    ['acquire', '--root', root, '--suite-name', 'sweep', '--record', 'endzone:issue-42'],
+    /unknown flag --suite-name/,
+  );
+  for (const flag of FLAGS.acquire) {
+    assert.throws(() => cli(['acquire', '--root', root, '--suite-name', 'sweep']), (error) => {
+      assert.match(error.message, new RegExp(`--${flag}\\b`));
+      return true;
+    });
+  }
+});
+
+test('cli: release refuses a typo\'d --forced, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  acquireSuiteLock({ root, suite: 'sweep', record: 'endzone:issue-42' });
+  usageError(
+    ['release', '--root', root, '--suite', 'sweep', '--record', 'endzone:issue-42', '--forced', 'true'],
+    /unknown flag --forced; accepted: .*--force\b/,
+  );
+  // The typo never reached releaseSuiteLock: the lock is still held.
+  assert.equal(suiteStatus({ root, suite: 'sweep' }).held, true);
+});
+
+test('cli: status refuses a typo\'d --suite-name, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  usageError(
+    ['status', '--root', root, '--suite-name', 'sweep'],
+    /unknown flag --suite-name; accepted: .*--suite\b/,
+  );
+});
+
+test('cli: run refuses a typo\'d --timeout, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  usageError(
+    ['run', '--root', root, '--suite', 'sweep', '--record', 'endzone:issue-42', '--timeout', '100', '--', 'npm', '-v'],
+    /unknown flag --timeout; accepted: .*--timeout-ms\b/,
+  );
+  // The typo never reached runWithSuiteLock: nothing took the lock.
+  assert.equal(suiteStatus({ root, suite: 'sweep' }).held, false);
+});
+
+test('cli: an unknown command is a usage error listing the commands', () => {
+  usageError(['acquireX', '--root', rootDir()], /unknown command 'acquireX'/);
+  usageError([], /unknown command/);
+});
+
+test('cli: a correct invocation of every command still works, byte-identical to calling the functions directly', () => {
+  const root = rootDir();
+
+  const acquired = cli(['acquire', '--root', root, '--suite', 'sweep', '--record', 'endzone:issue-42']);
+  assert.equal(acquired.acquired, true);
+  assert.equal(acquired.lock.record, 'endzone:issue-42');
+
+  const status = cli(['status', '--root', root, '--suite', 'sweep']);
+  assert.equal(status.held, true);
+  assert.equal(status.owner.record, 'endzone:issue-42');
+
+  const released = cli(['release', '--root', root, '--suite', 'sweep', '--record', 'endzone:issue-42']);
+  assert.equal(released.released, true);
+  assert.equal(suiteStatus({ root, suite: 'sweep' }).held, false);
+
+  try {
+    const ran = cli(['run', '--root', root, '--suite', 'sweep', '--record', 'endzone:issue-42', '--', process.execPath, '-e', 'process.exit(0)']);
+    assert.equal(ran.exitCode, 0);
+    assert.equal(suiteStatus({ root, suite: 'sweep' }).held, false);
+  } finally {
+    // cli('run', ...) sets process.exitCode as a side effect (mirrors the CLI
+    // entry point); undo it so this in-process assertion never leaks into the
+    // test runner's own exit status.
+    process.exitCode = undefined;
+  }
+});
+
+test('cli: exports cli and FLAGS (fleet#4 adoption)', () => {
+  assert.equal(typeof cli, 'function');
+  assert.deepEqual(Object.keys(FLAGS).sort(), ['acquire', 'release', 'run', 'status']);
+});
+
+test('spawned CLI: a typo\'d flag exits status 2, writes nothing to stdout, and a USAGE error as JSON to stderr', () => {
+  const root = rootDir();
+  const typo = spawnSync(process.execPath, [
+    CLI, 'acquire', '--root', root, '--suite-name', 'sweep', '--record', 'endzone:issue-42',
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stdout, '');
+  const parsed = JSON.parse(typo.stderr);
+  assert.equal(parsed.code, 'USAGE');
+  assert.match(parsed.message, /unknown flag --suite-name/);
+  assert.equal(suiteStatus({ root, suite: 'sweep' }).held, false);
+
+  // A correct invocation is unaffected: still exit 0, JSON on stdout.
+  const ok = spawnSync(process.execPath, [
+    CLI, 'acquire', '--root', root, '--suite', 'sweep', '--record', 'endzone:issue-42',
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(ok.status, 0);
+  assert.equal(JSON.parse(ok.stdout).acquired, true);
 });
