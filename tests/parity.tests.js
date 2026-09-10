@@ -7,7 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { compareParity, EXPECTED_CLASSES } = require('../bin/parity');
+const { compareParity, EXPECTED_CLASSES, cli, PARITY_FLAGS, ParityError } = require('../bin/parity');
+const { spawnSync } = require('node:child_process');
 
 const T0 = Date.parse('2026-09-02T00:00:00.000Z');
 const MIN = 60 * 1000;
@@ -282,4 +283,42 @@ test('--since and --until bound the evidence; text rendering names the verdict',
   const text = renderText(compareParity({ root, now: iso(end) }));
   assert.match(text, /PARITY: PASS/);
   assert.match(text, /continuous hours/i);
+});
+
+// --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
+// Red-tell: with bin/parity.js reverted to its old hand-rolled parseArgs (no schema),
+// the typo cases below stop throwing.
+
+test('cli: refuses --hour (confusable with --hours) as an unknown flag, naming the accepted set', () => {
+  const root = rootDir();
+  assert.throws(() => cli(['--root', root, '--hour', '48']), (error) => {
+    assert.ok(error instanceof ParityError, `expected ParityError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --hour\b/);
+    for (const flag of PARITY_FLAGS) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: a correct invocation still works, matching the direct call', () => {
+  const root = rootDir();
+  const end = writeCleanRun(root, 49);
+  const { result, json } = cli(['--root', root, '--now', iso(end), '--json', 'true']);
+  assert.equal(json, true);
+  assert.deepEqual(result, compareParity({ root, now: iso(end) }));
+});
+
+test('spawnSync: a typo exits 64 (EX_USAGE) with nothing on stdout, distinct from a FAILED gate (exit 2)', () => {
+  const bin = path.join(__dirname, '..', 'bin', 'parity.js');
+  const root = rootDir();
+  writeCleanRun(root, 5); // well short of the 48h requirement: a correct run here fails the gate
+
+  const typo = spawnSync(process.execPath, [bin, '--root', root, '--hour', '48'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 64);
+  assert.equal(typo.stdout, '');
+  assert.equal(JSON.parse(typo.stderr).code, 'USAGE');
+
+  const ok = spawnSync(process.execPath, [bin, '--root', root, '--json', 'true'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(ok.status, 2);
+  assert.equal(JSON.parse(ok.stdout).pass, false);
 });

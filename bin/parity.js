@@ -21,6 +21,19 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const workState = require('./work-state');
+
+// fleet#4: refuse an unknown flag rather than silently ignore it.
+class ParityError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'ParityError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+const PARITY_FLAGS = ['root', 'since', 'until', 'now', 'hours', 'actor', 'json'];
 
 const MIN = 60 * 1000;
 const DEFAULTS = Object.freeze({ parityHours: 48, pairWindowMinutes: 10, maxGapMinutes: 35, tickMinutes: 15 });
@@ -260,28 +273,30 @@ function renderText(result) {
   return `${lines.join('\n')}\n`;
 }
 
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith('--')) continue;
-    const key = token.slice(2);
-    const next = argv[index + 1];
-    args[key] = next && !next.startsWith('--') ? argv[++index] : 'true';
+function cli(argv) {
+  let args;
+  try {
+    args = workState.parseArgs(argv, PARITY_FLAGS);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new ParityError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
   }
-  return args;
+  const result = compareParity({ root: args.root, since: args.since, until: args.until, now: args.now, hours: args.hours, actor: args.actor });
+  return { result, json: args.json === 'true' };
 }
 
 if (require.main === module) {
   try {
-    const args = parseArgs(process.argv.slice(2));
-    const result = compareParity({ root: args.root, since: args.since, until: args.until, now: args.now, hours: args.hours, actor: args.actor });
-    process.stdout.write(args.json === 'true' ? `${JSON.stringify(result)}\n` : renderText(result));
+    const { result, json } = cli(process.argv.slice(2));
+    process.stdout.write(json ? `${JSON.stringify(result)}\n` : renderText(result));
     process.exitCode = result.pass ? 0 : 2;
   } catch (error) {
-    process.stderr.write(`${JSON.stringify({ code: 'ERROR', message: error.message })}\n`);
-    process.exitCode = 1;
+    process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
+    // fleet#4: exit 2 already means "gate FAILED" for this binary (README: "exit 2 on
+    // fail"), so a refused (typo'd) invocation must not share it - EX_USAGE (64) keeps
+    // a gate failure and a usage error distinguishable by status alone.
+    process.exitCode = error.code === 'USAGE' ? 64 : 1;
   }
 }
 
-module.exports = { compareParity, renderText, EXPECTED_CLASSES, CATEGORIES };
+module.exports = { compareParity, renderText, EXPECTED_CLASSES, CATEGORIES, cli, PARITY_FLAGS, ParityError };

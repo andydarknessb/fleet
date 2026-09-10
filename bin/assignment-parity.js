@@ -21,6 +21,24 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const workState = require('./work-state');
+
+// fleet#4: refuse an unknown command or flag rather than silently ignore it (fleet#2
+// found `review-policy.js classify` reading a typo'd flag as no argument at all and
+// answering riskReview:false, exit 0; the observe/report split here has the same shape).
+class AssignmentParityError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'AssignmentParityError';
+    this.code = code;
+    Object.assign(this, details);
+  }
+}
+
+const ASSIGNMENT_PARITY_FLAGS = {
+  observe: ['tenant', 'ready-label', 'fixture', 'repo', 'root', 'now', 'hook-frontier', 'hook-reason', 'mode'],
+  report: ['root', 'tenant', 'json'],
+};
 
 const DEFAULTS = Object.freeze({ parityEvaluations: 20, parityDistinctFrontiers: 5, parityHours: 48 });
 const MIN = 60 * 1000;
@@ -240,18 +258,6 @@ function renderText(result) {
   return `${lines.join('\n')}\n`;
 }
 
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith('--')) continue;
-    const key = token.slice(2);
-    const next = argv[index + 1];
-    args[key] = next !== undefined && !next.startsWith('--') ? argv[++index] : 'true';
-  }
-  return args;
-}
-
 // The hook's frontier travels as "1,2,3" or the literal 'none' (PowerShell 5.1 drops an
 // empty native argument). Anything else is a mangled call and must not read as an empty
 // frontier, which against an empty planner frontier would count as agreement.
@@ -266,7 +272,16 @@ function parseList(value) {
 // two frontiers read GitHub seconds apart, and records the pair.
 function cli(argv) {
   const [command, ...rest] = argv;
-  const args = parseArgs(rest);
+  if (!ASSIGNMENT_PARITY_FLAGS[command]) {
+    throw new AssignmentParityError('USAGE', `unknown command '${command}'; commands: ${Object.keys(ASSIGNMENT_PARITY_FLAGS).join(', ')}`);
+  }
+  let args;
+  try {
+    args = workState.parseArgs(rest, ASSIGNMENT_PARITY_FLAGS[command]);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new AssignmentParityError('USAGE', error.message, { flag: error.flag, accepted: error.accepted, command });
+    throw error;
+  }
   if (command === 'observe') {
     const assignment = require('./assignment');
     const exclusions = require('./exclusions');
@@ -301,14 +316,12 @@ function cli(argv) {
     const line = observeFrontier({ root: args.root, tenant, hookFrontier: parseList(args['hook-frontier']), hookReason: args['hook-reason'], planner, mode: args.mode, now: args.now });
     return { at: line.at, mode: line.mode, agree: line.agree, hookFrontier: line.hook.frontier, plannerFrontier: line.planner.frontier, plannerError: line.planner.error, differences: line.differences, live: line.mode === 'live' };
   }
-  if (command === 'report') {
-    const result = compareAssignmentParity({ root: args.root, tenant: args.tenant || 'endzone' });
-    if (args.json === 'true') return result;
-    process.stdout.write(renderText(result));
-    process.exitCode = result.pass ? 0 : 2;
-    return null;
-  }
-  throw new Error('commands: observe, report');
+  // command === 'report' (the only other key ASSIGNMENT_PARITY_FLAGS carries)
+  const result = compareAssignmentParity({ root: args.root, tenant: args.tenant || 'endzone' });
+  if (args.json === 'true') return result;
+  process.stdout.write(renderText(result));
+  process.exitCode = result.pass ? 0 : 2;
+  return null;
 }
 
 if (require.main === module) {
@@ -320,13 +333,19 @@ if (require.main === module) {
     }
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
-    process.exitCode = 1;
+    // fleet#4: exit 2 already means "gate FAILED" for `report` (README: "exit 2 on
+    // fail"), so a refused (typo'd) invocation must not share it - EX_USAGE (64) keeps
+    // a gate failure and a usage error distinguishable by status alone.
+    process.exitCode = error.code === 'USAGE' ? 64 : 1;
   }
 }
 
 module.exports = {
+  ASSIGNMENT_PARITY_FLAGS,
+  AssignmentParityError,
   CLASSES,
   classifyEvaluation,
+  cli,
   compareAssignmentParity,
   isAssignmentLive,
   observeFrontier,

@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const workState = require('./work-state');
 
 const CONTROL_PLANE_ROLES = new Set(['dispatcher', 'project-lead', 'sentinel', 'notifier']);
 const POLLING_COMMAND = /(?:\bgh\s+(?:pr\s+(?:view|checks|list)|issue\s+(?:view|list))\b|\b(?:git\s+(?:status|log|diff|show)|Get-Content|Get-Item|Test-Path|ListAgents|claude\s+agents)\b)/i;
@@ -577,21 +578,19 @@ function renderSummary(report) {
   return `${lines.join('\n')}\n`;
 }
 
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith('--')) continue;
-    const equal = token.indexOf('=');
-    const key = equal === -1 ? token.slice(2) : token.slice(2, equal);
-    const next = argv[index + 1];
-    const value = equal === -1
-      ? (next && !next.startsWith('--') ? argv[++index] : 'true')
-      : token.slice(equal + 1);
-    args[key] = value;
+// fleet#4: refuse an unknown flag rather than silently ignore it. No caller (README,
+// PowerShell scripts, or the tests) passes `--flag=value`; the shared schema parser
+// only accepts `--flag value`, matching every actual invocation.
+class MeasureCycleError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = 'MeasureCycleError';
+    this.code = code;
+    Object.assign(this, details);
   }
-  return args;
 }
+
+const MEASURE_CYCLE_FLAGS = ['transcripts', 'roster', 'out', 'since', 'until', 'now', 'no-verify-github'];
 
 function defaultTranscriptsDir() {
   const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -756,18 +755,28 @@ function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigs
   return { report: summaryReport, dailyReport, summaryReport, dailyArtifact, summaryArtifact, summaryJsonArtifact };
 }
 
+function cli(argv) {
+  let args;
+  try {
+    args = workState.parseArgs(argv, MEASURE_CYCLE_FLAGS);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new MeasureCycleError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
+  return collectFromFiles({
+    transcriptsDir: args.transcripts,
+    rosterPath: args.roster,
+    outputDir: args.out,
+    since: args.since,
+    until: args.until,
+    generatedAt: args.now,
+    verifyGithub: args['no-verify-github'] !== 'true',
+  });
+}
+
 if (require.main === module) {
   try {
-    const args = parseArgs(process.argv.slice(2));
-    const result = collectFromFiles({
-      transcriptsDir: args.transcripts,
-      rosterPath: args.roster,
-      outputDir: args.out,
-      since: args.since,
-      until: args.until,
-      generatedAt: args.now,
-      verifyGithub: args['no-verify-github'] !== 'true',
-    });
+    const result = cli(process.argv.slice(2));
     process.stdout.write(`${JSON.stringify({
       dailyArtifact: result.dailyArtifact,
       summaryArtifact: result.summaryArtifact,
@@ -775,8 +784,13 @@ if (require.main === module) {
       excludedUnits: result.report.sample.excludedUnits,
     })}\n`);
   } catch (error) {
-    process.stderr.write(`${error.stack || error}\n`);
-    process.exitCode = 1;
+    if (error.code === 'USAGE') {
+      process.stderr.write(`${JSON.stringify({ code: error.code, message: error.message })}\n`);
+      process.exitCode = 2;
+    } else {
+      process.stderr.write(`${error.stack || error}\n`);
+      process.exitCode = 1;
+    }
   }
 }
 
@@ -786,8 +800,10 @@ module.exports = {
   buildCycleRecords,
   buildReport,
   classifyTurns,
+  cli,
   collectFromFiles,
-  parseArgs,
+  MEASURE_CYCLE_FLAGS,
+  MeasureCycleError,
   parseTranscript,
   renderSummary,
 };

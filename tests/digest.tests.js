@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { projectDigest, foldLedger } = require('../bin/digest');
+const { projectDigest, foldLedger, cli, DIGEST_FLAGS, DigestError } = require('../bin/digest');
 const { addExclusion, liftExclusion } = require('../bin/exclusions');
 const { runNotifier } = require('../bin/notify');
 const workState = require('../bin/work-state');
@@ -162,4 +162,29 @@ test('a legacy record whose creation event predates prNumber on the ledger still
   const content = projectDigest({ root, now: '2026-09-01T08:00:00.000Z' }).content;
   assert.match(section(content, 'Merged (last 10 in the ledger window)'), new RegExp(`endzone #5 - PR #105`));
   assert.ok(fs.existsSync(path.join(root, 'state', 'archive', `work-${id.replace(/[^a-zA-Z0-9_.-]/g, '_')}.json`)));
+});
+
+// --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
+// Red-tell: with bin/digest.js reverted to its old hand-rolled parseArgs (no schema),
+// --exclusion-offset (missing the 's') is silently ignored instead of throwing.
+
+test('cli: refuses --exclusion-offset (confusable with --exclusions-offset) as an unknown flag', () => {
+  const root = rootDir();
+  assert.throws(() => cli(['--root', root, '--exclusion-offset', '0']), (error) => {
+    assert.ok(error instanceof DigestError, `expected DigestError, got ${error && error.name}`);
+    assert.equal(error.code, 'USAGE');
+    assert.match(error.message, /unknown flag --exclusion-offset\b/);
+    for (const flag of DIGEST_FLAGS) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: a correct invocation still works, matching the direct call byte-for-byte', () => {
+  const root = rootDir();
+  walk(root, 1, ['pr-open', 'ci-wait', 'escalated']);
+  const now = '2026-09-01T08:00:00.000Z';
+  const direct = projectDigest({ root, now });
+  const viaCli = cli(['--root', root, '--now', now, '--dry-run', 'true']);
+  assert.equal(viaCli.content, direct.content);
+  assert.deepEqual(viaCli.offset, direct.offset);
 });
