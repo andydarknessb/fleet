@@ -243,7 +243,17 @@ function writeArtifactExclusive(root, recordId, kind, buildContent) {
       if (error.code === 'EEXIST') { sequence += 1; continue; }
       throw error;
     }
-    fs.writeFileSync(handle, `${JSON.stringify(buildContent(stamp, sequence, relative), null, 2)}\n`, 'utf8');
+    let content;
+    try {
+      content = buildContent(stamp, sequence, relative);
+    } catch (error) {
+      // The name is ours (exclusive create) but nothing was written: never
+      // leave a 0-byte artifact behind for a later reader to find.
+      fs.closeSync(handle);
+      fs.rmSync(file, { force: true });
+      throw error;
+    }
+    fs.writeFileSync(handle, `${JSON.stringify(content, null, 2)}\n`, 'utf8');
     fs.closeSync(handle);
     return { relative, file, stamp, sequence };
   }
@@ -346,16 +356,22 @@ function recordReviewArtifact(options = {}) {
       // (`--no-findings "<sentence>"`), never as an empty list a later reader
       // cannot tell from lost content. Last guard before the write, so the
       // refusals above keep their precedence (ADR 0009, ruling 2).
+      // The guard reads what the artifact WILL hold (new findings plus the
+      // still-open prior findings carried forward), not only what the caller
+      // typed: a statement beside a carried blocker would be a lie. The dry
+      // build also raises DUPLICATE_FINDING_ID before any file exists.
       const supplied = options.findings || [];
       const noFindings = options.noFindings;
+      const preview = buildFindings('pending', supplied, priorArtifactData, prior ? prior.artifact : null, resolutions);
       if (noFindings !== undefined) {
         if (typeof noFindings !== 'string' || !noFindings.trim() || noFindings === 'true') {
           throw new ReviewPolicyError('USAGE', '--no-findings needs a one-sentence statement of what was examined and what was concluded');
         }
-        if (supplied.length) {
-          throw new ReviewPolicyError('USAGE', `a review cannot carry both ${supplied.length} finding(s) and a no-findings statement; give one or the other`);
+        if (preview.length) {
+          const carried = preview.length - supplied.length;
+          throw new ReviewPolicyError('USAGE', `the artifact would carry ${preview.length} finding(s) (${supplied.length} new, ${carried} still open from ${prior ? prior.artifact : 'the prior artifact'}); it is not a no-findings review, omit --no-findings`);
         }
-      } else if (!supplied.length) {
+      } else if (!preview.length) {
         throw new ReviewPolicyError('EMPTY_FINDINGS', `a ${kind} review with no findings must say so: pass --no-findings "<what was examined and what was concluded>" so the artifact is not read as lost content`);
       }
 

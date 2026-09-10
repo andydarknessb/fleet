@@ -812,7 +812,7 @@ test('a no-findings statement cannot accompany findings, and cannot be blank or 
   };
   assert.throws(
     () => recordReviewArtifact({ ...base, findings: [{ file: 'src/a.jsx', claim: 'x', severity: 'nit' }], noFindings: 'nothing', idempotencyKey: 'k1' }),
-    (error) => error.code === 'USAGE' && /both/.test(error.message),
+    (error) => error.code === 'USAGE' && /1 new, 0 still open/.test(error.message),
   );
   assert.throws(() => recordReviewArtifact({ ...base, findings: [], noFindings: '   ', idempotencyKey: 'k2' }), (error) => error.code === 'USAGE');
   assert.throws(() => recordReviewArtifact({ ...base, findings: [], noFindings: 'true', idempotencyKey: 'k3' }), (error) => error.code === 'USAGE');
@@ -856,4 +856,65 @@ test('plan-rereview and hold refuse their confusable flag names too', () => {
   assert.throws(() => cli(['plan-rereview', '--root', root, '--id', 'endzone:issue-42', '--head', 'ccc3333']), (error) => error.code === 'USAGE' && /unknown flag --head/.test(error.message));
   assert.throws(() => cli(['hold', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '4', '--why', 'carve-out']), (error) => error.code === 'USAGE' && /unknown flag --why/.test(error.message));
   assert.throws(() => cli(['unhold', '--root', root]), (error) => error.code === 'USAGE' && /unknown command/.test(error.message));
+});
+
+test('a no-findings statement is refused beside a carried-forward still-open finding; the carry itself needs no statement', () => {
+  const root = rootDir();
+  let revision = seedRecord(root);
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [
+      { file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'should-fix' },
+      { file: 'src/b.js', line: 9, claim: 'lost focus ring', severity: 'blocker' },
+    ],
+    idempotencyKey: 'formal-1', now: '2026-09-01T02:00:00.000Z',
+  });
+  revision = first.result.revision;
+  for (const [index, to] of ['revision', 'pr-open', 'ci-wait', 'review'].entries()) {
+    revision = workState.transitionRecord({
+      root, id: 'endzone:issue-42', to, expectedRevision: revision, idempotencyKey: `again-${to}`,
+      actor: 'test', evidence: 'revision cycle', now: `2026-09-01T02:1${index}:00.000Z`,
+    }).revision;
+  }
+  const resolutions = { 'formal-001-f1': 'resolved', 'formal-001-f2': 'still-open' };
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [],
+      priorArtifact: first.artifact, resolutions, noFindings: 'nothing new in the range',
+      idempotencyKey: 'formal-2-lie', now: '2026-09-01T02:20:00.000Z',
+    }),
+    (error) => error.code === 'USAGE' && /1 still open/.test(error.message),
+  );
+  const second = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [],
+    priorArtifact: first.artifact, resolutions,
+    idempotencyKey: 'formal-2', now: '2026-09-01T02:21:00.000Z',
+  });
+  const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
+  assert.equal(stored.noFindings, null);
+  assert.deepEqual(stored.findings.map((finding) => finding.id), ['formal-001-f2']);
+  assert.equal(stored.findings[0].carriedFrom, first.artifact);
+});
+
+test('a duplicate finding id is refused before any artifact file exists', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] },
+      findings: [{ id: 'same', file: 'src/a.js', claim: 'x', severity: 'nit' }, { id: 'same', file: 'src/b.js', claim: 'y', severity: 'nit' }],
+      idempotencyKey: 'formal-dupid', now: '2026-09-01T02:00:00.000Z',
+    }),
+    (error) => error.code === 'DUPLICATE_FINDING_ID',
+  );
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'no 0-byte orphan artifact');
 });
