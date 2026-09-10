@@ -123,6 +123,17 @@ test('a direct third reservation cannot forge independence over empty active res
   );
 });
 
+test('reservation conflicts are path-aware on component segment boundaries', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-1146', tenant: 'endzone', issue: 1146, reservations: { components: ['src/widgets/my-team-summary/ui/MyTeamSummary.jsx'] }, idempotencyKey: 'reserve-1146', now: '2026-09-10T00:00:00.000Z' });
+  assert.throws(
+    () => reserveRecord({ root, id: 'endzone:issue-1150', tenant: 'endzone', issue: 1150, reservations: { components: ['src/widgets/my-team-summary'] }, idempotencyKey: 'reserve-1150', now: '2026-09-10T00:00:01.000Z' }),
+    (error) => error.code === 'RESERVATION_CONFLICT' && error.conflicts[0].value === 'src/widgets/my-team-summary',
+  );
+  const sibling = reserveRecord({ root, id: 'endzone:issue-1151', tenant: 'endzone', issue: 1151, reservations: { components: ['src/widgets/my-team-summary-v2'] }, idempotencyKey: 'reserve-1151', now: '2026-09-10T00:00:02.000Z' });
+  assert.equal(sibling.record.issue, 1151);
+});
+
 test('a third reservation accepts verified legacy reservation subjects and rejects their conflicts', () => {
   const root = rootDir();
   reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: {}, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });

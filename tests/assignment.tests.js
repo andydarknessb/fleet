@@ -70,6 +70,23 @@ test('reservation attempts cannot claim the same component', () => {
   assert.throws(() => reserveRecord({ root, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, reservations: { components: ['src/shared'] }, idempotencyKey: 'reserve-1', now: '2026-09-01T00:00:00.000Z' }), (error) => error.code === 'RESERVATION_CONFLICT' && error.conflicts[0].issue === 40);
 });
 
+test('a directory reservation conflicts with a file inside it, but not a sibling prefix', () => {
+  const active = [
+    { id: 'endzone:issue-1146', issue: 1146, state: 'implementing', manifestPath: 'm1146', reservations: { components: ['src/widgets/my-team-summary/ui/MyTeamSummary.jsx'] } },
+    { id: 'endzone:issue-1149', issue: 1149, state: 'implementing', manifestPath: 'm1149', reservations: { components: ['src/entities/matchup/model/play.js'] } },
+  ];
+  const overlap = issue(1150, { components: ['src/widgets/my-team-summary'] });
+  const overlapPlan = buildLaunchPlan({ frontier: { eligible: [overlap] }, active, maxIcs: 3 });
+  assert.equal(overlapPlan.assignments.length, 0);
+  assert.equal(overlapPlan.thirdProof.independent, false);
+  assert.deepEqual(overlapPlan.thirdProof.conflicts, [{ left: 1146, right: 1150 }]);
+
+  const sibling = issue(1151, { components: ['src/widgets/my-team-summary-v2'] });
+  const siblingPlan = buildLaunchPlan({ frontier: { eligible: [sibling] }, active, maxIcs: 3 });
+  assert.equal(siblingPlan.assignments.length, 1);
+  assert.equal(siblingPlan.thirdProof.independent, true);
+});
+
 test('assignment creates one immutable manifest and reserves a Work record', () => {
   const root = rootDir();
   const result = reserveAssignment({
