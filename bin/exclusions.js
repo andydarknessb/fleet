@@ -9,7 +9,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { STATES, WorkStateError, readEvents } = require('./work-state');
+const { STATES, WorkStateError, readEvents, parseArgs } = require('./work-state');
 
 // A recheck event of this type is never looked up in the Fleet ledger: it means
 // "only the owner's lift releases this exclusion".
@@ -171,21 +171,27 @@ function liftExclusion({ root, tenant, id, actor, evidence, now } = {}) {
   });
 }
 
-function parseArgs(argv) {
-  const args = {};
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith('--')) continue;
-    const key = token.slice(2);
-    const next = argv[index + 1];
-    args[key] = next && !next.startsWith('--') ? argv[++index] : 'true';
-  }
-  return args;
-}
+// The flags each command accepts, declared per command (fleet#4, following
+// review-policy.js's CLASSIFY_FLAGS / fleet#2): before this, a typo'd flag
+// (`--recheck-envent`, `--reasan`, ...) fell into a bucket nothing read and
+// the command carried on as if it had not been given - `add` would silently
+// drop the recheck (or the reason/evidence/owner) and either refuse for a
+// different reason than the one typed, or in the worst case still write an
+// exclusion the caller did not mean to write. Now an unknown flag is a USAGE
+// error naming the flag and the accepted set, before any command runs.
+const EXCLUSIONS_FLAGS = Object.freeze({
+  add: ['root', 'tenant', 'issue', 'reason', 'evidence', 'owner', 'expires', 'recheck-event', 'recheck-record', 'recheck-issue', 'actor', 'now', 'id'],
+  lift: ['root', 'tenant', 'id', 'actor', 'evidence', 'now'],
+  project: ['root', 'tenant', 'now'],
+});
+
+const EXCLUSIONS_USAGE = 'commands: add (--issue --reason --evidence --owner and --expires <iso> | --recheck-event <type> [--recheck-record id | --recheck-issue n]), lift (--id --evidence), project';
 
 function cli(argv) {
   const [command, ...rest] = argv;
-  const args = parseArgs(rest);
+  const flags = EXCLUSIONS_FLAGS[command];
+  if (!flags) throw new WorkStateError('USAGE', EXCLUSIONS_USAGE);
+  const args = parseArgs(rest, flags);
   const tenant = args.tenant || 'endzone';
   if (command === 'add') {
     const recheck = args.expires ? { expiresAt: args.expires }
@@ -194,8 +200,7 @@ function cli(argv) {
     return addExclusion({ root: args.root, tenant, issue: Number(args.issue), reason: args.reason, evidence: args.evidence, owner: args.owner, recheck, actor: args.actor, now: args.now, id: args.id });
   }
   if (command === 'lift') return liftExclusion({ root: args.root, tenant, id: args.id, actor: args.actor, evidence: args.evidence, now: args.now });
-  if (command === 'project') return projectTenant({ root: args.root, tenant, now: args.now });
-  throw new WorkStateError('USAGE', 'commands: add (--issue --reason --evidence --owner and --expires <iso> | --recheck-event <type> [--recheck-record id | --recheck-issue n]), lift (--id --evidence), project');
+  return projectTenant({ root: args.root, tenant, now: args.now });
 }
 
 if (require.main === module) {
@@ -203,15 +208,19 @@ if (require.main === module) {
     process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
-    process.exitCode = 1;
+    // A refused invocation exits 2 so a caller reading only the status cannot
+    // take it for a failed one, let alone for an answer (fleet#2/fleet#4).
+    process.exitCode = error.code === 'USAGE' ? 2 : 1;
   }
 }
 
 module.exports = {
+  EXCLUSIONS_FLAGS,
   LIFT_ONLY_RECHECK_EVENTS,
   RECHECK_EVENT_TYPES,
   activeExclusions,
   addExclusion,
+  cli,
   ledgerPath,
   liftExclusion,
   parseArgs,
