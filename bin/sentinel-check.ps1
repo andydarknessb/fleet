@@ -101,8 +101,32 @@ foreach ($x in $expected) {
   # fleet-dead during a plain Max-plan window).
   if ($detail -match 'rate.?limit|usage limit|session limit|limit reached|resets? (at|\d)') {
     if (-not (Test-Paused)) {
-      if ($Apply) { & "$PSScriptRoot\pause.ps1" -Reason "rate-limit seen on $($x.name)" -Minutes 60 | Out-Null }
-      $report.pause = "set: rate-limit signal on $($x.name)"
+      # The detail line is a LEVEL, not an event: it is the session's own last status summary and
+      # stands long after the limit it names has reset (live 2026-09-10: "resets 1:20am" still stood
+      # at 13:16Z and re-armed a PAUSE within one tick of each manual clear, three times in 14h). One
+      # PAUSE per wording per session: state/sentinel/rate-limit-signal.json remembers the wording
+      # each name was last paused on, and the same wording never pauses twice. A new limit writes a
+      # new reset time, which is a new wording, which pauses again.
+      $signalPath = "$FleetHome\state\sentinel\rate-limit-signal.json"
+      $seen = Read-Json $signalPath
+      $prior = $null; if ($seen) { $prior = $seen.PSObject.Properties[$x.name] }
+      if ($prior -and "$($prior.Value.detail)" -eq $detail) {
+        $report.ok += [pscustomobject]@{ name = $x.name; detail = "rate-limit wording unchanged since the PAUSE set at $($prior.Value.pausedAt); not re-armed" }
+      } else {
+        if ($Apply) {
+          # 59, not 60: the watchdog ticks every 15 min and phase-locks to itself, so a 60-min
+          # window ends ~100 ms AFTER the +60 tick's frozen $now and only the +75 tick clears it
+          # (measured 2026-09-10: until minus that tick's start = +64 ms, every occurrence). One
+          # minute short lands the end inside the +60 tick.
+          & "$PSScriptRoot\pause.ps1" -Reason "rate-limit seen on $($x.name)" -Minutes 59 | Out-Null
+          $record = [ordered]@{}
+          if ($seen) { foreach ($p in $seen.PSObject.Properties) { $record[$p.Name] = $p.Value } }
+          $record[$x.name] = [pscustomobject]@{ detail = $detail; pausedAt = (Now-Iso) }
+          [IO.Directory]::CreateDirectory("$FleetHome\state\sentinel") | Out-Null
+          Write-Json $signalPath ([pscustomobject]$record)
+        }
+        $report.pause = "set: rate-limit signal on $($x.name)"
+      }
     }
   }
   $state = "$($row.state)"

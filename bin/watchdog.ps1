@@ -118,7 +118,7 @@ try {
   # --- relaunched (post-logon recovery, or a deliberate stop + launch) has no first-turn
   # --- heartbeat yet, and paging on the cure would be a false page. PAUSE suppresses
   # --- staleness paging entirely: paused sessions idle by design, and a rate-limit
-  # --- pause (60 min) outlasts the staleness threshold.
+  # --- pause (59 min) outlasts the staleness threshold.
   $stateErrors = @()
   $paused = Test-Paused
   $static = $null
