@@ -537,3 +537,116 @@ test('state/flags/review-dedup-off records a second formal review at the same he
     'the flag removed, deduplication is back',
   );
 });
+
+// --- fleet#2: classify fails closed ---------------------------------------
+// classify answers "does this diff need a risk reviewer?", so it is dangerous
+// in exactly one direction: a wrong "no". Before fleet#2 a typo'd flag name
+// (`--repo-path`, `--tenant-config`: assignment.js's names for the same two
+// concepts) fell into a bucket nothing read, and classify answered
+// riskReview:false over an empty diff, exit 0, byte-identical to the answer for
+// no arguments at all. The interface is the test surface here: every case goes
+// through `cli`, the same door the IC and the lead use.
+//
+// Red-tell: revert `classifyCli` to the old `if (args.repo && args.base)`
+// fall-through and the typo cases below go green on riskReview:false instead of
+// throwing; revert the schema in `parseArgs` and only the unknown-flag cases
+// fail. Each guard has a case that only it turns.
+
+const { cli, CLASSIFY_FLAGS } = require('../bin/review-policy');
+const { execFileSync, spawnSync } = require('node:child_process');
+
+function classifyRoot() {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify(TENANT));
+  fs.writeFileSync(path.join(root, 'tenants', 'blank.json'), JSON.stringify({ name: 'blank' }));
+  return root;
+}
+
+function refuses(argv, code, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof ReviewPolicyError, `expected ReviewPolicyError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, code);
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('classify: --tenant-config (assignment.js name) is refused as an unknown flag, not read as no tenant', () => {
+  const root = classifyRoot();
+  refuses(['classify', '--root', root, '--tenant-config', 'tenants/endzone.json', '--files', '["server/middleware/auth.js"]'], 'USAGE', /unknown flag --tenant-config/);
+});
+
+test('classify: --repo-path (assignment.js name) is refused as an unknown flag, never classified as an empty diff', () => {
+  const root = classifyRoot();
+  refuses(['classify', '--root', root, '--tenant', 'endzone', '--repo-path', '/e/repo', '--base', 'abc', '--head', 'def'], 'USAGE', /unknown flag --repo-path; accepted: .*--repo\b/);
+});
+
+test('classify: the unknown-flag refusal names the accepted set', () => {
+  const root = classifyRoot();
+  assert.throws(() => cli(['classify', '--root', root, '--tenant', 'endzone', '--nope', 'x', '--files', '["a.js"]']), (error) => {
+    for (const flag of CLASSIFY_FLAGS) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('classify: no arguments at all is a usage error, not an answer', () => {
+  refuses(['classify'], 'USAGE', /--tenant <name> is required/);
+});
+
+test('classify: a tenant with no source of files is a usage error, never an empty diff', () => {
+  const root = classifyRoot();
+  refuses(['classify', '--root', root, '--tenant', 'endzone'], 'USAGE', /nothing to classify/);
+  refuses(['classify', '--root', root, '--tenant', 'endzone', '--files', '[]'], 'USAGE', /non-empty JSON array/);
+  refuses(['classify', '--root', root, '--tenant', 'endzone', '--repo', '/e/repo'], 'USAGE', /--repo needs --base/);
+  refuses(['classify', '--root', root, '--tenant', 'endzone', '--base', 'abc'], 'USAGE', /--base needs --repo/);
+  refuses(['classify', '--root', root, '--tenant', 'endzone', '--diff', path.join(root, 'missing.diff')], 'USAGE', /--diff file not found/);
+});
+
+test('classify: a tenant that declares neither carve-outs nor risk triggers is refused', () => {
+  const root = classifyRoot();
+  refuses(['classify', '--root', root, '--tenant', 'blank', '--files', '["server/middleware/auth.js"]'], 'EMPTY_TENANT', /could only ever answer riskReview:false/);
+});
+
+test('classify: a correct invocation still answers, with the files it classified', () => {
+  const root = classifyRoot();
+  const answer = cli(['classify', '--root', root, '--tenant', 'endzone', '--files', '["server/middleware/auth.js"]']);
+  assert.equal(answer.riskReview, true);
+  assert.deepEqual(answer.files, ['server/middleware/auth.js']);
+  const docs = cli(['classify', '--root', root, '--tenant', 'endzone', '--files', '["docs/guide.md"]']);
+  assert.equal(docs.riskReview, false);
+  assert.deepEqual(docs.files, ['docs/guide.md']);
+});
+
+test('classify: the process exits 2 on a refusal and writes the refusal to stderr, no JSON answer on stdout', () => {
+  const root = classifyRoot();
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const typo = spawnSync(process.execPath, [bin, 'classify', '--root', root, '--repo-path', '/e/repo', '--base', 'a', '--head', 'b', '--tenant-config', 'tenants/endzone.json'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stdout, '');
+  assert.equal(JSON.parse(typo.stderr).code, 'USAGE');
+  const bare = spawnSync(process.execPath, [bin, 'classify'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(bare.status, 2);
+  assert.equal(bare.stdout, '');
+  const ok = execFileSync(process.execPath, [bin, 'classify', '--root', root, '--tenant', 'endzone', '--files', '["docs/guide.md"]'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(JSON.parse(ok).riskReview, false);
+});
+
+test('parseArgs: without a schema every flag is still accepted (the other binaries are unchanged)', () => {
+  const args = workState.parseArgs(['--repo-path', '/x', '--flag', '--', 'rest']);
+  assert.equal(args['repo-path'], '/x');
+  assert.equal(args.flag, 'true');
+  assert.deepEqual(args._, ['rest']);
+});
+
+test('parseArgs: with a schema an unknown flag is a USAGE error carrying the flag and the accepted set', () => {
+  assert.throws(() => workState.parseArgs(['--repo-path', '/x'], ['repo', 'base']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.equal(error.flag, 'repo-path');
+    assert.deepEqual(error.accepted, ['repo', 'base']);
+    return true;
+  });
+  const args = workState.parseArgs(['--repo', '/x', '--', '--repo-path'], { flags: ['repo'] });
+  assert.equal(args.repo, '/x');
+  assert.deepEqual(args._, ['--repo-path'], 'tokens after -- are never flags, schema or not');
+});

@@ -1066,13 +1066,29 @@ function shadowProject(options = {}) {
   });
 }
 
-function parseArgs(argv) {
+/**
+ * Parse `--flag value` pairs. With no schema every flag is accepted, as it
+ * always was: a typo lands in a bucket nothing reads and the command answers
+ * as if the flag had not been given. A command that must not answer by
+ * accident passes `schema` (an array of accepted flag names, or
+ * `{ flags: [...] }`), and then an unknown flag is a USAGE error naming the
+ * flag and the accepted set (fleet#2: `review-policy.js classify` answered
+ * riskReview:false over an empty diff when `--repo-path` or
+ * `--tenant-config` was typed for `--repo` / `--tenant`). Adoption is one
+ * binary at a time; a binary that has not adopted a schema is unchanged.
+ */
+function parseArgs(argv, schema = null) {
   const args = { _: [] };
+  const accepted = schema ? new Set(Array.isArray(schema) ? schema : schema.flags || []) : null;
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
     if (token === '--') { args._ = argv.slice(i + 1); break; }
     if (!token.startsWith('--')) continue;
     const key = token.slice(2);
+    if (accepted && !accepted.has(key)) {
+      const list = [...accepted].map((flag) => `--${flag}`).join(', ');
+      throw new WorkStateError('USAGE', `unknown flag --${key}; accepted: ${list}`, { flag: key, accepted: [...accepted] });
+    }
     const next = argv[i + 1];
     args[key] = next && !next.startsWith('--') ? argv[++i] : 'true';
   }

@@ -466,23 +466,65 @@ function loadConfig(root) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+// The flags `classify` accepts. It is the one command here whose wrong answer is
+// dangerous in exactly one direction (a false "no risk review"), so it parses
+// against a schema and refuses to answer anything it was not clearly asked
+// (fleet#2). `--repo-path` and `--tenant-config` are assignment.js's names
+// for the same two concepts; before this they fell into a bucket nothing read
+// and classify answered riskReview:false over an empty diff, exit 0.
+const CLASSIFY_FLAGS = ['root', 'tenant', 'repo', 'base', 'head', 'files', 'diff', 'changed-lines'];
+const CLASSIFY_USAGE = 'classify --tenant <name> (--repo <path> --base <ref> [--head <ref>] | --files <json array> [--diff <file>] | --diff <file>) [--root <fleet root>]';
+
+function usage(message) {
+  return new ReviewPolicyError('USAGE', `${message}\nusage: ${CLASSIFY_USAGE}`);
+}
+
+function classifyCli(rest) {
+  let args;
+  try {
+    args = workState.parseArgs(rest, CLASSIFY_FLAGS);
+  } catch (error) {
+    if (error.code === 'USAGE') throw usage(error.message);
+    throw error;
+  }
+  const root = args.root;
+  // A classification is always tenant-scoped: carve-outs and risk triggers
+  // are the tenant's. Against an empty tenant nothing can match, so the only
+  // answer it could give is riskReview:false, which is a false negative by
+  // construction, not an answer.
+  if (!args.tenant || args.tenant === 'true') throw usage('--tenant <name> is required');
+  const tenant = loadTenant(root, args.tenant);
+  const carveOuts = Array.isArray(tenant.carveOuts) ? tenant.carveOuts.length : 0;
+  const triggers = tenant.riskTriggers && typeof tenant.riskTriggers === 'object' ? Object.keys(tenant.riskTriggers).length : 0;
+  if (carveOuts === 0 && triggers === 0) {
+    throw new ReviewPolicyError('EMPTY_TENANT', `tenant "${args.tenant}" declares no carveOuts and no riskTriggers; a classification against it could only ever answer riskReview:false`);
+  }
+  const config = loadConfig(root);
+  if (args.repo) {
+    if (args.repo === 'true') throw usage('--repo needs a path');
+    if (!args.base || args.base === 'true') throw usage('--repo needs --base <ref>');
+    return classifyFromGit({ repoPath: args.repo, baseRef: args.base, headRef: args.head, tenant, config });
+  }
+  if (args.base) throw usage('--base needs --repo <path>');
+  // No source of files is a usage error, never an empty diff: an empty
+  // classification must be impossible to obtain by accident.
+  if (!args.files && !args.diff) throw usage('nothing to classify: give --repo <path> --base <ref>, --files <json array>, or --diff <file>');
+  const files = args.files ? JSON.parse(args.files) : [];
+  if (args.files && (!Array.isArray(files) || files.length === 0)) throw usage('--files must be a non-empty JSON array of paths');
+  if (args.diff && !fs.existsSync(args.diff)) throw usage(`--diff file not found: ${args.diff}`);
+  return classifyChange({
+    files,
+    diffText: args.diff ? fs.readFileSync(args.diff, 'utf8') : undefined,
+    changedLines: args['changed-lines'] ? Number(args['changed-lines']) : undefined,
+    tenant, config,
+  });
+}
+
 function cli(argv) {
   const [command, ...rest] = argv;
+  if (command === 'classify') return classifyCli(rest);
   const args = workState.parseArgs(rest);
   const root = args.root;
-  if (command === 'classify') {
-    const tenant = args.tenant ? loadTenant(root, args.tenant) : {};
-    const config = loadConfig(root);
-    if (args.repo && args.base) {
-      return classifyFromGit({ repoPath: args.repo, baseRef: args.base, headRef: args.head, tenant, config });
-    }
-    return classifyChange({
-      files: args.files ? JSON.parse(args.files) : [],
-      diffText: args.diff ? fs.readFileSync(args.diff, 'utf8') : undefined,
-      changedLines: args['changed-lines'] ? Number(args['changed-lines']) : undefined,
-      tenant, config,
-    });
-  }
   if (command === 'record') {
     return recordReviewArtifact({
       root, recordId: args.id,
@@ -513,13 +555,17 @@ if (require.main === module) {
     process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
-    process.exitCode = 1;
+    // A refused invocation exits 2 so a caller reading only the status cannot
+    // take it for a failed one, let alone for an answer (fleet#2).
+    process.exitCode = error.code === 'USAGE' || error.code === 'EMPTY_TENANT' ? 2 : 1;
   }
 }
 
 module.exports = {
+  CLASSIFY_FLAGS,
   ReviewPolicyError,
   classifyChange,
+  cli,
   classifyFromGit,
   holdRecord,
   matchGlob,
