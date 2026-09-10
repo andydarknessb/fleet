@@ -5,9 +5,10 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { addExclusion, liftExclusion, readExclusions, projectExclusions, activeExclusions } = require('../bin/exclusions');
+const { addExclusion, liftExclusion, readExclusions, projectExclusions, activeExclusions, cli, EXCLUSIONS_FLAGS } = require('../bin/exclusions');
 const { selectFrontier } = require('../bin/assignment');
 const workState = require('../bin/work-state');
+const { WorkStateError } = workState;
 
 function rootDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-exclusions-'));
@@ -131,4 +132,90 @@ test('a torn trailing line does not block the frontier; a corrupt interior line 
   assert.equal(activeExclusions({ root, tenant: 'endzone' }).length, 1);
   fs.writeFileSync(file, `not json at all\n${intact}`);
   assert.throws(() => readExclusions(root, 'endzone'), { code: 'CORRUPT_EXCLUSION_LEDGER' });
+});
+
+// --- fleet#4: exclusions.js fails closed on a typo'd flag ------------------
+// Before this, `parseArgs` in this binary accepted any `--flag`: a typo
+// (`--reasno`, `--evidnce`, `--tenat`) landed in a bucket nothing read and the
+// command carried on as if the flag had not been given at all - `add` could
+// refuse for the wrong reason (missing reason/evidence) or, with `--expires`
+// still misread as the recheck, silently write an exclusion under a
+// different shape than the caller typed. Every case here goes through `cli`,
+// the same door the Stop hook and any operator use.
+//
+// Red-tell: stash the bin/exclusions.js change and run this file - the
+// typo/unknown-command/spawnSync cases below go red (the typo'd flags land in
+// the args bucket and either answer wrong or exit 1 with a business error
+// instead of a USAGE refusal at exit 2).
+
+const { execFileSync, spawnSync } = require('node:child_process');
+
+function refusesUsage(argv, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof WorkStateError, `expected WorkStateError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('cli add: a typo\'d flag (--reasno) is refused, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  refusesUsage(
+    ['add', '--root', root, '--tenant', 'endzone', '--issue', '10', '--reasno', 'x', '--evidence', 'e', '--owner', 'o', '--expires', '2027-01-01T00:00:00.000Z'],
+    /unknown flag --reasno/,
+  );
+  assert.throws(() => cli(['add', '--root', root, '--tenant', 'endzone', '--issue', '10', '--reasno', 'x', '--evidence', 'e', '--owner', 'o', '--expires', '2027-01-01T00:00:00.000Z']), (error) => {
+    for (const flag of EXCLUSIONS_FLAGS.add) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli lift: a typo\'d flag (--evidnce) is refused, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  refusesUsage(['lift', '--root', root, '--tenant', 'endzone', '--id', 'endzone:excl-1-1', '--evidnce', 'done'], /unknown flag --evidnce/);
+  assert.throws(() => cli(['lift', '--root', root, '--tenant', 'endzone', '--id', 'endzone:excl-1-1', '--evidnce', 'done']), (error) => {
+    for (const flag of EXCLUSIONS_FLAGS.lift) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli project: a typo\'d flag (--tenat) is refused, naming the flag and the accepted set', () => {
+  const root = rootDir();
+  refusesUsage(['project', '--root', root, '--tenat', 'endzone'], /unknown flag --tenat/);
+  assert.throws(() => cli(['project', '--root', root, '--tenat', 'endzone']), (error) => {
+    for (const flag of EXCLUSIONS_FLAGS.project) assert.match(error.message, new RegExp(`--${flag}\\b`));
+    return true;
+  });
+});
+
+test('cli: an unknown command is a usage error listing the commands', () => {
+  refusesUsage(['nope'], /commands: add/);
+  refusesUsage([], /commands: add/);
+});
+
+test('cli: a correct invocation per command still answers exactly as before', () => {
+  const root = rootDir();
+  const added = cli(['add', '--root', root, '--tenant', 'endzone', '--issue', '55', '--reason', 'r', '--evidence', 'e', '--owner', 'cory', '--actor', 'test', '--expires', '2027-01-01T00:00:00.000Z']);
+  assert.equal(added.kind, 'exclusion-added');
+  assert.equal(added.id, 'endzone:excl-55-1');
+  const projected = cli(['project', '--root', root, '--tenant', 'endzone']);
+  assert.equal(projected.active.length, 1);
+  assert.equal(projected.active[0].id, added.id);
+  const lifted = cli(['lift', '--root', root, '--tenant', 'endzone', '--id', added.id, '--actor', 'cory', '--evidence', 'pass done']);
+  assert.equal(lifted.kind, 'exclusion-lifted');
+  const after = cli(['project', '--root', root, '--tenant', 'endzone']);
+  assert.equal(after.active.length, 0);
+  assert.equal(after.discharged[0].dischargedBy, 'lifted');
+});
+
+test('cli: the process exits 2 on a refused flag, empty stdout, USAGE JSON on stderr', () => {
+  const root = rootDir();
+  const bin = path.join(__dirname, '..', 'bin', 'exclusions.js');
+  const typo = spawnSync(process.execPath, [bin, 'add', '--root', root, '--tenant', 'endzone', '--issue', '10', '--reasno', 'x', '--evidence', 'e', '--owner', 'o', '--expires', '2027-01-01T00:00:00.000Z'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stdout, '');
+  assert.equal(JSON.parse(typo.stderr).code, 'USAGE');
+  const ok = execFileSync(process.execPath, [bin, 'project', '--root', root, '--tenant', 'endzone'], { encoding: 'utf8', windowsHide: true });
+  assert.deepEqual(JSON.parse(ok), { active: [], discharged: [] });
 });
