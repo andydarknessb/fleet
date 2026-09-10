@@ -477,15 +477,31 @@ function hasReservationEvidence(reservations) {
   return RESERVATION_FIELDS.some((field) => (reservations?.[field] || []).length > 0);
 }
 
+function reservationPathRoot(value) {
+  let normalized = String(value).trim().replaceAll('\\', '/').replace(/^\.\/+/, '').replace(/\/{2,}/g, '/');
+  const wildcard = normalized.search(/[?*\[\]{}]/);
+  if (wildcard >= 0) normalized = normalized.slice(0, wildcard);
+  normalized = path.posix.normalize(normalized).replace(/^\.\/+/, '').replace(/\/+$/, '');
+  return normalized === '.' ? '' : normalized;
+}
+
+function reservationValuesOverlap(field, left, right) {
+  if (!['components', 'testResources'].includes(field)) return String(left) === String(right);
+  const leftPath = reservationPathRoot(left);
+  const rightPath = reservationPathRoot(right);
+  if (!leftPath || !rightPath) return true;
+  return leftPath === rightPath || leftPath.startsWith(`${rightPath}/`) || rightPath.startsWith(`${leftPath}/`);
+}
+
 function reservationConflicts(records, reservations, ignoreRecordId = null) {
   const requested = reservations || {};
   const conflicts = [];
   for (const record of Object.values(records)) {
     if (record.id === ignoreRecordId) continue;
     for (const field of RESERVATION_FIELDS) {
-      const values = new Set((record.reservations?.[field] || []).map(String));
+      const values = (record.reservations?.[field] || []).map(String);
       for (const value of (requested[field] || []).map(String)) {
-        if (values.has(value)) conflicts.push({ recordId: record.id, issue: record.issue, field, value });
+        if (values.some((reserved) => reservationValuesOverlap(field, reserved, value))) conflicts.push({ recordId: record.id, issue: record.issue, field, value });
       }
     }
   }
@@ -509,8 +525,8 @@ function proofFor(records) {
   for (let left = 0; left < records.length; left += 1) {
     for (let right = left + 1; right < records.length; right += 1) {
       if (RESERVATION_FIELDS.some((field) => {
-        const rightValues = new Set((records[right].reservations?.[field] || []).map(String));
-        return (records[left].reservations?.[field] || []).some((value) => rightValues.has(String(value)));
+        const rightValues = (records[right].reservations?.[field] || []).map(String);
+        return (records[left].reservations?.[field] || []).some((value) => rightValues.some((rightValue) => reservationValuesOverlap(field, value, rightValue)));
       })) conflicts.push({ left: Number(records[left].issue), right: Number(records[right].issue) });
     }
   }
@@ -1317,6 +1333,7 @@ module.exports = {
   releaseRecord,
   reservationBaseline,
   reservationConflicts,
+  reservationValuesOverlap,
   reserveRecord,
   shadowProject,
   transitionRecord,

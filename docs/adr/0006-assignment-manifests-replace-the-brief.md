@@ -53,7 +53,10 @@ launch (body hash, base SHA) means no IC works against stale criteria.
   pins that complete criteria snapshot in the manifest, rehydrates older active
   records only when their stored hash still matches, and refuses a third
   assignment when any subject has no reservation evidence. Review-artifact
-  paths under `state/reviews/` are provenance, not work reservations.
+  paths under `state/reviews/` are provenance, not work reservations. Component
+  and test-resource paths overlap when either names the other or one contains
+  the other on a path-segment boundary; directory/file granularity cannot make
+  an overlapping assignment appear independent.
 
 ## Status note - 02/03 cutover (2026-09-04)
 

@@ -13,6 +13,7 @@ const {
   releaseRecord,
   reservationBaseline,
   reservationConflicts: workReservationConflicts,
+  reservationValuesOverlap,
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
@@ -120,8 +121,8 @@ function reservationConflicts(issue, records) {
 
 function independentPair(left, right) {
   return RESERVATION_FIELDS.every((field) => {
-    const rightValues = new Set((right.reservations?.[field] || []).map(String));
-    return !(left.reservations?.[field] || []).some((value) => rightValues.has(String(value)));
+    const rightValues = (right.reservations?.[field] || []).map(String);
+    return !(left.reservations?.[field] || []).some((value) => rightValues.some((rightValue) => reservationValuesOverlap(field, value, rightValue)));
   });
 }
 
