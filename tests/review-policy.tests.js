@@ -476,7 +476,7 @@ test('a missing prior artifact degrades to an honest re-review instead of wedgin
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
     kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
-    findings: [], priorArtifact: first.artifact,
+    findings: [], noFindings: 'prior artifact gone; nothing new at ccc3333', priorArtifact: first.artifact,
     idempotencyKey: 'formal-2', now: '2026-09-01T02:20:00.000Z',
   });
   const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
@@ -511,7 +511,7 @@ test('state/flags/review-dedup-off records a second formal review at the same he
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
     kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
-    classification: { tier: 'normal', triggers: [] }, findings: [],
+    classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'nothing at bbb2222',
     idempotencyKey: 'formal-a', now: '2026-09-09T02:00:00.000Z',
   });
   fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
@@ -520,7 +520,7 @@ test('state/flags/review-dedup-off records a second formal review at the same he
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
     kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
-    classification: { tier: 'normal', triggers: [] }, findings: [],
+    classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'nothing at bbb2222, second pass',
     now: '2026-09-09T02:01:00.000Z',
   });
   assert.equal(second.result.replayed, false, 'the flag must beat the default replay key');
@@ -699,4 +699,161 @@ test('record: INVALID_REVIEW_STATE exits 2 with the refusal on stderr and nothin
   const refusal = JSON.parse(early.stderr);
   assert.equal(refusal.code, 'INVALID_REVIEW_STATE');
   assert.match(refusal.message, /checks-settled/);
+});
+
+// --- fleet#18: an artifact is never silent about its own result -------------
+// `record --kind risk` accepted `findings: []` on endzone PR #1168 at the one
+// moment it could still be corrected; the artifact then read as a clean review
+// to anyone who opened it, indistinguishable from "the file lost its content".
+// A reviewer who found nothing is a real outcome, so the refusal is
+// satisfiable without lying: `--no-findings "<one sentence>"` writes the
+// statement into the artifact. What is no longer possible is an artifact that
+// says nothing (ADR 0009, ruling 2). The guard sits last, at the write, so the
+// earlier refusals (ALREADY_REVIEWED, RISK_REVIEW_NOT_TRIGGERED,
+// REREVIEW_REQUIRES_PRIOR, UNRESOLVED_FINDINGS_UNACCOUNTED) keep their cases.
+
+const RISK = { tier: 'high-risk', triggers: [{ class: 'accessibility', matches: [{ pattern: 'aria-', file: 'src/a.jsx', line: 'aria-label' }] }] };
+
+test('record --kind risk with an empty findings array is refused, leaves no artifact, and touches no state', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK, findings: [],
+      idempotencyKey: 'risk-empty', now: '2026-09-10T18:56:28.000Z',
+    }),
+    (error) => {
+      assert.ok(error instanceof ReviewPolicyError);
+      assert.equal(error.code, 'EMPTY_FINDINGS');
+      assert.match(error.message, /--no-findings/);
+      return true;
+    },
+  );
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0);
+  const record = workState.getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.revision, revision);
+  assert.equal(record.review?.risk, undefined);
+});
+
+test('record --kind risk with an explicit no-findings statement writes the statement into the artifact', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const clean = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK, findings: [],
+    noFindings: 'Examined the Badge link for focus ring, hover and cursor; ButtonBase is reached via clickable, nothing to fix.',
+    idempotencyKey: 'risk-clean', now: '2026-09-10T18:56:28.000Z',
+  });
+  const stored = JSON.parse(fs.readFileSync(path.join(root, clean.artifact), 'utf8'));
+  assert.deepEqual(stored.findings, []);
+  assert.match(stored.noFindings, /^Examined the Badge link/);
+  assert.equal(clean.result.record.review.risk.artifact, clean.artifact);
+});
+
+test('a formal review with no findings needs the same statement; a re-review that resolves everything can say so', () => {
+  const root = rootDir();
+  let revision = seedRecord(root);
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [],
+      idempotencyKey: 'formal-empty', now: '2026-09-01T02:00:00.000Z',
+    }),
+    (error) => error.code === 'EMPTY_FINDINGS',
+  );
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [{ file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'should-fix' }],
+    idempotencyKey: 'formal-1', now: '2026-09-01T02:01:00.000Z',
+  });
+  revision = first.result.revision;
+  for (const [index, to] of ['revision', 'pr-open', 'ci-wait', 'review'].entries()) {
+    revision = workState.transitionRecord({
+      root, id: 'endzone:issue-42', to, expectedRevision: revision, idempotencyKey: `again-${to}`,
+      actor: 'test', evidence: 'revision cycle', now: `2026-09-01T02:1${index}:00.000Z`,
+    }).revision;
+  }
+  // Every prior finding resolved and nothing new: the artifact still has to say so.
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [],
+      priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
+      idempotencyKey: 'formal-2-empty', now: '2026-09-01T02:20:00.000Z',
+    }),
+    (error) => error.code === 'EMPTY_FINDINGS',
+  );
+  const second = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [],
+    priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
+    noFindings: 'Range aaa1111..ccc3333 fixes the off-by-one; nothing new in the changed lines.',
+    idempotencyKey: 'formal-2', now: '2026-09-01T02:21:00.000Z',
+  });
+  const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
+  assert.deepEqual(stored.findings, []);
+  assert.deepEqual(stored.resolutions, { 'formal-001-f1': 'resolved' });
+  assert.match(stored.noFindings, /nothing new/);
+});
+
+test('a no-findings statement cannot accompany findings, and cannot be blank or a bare flag', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const base = {
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK, now: '2026-09-10T18:56:28.000Z',
+  };
+  assert.throws(
+    () => recordReviewArtifact({ ...base, findings: [{ file: 'src/a.jsx', claim: 'x', severity: 'nit' }], noFindings: 'nothing', idempotencyKey: 'k1' }),
+    (error) => error.code === 'USAGE' && /both/.test(error.message),
+  );
+  assert.throws(() => recordReviewArtifact({ ...base, findings: [], noFindings: '   ', idempotencyKey: 'k2' }), (error) => error.code === 'USAGE');
+  assert.throws(() => recordReviewArtifact({ ...base, findings: [], noFindings: 'true', idempotencyKey: 'k3' }), (error) => error.code === 'USAGE');
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0);
+});
+
+test('record cli: --no-findings reaches the artifact; --no-finding and --findings-file are refused as unknown flags', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  for (const [flag, value] of [['--no-finding', 'nothing'], ['--findings-file', 'f.json']]) {
+    assert.throws(
+      () => cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', 'ce19d6a',
+        '--classification', JSON.stringify(RISK), flag, value]),
+      (error) => error instanceof ReviewPolicyError && error.code === 'USAGE' && new RegExp(`unknown flag ${flag}`).test(error.message),
+    );
+  }
+  const clean = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', 'ce19d6a',
+    '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--no-findings', 'Examined the accessibility angle; nothing to fix.']);
+  const stored = JSON.parse(fs.readFileSync(path.join(root, clean.artifact), 'utf8'));
+  assert.equal(stored.noFindings, 'Examined the accessibility angle; nothing to fix.');
+  assert.deepEqual(stored.findings, []);
+});
+
+test('record: EMPTY_FINDINGS exits 2 with the refusal on stderr and nothing on stdout', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const empty = spawnSync(process.execPath, [
+    bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
+    '--kind', 'risk', '--head-sha', 'ce19d6a', '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', '[]',
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(empty.status, 2);
+  assert.equal(empty.stdout, '');
+  assert.equal(JSON.parse(empty.stderr).code, 'EMPTY_FINDINGS');
+});
+
+test('plan-rereview and hold refuse their confusable flag names too', () => {
+  const root = rootDir();
+  seedRecord(root);
+  assert.throws(() => cli(['plan-rereview', '--root', root, '--id', 'endzone:issue-42', '--head', 'ccc3333']), (error) => error.code === 'USAGE' && /unknown flag --head/.test(error.message));
+  assert.throws(() => cli(['hold', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '4', '--why', 'carve-out']), (error) => error.code === 'USAGE' && /unknown flag --why/.test(error.message));
+  assert.throws(() => cli(['unhold', '--root', root]), (error) => error.code === 'USAGE' && /unknown command/.test(error.message));
 });

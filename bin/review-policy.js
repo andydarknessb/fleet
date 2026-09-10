@@ -341,6 +341,24 @@ function recordReviewArtifact(options = {}) {
         }
       }
 
+      // fleet#18: the artifact is never silent about its own result. A reviewer
+      // who found nothing is a real outcome, so it is recorded as a statement
+      // (`--no-findings "<sentence>"`), never as an empty list a later reader
+      // cannot tell from lost content. Last guard before the write, so the
+      // refusals above keep their precedence (ADR 0009, ruling 2).
+      const supplied = options.findings || [];
+      const noFindings = options.noFindings;
+      if (noFindings !== undefined) {
+        if (typeof noFindings !== 'string' || !noFindings.trim() || noFindings === 'true') {
+          throw new ReviewPolicyError('USAGE', '--no-findings needs a one-sentence statement of what was examined and what was concluded');
+        }
+        if (supplied.length) {
+          throw new ReviewPolicyError('USAGE', `a review cannot carry both ${supplied.length} finding(s) and a no-findings statement; give one or the other`);
+        }
+      } else if (!supplied.length) {
+        throw new ReviewPolicyError('EMPTY_FINDINGS', `a ${kind} review with no findings must say so: pass --no-findings "<what was examined and what was concluded>" so the artifact is not read as lost content`);
+      }
+
       if (!written) {
         written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
           schemaVersion: 1,
@@ -355,6 +373,7 @@ function recordReviewArtifact(options = {}) {
           priorArtifact: prior ? prior.artifact : null,
           priorArtifactMissing: priorArtifactMissing || undefined,
           resolutions,
+          noFindings: noFindings ? noFindings.trim() : null,
           findings: buildFindings(stamp, options.findings, priorArtifactData, prior ? prior.artifact : null, resolutions),
         }));
       }
@@ -530,10 +549,31 @@ function classifyCli(rest) {
   });
 }
 
+// fleet#4's contract for the other three commands (fleet#18 added
+// `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
+// each list is every flag its handler consumes; an unknown flag or command is
+// USAGE, exit 2, nothing on stdout.
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact'];
+const COMMAND_FLAGS = Object.freeze({
+  classify: CLASSIFY_FLAGS,
+  record: RECORD_FLAGS,
+  'plan-rereview': ['root', 'id', 'head-sha'],
+  hold: ['root', 'id', 'expected-revision', 'reason', 'actor', 'now', 'idempotency-key', 'no-notifier'],
+});
+
 function cli(argv) {
   const [command, ...rest] = argv;
   if (command === 'classify') return classifyCli(rest);
-  const args = workState.parseArgs(rest);
+  if (!Object.prototype.hasOwnProperty.call(COMMAND_FLAGS, command)) {
+    throw new ReviewPolicyError('USAGE', `unknown command '${command}'; commands: ${Object.keys(COMMAND_FLAGS).join(', ')}`);
+  }
+  let args;
+  try {
+    args = workState.parseArgs(rest, COMMAND_FLAGS[command]);
+  } catch (error) {
+    if (error.code === 'USAGE') throw new ReviewPolicyError('USAGE', error.message, { flag: error.flag, accepted: error.accepted });
+    throw error;
+  }
   const root = args.root;
   if (command === 'record') {
     return recordReviewArtifact({
@@ -543,6 +583,7 @@ function cli(argv) {
       idempotencyKey: args['idempotency-key'], evidence: args.evidence,
       classification: args.classification ? JSON.parse(fs.existsSync(args.classification) ? fs.readFileSync(args.classification, 'utf8') : args.classification) : {},
       findings: args.findings ? JSON.parse(fs.existsSync(args.findings) ? fs.readFileSync(args.findings, 'utf8') : args.findings) : [],
+      noFindings: args['no-findings'],
       resolutions: args.resolutions ? JSON.parse(args.resolutions) : null,
       priorArtifact: args['prior-artifact'],
     });
@@ -550,14 +591,12 @@ function cli(argv) {
   if (command === 'plan-rereview') {
     return planRereview({ root, recordId: args.id, headSha: args['head-sha'] });
   }
-  if (command === 'hold') {
-    return holdRecord({
-      root, recordId: args.id, expectedRevision: Number(args['expected-revision']),
-      reason: args.reason, actor: args.actor, now: args.now, idempotencyKey: args['idempotency-key'],
-      notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
-    });
-  }
-  throw new ReviewPolicyError('USAGE', 'commands: classify, record, plan-rereview, hold');
+  // command === 'hold'
+  return holdRecord({
+    root, recordId: args.id, expectedRevision: Number(args['expected-revision']),
+    reason: args.reason, actor: args.actor, now: args.now, idempotencyKey: args['idempotency-key'],
+    notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
+  });
 }
 
 if (require.main === module) {
@@ -569,12 +608,13 @@ if (require.main === module) {
     // take it for a failed one, let alone for an answer (fleet#2).
     // INVALID_REVIEW_STATE is a refused invocation too (fleet#20): nothing was
     // recorded, and the message names the door that opens the state.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS'].includes(error.code) ? 2 : 1;
   }
 }
 
 module.exports = {
   CLASSIFY_FLAGS,
+  COMMAND_FLAGS,
   ReviewPolicyError,
   classifyChange,
   cli,
