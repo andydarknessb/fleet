@@ -19,6 +19,9 @@
     "SessionStart": [
       { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/session-start.ps1", "timeout": 30 } ] }
     ],
+    "PreToolUse": [
+      { "matcher": "Bash|PowerShell|WebFetch|WebSearch", "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/research-gate.ps1", "timeout": 15 } ] }
+    ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/stop.ps1", "timeout": 60 } ] }
     ]
