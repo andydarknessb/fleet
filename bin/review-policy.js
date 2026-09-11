@@ -375,6 +375,16 @@ function recordReviewArtifact(options = {}) {
         // A routine concurrent bump (pr-watch observing the PR) is retried when
         // the caller did not pin a revision; everything else is terminal.
         if (error.code === 'STALE_REVISION' && pinnedRevision === null && attempt < STALE_RETRY_LIMIT) continue;
+        if (error.code === 'INVALID_REVIEW_STATE') {
+          // fleet#20: the door is closed on purpose (a formal review lands on a
+          // settled PR; a risk review is IC-hosted pre-PR-ready). Name what
+          // opens it, so a lead who reviewed early knows to wait rather than
+          // park the findings somewhere non-canonical (ADR 0009).
+          const opens = kind === 'formal'
+            ? 'the PR watcher records checks-settled when the gates finish and moves the record to `review`; review then, not before'
+            : 'a risk review is recorded by the IC pre-PR-ready (implementing, revision, pr-open), never from the lead\'s review';
+          throw new ReviewPolicyError('INVALID_REVIEW_STATE', `${error.message}; ${opens}`, { state: record.state });
+        }
         throw error;
       }
     }
@@ -557,7 +567,9 @@ if (require.main === module) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
     // A refused invocation exits 2 so a caller reading only the status cannot
     // take it for a failed one, let alone for an answer (fleet#2).
-    process.exitCode = error.code === 'USAGE' || error.code === 'EMPTY_TENANT' ? 2 : 1;
+    // INVALID_REVIEW_STATE is a refused invocation too (fleet#20): nothing was
+    // recorded, and the message names the door that opens the state.
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE'].includes(error.code) ? 2 : 1;
   }
 }
 

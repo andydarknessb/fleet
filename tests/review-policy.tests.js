@@ -650,3 +650,53 @@ test('parseArgs: with a schema an unknown flag is a USAGE error carrying the fla
   assert.equal(args.repo, '/x');
   assert.deepEqual(args._, ['--repo-path'], 'tokens after -- are never flags, schema or not');
 });
+
+// --- fleet#20: a formal review cannot be recorded in ci-wait, and the refusal is unmistakable ---
+// The lead role file says a PR whose gates are still running is not yet
+// reviewable; two leads read the diff anyway, hit INVALID_REVIEW_STATE from
+// the work-state door, and parked their findings in a PR comment and a temp
+// file. The door stays closed (ADR 0009, ruling 1): the refusal now names the
+// state that opens it, leaves no artifact behind, and exits 2 as a refused
+// invocation rather than 1 as a failed one.
+
+test('record --kind formal in ci-wait is refused with the door named, and leaves no artifact behind', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'ci-wait' });
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] },
+      findings: [{ file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'should-fix' }],
+      idempotencyKey: 'formal-early', now: '2026-09-01T02:00:00.000Z',
+    }),
+    (error) => {
+      assert.ok(error instanceof ReviewPolicyError, `expected ReviewPolicyError, got ${error && error.name}`);
+      assert.equal(error.code, 'INVALID_REVIEW_STATE');
+      assert.equal(error.state, 'ci-wait');
+      assert.match(error.message, /cannot be recorded while ci-wait/);
+      assert.match(error.message, /checks-settled/);
+      assert.match(error.message, /`review`/);
+      return true;
+    },
+  );
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'a refused review leaves no artifact');
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).review?.formal, undefined);
+});
+
+test('record: INVALID_REVIEW_STATE exits 2 with the refusal on stderr and nothing on stdout', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'ci-wait' });
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const early = spawnSync(process.execPath, [
+    bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
+    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead',
+    '--findings', '[{"file":"src/a.js","line":3,"claim":"off-by-one","severity":"should-fix"}]',
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(early.status, 2);
+  assert.equal(early.stdout, '');
+  const refusal = JSON.parse(early.stderr);
+  assert.equal(refusal.code, 'INVALID_REVIEW_STATE');
+  assert.match(refusal.message, /checks-settled/);
+});
