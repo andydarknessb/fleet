@@ -104,15 +104,15 @@ Status files: `state/STATUS.md` (dispatcher's digest), `state/status/<tenant>.md
 
 ```powershell
 # ticket 07: decisions, exclusions, delivery
-node C:\Users\Cory\fleet\bin\digest.js --print                       # rebuild and show the fleet digest
-node C:\Users\Cory\fleet\bin\exclusions.js project --tenant endzone   # active + discharged frontier exclusions
-node C:\Users\Cory\fleet\bin\exclusions.js add --tenant endzone --issue <n> --owner cory --reason "..." --evidence "<path or url>" --recheck-event exclusion-lifted
-node C:\Users\Cory\fleet\bin\exclusions.js lift --tenant endzone --id endzone:excl-<n>-1 --actor cory --evidence "..."
-node C:\Users\Cory\fleet\bin\work-state.js notify --id <tenant>:issue-<n> --phase authorize-retry --decision-sequence <seq> --expected-revision <r> --actor cory --evidence "..."   # re-arm ONE more page after a failed delivery
+node C:/Users/Cory/fleet/bin/digest.js --print                       # rebuild and show the fleet digest
+node C:/Users/Cory/fleet/bin/exclusions.js project --tenant endzone   # active + discharged frontier exclusions
+node C:/Users/Cory/fleet/bin/exclusions.js add --tenant endzone --issue <n> --owner cory --reason "..." --evidence "<path or url>" --recheck-event exclusion-lifted
+node C:/Users/Cory/fleet/bin/exclusions.js lift --tenant endzone --id endzone:excl-<n>-1 --actor cory --evidence "..."
+node C:/Users/Cory/fleet/bin/work-state.js notify --id <tenant>:issue-<n> --phase authorize-retry --decision-sequence <seq> --expected-revision <r> --actor cory --evidence "..."   # re-arm ONE more page after a failed delivery
 New-Item C:\Users\Cory\fleet\state\flags\notifier-live               # cutover: decision events page you directly (toast)
 
 # ticket 08b: supervision parity and cutover
-node C:\Users\Cory\fleet\bin\parity.js                               # 48h parity report (text; --json for scripts)
+node C:/Users/Cory/fleet/bin/parity.js                               # 48h parity report (text; --json for scripts)
 powershell -File C:\Users\Cory\fleet\bin\cutover-sentinel.ps1 -DryRun  # gates only; drop -DryRun to cut over
 powershell -File C:\Users\Cory\fleet\bin\rollback-sentinel.ps1         # restore the rostered Sentinel within one release
 ```
@@ -154,6 +154,7 @@ The `mattpocock-skills` plugin is enabled at user scope, so every fleet session 
 - `claude rm <id>` also removes the session's worktree. `claude stop` does not.
 - **Worktree isolation is lazy for legacy launches.** A background session starts in the repo's main checkout (reads only) and is moved into `<repo>/.claude/worktrees/<name>-<slug>` on a `worktree-*` branch the first time it writes. The main checkout is never dirtied. ICs then create their `fleet/<issue>-<slug>` branch inside that worktree. Manifest-launched assignments are the exception: `launch.ps1` creates `<name>-assignment` directly from the manifest base SHA on the manifest branch, so the IC must not create a nested worktree or switch branches. `claude rm` removes the worktree and its branch. The fleet never touches worktrees it didn't create; your hand-made `Endzone-Empire-*` worktrees are yours.
 - **Hook commands run through a POSIX shell, even on Windows.** Backslashes in `fleet-settings.json` hook paths get eaten (`C:UsersCory...`). Use forward slashes: `-File C:/Users/Cory/fleet/hooks/stop.ps1`. PowerShell accepts them.
+- **So does anything a session pastes into its Bash tool.** The ack command in the launch prompt and the session-start context, and every `node C:/Users/Cory/fleet/bin/...` example in the role files, are written with forward slashes for the same reason: an unquoted `C:\Users\...` collapses to a drive-relative `C:UsersCory...` and node reports MODULE_NOT_FOUND against `C:\`. Every IC since the manifest cutover lost its first turn to this before 2026-09-11. Keep new examples in forward slashes.
 - `--settings <file>` on `claude --bg` applies the file's `env` block and `hooks`; that is how a session learns who it is (`FLEET_*`). `respawnFlags` in the job's `state.json` records the settings path, so `claude respawn` keeps the identity.
 - Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the dispatcher to recreate its own.
 - Max 5x: rate limiting is a first-class state. The supervisor's applied check sets a 59-minute PAUSE when a fleet job reports one (one minute short of the 15-minute tick cadence, so the tick one hour later clears it rather than the one after), clears it after the window, and pauses at most once per distinct limit wording per session (`state/sentinel/rate-limit-signal.json`): the wording is the session's own status summary and outlives the limit it names.

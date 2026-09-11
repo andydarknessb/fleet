@@ -144,6 +144,11 @@ try {
   $r8b = Run-Script 'launch.ps1' @('-Manifest', $r8.manifestPath, '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r8b.dryRun -eq $true -and $r8b.name -eq 'ic-101') "a manifest launch must pass the door under the flag: $lastOut"
   Assert-True ((Get-Content "$testRoot\state\sessions\ic-101.settings.json" -Raw) -match 'FLEET_WORK_RECORD_ID') 'the manifest launch must carry the Work record identity into the session'
+  # Regression (2026-09-11): the prompt's ack command is pasted into the Bash tool; backslash paths
+  # collapse there (C:UsersCory...). The dry run reports the prompt so this can be checked.
+  Assert-True ([bool]$r8b.prompt -and $r8b.prompt -match 'assignment\.js ack') "the dry run must report the manifest prompt: $lastOut"
+  $promptCmd = ([regex]::Match($r8b.prompt, '\((node \S+assignment\.js ack)\)')).Groups[1].Value
+  Assert-True ([bool]$promptCmd -and $promptCmd -notmatch '\\') "the prompt's ack command must carry no backslashes: $($r8b.prompt)"
   $eventsAfterReserve = @(Get-EventLines).Count
 
   # Case 9: rollback -DryRun lists the pending manifest and changes nothing.
