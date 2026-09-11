@@ -200,6 +200,14 @@ one formal Standards and Spec review; a diff without a trigger never gets a
 risk reviewer.
 _Avoid_: second reviewer, QA pass, extra review angle
 
+**Researcher**:
+A Worker spawned to find facts and report them: documentation, how a thing
+works, where it is called, what a log or thread says. It edits nothing and
+decides nothing, and it runs on the cheapest tier that can read. Reading what
+was handed to a session is that session's own job; going to find something out
+is a Researcher's. Authoring and judgment never delegate to one.
+_Avoid_: explorer, lookup agent, research sub-agent
+
 **Budget**:
 The token line a Unit of work is measured against: job tokens (input plus
 output, never cache fields) summed over the IC session's transcript. The
