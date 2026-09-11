@@ -73,6 +73,15 @@ try {
   Assert-True ($out4 -match 'reconciled against GitHub at: 2026-09-02T10:01') 'the handoff must carry the reconcile time'
   $out4b = Run-Hook 'dispatcher' 'dispatcher' '' '{"session_id":"sess-dispatcher"}'
   Assert-True ($out4b -notmatch 'ROTATION:') 'another session must not see the handoff'
+  # ADR 0010: gated roles are told the researcher is official and whether the gate stands.
+  $outR1 = Run-Hook -Name 'ic-7' -Role 'ic' -Tenant 'test'
+  Assert-True ($outR1 -match 'official researcher \(ADR 0010\)' -and $outR1 -match 'gate on') 'an IC must be told the researcher is official and the gate is on'
+  $outR2 = Run-Hook -Name 'sentinel' -Role 'sentinel' -Tenant ''
+  Assert-True ($outR2 -notmatch 'official researcher') 'the sentinel runs scripts only and is not gated'
+  Write-Utf8 "$testRoot\state\flags\research-gate-off" ''
+  $outR3 = Run-Hook -Name 'ic-7' -Role 'ic' -Tenant 'test'
+  Assert-True ($outR3 -match 'gate off') 'the rollback flag must be reported'
+  Remove-Item "$testRoot\state\flags\research-gate-off" -Force
   $out4c = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-later-respawn"}'
   Assert-True ($out4c -notmatch 'ROTATION:') 'a later respawn of the same name must not inherit the stale handoff'
 

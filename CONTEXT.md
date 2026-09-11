@@ -205,7 +205,9 @@ A Worker spawned to find facts and report them: documentation, how a thing
 works, where it is called, what a log or thread says. It edits nothing and
 decides nothing, and it runs on the cheapest tier that can read. Reading what
 was handed to a session is that session's own job; going to find something out
-is a Researcher's. Authoring and judgment never delegate to one.
+is a Researcher's. It is the fleet's official researcher (ADR 0010): the
+research-gate hook refuses a session's own repo sweeps, history reads, CI log
+reads and web fetches. Authoring and judgment never delegate to one.
 _Avoid_: explorer, lookup agent, research sub-agent
 
 **Budget**:

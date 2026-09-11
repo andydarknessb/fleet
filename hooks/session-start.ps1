@@ -78,6 +78,10 @@ if ($tenant -and (Test-Path "$home_\tenants\$tenant.json")) {
   Write-Output "Tenant file: $home_\tenants\$tenant.json"
 }
 if ($env:FLEET_ISSUE) { Write-Output "Your unit of work: issue #$($env:FLEET_ISSUE). Nothing else." }
+if ($role -in @('ic', 'project-lead', 'dispatcher')) {
+  $gateState = if (Test-Path "$home_\state\flags\research-gate-off") { 'off (state/flags/research-gate-off stands)' } else { 'on' }
+  Write-Output "Researcher: the haiku researcher worker (Agent tool, subagent_type: researcher) is your official researcher (ADR 0010). Repo sweeps, git log, CI logs and web fetches from this session are refused by the research-gate hook (gate $gateState); give the researcher the one question and a line cap. Reading what was handed to you stays yours."
+}
 # 02/03 cutover: a manifest-launched IC learns its manifest, Work record, and the
 # acknowledgment command here, with the record's current revision read at hook time
 # so the first useful turn can acknowledge without a lookup.
