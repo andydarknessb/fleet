@@ -285,11 +285,19 @@ function writeManifest(root, manifest) {
 // Amendment 14 (2026-09-09): an IC is haiku or sonnet, never opus. The only opus worker in
 // an IC's world is the risk reviewer it hosts on a trigger. Enforced where the manifest is
 // made, because the manifest is what the launch door starts.
-const IC_MODELS = Object.freeze(['haiku', 'sonnet']);
+// Fleet #28 (2026-09-11): the Claude Code CLI keeps a per-model auto-mode list and
+// claude-haiku-4-5 is not on it (2.1.267 and 2.1.268 verified; an explicit
+// --permission-mode auto is downgraded too). A haiku --bg session therefore runs in
+// permission-mode default and blocks on its first out-of-cwd Read with nobody to
+// approve it. Amendment 14's haiku tier is suspended until the CLI list changes:
+// put 'haiku' back here AND in launch.ps1's refusal when it does.
+const IC_MODELS = Object.freeze(['sonnet']);
+const HAIKU_REFUSAL = "the installed Claude Code CLI has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet";
 
 function icModel(model) {
   const value = String(model === undefined || model === null || model === '' ? 'sonnet' : model).toLowerCase();
-  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as haiku or sonnet, not '${model}' (amendment 14; the risk reviewer is the only opus worker)`);
+  if (value === 'haiku') throw new WorkStateError('INVALID_IC_MODEL', HAIKU_REFUSAL);
+  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as sonnet, not '${model}' (amendment 14 with the haiku tier suspended by fleet #28; the risk reviewer is the only opus worker)`);
   return value;
 }
 
