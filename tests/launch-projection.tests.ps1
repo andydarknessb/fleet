@@ -68,7 +68,7 @@ try {
   # The planner must now refuse the issue as reserved, which is the whole point: the
   # Stop hook has already dropped it from its own frontier, so the two agree.
   $fixture = "$testRoot\issues.json"
-  Write-Utf8 $fixture '[{"number":101,"title":"Fixture","url":"https://example/101","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Write-Utf8 $fixture '[{"number":101,"title":"Fixture","url":"https://example/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   $frontierRaw = & node "$testRoot\bin\assignment.js" frontier --root $testRoot --tenant test --fixture $fixture --ready-label ready-for-agent 2>&1 | Out-String
   $ErrorActionPreference = $eap

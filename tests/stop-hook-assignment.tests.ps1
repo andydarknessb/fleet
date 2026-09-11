@@ -41,7 +41,7 @@ try {
   Write-Utf8 "$testRoot\gh-pr.json" '[]'
   Write-Utf8 "$testRoot\gh-issue.json" '[{"number":101}]'
   Write-Utf8 "$testRoot\gh-deps.json" '[{"number":101,"issue_dependencies_summary":{"blocked_by":0}}]'
-  Write-Utf8 "$testRoot\gh-graphql.json" '{"data":{"repository":{"issues":{"nodes":[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":{"nodes":[{"name":"ready-for-agent"}]},"assignees":{"nodes":[]},"blockedBy":{"nodes":[],"pageInfo":{"hasNextPage":false}},"subIssues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'
+  Write-Utf8 "$testRoot\gh-graphql.json" '{"data":{"repository":{"issues":{"nodes":[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":{"nodes":[{"name":"ready-for-agent"}]},"assignees":{"nodes":[]},"blockedBy":{"nodes":[],"pageInfo":{"hasNextPage":false}},"subIssues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" +
     'if "%1"=="pr" type "' + $testRoot + '\gh-pr.json"' + "`r`n" +
     'if "%1"=="issue" type "' + $testRoot + '\gh-issue.json"' + "`r`n" +
@@ -51,7 +51,7 @@ try {
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue
   # The planner runs under Node, which cannot execute the gh.cmd mock; it reads the same issue as a fixture.
-  Write-Utf8 "$testRoot\issues-fixture.json" '[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Write-Utf8 "$testRoot\issues-fixture.json" '[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
   $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-fixture.json"
 
   # Case 1: no flag -> the legacy frontier decides; the planner is recorded beside it, agreeing.

@@ -296,6 +296,36 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
       }],
     };
   }
+  // fleet#34: a lead that returns a PR to its IC leaves the record in review. When
+  // the IC re-readies the PR the head SHA moves, the gates go pending, and a
+  // change-within-review observe would carry no wake - so a green re-ready never
+  // woke anyone, and `record --kind formal` could not refuse a review of pending
+  // gates because the state field still said review. A new head while in review
+  // walks the store's own path back to ci-wait (revision, pr-open, ci-wait), which
+  // restores the ci-wait -> review transition, its checks-settled wake, and the
+  // formal-review guard in one stroke. Already-settled gates at the new head take
+  // the last hop to review in the same tick, so no wake is ever a tick late.
+  // hold is left alone: a held PR is parked for Cory's merge, not being reworked.
+  const prevHead = record.github?.observation?.headSha || null;
+  const headMoved = state === 'review' && prevHead && livePr.headRefOid && livePr.headRefOid !== prevHead;
+  if (headMoved) {
+    const hops = hopsTo('review', 'ci-wait');
+    if (hops) {
+      const settled = evaluation.settled;
+      const chain = settled ? [...hops, 'review'] : hops;
+      const wake = settled ? 'checks-settled' : (evaluation.failed ? 'checks-failed' : null);
+      return {
+        actions: chain.map((to, index) => ({
+          kind: 'transition', to,
+          observe: index === chain.length - 1 ? { pr: livePr, evaluation, closing: settled ? true : null } : null,
+          evidence: index === chain.length - 1
+            ? `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review (was ${String(prevHead).slice(0, 12)}); ${settled ? `every gate green; closing linkage verified for #${record.issue}` : `gates ${evaluation.failed ? `failed: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}` : `pending: ${evaluation.gatePending.join(', ') || 'none observed'}`}`}`
+            : `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review; walking back to ci-wait`,
+          wake: index === chain.length - 1 ? wake : null,
+        })),
+      };
+    }
+  }
   const observation = buildObservation(livePr, evaluation, true);
   if (observation.digest === prevDigest) return { actions: [] };
   return { actions: [{ kind: 'observe', observation, evidence: `PR #${prNumber} changed while ${state}`, wake: null }] };

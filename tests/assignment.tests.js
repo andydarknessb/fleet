@@ -34,7 +34,9 @@ function issue(number, overrides = {}) {
     number,
     title: `Issue ${number}`,
     url: `https://github.com/example/repo/issues/${number}`,
-    body: `criteria for ${number}`,
+    // fleet#33: a body with no reservable surface is refused at assign, so the
+    // default fixture names one file of its own.
+    body: `Change \`src/issue-${number}.js\`.`,
     createdAt: `2026-09-01T00:00:${String(number).padStart(2, '0')}.000Z`,
     state: 'OPEN',
     labels: ['ready-for-agent'],
@@ -228,7 +230,7 @@ test('a third assignment requires and records an independence proof', () => {
 });
 
 test('a third assignment fails closed without reservation evidence', () => {
-  const frontier = { eligible: [issue(50), issue(51), issue(52)] };
+  const frontier = { eligible: [issue(50, { body: 'Improve the experience.' }), issue(51), issue(52)] };
   const active = [
     { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', reservations: {} },
     { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', reservations: {} },
@@ -269,6 +271,88 @@ test('issue criteria derive typed reservations from body and comment paths', () 
     schemaAreas: ['players'],
     testResources: ['src/entities/roster/model/lineupModel.test.js'],
   });
+});
+
+// fleet#32: the prohibition criterion that collided endzone #1242 with #1233, verbatim
+// as it read before the 2026-09-11T22:05Z reword. The ticket edits scheduler.js and
+// its test; criterion 3 forbids three other paths, and criterion 2 runs a test unedited.
+test('fleet#32: a prohibition criterion reserves nothing; an unedited test run is not a surface', () => {
+  const normalized = normalizeIssue(issue(1242, {
+    body: [
+      '## Acceptance criteria',
+      '1. `node --test server/test/scheduler.test.js` is green, with these cases:',
+      '   - A `schedule` job whose latest row is `ok: true` reports `syncRuns.schedule.latest.failedWeeks === 13`.',
+      '2. `node --test server/test/healthPayloadShape.test.js` is green with both scheduler key-set assertions unedited.',
+      '3. `git diff --name-only origin/integration...HEAD` lists no file under `server/modules/syncRun.js`, `server/services/` or `server/db/migrations/`. No change to how the run row is written, and no migration.',
+      '4. `latestOk` keeps its `{ finishedAt }` shape.',
+    ].join('\n'),
+  }));
+  assert.deepEqual(normalized.reservations, { components: [], migrationPrefixes: [], schemaAreas: [], testResources: ['server/test/scheduler.test.js'] });
+});
+
+test('fleet#32: an allowlist criterion is the whole reservation, so a directory named elsewhere is not reserved', () => {
+  const normalized = normalizeIssue(issue(1242, {
+    body: [
+      'Surface the count on `getSchedulerStatus()` in `server/modules/scheduler.js`; the row is written by `server/modules/syncRun.js`.',
+      '3. `git diff --name-only origin/integration...HEAD` lists exactly `server/modules/scheduler.js` and `server/test/scheduler.test.js`. No change to how the run row is written, and no migration.',
+    ].join('\n'),
+  }));
+  assert.deepEqual(normalized.reservations, { components: ['server/modules/scheduler.js'], migrationPrefixes: [], schemaAreas: [], testResources: ['server/test/scheduler.test.js'] });
+});
+
+test('fleet#32: a negated sentence, an out-of-scope section, a cited ADR and a copula-cited premise reserve nothing; the same path in an edit sentence still does', () => {
+  const normalized = normalizeIssue(issue(1200, {
+    body: [
+      'Add `server/modules/syncRun.js` and move `runInjurySync` (`server/services/scoring.service.js:946-1154`) onto it. Nothing else migrates in this ticket.',
+      '**This ticket adds no migration**: `server/db/migrations/**` is a carve-out.',
+      'Rulings: ADR 0036 at `docs/adr/0036-sync-runs.md`. Amend `docs/adr/0033-with-transaction.md` with the lock order.',
+      '`PLAYERS_BULK_WRITE_LOCK` is `server/modules/advisoryLock.js:38` (`23004`). `server/modules/liveBox.js:79` stays outside, per the body.',
+      'The `data_sync_runs` table gains one row per run; the `players` table is not touched.',
+      '## Out of scope',
+      '- `server/services/adp.service.js` moves in #1201.',
+      '- The `leagues` table.',
+      '## Checks',
+      '`node --test server/test/injury.test.js` covers the rejects.',
+    ].join('\n'),
+  }));
+  assert.deepEqual(normalized.reservations, {
+    components: ['docs/adr/0033-with-transaction.md', 'server/modules/syncRun.js', 'server/services/scoring.service.js'],
+    migrationPrefixes: [],
+    schemaAreas: ['data_sync_runs'],
+    testResources: ['server/test/injury.test.js'],
+  });
+});
+
+test('fleet#32: a prohibition no longer collides a ticket with the directory owner it never touches', () => {
+  const owner = { id: 'endzone:issue-1233', issue: 1233, state: 'implementing', manifestPath: 'm1233', reservations: { components: ['server/db/migrations/'] } };
+  const candidate = issue(1242, { body: '`git diff --name-only origin/integration...HEAD` lists no file under `server/db/migrations/`. Edit `server/modules/scheduler.js`.' });
+  const frontier = selectFrontier({ issues: [candidate], readyLabel: 'ready-for-agent', active: [owner], now: '2026-09-11T22:00:00.000Z' });
+  assert.deepEqual(frontier.eligible.map((entry) => entry.number), [1242]);
+  assert.deepEqual(frontier.excluded, []);
+});
+
+// fleet#33: endzone #1234's six criteria name seams in prose and no path, so the
+// derivation produced an empty set and the record silently blocked every later
+// third assignment. Assign refuses that; the lead answers with --reservations.
+test('fleet#33: assign refuses an assignment whose criteria derive no reservation, and accepts an explicit set', () => {
+  const root = rootDir();
+  const fileless = issue(1234, { body: 'An ESPN implementation of the existing odds provider seam reads each event\'s odds block. A new hourly Sync run (ADR 0036) fetches the slate once.' });
+  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
+  assert.throws(() => reserveAssignment({ root, issue: fileless, tenant: 'endzone', readyLabel: 'ready-for-agent', base }), (error) => error.code === 'EMPTY_RESERVATIONS' && error.issue === 1234 && /--reservations/.test(error.message));
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-1234' }), (error) => error.code === 'NOT_FOUND');
+
+  assert.throws(() => reserveAssignment({ root, issue: fileless, tenant: 'endzone', readyLabel: 'ready-for-agent', base, reservations: '{"components":[]}' }), (error) => error.code === 'EMPTY_RESERVATIONS');
+  assert.throws(() => reserveAssignment({ root, issue: fileless, tenant: 'endzone', readyLabel: 'ready-for-agent', base, reservations: '{"files":["server/modules/odds.js"]}' }), (error) => error.code === 'USAGE' && /unknown field/.test(error.message));
+
+  const reserved = reserveAssignment({ root, issue: fileless, tenant: 'endzone', readyLabel: 'ready-for-agent', base, reservations: '{"components":["server/modules/oddsProvider.js","server/modules/espnOdds.js"],"testResources":["server/test/fixtures/espn-scoreboard-2025-w1.json"]}' });
+  const expected = { components: ['server/modules/espnOdds.js', 'server/modules/oddsProvider.js'], migrationPrefixes: [], schemaAreas: [], testResources: ['server/test/fixtures/espn-scoreboard-2025-w1.json'] };
+  assert.deepEqual(reserved.manifest.reservations, expected);
+  assert.deepEqual(getRecord({ root, id: 'endzone:issue-1234' }).reservations, expected);
+});
+
+test('cli: assign accepts --reservations and refuses a bare flag', () => {
+  assert.ok(FLAGS.assign.includes('reservations'));
+  assert.throws(() => cli(['assign', '--root', rootDir(), '--reservations']), (error) => error.code === 'USAGE');
 });
 
 test('legacy active records use matching GitHub criteria for third-assignment proof and conflicts', () => {
