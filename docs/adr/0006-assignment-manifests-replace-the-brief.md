@@ -11,14 +11,15 @@ frontier from GitHub facts (open, ready label, unassigned, no open blockers,
 not a spec parent, not marked ready for human work) plus fleet facts (active
 Work-record reservations, the structured Frontier exclusion ledger, the legacy
 skip file), oldest first; reserves the head as a Work record in `assigned`;
-writes one immutable manifest that points at the issue and carries the base
+writes one immutable manifest that points at the issue, pins the issue body
+and ordered comment thread, and carries the base
 SHA resolved from the fetched remote ref, branch, model, risk, token budget,
 the CONTEXT.md headings and ADR paths to read, the test plan, CI gates, and
 reservations; and launches it through `launch.ps1 -Manifest`, the one door
 (ADR 0002). The IC acknowledges the manifest in its first useful turn
-(`assignment-started`, record to `implementing`). The GitHub issue remains the
-only copy of the acceptance criteria: the manifest, the prompt, and every
-message point at it and never restate it.
+(`assignment-started`, record to `implementing`). The GitHub issue body and
+comments remain the only copy of the acceptance criteria: the manifest, the
+prompt, and every message point at them and never restate them.
 
 The project lead keeps the judgment that is genuinely its own, expressed as
 manifest fields: which model, which risk class, which context headings and
@@ -35,7 +36,8 @@ Stop-hook frontier also cannot see assignees, spec parents, the
 those exclusions by hand in the skip file. A script that reads GitHub once
 per decision and reserves before launching removes both the duplication and
 the blind spots, and a manifest whose preconditions are checked again at
-launch (body hash, base SHA) means no IC works against stale criteria.
+launch (body-and-comments criteria hash, base SHA) means no IC works against
+stale criteria.
 
 ## Consequences
 
@@ -57,6 +59,16 @@ launch (body hash, base SHA) means no IC works against stale criteria.
   and test-resource paths overlap when either names the other or one contains
   the other on a path-segment boundary; directory/file granularity cannot make
   an overlapping assignment appear independent.
+
+## Criteria-integrity amendment (2026-09-09)
+
+Issue comments are part of the assignment criteria because project leads may
+post corrections and rulings there and ICs read the issue with `--comments`.
+The planner hashes the body plus every comment's identity, creation time, and
+body in chronological order. Both launch paths re-fetch and compare that hash
+before acknowledgment; a missing legacy hash or any body/comment drift
+invalidates the manifest and releases its reservation. Issues whose complete
+comment thread cannot be fetched in the bounded query fail closed.
 
 ## Status note - 02/03 cutover (2026-09-04)
 

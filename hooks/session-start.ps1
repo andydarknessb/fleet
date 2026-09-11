@@ -89,7 +89,7 @@ if ($env:FLEET_ASSIGNMENT_MANIFEST -and $env:FLEET_WORK_RECORD_ID) {
     if ($ackRecord) { $ackRevision = [int]$ackRecord.Value.revision }
   } catch {}
   $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $home_ + '\bin\work-state.js get --root ' + $home_ + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
-  Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue stays the only copy of the criteria; the manifest carries pointers. In your first useful turn acknowledge it: node $home_\bin\assignment.js ack --root $home_ --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
+  Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $home_\bin\assignment.js ack --root $home_ --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
 }
 # The handoff goes only to the session the rotation itself launched: the intent's
 # newSessionId must match this session's id, so a later respawn or manual launch of

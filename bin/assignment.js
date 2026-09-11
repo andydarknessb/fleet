@@ -357,7 +357,7 @@ function validateManifest({ manifest, issue, base } = {}) {
   const current = normalizeIssue(issue);
   const mismatches = [];
   if (current.bodyHash !== manifest.issue.bodyHash) mismatches.push({ field: 'issue.bodyHash', expected: manifest.issue.bodyHash, actual: current.bodyHash });
-  if (manifest.issue.criteriaHash && current.criteriaHash !== manifest.issue.criteriaHash) mismatches.push({ field: 'issue.criteriaHash', expected: manifest.issue.criteriaHash, actual: current.criteriaHash });
+  if (current.criteriaHash !== manifest.issue.criteriaHash) mismatches.push({ field: 'issue.criteriaHash', expected: manifest.issue.criteriaHash, actual: current.criteriaHash });
   if (current.commentsTruncated) mismatches.push({ field: 'issue.commentsComplete', expected: true, actual: false });
   if (base && base.sha !== manifest.base.sha) mismatches.push({ field: 'base.sha', expected: manifest.base.sha, actual: base.sha });
   return { valid: mismatches.length === 0, mismatches };
