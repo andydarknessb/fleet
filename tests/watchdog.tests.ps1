@@ -358,7 +358,7 @@ try {
   function Get-RotateCalls { if (Test-Path "$testRoot\rotate-calls.txt") { @(Get-Content "$testRoot\rotate-calls.txt") } else { @() } }
   function Get-AlertLines { if (Test-Path "$testRoot\state\alerts\alerts.jsonl") { @(Get-Content "$testRoot\state\alerts\alerts.jsonl" | Where-Object { $_ }) } else { @() } }
   $wakeFixture = "$testRoot\issues-fixture.json"
-  Write-Utf8 $wakeFixture '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Write-Utf8 $wakeFixture '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
   $env:FLEET_GITHUB_ISSUES_FIXTURE = $wakeFixture
   # Live supervision is the precondition (a rollback case above removed the flag).
   Write-Utf8 (Join-Path $testRoot 'state\flags\sentinel-off') 'wake test'
@@ -425,7 +425,7 @@ try {
   Assert-True ($wake6b.decision -eq 'none') 'a consumed outbox wake must not wake again'
 
   # Case W7: state/flags/frontier-wake-off disables the wake entirely.
-  Write-Utf8 $wakeFixture '[{"number":502,"title":"Ready","url":"https://github.com/owner/repo/issues/502","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Write-Utf8 $wakeFixture '[{"number":502,"title":"Ready","url":"https://github.com/owner/repo/issues/502","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
   Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
   Write-Utf8 "$testRoot\state\flags\frontier-wake-off" 'x'
   $callsBefore = @(Get-RotateCalls).Count

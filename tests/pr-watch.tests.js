@@ -330,6 +330,55 @@ test('linkage disappearing during review escalates decision-needed before any me
   assert.equal(outbox(root)[0].wake, 'decision-needed');
 });
 
+test('fleet#34: a re-readied PR whose record sits in review re-enters ci-wait on the new head, then wakes checks-settled when it settles', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  // Baseline: the lead reviewed head abc123 (green, linked) and returned it without moving the record.
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'review');
+  assert.deepEqual(outbox(root), []);
+
+  // The IC pushes fixes: new head, every gate pending. The record must stop reading `review`.
+  const pending = [check('g1', 'IN_PROGRESS', ''), check('g2', 'QUEUED', '')];
+  watch(root, fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: pending })], viewResult: view({ headRefOid: 'def456', body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'ci-wait', 'a new head with pending gates is ci-wait, not review');
+  assert.deepEqual(outbox(root), []);
+
+  // Gates settle green at the new head: the lead gets exactly one checks-settled wake.
+  const f = fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: GREEN })], viewResult: view({ headRefOid: 'def456', statusCheckRollup: GREEN, body: 'Closes #42' }) });
+  watch(root, f);
+  assert.equal(record(root).state, 'review');
+  const wakes = outbox(root);
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].wake, 'checks-settled');
+  watch(root, f);
+  assert.equal(outbox(root).length, 1);
+});
+
+test('fleet#34: a re-readied PR whose new head is already green wakes checks-settled in one tick', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  assert.deepEqual(outbox(root), []);
+  watch(root, fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: GREEN })], viewResult: view({ headRefOid: 'def456', statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'review');
+  const wakes = outbox(root);
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].wake, 'checks-settled');
+});
+
+test('fleet#34: a gate failure at a re-readied head wakes checks-failed instead of sitting silent in review', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  const red = [check('g1', 'COMPLETED', 'FAILURE'), check('g2', 'COMPLETED', 'SUCCESS')];
+  watch(root, fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: red })], viewResult: view({ headRefOid: 'def456', body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'ci-wait');
+  const wakes = outbox(root);
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].wake, 'checks-failed');
+});
+
 test('an implementing record discovers its PR by branch prefix and moves to pr-open', () => {
   const root = rootDir();
   seed(root, { state: 'implementing', prNumber: null });

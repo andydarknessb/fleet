@@ -82,3 +82,33 @@ retry as a record.
 Not chosen: hashing the PR body into the key. It would make the key depend on
 data the tool does not otherwise read, and a retry after any body edit would
 silently become a second review with no prior link.
+
+## 4. A re-readied PR re-enters ci-wait (fleet#34)
+
+Section 1's guard held on the first round only. A lead that sends a PR back
+to its IC leaves the Work record in `review`; when the IC pushes fixes and
+re-readies the PR the head moves and every gate goes pending, but the watcher
+took the change-within-review branch and recorded an observe with no wake.
+The only producer of `checks-settled` is the `ci-wait -> review` transition,
+and the record could never re-enter `ci-wait`, so an open, non-draft, fully
+green PR sat with nobody woken (endzone PR #1258, 2026-09-11, rev 15: state
+`review` while its own observation reported six pending gates). Worse,
+`record --kind formal` could not refuse a review of pending gates, because
+the state field said `review`.
+
+Now a head SHA observed while in `review` that differs from the record's last
+observed head walks the store's own path back to `ci-wait` (`revision`,
+`pr-open`, `ci-wait`), which is also the truth of what happened: the lead
+returned it, the IC re-opened it, CI is waiting. That restores the existing
+transition, its `checks-settled` wake, and the section 1 guard in one stroke,
+so the stale-review-with-pending-gates condition stops existing rather than
+being worked around. Gates already green at the new head take the last hop
+to `review` in the same tick with the wake, so no wake is a tick late; a red
+gate at the new head wakes `checks-failed` from `ci-wait` as any first round
+would. `hold` is untouched: a held PR is parked for Cory's merge, not being
+reworked, and a head change there remains an observe.
+
+Not chosen: emitting `checks-settled` from the change-within-review branch
+when the evaluation flips settled at a new head. It would wake the lead but
+leave the state field saying `review` over pending gates, and the guard in
+section 1 would still be absent on every round after the first.

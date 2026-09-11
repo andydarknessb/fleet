@@ -135,7 +135,7 @@ try {
   # Case 8: a manifest reserved by the planner launches through the door under the flag (dry run),
   # and the manifest carries the tenant's checks and CI gates as pointers.
   $fixture = "$testRoot\issues.json"
-  Write-Utf8 $fixture '[{"number":101,"title":"Fixture issue","url":"https://github.com/owner/repo/issues/101","body":"criteria","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Write-Utf8 $fixture '[{"number":101,"title":"Fixture issue","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
   $r8 = Run-Node @("$testRoot\bin\assignment.js", 'assign', '--root', $testRoot, '--tenant', 'test', '--tenant-config', "$testRoot\tenants\test.json", '--fixture', $fixture, '--base-sha', ('a' * 40), '--parent', 'pl-test', '--model', 'sonnet', '--adr-paths', 'docs/adr/0002-one-launch-door.md')
   Assert-True ($lastExit -eq 0 -and $r8.manifestPath) "assign must reserve a manifest: $lastOut"
   $manifest = (Get-Content $r8.manifestPath -Raw) | ConvertFrom-Json

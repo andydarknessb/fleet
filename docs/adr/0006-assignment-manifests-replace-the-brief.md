@@ -296,3 +296,50 @@ to demand a cadence the lead does not have. `parityHours: 0` disables the time
 requirement (fixtures). On the live ledger the window immediately became 71
 evaluations spanning 47.52 h over 11 distinct frontiers, so only real
 differences gate now.
+
+## Reservation-polarity amendment (2026-09-11, fleet#32 and fleet#33)
+
+A path is reserved for the polarity of the sentence that names it. The
+derivation used to reserve every path the criteria mentioned, so a criterion
+of the form "lists no file under `server/db/migrations/`" reserved the
+directory and collided the ticket with the directory's real owner (endzone
+#1242 against #1233, a frontier that sat empty with a free IC slot). The
+planner reports such a conflict with a real owner, so the exclusion looked
+legitimate and the only way out was a ruling to reword an approved criterion.
+
+Now, per sentence (a line, split again at `. `, `; `, `! ` and `? `):
+
+1. An allowlist sentence ("lists exactly A and B", "touches only A") is the
+   whole reservation; nothing named outside it is reserved. This is the shape
+   Cory's #1242 reword produced and it is strictly more precise than any
+   prohibition, so it is the recommended way to write criterion-level scope.
+2. A sentence carrying a negation (no, not, never, nothing, without,
+   unchanged, unedited, out of scope, carve-out, stays outside, does not,
+   must not, and the contractions) reserves nothing. A section headed "Out of
+   scope" or "Non-goals" is negated throughout. A path also named in a
+   positive sentence is still reserved from that sentence.
+3. A path under `docs/` is a citation unless its sentence carries an edit
+   verb; criteria cite ADRs far more often than they change them.
+4. A line-numbered path introduced by a copula ("`LOCK` is
+   `server/modules/advisoryLock.js:53`") in a sentence with no edit verb is a
+   premise citation, not a surface.
+
+Measured against the five instances fleet#32 named, every prohibition-sourced
+reservation is gone and every edited path is still reserved. Two residuals
+are known and accepted: a lead premise that names a path first
+("`scripts/run-pg-tests.js:82` picks up every pg test") still reserves it,
+and a file cited only as "the existing test is `path:172`" is not reserved
+even when the ticket goes on to edit it. The allowlist criterion is the
+precise tool for both.
+
+The opposite failure is refused at assign time. Endzone #1234's six criteria
+named seams and fixtures in prose and no path, so the derivation produced an
+empty set, the record carried no reservation, and the next third assignment
+failed closed on `missingReservations` with the cause invisible. An
+assignment that ends with no reservation evidence is a derivation failure
+far more often than a file-less ticket, so `assign` now refuses it
+(`EMPTY_RESERVATIONS`, no manifest written, no record reserved) and the lead
+answers with `--reservations '{"components":[...],"testResources":[...]}'`,
+the Work record's own shape; an unknown field is a usage error. An explicit
+set replaces the derived one entirely, is pinned in the manifest like any
+other, and is subject to the same conflict check and third-assignment proof.

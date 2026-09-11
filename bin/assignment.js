@@ -42,22 +42,66 @@ function criteriaHash(issue) {
   return sha256(parts.join('\u0000'));
 }
 
+// fleet#32: a path is reserved for the polarity of the sentence that names it. A
+// criterion of the form "lists no file under `server/db/migrations/`" forbids the
+// path; reserving it collided the ticket with the directory's real owner. Three
+// rules, applied per sentence (a line, split again at `. `, `; `, `! ` and `? `):
+//   1. An allowlist sentence ("lists exactly A and B", "touches only A") is the
+//      whole reservation: nothing outside it is reserved.
+//   2. A sentence carrying a negation reserves nothing. A path also named in a
+//      positive sentence is still reserved from that sentence.
+//   3. Paths under `docs/` are citations unless the sentence carries an edit verb;
+//      criteria cite ADRs far more often than they change them.
+//   4. A line-numbered path introduced by a copula ("`LOCK` is `server/modules/
+//      advisoryLock.js:53`") in a sentence with no edit verb is a premise citation.
+// Sections headed "Out of scope" (or "Non-goals") count as negated throughout. A
+// path one sentence only cites is still reserved from any sentence that edits it.
+const COPULA_BEFORE_PATH = /\b(?:is|are|was|were)\b(?:\s+(?:now|still|already))?(?:\s+`[^`]{1,40}`)?(?:\s+(?:at|in|on))?\s+`?$/i;
+const NEGATION = /(?:\b(?:no|not|never|nothing|none|nor|neither|without|unchanged|untouched|unedited|forbidden|prohibited|cannot|can't|won't|don't|doesn't|isn't|aren't|mustn't|shouldn't)\b|\bcarve-outs?\b|\bout of scope\b|\bstays? (?:outside|as is|untouched)\b|\bdoes not\b|\bdo not\b|\bmust not\b|\bshould not\b|\bwill not\b)/i;
+const ALLOWLIST = /\b(?:lists?|touch(?:es)?|edits?|changes?|modif(?:y|ies)|writes?)\s+(?:exactly|only)\b|\bexactly\s+(?:these|the following)\s+files?\b|\bonly\s+(?:these|the following)\s+files?\b/i;
+const EDIT_VERB = /\b(?:add|adds|added|amend|amends|amended|append|appends|appended|write|writes|written|edit|edits|edited|update|updates|updated|change|changes|changed|create|creates|created|rewrite|rewrites|rewritten|extend|extends|extended|revise|revises|revised|own|owns|touch|touches|move|moves|delete|deletes|remove|removes|rename|renames|new)\b/i;
+const NEGATED_HEADING = /^\s{0,3}#{1,6}\s+.*\b(?:out of scope|non-goals?|not in scope|do not touch|must not touch)\b|^\s*\*\*(?:out of scope|non-goals?)\.?\*\*/i;
+
+function criteriaSentences(text) {
+  const sentences = [];
+  let negatedSection = false;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (/^\s{0,3}#{1,6}\s/.test(line) || /^\s*\*\*[^*]+\*\*/.test(line)) negatedSection = NEGATED_HEADING.test(line);
+    for (const sentence of line.split(/(?<=[.;!?])\s+(?=\S)/)) {
+      if (sentence.trim()) sentences.push({ text: sentence, negated: negatedSection || NEGATION.test(sentence), allowlist: ALLOWLIST.test(sentence), edit: EDIT_VERB.test(sentence) });
+    }
+  }
+  return sentences;
+}
+
 function derivedReservations(issue) {
   const reservations = Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, []]));
   const text = [issue.body, ...normalizeComments(issue.comments).map((comment) => comment.body)].filter(Boolean).join('\n');
   const pathPattern = /(?:\.github|src|server|docs|bin|hooks|tests|config|tenants|state|scripts|entities|features|widgets|pages|shared)[\\/][A-Za-z0-9_.\-/*{}\[\]\\]+/gi;
-  for (const match of text.matchAll(pathPattern)) {
-    const rawValue = match[0].replaceAll('\\', '/').replace(/[.,;:!?]+$/, '');
-    const value = /^(?:entities|features|widgets|pages|shared)\//i.test(rawValue) ? `src/${rawValue}` : rawValue;
-    if (/^state\/reviews\//i.test(value)) continue;
-    const migration = value.match(/^server\/db\/migrations\/(\d+)/i);
-    if (migration) reservations.migrationPrefixes.push(migration[1]);
-    else if (/(?:^|\/)(?:tests?\/|[^/]*\.tests?\.)/i.test(value)) reservations.testResources.push(value);
-    else reservations.components.push(value);
+  const sentences = criteriaSentences(text);
+  const allowlists = sentences.filter((sentence) => sentence.allowlist && !sentence.negated);
+  const sources = allowlists.length ? allowlists : sentences.filter((sentence) => !sentence.negated);
+  for (const sentence of sources) {
+    for (const match of sentence.text.matchAll(pathPattern)) {
+      const rawValue = match[0].replaceAll('\\', '/').replace(/[.,;:!?]+$/, '');
+      const value = /^(?:entities|features|widgets|pages|shared)\//i.test(rawValue) ? `src/${rawValue}` : rawValue;
+      if (/^state\/reviews\//i.test(value)) continue;
+      if (/^docs\//i.test(value) && !sentence.edit && !sentence.allowlist) continue;
+      const after = sentence.text.slice(match.index + match[0].length, match.index + match[0].length + 24);
+      const lineCited = /^:\d/.test(after);
+      const copula = COPULA_BEFORE_PATH.test(sentence.text.slice(Math.max(0, match.index - 64), match.index)) || /^:\d+(?:-\d+)?`?\s+(?:is|are|was|were)\b/i.test(after);
+      if (lineCited && copula && !sentence.edit && !sentence.allowlist) continue;
+      const migration = value.match(/^server\/db\/migrations\/(\d+)/i);
+      if (migration) reservations.migrationPrefixes.push(migration[1]);
+      else if (/(?:^|\/)(?:tests?\/|[^/]*\.tests?\.)/i.test(value)) reservations.testResources.push(value);
+      else reservations.components.push(value);
+    }
   }
   const tablePatterns = [/(?:the\s+)?`([A-Za-z_][A-Za-z0-9_]*)`\s+table\b/gi, /\btable\s+`([A-Za-z_][A-Za-z0-9_]*)`/gi];
   for (const pattern of tablePatterns) {
-    for (const match of text.matchAll(pattern)) reservations.schemaAreas.push(match[1]);
+    for (const sentence of sources) {
+      for (const match of sentence.text.matchAll(pattern)) reservations.schemaAreas.push(match[1]);
+    }
   }
   return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set(reservations[field])].sort()]));
 }
@@ -334,11 +378,31 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
   };
 }
 
-function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, actor = 'assignment-planner', runner } = {}) {
+// fleet#33: lead-supplied reservations replace the derived set. The shape is the
+// Work record's own (components, migrationPrefixes, schemaAreas, testResources);
+// an unknown field is a usage error, not a silently dropped one.
+function explicitReservations(value) {
+  if (value === undefined || value === null) return undefined;
+  const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new WorkStateError('USAGE', `--reservations must be a JSON object with the fields ${RESERVATION_FIELDS.join(', ')}`);
+  const unknown = Object.keys(parsed).filter((field) => !RESERVATION_FIELDS.includes(field));
+  if (unknown.length) throw new WorkStateError('USAGE', `--reservations has unknown field(s) ${unknown.join(', ')}; accepted: ${RESERVATION_FIELDS.join(', ')}`);
+  return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((parsed[field] || []).map(String))].sort()]));
+}
+
+function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, now, actor = 'assignment-planner', runner } = {}) {
   const proofRecords = hydrateActiveReservations(active, issues);
-  const frontier = selectFrontier({ issues: [issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
+  const explicit = explicitReservations(reservations);
+  const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
+  // fleet#33: an assignment with no reservation at all is a derivation failure far
+  // more often than a file-less ticket, and it is invisible until the next third
+  // assignment fails closed on `missingReservations`. Refuse it here, where the
+  // lead can answer with the surface the criteria describe.
+  if (!hasReservationEvidence(normalized.reservations)) {
+    throw new WorkStateError('EMPTY_RESERVATIONS', `issue #${normalized.number} derives no reservation from its criteria${explicit ? ' and the explicit set is empty' : ''}; pass --reservations '{"components":[...],"testResources":[...]}' naming the seams the ticket edits`, { issue: normalized.number, criteriaHash: normalized.criteriaHash, reservations: normalized.reservations });
+  }
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
   const workRecordId = `${tenant}:issue-${normalized.number}`;
   const baseline = reservationBaseline({ root, id: workRecordId });
@@ -447,7 +511,7 @@ const FLAGS = Object.freeze({
   proof: [...FRONTIER_FLAGS, 'issue'],
   assign: [
     ...FRONTIER_FLAGS, 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'risk', 'token-budget',
-    'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof',
+    'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof', 'reservations',
   ],
   validate: ['manifest', 'issue', 'base-sha'],
   launch: ['root', 'manifest', 'work-record-id', 'launch-script', 'repo-path', 'github-repo', 'dry-run'],
@@ -483,6 +547,7 @@ function cli(argv) {
   // parseArgs throws work-state's error class, which is also this binary's, so
   // a USAGE built there and one built here are the same to every caller.
   const args = parseArgs(rest, FLAGS[command]);
+  if (command === 'assign' && args.reservations === 'true') throw new WorkStateError('USAGE', '--reservations needs a JSON object value (fleet#33)');
   if (command === 'frontier') {
     const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
     const readyLabel = args['ready-label'] || config.readyLabel || 'ready-for-agent';
@@ -524,7 +589,7 @@ function cli(argv) {
     for (const key of ['test-plan', 'ci-gates', 'context-headings', 'adr-paths']) { if (args[key] === 'true') throw new WorkStateError('USAGE', `--${key} needs a comma-separated value`); }
     const testPlan = given('test-plan') ? list('test-plan') : Object.entries(config.checks || {}).map(([name, command]) => `${name}: ${command}`);
     const ciGates = given('ci-gates') ? list('ci-gates') : [...(config.ciGates || [])];
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, now: args.now });
+    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });
@@ -553,6 +618,7 @@ module.exports = {
   buildLaunchPlan,
   cli,
   criteriaHash,
+  criteriaSentences,
   derivedReservations,
   hydrateActiveReservations,
   invalidateManifest,
@@ -563,6 +629,7 @@ module.exports = {
   readTenantConfig,
   queryGithubIssues,
   resolveRemoteBase,
+  explicitReservations,
   reserveAssignment,
   selectFrontier,
   sha256,
