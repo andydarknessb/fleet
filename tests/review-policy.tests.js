@@ -531,10 +531,10 @@ test('state/flags/review-dedup-off records a second formal review at the same he
       root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
       kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
-      idempotencyKey: 'formal-c', now: '2026-09-09T02:02:00.000Z', priorArtifact: second.artifact,
+      idempotencyKey: 'formal-c', now: '2026-09-09T02:02:00.000Z',
     }),
     (error) => error instanceof ReviewPolicyError && error.code === 'ALREADY_REVIEWED',
-    'the flag removed, deduplication is back',
+    'the flag removed, deduplication is back (an unlinked same-head pass; a linked one is a re-review, fleet#19)',
   );
 });
 
@@ -917,4 +917,164 @@ test('a duplicate finding id is refused before any artifact file exists', () => 
   );
   const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
   assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'no 0-byte orphan artifact');
+});
+
+// --- fleet#19: a body-only revision can be re-recorded at an unchanged head ---
+// The replay key was kind:record:head, so a second formal pass at the same
+// head always replayed the first, exit 0, discarding the findings and the
+// resolutions it was given. A PR body changes without a commit (measurement
+// claims, the risk-artifact pointer, the squash commit message), so a formal
+// re-review that links its prior artifact is a new review even at the same
+// head (ADR 0009, ruling 3); a retry of that same re-review still replays,
+// and any replay says what it did not write.
+
+test('a linked formal re-review at an unchanged head records a new artifact, resolving the prior findings', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [{ file: 'PR body', claim: 'asserts a command result that is false', severity: 'blocker' }],
+    now: '2026-09-10T19:00:00.000Z',
+  });
+  // The prior link must name the recorded artifact, and every open finding needs a resolution.
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [],
+      priorArtifact: 'state/reviews/endzone_issue-42/formal-009.json', resolutions: { 'formal-001-f1': 'resolved' },
+      noFindings: 'body corrected', now: '2026-09-10T19:30:00.000Z',
+    }),
+    (error) => error.code === 'REREVIEW_REQUIRES_PRIOR',
+  );
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [],
+      priorArtifact: first.artifact, noFindings: 'body corrected', now: '2026-09-10T19:30:00.000Z',
+    }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED',
+  );
+  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: 'f91ba70' });
+  assert.equal(plan.range, 'f91ba70..f91ba70');
+  assert.deepEqual(plan.unresolved.map((finding) => finding.id), ['formal-001-f1']);
+
+  const second = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+    kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [],
+    priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
+    noFindings: 'PR body now states the measured result; nothing else changed at f91ba70.',
+    now: '2026-09-10T19:31:00.000Z',
+  });
+  assert.equal(second.result.replayed, false, 'a linked re-review at the same head is a new review, not a replay');
+  assert.notEqual(second.artifact, first.artifact);
+  const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
+  assert.equal(stored.priorArtifact, first.artifact);
+  assert.equal(stored.range, 'f91ba70..f91ba70');
+  assert.equal(stored.sameHead, true);
+  assert.deepEqual(stored.resolutions, { 'formal-001-f1': 'resolved' });
+  assert.deepEqual(stored.findings, []);
+  assert.equal(second.result.record.review.formal.artifact, second.artifact);
+  assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: 'f91ba70' }).unresolved, []);
+
+  // A linked third pass at the same head has nothing open to resolve: it is not a re-review.
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
+      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'still clean',
+      priorArtifact: second.artifact, idempotencyKey: 'formal-3-linked', now: '2026-09-10T19:32:30.000Z',
+    }),
+    (error) => error.code === 'ALREADY_REVIEWED' && /nothing open to resolve/.test(error.message),
+  );
+  assert.equal(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')).length, 2, 'no same-head pileup');
+
+  // A retry of the same re-review replays it; an unlinked third pass is still refused.
+  const retry = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42',
+    kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [],
+    priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
+    noFindings: 'PR body now states the measured result; nothing else changed at f91ba70.',
+    now: '2026-09-10T19:32:00.000Z',
+  });
+  assert.equal(retry.result.replayed, true);
+  assert.equal(retry.artifact, second.artifact);
+  assert.equal(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')).length, 2);
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
+      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'again',
+      idempotencyKey: 'formal-3-unlinked', now: '2026-09-10T19:33:00.000Z',
+    }),
+    (error) => error.code === 'ALREADY_REVIEWED',
+  );
+});
+
+test('a risk review at the same head is still exactly one review: the link is a formal-only door', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const classification = { tier: 'high-risk', triggers: [{ class: 'concurrency', matches: [{ pattern: 'FOR UPDATE', file: 'server/x.js', line: 'FOR UPDATE' }] }] };
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'risk', headSha: 'ddd4444', actor: 'ic-42', classification,
+    findings: [{ file: 'server/x.js', claim: 'lock order', severity: 'should-fix' }], now: '2026-09-10T19:00:00.000Z',
+  });
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+      kind: 'risk', headSha: 'ddd4444', actor: 'ic-42', classification,
+      findings: [], noFindings: 'fixed', priorArtifact: first.artifact, resolutions: { 'risk-001-f1': 'resolved' },
+      idempotencyKey: 'risk-2-linked', now: '2026-09-10T19:01:00.000Z',
+    }),
+    (error) => error.code === 'ALREADY_REVIEWED',
+  );
+});
+
+test('a replay says what it did not write: the result names the ignored findings and resolutions', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const args = {
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit' }],
+    now: '2026-09-01T02:00:00.000Z',
+  };
+  const first = recordReviewArtifact(args);
+  assert.equal(first.ignored, undefined);
+  const retry = recordReviewArtifact({
+    ...args,
+    findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit' }, { file: 'src/b.js', claim: 'y', severity: 'nit' }],
+    resolutions: { 'formal-001-f1': 'resolved' },
+  });
+  assert.equal(retry.result.replayed, true);
+  assert.deepEqual(retry.ignored, { findings: 2, resolutions: 1 });
+  assert.equal(retry.artifact, first.artifact);
+});
+
+test('record cli: a replay exits 0 with the JSON answer on stdout and the not-written warning on stderr', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const argv = [
+    bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
+    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead',
+    '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]',
+  ];
+  const first = spawnSync(process.execPath, argv, { encoding: 'utf8', windowsHide: true });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(first.stderr, '');
+  const retry = spawnSync(process.execPath, argv, { encoding: 'utf8', windowsHide: true });
+  assert.equal(retry.status, 0, retry.stderr);
+  const answer = JSON.parse(retry.stdout);
+  assert.equal(answer.result.replayed, true);
+  assert.deepEqual(answer.ignored, { findings: 1, resolutions: 0 });
+  assert.match(retry.stderr, /NOT written/);
+  assert.match(retry.stderr, /--prior-artifact/);
 });

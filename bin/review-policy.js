@@ -295,7 +295,13 @@ function recordReviewArtifact(options = {}) {
   // second pass at the same head replay the first, so under the flag the default key
   // carries the moment too, and a same-head formal pass is not held to the re-review link.
   const dedupOff = fs.existsSync(path.join(root, 'state', 'flags', 'review-dedup-off'));
-  const key = options.idempotencyKey || `${kind}:${recordId}:${headSha}${dedupOff ? `:${new Date(options.now || Date.now()).toISOString()}` : ''}`;
+  // fleet#19: the replay key identifies the review, not the head. A formal
+  // re-review that links its prior artifact is a new review even at an
+  // unchanged head (a body-only revision: the PR body carries the measurement
+  // claims and becomes the squash commit message), so the link is part of the
+  // key; a retry of that same re-review still replays (ADR 0009, ruling 3).
+  const linkedRereview = kind === 'formal' && typeof options.priorArtifact === 'string' && options.priorArtifact.length > 0;
+  const key = options.idempotencyKey || `${kind}:${recordId}:${headSha}${linkedRereview ? `:rereview:${options.priorArtifact}` : ''}${dedupOff ? `:${new Date(options.now || Date.now()).toISOString()}` : ''}`;
   const pinnedRevision = options.expectedRevision !== undefined && Number.isInteger(Number(options.expectedRevision))
     ? Number(options.expectedRevision) : null;
 
@@ -308,14 +314,18 @@ function recordReviewArtifact(options = {}) {
       if (record.idempotency?.[key]) {
         if (written) fs.rmSync(written.file, { force: true });
         const artifact = record.review?.[kind]?.artifact || null;
+        // A replay writes nothing: say so, with what it did not write, so a
+        // caller reading a formatted summary cannot take it for a record (fleet#19).
+        const ignored = { findings: (options.findings || []).length, resolutions: Object.keys(options.resolutions || {}).length };
         return {
           artifact,
+          ...(ignored.findings || ignored.resolutions ? { ignored } : {}),
           result: { replayed: true, revision: record.idempotency[key].revision, eventSequence: record.idempotency[key].eventSequence, record },
         };
       }
 
       const prior = record.review?.[kind] || null;
-      if (prior && prior.headSha === String(headSha) && !dedupOff) {
+      if (prior && prior.headSha === String(headSha) && !dedupOff && !linkedRereview) {
         throw new ReviewPolicyError('ALREADY_REVIEWED', `a ${kind} review is already recorded for ${recordId} at ${headSha}`, { artifact: prior.artifact });
       }
       if (kind === 'risk' && !(classification.triggers || []).length) {
@@ -333,6 +343,13 @@ function recordReviewArtifact(options = {}) {
         }
         priorArtifactData = readArtifact(root, prior.artifact);
         range = `${prior.headSha}..${headSha}`;
+        // fleet#19: a re-review at an unchanged head exists to resolve prior
+        // findings. With nothing open (or no readable prior) there is nothing
+        // to re-review at this head, and a linked chain of clean same-head
+        // artifacts would only look like N reviews; that is one review.
+        if (prior.headSha === String(headSha) && (priorArtifactData === null || !openFindings(priorArtifactData).length)) {
+          throw new ReviewPolicyError('ALREADY_REVIEWED', `a formal review is already recorded for ${recordId} at ${headSha} and ${prior.artifact} has nothing open to resolve; a re-review at an unchanged head needs an open prior finding`, { artifact: prior.artifact });
+        }
         if (priorArtifactData === null) {
           // The referenced file is gone (crash, hand cleanup, pruned tree):
           // degrade honestly instead of wedging the record forever.
@@ -382,6 +399,9 @@ function recordReviewArtifact(options = {}) {
           kind,
           headSha: String(headSha),
           range,
+          // Descriptive only: under review-dedup-off a same-head pass skips the
+          // linked re-review checks, so sameHead does not imply resolutions ran.
+          sameHead: prior && prior.headSha === String(headSha) ? true : undefined,
           tier: classification.tier || null,
           triggers: classification.triggers || [],
           reviewer: actor || 'unknown',
@@ -617,7 +637,12 @@ function cli(argv) {
 
 if (require.main === module) {
   try {
-    process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
+    const answer = cli(process.argv.slice(2));
+    if (answer && answer.ignored) {
+      // Loud on stderr, exit 0: the call was a retry and nothing was written.
+      process.stderr.write(`replayed: ${answer.ignored.findings} finding(s) and ${answer.ignored.resolutions} resolution(s) supplied were NOT written; the recorded artifact ${answer.artifact} stands (a re-review at the same head links --prior-artifact; fleet#19)\n`);
+    }
+    process.stdout.write(`${JSON.stringify(answer)}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
     // A refused invocation exits 2 so a caller reading only the status cannot

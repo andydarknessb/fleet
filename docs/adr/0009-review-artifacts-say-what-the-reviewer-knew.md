@@ -54,3 +54,31 @@ records what was looked at.
 The alternative, a single `info`-severity finding standing in for "nothing",
 was rejected: it would make `openFindings` count a non-finding as open and
 force the next re-review to resolve it.
+
+## 3. The replay key identifies the review, not the head (fleet#19)
+
+The default idempotency key was `kind:record:head`, which encoded the
+assumption that a revision worth re-reviewing always moves the head SHA. A
+PR body is part of what the lead reviews (measurement claims, the risk
+artifact pointer, and under squash-merge the permanent commit message) and it
+changes without a commit. A formal re-review that links its prior artifact
+(`--prior-artifact`) is therefore a new review even at an unchanged head:
+the link joins the key (`formal:record:head:rereview:<prior>`), the
+`ALREADY_REVIEWED` guard yields to the re-review path, and that path's own
+preconditions still bind (the link must name the recorded prior, every open
+prior finding needs a resolution). A retry of that same re-review still
+replays. The artifact marks `sameHead: true` and its `range` is honest
+(`X..X`). An unlinked second pass at the same head is still refused, and a
+risk review at the same head is still one review. A linked pass at the same
+head whose prior has nothing open (or no readable prior) is refused too: a
+re-review at an unchanged head exists to resolve prior findings, so once the
+chain is clean at a head it is one review at that head, never a pileup.
+
+A replay says what it did not write: the result carries `ignored:
+{findings, resolutions}` when the caller supplied either, and the CLI prints
+that on stderr while still exiting 0, so a formatted summary cannot present a
+retry as a record.
+
+Not chosen: hashing the PR body into the key. It would make the key depend on
+data the tool does not otherwise read, and a retry after any body edit would
+silently become a second review with no prior link.
