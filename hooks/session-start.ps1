@@ -14,6 +14,11 @@ $home_ = $env:FLEET_HOME; if (-not $home_) { exit 0 }
 $name = $env:FLEET_NAME; $role = $env:FLEET_ROLE; $tenant = $env:FLEET_TENANT; $parent = $env:FLEET_PARENT
 if (-not $name) { exit 0 }
 $legacy = Test-Path "$home_\state\flags\legacy-notice"
+# Commands printed into context are pasted into the Bash tool (Git Bash), where an unquoted
+# backslash path collapses to C:UsersCory... and node fails MODULE_NOT_FOUND. Print them with
+# forward slashes; node and PowerShell both accept them. (Every IC since the cutover lost its
+# first turn to this, 2026-09-11.)
+$homeFwd = $home_ -replace '\\', '/'
 
 $script:activeWork = $null
 function Get-ActiveWork {
@@ -88,8 +93,8 @@ if ($env:FLEET_ASSIGNMENT_MANIFEST -and $env:FLEET_WORK_RECORD_ID) {
     $ackRecord = $activeWork.records.PSObject.Properties[$env:FLEET_WORK_RECORD_ID]
     if ($ackRecord) { $ackRevision = [int]$ackRecord.Value.revision }
   } catch {}
-  $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $home_ + '\bin\work-state.js get --root ' + $home_ + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
-  Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $home_\bin\assignment.js ack --root $home_ --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
+  $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $homeFwd + '/bin/work-state.js get --root ' + $homeFwd + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
+  Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $homeFwd/bin/assignment.js ack --root $homeFwd --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
 }
 # The handoff goes only to the session the rotation itself launched: the intent's
 # newSessionId must match this session's id, so a later respawn or manual launch of
@@ -99,7 +104,7 @@ try { $rotation = Get-Content "$home_\state\rotation\$name.json" -Raw -Encoding 
 if ($rotation -and "$($rotation.phase)" -eq 'launched' -and $hookSessionId -and "$($rotation.newSessionId)" -eq "$hookSessionId") {
   $why = (@($rotation.reasons) -join '; ')
   $reconciledAt = if ($rotation.reconcile) { $rotation.reconcile.at } else { 'not run; the scheduled pr-watch tick covers it' }
-  Write-Output "ROTATION: you replace a predecessor rotated at $($rotation.savedAt) ($why). Its transcript is gone by design; reconstruct from canonical state only - Work records (node $home_\bin\work-state.js get/project), state/status/, the roster, and the skip file. Active records were reconciled against GitHub at: $reconciledAt. Event offset at rotation: $($rotation.offset.totalEvents) events. Re-read live GitHub state before your first action."
+  Write-Output "ROTATION: you replace a predecessor rotated at $($rotation.savedAt) ($why). Its transcript is gone by design; reconstruct from canonical state only - Work records (node $homeFwd/bin/work-state.js get/project), state/status/, the roster, and the skip file. Active records were reconciled against GitHub at: $reconciledAt. Event offset at rotation: $($rotation.offset.totalEvents) events. Re-read live GitHub state before your first action."
 }
 if ($legacy -and (Test-Path "$home_\state\NOTICE.md")) {
   Write-Output "--- NOTICE from Cory (state/NOTICE.md; LEGACY PATH restored by state/flags/legacy-notice) ---"

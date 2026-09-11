@@ -90,6 +90,18 @@ try {
   $env:FLEET_NAME = 'ic-101'; $env:FLEET_ROLE = 'ic'; $env:FLEET_ISSUE = '101'; $env:FLEET_ASSIGNMENT_MANIFEST = "$testRoot\state\manifests-x.json"; $env:FLEET_WORK_RECORD_ID = 'test:issue-101'; $env:FLEET_BASE_SHA = ('a' * 40); $env:FLEET_ASSIGNMENT_BRANCH = 'fleet/101-fixture'
   $start = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\session-start.ps1" 2>&1 | Out-String)
   Assert-True ($start -match 'Assignment manifest:' -and $start -match 'assignment\.js ack --root' -and $start -match '--expected-revision 3') "the session-start hook must print the acknowledgment with revision 3: $start"
+  # Regression (2026-09-11): ICs paste the printed command into the Bash tool (Git Bash), where an
+  # unquoted backslash path collapses to C:UsersCory... and node fails with MODULE_NOT_FOUND. The
+  # printed command must survive the shell it is pasted into: run it through bash against a stub.
+  $ackCmd = ([regex]::Match($start, 'acknowledge it: (node \S+assignment\.js ack[^\r\n]*)')).Groups[1].Value
+  Assert-True ([bool]$ackCmd) "the ack command must be extractable from the session-start line: $start"
+  Assert-True ($ackCmd -notmatch '\\') "the ack command must not carry backslashes (they are eaten by the Bash tool): $ackCmd"
+  Write-Utf8 "$testRoot\bin\assignment.js" 'console.log("ACK-STUB " + process.argv.slice(2).join(" "))'
+  $bashExe = (Get-Command bash -ErrorAction SilentlyContinue).Source
+  if ($bashExe) {
+    $viaBash = (& $bashExe -c $ackCmd 2>&1 | Out-String)
+    Assert-True ($viaBash -match 'ACK-STUB ack --root') "the ack command must run unchanged through bash: $viaBash"
+  }
 
   Write-Output 'stop hook assignment tests passed'
 } finally {

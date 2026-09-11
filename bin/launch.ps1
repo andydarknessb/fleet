@@ -35,7 +35,11 @@ if ($Manifest) {
   $Model = [string]$assignment.model
   # A slash command at the head of a launch prompt is a user invocation in the new
   # session, so the IC runs the real /implement (the same convention as a legacy brief).
-  $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest and the GitHub issue body and comments. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $FleetHome\bin\assignment.js ack), then follow the manifest pointers without restating the issue criteria."
+  # Forward slashes on purpose: the IC pastes this into the Bash tool (Git Bash), where an unquoted
+  # backslash path collapses to C:UsersCory... (every IC since the cutover lost its first turn to
+  # MODULE_NOT_FOUND and retried through PowerShell). node accepts either separator on Windows.
+  $fleetHomeFwd = $FleetHome -replace '\\', '/'
+  $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest and the GitHub issue body and comments. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $fleetHomeFwd/bin/assignment.js ack), then follow the manifest pointers without restating the issue criteria."
   $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $tenantConfig) { Write-Error "no tenant file for '$Tenant'"; exit 4 }
   $cwd = $tenantConfig.repo
@@ -291,7 +295,7 @@ if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-o
 }
 
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; effort = $effort; cwd = $cwd; settings = $settingsPath; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
+  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
   exit 0
 }
 
