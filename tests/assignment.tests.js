@@ -4,8 +4,12 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
+const { spawnSync } = require('node:child_process');
+
 const {
+  FLAGS,
   acknowledgeAssignment,
+  cli,
   buildManifest,
   buildLaunchPlan,
   independenceProof,
@@ -19,7 +23,7 @@ const {
   sha256,
   validateManifest,
 } = require('../bin/assignment');
-const { getRecord, reserveRecord } = require('../bin/work-state');
+const { WorkStateError, getRecord, reserveRecord } = require('../bin/work-state');
 
 function rootDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-assignment-'));
@@ -344,4 +348,114 @@ test('assignment refuses an IC model outside haiku/sonnet and defaults to sonnet
   const defaulted = reserveAssignment({ root: rootDir(), issue: issue(72), tenant: 'endzone', readyLabel: 'ready-for-agent', base });
   assert.equal(defaulted.manifest.model, 'sonnet');
   assert.equal(reserveAssignment({ root: rootDir(), issue: issue(73), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'Sonnet' }).manifest.model, 'sonnet', 'case is not a distinction');
+});
+
+// --- fleet#4: assignment.js adopts the parseArgs flag schema -----------------
+// Before this, `cli()` used its own permissive parser: a typo'd flag fell into a
+// bucket nothing read and the command answered as if it had not been given.
+// `assign --base <sha>` reserved from the remote as if no base were pinned,
+// `launch --repo owner/name` launched with no GitHub repo, `ack --revision 3`
+// acknowledged with expectedRevision NaN. This binary shares the confusable
+// names with review-policy.js classify (`--repo` here is the GitHub owner/name,
+// `--repo-path` the checkout, `--tenant-config` the tenant file), which is why
+// it went last (ruling 1). Every case below goes through `cli`, the door the
+// lead's role file and the hooks use.
+//
+// Red-tell: with bin/assignment.js stashed back to its own parseArgs and no
+// FLAGS, every USAGE case below fails (the typo resolves to undefined instead
+// of throwing) and `require('../bin/assignment')` exports neither cli nor FLAGS.
+
+function usageError(argv, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof WorkStateError, `expected WorkStateError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('cli: every command declares its accepted flags, and an unknown command is a usage error', () => {
+  assert.deepEqual(Object.keys(FLAGS).sort(), ['ack', 'assign', 'frontier', 'launch', 'proof', 'validate']);
+  usageError(['reserve', '--root', rootDir()], /unknown command 'reserve'/);
+  usageError([], /unknown command/);
+});
+
+test('cli: frontier refuses --repo-path (the checkout) where --repo (owner/name) is meant', () => {
+  usageError(['frontier', '--root', rootDir(), '--tenant', 'endzone', '--repo-path', 'E:/Endzone-Empire'], /unknown flag --repo-path/);
+});
+
+test('cli: frontier refuses --tenant-file for --tenant-config, naming the accepted set', () => {
+  assert.throws(() => cli(['frontier', '--root', rootDir(), '--tenant-file', 'x.json']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.equal(error.flag, 'tenant-file');
+    assert.deepEqual(error.accepted, FLAGS.frontier);
+    assert.match(error.message, /--tenant-config/);
+    return true;
+  });
+});
+
+test('cli: assign refuses --base for --base-sha instead of reserving from the remote as if unpinned', () => {
+  usageError(['assign', '--root', rootDir(), '--tenant', 'endzone', '--base', 'a'.repeat(40)], /unknown flag --base/);
+});
+
+test('cli: assign refuses --proof for --independence-proof and the singular list names', () => {
+  const root = rootDir();
+  usageError(['assign', '--root', root, '--tenant', 'endzone', '--proof', '{}'], /unknown flag --proof/);
+  usageError(['assign', '--root', root, '--tenant', 'endzone', '--ci-gate', 'ci'], /unknown flag --ci-gate/);
+  usageError(['assign', '--root', root, '--tenant', 'endzone', '--adr-path', 'docs/adr/0006.md'], /unknown flag --adr-path/);
+  usageError(['assign', '--root', root, '--tenant', 'endzone', '--context-heading', 'Rosters'], /unknown flag --context-heading/);
+});
+
+test('cli: proof refuses --issue-number for --issue', () => {
+  usageError(['proof', '--root', rootDir(), '--tenant', 'endzone', '--issue-number', '42'], /unknown flag --issue-number/);
+});
+
+test('cli: validate refuses --base for --base-sha and --issue-file for --issue', () => {
+  usageError(['validate', '--manifest', 'm.json', '--issue', 'i.json', '--base', 'a'.repeat(40)], /unknown flag --base/);
+  usageError(['validate', '--manifest', 'm.json', '--issue-file', 'i.json'], /unknown flag --issue-file/);
+});
+
+test('cli: launch refuses --repo (owner/name belongs to --github-repo) and --work-record', () => {
+  usageError(['launch', '--root', rootDir(), '--manifest', 'm.json', '--work-record-id', 'endzone:issue-42', '--repo', 'owner/name'], /unknown flag --repo/);
+  usageError(['launch', '--root', rootDir(), '--manifest', 'm.json', '--work-record', 'endzone:issue-42'], /unknown flag --work-record/);
+});
+
+test('cli: ack refuses --revision for --expected-revision and --record-id for --work-record-id', () => {
+  usageError(['ack', '--root', rootDir(), '--work-record-id', 'endzone:issue-42', '--revision', '3'], /unknown flag --revision/);
+  usageError(['ack', '--root', rootDir(), '--record-id', 'endzone:issue-42', '--expected-revision', '3'], /unknown flag --record-id/);
+});
+
+test('cli: a correct validate invocation still answers', () => {
+  const root = rootDir();
+  const original = issue(60);
+  const reserved = reserveAssignment({
+    root, issue: original, tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-01T00:00:00.000Z',
+  });
+  const manifestFile = path.join(root, 'manifest.json');
+  const issueFile = path.join(root, 'issue.json');
+  fs.writeFileSync(manifestFile, JSON.stringify(reserved.manifest));
+  fs.writeFileSync(issueFile, JSON.stringify(original));
+  assert.equal(cli(['validate', '--manifest', manifestFile, '--issue', issueFile, '--base-sha', 'c'.repeat(40)]).valid, true);
+  fs.writeFileSync(issueFile, JSON.stringify(issue(60, { body: 'changed' })));
+  assert.equal(cli(['validate', '--manifest', manifestFile, '--issue', issueFile]).valid, false);
+});
+
+test('cli: a correct frontier invocation against a fixture still answers', () => {
+  const root = rootDir();
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(61), issue(62, { assignees: ['cory'] })]));
+  const frontier = cli(['frontier', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--ready-label', 'ready-for-agent', '--now', '2026-09-01T12:00:00.000Z']);
+  assert.deepEqual(frontier.eligible.map((entry) => entry.number), [61]);
+});
+
+test('cli: the process exits 2 on a refusal and writes it to stderr, no JSON answer on stdout', () => {
+  const result = spawnSync(process.execPath, [
+    path.join(__dirname, '..', 'bin', 'assignment.js'), 'assign', '--root', rootDir(), '--tenant', 'endzone', '--base', 'a'.repeat(40),
+  ], { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 2);
+  assert.equal(result.stdout, '');
+  const refusal = JSON.parse(result.stderr.trim());
+  assert.equal(refusal.code, 'USAGE');
+  assert.match(refusal.message, /unknown flag --base/);
 });
