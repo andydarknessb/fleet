@@ -34,3 +34,23 @@ the shape a caller reading only the status cannot mistake for an answer.
 Not chosen: opening the formal door in `ci-wait`. It would let a review land
 before the material it reviews is settled, and the watcher's `ci-wait ->
 review` transition would stop meaning "now reviewable".
+
+## 2. An artifact is never silent about its own result (fleet#18)
+
+`record` refuses an empty `findings` list for both kinds (`EMPTY_FINDINGS`,
+exit 2), as the last guard before the write so the earlier refusals keep
+their precedence. "The reviewer looked and found nothing" is a real and
+common outcome, so the refusal is satisfiable without lying: `--no-findings
+"<what was examined and what was concluded>"` writes that sentence into the
+artifact as `noFindings`, with `findings: []`. The guard reads what the
+artifact will hold, not only what the caller typed: a statement beside new
+findings, or beside a still-open prior finding carried forward, is a usage
+error, and a re-review that carries a still-open finding needs no statement
+because it is not silent. A blank statement or a bare flag is a usage error.
+A re-review whose prior findings are all resolved and that found nothing new
+still says so; the resolutions map records what closed, the statement
+records what was looked at.
+
+The alternative, a single `info`-severity finding standing in for "nothing",
+was rejected: it would make `openFindings` count a non-finding as open and
+force the next re-review to resolve it.
