@@ -18,13 +18,18 @@
   naming the parent, and check escalations of the configured kinds
   (config/cycle.json supervisor.pageKinds) page once per new name:kind as a banner
   condition plus one escalation file. `blocked` is recorded, never paged: the daemon's
-  label is a summary of a session's last line, not a measured wait. A Sentinel session
+  label is a summary of a session's last line, not a measured wait. The exception (fleet
+  #28) is a permission wait: a job whose state.json `needs` starts with "approve " and
+  whose updatedAt is older than $permissionWaitMinutes is a session stuck on a
+  permission prompt nobody will answer; it pages once per job and files an escalation
+  naming the parent, in shadow and live alike (no Sentinel handles it). A Sentinel session
   running under the flag is the double-actor condition: page, stay in shadow.
 #>
 [CmdletBinding()]
 param(
   [switch]$Verify,   # compute and print only: no fleet-state writes, no toast (the shadowed check still fetches)
-  [switch]$NoToast   # write state but never toast (tests)
+  [switch]$NoToast,  # write state but never toast (tests)
+  [int]$PermissionWaitMinutes = 5   # fleet #28: minutes a --bg session may sit on a permission prompt before it pages (tests lower it)
 )
 
 try {
@@ -37,6 +42,7 @@ try {
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
+  $permissionWaitMinutes = $PermissionWaitMinutes  # fleet #28: a permission prompt in a --bg session has no approver; ic-1208 sat 12 min unseen
 
   function Get-HeartbeatAgeMinutes {
     # $null = no heartbeat recorded; unparseable or future-dated (skew) = stale, never fatal.
@@ -161,6 +167,25 @@ try {
       $detail = 'no detail recorded'; if ($js -and $js.detail) { $detail = Get-OneLine $js.detail }
       $retryTrips += [pscustomobject]@{ name = $g.Name; failures = $streak; latestJob = $latest.id; detail = $detail }
     }
+  }
+
+  # --- permission waits (fleet #28): a running fleet session whose job state `needs`
+  # --- an approval ("approve Read: ...") has hit a permission prompt, and a --bg session
+  # --- has no one at the prompt. The wait is measured, not read off the tempo label:
+  # --- the daemon stops touching state.json while the prompt stands, so updatedAt is
+  # --- the start of the wait. The cause today is a model the CLI cannot run in auto
+  # --- mode (haiku), refused at launch; this catches the next cause.
+  $permissionWaits = @()
+  foreach ($row in @($daemon | Where-Object { "$($_.name)" -match $fleetPattern -and "$($_.state)" -notin @('stopped','failed','done') })) {
+    $js = $null; try { $js = Get-JobState $row.id } catch {}
+    if (-not $js -or -not $js.PSObject.Properties['needs'] -or "$($js.needs)" -notmatch '^approve ') { continue }
+    $since = $null; if ($js.PSObject.Properties['updatedAt']) { $since = ConvertTo-UtcDateTime $js.updatedAt }
+    if (-not $since) { continue }
+    $waitMin = [Math]::Floor((New-TimeSpan -Start $since -End $now).TotalMinutes)
+    if ($waitMin -lt $permissionWaitMinutes) { continue }
+    $parentName = ''
+    try { $rr = (Get-LiveRoster).sessions | Where-Object { $_.name -eq $row.name } | Select-Object -Last 1; if ($rr) { $parentName = "$($rr.parent)" } } catch {}
+    $permissionWaits += [pscustomobject]@{ name = "$($row.name)"; job = "$($row.id)"; parent = $parentName; waitMin = $waitMin; needs = (Get-OneLine "$($js.needs)" 200) }
   }
 
   # --- retry cap -> skip-hold for ICs (the third identical attempt never finds the cause).
@@ -389,6 +414,12 @@ try {
       $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e }
     }
   }
+  foreach ($pw in $permissionWaits) {
+    $pwDetail = "$($pw.name) (job $($pw.job)) has waited $($pw.waitMin) min on a permission prompt no one can answer in a --bg session: $($pw.needs). Stop it (claude stop $($pw.job)) and relaunch on a model the CLI runs in auto mode, or attach and answer (claude attach $($pw.job))"
+    # Keyed by job, not name: a stale daemon row and its relaunch can share a name, and one
+    # key per job is also what lets a retired job's page clear while its successor's stands.
+    $conditions += [pscustomobject]@{ key = "permission-wait:$($pw.name):$($pw.job)"; detail = $pwDetail; escalation = [pscustomobject]@{ name = $pw.name; kind = 'permission-wait'; detail = $pwDetail; parent = $pw.parent } }
+  }
   $escCount = @(Get-ChildItem "$FleetHome\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count
   $checkEsc = 0; if ($check) { $checkEsc = @($check.escalate).Count }
   $pendingNote = "; $escCount escalation file(s) and $checkEsc check-reported escalation(s) have no live relay"
@@ -470,7 +501,7 @@ try {
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
     toastDelivered = $toastDelivered; checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes
-    staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; paused = [bool]$paused; verify = [bool]$Verify
+    staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)
   if (-not $Verify) {

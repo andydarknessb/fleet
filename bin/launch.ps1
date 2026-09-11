@@ -100,6 +100,19 @@ function Invalidate-Manifest {
   if ($LASTEXITCODE -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId'" }
   Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = $assignment.id; invalidatedAt = (Now-Iso); reason = $Reason })
 }
+# Fleet #28 (2026-09-11): the installed Claude Code CLI keeps a per-model auto-mode
+# list and claude-haiku-4-5 is not on it (verified on 2.1.267 and both 2.1.268 builds;
+# an explicit --permission-mode auto is downgraded the same way). A haiku --bg session
+# therefore runs in permission-mode default and blocks on its first out-of-cwd Read
+# with nobody to approve it. Refused here even under -Force (the CLI cannot be forced)
+# and even for a dry run, so a rehearsal reports the truth. assignment.js refuses the
+# same model at reservation time; lift both together when the CLI list changes.
+if ($Model -eq 'haiku') {
+  $haikuReason = "the installed Claude Code CLI ($(try { (& claude --version 2>$null | Out-String).Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
+  $released = $false
+  if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $haikuReason; $released = $true } catch {} }
+  Write-Output (@{ launched = $false; reason = $haikuReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+}
 
 if ($Manifest -and -not $DryRun) {
   $previousOutputEncoding = [Console]::OutputEncoding

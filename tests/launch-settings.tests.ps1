@@ -130,6 +130,15 @@ exit $LASTEXITCODE
   $r6c = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
   Assert-True ($r6c.dryRun -eq $true) 'a stopped job state must not block a relaunch'
 
+  # Fleet #28: the CLI has no auto mode for claude-haiku-4-5; the one door refuses haiku
+  # even on a dry run, names the cause, and never reaches the claude command.
+  $rh = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'haiku', '-DryRun')
+  Assert-True ($script:lastExit -eq 3) "a haiku launch must exit 3 (got $script:lastExit)"
+  Assert-True ($rh.launched -eq $false -and -not $rh.dryRun) 'a haiku launch must be refused before the dry-run report'
+  Assert-True ("$($rh.reason)" -match 'auto mode' -and "$($rh.reason)" -match 'fleet #28') 'the haiku refusal must name the CLI auto-mode cause'
+  $rs = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
+  Assert-True ($rs.dryRun -eq $true -and $rs.model -eq 'sonnet') 'a sonnet launch still dry-runs'
+
   Write-Output 'launch settings tests passed'
 } finally {
   $env:PATH = $oldPath
