@@ -6,8 +6,10 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  FLAGS,
   WorkStateError,
   abandonRecord,
+  cli,
   createRecord,
   getRecord,
   notifyRecord,
@@ -816,4 +818,104 @@ test('shadow projection cannot resurrect an abandoned attempt from its stale ros
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records), []);
   assert.equal(getRecord({ root, id }).state, 'abandoned');
   assert.equal(readEvents(root).filter((event) => event.recordId === id).length, 3);
+});
+
+// --- fleet#4: work-state.js's own cli adopts the parseArgs flag schema --------
+// The ledger's door went last (ruling 1). Before this, cli() parsed every
+// command without a schema: a typo'd flag fell into a bucket nothing read, and
+// whether the command noticed depended on which field the typo left unset.
+// `transition --state review` hit INVALID_TRANSITION only because `to` was
+// undefined; `release --revision 3` compared NaN to the revision and got
+// STALE_REVISION; `transition --no-notify` (for --no-notifier) launched the
+// notifier anyway, and `budget --token 5000` recorded a budget phase with no
+// tokens. Every case below goes through `cli`, the door launch.ps1,
+// rollback-assignment.ps1 and the role files use.
+//
+// Red-tell: with bin/work-state.js stashed back to parseArgs(rest) and no
+// FLAGS, every USAGE case below fails (the typo resolves to undefined instead
+// of throwing) and `require('../bin/work-state')` exports neither cli nor FLAGS.
+
+function usageError(argv, fragment) {
+  assert.throws(() => cli(argv), (error) => {
+    assert.ok(error instanceof WorkStateError, `expected WorkStateError, got ${error && error.name}: ${error && error.message}`);
+    assert.equal(error.code, 'USAGE');
+    if (fragment) assert.match(error.message, fragment);
+    return true;
+  });
+}
+
+test('cli: every command declares its accepted flags, and an unknown command is a usage error', () => {
+  assert.deepEqual(Object.keys(FLAGS).sort(), ['abandon', 'budget', 'create', 'get', 'notify', 'observe', 'project', 'reconcile', 'release', 'reserve', 'review', 'shadow', 'transition']);
+  usageError(['ack', '--root', rootDir(), '--id', 'endzone:issue-42'], /unknown command 'ack'/);
+  usageError([], /unknown command/);
+});
+
+test('cli: transition refuses --state for --to and --no-notify for --no-notifier', () => {
+  const root = rootDir();
+  makeRecord(root);
+  usageError(['transition', '--root', root, '--id', 'endzone:issue-42', '--state', 'implementing', '--expected-revision', '1', '--idempotency-key', 'k'], /unknown flag --state/);
+  usageError(['transition', '--root', root, '--id', 'endzone:issue-42', '--to', 'implementing', '--expected-revision', '1', '--idempotency-key', 'k', '--no-notify'], /unknown flag --no-notify/);
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'assigned');
+});
+
+test('cli: release and abandon refuse --revision for --expected-revision, naming the accepted set', () => {
+  const root = rootDir();
+  makeRecord(root);
+  assert.throws(() => cli(['release', '--root', root, '--id', 'endzone:issue-42', '--revision', '1', '--idempotency-key', 'k']), (error) => {
+    assert.equal(error.code, 'USAGE');
+    assert.equal(error.flag, 'revision');
+    assert.deepEqual(error.accepted, FLAGS.release);
+    assert.match(error.message, /--expected-revision/);
+    return true;
+  });
+  usageError(['abandon', '--root', root, '--id', 'endzone:issue-42', '--revision', '1', '--idempotency-key', 'k', '--reason', 'x'], /unknown flag --revision/);
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'assigned');
+});
+
+test('cli: create and reserve refuse --pr for --pr-number and --proof for --independence-proof', () => {
+  const root = rootDir();
+  usageError(['create', '--root', root, '--id', 'endzone:issue-42', '--tenant', 'endzone', '--issue', '42', '--pr', '77', '--idempotency-key', 'k'], /unknown flag --pr/);
+  usageError(['reserve', '--root', root, '--id', 'endzone:issue-42', '--tenant', 'endzone', '--issue', '42', '--manifest', 'm', '--proof', '{}', '--idempotency-key', 'k'], /unknown flag --proof/);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'work', 'active.json')), false);
+});
+
+test('cli: review refuses --head for --head-sha and --artifact-path for --artifact', () => {
+  const root = rootDir();
+  usageError(['review', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '1', '--kind', 'formal', '--head', 'abc', '--artifact', 'a.json', '--idempotency-key', 'k'], /unknown flag --head/);
+  usageError(['review', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '1', '--kind', 'formal', '--head-sha', 'abc', '--artifact-path', 'a.json', '--idempotency-key', 'k'], /unknown flag --artifact-path/);
+});
+
+test('cli: observe, notify and budget refuse their confusable names', () => {
+  const root = rootDir();
+  usageError(['observe', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '1', '--pr', '77', '--idempotency-key', 'k'], /unknown flag --pr/);
+  usageError(['notify', '--root', root, '--id', 'endzone:issue-42', '--phase', 'claim', '--expected-revision', '1', '--sequence', '3', '--idempotency-key', 'k'], /unknown flag --sequence/);
+  usageError(['budget', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '1', '--phase', 'warning', '--token', '5000', '--idempotency-key', 'k'], /unknown flag --token/);
+});
+
+test('cli: get, shadow and reconcile refuse --record, --roster-path and --pr', () => {
+  const root = rootDir();
+  usageError(['get', '--root', root, '--record', 'endzone:issue-42'], /unknown flag --record/);
+  usageError(['shadow', '--root', root, '--roster-path', 'roster.json'], /unknown flag --roster-path/);
+  usageError(['reconcile', '--repo', 'owner/name', '--pr', '77'], /unknown flag --pr/);
+});
+
+test('cli: a correct get invocation still answers', () => {
+  const root = rootDir();
+  makeRecord(root);
+  assert.equal(cli(['get', '--root', root, '--id', 'endzone:issue-42']).state, 'assigned');
+});
+
+test('cli: the process exits 2 on a refusal and writes it to stderr, no JSON answer on stdout', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  let failure;
+  try {
+    execFileSync(process.execPath, [script, 'transition', '--root', root, '--id', 'endzone:issue-42', '--state', 'implementing', '--expected-revision', '1', '--idempotency-key', 'k'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) { failure = error; }
+  assert.ok(failure, 'expected a USAGE failure');
+  assert.equal(failure.status, 2);
+  assert.equal(failure.stdout, '');
+  assert.equal(JSON.parse(failure.stderr).code, 'USAGE');
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'assigned');
 });

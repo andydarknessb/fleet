@@ -1261,9 +1261,37 @@ function parseArgs(argv, schema = null) {
   return args;
 }
 
+// fleet#4: this binary's own cli adopts the schema last (ruling 1), after the
+// fourteen others. Declared per command: each list is every `args.xxx` /
+// `args['xxx']` the handler consumes, directly or through `common`. Before
+// this, `transition --state review` moved the record to `undefined`
+// (INVALID_TRANSITION by luck), `review --head abc` recorded with no headSha
+// (MISSING_REVIEW_EVIDENCE by luck), and `release --revision 3` released
+// against NaN; a typo that happened to leave a required field unset was
+// caught by the handler, one that named an optional field was not.
+const COMMON_FLAGS = ['root', 'now', 'actor', 'evidence', 'idempotency-key'];
+const FLAGS = Object.freeze({
+  create: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'state', 'pr-number'],
+  reserve: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'manifest', 'reservations', 'assignment', 'independence-proof', 'issue-url', 'body-hash'],
+  release: [...COMMON_FLAGS, 'id', 'expected-revision'],
+  abandon: [...COMMON_FLAGS, 'id', 'expected-revision', 'reason', 'kill-point'],
+  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'github-evidence', 'no-notifier'],
+  reconcile: ['repo', 'pr-number'],
+  observe: [...COMMON_FLAGS, 'id', 'expected-revision', 'pr-number', 'observation', 'changed', 'wake'],
+  review: [...COMMON_FLAGS, 'id', 'expected-revision', 'kind', 'head-sha', 'artifact', 'tier', 'triggers', 'prior-artifact'],
+  notify: [...COMMON_FLAGS, 'id', 'phase', 'expected-revision', 'decision-sequence', 'channel', 'detail', 'no-notifier'],
+  budget: [...COMMON_FLAGS, 'id', 'expected-revision', 'phase', 'tokens', 'by', 'reason', 'threshold'],
+  get: ['root', 'id'],
+  shadow: ['root', 'roster', 'now', 'actor', 'kill-point'],
+  project: PROJECT_FLAGS,
+});
+
 function cli(argv) {
   const [command, ...rest] = argv;
-  const args = parseArgs(rest);
+  if (!Object.prototype.hasOwnProperty.call(FLAGS, command)) {
+    throw new WorkStateError('USAGE', `unknown command '${command}'; commands: ${Object.keys(FLAGS).join(', ')}`);
+  }
+  const args = parseArgs(rest, FLAGS[command]);
   const common = { root: args.root, now: args.now, actor: args.actor, evidence: args.evidence, idempotencyKey: args['idempotency-key'] };
   if (command === 'create') return createRecord({ ...common, id: args.id, tenant: args.tenant, issue: Number(args.issue), state: args.state || 'assigned', github: args['pr-number'] ? { issueNumber: Number(args.issue), prNumber: Number(args['pr-number']) } : undefined });
   if (command === 'reserve') return reserveRecord({
@@ -1316,22 +1344,21 @@ function cli(argv) {
   if (command === 'budget') return recordBudget({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']), phase: args.phase, tokens: args.tokens !== undefined ? Number(args.tokens) : undefined, by: args.by, reason: args.reason, threshold: args.threshold !== undefined ? Number(args.threshold) : undefined });
   if (command === 'get') return getRecord({ root: args.root, id: args.id });
   if (command === 'shadow') return shadowProject({ root: args.root, rosterPath: args.roster, now: args.now, actor: args.actor, killPoint: args['kill-point'] });
-  if (command === 'project') {
-    const strict = parseArgs(rest, PROJECT_FLAGS);
-    return projectStatus({ root: strict.root, tenant: strict.tenant, now: strict.now, output: strict.output });
-  }
-  throw new WorkStateError('USAGE', 'commands: create, reserve, release, abandon, transition, reconcile, observe, review, notify, get, shadow, project');
+  // command === 'project'
+  return projectStatus({ root: args.root, tenant: args.tenant, now: args.now, output: args.output });
 }
 
 module.exports = {
   DECISION_EVENT_TYPES,
   DECISION_STATES,
+  FLAGS,
   NOTIFICATION_PHASES,
   RESERVATION_FIELDS,
   STATES,
   TRANSITIONS,
   WorkStateError,
   abandonRecord,
+  cli,
   createRecord,
   enteringEvent,
   getRecord,
@@ -1362,6 +1389,10 @@ if (require.main === module) {
     process.stdout.write(`${JSON.stringify(cli(process.argv.slice(2)))}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message, currentRevision: error.currentRevision })}\n`);
-    process.exitCode = 1;
+    // A refused invocation exits 2 so a caller reading only the status cannot
+    // take it for a failed mutation, let alone for an answer (fleet#2's rule);
+    // every other error keeps exit 1 (STALE_REVISION, INVALID_TRANSITION,
+    // NOT_FOUND...), which callers read as "the ledger said no", not "usage".
+    process.exitCode = error.code === 'USAGE' ? 2 : 1;
   }
 }
