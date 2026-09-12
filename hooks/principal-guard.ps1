@@ -12,10 +12,11 @@
 #        no gh pr merge, no wontfix/duplicate label, no git push to a branch outside
 #        docs/. One named test file passes.
 #      - No Supabase or Netlify-writing MCP tool.
-#   2. every fleet role: no comment whose body begins "Approved" on any issue. The
-#      machine's gh login is the tenant owner's login (fleetIdentity == ownerLogin), so
-#      the owner-login gate in bin/triage.js cannot tell Cory's Approved from one a
-#      session posts; this rule is what makes an Approval Cory's alone.
+#   2. every fleet role: no comment whose body begins "Approved" or "Re-propose" on any
+#      issue. The machine's gh login is the tenant owner's login (fleetIdentity ==
+#      ownerLogin), so the owner-login gate in bin/triage.js cannot tell Cory's Approved
+#      from one a session posts; this rule is what makes an Approval, and (fleet#55) a
+#      re-proposal ask, Cory's alone.
 #
 # Rollback: state/flags/principal-guard-off. Output contract: a deny is JSON on stdout
 # with permissionDecision "deny"; anything else is silence + exit 0. Never exit nonzero.
@@ -61,6 +62,10 @@ if ($tool -in @('Bash', 'PowerShell')) {
     foreach ($body in $bodies) {
       if ("$body" -match '^\s*(\\n|\s)*approved\b') {
         $reason = "a comment that begins 'Approved' is the tenant owner's Approval of a Triage proposal (CONTEXT.md **Approval**) and no fleet session may post one under any role: the fleet acts under the owner's own GitHub login, so bin/triage.js could not tell them apart. Say what you mean in other words ('the lead agrees', 'ruled: ...') or leave the decision to Cory $cite"
+        break
+      }
+      if ("$body" -match '^\s*(\\n|\s)*re-?propose\b') {
+        $reason = "a comment that begins 'Re-propose' is the tenant owner's ask for a new Triage proposal and no fleet session may post one under any role (fleet#55): the fleet acts under the owner's own GitHub login, so bin/triage.js reads the shape, not the author. Say what you mean in other words ('the scope changed; the Principal should look again') or leave the ask to Cory $cite"
         break
       }
     }

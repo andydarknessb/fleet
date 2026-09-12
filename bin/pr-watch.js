@@ -468,12 +468,13 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
         revision = acted.revision;
         health.actions.push(`${summary}${acted.replayed ? ' (replayed)' : ''}`);
         if (action.wake && !acted.replayed) {
-          fs.mkdirSync(watchDir, { recursive: true });
-          const wakeLine = {
-            at: new Date().toISOString(), recordId: record.id, revision: acted.revision,
-            eventSequence: acted.eventSequence, wake: action.wake, idempotencyKey: key, evidence: action.evidence,
-          };
-          fs.appendFileSync(path.join(watchDir, 'wake-outbox.jsonl'), `${JSON.stringify(wakeLine)}\n`, 'utf8');
+          // A decision transition's line was written by the transition door
+          // (fleet#56) under this same key; the helper finds it and appends
+          // nothing. Observe wakes (checks-settled, checks-failed) are written here.
+          workState.appendWakeOutbox({
+            root: base, recordId: record.id, revision: acted.revision, eventSequence: acted.eventSequence,
+            wake: action.wake, idempotencyKey: key, evidence: action.evidence,
+          });
           if (action.wake === 'decision-needed' && notifier) {
             try { notifier({ root: base, recordId: record.id, sequence: acted.eventSequence }); } catch (error) { health.actions.push(`${record.id}: notifier launch failed (${String(error.message || error).slice(0, 120)})`); }
           }

@@ -377,3 +377,39 @@ and "see" are ordinary prepositions as well as cues, so an edit sentence of
 the shape "store the failure per `server/x.js`" loses that path silently,
 and nothing fails closed unless it was the only path. The allowlist
 criterion is the precise tool there too.
+
+## Root-file amendment (2026-09-12, fleet#54)
+
+Endzone #1294's approved Ruling carried an allowlist Scope line naming four
+files. The recognizer needed one of a fixed list of directory names followed
+by a separator, so the root file `CONTEXT.md` matched nothing and the derived
+set was three of four. Every guard was satisfied: the set was non-empty, it
+conflicted with nothing, and the third-assignment proof answered
+`independent: true` over a missing file. Partial derivation fails open and
+silently, which is worse than the empty case fleet#33 closed.
+
+6. A repo-root file is a path in its own right. A bare token that is a known
+   root name (the repo documents `README.md`, `CONTEXT.md`, `CLAUDE.md`;
+   `package.json` and its lock; tool configs such as `jest.config.js` and
+   `tsconfig.json`; deploy files such as `netlify.toml`, `render.yaml`,
+   `Dockerfile`, `Procfile`; the dotfiles `.env`, `.eslintrc`, `.gitignore`
+   and their kin) is reserved when it is fenced in backticks or sits in an
+   allowlist sentence. A bare basename that is not a known root name is never
+   guessed to be at the root: `assignment.js` lives in `bin/`, and a root
+   reservation of it would overlap nothing and read as independent of the
+   ticket that edits the real file. In an allowlist sentence such a token is
+   unrecognized (rule 7); elsewhere it is prose. The recognizer never matches
+   inside a longer path.
+7. An allowlist sentence states its own cardinality. Each single-token item it
+   enumerates that neither recognizer saw is reported on the normalized issue
+   as `unrecognizedPaths` (the frontier answer carries it), and `assign`
+   refuses a short derived set (`PARTIAL_RESERVATIONS`, no manifest, no
+   record) until the lead declares the whole set with `--reservations`, the
+   fleet#33 answer. An explicit set is never checked against the sentence.
+
+Not chosen: lengthening the directory-prefix list. It would still miss the
+next root file, and the failure would still be silent. Not chosen: reserving
+every dotted token by extension. `e.g.`, `v2.0` and a library name in prose
+are not files, and a bare basename reserved at the root is a collision with
+nobody: it lets a ticket that edits the real file under `bin/` or `src/`
+prove itself independent of this one.

@@ -531,17 +531,6 @@ function planRereview(options = {}) {
 
 // --- hold: park a reviewed-clean PR for Cory, page once ---
 
-function outboxHasWake(outboxFile, recordId, idempotencyKey) {
-  if (!fs.existsSync(outboxFile)) return false;
-  return fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).some((line) => {
-    if (!line.trim()) return false;
-    try {
-      const entry = JSON.parse(line);
-      return entry.recordId === recordId && entry.idempotencyKey === idempotencyKey;
-    } catch { return false; }
-  });
-}
-
 function holdRecord(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, reason, actor } = options;
@@ -555,25 +544,15 @@ function holdRecord(options = {}) {
     evidence: `wake:decision-needed; ${reason}`,
   });
   // Page once, at-least-once: the state-hold event is the authoritative record;
-  // the outbox line is the delivery cache (pr-watch shape) and the ticket-07
-  // notifier is launched for the event (it claims through the state command, so
-  // a second launch finds the claim and sends nothing). A crash between the
-  // transition and this append is repaired by any retry, which finds the
-  // committed transition (replay) but no outbox line, and delivers the page.
-  const watchDir = path.join(root, 'state', 'watch');
-  const outboxFile = path.join(watchDir, 'wake-outbox.jsonl');
-  let paged = false;
-  if (!result.replayed || !outboxHasWake(outboxFile, recordId, key)) {
-    fs.mkdirSync(watchDir, { recursive: true });
-    const wakeLine = {
-      at: new Date(options.now || Date.now()).toISOString(), recordId, revision: result.revision,
-      eventSequence: result.eventSequence, wake: 'decision-needed',
-      idempotencyKey: key, evidence: reason,
-    };
-    fs.appendFileSync(outboxFile, `${JSON.stringify(wakeLine)}\n`, 'utf8');
-    paged = true;
-    if (options.notifier) options.notifier({ root, recordId, sequence: result.eventSequence });
-  }
+  // the outbox line is the delivery cache, written by the transition door itself
+  // (work-state.js, fleet#56: every decision transition writes it, whoever
+  // calls), and the ticket-07 notifier is launched when this call wrote the
+  // line (it claims through the state command, so a second launch finds the
+  // claim and sends nothing). A crash between the transition and the append is
+  // repaired by any retry, which finds the committed transition (replay) but no
+  // outbox line, writes it, and delivers the page.
+  const paged = Boolean(result.paged);
+  if (paged && options.notifier) options.notifier({ root, recordId, sequence: result.eventSequence });
   return { result, paged };
 }
 

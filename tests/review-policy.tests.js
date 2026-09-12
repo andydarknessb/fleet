@@ -487,14 +487,17 @@ test('a crash between the hold transition and the page is repaired by the retry'
   const root = rootDir();
   const revision = seedRecord(root);
   // Simulate the crash: the transition committed (same key holdRecord would use)
-  // but the process died before the outbox append.
+  // but the process died before the outbox append. Since fleet#56 the transition
+  // door writes the line itself, so the crash window is inside that call: the
+  // committed transition with its line removed is the state a retry finds.
   workState.transitionRecord({
     root, id: 'endzone:issue-42', to: 'hold', expectedRevision: revision,
     idempotencyKey: 'hold-1', actor: 'project-lead',
     evidence: 'wake:decision-needed; carve-out PR #77 waits for Cory', now: '2026-09-01T03:00:00.000Z',
   });
   const outbox = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
-  assert.equal(fs.existsSync(outbox), false);
+  assert.equal(fs.existsSync(outbox), true, 'the door wrote the line');
+  fs.rmSync(outbox);
   const retry = holdRecord({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
     reason: 'carve-out PR #77 waits for Cory', actor: 'project-lead',

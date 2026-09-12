@@ -373,6 +373,61 @@ test('fleet#52: every citation cue is a citation; the written path beside it is 
   });
 });
 
+
+// fleet#54: endzone #1294's approved Ruling carried an allowlist Scope line naming four
+// files; the recognizer needed a hardcoded directory prefix plus a separator, so the
+// root file `CONTEXT.md` matched nothing, the derived set was three of four, and every
+// guard was satisfied: non-empty, no conflict, `independent: true`. Partial and silent,
+// failing open. A root-level file is a path in its own right (allowlist sentence or
+// backtick-fenced, known extension or dotfile), and an allowlist sentence states its own
+// cardinality: an item it lists that the recognizer did not turn into a reservation is
+// reported as `unrecognizedPaths`, and `assign` refuses to reserve a short set.
+test('fleet#54: a root-level file in an allowlist Scope line is reserved, verbatim from endzone #1294', () => {
+  const normalized = normalizeIssue(issue(1294, {
+    body: 'Scope: lists exactly CONTEXT.md and docs/adr/0038-pickem-joins-the-island.md and src/entities/line/model/lineModel.js and src/entities/pickem-game/model/gameDetailModel.js',
+  }));
+  assert.deepEqual(normalized.reservations, {
+    components: ['CONTEXT.md', 'docs/adr/0038-pickem-joins-the-island.md', 'src/entities/line/model/lineModel.js', 'src/entities/pickem-game/model/gameDetailModel.js'],
+    migrationPrefixes: [], schemaAreas: [], testResources: [],
+  });
+  assert.deepEqual(normalized.unrecognizedPaths, []);
+});
+
+test('fleet#54: a fenced known root file in an edit sentence is reserved; a runtime name and an unfenced prose token are not', () => {
+  const normalized = normalizeIssue(issue(1295, {
+    body: [
+      'Add the `Decision card` entry to `CONTEXT.md` and bump `package.json`; `.eslintrc.json` gains one rule.',
+      'The client runs on Node.js and renders with React.js; the config lives in netlify.toml which this ticket does not touch.',
+      'Write `src/widgets/DecisionCard/DecisionCard.jsx`.',
+    ].join('\n'),
+  }));
+  assert.deepEqual(normalized.reservations.components, ['.eslintrc.json', 'CONTEXT.md', 'package.json', 'src/widgets/DecisionCard/DecisionCard.jsx']);
+  assert.deepEqual(normalized.unrecognizedPaths, []);
+});
+
+test('fleet#54: an allowlist item the recognizer cannot place is reported, and assign refuses the short set until the lead declares it', () => {
+  const body = 'Scope: lists exactly `src/entities/line/model/lineModel.js` and `Procfile` and `assignment.js` and `weird~name` and the `players` table.';
+  const normalized = normalizeIssue(issue(1296, { body }));
+  assert.deepEqual(normalized.reservations.components, ['Procfile', 'src/entities/line/model/lineModel.js']);
+  assert.deepEqual(normalized.unrecognizedPaths, ['assignment.js', 'weird~name']);
+
+  const root = rootDir();
+  const base = 'c'.repeat(40);
+  assert.throws(
+    () => reserveAssignment({ root, issue: issue(1296, { body }), tenant: 'endzone', readyLabel: 'ready-for-agent', base }),
+    (error) => error.code === 'PARTIAL_RESERVATIONS' && error.issue === 1296 && /assignment.js/.test(error.message) && /--reservations/.test(error.message) && error.unrecognizedPaths.length === 2,
+  );
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'work', 'active.json')) || !JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-1296'], 'a refused assignment reserves nothing');
+  const explicit = reserveAssignment({ root, issue: issue(1296, { body }), tenant: 'endzone', readyLabel: 'ready-for-agent', base, reservations: '{"components":["src/entities/line/model/lineModel.js","Procfile"]}' });
+  assert.deepEqual(explicit.manifest.reservations.components, ['Procfile', 'src/entities/line/model/lineModel.js']);
+});
+
+test('fleet#54: the frontier answer carries unrecognizedPaths so a lead reading it sees a short derivation', () => {
+  const candidate = issue(1297, { body: 'Scope: lists exactly `src/a.js` and `assignment.js`.' });
+  const frontier = selectFrontier({ issues: [candidate], readyLabel: 'ready-for-agent', active: [], now: '2026-09-12T17:00:00.000Z' });
+  assert.deepEqual(frontier.eligible[0].unrecognizedPaths, ['assignment.js']);
+});
+
 // fleet#33: endzone #1234's six criteria name seams in prose and no path, so the
 // derivation produced an empty set and the record silently blocked every later
 // third assignment. Assign refuses that; the lead answers with --reservations.
