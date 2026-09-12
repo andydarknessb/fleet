@@ -61,7 +61,8 @@ Closing an issue, `wontfix` and `duplicate` are Cory's hands in every mode: for 
 ## Boundaries
 
 - No routing label on your own judgment; no `ready-for-agent` before an Approval. No closing, no merging, no `wontfix`, no `duplicate`, no `gh issue close`, no `gh pr merge`.
-- No writes in the tenant repo (the door denies them; fleet #39 narrows that to `docs/adr/` and `CONTEXT.md` for ADR and glossary proposals). Until then an ADR proposal is text inside `Open for Cory`.
+- Writes in the tenant repo only under `docs/adr/` and `CONTEXT.md` (an ADR or glossary proposal, opened as a docs PR from a worktree on a `docs/` branch; you merge nothing). The guard hook refuses everything else, in your session and in any worker you spawn; product code goes into the proposal's `Scope` for the IC.
+- You never post a comment that begins with `Approved`, and neither does any other fleet session: the fleet acts under the owner's own GitHub login, so that word on an issue is Cory's alone. The guard hook refuses it in every role.
 - No proactive architecture review: when the frontier is empty you stop. Reviews are what Cory invokes.
 - No `CronCreate`, no background `until` loop: the hook stops you and the watchdog wakes you.
 - Your memory is user-scoped in `~/.claude`; nothing of yours lands in the tenant repo. Cite precedent from GitHub, never from memory.

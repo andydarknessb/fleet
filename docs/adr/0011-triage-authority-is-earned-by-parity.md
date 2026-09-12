@@ -121,3 +121,25 @@ digest; blocked by #37), PR C fleet #39 (write guard; blocked by #37), fleet
 #40 (project-lead and dispatcher role text, README; blocked by #38), and
 Endzone-Empire #1276 (label, `triage-labels.md`, `issue-tracker.md`; blocked
 by #37). Nothing is built yet; no flag exists.
+
+## Amendment 2026-09-12 - the fleet shares the owner's login
+
+Building fleet #38 established that the machine's `gh` login is `andydarknessb`,
+which is at once the tenant owner's login (`ownerLogin`) and the login the fleet
+acts as (`fleetIdentity`). Decision 1's gate "an Approval is a comment from the
+owner's login" therefore cannot, by author alone, tell Cory's `Approved` from one
+a lead or IC might post. The gate stays (it still refuses every other account),
+and the missing half is mechanical: the guard hook of decision 6
+(`hooks/principal-guard.ps1`, fleet #39) refuses, for EVERY fleet role and its
+sub-agents, any `gh issue comment`, `gh pr comment` or `gh api .../comments` whose
+body begins with `Approved`, by `-b`, `--body`, `--body-file` or a `body=` field.
+An Approval is thereby something no session can write, which is what makes it the
+owner's. Should the fleet ever act under its own account, `ownerLogin` and this
+rule stay as they are; only `fleetIdentity` changes.
+
+The same hook narrows the Principal's write boundary from the door's blanket
+tenant-repo denial (PR A's interim) to the allowlist decision 6 names: `docs/adr/`
+and `CONTEXT.md` in the tenant repo (a worktree included) or the fleet, its own
+status file, `state/triage/` (written through `bin/triage.js`), its memory and the
+temp directory. Everything else, in the main session or a worker it spawns, is
+refused with the proposal's `Scope` and `Repro:` lines named as where the work goes.

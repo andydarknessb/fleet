@@ -12,7 +12,8 @@
       "gh pr merge of a PR touching a carve-out path (migrations, deploy hooks, .env*, CI secrets); carve-outs merge only with Cory",
       "claude stop / claude rm / claude respawn of a session that is not on the fleet roster; the Sentinel acts only on roster sessions",
       "Editing C:\\Users\\Cory\\fleet\\roster.json, fleet-settings.json, or any file under agents/ from a fleet session; role and roster changes are Cory's",
-      "Writing into C:\\Users\\Cory\\fleet\\state\\work, state\\events, state\\archive, or state\\exclusions by ANY means, shell redirection and scripts included; bin/work-state.js is the only writer of the first three and bin/exclusions.js of the last. Control-plane roles (dispatcher, project lead, sentinel) additionally never edit files inside a tenant repo by any tool: they review and merge, ICs write"
+      "Writing into C:\\Users\\Cory\\fleet\\state\\work, state\\events, state\\archive, or state\\exclusions by ANY means, shell redirection and scripts included; bin/work-state.js is the only writer of the first three and bin/exclusions.js of the last. Control-plane roles (dispatcher, project lead, sentinel) additionally never edit files inside a tenant repo by any tool: they review and merge, ICs write. The Principal (ADR 0011) writes only docs/adr/*.md and CONTEXT.md in a tenant repo, its own status file, and its memory; never src, never a close or merge, never wontfix or duplicate",
+      "Any fleet session, in any role, posting an issue or PR comment whose body begins with 'Approved': that word is the tenant owner's Approval of a Triage proposal (ADR 0011) and the fleet acts under the owner's own GitHub login, so a session must never write it"
     ]
   },
   "hooks": {
@@ -20,7 +21,8 @@
       { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/session-start.ps1", "timeout": 30 } ] }
     ],
     "PreToolUse": [
-      { "matcher": "Bash|PowerShell|WebFetch|WebSearch", "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/research-gate.ps1", "timeout": 15 } ] }
+      { "matcher": "Bash|PowerShell|WebFetch|WebSearch", "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/research-gate.ps1", "timeout": 15 } ] },
+      { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/principal-guard.ps1", "timeout": 15 } ] }
     ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/stop.ps1", "timeout": 60 } ] }
