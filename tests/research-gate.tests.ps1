@@ -48,6 +48,11 @@ try {
   Assert-Denied (Run-Gate -Role ic -Tool WebFetch) 'WebFetch'
   Assert-Denied (Run-Gate -Role project-lead -Tool WebSearch) 'WebSearch for a lead'
   Assert-Denied (Run-Gate -Role dispatcher -Tool Bash -Command 'git blame bin/watchdog.ps1') 'git blame for the dispatcher'
+  # ADR 0011: the Principal reads tickets as judgment and hands every sweep to the researcher.
+  Assert-Denied (Run-Gate -Role principal -Tool Bash -Command 'rg "getLineup" server src') 'a ripgrep sweep for the principal'
+  Assert-Denied (Run-Gate -Role principal -Tool WebFetch) 'WebFetch for the principal'
+  Assert-Allowed (Run-Gate -Role principal -Tool Bash -Command 'gh issue view 1276 --comments') 'the principal reading a ticket'
+  Assert-Allowed (Run-Gate -Role principal -Tool Bash -Command 'node --test server/test/lineup.test.js') 'the principal running one named test file'
 
   # --- allowed: what was handed to you, targeted reads, authoring, tests ---
   Assert-Allowed (Run-Gate -Role ic -Tool Bash -Command 'gh issue view 1200 --comments') 'reading your own issue'

@@ -51,7 +51,9 @@ if ($FromRoster) {
   $Role = $e.role; $Name = $e.name; $Tenant = $e.tenant; $Parent = $e.parent; $Prompt = $e.prompt; $cwd = $e.cwd
 }
 foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req -ValueOnly)) { Write-Error "missing -$req"; exit 4 } }
-if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$') { Write-Error "name '$Name' does not match the fleet naming scheme"; exit 4 }
+if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$') { Write-Error "name '$Name' does not match the fleet naming scheme"; exit 4 }
+if ($Role -eq 'principal' -and $Name -notmatch '^pe-') { Write-Error "a principal session is named pe-<tenant> (ADR 0011)"; exit 4 }
+if ($Role -eq 'principal' -and -not $Tenant) { Write-Error "a principal needs -Tenant (one per tenant, ADR 0011)"; exit 4 }
 # Ticket 08b: while the rostered Sentinel is cut over, the one door refuses to start a
 # second supervisor (not even with -Force: two actors is the failure cutover exists to
 # prevent). rollback-sentinel.ps1 removes the flag first, then comes through here. A
@@ -183,8 +185,16 @@ if ($rosterEntry -and $rosterEntry.jobId) {
     }
   }
 }
-if (-not $Force -and $liveFleet.Count -ge [int]$static.cap) {
-  Write-Output (@{ launched = $false; reason = "cap reached ($($liveFleet.Count)/$($static.cap))" } | ConvertTo-Json -Compress); exit 3
+# The cap bounds concurrent worktrees and PR churn, so it counts the sessions that
+# produce them. config/cycle.json `cap.exemptNamePrefixes` (the Principal, `pe-`;
+# ADR 0011 / grill Q28) lists the standing control-plane names that neither count
+# toward the cap nor are refused by it. Absent config = nothing is exempt.
+$capExemptPrefixes = @()
+try { $capExemptPrefixes = @((Read-Json "$FleetHome\config\cycle.json").cap.exemptNamePrefixes | Where-Object { "$_" }) } catch {}
+$isCapExempt = { param([string]$n) foreach ($p in $capExemptPrefixes) { if ($n.StartsWith("$p")) { return $true } } return $false }
+$capCounted = @($liveFleet | Where-Object { -not (& $isCapExempt $_.name) })
+if (-not $Force -and -not (& $isCapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
+  Write-Output (@{ launched = $false; reason = "cap reached ($($capCounted.Count)/$($static.cap))" } | ConvertTo-Json -Compress); exit 3
 }
 if ($Role -eq 'ic') {
   if (-not $Issue) { Write-Error "ICs need -Issue"; exit 4 }
@@ -223,7 +233,10 @@ if ($toolContractOn) {
     foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**', 'state/exclusions/**', 'state/status/DIGEST.md', 'state/status/*-status.md') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
     if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
   }
-  if ($Role -in @('dispatcher', 'project-lead', 'sentinel')) {
+  # The Principal (ADR 0011) gets the same blanket tenant-repo write denial until the
+  # allowlisting write guard lands (fleet #39: docs/adr/, CONTEXT.md, state/triage/ only).
+  # Until then its ADR proposals are comment text, never files. Fail closed on purpose.
+  if ($Role -in @('dispatcher', 'project-lead', 'sentinel', 'principal')) {
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
       $tenantRepo = $null
       try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
@@ -243,10 +256,17 @@ Write-Json $settingsPath $settings
 
 # The friendly -Model token is passed to `claude --model`, but the bare 'opus'
 # alias tracks the latest Opus (currently Opus 5). ICs must run Opus 4.8, so pin
-# 'opus' to the concrete id; other tokens keep their CLI aliases (latest).
+# 'opus' to the concrete id. 'fable' is pinned too (ADR 0011: the Principal is the
+# one Fable seat and a default-Fable bump must not move it silently; the installed
+# CLI 2.1.269 admits claude-fable-5-1 to auto mode, verified in its model predicate
+# 2026-09-11, so no fleet #28-style refusal). Other tokens keep their CLI aliases.
+# A principal launched with no -Model runs the role file's `model: fable` alias;
+# pin that path too so the two spellings resolve to the same id.
+$modelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1' }
+if (-not $Model -and $Role -eq 'principal') { $Model = 'fable' }
 $modelArgs = @()
 if ($Model) {
-  $resolvedModel = if ($Model -eq 'opus') { 'claude-opus-4-8' } else { $Model }
+  $resolvedModel = if ($modelPins.ContainsKey($Model)) { $modelPins[$Model] } else { $Model }
   $modelArgs = @('--model', $resolvedModel)
 }
 
