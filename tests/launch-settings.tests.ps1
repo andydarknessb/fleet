@@ -150,7 +150,8 @@ exit $LASTEXITCODE
   Assert-True ("$($rp.command)" -match '--effort high') 'a principal must run at the role file effort'
   Assert-True ($rp.budget.ceiling -eq 30000) 'the principal ceiling must come from config/cycle.json'
   $denyP = @((Get-Content "$testRoot\state\sessions\pe-test.settings.json" -Raw | ConvertFrom-Json).permissions.deny)
-  Assert-True ($denyP -contains "Edit($repoFwd/**)") 'a principal must lose engineering edits in tenant repos until the write guard lands'
+  Assert-True (-not ($denyP -contains "Edit($repoFwd/**)")) 'a principal must NOT carry the blanket tenant-repo denial: hooks/principal-guard.ps1 enforces its allowlist (fleet #39)'
+  Assert-True ($denyP -contains "Edit($rootFwd/state/work/**)") 'a principal still loses the direct state-door writes'
   $rpf = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-Model', 'fable', '-DryRun')
   Assert-True ("$($rpf.command)" -match '--model claude-fable-5-1') 'an explicit -Model fable must resolve to the same pinned id'
   Run-Launch @('-Role', 'principal', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null

@@ -230,10 +230,11 @@ if ($toolContractOn) {
     foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**', 'state/exclusions/**', 'state/status/DIGEST.md', 'state/status/*-status.md') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
     if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
   }
-  # The Principal (ADR 0011) gets the same blanket tenant-repo write denial until the
-  # allowlisting write guard lands (fleet #39: docs/adr/, CONTEXT.md, state/triage/ only).
-  # Until then its ADR proposals are comment text, never files. Fail closed on purpose.
-  if ($Role -in @('dispatcher', 'project-lead', 'sentinel', 'principal')) {
+  # The Principal (ADR 0011) is NOT on this list: settings deny rules cannot express an
+  # allowlist, so its write boundary (docs/adr/*.md and CONTEXT.md in the tenant repo,
+  # its status file, the triage ledger, its memory) is enforced by hooks/principal-guard.ps1
+  # (fleet #39), registered in fleet-settings.json for every fleet session.
+  if ($Role -in @('dispatcher', 'project-lead', 'sentinel')) {
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
       $tenantRepo = $null
       try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
