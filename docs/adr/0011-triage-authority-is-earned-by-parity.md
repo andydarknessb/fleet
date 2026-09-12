@@ -112,3 +112,12 @@ rotation policy are the mitigations until the first budget summary shows a
   flag.
 - When the graduation ticket is filed, this ADR is amended with the measured
   window and the bounded-authority definition, not superseded.
+
+## Status note - 2026-09-11
+
+Docs landed in fleet PR #36. Delivery issues: PR A fleet #37 (role file, door,
+config, hook lists), PR B fleet #38 (`triage.js`, watchdog wake, Stop hook,
+digest; blocked by #37), PR C fleet #39 (write guard; blocked by #37), fleet
+#40 (project-lead and dispatcher role text, README; blocked by #38), and
+Endzone-Empire #1276 (label, `triage-labels.md`, `issue-tracker.md`; blocked
+by #37). Nothing is built yet; no flag exists.
