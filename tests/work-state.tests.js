@@ -66,6 +66,10 @@ test('state command validates the full lifecycle and escalation resolution', () 
   move(root, 'endzone:issue-42', 10, 'retired', 't-10', 'evidence archived', '2026-09-01T00:00:10.000Z');
 
   assert.equal(resolved.record.state, 'review');
+  // fleet#44: the resolved escalation's evidence survives beside the resolution.
+  assert.equal(resolved.record.decisionEvidence, null);
+  assert.equal(resolved.record.resolvedDecisionEvidence, 'Cory decision required');
+  assert.equal(resolved.record.resolutionEvidence, 'Cory approved review');
   assert.throws(() => move(root, 'endzone:issue-42', 10, 'assigned', 'bad', 'invalid', '2026-09-01T00:00:11.000Z'), (error) => error.code === 'NOT_FOUND');
   assert.ok(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-42.json')));
   assert.equal(fs.existsSync(path.join(root, 'state', 'work', 'active.json')), true);

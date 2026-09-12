@@ -202,13 +202,18 @@ test('the Triage section reports pending proposals, awaiting-finalize and the gr
   recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: 'h', commentUrl: 'https://x/7', model: 'fable', now: '2026-09-10T00:00:00.000Z' });
   recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 8, bodyHash: 'h', commentUrl: 'https://x/8', model: 'fable', now: '2026-09-10T00:01:00.000Z' });
   recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 8, by: 'cory', now: '2026-09-11T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 9, bodyHash: 'h', commentUrl: 'https://x/9', model: 'fable', now: '2026-09-10T00:02:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 9, by: 'cory', now: '2026-09-11T00:01:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 9, labels: 'ready-for-agent', prUrl: 'https://x/pull/90', now: '2026-09-11T00:02:00.000Z' });
   const content = projectDigest({ root, now, dryRun: true }).content;
   const triageSection = section(content, 'Triage (advisory Principal, ADR 0011)');
-  assert.match(triageSection, /endzone: 1 proposal\(s\) awaiting approval, 1 approved awaiting finalizing, 2 proposed in all/);
-  assert.match(triageSection, /1 decided, 1 approved unchanged \(100%\)/);
-  assert.match(triageSection, /graduation not met \(1\/30 decided/);
+  assert.match(triageSection, /endzone: 1 proposal\(s\) awaiting approval, 1 approved awaiting finalizing, 3 proposed in all/);
+  assert.match(triageSection, /2 decided, 2 approved unchanged \(100%\)/);
+  assert.match(triageSection, /graduation not met \(2\/30 decided/);
   assert.match(triageSection, /- #7 proposed 2026-09-10T00:00:00.000Z - https:\/\/x\/7/);
   assert.match(triageSection, /- #8 approved 2026-09-11T00:00:00.000Z, not yet finalized/);
+  // fleet#49: a Principal docs PR is listed for Cory's merge; nothing else in the fleet reviews or merges it.
+  assert.ok(triageSection.includes("- #9 docs PR https://x/pull/90 opened 2026-09-11T00:02:00.000Z; the merge is Cory's"), triageSection);
   assert.equal(projectDigest({ root, now, dryRun: true }).content, content, 'the projection stays byte-stable for the same now');
 });
 

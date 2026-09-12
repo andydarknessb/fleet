@@ -188,6 +188,8 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageBy
     lines.push(`- ${tenant}: ${fold.pending.length} proposal(s) awaiting approval, ${fold.awaitingFinalize.length} approved awaiting finalizing, ${fold.proposalsTotal} proposed in all; last ${fold.windowDays} days: ${fold.window.decided} decided, ${fold.window.unchanged} approved unchanged (${ratio(fold.window.unchangedRatio)}), ${fold.window.withEdits} with edits, ${fold.window.rejected} rejected; graduation ${gate.met ? 'MET' : 'not met'} (${gate.decided}/${gate.minProposals} decided over ${gate.spanDays}/${gate.minDays} days at ${ratio(gate.unchangedRatio)} of ${ratio(gate.minUnchangedRatio)}); decision-needed wakes consumed through ${fold.consumedThrough || 'never'}.`);
     for (const row of fold.pending) lines.push(`  - #${row.issue} proposed ${row.since}${row.commentUrl ? ` - ${row.commentUrl}` : ''}`);
     for (const row of fold.awaitingFinalize) lines.push(`  - #${row.issue} ${row.outcome} ${row.since}, not yet finalized`);
+    // fleet#49: Principal docs PRs have no lead and no Work record; Cory merges them from here.
+    for (const row of fold.docsPrs || []) lines.push(`  - #${row.issue} docs PR ${row.prUrl} opened ${row.since}; the merge is Cory's`);
   }
 
   lines.push('', "## Cory's authority", '');

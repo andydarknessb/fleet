@@ -121,7 +121,7 @@ function appendEntry(root, tenant, entry) {
   return entry;
 }
 
-function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, now } = {}) {
+function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, now } = {}) {
   if (!LEDGER_KINDS.includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `kind must be one of ${LEDGER_KINDS.join(', ')}`);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : 'principal' };
@@ -146,6 +146,10 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
   if (kind === 'finalized') {
     const applied = String(labels || '').split(',').map((label) => label.trim()).filter(Boolean);
     entry.labels = applied;
+    // fleet#49: a ruling that opened a docs PR (ADR or glossary text) names it here. The
+    // lead reviews only branchPrefix PRs and pr-watch tracks only Work records, so the
+    // digest is where the PR stays visible until Cory merges it (the merge is Cory's).
+    if (prUrl) entry.prUrl = String(prUrl);
   }
   if (evidence) entry.evidence = String(evidence);
   const entries = readLedger(root, tenant);
@@ -189,6 +193,8 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
   const pending = rows.filter((row) => row.proposed && !row.outcome).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model }));
   const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits'].includes(row.outcome.kind) && !row.finalized).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
   const cutoff = new Date(new Date(at).getTime() - window * 86400000).toISOString();
+  // fleet#49: docs PRs the Principal opened while finalizing, within the window; Cory merges them.
+  const docsPrs = rows.filter((row) => row.finalized && row.finalized.prUrl && String(row.finalized.at) >= cutoff).map((row) => ({ issue: row.issue, prUrl: row.finalized.prUrl, since: row.finalized.at }));
   const tally = (list) => {
     const counts = { unchanged: 0, withEdits: 0, rejected: 0, superseded: 0, decided: 0 };
     for (const entry of list) {
@@ -209,7 +215,7 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     decided: allTime.decided, spanDays: Number(spanDays.toFixed(1)), unchangedRatio: allTime.unchangedRatio,
     met: allTime.decided >= rule.minProposals && spanDays >= rule.minDays && allTime.unchangedRatio !== null && allTime.unchangedRatio >= rule.minUnchangedRatio,
   };
-  return { at, windowDays: window, byIssue, pending, awaitingFinalize, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
+  return { at, windowDays: window, byIssue, pending, awaitingFinalize, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
 }
 
 // --------------------------------------------------------------- GitHub ----
@@ -335,7 +341,9 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
   const tickets = [];
   const skipped = [];
 
-  for (const issue of issues.map((raw) => raw.number !== undefined && raw.comments && Array.isArray(raw.labels) && raw.bodyHash ? raw : normalizeIssue(raw)).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.number - right.number)) {
+  const normalized = issues.map((raw) => raw.number !== undefined && raw.comments && Array.isArray(raw.labels) && raw.bodyHash ? raw : normalizeIssue(raw)).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.number - right.number);
+  const issueByNumber = new Map(normalized.map((issue) => [Number(issue.number), issue]));
+  for (const issue of normalized) {
     const labels = new Set(issue.labels);
     const row = projection.byIssue[issue.number] || null;
     const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
@@ -382,7 +390,11 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     if (tenant && parsed.tenant !== String(tenant)) continue;
     if (projection.consumedThrough && String(record.at) <= projection.consumedThrough) continue;
     const previous = escalations.get(record.recordId);
-    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), reason: 'decision-needed wake newer than the consumed marker' });
+    // fleet#48: an escalation carries the issue's own bodyHash, title and url (null when
+    // the issue is closed or absent) so the Principal copies the hash into
+    // `record --kind proposed` instead of hashing the body by hand and mismatching.
+    const issue = issueByNumber.get(Number(parsed.issue)) || null;
+    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
   }
 
   approvals.sort((left, right) => left.at.localeCompare(right.at));
@@ -414,7 +426,7 @@ function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, 
 
 const TRIAGE_FLAGS = Object.freeze({
   frontier: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
-  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'now'],
+  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'now'],
   state: ['root', 'tenant', 'now', 'days'],
 });
 const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n])';
@@ -429,7 +441,7 @@ function cli(argv) {
   if (command === 'record') {
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
-      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, now: args.now,
+      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], now: args.now,
     });
   }
   const config = readTriageConfig(args.root);

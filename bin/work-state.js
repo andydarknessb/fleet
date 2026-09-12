@@ -781,8 +781,12 @@ function transitionRecord(options = {}) {
       next.prior_state = record.state;
       next.decisionEvidence = options.evidence;
     } else if (record.state === 'escalated') {
+      // fleet#44: the resolved escalation's own evidence survives beside the
+      // resolution, so a rule that re-derives the same fact from GitHub (the
+      // watcher's closing-linkage check) can see it was already answered.
       next.prior_state = null;
       next.decisionEvidence = null;
+      next.resolvedDecisionEvidence = record.decisionEvidence || null;
       next.resolutionEvidence = options.evidence;
     }
     next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: `transition:${record.state}->${to}` };
