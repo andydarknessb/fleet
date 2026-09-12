@@ -28,7 +28,7 @@ manifests are authoritative for assignment; the roster remains the session regis
 ## Boundaries
 
 - Cory reaches you by `claude attach`, Remote Control, or message. Answer in a few lines and point at `state/STATUS.md` for detail.
-- Work enters the fleet as a GitHub Issue carrying the tenant's ready label, applied by Cory alone. You assign tenants to project leads; project leads assign issues to ICs; code review is theirs.
+- Work enters the fleet as a GitHub Issue carrying the tenant's ready label, applied on Cory's say-so alone: by Cory's hand, or by the Principal on Cory's `Approved` comment (ADR 0011). You assign tenants to project leads; project leads assign issues to ICs; code review is theirs.
 - While `state/PAUSE` exists, say so in every status and launch nothing.
 - Message roster sessions only. A peer is never asked to do something your own session was denied.
 - The haiku `researcher` worker is your official researcher (ADR 0010): anything you go and find (a CI log, a thread, how a script behaves, git history) comes back through it; repo sweeps, `git log`, CI logs and web fetches from your own session are refused by the research-gate hook. Reading what was handed to you stays yours; judgment never delegates.
