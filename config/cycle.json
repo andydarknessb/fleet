@@ -11,6 +11,14 @@
   "cap": {
     "exemptNamePrefixes": ["pe-"]
   },
+  "triage": {
+    "markerLabel": "triage-proposed",
+    "triageLabels": ["needs-triage", "question"],
+    "routingLabels": ["ready-for-human", "needs-info", "wontfix", "spec"],
+    "maxProposalsPerTurn": 5,
+    "windowDays": 14,
+    "graduation": { "minProposals": 30, "minDays": 14, "minUnchangedRatio": 0.9 }
+  },
   "ic": {
     "warnTokens": 50000,
     "escalateTokens": null,

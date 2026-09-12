@@ -326,7 +326,7 @@ try {
     $nodeExe = $null; try { $nodeExe = Get-NodeExe } catch {}
     $liveRoster = $null; try { $liveRoster = Get-LiveRoster } catch {}
     $cap = 0; try { $cap = [int]$static.cap } catch {}
-    $liveCount = @($daemon | Where-Object { $_.pid -and ($staticNames -contains "$($_.name)" -or "$($_.name)" -match '^ic-') }).Count
+    $liveCount = @($daemon | Where-Object { $_.pid -and ($staticNames -contains "$($_.name)" -or "$($_.name)" -match '^ic-') -and -not (Test-CapExempt "$($_.name)") }).Count
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
       $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
       if (-not $tenant) { continue }
@@ -399,6 +399,78 @@ try {
       $frontierWakes += [pscustomobject]$wake
     }
     try { Write-Json $wakeStatePath $wakeState } catch {}
+  }
+
+  # --- triage wake (ADR 0011, fleet #38). The Principal's frontier (bin/triage.js) is
+  # --- computed every tick and written to state/watchdog/triage-frontier.json: that file
+  # --- is the shadow record Cory reads before setting the flag. Only while
+  # --- state/flags/principal-live stands, in live mode, is an idle pe-<tenant> rotated for
+  # --- a non-empty frontier, under the lead wake's guards: one per tenant per tick, the
+  # --- same cooldown on identical evidence (state/watchdog/triage-wake.json), PAUSE, the
+  # --- boundary inside rotate.ps1, and state/flags/triage-wake-off as the rollback. A
+  # --- missing principal under the live flag is launchNeeded's job, not this block's. An
+  # --- unreadable frontier wakes nothing (fail closed) and says so in the shadow file.
+  $triageWakes = @()
+  $triageOff = Test-Path "$FleetHome\state\flags\triage-wake-off"
+  if (-not $Verify -and -not $triageOff) {
+    $principalLive = Test-PrincipalLive
+    $triageShadow = [ordered]@{ at = (Now-Iso); live = [bool]$principalLive; mode = $mode; tenants = @() }
+    $triageNode = $null; try { $triageNode = Get-NodeExe } catch {}
+    $triageStatePath = "$FleetHome\state\watchdog\triage-wake.json"
+    $triageState = $null; try { $triageState = Read-Json $triageStatePath } catch {}
+    if (-not $triageState) { $triageState = [pscustomobject]@{ tenants = [pscustomobject]@{} } }
+    if ($null -eq $triageState.PSObject.Properties['tenants']) { $triageState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
+    foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
+      $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
+      if (-not $tenant) { continue }
+      $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
+      $principalName = "pe-$tenantName"
+      $twake = [ordered]@{ tenant = $tenantName; principal = $principalName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null; frontierError = $null; counts = $null }
+      $frontier = $null
+      if (-not $triageNode) { $twake.frontierError = 'node not found (FLEET_NODE_PATH or PATH)' }
+      else {
+        try {
+          $triageArgs = @('frontier', '--root', $FleetHome, '--tenant', $tenantName)
+          if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $triageArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
+          $triageRaw = & $triageNode "$PSScriptRoot\triage.js" @triageArgs 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { $twake.frontierError = "triage.js exited $LASTEXITCODE`: $(Get-OneLine $triageRaw 200)" }
+          else { $frontier = ConvertFrom-LastJsonLine $triageRaw; if (-not $frontier) { $twake.frontierError = "triage.js returned no JSON: $(Get-OneLine $triageRaw 200)" } }
+        } catch { $twake.frontierError = "triage.js threw: $(Get-OneLine $_.Exception.Message 200)" }
+      }
+      if ($frontier) {
+        $twake.counts = $frontier.counts
+        foreach ($item in @($frontier.eligible)) { $twake.evidence += "$($item.kind) #$($item.number)" }
+        $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; counts = $frontier.counts; proposeNow = @($frontier.proposeNow); consumedThrough = $frontier.consumedThrough; eligible = @($frontier.eligible | ForEach-Object { [pscustomobject]@{ kind = "$($_.kind)"; number = $_.number; reason = "$($_.reason)" } }); skipped = @($frontier.skipped) }
+      } else { $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; error = $twake.frontierError } }
+      if (-not $principalLive) { $twake.decision = 'shadow'; $twake.reason = 'state/flags/principal-live absent: frontier recorded, nothing launched'; $triageWakes += [pscustomobject]$twake; continue }
+      if ($mode -ne 'live') { $twake.reason = "supervision mode is $mode, not live"; $triageWakes += [pscustomobject]$twake; continue }
+      if ($paused) { $twake.reason = 'PAUSE set'; $triageWakes += [pscustomobject]$twake; continue }
+      if ($twake.frontierError) { $twake.reason = 'frontier unreadable; waking nothing (fail closed)'; $triageWakes += [pscustomobject]$twake; continue }
+      if ($twake.evidence.Count -eq 0) { $twake.reason = 'nothing to wake for'; $triageWakes += [pscustomobject]$twake; continue }
+      $principalRow = $daemon | Where-Object { "$($_.name)" -eq $principalName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      if (-not $principalRow) { $twake.reason = 'no running principal session (launchNeeded covers a missing one)'; $triageWakes += [pscustomobject]$twake; continue }
+      if ("$($principalRow.status)" -ne 'idle') { $twake.reason = "principal is $($principalRow.status), not idle"; $triageWakes += [pscustomobject]$twake; continue }
+      $tdigest = ($twake.evidence -join '; ')
+      $tState = $null; if ($triageState.tenants.PSObject.Properties[$tenantName]) { $tState = $triageState.tenants.$tenantName }
+      if ($tState -and "$($tState.digest)" -eq $tdigest -and $tState.lastAt) {
+        $tLast = ConvertTo-UtcDateTime $tState.lastAt
+        if ($tLast -and ($now - $tLast).TotalMinutes -lt $wakeCooldown) { $twake.decision = 'cooldown'; $twake.reason = "same evidence woken at $($tState.lastAt); cooldown $wakeCooldown min"; $triageWakes += [pscustomobject]$twake; continue }
+      }
+      $twake.decision = 'wake'
+      $tRotateRaw = ''; $tRotateOut = $null
+      try { $tRotateRaw = & "$PSScriptRoot\rotate.ps1" -Name $principalName -Wake $tdigest 2>&1 | Out-String; $tRotateOut = ConvertFrom-LastJsonLine $tRotateRaw } catch { $twake.reason = "rotate.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
+      $tRotated = $false
+      if ($tRotateOut -and $tRotateOut.PSObject.Properties['rotated']) { $tRotated = (@($tRotateOut.rotated) -contains $principalName) }
+      $twake.outcome = if ($tRotateOut -and $tRotateOut.PSObject.Properties['outcomes']) { @($tRotateOut.outcomes | Where-Object { $_.name -eq $principalName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $tRotateRaw 200 }
+      if ($tRotated) {
+        $twake.decision = 'woken'
+        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest }) -Force
+        try { $twake.alert = Send-FleetAlert 'triage-wake' 'Fleet watchdog: triage wake' "$principalName relaunched for $tdigest" ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) -NoToast:$NoToast } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+      } else { $twake.decision = 'deferred'; if (-not $twake.reason) { $twake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($tRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
+      $triageWakes += [pscustomobject]$twake
+    }
+    try { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; Write-Json "$FleetHome\state\watchdog\triage-frontier.json" ([pscustomobject]$triageShadow) } catch {}
+    try { Write-Json $triageStatePath $triageState } catch {}
   }
 
   # --- page conditions ---
@@ -500,7 +572,7 @@ try {
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
     toastDelivered = $toastDelivered; checkError = $checkError; proposed = $proposed
-    launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes
+    launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes; triageWakes = $triageWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

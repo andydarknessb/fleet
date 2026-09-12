@@ -19,9 +19,9 @@ if ($inp) { $sid = $inp.session_id; $sha = [bool]$inp.stop_hook_active }
 $hb = @{ name = $name; role = $role; tenant = $tenant; sessionId = $sid; at = $now; stopHookActive = $sha }
 [IO.File]::WriteAllText("$home_\state\heartbeats\$name.json", ($hb | ConvertTo-Json -Compress), $utf8)
 
-if ($role -ne 'project-lead') { exit 0 }
+if ($role -notin @('project-lead', 'principal')) { exit 0 }
 
-# --- project lead continuation ---
+# --- project lead and principal continuation ---
 function ConvertFrom-JsonArray { param($Raw) try { $o = ($Raw | Out-String | ConvertFrom-Json); if ($null -eq $o) { return @() }; return @($o) } catch { return @() } }
 $counterPath = "$home_\state\continue\$name.json"
 $count = 0; $lastReason = ''; $total = 0
@@ -41,7 +41,8 @@ function Continue-With {
   if ($key -eq $script:lastKey) { $script:count++ } else { $script:count = 1 }
   $script:total++
   [IO.File]::WriteAllText($counterPath, (@{ count = $script:count; total = $script:total; lastAt = $now; continuedBecause = $key } | ConvertTo-Json -Compress), $utf8)
-  [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (same-reason continuation $script:count/30, total $script:total/100 since last natural stop). If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking.")
+  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
+  [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (same-reason continuation $script:count/30, total $script:total/100 since last natural stop). $hint")
   exit 2
 }
 $script:lastKey = $lastReason
@@ -49,13 +50,46 @@ $script:lastKey = $lastReason
 if (Test-Path "$home_\state\PAUSE") { Stop-Now 'PAUSE set' }
 if ($count -ge 30 -or $total -ge 100) {
   $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-  $esc = @{ at = $now; from = $name; kind = 'loop-guard'; detail = "project lead continued $count times for the same reason ('$lastReason'), $total in total, without a natural stop; possible loop" }
+  $esc = @{ at = $now; from = $name; kind = 'loop-guard'; detail = "$role continued $count times for the same reason ('$lastReason'), $total in total, without a natural stop; possible loop" }
   [IO.File]::WriteAllText("$home_\state\escalations\$stamp-$name.json", ($esc | ConvertTo-Json -Compress), $utf8)
   Stop-Now "loop guard tripped (same-reason $count, total $total); escalation filed"
 }
 $t = $null
 try { $t = Get-Content "$home_\tenants\$tenant.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 if (-not $t) { Stop-Now 'no tenant file' }
+
+# --- principal (ADR 0011, fleet #38): continue while the triage frontier is non-empty.
+# --- bin/triage.js computes it from GitHub facts, the outbox and the triage ledger; an
+# --- unreadable frontier stops the session (fail closed), never "frontier empty".
+if ($role -eq 'principal') {
+  $triageNode = $null
+  if ($env:FLEET_NODE_PATH) { if (Test-Path -LiteralPath $env:FLEET_NODE_PATH -PathType Leaf) { $triageNode = $env:FLEET_NODE_PATH } }
+  else { $triageCmd = Get-Command node -ErrorAction SilentlyContinue; if ($triageCmd) { $triageNode = $triageCmd.Source } }
+  if (-not $triageNode) { Stop-Now 'node not found; the triage frontier cannot be computed, proposing nothing' }
+  $triageArgs = @('frontier', '--root', $home_, '--tenant', $tenant)
+  if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $triageArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
+  $triageRaw = ''; $triageExit = 1; $frontierOut = $null
+  try { $triageRaw = & $triageNode "$home_\bin\triage.js" @triageArgs 2>&1 | Out-String; $triageExit = $LASTEXITCODE } catch { $triageRaw = "$($_.Exception.Message)" }
+  if ($triageExit -eq 0) { try { $frontierOut = ("$triageRaw".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { $frontierOut = $null } }
+  if ($triageExit -ne 0 -or -not $frontierOut) {
+    $triageSnippet = ("$triageRaw" -replace '\s+', ' ').Trim()
+    if ($triageSnippet.Length -gt 200) { $triageSnippet = $triageSnippet.Substring(0, 200) }
+    Stop-Now "triage frontier unreadable (triage.js exit ${triageExit}; $triageSnippet); proposing nothing"
+  }
+  $eligible = @($frontierOut.eligible)
+  if ($eligible.Count -gt 0) {
+    $approvals = @($eligible | Where-Object { $_.kind -eq 'approval' } | ForEach-Object { "#$($_.number)" })
+    $escalations = @($eligible | Where-Object { $_.kind -eq 'escalation' } | ForEach-Object { "#$($_.number)" })
+    $proposeNow = @($frontierOut.proposeNow | ForEach-Object { "#$_" })
+    $parts = @()
+    if ($approvals.Count -gt 0) { $parts += "finalize approved $($approvals -join ', ')" }
+    if ($escalations.Count -gt 0) { $parts += "rule on escalation(s) $($escalations -join ', ')" }
+    if ($proposeNow.Count -gt 0) { $parts += "propose triage for $($proposeNow -join ', ') (at most $($frontierOut.cap) this turn of $($frontierOut.counts.tickets) waiting)" }
+    Continue-With "triage frontier: $($parts -join '; '). Post on the issue first, record it with 'node $home_\bin\triage.js record', then stop; the next turn re-reads the frontier"
+  }
+  Stop-Now "triage frontier empty (issues=$($frontierOut.counts.issues), skipped=$(@($frontierOut.skipped).Count), consumed through $($frontierOut.consumedThrough)); the watchdog wakes you"
+}
+
 try { $checkPolicy = Get-TenantCheckPolicy $t } catch { Stop-Now "invalid tenant check policy: $($_.Exception.Message)" }
 $owner, $repoName = $t.github -split '/'
 

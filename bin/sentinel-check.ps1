@@ -200,13 +200,15 @@ foreach ($x in $expected) {
 }
 
 # --- strays and cap ---
-$fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$'
+$fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$'
 $known = @($expected | ForEach-Object { $_.name })
 foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fleetPattern) -and ($known -notcontains $_.name) })) {
   $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'stray'; detail = "fleet-named session not on the roster (job $($row.id)); cause not measured: launched outside launch.ps1, or its roster entry was lost or retired while the process lived" }
 }
 $liveFleet = @($daemon | Where-Object { $_.pid -and ($known -contains $_.name) })
-if ($liveFleet.Count -gt [int]$static.cap) { $report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'cap-exceeded'; detail = "$($liveFleet.Count) live fleet sessions, cap $($static.cap)" } }
+# The cap counts what the door counts: cap-exempt names (config/cycle.json cap.exemptNamePrefixes, the Principal) are outside it.
+$capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
+if ($capCounted.Count -gt [int]$static.cap) { $report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'cap-exceeded'; detail = "$($capCounted.Count) live fleet sessions, cap $($static.cap)" } }
 
 # --- clear a PAUSE we set once its window passed ---
 if (Test-Paused) {

@@ -189,11 +189,8 @@ if ($rosterEntry -and $rosterEntry.jobId) {
 # produce them. config/cycle.json `cap.exemptNamePrefixes` (the Principal, `pe-`;
 # ADR 0011 / grill Q28) lists the standing control-plane names that neither count
 # toward the cap nor are refused by it. Absent config = nothing is exempt.
-$capExemptPrefixes = @()
-try { $capExemptPrefixes = @((Read-Json "$FleetHome\config\cycle.json").cap.exemptNamePrefixes | Where-Object { "$_" }) } catch {}
-$isCapExempt = { param([string]$n) foreach ($p in $capExemptPrefixes) { if ($n.StartsWith("$p")) { return $true } } return $false }
-$capCounted = @($liveFleet | Where-Object { -not (& $isCapExempt $_.name) })
-if (-not $Force -and -not (& $isCapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
+$capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
+if (-not $Force -and -not (Test-CapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
   Write-Output (@{ launched = $false; reason = "cap reached ($($capCounted.Count)/$($static.cap))" } | ConvertTo-Json -Compress); exit 3
 }
 if ($Role -eq 'ic') {

@@ -6,6 +6,7 @@
   "releaseBranch": "main",
   "readyLabel": "ready-for-agent",
   "fleetIdentity": "andydarknessb",
+  "ownerLogin": "andydarknessb",
   "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",
   "maxIcs": 3,
