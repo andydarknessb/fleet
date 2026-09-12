@@ -130,10 +130,18 @@ test('decision-needed wakes are escalations only when newer than the consumed ma
     { at: '2026-09-08T00:00:00.000Z', recordId: 'endzone:issue-603', wake: 'checks-settled', evidence: 'not a decision' },
     { at: '2026-09-08T00:00:00.000Z', recordId: 'other:issue-1', wake: 'decision-needed', evidence: 'another tenant' },
   ];
-  const result = frontier([issue(1)], { entries, outbox });
+  const open602 = issue(602, { labels: ['ready-for-agent'], body: 'Body of #602 with a trailing newline\n' });
+  const result = frontier([issue(1), open602], { entries, outbox });
   assert.deepEqual(result.eligible.map((entry) => entry.kind), ['escalation', 'ticket']);
   assert.equal(result.eligible[0].number, 602);
   assert.equal(result.eligible[0].evidence, 'second');
+  // fleet#48: the escalation carries the issue's own hash, title and url; the
+  // Principal copies bodyHash, never computes it. Absent issue: nulls, not undefined.
+  assert.equal(result.eligible[0].bodyHash, triage.normalizeIssue(open602).bodyHash);
+  assert.equal(result.eligible[0].title, 'Issue 602');
+  assert.equal(result.eligible[0].url, 'https://github.com/owner/repo/issues/602');
+  const absent = frontier([issue(1)], { entries, outbox }).eligible[0];
+  assert.deepEqual([absent.bodyHash, absent.title, absent.url], [null, null, null]);
   assert.equal(result.consumedThrough, '2026-09-05T00:00:00.000Z');
   assert.deepEqual(result.proposeNow, [1], 'escalations do not spend the proposal cap');
 });
@@ -150,8 +158,12 @@ test('the ledger is typed: proposals need hash, comment and model; outcomes need
   assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 1, by: OWNER, now: '2026-09-10T02:00:00.000Z' }), { code: 'TRIAGE_INVALID' });
   recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 1, by: OWNER, edits: 'tier sonnet', now: '2026-09-10T02:00:00.000Z' });
   assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'rejected', issue: 1, by: OWNER, now: '2026-09-10T03:00:00.000Z' }), { code: 'TRIAGE_OUTCOME_RECORDED' });
-  const finalized = recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 1, labels: 'ready-for-agent', now: '2026-09-10T04:00:00.000Z' });
+  const finalized = recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 1, labels: 'ready-for-agent', prUrl: 'https://github.com/owner/repo/pull/9', now: '2026-09-10T04:00:00.000Z' });
   assert.deepEqual(finalized.labels, ['ready-for-agent']);
+  // fleet#49: a finalize that opened a docs PR names it, and the projection lists it for Cory's merge.
+  assert.equal(finalized.prUrl, 'https://github.com/owner/repo/pull/9');
+  assert.deepEqual(projectTriage({ entries: readLedger(root, 'endzone'), now: '2026-09-11T00:00:00.000Z' }).docsPrs, [{ issue: 1, prUrl: 'https://github.com/owner/repo/pull/9', since: '2026-09-10T04:00:00.000Z' }]);
+  assert.deepEqual(projectTriage({ entries: readLedger(root, 'endzone'), now: '2026-10-11T00:00:00.000Z' }).docsPrs, [], 'outside the window it leaves the digest');
   // A superseded proposal reopens the issue for a new proposal.
   recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 2, bodyHash: 'h', commentUrl: 'u', model: 'fable', now: '2026-09-10T05:00:00.000Z' });
   recordEntry({ root, tenant: 'endzone', kind: 'superseded', issue: 2, bodyHash: 'h3', now: '2026-09-10T06:00:00.000Z' });

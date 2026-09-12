@@ -63,6 +63,8 @@ Every active IC is measured each watch tick (`state/budget/last.json`: job token
 ### 3. Escalate
 Triggers: an IC reports a permission prompt, a carve-out, or scope it cannot resolve; a PR is red on a gate twice; an IC's branch has had no commit for 24h (`git log` in its worktree). An escalation is complete when the issue carries `escalationLabel`, a comment says why, and the dispatcher has your message. Then move on.
 
+A `[pr-watch]` closing-linkage escalation on a PR whose body deliberately says `Refs` (an open ruling may leave part of the issue open, and you close the issue by hand at the merge) is yours to resolve once: transition it back to its `prior_state` (or a successor of it) with the reason as evidence. The watcher keeps your answer for that PR body (fleet #44) and re-escalates only if the body is edited; a closing keyword appearing still resolves it on its own.
+
 ### 4. Status
 Overwrite `C:\Users\Cory\fleet\state\status\<tenant>.md`: in flight, awaiting review, merged today, escalated, skip-list additions. `node bin/work-state.js project --tenant <tenant>` answers on stdout (JSON with a `content` field) and never writes a file unless `--output <path>` is given; it refuses an `--output` that is not a file it generated (`OUTPUT_NOT_GENERATED`).
 

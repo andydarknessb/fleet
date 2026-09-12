@@ -330,6 +330,68 @@ test('linkage disappearing during review escalates decision-needed before any me
   assert.equal(outbox(root)[0].wake, 'decision-needed');
 });
 
+// fleet#44: the closing-linkage rule re-derived "no closing keyword" from GitHub on
+// every tick and re-escalated a deliberate Refs body a lead had already resolved,
+// each time blocking the formal review. A resolved closing-linkage escalation is a
+// ruling on that body: the same body never re-escalates, an edited body does.
+function resolveAsLead(root, to, evidence = 'Refs is deliberate: AC1 is escalated to Cory; closure is mine at the merge') {
+  return workState.transitionRecord({
+    root, id: 'endzone:issue-42', to, expectedRevision: record(root).revision,
+    idempotencyKey: `pl-resolve-${record(root).revision}`, actor: 'pl-endzone', evidence, now: now(),
+  });
+}
+const REFS_BODY = 'Refs #42 (deliberate; AC1 ruling open)';
+
+test('fleet#44: a lead-resolved closing-linkage escalation is not re-raised while the body is unchanged', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  const f = fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: REFS_BODY }) });
+  watch(root, f);
+  assert.equal(record(root).state, 'escalated', 'the first escalation is legitimate');
+  resolveAsLead(root, 'review');
+  const resolved = record(root);
+  assert.ok(String(resolved.resolvedDecisionEvidence).includes(`${WATCHER_MARK} closing-linkage body=`), 'the store keeps the answered fact beside the resolution');
+  for (let tick = 0; tick < 5; tick += 1) {
+    const health = watch(root, f);
+    assert.equal(record(root).state, 'review', `tick ${tick}: an already-ruled Refs body must not re-escalate`);
+    if (tick > 0) assert.deepEqual(health.actions, [], `tick ${tick}: steady state is silent`);
+  }
+  assert.equal(record(root).github.observation.closingVerified, false, 'the observation says what the body says');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed'], 'one page, not one per tick');
+});
+
+test('fleet#44: the ruling survives a re-ready: settled gates at a new head go to review with checks-settled, never back to escalated', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: REFS_BODY }) }));
+  assert.equal(record(root).state, 'escalated');
+  resolveAsLead(root, 'revision');   // the lead sends it back to the IC on the same ruling
+  const rereadied = fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: GREEN })], viewResult: view({ headRefOid: 'def456', body: REFS_BODY }) });
+  watch(root, rereadied);
+  assert.equal(record(root).state, 'pr-open');
+  watch(root, rereadied);
+  assert.equal(record(root).state, 'ci-wait');
+  watch(root, rereadied);
+  const rec = record(root);
+  assert.equal(rec.state, 'review', 'settled gates on a ruled body reach review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'checks-settled']);
+  const settledEvent = events(root).filter((e) => e.type === 'state-review').pop();
+  assert.match(String(settledEvent.evidence), /ruled deliberate by the lead/);
+});
+
+test('fleet#44: an edited body is a new fact and escalates again; a closing keyword resolves it as before', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: REFS_BODY }) }));
+  resolveAsLead(root, 'review');
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42 and the ruling paragraph was rewritten' }) }));
+  assert.equal(record(root).state, 'escalated', 'a different body was never ruled on');
+  assert.equal(record(root).prior_state, 'review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'decision-needed']);
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'review', 'linkage appearing still self-resolves the watcher own escalation');
+});
+
 test('fleet#34: a re-readied PR whose record sits in review re-enters ci-wait on the new head, then wakes checks-settled when it settles', () => {
   const root = rootDir();
   seed(root, { state: 'review' });

@@ -46,6 +46,8 @@ Open for Cory: <questions only the owner can answer, or "none">
 
 `Scope` is an allowlist sentence on purpose: the reservation builder reads "lists exactly A and B" and nothing else (fleet #32). `Tier` never says opus (amendment 14). `Precedent` is a GitHub link, never a memory: if Cory has ruled on this question before, quote that comment; if your proposal departs from it, say so and why. You never overrule a prior ruling silently.
 
+When you record a proposal, copy `bodyHash` from the frontier output (`triage.js frontier`) into `record --kind proposed --body-hash`; never compute it yourself, a hand-made hash differs by a newline and reads later as "body changed since the proposal" (fleet #48). Every frontier item carries it, escalations included.
+
 When the ticket came from a lead's `decision-needed` escalation, post the proposal on the issue first, then one line by SendMessage to `pl-<tenant>` naming the issue and the `Ruling:` line. The issue is the record; the message is the wake. Never rule only in a message. The lead waits for Cory's approval regardless.
 
 ## Approval and finalizing
@@ -54,7 +56,7 @@ An Approval is a comment on the proposal's issue from the tenant owner's GitHub 
 
 1. Post `## Ruling` restating the proposal with the edits folded in.
 2. Apply `ready-for-agent`, `ready-for-human` or `needs-info` as ruled, and remove `triage-proposed`.
-3. Record it (`triage.js record`, once it exists) and message `pl-<tenant>` if a lead was waiting.
+3. Record it (`triage.js record --kind finalized`; if the ruling opened a docs PR, add `--pr-url <url>` so the digest lists it) and message `pl-<tenant>` if a lead was waiting.
 
 Closing an issue, `wontfix` and `duplicate` are Cory's hands in every mode: for those classifications step 2 is the `## Ruling` comment only. Any other reply from Cory is a conversation: answer it, do not re-propose. Re-propose a ticket only when its body changed after your proposal or Cory asks you to in a comment.
 
@@ -62,6 +64,7 @@ Closing an issue, `wontfix` and `duplicate` are Cory's hands in every mode: for 
 
 - No routing label on your own judgment; no `ready-for-agent` before an Approval. No closing, no merging, no `wontfix`, no `duplicate`, no `gh issue close`, no `gh pr merge`.
 - Writes in the tenant repo only under `docs/adr/` and `CONTEXT.md` (an ADR or glossary proposal, opened as a docs PR from a worktree on a `docs/` branch; you merge nothing). The guard hook refuses everything else, in your session and in any worker you spawn; product code goes into the proposal's `Scope` for the IC.
+- A docs PR you open has no lead and no Work record: the lead's Stop hook lists only `fleet/` PRs and pr-watch tracks only Work records, so nobody in the fleet reviews or merges it (fleet #49). The merge is Cory's. Link the PR under `Open for Cory` in your `## Ruling` comment, record it with `--pr-url` when you finalize, and never write "merge is the lead's".
 - You never post a comment that begins with `Approved`, and neither does any other fleet session: the fleet acts under the owner's own GitHub login, so that word on an issue is Cory's alone. The guard hook refuses it in every role.
 - No proactive architecture review: when the frontier is empty you stop. Reviews are what Cory invokes.
 - No `CronCreate`, no background `until` loop: the hook stops you and the watchdog wakes you.
