@@ -112,3 +112,83 @@ Not chosen: emitting `checks-settled` from the change-within-review branch
 when the evaluation flips settled at a new head. It would wake the lead but
 leave the state field saying `review` over pending gates, and the guard in
 section 1 would still be absent on every round after the first.
+
+## 5. A risk artifact is read, not only written (fleet#43)
+
+Endzone PR #1280 (issue #1240) tripped the `accessibility` trigger; the IC
+hosted the reviewer, fixed five of six findings, and recorded a well-formed
+artifact that reported coverage better than it was in three silent ways.
+
+**A supplied finding never carries its own resolution.** Every finding was
+written with `outcome: "fixed"` beside the forced `status: "open"`, on the
+precedent of `ReportFindings`' documented `outcome` field; nothing in the
+policy read `outcome`, so the human read five resolved and the machine read
+six open. `record` now refuses a finding carrying `outcome` or `resolution`
+(`FINDING_CARRIES_OUTCOME`, exit 2, before any file exists). The artifact
+says what the reviewer found; what closed a finding is recorded by the
+review that verified the close, through `--resolutions`. Not chosen: letting
+`outcome` drive `status`. It would let the reviewed party close its own
+findings in the artifact that opened them, with nobody's verification on
+record.
+
+**The formal review walks the risk chain.** `prior` was scoped per kind, so
+a formal review never saw risk findings; no path produced a second risk
+artifact; risk findings were write-only and could not go stale. The lead
+already verifies every risk finding by hand (project-lead.md, Merge), so
+the formal review that does so now records it: the risk artifact's open
+findings need a resolution like any linked prior
+(`UNRESOLVED_FINDINGS_UNACCOUNTED` names the artifact), still-open ones are
+carried into the formal artifact with `carriedFrom`, and the formal
+artifact names the `riskArtifact` it consumed so a later re-review binds to
+the formal chain alone. `--no-findings` beside a still-open risk finding is
+refused as before; a chain whose risk findings all resolved can say so. A
+missing risk file degrades to `riskArtifactMissing: true`, as a missing
+formal prior does. The two kinds stay separate reviews; what is coupled is
+the resolution ledger, which was the open question in fleet#43. Not chosen:
+a linked risk re-review path. It would have the IC verify its own fixes at
+its own angle, which is the coverage hole the third ruling names.
+
+**`reviewedSha` is the tree the reviewer read.** The qa-reviewer read
+`000c07b9`; the IC recorded at `17fa3c48`, the post-fix head, and `headSha`
+could not say which. Five focus and aria-state fixes landed after the
+accessibility read and were reviewed by nobody at that angle, while the
+artifact answered "covered". `record` now writes `reviewedSha` (from
+`--reviewed-sha`, defaulting to the head) beside `headSha`, and a risk
+artifact whose two differ carries `range: <reviewed>..<head>`, the delta no
+reviewer at that angle has read, visible instead of implied. A formal
+review is the lead's own read at the head it records, so there the two
+must agree (`REVIEWED_SHA_MISMATCH`, exit 2): a moved head is a re-review,
+never a record of a tree nobody read.
+
+## 6. The reviewer is the session (fleet#46)
+
+`record` wrote `reviewer: "unknown"` whenever `--actor` was omitted, the
+documented invocation omitted it, and a replay cannot repair it (ruling 3),
+so one record's chain carried `pl-endzone` on two artifacts and `unknown` on
+the third. `record` and `hold` now default the actor to `FLEET_NAME`, which
+every fleet session carries, before falling back to `unknown`; `--actor`
+still wins. The documented lines carry `--actor` too, so a build without the
+fallback still records provenance.
+
+## 7. The hook and the review gate share one clock (fleet#51)
+
+The lead's Stop hook read "CI settled" from live GitHub while `record
+--kind formal` reads the Work record, which the PR watcher advances on a
+five-minute tick. In the window between a green check and the next tick the
+hook said "review #1285" and the gate refused #1285
+(`INVALID_REVIEW_STATE`), and nine minutes later it named one reviewable and
+one unreviewable PR in the same sentence. The lead had no sanctioned way to
+close the gap: forging an observation and polling in a loop are both
+forbidden for good reasons.
+
+Now a PR awaits review only when its Work record is in `review`, the state
+that opens the formal door (ruling 1). A PR green on GitHub whose record is
+still `ci-wait` is named as lagging ("record still ci-wait", the watcher's
+next tick moves it), never offered. Under `state/flags/pr-watch-off` the
+records do not advance, so the live verdict decides again; a PR with no
+Work record keeps the live verdict, labelled, so nothing goes invisible.
+The hook's advice to schedule a `CronCreate` re-check for a PR waiting on
+CI is gone: the watcher records `checks-settled` and the watchdog wakes the
+lead. Not chosen: a lead-invoked "observe this PR now" command. It would be
+a second writer of watcher evidence, and the lag it removes is at most one
+tick.

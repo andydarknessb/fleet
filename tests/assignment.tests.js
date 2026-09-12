@@ -331,6 +331,48 @@ test('fleet#32: a prohibition no longer collides a ticket with the directory own
   assert.deepEqual(frontier.excluded, []);
 });
 
+
+// fleet#52: endzone #1264's first criterion names `entities/matchup/entityImportBoundary.test.js`
+// as the TEMPLATE the two new slices copy ("like `...`"); the ticket must never edit it. The
+// derivation reserved it, and nothing else, so the record would have claimed one file the
+// ticket never touches and none of the sixteen it writes. A path introduced by a citation
+// cue (like, similar to, modelled on, as in, see, per, cf., e.g., such as) reserves nothing
+// from that sentence; the same path in an edit sentence is still reserved.
+test('fleet#52: a path cited as a template to imitate reserves nothing, so the assignment fails closed instead of claiming it', () => {
+  const body = [
+    '## Acceptance criteria',
+    '1. Import-boundary test like `entities/matchup/entityImportBoundary.test.js` passes for both slices.',
+    '2. `npm test -- src/components/LeaguePickem` is green.',
+  ].join('\n');
+  const normalized = normalizeIssue(issue(1264, { body }));
+  assert.deepEqual(normalized.reservations, { components: ['src/components/LeaguePickem'], migrationPrefixes: [], schemaAreas: [], testResources: [] });
+
+  const root = rootDir();
+  const base = 'b'.repeat(40);
+  assert.throws(
+    () => reserveAssignment({ root, issue: issue(1264, { body: body.split('\n').slice(0, 2).join('\n') }), tenant: 'endzone', readyLabel: 'ready-for-agent', base }),
+    (error) => error.code === 'EMPTY_RESERVATIONS' && error.issue === 1264,
+  );
+});
+
+test('fleet#52: every citation cue is a citation; the written path beside it is still reserved, and an edit sentence still reserves a path cited elsewhere', () => {
+  const normalized = normalizeIssue(issue(1265, {
+    body: [
+      'Add `src/entities/pickem-board/entityImportBoundary.test.js` modelled on `src/entities/matchup/entityImportBoundary.test.js`.',
+      'Shape it similar to `src/entities/matchup/model/matchupModel.js`, as in `src/entities/roster/model/lineupModel.js`.',
+      'See `src/shared/lib/kickoff.js`; per `src/shared/lib/formatCount.js`; cf. `src/shared/lib/parseInjury.js`; e.g. `src/shared/lib/positions.js`; such as `src/shared/lib/adp.js`.',
+      'Create `src/entities/pickem-board/model/boardModel.js` like the existing `src/entities/pickem-slate/model/slateModel.js`.',
+      'Update `src/entities/matchup/model/matchupModel.js` to export the shared helper.',
+    ].join('\n'),
+  }));
+  assert.deepEqual(normalized.reservations, {
+    components: ['src/entities/matchup/model/matchupModel.js', 'src/entities/pickem-board/model/boardModel.js'],
+    migrationPrefixes: [],
+    schemaAreas: [],
+    testResources: ['src/entities/pickem-board/entityImportBoundary.test.js'],
+  });
+});
+
 // fleet#33: endzone #1234's six criteria name seams in prose and no path, so the
 // derivation produced an empty set and the record silently blocked every later
 // third assignment. Assign refuses that; the lead answers with --reservations.
