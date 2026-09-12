@@ -8,6 +8,20 @@ function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
 # 02/03 cutover: while this flag stands the assignment planner (bin/assignment.js) is the
 # authoritative frontier and launch path for ICs; the launch door refuses a legacy IC launch.
 function Test-AssignmentLive { Test-Path "$FleetHome\state\flags\assignment-live" }
+# ADR 0011 (fleet #38): while this flag stands the Principal (pe-<tenant>) is an expected
+# static session (launched by launchNeeded, woken by the watchdog's triage wake). Absent
+# the flag its roster entry is inert: nothing expects, launches, recovers or wakes it, and
+# the watchdog only records the triage frontier it would have woken it for.
+function Test-PrincipalLive { Test-Path "$FleetHome\state\flags\principal-live" }
+# config/cycle.json cap.exemptNamePrefixes: standing control-plane names (the Principal,
+# `pe-`) that neither count toward the cap nor are refused by it; the cap bounds concurrent
+# worktrees and PR churn, which these sessions never produce. Absent config = nothing exempt.
+function Get-CapExemptPrefixes {
+  $prefixes = @()
+  try { $prefixes = @((Read-Json "$FleetHome\config\cycle.json").cap.exemptNamePrefixes | Where-Object { "$_" } | ForEach-Object { "$_" }) } catch {}
+  return $prefixes
+}
+function Test-CapExempt { param([string]$Name) foreach ($p in (Get-CapExemptPrefixes)) { if ("$Name".StartsWith($p)) { return $true } }; return $false }
 # Ticket 09: a high-priority alert for the actions Cory audits in real time (a watchdog
 # frontier wake). Three channels, none of them fatal: the Windows toast, a webhook POST
 # (Slack-compatible {"text": ...}) to the URL in FLEET_ALERT_WEBHOOK or
@@ -43,6 +57,8 @@ function Get-ExpectedStaticSessions {
   if (-not $Static) { $Static = Get-StaticRoster }
   $sessions = @(); if ($Static -and $Static.sessions) { $sessions = @($Static.sessions) }
   if (Test-SentinelOff) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'sentinel' -and "$($_.name)" -ne 'sentinel' }) }
+  # The inverse gate for the Principal: expected only while principal-live stands (ADR 0011).
+  if (-not (Test-PrincipalLive)) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'principal' -and "$($_.name)" -notmatch '^pe-' }) }
   return $sessions
 }
 function Get-LiveRoster {

@@ -349,7 +349,7 @@ try {
   # ===== Ticket 09 ruling 2: the frontier wake =====
   # A mock rotate.ps1 records every -Wake call and answers like the real one; the planner
   # runs for real against a fixture issue file (FLEET_GITHUB_ISSUES_FIXTURE).
-  foreach ($f in 'assignment.js','work-state.js','exclusions.js','notify.js','assignment-parity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
+  foreach ($f in 'assignment.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
   [IO.Directory]::CreateDirectory("$testRoot\state\work") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\state\watch") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
@@ -364,7 +364,7 @@ try {
   Write-Utf8 (Join-Path $testRoot 'state\flags\sentinel-off') 'wake test'
   Remove-Item (Join-Path $testRoot 'state\heartbeats\sentinel.json') -ErrorAction SilentlyContinue
   Remove-Item (Join-Path $testRoot 'state\watchdog\paged.json') -ErrorAction SilentlyContinue
-  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName readyLabel -NotePropertyValue 'ready-for-agent' -Force; $_ | Add-Member -NotePropertyName maxIcs -NotePropertyValue 2 -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName readyLabel -NotePropertyValue 'ready-for-agent' -Force; $_ | Add-Member -NotePropertyName maxIcs -NotePropertyValue 2 -Force; $_ | Add-Member -NotePropertyName ownerLogin -NotePropertyValue 'cory-owner' -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
   $leadStart = Get-EpochMs (Get-Date).AddHours(-2)
   $idleLeadRows = '[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + $leadStart + '}]'
   $busyLeadRows = $idleLeadRows.Replace('"status":"idle","pid":13', '"status":"busy","pid":13')
@@ -433,6 +433,78 @@ try {
   Assert-True (@($w7.frontierWakes).Count -eq 0 -and @(Get-RotateCalls).Count -eq $callsBefore) 'the flag must disable the wake'
   Remove-Item "$testRoot\state\flags\frontier-wake-off"
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
+
+  # ===== ADR 0011 (fleet #38): the triage wake =====
+  # bin/triage.js runs for real against a fixture (FLEET_TRIAGE_ISSUES_FIXTURE); the mock
+  # rotate.ps1 above records the wake. Without principal-live the frontier is only recorded.
+  $triageFixture = "$testRoot\triage-fixture.json"
+  Write-Utf8 $triageFixture '[{"number":601,"title":"Unrouted","url":"https://github.com/owner/repo/issues/601","body":"Something is off.","createdAt":"2026-09-02T00:00:00.000Z","labels":[],"assignees":[],"comments":[]}]'
+  $env:FLEET_TRIAGE_ISSUES_FIXTURE = $triageFixture
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\triage-frontier.json" -ErrorAction SilentlyContinue
+  function Get-TriageRotateCalls { @(Get-RotateCalls | Where-Object { $_ -like 'pe-test|*' }) }
+
+  # Case T1: flag absent -> shadow: the frontier is recorded to the shadow file, nothing is rotated.
+  Set-AgentsRows $idleLeadRows
+  $t1 = Run-Watchdog
+  $tw1 = @($t1.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($null -ne $tw1 -and $tw1.decision -eq 'shadow') "without principal-live the triage wake must be shadow (got $($tw1 | ConvertTo-Json -Compress -Depth 5))"
+  Assert-True ((@($tw1.evidence) -join ' ') -match 'ticket #601') 'the shadow record must name the ticket'
+  Assert-True (Test-Path "$testRoot\state\watchdog\triage-frontier.json") 'the shadow file must be written'
+  $shadow1 = Get-Content "$testRoot\state\watchdog\triage-frontier.json" -Raw | ConvertFrom-Json
+  Assert-True ($shadow1.live -eq $false -and (@(@($shadow1.tenants)[0].proposeNow) -contains 601)) 'the shadow file must carry the frontier'
+  Assert-True (@(Get-TriageRotateCalls).Count -eq 0) 'shadow must not rotate the principal'
+
+  # Case T2: flag present, principal rostered and idle, frontier non-empty -> one wake through rotate.ps1 -Wake, one triage-wake alert.
+  Write-Utf8 "$testRoot\state\flags\principal-live" 'x'
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"},{"name":"pe-test","role":"principal","parent":"dispatcher","tenant":"test"}]}'
+  $principalRows = $idleLeadRows.TrimEnd(']') + ',{"id":"job-pe","name":"pe-test","state":"working","status":"idle","pid":14,"startedAt":' + $leadStart + '}]'
+  Set-AgentsRows $principalRows
+  Set-Heartbeat 'pe-test' 5
+  $alertsBefore = @(Get-AlertLines).Count
+  $t2 = Run-Watchdog
+  $tw2 = @($t2.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw2.decision -eq 'woken') "an idle principal with a frontier must be woken (got $($tw2.decision): $($tw2.reason); error=$($tw2.frontierError))"
+  Assert-True (@(Get-TriageRotateCalls) -contains 'pe-test|ticket #601') 'the triage wake must go through rotate.ps1 -Wake with the evidence'
+  $alerts2 = @(Get-AlertLines)
+  Assert-True ($alerts2.Count -eq $alertsBefore + 1 -and ($alerts2[-1] | ConvertFrom-Json).kind -eq 'triage-wake') 'every executed triage wake must write one alert audit line'
+  Assert-True (Test-Path "$testRoot\state\watchdog\triage-wake.json") 'the triage wake state must be recorded'
+
+  # Case T3: the same evidence inside the cooldown -> no second wake.
+  $t3 = Run-Watchdog
+  $tw3 = @($t3.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw3.decision -eq 'cooldown') "identical evidence inside the cooldown must not wake again (got $($tw3.decision))"
+
+  # Case T4: a busy principal is not woken.
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows ($principalRows.Replace('"status":"idle","pid":14', '"status":"busy","pid":14'))
+  $t4 = Run-Watchdog
+  $tw4 = @($t4.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw4.decision -eq 'none' -and $tw4.reason -match 'not idle') "a busy principal must not be woken (got $($tw4.decision): $($tw4.reason))"
+
+  # Case T5: every issue routed -> nothing to wake for.
+  Set-AgentsRows $principalRows
+  Write-Utf8 $triageFixture '[{"number":602,"title":"Ready","url":"https://github.com/owner/repo/issues/602","body":"x","createdAt":"2026-09-02T00:00:00.000Z","labels":["ready-for-agent"],"assignees":[],"comments":[]}]'
+  $t5 = Run-Watchdog
+  $tw5 = @($t5.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw5.decision -eq 'none' -and $tw5.reason -match 'nothing to wake for') "a routed-only board must not wake (got $($tw5.decision): $($tw5.reason))"
+
+  # Case T6: an unreadable frontier wakes nothing and says so (fail closed).
+  $env:FLEET_TRIAGE_ISSUES_FIXTURE = "$testRoot\missing-fixture.json"
+  $callsBefore6 = @(Get-TriageRotateCalls).Count
+  $t6 = Run-Watchdog
+  $tw6 = @($t6.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ("$($tw6.frontierError)" -ne '' -and $tw6.decision -eq 'none' -and $tw6.reason -match 'fail closed') "an unreadable frontier must fail closed (got $($tw6.decision): $($tw6.reason); error=$($tw6.frontierError))"
+  Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6) 'an unreadable frontier must not rotate'
+  $env:FLEET_TRIAGE_ISSUES_FIXTURE = $triageFixture
+
+  # Case T7: state/flags/triage-wake-off disables the block entirely.
+  Write-Utf8 "$testRoot\state\flags\triage-wake-off" 'x'
+  $t7 = Run-Watchdog
+  Assert-True (@($t7.triageWakes).Count -eq 0) 'the flag must disable the triage wake'
+  Remove-Item "$testRoot\state\flags\triage-wake-off"
+  Remove-Item "$testRoot\state\flags\principal-live"
+  Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE
 
   Write-Output 'watchdog tests passed'
 } finally {

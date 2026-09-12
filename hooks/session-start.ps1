@@ -87,6 +87,10 @@ if ($role -in @('ic', 'project-lead', 'dispatcher', 'principal')) {
   $gateState = if (Test-Path "$home_\state\flags\research-gate-off") { 'off (state/flags/research-gate-off stands)' } else { 'on' }
   Write-Output "Researcher: the haiku researcher worker (Agent tool, subagent_type: researcher) is your official researcher (ADR 0010). Repo sweeps, git log, CI logs and web fetches from this session are refused by the research-gate hook (gate $gateState); give the researcher the one question and a line cap. Reading what was handed to you stays yours."
 }
+if ($role -eq 'principal') {
+  $principalMode = if (Test-Path "$home_\state\flags\principal-live") { 'live' } else { 'shadow (state/flags/principal-live absent; you were launched by hand)' }
+  Write-Output "Principal (ADR 0011, $principalMode): your frontier is 'node $homeFwd/bin/triage.js frontier --root $homeFwd --tenant $tenant' (approvals to finalize, escalations to rule on, then at most cap tickets to propose, oldest first); your Stop hook runs it and continues you while it is non-empty. Record every proposal, outcome and finalizing with 'node $homeFwd/bin/triage.js record --root $homeFwd --tenant $tenant --kind <kind> ...' right after the gh call that made it true; 'triage.js state' shows the ledger. You are advisory: no routing label without the owner's Approved comment; closing, wontfix and duplicate are never yours."
+}
 # 02/03 cutover: a manifest-launched IC learns its manifest, Work record, and the
 # acknowledgment command here, with the record's current revision read at hook time
 # so the first useful turn can acknowledge without a lookup.

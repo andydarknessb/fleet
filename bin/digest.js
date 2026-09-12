@@ -13,6 +13,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 const { readExclusions, projectExclusions } = require('./exclusions');
+const { readLedger: readTriageLedger, projectTriage, readTriageConfig } = require('./triage');
 
 const CREATION_TYPES = Object.freeze(['assignment-reserved', 'work-created', 'shadow-projected']);
 const RETIRED_TYPES = Object.freeze(['assignment-released', 'assignment-retired', 'shadow-retired']);
@@ -121,7 +122,7 @@ function renderRow(row) {
   return `${row.tenant} #${row.issue}`;
 }
 
-function render({ scope, tenantNames, rows, events, exclusionsByTenant, offset, configs }) {
+function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, offset, configs }) {
   const lastEvent = events[events.length - 1] || null;
   const lines = [];
   lines.push(scope === 'fleet' ? '# Fleet digest' : `# ${scope} status`);
@@ -176,6 +177,19 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, offset, 
     lines.push(`  reason was: ${entry.reason}`);
   }
 
+  // ADR 0011: the Principal's ledger, folded. The approved-unchanged ratio over the
+  // window is the graduation metric; the all-time gate is printed beside it.
+  lines.push('', '## Triage (advisory Principal, ADR 0011)', '');
+  for (const tenant of tenantNames) {
+    const fold = (triageByTenant || {})[tenant];
+    if (!fold) { lines.push(`- ${tenant}: no triage ledger.`); continue; }
+    const ratio = (value) => (value === null || value === undefined ? 'n/a' : `${Math.round(value * 100)}%`);
+    const gate = fold.graduation;
+    lines.push(`- ${tenant}: ${fold.pending.length} proposal(s) awaiting approval, ${fold.awaitingFinalize.length} approved awaiting finalizing, ${fold.proposalsTotal} proposed in all; last ${fold.windowDays} days: ${fold.window.decided} decided, ${fold.window.unchanged} approved unchanged (${ratio(fold.window.unchangedRatio)}), ${fold.window.withEdits} with edits, ${fold.window.rejected} rejected; graduation ${gate.met ? 'MET' : 'not met'} (${gate.decided}/${gate.minProposals} decided over ${gate.spanDays}/${gate.minDays} days at ${ratio(gate.unchangedRatio)} of ${ratio(gate.minUnchangedRatio)}); decision-needed wakes consumed through ${fold.consumedThrough || 'never'}.`);
+    for (const row of fold.pending) lines.push(`  - #${row.issue} proposed ${row.since}${row.commentUrl ? ` - ${row.commentUrl}` : ''}`);
+    for (const row of fold.awaitingFinalize) lines.push(`  - #${row.issue} ${row.outcome} ${row.since}, not yet finalized`);
+  }
+
   lines.push('', "## Cory's authority", '');
   for (const tenant of tenantNames) {
     const config = configs[tenant] || {};
@@ -218,7 +232,12 @@ function projectDigest(options = {}) {
     exclusionsByTenant[tenant] = projectExclusions({ entries, events, now: options.now });
   }
   const offset = { events: eventsOffset, exclusions: exclusionsOffset };
-  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, offset, configs });
+  const triageConfig = readTriageConfig(base);
+  const triageByTenant = {};
+  for (const tenant of tenantNames) {
+    triageByTenant[tenant] = projectTriage({ entries: readTriageLedger(base, tenant), now: options.now, windowDays: triageConfig.windowDays, graduation: triageConfig.graduation });
+  }
+  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, offset, configs });
   const output = options.output ? path.resolve(options.output) : path.join(base, 'state', 'status', options.tenant ? `${options.tenant}-status.md` : 'DIGEST.md');
   if (!options.dryRun) writeAtomic(output, content);
   return { output, content, offset };
