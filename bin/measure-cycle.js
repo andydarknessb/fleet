@@ -5,7 +5,8 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
 
-const CONTROL_PLANE_ROLES = new Set(['dispatcher', 'project-lead', 'sentinel', 'notifier']);
+// The Principal (ADR 0011) is control plane: it routes tickets and proposes rulings, never implements a unit.
+const CONTROL_PLANE_ROLES = new Set(['dispatcher', 'project-lead', 'sentinel', 'notifier', 'principal']);
 const POLLING_COMMAND = /(?:\bgh\s+(?:pr\s+(?:view|checks|list)|issue\s+(?:view|list))\b|\b(?:git\s+(?:status|log|diff|show)|Get-Content|Get-Item|Test-Path|ListAgents|claude\s+agents)\b)/i;
 const PR_REFERENCE = /\bPR\s*#?(\d+)\b|\bpull request\s*#?(\d+)\b/gi;
 const GH_PR_REFERENCE = /\bgh\s+pr\s+(?:view|checks|merge|create)\s+#?(\d+)\b/gi;

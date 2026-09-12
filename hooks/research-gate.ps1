@@ -12,7 +12,7 @@ try { $inp = "$raw" | ConvertFrom-Json } catch {}
 if (-not $inp) { exit 0 }
 $home_ = $env:FLEET_HOME; $role = $env:FLEET_ROLE
 if (-not $home_ -or -not $role) { exit 0 }                                   # not a fleet session
-if ($role -notin @('ic', 'project-lead', 'dispatcher')) { exit 0 }            # sentinel runs scripts only
+if ($role -notin @('ic', 'project-lead', 'dispatcher', 'principal')) { exit 0 } # sentinel runs scripts only; principal gated per ADR 0011
 if (Test-Path "$home_\state\flags\research-gate-off") { exit 0 }
 if ($inp.PSObject.Properties['agent_id'] -and "$($inp.agent_id)") { exit 0 } # inside a sub-agent: the researcher's own reads
 

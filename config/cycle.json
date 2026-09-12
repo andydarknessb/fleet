@@ -5,7 +5,11 @@
     "dispatcher": 22000,
     "project-lead": 30000,
     "ic": 35000,
-    "sentinel": 22000
+    "sentinel": 22000,
+    "principal": 30000
+  },
+  "cap": {
+    "exemptNamePrefixes": ["pe-"]
   },
   "ic": {
     "warnTokens": 50000,
@@ -30,7 +34,8 @@
   },
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },
-    "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 }
+    "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 },
+    "principal": { "maxAgeHours": 24, "maxJobTokens": 250000 }
   },
   "supervisor": {
     "parityHours": 48,

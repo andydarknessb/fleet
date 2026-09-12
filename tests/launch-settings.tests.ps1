@@ -29,6 +29,7 @@ try {
   foreach ($roleName in 'dispatcher','project-lead','ic') {
     Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
   }
+  Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: fable`neffort: high`n---`nRole body for principal."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -138,6 +139,33 @@ exit $LASTEXITCODE
   Assert-True ("$($rh.reason)" -match 'auto mode' -and "$($rh.reason)" -match 'fleet #28') 'the haiku refusal must name the CLI auto-mode cause'
   $rs = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
   Assert-True ($rs.dryRun -eq $true -and $rs.model -eq 'sonnet') 'a sonnet launch still dry-runs'
+
+  # ADR 0011 (fleet #37): the Principal comes through the door as pe-<tenant>, on the
+  # pinned Fable id at effort high, with the control-plane tenant-repo denial and its
+  # own ceiling; it is named by scheme and needs a tenant; it neither counts toward
+  # nor is refused by the cap.
+  $rp = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun')
+  Assert-True ($rp.dryRun -eq $true) "a principal dry run must pass the gates (got: $rp)"
+  Assert-True ("$($rp.command)" -match '--model claude-fable-5-1') 'a principal with no -Model must run the pinned Fable id'
+  Assert-True ("$($rp.command)" -match '--effort high') 'a principal must run at the role file effort'
+  Assert-True ($rp.budget.ceiling -eq 30000) 'the principal ceiling must come from config/cycle.json'
+  $denyP = @((Get-Content "$testRoot\state\sessions\pe-test.settings.json" -Raw | ConvertFrom-Json).permissions.deny)
+  Assert-True ($denyP -contains "Edit($repoFwd/**)") 'a principal must lose engineering edits in tenant repos until the write guard lands'
+  $rpf = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-Model', 'fable', '-DryRun')
+  Assert-True ("$($rpf.command)" -match '--model claude-fable-5-1') 'an explicit -Model fable must resolve to the same pinned id'
+  Run-Launch @('-Role', 'principal', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
+  Assert-True ($script:lastExit -eq 4) 'a principal not named pe-<tenant> must be refused as a usage error'
+  Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
+  Assert-True ($script:lastExit -eq 4) 'a principal without -Tenant must be refused as a usage error'
+  # Cap: a full cap refuses a lead but not the principal, and the principal's own
+  # session does not count toward it.
+  Write-Utf8 "$testRoot\roster.json" '{"cap":1,"sessions":[{"name":"pe-test","role":"principal","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"p"},{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"p"}]}'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo [{"name":"pe-test","id":"j1","sessionId":"s1","state":"idle"}]' + "`r`n" + 'exit /b 0' + "`r`n")
+  $rcap = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
+  Assert-True ($rcap.dryRun -eq $true) "a running principal must not count toward the cap (got: $rcap)"
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo [{"name":"pl-test","id":"j2","sessionId":"s2","state":"idle"}]' + "`r`n" + 'exit /b 0' + "`r`n")
+  $rcap2 = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'p', '-DryRun')
+  Assert-True ($rcap2.dryRun -eq $true) "a full cap must not refuse the principal (got: $rcap2)"
 
   Write-Output 'launch settings tests passed'
 } finally {
