@@ -343,3 +343,37 @@ answers with `--reservations '{"components":[...],"testResources":[...]}'`,
 the Work record's own shape; an unknown field is a usage error. An explicit
 set replaces the derived one entirely, is pinned in the manifest like any
 other, and is subject to the same conflict check and third-assignment proof.
+
+## Citation-cue amendment (2026-09-12, fleet#52)
+
+Endzone #1264's first criterion read "Import-boundary test **like**
+`entities/matchup/entityImportBoundary.test.js` passes for both slices". The
+path is a template the two new slices copy; the ticket must never edit it.
+The derivation reserved it, and nothing else, so the record would have
+claimed one file the ticket never touches and none of the sixteen it writes,
+and `proof` would have called a genuinely colliding ticket independent. Same
+family as the prohibition (rule 2), opposite polarity: named as an example
+to imitate rather than named in order to forbid.
+
+5. A path introduced by a citation cue ("like", "unlike", "similar to",
+   "modelled on/after", "patterned on/after", "as in", "see", "per", "cf.",
+   "e.g.", "such as", "mirroring", "akin to", "in the shape/style of")
+   reserves nothing from that sentence. The cue must stand immediately
+   before the path, with at most an article or "existing" between, so the
+   written path earlier in the same sentence ("Add `A` modelled on `B`") is
+   still reserved, and a path cited in one sentence is still reserved from
+   another sentence that edits it. An abbreviation's period ("cf.", "e.g.",
+   "i.e.") no longer ends a sentence, so the cue stays beside its path.
+
+The refuse-rather-than-guess half is already in place: with the citation
+gone, #1264 derives nothing and `assign` fails closed on
+`EMPTY_RESERVATIONS`, so the lead declares the sixteen-file set by hand, as
+was done at the time. Not chosen: refusing a lone reservation under a
+directory the ticket does not otherwise name. It is a useful tell for a
+reader and a poor rule for a tool; a one-file ticket is exactly that shape.
+
+One residual is known and accepted, in the same family as rule 4's: "per"
+and "see" are ordinary prepositions as well as cues, so an edit sentence of
+the shape "store the failure per `server/x.js`" loses that path silently,
+and nothing fails closed unless it was the only path. The allowlist
+criterion is the precise tool there too.

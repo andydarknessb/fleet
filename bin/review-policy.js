@@ -19,6 +19,10 @@
 //                 a risk review without a trigger are refused; an identical
 //                 retry replays. A revision bumped by a routine observation
 //                 (pr-watch) retries internally rather than losing the review.
+//                 A finding never carries its own `outcome`; the formal review
+//                 resolves the risk artifact's open findings; `reviewedSha` is
+//                 the tree the reviewer read (fleet#43). `--actor` defaults to
+//                 FLEET_NAME (fleet#46).
 //   plan-rereview a revision re-review inspects the changed range and the
 //                 unresolved findings, never the settled material.
 //   hold          a clean carve-out (or any PR requiring Cory) parks in the
@@ -259,20 +263,31 @@ function writeArtifactExclusive(root, recordId, kind, buildContent) {
   }
 }
 
-function buildFindings(stamp, suppliedFindings, priorArtifactData, priorArtifactPath, resolutions) {
+// fleet#43: a supplied finding never carries its own resolution. On endzone PR
+// #1280 the IC wrote `outcome: "fixed"` beside the forced `status: "open"`,
+// read the artifact as five resolved findings, and the machine read six open;
+// `outcome` (ReportFindings' field) appeared nowhere in the resolution logic.
+// The artifact says what the reviewer FOUND; what closed a finding is recorded
+// by the review that verified the close, through --resolutions (ADR 0009, 5).
+const RESOLUTION_LIKE_FIELDS = Object.freeze(['outcome', 'resolution']);
+
+function buildFindings(stamp, suppliedFindings, priors, resolutions) {
   // Caller fields never override the forced-open status: openFindings gates the
   // unresolved-findings guard on it.
-  const findings = (suppliedFindings || []).map((finding, index) => ({
-    ...finding,
-    id: finding.id || `${stamp}-f${index + 1}`,
-    status: 'open',
-  }));
-  if (priorArtifactData) {
+  const findings = (suppliedFindings || []).map((finding, index) => {
+    const carried = RESOLUTION_LIKE_FIELDS.find((field) => finding[field] !== undefined);
+    if (carried) {
+      throw new ReviewPolicyError('FINDING_CARRIES_OUTCOME', `finding ${finding.id || `#${index + 1}`} carries \`${carried}\`; a recorded finding is open (the artifact says what the reviewer found), and what closed it is recorded through --resolutions on the review that verified the close: a risk finding by the lead's formal review, a formal finding by the linked re-review`, { finding: finding.id || index + 1, field: carried });
+    }
+    return { ...finding, id: finding.id || `${stamp}-f${index + 1}`, status: 'open' };
+  });
+  for (const { data, path: priorPath } of priors) {
+    if (!data) continue;
     // Carry the still-open prior findings forward so the latest artifact is the
     // complete unresolved set; resolved and not-real material is settled.
-    for (const finding of openFindings(priorArtifactData)) {
+    for (const finding of openFindings(data)) {
       if (resolutions[finding.id] === 'still-open') {
-        findings.push({ ...finding, status: 'open', carriedFrom: priorArtifactPath });
+        findings.push({ ...finding, status: 'open', carriedFrom: priorPath });
       }
     }
   }
@@ -289,6 +304,17 @@ function recordReviewArtifact(options = {}) {
   const { recordId, kind, headSha, actor } = options;
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
   if (!['formal', 'risk'].includes(kind)) throw new ReviewPolicyError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
+  // fleet#43: `headSha` is the head the artifact is recorded against;
+  // `reviewedSha` is the tree the reviewer actually read. An IC that fixes
+  // findings after the risk reviewer read the tree records at the post-fix
+  // head with the reviewer's tree named, and the uncovered delta becomes the
+  // artifact's `range` instead of an implied "reviewed". A formal review is the
+  // lead's own read at the head it records, so there the two must agree; a
+  // moved head is a re-review, never a record at a tree nobody read.
+  const reviewedSha = options.reviewedSha !== undefined && options.reviewedSha !== null ? String(options.reviewedSha) : String(headSha);
+  if (kind === 'formal' && reviewedSha !== String(headSha)) {
+    throw new ReviewPolicyError('REVIEWED_SHA_MISMATCH', `a formal review is recorded at the head it read: --reviewed-sha ${reviewedSha} differs from --head-sha ${headSha}; re-review at ${headSha} (plan-rereview scopes it) rather than record a review of a tree nobody read`, { reviewedSha, headSha: String(headSha) });
+  }
   const classification = options.classification || {};
   // Ticket 09: with state/flags/review-dedup-off every review pass is written down (the
   // legacy behaviour). The default replay key is kind:record:head, which would make a
@@ -334,9 +360,14 @@ function recordReviewArtifact(options = {}) {
 
       let priorArtifactData = null;
       let priorArtifactMissing = false;
-      let range = null;
+      let range = kind === 'risk' && reviewedSha !== String(headSha) ? `${reviewedSha}..${headSha}` : null;
       const resolutions = options.resolutions || null;
       const sameHeadPassUnderFlag = dedupOff && prior && prior.headSha === String(headSha) && !options.priorArtifact;
+      // Every artifact whose open findings this review must account for: the
+      // linked formal prior, and (fleet#43) the risk artifact the formal
+      // review consumes. Each open finding needs a resolution; still-open ones
+      // are carried into this artifact so it stays the complete unresolved set.
+      const priors = [];
       if (kind === 'formal' && prior && !sameHeadPassUnderFlag) {
         if (!options.priorArtifact || options.priorArtifact !== prior.artifact) {
           throw new ReviewPolicyError('REREVIEW_REQUIRES_PRIOR', `a revision re-review must link the prior findings artifact ${prior.artifact}`, { priorArtifact: prior.artifact });
@@ -350,20 +381,41 @@ function recordReviewArtifact(options = {}) {
         if (prior.headSha === String(headSha) && (priorArtifactData === null || !openFindings(priorArtifactData).length)) {
           throw new ReviewPolicyError('ALREADY_REVIEWED', `a formal review is already recorded for ${recordId} at ${headSha} and ${prior.artifact} has nothing open to resolve; a re-review at an unchanged head needs an open prior finding`, { artifact: prior.artifact });
         }
-        if (priorArtifactData === null) {
-          // The referenced file is gone (crash, hand cleanup, pruned tree):
-          // degrade honestly instead of wedging the record forever.
-          priorArtifactMissing = true;
-        } else {
-          const open = openFindings(priorArtifactData);
-          for (const finding of open) {
-            const resolution = resolutions?.[finding.id];
-            if (!resolution) {
-              throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} has no resolution`, { unresolved: open.map((entry) => entry.id) });
-            }
-            if (!RESOLUTION_VALUES.includes(resolution)) {
-              throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
-            }
+        // The referenced file is gone (crash, hand cleanup, pruned tree):
+        // degrade honestly instead of wedging the record forever.
+        if (priorArtifactData === null) priorArtifactMissing = true;
+        priors.push({ data: priorArtifactData, path: prior.artifact });
+      }
+      // fleet#43: nothing walked the risk chain. `prior` is scoped per kind, so
+      // a formal review never saw risk findings and a risk artifact was
+      // write-only: recorded once, resolved by nothing, unable to go stale.
+      // The lead already verifies every risk finding by hand (project-lead.md,
+      // Merge); the formal review that does so now records it: the risk
+      // artifact's open findings need a resolution like any linked prior, and
+      // the formal artifact names the risk artifact it consumed, so a later
+      // re-review binds to the formal chain alone (ADR 0009, ruling 5).
+      let riskArtifact = null;
+      let riskArtifactMissing = false;
+      if (kind === 'formal') {
+        const risk = record.review?.risk || null;
+        const consumedByPrior = risk && priorArtifactData && priorArtifactData.riskArtifact === risk.artifact;
+        if (risk && !consumedByPrior) {
+          riskArtifact = risk.artifact;
+          const riskData = readArtifact(root, risk.artifact);
+          if (riskData === null) riskArtifactMissing = true;
+          priors.push({ data: riskData, path: risk.artifact });
+        }
+      }
+      for (const { data, path: priorPath } of priors) {
+        if (!data) continue;
+        const open = openFindings(data);
+        for (const finding of open) {
+          const resolution = resolutions?.[finding.id];
+          if (!resolution) {
+            throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} in ${priorPath} has no resolution`, { unresolved: open.map((entry) => entry.id), artifact: priorPath });
+          }
+          if (!RESOLUTION_VALUES.includes(resolution)) {
+            throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
           }
         }
       }
@@ -379,14 +431,15 @@ function recordReviewArtifact(options = {}) {
       // build also raises DUPLICATE_FINDING_ID before any file exists.
       const supplied = options.findings || [];
       const noFindings = options.noFindings;
-      const preview = buildFindings('pending', supplied, priorArtifactData, prior ? prior.artifact : null, resolutions);
+      const preview = buildFindings('pending', supplied, priors, resolutions);
       if (noFindings !== undefined) {
         if (typeof noFindings !== 'string' || !noFindings.trim() || noFindings === 'true') {
           throw new ReviewPolicyError('USAGE', '--no-findings needs a one-sentence statement of what was examined and what was concluded');
         }
         if (preview.length) {
           const carried = preview.length - supplied.length;
-          throw new ReviewPolicyError('USAGE', `the artifact would carry ${preview.length} finding(s) (${supplied.length} new, ${carried} still open from ${prior ? prior.artifact : 'the prior artifact'}); it is not a no-findings review, omit --no-findings`);
+          const carriedFrom = [...new Set(preview.filter((finding) => finding.carriedFrom).map((finding) => finding.carriedFrom))];
+          throw new ReviewPolicyError('USAGE', `the artifact would carry ${preview.length} finding(s) (${supplied.length} new, ${carried} still open from ${carriedFrom.length ? carriedFrom.join(' and ') : 'the prior artifact'}); it is not a no-findings review, omit --no-findings`);
         }
       } else if (!preview.length) {
         throw new ReviewPolicyError('EMPTY_FINDINGS', `a ${kind} review with no findings must say so: pass --no-findings "<what was examined and what was concluded>" so the artifact is not read as lost content`);
@@ -398,6 +451,10 @@ function recordReviewArtifact(options = {}) {
           recordId,
           kind,
           headSha: String(headSha),
+          // fleet#43: the tree the reviewer read. Equal to headSha unless the
+          // caller said otherwise (risk only); `range` then names the delta
+          // no reviewer at this angle has looked at.
+          reviewedSha,
           range,
           // Descriptive only: under review-dedup-off a same-head pass skips the
           // linked re-review checks, so sameHead does not imply resolutions ran.
@@ -408,9 +465,13 @@ function recordReviewArtifact(options = {}) {
           at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
           priorArtifact: prior ? prior.artifact : null,
           priorArtifactMissing: priorArtifactMissing || undefined,
+          // fleet#43 (formal only): the risk artifact whose open findings this
+          // review accounted for; null when there was none or a prior formal
+          // review already consumed it.
+          ...(kind === 'formal' ? { riskArtifact, riskArtifactMissing: riskArtifactMissing || undefined } : {}),
           resolutions,
           noFindings: noFindings ? noFindings.trim() : null,
-          findings: buildFindings(stamp, options.findings, priorArtifactData, prior ? prior.artifact : null, resolutions),
+          findings: buildFindings(stamp, options.findings, priors, resolutions),
         }));
       }
 
@@ -589,7 +650,7 @@ function classifyCli(rest) {
 // `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
 // each list is every flag its handler consumes; an unknown flag or command is
 // USAGE, exit 2, nothing on stdout.
-const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact'];
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact'];
 const COMMAND_FLAGS = Object.freeze({
   classify: CLASSIFY_FLAGS,
   record: RECORD_FLAGS,
@@ -611,11 +672,15 @@ function cli(argv) {
     throw error;
   }
   const root = args.root;
+  // fleet#46: the reviewer is the session. `record` wrote `reviewer: "unknown"`
+  // whenever --actor was omitted (and the documented line omitted it), which a
+  // replay can never repair; FLEET_NAME is in every fleet session's environment.
+  const actor = args.actor || process.env.FLEET_NAME || undefined;
   if (command === 'record') {
     return recordReviewArtifact({
       root, recordId: args.id,
       expectedRevision: args['expected-revision'] !== undefined ? Number(args['expected-revision']) : undefined,
-      kind: args.kind, headSha: args['head-sha'], actor: args.actor, now: args.now,
+      kind: args.kind, headSha: args['head-sha'], reviewedSha: args['reviewed-sha'], actor, now: args.now,
       idempotencyKey: args['idempotency-key'], evidence: args.evidence,
       classification: args.classification ? JSON.parse(fs.existsSync(args.classification) ? fs.readFileSync(args.classification, 'utf8') : args.classification) : {},
       findings: args.findings ? JSON.parse(fs.existsSync(args.findings) ? fs.readFileSync(args.findings, 'utf8') : args.findings) : [],
@@ -630,7 +695,7 @@ function cli(argv) {
   // command === 'hold'
   return holdRecord({
     root, recordId: args.id, expectedRevision: Number(args['expected-revision']),
-    reason: args.reason, actor: args.actor, now: args.now, idempotencyKey: args['idempotency-key'],
+    reason: args.reason, actor, now: args.now, idempotencyKey: args['idempotency-key'],
     notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
   });
 }
@@ -649,7 +714,9 @@ if (require.main === module) {
     // take it for a failed one, let alone for an answer (fleet#2).
     // INVALID_REVIEW_STATE is a refused invocation too (fleet#20): nothing was
     // recorded, and the message names the door that opens the state.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS'].includes(error.code) ? 2 : 1;
+    // FINDING_CARRIES_OUTCOME and REVIEWED_SHA_MISMATCH (fleet#43) are refused
+    // invocations too: nothing was recorded, and the message names the door.
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH'].includes(error.code) ? 2 : 1;
   }
 }
 

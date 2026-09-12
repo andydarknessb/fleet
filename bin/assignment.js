@@ -54,8 +54,15 @@ function criteriaHash(issue) {
 //      criteria cite ADRs far more often than they change them.
 //   4. A line-numbered path introduced by a copula ("`LOCK` is `server/modules/
 //      advisoryLock.js:53`") in a sentence with no edit verb is a premise citation.
+//   5. (fleet#52) A path introduced by a citation cue ("like `X`", "similar to",
+//      "modelled on", "as in", "see", "per", "cf.", "e.g.", "such as") is a
+//      template to imitate or a reference to read, never a write target. The
+//      cue must stand immediately before the path (an article or "existing"
+//      may sit between), so the written path earlier in the same sentence
+//      ("Add `A` modelled on `B`") is still reserved.
 // Sections headed "Out of scope" (or "Non-goals") count as negated throughout. A
 // path one sentence only cites is still reserved from any sentence that edits it.
+const CITATION_BEFORE_PATH = /\b(?:like|unlike|similar to|modell?ed (?:on|after)|patterned (?:on|after)|as in|see|per|cf\.?|e\.g\.?|such as|mirror(?:s|ing)|akin to|in the (?:shape|style|manner) of|the (?:same )?shape (?:of|as))\s+(?:(?:the|an?|existing|current|its|our)\s+)*`?$/i;
 const COPULA_BEFORE_PATH = /\b(?:is|are|was|were)\b(?:\s+(?:now|still|already))?(?:\s+`[^`]{1,40}`)?(?:\s+(?:at|in|on))?\s+`?$/i;
 const NEGATION = /(?:\b(?:no|not|never|nothing|none|nor|neither|without|unchanged|untouched|unedited|forbidden|prohibited|cannot|can't|won't|don't|doesn't|isn't|aren't|mustn't|shouldn't)\b|\bcarve-outs?\b|\bout of scope\b|\bstays? (?:outside|as is|untouched)\b|\bdoes not\b|\bdo not\b|\bmust not\b|\bshould not\b|\bwill not\b)/i;
 const ALLOWLIST = /\b(?:lists?|touch(?:es)?|edits?|changes?|modif(?:y|ies)|writes?)\s+(?:exactly|only)\b|\bexactly\s+(?:these|the following)\s+files?\b|\bonly\s+(?:these|the following)\s+files?\b/i;
@@ -67,7 +74,9 @@ function criteriaSentences(text) {
   let negatedSection = false;
   for (const line of String(text || '').split(/\r?\n/)) {
     if (/^\s{0,3}#{1,6}\s/.test(line) || /^\s*\*\*[^*]+\*\*/.test(line)) negatedSection = NEGATED_HEADING.test(line);
-    for (const sentence of line.split(/(?<=[.;!?])\s+(?=\S)/)) {
+    // An abbreviation's period ends no sentence: "cf. `path`" and "e.g. `path`"
+    // keep their cue beside the path they cite (fleet#52).
+    for (const sentence of line.split(/(?<=[.;!?])(?<!\b(?:cf|e\.g|i\.e|vs|etc)\.)\s+(?=\S)/i)) {
       if (sentence.trim()) sentences.push({ text: sentence, negated: negatedSection || NEGATION.test(sentence), allowlist: ALLOWLIST.test(sentence), edit: EDIT_VERB.test(sentence) });
     }
   }
@@ -87,9 +96,12 @@ function derivedReservations(issue) {
       const value = /^(?:entities|features|widgets|pages|shared)\//i.test(rawValue) ? `src/${rawValue}` : rawValue;
       if (/^state\/reviews\//i.test(value)) continue;
       if (/^docs\//i.test(value) && !sentence.edit && !sentence.allowlist) continue;
+      const before = sentence.text.slice(Math.max(0, match.index - 64), match.index);
       const after = sentence.text.slice(match.index + match[0].length, match.index + match[0].length + 24);
+      // fleet#52: "like `path`" cites a template; the path is not this ticket's.
+      if (CITATION_BEFORE_PATH.test(before)) continue;
       const lineCited = /^:\d/.test(after);
-      const copula = COPULA_BEFORE_PATH.test(sentence.text.slice(Math.max(0, match.index - 64), match.index)) || /^:\d+(?:-\d+)?`?\s+(?:is|are|was|were)\b/i.test(after);
+      const copula = COPULA_BEFORE_PATH.test(before) || /^:\d+(?:-\d+)?`?\s+(?:is|are|was|were)\b/i.test(after);
       if (lineCited && copula && !sentence.edit && !sentence.allowlist) continue;
       const migration = value.match(/^server\/db\/migrations\/(\d+)/i);
       if (migration) reservations.migrationPrefixes.push(migration[1]);

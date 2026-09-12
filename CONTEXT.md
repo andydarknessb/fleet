@@ -203,8 +203,9 @@ _Avoid_: optional gate, ignored check, non-required check
 An ephemeral, read-only `qa-reviewer` worker added to a Unit of work only when
 a configured risk trigger fires (carve-out, auth, security, data integrity,
 concurrency, destructive behavior, material accessibility). The IC hosts it
-pre-PR-ready; its findings land once, in the unit's review artifact, and the
-spawning session verifies every claim. Every PR still gets the project lead's
+pre-PR-ready; its findings land once, in the unit's review artifact, the
+spawning session verifies every claim, and the project lead's formal review
+resolves each of them on record. Every PR still gets the project lead's
 one formal Standards and Spec review; a diff without a trigger never gets a
 risk reviewer.
 _Avoid_: second reviewer, QA pass, extra review angle

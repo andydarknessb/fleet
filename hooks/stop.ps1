@@ -94,15 +94,30 @@ try { $checkPolicy = Get-TenantCheckPolicy $t } catch { Stop-Now "invalid tenant
 $owner, $repoName = $t.github -split '/'
 
 # --- PRs awaiting review (checked first: cheapest, highest value) ---
-# Actionable = open, non-draft, fleet-prefixed, NOT held by the lead (state/skip/<tenant>.json "prs"), and with no
-# ciGates check still pending (a PR waiting on CI has nothing to act on; the lead schedules its own re-check).
+# Actionable = open, non-draft, fleet-prefixed, NOT held by the lead (state/skip/<tenant>.json "prs"), with no
+# ciGates check still pending, AND (fleet#51) whose Work record is in `review`. `review-policy.js record --kind
+# formal` reads the record, which the PR watcher advances on its tick, so a PR that is green on live GitHub while
+# its record is still `ci-wait` is one the gate refuses (INVALID_REVIEW_STATE); the hook and the gate now share
+# one clock. Such a PR is named as lagging, never offered. Under state/flags/pr-watch-off the records do not
+# advance and the live verdict decides; a PR with no Work record keeps the live verdict, labelled.
 $skipAll = $null
 $skipPath = "$home_\state\skip\$tenant.json"
 if (Test-Path $skipPath) { try { $skipAll = Get-Content $skipPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {} }
 $heldPrs = @{}
 if ($skipAll -and $skipAll.prs) { foreach ($p in $skipAll.prs.PSObject.Properties) { $heldPrs[[int]$p.Name] = $p.Value } }
+$watchOff = Test-Path "$home_\state\flags\pr-watch-off"
+$recordsByPr = @{}
+if (-not $watchOff) {
+  try {
+    $activeWork = Get-Content "$home_\state\work\active.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($r in $activeWork.records.PSObject.Properties) {
+      $rec = $r.Value
+      if ($rec.github -and $rec.github.prNumber) { $recordsByPr[[int]$rec.github.prNumber] = $rec }
+    }
+  } catch {}
+}
 $prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName,statusCheckRollup 2>$null
-$awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @()
+$awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @(); $recordLag = @(); $noRecord = @()
 foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   if ($pr.isDraft -or -not $pr.headRefName.StartsWith($t.branchPrefix)) { continue }
   $n = [int]$pr.number
@@ -110,12 +125,21 @@ foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   $checkState = Get-CheckPolicyEvaluation $checkPolicy @($pr.statusCheckRollup)
   foreach ($finding in $checkState.WatchedFindings) { $watchedFindings += "#$n/$($finding.Name)=$($finding.Conclusion)" }
   if ($checkState.GatePending.Count -gt 0) { $waitingOnCi += $n; continue }
+  if (-not $watchOff) {
+    if ($recordsByPr.ContainsKey($n)) {
+      $recordState = "$($recordsByPr[$n].state)"
+      if ($recordState -ne 'review') { $recordLag += "#$n (record still $recordState)"; continue }
+    } else { $noRecord += $n }
+  }
   $awaiting += $n
 }
+$lagNote = ''
+if ($recordLag.Count -gt 0) { $lagNote = "; PR(s) settled on GitHub whose Work record is not yet in review, not reviewable until the watcher's next tick moves it: $($recordLag -join ', ')" }
 if ($awaiting.Count -gt 0) {
   $reason = "PR(s) awaiting your review with CI settled: #$($awaiting -join ', #')"
+  if ($noRecord.Count -gt 0) { $reason += " (no Work record for #$($noRecord -join ', #'): live GitHub verdict, record --kind formal will not find it)" }
   if ($watchedFindings.Count -gt 0) { $reason += "; watched finding(s), not gates: $($watchedFindings -join ', ')" }
-  Continue-With $reason
+  Continue-With "$reason$lagNote"
 }
 
 # --- capacity ---
@@ -134,7 +158,8 @@ $capFree = $cap - $liveFleet.Count
 $icFree = [int]$t.maxIcs - $activeIcs.Count
 if ($capFree -le 0 -or $icFree -le 0) {
   $msg = "no free slot (capFree=$capFree, icFree=$icFree)"
-  if ($waitingOnCi.Count -gt 0) { $msg += "; PR(s) waiting on CI gates: #$($waitingOnCi -join ', #') (schedule a one-shot CronCreate re-check if you have none)" }
+  if ($waitingOnCi.Count -gt 0) { $msg += "; PR(s) waiting on CI gates: #$($waitingOnCi -join ', #') (the watcher records checks-settled and the watchdog wakes you; never poll)" }
+  $msg += $lagNote
   if ($held.Count -gt 0) { $msg += "; held PR(s): #$($held -join ', #')" }
   Stop-Now "$msg; ICs will message you"
 }
@@ -216,17 +241,19 @@ if ($assignmentLive) {
     Stop-Now "assignment planner failed ($plannerFailure) while state/flags/assignment-live stands; launching nothing, escalation filed (legacy frontier would be: #$($frontier -join ', #'))"
   }
   $plannerFrontier = @($planner.plannerFrontier | ForEach-Object { [int]$_ })
-  if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch' (state/flags/assignment-live stands: launch.ps1 refuses a legacy IC prompt)" }
+  if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch' (state/flags/assignment-live stands: launch.ps1 refuses a legacy IC prompt)$lagNote" }
   $why = "assignment frontier empty (planner; legacy frontier: #$($frontier -join ', #'); ready=$($ready.Count), assigned=$($assigned.Count), skipped=$($skip.Count), blocked=$($blocked.Count))"
-  if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (schedule a one-shot CronCreate re-check if you have none)" }
+  if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (the watcher records checks-settled and the watchdog wakes you; never poll)" }
+  $why += $lagNote
   if ($held.Count -gt 0) { $why += "; held PR(s): #$($held -join ', #')" }
   Stop-Now "$why; ICs will message you"
 }
 
-if ($frontier.Count -gt 0) { Continue-With "frontier issue(s) #$($frontier -join ', #') (ready, unblocked, unassigned, not skipped) with $capFree cap slot(s) and $icFree IC slot(s) free; launch the next IC" }
+if ($frontier.Count -gt 0) { Continue-With "frontier issue(s) #$($frontier -join ', #') (ready, unblocked, unassigned, not skipped) with $capFree cap slot(s) and $icFree IC slot(s) free; launch the next IC$lagNote" }
 $why = "frontier empty (ready=$($ready.Count), assigned=$($assigned.Count), skipped=$($skip.Count), blocked=$($blocked.Count)"
 if ($blocked.Count -gt 0) { $why += ": $($blocked -join ' ')" }
 $why += ")"
-if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (schedule a one-shot CronCreate re-check if you have none)" }
+if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (the watcher records checks-settled and the watchdog wakes you; never poll)" }
+$why += $lagNote
 if ($held.Count -gt 0) { $why += "; held PR(s): #$($held -join ', #')" }
 Stop-Now "$why; ICs will message you"

@@ -84,6 +84,31 @@ try {
   Assert-True ($lastExit -eq 2 -and $out4 -match 'frontier issue\(s\) #101') "without the flag a missing planner must not block the legacy frontier: exit $lastExit :: $out4"
   Remove-Item Env:FLEET_NODE_PATH
 
+
+  # fleet#51: "CI settled" used to be read from live GitHub while `record --kind formal` reads
+  # the Work record, which the watcher advances on a five-minute tick; the hook continued the
+  # lead onto a PR the review gate then refused (INVALID_REVIEW_STATE). A PR awaits review only
+  # when its Work record is in `review`; a green PR whose record lags is named, not actioned.
+  Write-Utf8 "$testRoot\gh-pr.json" '[{"number":7,"isDraft":false,"headRefName":"fleet/101-fixture","statusCheckRollup":[{"name":"test-build","status":"COMPLETED","conclusion":"SUCCESS"}]}]'
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"ci-wait","revision":6,"github":{"issueNumber":101,"prNumber":7}}}}'
+  $out51a = Run-Stop
+  Assert-True ($out51a -notmatch 'awaiting your review') "a green PR whose Work record is still ci-wait must not be offered for review: $out51a"
+  Assert-True ($out51a -match 'record still ci-wait' -and $out51a -match '#7') "the hook must name the lagging PR and its record state: $out51a"
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"review","revision":8,"github":{"issueNumber":101,"prNumber":7}}}}'
+  $out51b = Run-Stop
+  Assert-True ($lastExit -eq 2 -and $out51b -match 'awaiting your review with CI settled: #7') "a PR whose Work record is in review is awaiting review: exit $lastExit :: $out51b"
+  # Under state/flags/pr-watch-off the records do not advance, so the live GitHub verdict decides again.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"ci-wait","revision":6,"github":{"issueNumber":101,"prNumber":7}}}}'
+  Write-Utf8 "$testRoot\state\flags\pr-watch-off" 'test'
+  $out51c = Run-Stop
+  Assert-True ($lastExit -eq 2 -and $out51c -match 'awaiting your review with CI settled: #7') "under pr-watch-off the live verdict must decide: exit $lastExit :: $out51c"
+  Remove-Item "$testRoot\state\flags\pr-watch-off"
+  # A PR with no Work record at all keeps the live verdict, labelled, so it is never invisible.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{}}'
+  $out51d = Run-Stop
+  Assert-True ($lastExit -eq 2 -and $out51d -match 'awaiting your review with CI settled: #7' -and $out51d -match 'no Work record') "a PR without a Work record keeps the live verdict and says so: exit $lastExit :: $out51d"
+  Write-Utf8 "$testRoot\gh-pr.json" '[]'
+
   # Case 5: the session-start hook prints the acknowledgment command with the record's current revision.
   Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"assigned","revision":3}}}'
   Write-Utf8 "$testRoot\state\manifests-x.json" '{}'
