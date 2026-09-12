@@ -143,3 +143,50 @@ and `CONTEXT.md` in the tenant repo (a worktree included) or the fleet, its own
 status file, `state/triage/` (written through `bin/triage.js`), its memory and the
 temp directory. Everything else, in the main session or a worker it spawns, is
 refused with the proposal's `Scope` and `Repro:` lines named as where the work goes.
+
+## Amendment 2026-09-12 - authorship decides nothing (fleet#55, fleet#56)
+
+The frontier dropped any issue whose newest comment was the owner's and newer
+than the last body edit, as "a conversation, not a triage item". Because the
+fleet posts under `ownerLogin`, that test was true of every comment a lead, IC
+or Principal had ever written. Two companion tickets filed for triage left the
+frontier on the strength of the lead's own cross-link comments, with no
+releasing event: the state it waited for could not change on its own.
+
+The rule is gone, not narrowed. Nothing in `bin/triage.js` infers the owner's
+involvement from who wrote a comment. The two things the frontier must
+recognise as the owner's are recognised by shape, and each shape is one the
+guard hook (decision 6, the 2026-09-12 amendment above) refuses to every fleet
+role and its sub-agents, which is what makes it the owner's:
+
+- an Approval is a comment beginning `Approved`;
+- a re-proposal ask is a comment beginning `Re-propose` (`REPROPOSE_RE` is
+  anchored; the word later in a body is prose).
+
+The author test on each stays as a second lock against other accounts. A
+frontier exclusion nothing can lift is no longer expressible: every remaining
+skip names its releasing event (a label, a closed sub-issue, an unassign, an
+expiry, an approval, a body edit, a `Re-propose`).
+
+Not chosen: a machine-readable provenance footer on every fleet comment. It
+would make "was this written by a worker?" answerable, at the cost of a rule
+on every writer, and no consumer needs the answer once none infers from
+authorship. Worth its own decision if one ever does.
+
+The same day, a lead's escalation of a PR-less record (`work-state.js
+transition --to escalated`) wrote the `state-escalated` event and launched the
+notifier but appended no line to `state/watch/wake-outbox.jsonl`, and the
+Principal's frontier reads decision-needed wakes from the outbox alone (fleet
+#56). `hold` was the only lead door that wrote one, and `hold` is the PR-only
+parking state. Posting the finding on the issue then removed the issue from the
+frontier under the rule above; the two defects closed the loop on each other.
+The transition door itself (`work-state.js transitionRecord`) now appends the
+outbox line for any transition into a decision state, whoever calls it: the
+lead's CLI, `budget.js`, the watcher and `review-policy.js hold` (which all
+used to write, or forget, their own). The line is keyed by the transition's
+idempotency key: a retry that finds the line writes nothing, a retry that
+finds it missing repairs the cache, and the caller pages only when its call
+wrote the line (`paged`). Not chosen: a second frontier
+source reading decision events from the ledger. The outbox is also what the
+watchdog's frontier wake and the digest read; a second definition of
+"decision-needed" in one reader would let the readers disagree.

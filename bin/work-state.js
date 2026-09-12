@@ -752,13 +752,22 @@ function transitionRecord(options = {}) {
     const active = activeState(p);
     const record = active.records[String(options.id)];
     if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const to = String(options.to || '');
+    // fleet#56: a decision transition writes the outbox line from the door that
+    // commits it, whoever the caller is (the lead's CLI, budget.js, the watcher,
+    // review-policy hold). The Principal's frontier and the watchdog's frontier
+    // wake read that cache and nothing else, and a lead's escalation of a
+    // PR-less record used to reach every ledger but that one. A replay repairs
+    // a missing line (a crash between commit and append) and never duplicates.
+    const pageDecision = (result) => (DECISION_STATES.includes(to)
+      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, now: options.now }) }
+      : result);
     const replay = replayIfKnown(record, key);
-    if (replay) return replay;
+    if (replay) return pageDecision(replay);
     if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
     if (Number(options.expectedRevision) !== record.revision) {
       throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     }
-    const to = String(options.to || '');
     const prNumber = options.prNumber ? Number(options.prNumber) : record.github?.prNumber;
     const githubObservation = to === 'merged'
       ? (options.githubRepo ? reconcilePullRequest({ repo: options.githubRepo, prNumber, executable: options.githubExecutable })
@@ -807,7 +816,7 @@ function transitionRecord(options = {}) {
       event,
       killPoint: options.killPoint,
     });
-    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+    return pageDecision({ replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord });
   });
 }
 
@@ -913,6 +922,44 @@ function recordReview(options = {}) {
     commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
     return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
   });
+}
+
+// --- wake outbox (state/watch/wake-outbox.jsonl) ---
+// The event ledger is the authoritative wake record; the outbox is the delivery
+// cache the Principal's frontier, the watchdog's frontier wake and the digest
+// read. A decision transition appends one line, at-least-once and keyed by the
+// transition's idempotency key: a retry that finds the line writes nothing, a
+// retry that finds it missing (crash between commit and append) repairs it.
+function wakeOutboxFile(root) {
+  return path.join(asRoot(root), 'state', 'watch', 'wake-outbox.jsonl');
+}
+
+function outboxHasWake(root, recordId, idempotencyKey) {
+  const file = wakeOutboxFile(root);
+  if (!fs.existsSync(file)) return false;
+  return fs.readFileSync(file, 'utf8').split(/\r?\n/).some((line) => {
+    if (!line.trim()) return false;
+    try {
+      const entry = JSON.parse(line);
+      return entry.recordId === recordId && entry.idempotencyKey === idempotencyKey;
+    } catch { return false; }
+  });
+}
+
+// Idempotent by (recordId, idempotencyKey): the door that commits a decision
+// transition writes the line, so a caller that also writes one (the watcher,
+// for its observe wakes) finds it and appends nothing. Returns whether a line
+// was written, which is the caller's cue to launch the page.
+function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, now } = {}) {
+  if (outboxHasWake(root, recordId, idempotencyKey)) return false;
+  const file = wakeOutboxFile(root);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
+  // wake record); the outbox line names the wake in its own field.
+  const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
+  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, evidence: text };
+  fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
+  return true;
 }
 
 // Read-only view of the whole ledger (online partitions then archive), in ledger order.
@@ -1313,8 +1360,11 @@ function cli(argv) {
       githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'],
     });
     // Ticket 07: a decision event launches its notifier from the door that wrote it
-    // (the watcher does the same for its own); a replay wrote nothing, so it launches nothing.
-    if (!result.replayed && DECISION_EVENT_TYPES.includes(`state-${args.to}`) && args['no-notifier'] !== 'true') {
+    // (the watcher does the same for its own). `paged` is true when this call
+    // wrote the outbox line (fleet#56): a replay that only found the line
+    // launches nothing, a replay that repaired a missing line pages (the notify
+    // door claims per event, so a second launch sends nothing).
+    if (result.paged && args['no-notifier'] !== 'true') {
       result.notifier = require('./notify').spawnNotifier({ root: args.root, recordId: args.id, sequence: result.eventSequence });
     }
     return result;
@@ -1362,6 +1412,7 @@ module.exports = {
   TRANSITIONS,
   WorkStateError,
   abandonRecord,
+  appendWakeOutbox,
   cli,
   createRecord,
   enteringEvent,
@@ -1369,6 +1420,7 @@ module.exports = {
   hasReservationEvidence,
   notifyRecord,
   observeRecord,
+  outboxHasWake,
   parseArgs,
   proofMatches,
   projectStatus,

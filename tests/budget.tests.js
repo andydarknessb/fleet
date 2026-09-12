@@ -125,6 +125,12 @@ test('live: over the escalation threshold the record is escalated once with prio
   assert.equal(record.prior_state, 'review');
   assert.match(record.decisionEvidence, /budget: 80000 job tokens >= 75000/);
   assert.equal(record.budget.cumulativeTokens, 80000);
+  // fleet#56: the transition door wrote the decision-needed line the Principal's frontier reads.
+  const outbox = fs.readFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.equal(outbox.length, 1);
+  assert.equal(outbox[0].wake, 'decision-needed');
+  assert.equal(outbox[0].recordId, id);
+  assert.match(outbox[0].evidence, /^budget: 80000/, 'the wake prefix is stripped from the outbox evidence');
   const second = await run(root, { now: '2026-09-09T01:05:00.000Z' });
   assert.equal(second.records.length, 0, 'an escalated record is outside the budget states and is not re-measured');
   assert.equal(readEvents(root).filter((e) => e.type === 'state-escalated').length, 1);

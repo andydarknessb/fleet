@@ -111,6 +111,10 @@ try {
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Approved"') -AgentId 'w2') 'an Approved comment from a sub-agent'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Not approved: the scope misses the caption"')) 'a comment that does not begin with Approved'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Review: approved the PR shape, one nit"')) 'the word approved later in a body'
+  # fleet#55: a re-proposal ask is a shape only the owner may write, like Approved.
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1298 -b "Re-propose: the scope changed"')) 'a Re-propose comment from the lead' 'fleet#55'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 1298 --body "repropose please"') -AgentId 'w3') 'a repropose comment from a sub-agent'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1298 -b "The lead will re-propose the scope once #3 lands"')) 'the word re-propose later in a body'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh pr review 42 --approve -b "LGTM"')) 'a PR review approval (not a comment body)'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'

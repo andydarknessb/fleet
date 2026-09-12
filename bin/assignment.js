@@ -83,16 +83,50 @@ function criteriaSentences(text) {
   return sentences;
 }
 
-function derivedReservations(issue) {
+// fleet#54: a repo-root file is a path in its own right. The prefixed recognizer
+// below needs a directory name and a separator, so `CONTEXT.md` in endzone
+// #1294's allowlist Scope line matched nothing and the derived set was three of
+// four: non-empty, conflict-free, `independent: true`, and short. A bare token
+// counts when it is a KNOWN root name (the repo's documents, package manifests,
+// tool configs, deploy files and dotfiles) and is fenced in backticks or sits
+// in an allowlist sentence. A bare basename that is not a known root name
+// (`assignment.js`, which lives in `bin/`) is never guessed to be at the root:
+// in an allowlist sentence it is reported as unrecognized and the assignment
+// is refused; elsewhere it is prose. It never matches inside a longer path.
+const ROOT_FILE = /(?<![A-Za-z0-9_/.\-])(?:\.(?:env|eslintrc|prettierrc|babelrc|npmrc|nvmrc|gitignore|gitattributes|editorconfig|node-version|dockerignore)(?:\.[A-Za-z0-9_-]+)*|(?:README|CONTEXT|CLAUDE|AGENTS|CHANGELOG|CONTRIBUTING|LICENSE|SECURITY|CODEOWNERS)(?:\.md)?|package(?:-lock)?\.json|netlify\.toml|render\.ya?ml|vercel\.json|knexfile\.[cm]?js|(?:jest|vite|vitest|babel|eslint|prettier|tailwind|postcss|playwright|next|nuxt|svelte|webpack|rollup)\.config\.[cm]?[jt]s|(?:tsconfig|jsconfig)(?:\.[A-Za-z0-9_-]+)?\.json|Dockerfile|docker-compose\.ya?ml|Procfile|index\.html)(?![A-Za-z0-9_/.\-])/g;
+const ALLOWLIST_STOPWORDS = new Set(['the', 'this', 'that', 'its', 'own', 'file', 'files', 'itself', 'nothing', 'none', 'these', 'those', 'following', 'plus', 'test', 'tests']);
+
+// The items an allowlist sentence enumerates after its cue ("lists exactly A and
+// B, C"): single tokens, stripped of fences and punctuation. Anything with
+// whitespace ("the `players` table") is not an item the recognizer was asked
+// to place.
+function allowlistItems(sentenceText) {
+  const cue = ALLOWLIST.exec(sentenceText);
+  if (!cue) return [];
+  const rest = sentenceText.slice(cue.index + cue[0].length).replace(/^\s*(?:these|the following)?\s*files?\b/i, '').replace(/^[\s:]+/, '');
+  return rest.split(/\s*(?:,|;|\band\b|\bor\b)\s*/i)
+    .map((item) => item.trim().replace(/^[`'"(]+|[`'".,;:!?)]+$/g, ''))
+    .filter((item) => item.length > 1 && !/\s/.test(item) && !ALLOWLIST_STOPWORDS.has(item.toLowerCase()));
+}
+
+function deriveReservations(issue) {
   const reservations = Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, []]));
+  const unrecognized = [];
   const text = [issue.body, ...normalizeComments(issue.comments).map((comment) => comment.body)].filter(Boolean).join('\n');
   const pathPattern = /(?:\.github|src|server|docs|bin|hooks|tests|config|tenants|state|scripts|entities|features|widgets|pages|shared)[\\/][A-Za-z0-9_.\-/*{}\[\]\\]+/gi;
   const sentences = criteriaSentences(text);
   const allowlists = sentences.filter((sentence) => sentence.allowlist && !sentence.negated);
   const sources = allowlists.length ? allowlists : sentences.filter((sentence) => !sentence.negated);
   for (const sentence of sources) {
-    for (const match of sentence.text.matchAll(pathPattern)) {
+    const seen = new Set();
+    const matches = [...sentence.text.matchAll(pathPattern)];
+    for (const match of sentence.text.matchAll(ROOT_FILE)) {
+      const fenced = sentence.text[match.index - 1] === '`' && sentence.text[match.index + match[0].length] === '`';
+      if (fenced || sentence.allowlist) matches.push(match);
+    }
+    for (const match of matches) {
       const rawValue = match[0].replaceAll('\\', '/').replace(/[.,;:!?]+$/, '');
+      seen.add(rawValue.toLowerCase());
       const value = /^(?:entities|features|widgets|pages|shared)\//i.test(rawValue) ? `src/${rawValue}` : rawValue;
       if (/^state\/reviews\//i.test(value)) continue;
       if (/^docs\//i.test(value) && !sentence.edit && !sentence.allowlist) continue;
@@ -108,6 +142,15 @@ function derivedReservations(issue) {
       else if (/(?:^|\/)(?:tests?\/|[^/]*\.tests?\.)/i.test(value)) reservations.testResources.push(value);
       else reservations.components.push(value);
     }
+    // fleet#54: an allowlist sentence states its own cardinality. An item it
+    // lists that neither recognizer saw is a short derivation, and a short set
+    // satisfies every other guard (non-empty, no conflict, independent), so it
+    // is reported here and refused at assign rather than reserved as if whole.
+    if (sentence.allowlist) {
+      for (const item of allowlistItems(sentence.text)) {
+        if (!seen.has(item.replaceAll('\\', '/').toLowerCase())) unrecognized.push(item);
+      }
+    }
   }
   const tablePatterns = [/(?:the\s+)?`([A-Za-z_][A-Za-z0-9_]*)`\s+table\b/gi, /\btable\s+`([A-Za-z_][A-Za-z0-9_]*)`/gi];
   for (const pattern of tablePatterns) {
@@ -115,14 +158,20 @@ function derivedReservations(issue) {
       for (const match of sentence.text.matchAll(pattern)) reservations.schemaAreas.push(match[1]);
     }
   }
-  return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set(reservations[field])].sort()]));
+  return {
+    reservations: Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set(reservations[field])].sort()])),
+    unrecognized: [...new Set(unrecognized)],
+  };
 }
 
 function normalizeReservations(issue) {
   const explicit = issue.reservations !== undefined || RESERVATION_FIELDS.some((field) => (issue[field] || []).length);
-  if (!explicit) return derivedReservations(issue);
+  if (!explicit) {
+    const derived = deriveReservations(issue);
+    return { reservations: derived.reservations, unrecognizedPaths: derived.unrecognized };
+  }
   const source = issue.reservations || issue;
-  return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((source[field] || []).map(String))].sort()]));
+  return { reservations: Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((source[field] || []).map(String))].sort()])), unrecognizedPaths: [] };
 }
 
 function normalizeIssue(issue) {
@@ -147,7 +196,7 @@ function normalizeIssue(issue) {
     criteriaHash: issue.criteriaHash || criteriaHash({ ...issue, comments }),
     comments,
     commentsTruncated: Boolean(issue.commentsTruncated || issue.comments?.pageInfo?.hasNextPage),
-    reservations: normalizeReservations({ ...issue, comments }),
+    ...normalizeReservations({ ...issue, comments }),
     createdAt: issue.createdAt || '9999-12-31T23:59:59.999Z',
   };
 }
@@ -415,6 +464,12 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
   if (!hasReservationEvidence(normalized.reservations)) {
     throw new WorkStateError('EMPTY_RESERVATIONS', `issue #${normalized.number} derives no reservation from its criteria${explicit ? ' and the explicit set is empty' : ''}; pass --reservations '{"components":[...],"testResources":[...]}' naming the seams the ticket edits`, { issue: normalized.number, criteriaHash: normalized.criteriaHash, reservations: normalized.reservations });
   }
+  // fleet#54: a derived set that is short of what an allowlist criterion lists
+  // is refused the same way an empty one is; a partial reservation fails open
+  // everywhere else (the proof reads `independent: true` over a missing file).
+  if (!explicit && (normalized.unrecognizedPaths || []).length) {
+    throw new WorkStateError('PARTIAL_RESERVATIONS', `issue #${normalized.number} lists ${normalized.unrecognizedPaths.map((item) => `\`${item}\``).join(', ')} in an allowlist criterion that the reservation builder could not place, so the derived set is short; pass --reservations '{"components":[...],"testResources":[...]}' naming the whole set`, { issue: normalized.number, criteriaHash: normalized.criteriaHash, reservations: normalized.reservations, unrecognizedPaths: normalized.unrecognizedPaths });
+  }
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
   const workRecordId = `${tenant}:issue-${normalized.number}`;
   const baseline = reservationBaseline({ root, id: workRecordId });
@@ -631,7 +686,7 @@ module.exports = {
   cli,
   criteriaHash,
   criteriaSentences,
-  derivedReservations,
+  deriveReservations,
   hydrateActiveReservations,
   invalidateManifest,
   independenceProof,

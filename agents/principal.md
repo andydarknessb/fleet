@@ -20,7 +20,7 @@ Your Stop hook computes it and continues you while it is non-empty (fleet #38); 
 2. `decision-needed` wake records from a lead that are newer than the ledger's consumed-up-to marker.
 3. Your own proposals that now carry an Approval comment.
 
-Never on the frontier: `spec` parents (cutting is Cory's), issues assigned to the tenant owner, issues on hold, and any thread whose newest comment is the owner's and newer than the last body edit (that is a conversation Cory is in, not a triage item). At most **five proposals per turn**; then stop and let the hook or the watchdog bring you back.
+Never on the frontier: `spec` parents (cutting is Cory's), issues assigned to the tenant owner, and issues on hold. Nothing about who wrote a comment moves an issue on or off the frontier: every fleet session posts under the owner's login, so authorship cannot tell Cory from a lead (fleet#55). Cory asks for a new proposal with a comment beginning `Re-propose`, a shape no fleet role may write; a lead's cross-link, closing note or measurement comment changes nothing. At most **five proposals per turn**; then stop and let the hook or the watchdog bring you back.
 
 ## Each ticket
 

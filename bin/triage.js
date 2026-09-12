@@ -31,7 +31,11 @@ const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits
 const OUTCOME_KINDS = Object.freeze(['approved', 'approved-with-edits', 'rejected', 'superseded']);
 const APPROVAL_RE = /^\s*approved(\s+with\s*:|\b)/i;
 const APPROVAL_WITH_EDITS_RE = /^\s*approved\s+with\s*:/i;
-const REPROPOSE_RE = /\bre-?propose\b/i;
+// fleet#55: the fleet posts under the tenant's ownerLogin, so authorship cannot
+// tell Cory from a session. A re-proposal ask is therefore a comment that BEGINS
+// "Re-propose", a wording hooks/principal-guard.ps1 refuses to every fleet role
+// exactly as it refuses "Approved"; the shape is what makes it the owner's.
+const REPROPOSE_RE = /^\s*re-?propose\b/i;
 
 function baseOf(root) { return path.resolve(root || path.resolve(__dirname, '..')); }
 
@@ -378,7 +382,12 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     if (issue.openSubIssues > 0) { skipped.push({ number: issue.number, reason: 'spec parent (open sub-issues); cutting is the owner\'s' }); continue; }
     if (issue.assignees.includes(owner)) { skipped.push({ number: issue.number, reason: 'assigned to the owner' }); continue; }
     if (held.has(issue.number)) { skipped.push({ number: issue.number, reason: `held (${held.get(issue.number)})` }); continue; }
-    if (newest && newest.author === owner && newest.createdAt > issue.lastEditedAt && !ownerAsksAgain) { skipped.push({ number: issue.number, reason: 'owner has the newest comment; a conversation, not a triage item' }); continue; }
+    // fleet#55: there is no "owner has the newest comment" rule. Every fleet
+    // session's comment carries the owner login, so that test dropped two
+    // freshly filed companion tickets on the lead's own cross-links, with no
+    // event that could ever put them back. Nothing here infers the owner's
+    // involvement from authorship; an Approval and a re-proposal ask are
+    // recognised by a shape no fleet role may write.
     tickets.push({ kind: 'ticket', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: hasTriageLabel ? `labelled ${[...labels].filter((label) => triageLabels.has(label)).join(', ')}` : 'unrouted' });
   }
 

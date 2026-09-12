@@ -72,14 +72,34 @@ test('unrouted and triage-labelled issues are tickets; routed, spec-parent, owne
   assert.equal(result.counts.tickets, 4);
 });
 
-test('a thread where the owner has the newest comment is a conversation, not a triage item; a later comment by someone else reopens it', () => {
-  const quiet = frontier([issue(1, { labels: ['question'], comments: [comment('someone', 'why?', '2026-09-02T00:00:00.000Z'), comment(OWNER, 'because', '2026-09-03T00:00:00.000Z')] })]);
-  assert.equal(quiet.eligible.length, 0);
-  assert.match(quiet.skipped[0].reason, /owner has the newest comment/);
-  const reopened = frontier([issue(1, { labels: ['question'], comments: [comment(OWNER, 'because', '2026-09-03T00:00:00.000Z'), comment('someone', 'still unclear', '2026-09-04T00:00:00.000Z')] })]);
-  assert.equal(reopened.eligible.length, 1);
-  const edited = frontier([issue(1, { labels: ['question'], lastEditedAt: '2026-09-05T00:00:00.000Z', comments: [comment(OWNER, 'because', '2026-09-03T00:00:00.000Z')] })]);
-  assert.equal(edited.eligible.length, 1, 'a body edit after the owner comment puts it back');
+// fleet#55: every fleet session posts under the tenant's ownerLogin, so "the owner has
+// the newest comment" was true of every fleet comment and could not mean "Cory is in
+// conversation". Two companion tickets left the frontier on the strength of the lead's
+// own cross-link comments, with no releasing event. Authorship never decides; structure
+// does: an Approval and a re-proposal ask are comments no fleet role may write (the
+// guard hook refuses both), so they are the owner's by construction.
+test('fleet#55: a newest comment under the owner login keeps the issue on the frontier; nothing infers a conversation from authorship', () => {
+  const crossLinked = frontier([issue(1298, { labels: ['needs-triage'], comments: [comment(OWNER, 'Companion: #1299.', '2026-09-12T17:01:05.000Z')] })]);
+  assert.equal(crossLinked.eligible.length, 1);
+  assert.deepEqual(crossLinked.skipped, []);
+  const replied = frontier([issue(2, { labels: ['question'], comments: [comment('someone', 'why?', '2026-09-02T00:00:00.000Z'), comment(OWNER, 'because', '2026-09-03T00:00:00.000Z')] })]);
+  assert.equal(replied.eligible.length, 1, 'a reply under the owner login is not a reason to drop a triage item');
+  assert.ok(!JSON.stringify(replied.skipped).includes('conversation'));
+});
+
+test('fleet#55: a re-proposal ask is a comment that BEGINS "Re-propose"; the word mid-body from the owner login is not one', () => {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 3, bodyHash: triage.normalizeIssue(issue(3)).bodyHash, commentUrl: 'https://github.com/owner/repo/issues/3#issuecomment-1', model: 'fable', now: '2026-09-10T00:00:00.000Z' });
+  const entries = readLedger(root, 'endzone');
+  const midBody = frontier([issue(3, { labels: ['needs-triage', 'triage-proposed'], comments: [comment(OWNER, 'The lead will re-propose the scope on #4 once #3 lands.', '2026-09-11T00:00:00.000Z')] })], { entries });
+  assert.equal(midBody.eligible.length, 0);
+  assert.match(midBody.skipped[0].reason, /awaiting approval/);
+  const asked = frontier([issue(3, { labels: ['needs-triage', 'triage-proposed'], comments: [comment(OWNER, 'Re-propose: the caption is out of scope now.', '2026-09-11T00:00:00.000Z')] })], { entries });
+  assert.equal(asked.eligible.length, 1);
+  assert.equal(asked.eligible[0].kind, 'reproposal');
+  assert.match(asked.eligible[0].reason, /asked for a new proposal/);
+  const other = frontier([issue(3, { labels: ['needs-triage', 'triage-proposed'], comments: [comment('someone', 'Re-propose please', '2026-09-11T00:00:00.000Z')] })], { entries });
+  assert.equal(other.eligible.length, 0, 'an ask from another account is not the owner\'s');
 });
 
 test('the marker waits unless the body changed or the owner asks again; a marker with no ledger record is left alone', () => {
@@ -92,7 +112,7 @@ test('the marker waits unless the body changed or the owner asks again; a marker
   const changed = frontier([{ ...issue(1, { labels: ['needs-triage', 'triage-proposed'] }), bodyHash: 'hash-b' }], { entries });
   assert.equal(changed.eligible[0].kind, 'reproposal');
   assert.match(changed.eligible[0].reason, /body changed/);
-  const asked = frontier([{ ...issue(1, { labels: ['triage-proposed'], comments: [comment(OWNER, 'please re-propose with the new constraint', '2026-09-11T00:00:00.000Z')] }), bodyHash: 'hash-a' }], { entries });
+  const asked = frontier([{ ...issue(1, { labels: ['triage-proposed'], comments: [comment(OWNER, 'Re-propose with the new constraint.', '2026-09-11T00:00:00.000Z')] }), bodyHash: 'hash-a' }], { entries });
   assert.equal(asked.eligible[0].kind, 'reproposal');
   assert.match(asked.eligible[0].reason, /owner asked/);
   const orphan = frontier([issue(2, { labels: ['triage-proposed'] })], { entries });

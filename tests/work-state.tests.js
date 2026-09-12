@@ -923,3 +923,56 @@ test('cli: the process exits 2 on a refusal and writes it to stderr, no JSON ans
   assert.equal(JSON.parse(failure.stderr).code, 'USAGE');
   assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'assigned');
 });
+
+
+// fleet#56: `transition --to escalated` on a PR-less record wrote the state-escalated
+// event and launched the notifier but appended no wake-outbox line, and the Principal's
+// frontier reads decision-needed wakes from the outbox alone. `hold` was the only lead
+// door that wrote one, and it is a PR-only state. A decision transition through the CLI
+// now appends the outbox line the way `hold` does, idempotently, so a mis-specified
+// ticket can reach the Principal before an IC is launched.
+test('fleet#56: a CLI transition to escalated appends a decision-needed wake once; a retry repairs a missing line and never duplicates one', () => {
+  const root = rootDir();
+  makeRecord(root, { github: { issueNumber: 42 } });
+  const bin = path.join(__dirname, '..', 'bin', 'work-state.js');
+  const argv = [bin, 'transition', '--root', root, '--id', 'endzone:issue-42', '--to', 'escalated', '--expected-revision', '1', '--idempotency-key', 'esc-1', '--actor', 'pl-endzone', '--evidence', 'criterion 1 is unsatisfiable; restate it', '--no-notifier'];
+  const first = JSON.parse(execFileSync(process.execPath, argv, { encoding: 'utf8' }));
+  assert.equal(first.record.state, 'escalated');
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const lines = () => fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(lines().length, 1);
+  assert.equal(lines()[0].wake, 'decision-needed');
+  assert.equal(lines()[0].recordId, 'endzone:issue-42');
+  assert.equal(lines()[0].eventSequence, first.eventSequence);
+  assert.equal(lines()[0].idempotencyKey, 'esc-1');
+  assert.equal(lines()[0].evidence, 'criterion 1 is unsatisfiable; restate it');
+
+  const retry = JSON.parse(execFileSync(process.execPath, argv, { encoding: 'utf8' }));
+  assert.equal(retry.replayed, true);
+  assert.equal(lines().length, 1, 'a replay appends nothing');
+
+  fs.rmSync(outboxFile);
+  const repaired = JSON.parse(execFileSync(process.execPath, argv, { encoding: 'utf8' }));
+  assert.equal(repaired.replayed, true);
+  assert.equal(lines().length, 1, 'a replay that finds no line repairs the cache');
+
+  // A non-decision transition writes no line.
+  move(root, 'endzone:issue-42', repaired.revision, 'implementing', 'back', 'restated by Cory', '2026-09-12T18:00:00.000Z');
+  assert.equal(lines().length, 1);
+});
+
+test('fleet#56: the Principal sees a lead escalation on a PR-less record', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', ownerLogin: 'cory', fleetIdentity: 'cory' }));
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([{ number: 1267, title: 'Ticket', url: 'https://github.com/owner/repo/issues/1267', body: 'x', createdAt: '2026-09-11T00:00:00.000Z', labels: ['ready-for-agent'], assignees: [], comments: [] }]));
+  makeRecord(root, { id: 'endzone:issue-1267', issue: 1267, github: { issueNumber: 1267 }, idempotencyKey: 'create-1267' });
+  const bin = path.join(__dirname, '..', 'bin', 'work-state.js');
+  execFileSync(process.execPath, [bin, 'transition', '--root', root, '--id', 'endzone:issue-1267', '--to', 'escalated', '--expected-revision', '1', '--idempotency-key', 'esc-1267', '--actor', 'pl-endzone', '--evidence', 'acceptance criteria wrong', '--no-notifier'], { encoding: 'utf8' });
+  const frontier = require('../bin/triage').computeFrontier({ root, tenant: 'endzone', fixture, now: '2026-09-12T18:00:00.000Z' });
+  assert.equal(frontier.counts.escalations, 1);
+  assert.equal(frontier.eligible[0].kind, 'escalation');
+  assert.equal(frontier.eligible[0].number, 1267);
+  assert.equal(frontier.eligible[0].evidence, 'acceptance criteria wrong');
+});
