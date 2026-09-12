@@ -59,6 +59,15 @@ A session that does one unit of work for one project and reports to that
 project's project lead. It never talks to a lead or to Cory directly.
 _Avoid_: agent, worker (a worker is a subagent; an IC is a session)
 
+**Principal**:
+The session that reads a tenant's tickets and escalations and proposes
+rulings for them. One per tenant, standing, and the fleet's one seat on the
+top model tier. In advisory mode it decides nothing on its own: its Triage
+proposals become Rulings only on the tenant owner's Approval. It writes no
+product code, merges nothing, and closes nothing.
+_Avoid_: architect, staff engineer, triage bot, PE (in prose; `pe-<tenant>`
+is only the session name)
+
 ### Keeping it alive
 
 **Roster**:
@@ -279,3 +288,27 @@ and is neither retried nor respawned for being idle. Lifting the hold is
 Cory's merge, or Cory's instruction to the project lead.
 _Avoid_: blocked (a GitHub issue dependency), escalation (the page, not the
 state), parked
+
+**Triage**:
+Classifying a ticket and deciding what it needs before it can be worked: a
+Ruling, more information, a human, or nothing. An unrouted ticket (one that
+carries no routing label at all) needs triage as much as one labelled for it.
+_Avoid_: grooming, review (a review is of a pull request), prioritisation
+
+**Ruling**:
+A decision recorded on a ticket that settles a question the ticket's work
+depends on. A ruling is precedent for later tickets until it is explicitly
+overruled; whoever overrules one quotes it and says why.
+_Avoid_: decision (unqualified), verdict, call
+
+**Triage proposal**:
+A Principal's advisory triage of one ticket, posted on the ticket in a fixed
+shape and awaiting the tenant owner's Approval, edit, or rejection. It is not
+a Ruling and no session acts on it.
+_Avoid_: recommendation, draft ruling, suggestion
+
+**Approval**:
+The tenant owner's comment adopting a Triage proposal, with or without edits,
+which turns it into a Ruling. Only the tenant owner's login approves; the same
+word from anyone else, including the fleet's own identity, is not one.
+_Avoid_: sign-off, LGTM, ack
