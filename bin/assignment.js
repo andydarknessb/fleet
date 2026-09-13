@@ -14,7 +14,7 @@ const {
   releaseRecord,
   reservationBaseline,
   reservationConflicts: workReservationConflicts,
-  reservationValuesOverlap,
+  reservationOverlaps,
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
@@ -222,14 +222,16 @@ function localExclusionReasons(issue, skipIssues, exclusions) {
 
 function reservationConflicts(issue, records) {
   return workReservationConflicts(activeRecords(records), issue.reservations)
-    .map((conflict) => ({ code: 'reservation-conflict', detail: `${conflict.field}:${conflict.value}`, owner: conflict.recordId, ownerIssue: conflict.issue }));
-}
-
-function independentPair(left, right) {
-  return RESERVATION_FIELDS.every((field) => {
-    const rightValues = (right.reservations?.[field] || []).map(String);
-    return !(left.reservations?.[field] || []).some((value) => rightValues.some((rightValue) => reservationValuesOverlap(field, value, rightValue)));
-  });
+    .map((conflict) => ({
+      code: 'reservation-conflict',
+      // A cross-field hit (fleet #60) names the reservation it collided with,
+      // since the field alone would read as a same-field clash.
+      detail: conflict.reservedField === conflict.field
+        ? `${conflict.field}:${conflict.value}`
+        : `${conflict.field}:${conflict.value} (${conflict.reservedField}:${conflict.reservedValue} reserved)`,
+      owner: conflict.recordId,
+      ownerIssue: conflict.issue,
+    }));
 }
 
 function independenceProof(issues) {
@@ -238,7 +240,11 @@ function independenceProof(issues) {
   const missingReservations = issues.filter((issue) => !hasReservationEvidence(issue.reservations)).map(issueNumber);
   for (let left = 0; left < issues.length; left += 1) {
     for (let right = left + 1; right < issues.length; right += 1) {
-      if (!independentPair(issues[left], issues[right])) conflicts.push({ left: issueNumber(issues[left]), right: issueNumber(issues[right]) });
+      const overlaps = reservationOverlaps(issues[left].reservations, issues[right].reservations);
+      if (overlaps.length) {
+        const fields = [...new Set(overlaps.flatMap((overlap) => [overlap.leftField, overlap.rightField]))].sort();
+        conflicts.push({ left: issueNumber(issues[left]), right: issueNumber(issues[right]), fields });
+      }
     }
   }
   return { independent: conflicts.length === 0 && missingReservations.length === 0, candidates: issues.map(issueNumber), checkedFields: [...RESERVATION_FIELDS], conflicts, missingReservations };

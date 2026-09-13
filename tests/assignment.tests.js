@@ -86,7 +86,7 @@ test('a directory reservation conflicts with a file inside it, but not a sibling
   const overlapPlan = buildLaunchPlan({ frontier: { eligible: [overlap] }, active, maxIcs: 3 });
   assert.equal(overlapPlan.assignments.length, 0);
   assert.equal(overlapPlan.thirdProof.independent, false);
-  assert.deepEqual(overlapPlan.thirdProof.conflicts, [{ left: 1146, right: 1150 }]);
+  assert.deepEqual(overlapPlan.thirdProof.conflicts, [{ left: 1146, right: 1150, fields: ['components'] }]);
 
   const sibling = issue(1151, { components: ['src/widgets/my-team-summary-v2'] });
   const siblingPlan = buildLaunchPlan({ frontier: { eligible: [sibling] }, active, maxIcs: 3 });
@@ -256,7 +256,7 @@ test('a third assignment is proven only by populated non-overlapping reservation
 
   const conflict = independenceProof([...active, normalizeIssue(issue(53, { components: ['bin/a.js'] }))]);
   assert.equal(conflict.independent, false);
-  assert.deepEqual(conflict.conflicts, [{ left: 40, right: 53 }]);
+  assert.deepEqual(conflict.conflicts, [{ left: 40, right: 53, fields: ['components'] }]);
 });
 
 test('issue criteria derive typed reservations from body and comment paths', () => {
@@ -472,7 +472,7 @@ test('legacy active records use matching GitHub criteria for third-assignment pr
   const conflictPlan = buildLaunchPlan({ frontier: { eligible: [conflict] }, active, issues: [...activeIssues, conflict], maxIcs: 3 });
   assert.equal(conflictPlan.assignments.length, 0);
   assert.equal(conflictPlan.thirdProof.independent, false);
-  assert.deepEqual(conflictPlan.thirdProof.conflicts, [{ left: 40, right: 51 }]);
+  assert.deepEqual(conflictPlan.thirdProof.conflicts, [{ left: 40, right: 51, fields: ['components'] }]);
 
   const staleActive = [{ ...active[0], github: { bodyHash: '0'.repeat(64) } }, active[1]];
   const stalePlan = buildLaunchPlan({ frontier: { eligible: [independent] }, active: staleActive, issues: [...activeIssues, independent], maxIcs: 3 });

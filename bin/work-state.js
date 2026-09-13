@@ -485,12 +485,47 @@ function reservationPathRoot(value) {
   return normalized === '.' ? '' : normalized;
 }
 
+// The two fields whose values are repository paths. A directory reserved in
+// either claims every path beneath it in both (fleet #60): `components:
+// src/widgets/x/` and `testResources: src/widgets/x/ui/X.test.jsx` are the
+// same files in git, whichever field each unit derived them into.
+const PATH_RESERVATION_FIELDS = Object.freeze(['components', 'testResources']);
+
 function reservationValuesOverlap(field, left, right) {
-  if (!['components', 'testResources'].includes(field)) return String(left) === String(right);
+  if (!PATH_RESERVATION_FIELDS.includes(field)) return String(left) === String(right);
   const leftPath = reservationPathRoot(left);
   const rightPath = reservationPathRoot(right);
   if (!leftPath || !rightPath) return true;
   return leftPath === rightPath || leftPath.startsWith(`${rightPath}/`) || rightPath.startsWith(`${leftPath}/`);
+}
+
+// Which fields a value reserved under `field` is compared against: a path
+// field against both path fields, any other field against itself only.
+function comparableReservationFields(field) {
+  return PATH_RESERVATION_FIELDS.includes(field) ? [...PATH_RESERVATION_FIELDS] : [field];
+}
+
+// Every overlapping pair between two reservation sets, in field order. The
+// single authority the record reservation, the proof and the frontier read.
+function reservationOverlaps(leftReservations, rightReservations) {
+  const overlaps = [];
+  for (const leftField of RESERVATION_FIELDS) {
+    const leftValues = (leftReservations?.[leftField] || []).map(String);
+    if (!leftValues.length) continue;
+    for (const rightField of comparableReservationFields(leftField)) {
+      const rightValues = (rightReservations?.[rightField] || []).map(String);
+      for (const leftValue of leftValues) {
+        for (const rightValue of rightValues) {
+          if (reservationValuesOverlap(leftField, leftValue, rightValue)) overlaps.push({ leftField, leftValue, rightField, rightValue });
+        }
+      }
+    }
+  }
+  return overlaps;
+}
+
+function overlapFields(overlaps) {
+  return [...new Set(overlaps.flatMap((overlap) => [overlap.leftField, overlap.rightField]))].sort();
 }
 
 function reservationConflicts(records, reservations, ignoreRecordId = null) {
@@ -498,11 +533,15 @@ function reservationConflicts(records, reservations, ignoreRecordId = null) {
   const conflicts = [];
   for (const record of Object.values(records)) {
     if (record.id === ignoreRecordId) continue;
-    for (const field of RESERVATION_FIELDS) {
-      const values = (record.reservations?.[field] || []).map(String);
-      for (const value of (requested[field] || []).map(String)) {
-        if (values.some((reserved) => reservationValuesOverlap(field, reserved, value))) conflicts.push({ recordId: record.id, issue: record.issue, field, value });
-      }
+    for (const overlap of reservationOverlaps(record.reservations, requested)) {
+      conflicts.push({
+        recordId: record.id,
+        issue: record.issue,
+        field: overlap.rightField,
+        value: overlap.rightValue,
+        reservedField: overlap.leftField,
+        reservedValue: overlap.leftValue,
+      });
     }
   }
   return conflicts;
@@ -524,10 +563,8 @@ function proofFor(records) {
   const missingReservations = records.filter((record) => !hasReservationEvidence(record.reservations)).map((record) => Number(record.issue));
   for (let left = 0; left < records.length; left += 1) {
     for (let right = left + 1; right < records.length; right += 1) {
-      if (RESERVATION_FIELDS.some((field) => {
-        const rightValues = (records[right].reservations?.[field] || []).map(String);
-        return (records[left].reservations?.[field] || []).some((value) => rightValues.some((rightValue) => reservationValuesOverlap(field, value, rightValue)));
-      })) conflicts.push({ left: Number(records[left].issue), right: Number(records[right].issue) });
+      const overlaps = reservationOverlaps(records[left].reservations, records[right].reservations);
+      if (overlaps.length) conflicts.push({ left: Number(records[left].issue), right: Number(records[right].issue), fields: overlapFields(overlaps) });
     }
   }
   return {
@@ -1422,6 +1459,7 @@ module.exports = {
   observeRecord,
   outboxHasWake,
   parseArgs,
+  proofFor,
   proofMatches,
   projectStatus,
   readEvents,
@@ -1432,6 +1470,7 @@ module.exports = {
   releaseRecord,
   reservationBaseline,
   reservationConflicts,
+  reservationOverlaps,
   reservationValuesOverlap,
   reserveRecord,
   shadowProject,
