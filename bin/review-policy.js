@@ -116,9 +116,15 @@ function parseDiff(diffText) {
   return { addedByFile, changedLines };
 }
 
+// fleet#58: a pattern matches in the case the tenant wrote it. Compiled with
+// the `i` flag, the SQL pattern `TRUNCATE` fired on the English word
+// "truncated" in a comment (endzone PR #1344) and booked an opus risk review
+// on a false trigger. `DROP TABLE`, `DELETE FROM`, `FOR UPDATE` are SQL and
+// `JWT_SECRET` is a constant: their case is the signal. A tenant that wants a
+// case-insensitive pattern writes the alternation itself (`[Tt]runcate`).
 function patternRegExp(pattern) {
-  try { return new RegExp(pattern, 'i'); } catch {
-    return new RegExp(String(pattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+  try { return new RegExp(pattern); } catch {
+    return new RegExp(String(pattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   }
 }
 

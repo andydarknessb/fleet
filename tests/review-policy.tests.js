@@ -1354,3 +1354,34 @@ test('fleet#43: record cli accepts --reviewed-sha and refuses --reviewed (a typo
     '--reviewed-sha', '000c07b9', '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', JSON.stringify(RISK_FINDINGS)]);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8')).reviewedSha, '000c07b9');
 });
+
+// --- fleet#58: trigger patterns match in the case the tenant wrote them ------
+// `patternRegExp` compiled every pattern with the `i` flag, so the SQL pattern
+// `TRUNCATE` fired on the English word "truncated" in a comment (endzone PR
+// #1344, risk-003.json) and the IC hosted an opus risk review on a false
+// trigger. Tenant patterns are written in the case of the thing they detect.
+test('fleet#58: a prose word in the wrong case does not fire a risk pattern; the SQL form still does', () => {
+  const prose = classifyChange({
+    files: ['src/widgets/player-decision-card/ui/PlayerDecisionCard.jsx'], changedLines: 40,
+    addedLines: ['// long, truncated name reports `scrollWidth > clientWidth` despite nothing', 'const rows = list.slice(0, 3); // delete from the list, for update later'],
+    tenant: TENANT,
+  });
+  assert.deepEqual(prose.triggers, [], 'prose in a comment is not a destructive or concurrency operation');
+  const sql = classifyChange({
+    files: ['server/services/cleanup.js'], changedLines: 12,
+    addedLines: ['  await knex.raw("TRUNCATE stale_rows");', '  await trx("leagues").forUpdate(); // FOR UPDATE'],
+    tenant: TENANT,
+  });
+  assert.deepEqual(sql.triggers.map((trigger) => trigger.class), ['destructive', 'concurrency']);
+  // An unparseable pattern still falls back to a literal match, in the tenant's case.
+  const literal = classifyChange({
+    files: ['src/a.js'], changedLines: 3, addedLines: ['x = a[1'],
+    tenant: { riskTriggers: { odd: { paths: [], patterns: ['a[1'] } } },
+  });
+  assert.deepEqual(literal.triggers.map((trigger) => trigger.class), ['odd']);
+  const literalCase = classifyChange({
+    files: ['src/a.js'], changedLines: 3, addedLines: ['x = A[1'],
+    tenant: { riskTriggers: { odd: { paths: [], patterns: ['a[1'] } } },
+  });
+  assert.deepEqual(literalCase.triggers, []);
+});
