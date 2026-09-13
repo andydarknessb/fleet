@@ -10,11 +10,11 @@ const {
   getRecord,
   hasReservationEvidence,
   parseArgs,
+  proofFor,
   proofMatches,
   releaseRecord,
   reservationBaseline,
   reservationConflicts: workReservationConflicts,
-  reservationOverlaps,
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
@@ -234,20 +234,11 @@ function reservationConflicts(issue, records) {
     }));
 }
 
+// The proof over a mix of active Work records and frontier issues is the Work
+// record proof (work-state's proofFor) over the pair each carries: an issue
+// number and its reservations. One builder, one conflict shape (fleet #60).
 function independenceProof(issues) {
-  const conflicts = [];
-  const issueNumber = (issue) => issue.number ?? issue.issue;
-  const missingReservations = issues.filter((issue) => !hasReservationEvidence(issue.reservations)).map(issueNumber);
-  for (let left = 0; left < issues.length; left += 1) {
-    for (let right = left + 1; right < issues.length; right += 1) {
-      const overlaps = reservationOverlaps(issues[left].reservations, issues[right].reservations);
-      if (overlaps.length) {
-        const fields = [...new Set(overlaps.flatMap((overlap) => [overlap.leftField, overlap.rightField]))].sort();
-        conflicts.push({ left: issueNumber(issues[left]), right: issueNumber(issues[right]), fields });
-      }
-    }
-  }
-  return { independent: conflicts.length === 0 && missingReservations.length === 0, candidates: issues.map(issueNumber), checkedFields: [...RESERVATION_FIELDS], conflicts, missingReservations };
+  return proofFor(issues.map((issue) => ({ issue: issue.number ?? issue.issue, reservations: issue.reservations })));
 }
 
 function hydrateActiveReservations(active, issues = []) {

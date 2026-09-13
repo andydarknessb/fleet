@@ -533,7 +533,13 @@ function reservationConflicts(records, reservations, ignoreRecordId = null) {
   const conflicts = [];
   for (const record of Object.values(records)) {
     if (record.id === ignoreRecordId) continue;
+    // One conflict per requested value per record, as before: a path nested
+    // under two of the record's reservations is one collision, not two.
+    const seen = new Set();
     for (const overlap of reservationOverlaps(record.reservations, requested)) {
+      const key = `${overlap.rightField} ${overlap.rightValue}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       conflicts.push({
         recordId: record.id,
         issue: record.issue,

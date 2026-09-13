@@ -84,6 +84,19 @@ test('reservationConflicts and reserveRecord refuse a testResources file under a
   );
 });
 
+test('a requested path nested under two reservations of one record is one conflict, not two', () => {
+  const records = { 'endzone:issue-1': { id: 'endzone:issue-1', issue: 1, reservations: { components: ['src/widgets', 'src/widgets/x'], testResources: ['src/widgets/x/'] } } };
+  const conflicts = reservationConflicts(records, { components: ['src/widgets/x/y.jsx'] });
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].value, 'src/widgets/x/y.jsx');
+  assert.equal(conflicts[0].reservedField, 'components');
+
+  const active = [{ id: 'endzone:issue-1', issue: 1, state: 'implementing', manifestPath: 'm1', reservations: records['endzone:issue-1'].reservations }];
+  const frontier = selectFrontier({ issues: [issue(2, { components: ['src/widgets/x/y.jsx'] })], readyLabel: 'ready-for-agent', active, now: '2026-09-13T12:00:00.000Z' });
+  const reasons = frontier.excluded.find((entry) => entry.issue === 2).reasons.filter((reason) => reason.code === 'reservation-conflict');
+  assert.deepEqual(reasons.map((reason) => reason.detail), ['components:src/widgets/x/y.jsx']);
+});
+
 test('reserveRecord refuses a components file under an active testResources directory', () => {
   const root = rootDir();
   reserveRecord({ root, id: 'endzone:issue-1', tenant: 'endzone', issue: 1, reservations: { testResources: [DIR] }, idempotencyKey: 'reserve-1', now: '2026-09-13T00:00:00.000Z' });
