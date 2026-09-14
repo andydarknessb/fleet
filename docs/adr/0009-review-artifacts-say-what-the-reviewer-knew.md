@@ -192,3 +192,31 @@ CI is gone: the watcher records `checks-settled` and the watchdog wakes the
 lead. Not chosen: a lead-invoked "observe this PR now" command. It would be
 a second writer of watcher evidence, and the lag it removes is at most one
 tick.
+
+## 6. A triggered head needs its risk review before the formal (fleet#64)
+
+**Observed.** `record --kind formal` took the classification from the caller
+and read `triggers: []` when none was passed, so every trigger guard was
+walked past. Endzone PR #1380 formal-002 at `c4e31d2c` was recorded with
+`tier: null`, `triggers: []` and no risk artifact while `classify` at that
+head said `riskReview: true`. The lead's own finding in that artifact was the
+only place the gap was written down.
+
+**Ruled.** A formal record carries the head's classification
+(`--classification`, from the lead's own `classify` run; `CLASSIFICATION_REQUIRED`
+refuses without it). When that classification carries a trigger, the record
+needs a risk artifact at that head, or it refuses with `RISK_REVIEW_MISSING`
+(exit 2, nothing written, no state touched). Two doors stay open on purpose:
+
+- `--risk-ruling "<why>"` is the lead ruling the trigger on record (a false
+  positive, or covered by something it names). The ruling is written into the
+  artifact as `riskRuling`, so the record says what the lead knew. A risk
+  review never takes a ruling; the IC hosts it, the lead rules.
+- A linked re-review (`--prior-artifact`) at a later head stands on the prior
+  formal's walk of the risk chain (ruling 5): the delta is what the lead reads,
+  and an earlier-head risk artifact is not refused there. A fresh formal at a
+  new head is.
+
+The guard sits in the record, not in a doc line, because the doc line already
+said "a triggered diff missing that artifact goes back to the IC" and the
+record accepted it anyway.

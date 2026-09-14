@@ -694,7 +694,7 @@ test('record: INVALID_REVIEW_STATE exits 2 with the refusal on stderr and nothin
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const early = spawnSync(process.execPath, [
     bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead',
+    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead', '--classification', '{"tier":"normal","triggers":[]}',
     '--findings', '[{"file":"src/a.js","line":3,"claim":"off-by-one","severity":"should-fix"}]',
   ], { encoding: 'utf8', windowsHide: true });
   assert.equal(early.status, 2);
@@ -1067,7 +1067,7 @@ test('record cli: a replay exits 0 with the JSON answer on stdout and the not-wr
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const argv = [
     bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead',
+    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead', '--classification', '{"tier":"normal","triggers":[]}',
     '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]',
   ];
   const first = spawnSync(process.execPath, argv, { encoding: 'utf8', windowsHide: true });
@@ -1101,7 +1101,7 @@ test('fleet#46: record and hold take the reviewer from FLEET_NAME when --actor i
   const revision = seedRecord(root);
   withFleetName('pl-endzone', () => {
     const recorded = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-      '--kind', 'formal', '--head-sha', 'aaa1111', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
+      '--kind', 'formal', '--head-sha', 'aaa1111', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
     const stored = JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8'));
     assert.equal(stored.reviewer, 'pl-endzone');
     assert.equal(recorded.result.record.review.formal.actor, 'pl-endzone');
@@ -1117,7 +1117,7 @@ test('fleet#46: record and hold take the reviewer from FLEET_NAME when --actor i
   const revision2 = seedRecord(root2);
   withFleetName('pl-endzone', () => {
     const explicit = cli(['record', '--root', root2, '--id', 'endzone:issue-42', '--expected-revision', String(revision2),
-      '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'cory', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
+      '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'cory', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root2, explicit.artifact), 'utf8')).reviewer, 'cory');
   });
 });
@@ -1127,7 +1127,7 @@ test('fleet#46: with neither --actor nor FLEET_NAME the reviewer is still "unkno
   const revision = seedRecord(root);
   withFleetName(undefined, () => {
     const recorded = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-      '--kind', 'formal', '--head-sha', 'aaa1111', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
+      '--kind', 'formal', '--head-sha', 'aaa1111', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8')).reviewer, 'unknown');
   });
 });
@@ -1384,4 +1384,109 @@ test('fleet#58: a prose word in the wrong case does not fire a risk pattern; the
     tenant: { riskTriggers: { odd: { paths: [], patterns: ['a[1'] } } },
   });
   assert.deepEqual(literalCase.triggers, []);
+});
+
+// --- fleet#64: a triggered head needs its risk review before the formal ---
+
+test('fleet#64: a formal review at a triggered head with no risk artifact is refused, writes nothing, and touches no state', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification: RISK,
+      noFindings: 'clean at both angles', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error instanceof ReviewPolicyError && error.code === 'RISK_REVIEW_MISSING'
+      && error.message.includes('accessibility') && error.message.includes('no risk artifact is recorded') && error.message.includes('--risk-ruling'),
+  );
+  const record = workState.getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.revision, revision);
+  assert.equal(record.review.formal, undefined);
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.ok(!fs.existsSync(dir) || fs.readdirSync(dir).length === 0, 'no artifact was written');
+});
+
+test('fleet#64: a first formal review at a new head does not lean on a risk artifact recorded at an earlier head', () => {
+  const root = rootDir();
+  const { risk, revision } = seedRiskThenReview(root, { findings: [{ file: 'src/a.jsx', claim: 'aria', severity: 'nit' }] });
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'formal', headSha: 'bbb2222', actor: 'project-lead', classification: RISK,
+      noFindings: 'clean', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error instanceof ReviewPolicyError && error.code === 'RISK_REVIEW_MISSING'
+      && error.message.includes(risk.artifact) && error.message.includes('17fa3c48') && error.riskHeadSha === '17fa3c48',
+  );
+});
+
+test('fleet#64: --risk-ruling records the lead ruling in the artifact in place of the missing risk review', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const ruling = 'destructive pattern is cleanup on a throwaway CI test database; no live table is touched';
+  const formal = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification: RISK, riskRuling: ruling,
+    noFindings: 'clean at both angles', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
+  });
+  const stored = JSON.parse(fs.readFileSync(path.join(root, formal.artifact), 'utf8'));
+  assert.equal(stored.riskRuling, ruling);
+  assert.equal(stored.tier, 'high-risk');
+  assert.equal(stored.riskArtifact, null);
+  // A normal head carries no ruling field at all.
+  const root2 = rootDir();
+  const revision2 = seedRecord(root2);
+  const plain = recordReviewArtifact({
+    root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2,
+    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification: { tier: 'normal', triggers: [] },
+    noFindings: 'clean', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
+  });
+  assert.ok(!('riskRuling' in JSON.parse(fs.readFileSync(path.join(root2, plain.artifact), 'utf8'))));
+});
+
+test('fleet#64: a formal review without a classification is refused before any state is read', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  for (const classification of [undefined, {}, { triggers: [] }]) {
+    assert.throws(
+      () => recordReviewArtifact({
+        root, recordId: 'endzone:issue-42', expectedRevision: revision,
+        kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification,
+        noFindings: 'clean', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
+      }),
+      (error) => error instanceof ReviewPolicyError && error.code === 'CLASSIFICATION_REQUIRED' && error.message.includes('--classification'),
+    );
+  }
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision);
+  // A risk review never takes a ruling: the IC hosts it, the lead rules.
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      kind: 'risk', headSha: 'aaa1111', actor: 'ic-42', classification: RISK, riskRuling: 'no',
+      noFindings: 'clean', idempotencyKey: 'risk-1', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error instanceof ReviewPolicyError && error.code === 'USAGE',
+  );
+});
+
+test('fleet#64: record --kind formal exits 2 on RISK_REVIEW_MISSING and CLASSIFICATION_REQUIRED, and --risk-ruling opens the door', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const base = [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
+    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead', '--no-findings', 'clean'];
+  const unclassified = spawnSync(process.execPath, base, { encoding: 'utf8', windowsHide: true });
+  assert.equal(unclassified.status, 2, unclassified.stderr);
+  assert.equal(unclassified.stdout, '');
+  assert.equal(JSON.parse(unclassified.stderr).code, 'CLASSIFICATION_REQUIRED');
+  const triggered = spawnSync(process.execPath, [...base, '--classification', JSON.stringify(RISK)], { encoding: 'utf8', windowsHide: true });
+  assert.equal(triggered.status, 2, triggered.stderr);
+  assert.equal(triggered.stdout, '');
+  assert.equal(JSON.parse(triggered.stderr).code, 'RISK_REVIEW_MISSING');
+  const ruled = spawnSync(process.execPath, [...base, '--classification', JSON.stringify(RISK), '--risk-ruling', 'cleanup on a throwaway CI database'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(ruled.status, 0, ruled.stderr);
+  const record = workState.getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.review.formal.headSha, 'aaa1111');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, record.review.formal.artifact), 'utf8')).riskRuling, 'cleanup on a throwaway CI database');
 });
