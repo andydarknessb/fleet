@@ -322,6 +322,17 @@ function recordReviewArtifact(options = {}) {
     throw new ReviewPolicyError('REVIEWED_SHA_MISMATCH', `a formal review is recorded at the head it read: --reviewed-sha ${reviewedSha} differs from --head-sha ${headSha}; re-review at ${headSha} (plan-rereview scopes it) rather than record a review of a tree nobody read`, { reviewedSha, headSha: String(headSha) });
   }
   const classification = options.classification || {};
+  // fleet#64: a formal record with no classification read `triggers: []` and
+  // walked past every trigger guard, so a triggered head was formally recorded
+  // with no risk review ever having existed (Endzone PR #1380, formal-002 at
+  // c4e31d2c). The lead classifies the head before it reviews (project-lead.md,
+  // Merge); the record now carries that answer, and a triggered head needs its
+  // risk artifact (below) unless the lead rules the trigger on record.
+  if (kind === 'formal' && typeof classification.tier !== 'string') {
+    throw new ReviewPolicyError('CLASSIFICATION_REQUIRED', `a formal review records the head's classification: pass --classification '<json>' from review-policy.js classify at ${headSha}`, { headSha: String(headSha) });
+  }
+  const riskRuling = typeof options.riskRuling === 'string' && options.riskRuling.trim().length > 0 ? options.riskRuling.trim() : null;
+  if (riskRuling && kind !== 'formal') throw new ReviewPolicyError('USAGE', '--risk-ruling belongs to a formal review: it is the lead ruling on a trigger');
   // Ticket 09: with state/flags/review-dedup-off every review pass is written down (the
   // legacy behaviour). The default replay key is kind:record:head, which would make a
   // second pass at the same head replay the first, so under the flag the default key
@@ -362,6 +373,21 @@ function recordReviewArtifact(options = {}) {
       }
       if (kind === 'risk' && !(classification.triggers || []).length) {
         throw new ReviewPolicyError('RISK_REVIEW_NOT_TRIGGERED', 'a risk review requires a configured trigger; a normal PR never launches the risk reviewer');
+      }
+      // fleet#64: a triggered head has its risk artifact before the formal review
+      // records. A first formal at a head needs the risk artifact at that head;
+      // a linked re-review (--prior-artifact) is scoped to the delta since the
+      // prior formal, which already walked the risk chain (fleet#43), so an
+      // earlier-head risk artifact stands there and the lead verifies the delta
+      // by hand. --risk-ruling "<why>" is the lead ruling the trigger (a false
+      // positive, or covered) and is written into the artifact.
+      if (kind === 'formal' && (classification.triggers || []).length && !riskRuling) {
+        const risk = record.review?.risk || null;
+        const names = (classification.triggers || []).map((trigger) => trigger.class || trigger).join(', ');
+        const staleForFreshReview = risk && risk.headSha !== String(headSha) && !linkedRereview;
+        if (!risk || staleForFreshReview) {
+          throw new ReviewPolicyError('RISK_REVIEW_MISSING', `classification at ${headSha} carries trigger(s) ${names} and ${risk ? `the recorded risk artifact ${risk.artifact} is at ${risk.headSha}, not this head` : 'no risk artifact is recorded'}; the IC hosts the risk reviewer pre-PR-ready and records it at this head (ic.md), or the lead rules the trigger on record with --risk-ruling "<why>"`, { headSha: String(headSha), triggers: names, riskArtifact: risk ? risk.artifact : null, riskHeadSha: risk ? risk.headSha : null });
+        }
       }
 
       let priorArtifactData = null;
@@ -474,7 +500,7 @@ function recordReviewArtifact(options = {}) {
           // fleet#43 (formal only): the risk artifact whose open findings this
           // review accounted for; null when there was none or a prior formal
           // review already consumed it.
-          ...(kind === 'formal' ? { riskArtifact, riskArtifactMissing: riskArtifactMissing || undefined } : {}),
+          ...(kind === 'formal' ? { riskArtifact, riskArtifactMissing: riskArtifactMissing || undefined, riskRuling: riskRuling || undefined } : {}),
           resolutions,
           noFindings: noFindings ? noFindings.trim() : null,
           findings: buildFindings(stamp, options.findings, priors, resolutions),
@@ -635,7 +661,7 @@ function classifyCli(rest) {
 // `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
 // each list is every flag its handler consumes; an unknown flag or command is
 // USAGE, exit 2, nothing on stdout.
-const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact'];
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling'];
 const COMMAND_FLAGS = Object.freeze({
   classify: CLASSIFY_FLAGS,
   record: RECORD_FLAGS,
@@ -672,6 +698,7 @@ function cli(argv) {
       noFindings: args['no-findings'],
       resolutions: args.resolutions ? JSON.parse(args.resolutions) : null,
       priorArtifact: args['prior-artifact'],
+      riskRuling: args['risk-ruling'],
     });
   }
   if (command === 'plan-rereview') {
@@ -701,7 +728,7 @@ if (require.main === module) {
     // recorded, and the message names the door that opens the state.
     // FINDING_CARRIES_OUTCOME and REVIEWED_SHA_MISMATCH (fleet#43) are refused
     // invocations too: nothing was recorded, and the message names the door.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING'].includes(error.code) ? 2 : 1;
   }
 }
 
