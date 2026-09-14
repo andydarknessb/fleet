@@ -9,11 +9,43 @@ const {
   ReviewPolicyError,
   classifyChange,
   matchGlob,
-  recordReviewArtifact,
+  recordReviewArtifact: recordAgainstRepo,
   planRereview,
   holdRecord,
 } = require('../bin/review-policy');
 const workState = require('../bin/work-state');
+const { spawnSync: runGit } = require('node:child_process');
+
+// fleet#67: `record` resolves every SHA it is given against the tenant repo.
+// The tests below that are about the record's other guards run against a stub
+// repo in which every object exists; the fleet#67 tests at the end use a real
+// one. `git` is the injected runner: (args, repoPath) -> stdout, throws on a
+// non-zero exit like execFileSync does.
+function recordReviewArtifact(options) {
+  return recordAgainstRepo({ repoPath: 'E:/stub-repo', git: () => '', ...options });
+}
+
+// A real repository with one commit, for the CLI tests (the binary runs git for
+// real) and the fleet#67 tests. Returns the repo path and its head SHA.
+function commitIn(root) {
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  const git = (...args) => {
+    const result = runGit('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a');
+  git('add', 'a.txt');
+  git('commit', '-q', '-m', 'one', '--no-gpg-sign');
+  const prior = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'b');
+  git('commit', '-q', '-a', '-m', 'two', '--no-gpg-sign');
+  return { repo, head: git('rev-parse', 'HEAD'), prior };
+}
 
 function rootDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-review-policy-'));
@@ -691,10 +723,11 @@ test('record --kind formal in ci-wait is refused with the door named, and leaves
 test('record: INVALID_REVIEW_STATE exits 2 with the refusal on stderr and nothing on stdout', () => {
   const root = rootDir();
   const revision = seedRecord(root, { state: 'ci-wait' });
+  const { repo, head } = commitIn(root);
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const early = spawnSync(process.execPath, [
     bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead', '--classification', '{"tier":"normal","triggers":[]}',
+    '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'project-lead', '--classification', '{"tier":"normal","triggers":[]}',
     '--findings', '[{"file":"src/a.js","line":3,"claim":"off-by-one","severity":"should-fix"}]',
   ], { encoding: 'utf8', windowsHide: true });
   assert.equal(early.status, 2);
@@ -826,14 +859,15 @@ test('a no-findings statement cannot accompany findings, and cannot be blank or 
 test('record cli: --no-findings reaches the artifact; --no-finding and --findings-file are refused as unknown flags', () => {
   const root = rootDir();
   const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
   for (const [flag, value] of [['--no-finding', 'nothing'], ['--findings-file', 'f.json']]) {
     assert.throws(
-      () => cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', 'ce19d6a',
+      () => cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', head, '--repo-path', repo,
         '--classification', JSON.stringify(RISK), flag, value]),
       (error) => error instanceof ReviewPolicyError && error.code === 'USAGE' && new RegExp(`unknown flag ${flag}`).test(error.message),
     );
   }
-  const clean = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', 'ce19d6a',
+  const clean = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', head, '--repo-path', repo,
     '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--no-findings', 'Examined the accessibility angle; nothing to fix.']);
   const stored = JSON.parse(fs.readFileSync(path.join(root, clean.artifact), 'utf8'));
   assert.equal(stored.noFindings, 'Examined the accessibility angle; nothing to fix.');
@@ -843,10 +877,11 @@ test('record cli: --no-findings reaches the artifact; --no-finding and --finding
 test('record: EMPTY_FINDINGS exits 2 with the refusal on stderr and nothing on stdout', () => {
   const root = rootDir();
   const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const empty = spawnSync(process.execPath, [
     bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'risk', '--head-sha', 'ce19d6a', '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', '[]',
+    '--kind', 'risk', '--head-sha', head, '--repo-path', repo, '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', '[]',
   ], { encoding: 'utf8', windowsHide: true });
   assert.equal(empty.status, 2);
   assert.equal(empty.stdout, '');
@@ -1064,10 +1099,11 @@ test('a replay says what it did not write: the result names the ignored findings
 test('record cli: a replay exits 0 with the JSON answer on stdout and the not-written warning on stderr', () => {
   const root = rootDir();
   const revision = seedRecord(root);
+  const { repo, head } = commitIn(root);
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const argv = [
     bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead', '--classification', '{"tier":"normal","triggers":[]}',
+    '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'project-lead', '--classification', '{"tier":"normal","triggers":[]}',
     '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]',
   ];
   const first = spawnSync(process.execPath, argv, { encoding: 'utf8', windowsHide: true });
@@ -1099,9 +1135,10 @@ function withFleetName(value, body) {
 test('fleet#46: record and hold take the reviewer from FLEET_NAME when --actor is omitted; --actor still wins', () => {
   const root = rootDir();
   const revision = seedRecord(root);
+  const { repo, head } = commitIn(root);
   withFleetName('pl-endzone', () => {
     const recorded = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-      '--kind', 'formal', '--head-sha', 'aaa1111', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
+      '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
     const stored = JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8'));
     assert.equal(stored.reviewer, 'pl-endzone');
     assert.equal(recorded.result.record.review.formal.actor, 'pl-endzone');
@@ -1115,9 +1152,10 @@ test('fleet#46: record and hold take the reviewer from FLEET_NAME when --actor i
 
   const root2 = rootDir();
   const revision2 = seedRecord(root2);
+  const { repo: repo2, head: head2 } = commitIn(root2);
   withFleetName('pl-endzone', () => {
     const explicit = cli(['record', '--root', root2, '--id', 'endzone:issue-42', '--expected-revision', String(revision2),
-      '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'cory', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
+      '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'cory', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root2, explicit.artifact), 'utf8')).reviewer, 'cory');
   });
 });
@@ -1125,9 +1163,10 @@ test('fleet#46: record and hold take the reviewer from FLEET_NAME when --actor i
 test('fleet#46: with neither --actor nor FLEET_NAME the reviewer is still "unknown", never blank', () => {
   const root = rootDir();
   const revision = seedRecord(root);
+  const { repo, head } = commitIn(root);
   withFleetName(undefined, () => {
     const recorded = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-      '--kind', 'formal', '--head-sha', 'aaa1111', '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
+      '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--classification', '{"tier":"normal","triggers":[]}', '--findings', '[{"file":"src/a.js","claim":"x","severity":"nit"}]']);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8')).reviewer, 'unknown');
   });
 });
@@ -1167,10 +1206,11 @@ test('fleet#43: a supplied finding carrying outcome (or resolution) is refused b
 test('fleet#43: FINDING_CARRIES_OUTCOME is a refused invocation: exit 2, refusal on stderr, nothing on stdout', () => {
   const root = rootDir();
   const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const refused = spawnSync(process.execPath, [
     bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'risk', '--head-sha', 'ce19d6a', '--actor', 'ic-42', '--classification', JSON.stringify(RISK),
+    '--kind', 'risk', '--head-sha', head, '--repo-path', repo, '--actor', 'ic-42', '--classification', JSON.stringify(RISK),
     '--findings', JSON.stringify([{ ...RISK_FINDINGS[0], outcome: 'fixed', status: 'open' }]),
   ], { encoding: 'utf8', windowsHide: true });
   assert.equal(refused.status, 2);
@@ -1345,14 +1385,15 @@ test('fleet#43: a risk artifact whose file is gone degrades honestly instead of 
 test('fleet#43: record cli accepts --reviewed-sha and refuses --reviewed (a typo is never a silent no-op)', () => {
   const root = rootDir();
   const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head, prior } = commitIn(root);
   assert.throws(
-    () => cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', '17fa3c48',
-      '--reviewed', '000c07b9', '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', JSON.stringify(RISK_FINDINGS)]),
+    () => cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', head, '--repo-path', repo,
+      '--reviewed', prior, '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', JSON.stringify(RISK_FINDINGS)]),
     (error) => error.code === 'USAGE' && /unknown flag --reviewed/.test(error.message),
   );
-  const recorded = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', '17fa3c48',
-    '--reviewed-sha', '000c07b9', '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', JSON.stringify(RISK_FINDINGS)]);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8')).reviewedSha, '000c07b9');
+  const recorded = cli(['record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--head-sha', head, '--repo-path', repo,
+    '--reviewed-sha', prior, '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', JSON.stringify(RISK_FINDINGS)]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8')).reviewedSha, prior);
 });
 
 // --- fleet#58: trigger patterns match in the case the tenant wrote them ------
@@ -1473,9 +1514,10 @@ test('fleet#64: a formal review without a classification is refused before any s
 test('fleet#64: record --kind formal exits 2 on RISK_REVIEW_MISSING and CLASSIFICATION_REQUIRED, and --risk-ruling opens the door', () => {
   const root = rootDir();
   const revision = seedRecord(root);
+  const { repo, head } = commitIn(root);
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const base = [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
-    '--kind', 'formal', '--head-sha', 'aaa1111', '--actor', 'project-lead', '--no-findings', 'clean'];
+    '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'project-lead', '--no-findings', 'clean'];
   const unclassified = spawnSync(process.execPath, base, { encoding: 'utf8', windowsHide: true });
   assert.equal(unclassified.status, 2, unclassified.stderr);
   assert.equal(unclassified.stdout, '');
@@ -1487,6 +1529,105 @@ test('fleet#64: record --kind formal exits 2 on RISK_REVIEW_MISSING and CLASSIFI
   const ruled = spawnSync(process.execPath, [...base, '--classification', JSON.stringify(RISK), '--risk-ruling', 'cleanup on a throwaway CI database'], { encoding: 'utf8', windowsHide: true });
   assert.equal(ruled.status, 0, ruled.stderr);
   const record = workState.getRecord({ root, id: 'endzone:issue-42' });
-  assert.equal(record.review.formal.headSha, 'aaa1111');
+  assert.equal(record.review.formal.headSha, head);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, record.review.formal.artifact), 'utf8')).riskRuling, 'cleanup on a throwaway CI database');
+});
+
+// --- fleet#67: a recorded head is a commit ----------------------------------
+// `record --kind risk` on endzone #1382 accepted headSha
+// 0f2fb0064a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c: the branch head's real 8-character
+// prefix followed by a padded pattern. Nothing had asked the tenant repo whether
+// the object existed, so the risk chain, plan-rereview ranges and the merge-time
+// head check all keyed off a SHA nobody could ever have read.
+
+test('fleet#67: record refuses a headSha that is not a commit in the tenant repo, and writes nothing', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
+  const fake = `${head.slice(0, 8)}4a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c`;
+  assert.throws(
+    () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'risk', headSha: fake, actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS }),
+    (error) => error instanceof ReviewPolicyError && error.code === 'UNKNOWN_COMMIT' && error.sha === fake && error.repoPath === repo && new RegExp(fake).test(error.message),
+  );
+  const record = workState.getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.revision, revision, 'a refused record bumps nothing');
+  assert.equal(Object.keys(record.idempotency).some((key) => key.includes(fake)), false, 'and keeps no idempotency key for the invented head');
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.equal(fs.existsSync(dir) ? fs.readdirSync(dir).length : 0, 0, 'no artifact is written');
+
+  const real = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'risk', headSha: head, actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, real.artifact), 'utf8')).headSha, head);
+
+  const otherRoot = rootDir();
+  const otherRevision = seedRecord(otherRoot, { state: 'implementing' });
+  const short = recordAgainstRepo({ root: otherRoot, recordId: 'endzone:issue-42', expectedRevision: otherRevision, repoPath: repo, kind: 'risk', headSha: head.slice(0, 12), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
+  assert.ok(short.artifact, 'an abbreviated SHA that names a commit is accepted, as git accepts it');
+});
+
+test('fleet#67: reviewedSha is resolved too, so a range cannot start at a tree nobody could read', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
+  const fake = 'e'.repeat(40);
+  assert.throws(
+    () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'risk', headSha: head, reviewedSha: fake, actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS }),
+    (error) => error.code === 'UNKNOWN_COMMIT' && error.sha === fake && /--reviewed-sha/.test(error.message),
+  );
+});
+
+test('fleet#67: the check fetches the record\'s PR branch first and tolerates a fetch that fails, but not a missing object', () => {
+  const root = rootDir();
+  workState.createRecord({
+    root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, state: 'implementing',
+    github: { issueNumber: 42, prNumber: 77 }, assignment: { branch: 'fleet/42-thing', baseSha: 'b'.repeat(40) },
+    actor: 'test', idempotencyKey: 'create-42', now: '2026-09-01T00:00:00.000Z',
+  });
+  const revision = workState.getRecord({ root, id: 'endzone:issue-42' }).revision;
+  const calls = [];
+  const git = (args, repoPath) => { calls.push([repoPath, ...args]); if (args[0] === 'fetch') throw new Error('offline'); return ''; };
+  const recorded = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: 'E:/tenant', git, kind: 'risk', headSha: 'c'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
+  assert.ok(recorded.artifact);
+  assert.deepEqual(calls[0], ['E:/tenant', 'fetch', '--quiet', 'origin', 'fleet/42-thing'], 'the PR branch is fetched so a just-pushed head resolves');
+  assert.deepEqual(calls[1], ['E:/tenant', 'cat-file', '-e', `${'c'.repeat(40)}^{commit}`]);
+  assert.equal(calls.length, 2, 'reviewedSha equal to headSha is resolved once');
+
+  const missing = (args) => { if (args[0] === 'cat-file') { const error = new Error('fatal: Not a valid object name'); error.status = 1; throw error; } return ''; };
+  assert.throws(
+    () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: recorded.result.revision, repoPath: 'E:/tenant', git: missing, kind: 'risk', headSha: 'd'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS, idempotencyKey: 'second' }),
+    (error) => error.code === 'UNKNOWN_COMMIT',
+  );
+});
+
+test('fleet#67: the repo comes from --repo-path or the tenant file; with neither the record is refused, never skipped', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  assert.throws(
+    () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, git: () => '', kind: 'risk', headSha: 'c'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS }),
+    (error) => error.code === 'TENANT_REPO_UNKNOWN' && /endzone\.json/.test(error.message),
+  );
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ ...TENANT, repo: 'E:\\Tenant-Repo' }));
+  const calls = [];
+  const recorded = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, git: (args, repoPath) => { calls.push(repoPath); return ''; }, kind: 'risk', headSha: 'c'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
+  assert.ok(recorded.artifact);
+  assert.deepEqual([...new Set(calls)], ['E:\\Tenant-Repo'], 'the tenant file\'s repo is the default');
+});
+
+test('fleet#67: the binary refuses an invented head with exit 2 and takes --repo-path; an unknown flag is still USAGE', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const fake = `${head.slice(0, 8)}4a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c`;
+  const base = [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'risk', '--actor', 'ic-42', '--classification', JSON.stringify(RISK), '--findings', JSON.stringify(RISK_FINDINGS)];
+  const invented = spawnSync(process.execPath, [...base, '--repo-path', repo, '--head-sha', fake], { encoding: 'utf8', windowsHide: true });
+  assert.equal(invented.status, 2, invented.stderr);
+  assert.equal(invented.stdout, '');
+  assert.equal(JSON.parse(invented.stderr).code, 'UNKNOWN_COMMIT');
+  const typo = spawnSync(process.execPath, [...base, '--repo', repo, '--head-sha', head], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.match(JSON.parse(typo.stderr).message, /unknown flag --repo\b/);
+  const real = spawnSync(process.execPath, [...base, '--repo-path', repo, '--head-sha', head], { encoding: 'utf8', windowsHide: true });
+  assert.equal(real.status, 0, real.stderr);
+  assert.equal(JSON.parse(real.stdout).result.record.review.risk.headSha, head);
 });
