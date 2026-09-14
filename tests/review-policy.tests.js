@@ -1627,6 +1627,9 @@ test('fleet#67: the binary refuses an invented head with exit 2 and takes --repo
   const typo = spawnSync(process.execPath, [...base, '--repo', repo, '--head-sha', head], { encoding: 'utf8', windowsHide: true });
   assert.equal(typo.status, 2);
   assert.match(JSON.parse(typo.stderr).message, /unknown flag --repo\b/);
+  const bare = spawnSync(process.execPath, [...base, '--head-sha', head, '--repo-path'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(bare.status, 2);
+  assert.match(JSON.parse(bare.stderr).message, /--repo-path needs a path/);
   const real = spawnSync(process.execPath, [...base, '--repo-path', repo, '--head-sha', head], { encoding: 'utf8', windowsHide: true });
   assert.equal(real.status, 0, real.stderr);
   assert.equal(JSON.parse(real.stdout).result.record.review.risk.headSha, head);

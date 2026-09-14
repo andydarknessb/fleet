@@ -203,9 +203,7 @@ function classifyFromGit(options = {}) {
   const { repoPath, baseRef, tenant, config } = options;
   const headRef = options.headRef || 'HEAD';
   if (!repoPath || !baseRef) throw new ReviewPolicyError('USAGE', 'repoPath and baseRef are required');
-  const git = (args) => execFileSync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
-  });
+  const git = (args) => gitInRepo(repoPath, args);
   // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01).
   const files = git(['diff', '--name-only', `${baseRef}...${headRef}`]).split(/\r?\n/).filter(Boolean);
   const diffText = git(['diff', `${baseRef}...${headRef}`]);
@@ -336,7 +334,7 @@ function tenantRepoPath({ root, recordId, record, repoPath }) {
 
 function gitInRepo(repoPath, args) {
   return execFileSync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
   });
 }
 
@@ -748,12 +746,13 @@ function cli(argv) {
   // replay can never repair; FLEET_NAME is in every fleet session's environment.
   const actor = args.actor || process.env.FLEET_NAME || undefined;
   if (command === 'record') {
+    if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
     return recordReviewArtifact({
       root, recordId: args.id,
       expectedRevision: args['expected-revision'] !== undefined ? Number(args['expected-revision']) : undefined,
       kind: args.kind, headSha: args['head-sha'], reviewedSha: args['reviewed-sha'], actor, now: args.now,
       // fleet#67: the repo the SHAs resolve against; the tenant file's `repo` otherwise.
-      repoPath: args['repo-path'] && args['repo-path'] !== 'true' ? args['repo-path'] : undefined,
+      repoPath: args['repo-path'],
       idempotencyKey: args['idempotency-key'], evidence: args.evidence,
       classification: args.classification ? JSON.parse(fs.existsSync(args.classification) ? fs.readFileSync(args.classification, 'utf8') : args.classification) : {},
       findings: args.findings ? JSON.parse(fs.existsSync(args.findings) ? fs.readFileSync(args.findings, 'utf8') : args.findings) : [],

@@ -252,4 +252,8 @@ purpose:
 
 A legacy artifact recorded before this section stands as written; a
 re-review or a later record at a real head supersedes it in the chain the way
-#1382's `risk-002.json` did.
+#1382's `risk-002.json` did. Two things stay as they were, on purpose: a
+replay (an idempotency key the record already holds) returns the artifact it
+recorded and writes nothing, so it is not re-resolved; and `plan-rereview`
+resolves nothing itself, because it is a reader of these SHAs and the formal
+record at that head is where the guard sits.
