@@ -14,6 +14,7 @@ const {
   getRecord,
   notifyRecord,
   projectStatus,
+  proofFor,
   readEvents,
   releaseRecord,
   reservationBaseline,
@@ -148,7 +149,9 @@ test('a third reservation accepts verified legacy reservation subjects and rejec
     { id: 'endzone:issue-40', issue: 40, reservations: { components: ['src/a.js'] } },
     { id: 'endzone:issue-41', issue: 41, reservations: { components: ['src/b.js'] } },
   ];
-  const proof = { independent: true, candidates: [40, 41, 42], checkedFields: ['components', 'migrationPrefixes', 'schemaAreas', 'testResources'], conflicts: [], missingReservations: [] };
+  // fleet#62: the proof is bound to the reservations it was computed over, so it
+  // is built by proofFor over the subjects and the candidate, never typed by hand.
+  const proof = proofFor([...proofRecords, { issue: 42, reservations: { components: ['src/c.js'] } }]);
   const third = reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['src/c.js'] }, proofRecords, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' });
   assert.equal(third.record.issue, 42);
 
@@ -165,9 +168,32 @@ test('a third reservation accepts populated non-overlapping evidence', () => {
   const root = rootDir();
   reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: { components: ['bin/a.js'] }, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
   reserveRecord({ root, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: { components: ['bin/b.js'] }, idempotencyKey: 'reserve-41', now: '2026-09-01T00:00:01.000Z' });
-  const proof = { independent: true, candidates: [40, 41, 42], checkedFields: ['components', 'migrationPrefixes', 'schemaAreas', 'testResources'], conflicts: [], missingReservations: [] };
+  const proof = proofFor([
+    { issue: 40, reservations: { components: ['bin/a.js'] } },
+    { issue: 41, reservations: { components: ['bin/b.js'] } },
+    { issue: 42, reservations: { components: ['bin/c.js'] } },
+  ]);
   const third = reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['bin/c.js'] }, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' });
   assert.equal(third.record.issue, 42);
+
+  // fleet#62: the same proof under a different (still non-overlapping) set is
+  // not that reservation's proof: the digest binds the set.
+  const otherRoot = rootDir();
+  reserveRecord({ root: otherRoot, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: { components: ['bin/a.js'] }, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
+  reserveRecord({ root: otherRoot, id: 'endzone:issue-41', tenant: 'endzone', issue: 41, manifestPath: 'm41', reservations: { components: ['bin/b.js'] }, idempotencyKey: 'reserve-41', now: '2026-09-01T00:00:01.000Z' });
+  assert.throws(
+    () => reserveRecord({ root: otherRoot, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['bin/d.js'] }, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' }),
+    (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF',
+  );
+  const unbound = { ...proof };
+  delete unbound.reservationDigest;
+  assert.throws(
+    () => reserveRecord({ root: otherRoot, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['bin/c.js'] }, independenceProof: unbound, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' }),
+    (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF',
+    'a proof with no digest is a hand-authored proof, not the printed one',
+  );
+  const bound = reserveRecord({ root: otherRoot, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: { components: ['bin/c.js'] }, independenceProof: proof, idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' });
+  assert.equal(bound.record.issue, 42);
 });
 
 test('an untouched assignment release is reusable and continues the record lineage', () => {

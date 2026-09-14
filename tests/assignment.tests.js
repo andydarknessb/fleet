@@ -645,3 +645,79 @@ test('cli: the process exits 2 on a refusal and writes it to stderr, no JSON ans
   assert.equal(refusal.code, 'USAGE');
   assert.match(refusal.message, /unknown flag --base/);
 });
+
+// fleet#62: `proof` took no --reservations, so a candidate whose criteria name
+// their seams in prose printed `missingReservations: [<it>]` while `assign`
+// checked a proof computed over the explicit set. The documented path (pass the
+// printed proof verbatim) could never satisfy the third-assignment gate for a
+// prose-seam ticket; the lead's only exits were a hand-authored proof or an
+// indefinite wait (endzone #1376, 2026-09-14).
+function proseSeamFixture() {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  const tenantFile = path.join(root, 'tenants', 'endzone.json');
+  fs.writeFileSync(tenantFile, JSON.stringify({ name: 'endzone', readyLabel: 'ready-for-agent', defaultBranch: 'integration' }));
+  const issues = [
+    issue(1272, { body: 'Change `src/a.js`.' }),
+    issue(1375, { body: 'Change `src/b.js`.' }),
+    issue(1376, { body: 'The kickoff waivers writer records a row at kickoff; the reader answers from it.' }),
+  ];
+  const active = [
+    { id: 'endzone:issue-1272', issue: 1272, state: 'implementing', manifestPath: 'm1272', reservations: { components: ['src/a.js'] } },
+    { id: 'endzone:issue-1375', issue: 1375, state: 'implementing', manifestPath: 'm1375', reservations: { components: ['src/b.js'] } },
+  ];
+  const fixture = path.join(root, 'issues.json');
+  const activeFile = path.join(root, 'active.json');
+  fs.writeFileSync(fixture, JSON.stringify(issues));
+  fs.writeFileSync(activeFile, JSON.stringify(active));
+  const common = ['--root', root, '--tenant', 'endzone', '--tenant-config', tenantFile, '--fixture', fixture, '--active', activeFile];
+  return { root, common };
+}
+
+test('fleet#62: proof --reservations applies the explicit set to the candidate and prints the proof assign expects', () => {
+  const { common } = proseSeamFixture();
+  const explicit = '{"components":["server/services/kickoffWaivers.js"],"testResources":["server/test/kickoffWaivers.test.js"]}';
+
+  const bare = cli(['proof', ...common, '--issue', '1376']);
+  assert.equal(bare.proof.independent, false);
+  assert.deepEqual(bare.proof.missingReservations, [1376], 'without the flag the prose-seam candidate reserves nothing, as before');
+
+  const answered = cli(['proof', ...common, '--issue', '1376', '--reservations', explicit]);
+  assert.equal(answered.issue, 1376);
+  assert.deepEqual(answered.activeAssignments, ['endzone:issue-1272', 'endzone:issue-1375']);
+  assert.equal(answered.proof.independent, true);
+  assert.deepEqual(answered.proof.missingReservations, []);
+  assert.deepEqual(answered.proof.conflicts, []);
+  assert.deepEqual(answered.proof.candidates, [1272, 1375, 1376]);
+  assert.deepEqual(answered.reservations, { components: ['server/services/kickoffWaivers.js'], migrationPrefixes: [], schemaAreas: [], testResources: ['server/test/kickoffWaivers.test.js'] }, 'the candidate\'s reservations are drawn from the flag');
+
+  const conflicting = cli(['proof', ...common, '--issue', '1376', '--reservations', '{"components":["src/a.js"]}']);
+  assert.equal(conflicting.proof.independent, false);
+  assert.deepEqual(conflicting.proof.conflicts, [{ left: 1272, right: 1376, fields: ['components'] }], 'an explicit set is checked for conflicts like a derived one');
+});
+
+test('fleet#62: the printed proof passed verbatim satisfies assign with the same --reservations and is refused with a different set', () => {
+  const { root, common } = proseSeamFixture();
+  const explicit = '{"components":["server/services/kickoffWaivers.js"],"testResources":["server/test/kickoffWaivers.test.js"]}';
+  const printed = cli(['proof', ...common, '--issue', '1376', '--reservations', explicit]).proof;
+  const assign = (reservations) => cli(['assign', ...common, '--base-sha', 'd'.repeat(40), '--independence-proof', JSON.stringify(printed), '--reservations', reservations]);
+
+  // A different, non-conflicting set under the same proof: the proof was not
+  // computed over what is being reserved, so it is not that assignment's proof.
+  assert.throws(() => assign('{"components":["server/services/somethingElse.js"]}'), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-1376' }), (error) => error.code === 'NOT_FOUND', 'a refused assign writes nothing');
+
+  const reserved = assign(explicit);
+  assert.equal(reserved.manifest.issue.number, 1376);
+  assert.deepEqual(reserved.manifest.reservations, { components: ['server/services/kickoffWaivers.js'], migrationPrefixes: [], schemaAreas: [], testResources: ['server/test/kickoffWaivers.test.js'] });
+  assert.deepEqual(reserved.manifest.independenceProof, printed);
+  assert.deepEqual(getRecord({ root, id: 'endzone:issue-1376' }).reservations, reserved.manifest.reservations);
+});
+
+test('fleet#62: proof refuses a bare --reservations and an unknown flag as USAGE', () => {
+  assert.ok(FLAGS.proof.includes('reservations'));
+  const { common } = proseSeamFixture();
+  assert.throws(() => cli(['proof', ...common, '--reservations']), (error) => error.code === 'USAGE' && /--reservations needs a JSON object/.test(error.message));
+  assert.throws(() => cli(['proof', ...common, '--reservation', '{}']), (error) => error.code === 'USAGE' && /unknown flag --reservation/.test(error.message));
+  assert.throws(() => cli(['proof', ...common, '--reservations', '{"files":["a.js"]}']), (error) => error.code === 'USAGE' && /unknown field/.test(error.message));
+});
