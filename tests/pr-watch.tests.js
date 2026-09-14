@@ -417,6 +417,41 @@ test('fleet#34: a re-readied PR whose record sits in review re-enters ci-wait on
   assert.equal(outbox(root).length, 1);
 });
 
+test('fleet#63: a PR returned to draft at the reviewed head walks the record review -> revision so the IC can record its risk review before the next push', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'review');
+  // The lead records its formal review and sends the PR back: gh pr ready --undo, same head.
+  // The draft PR drops out of the open list; the view says OPEN + isDraft at the old head.
+  const drafted = fetchers({ open: [], viewResult: view({ isDraft: true, statusCheckRollup: GREEN, body: 'Closes #42' }) });
+  watch(root, drafted);
+  const rec = record(root);
+  assert.equal(rec.state, 'revision', 'a drafted PR at the reviewed head is back with the IC, not still under review');
+  assert.equal(rec.github.prNumber, 77, 'the PR number survives the return');
+  assert.deepEqual(outbox(root), [], 'the return is the lead own act; nobody is woken');
+  // Idempotent: the same draft view on the next tick does nothing.
+  watch(root, drafted);
+  assert.equal(record(root).state, 'revision');
+  // The IC pushes and re-readies: the record walks the ordinary revision -> pr-open -> ci-wait -> review path.
+  const readied = fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: GREEN })], viewResult: view({ headRefOid: 'def456', statusCheckRollup: GREEN, body: 'Closes #42' }) });
+  watch(root, readied);
+  assert.equal(record(root).state, 'pr-open');
+  watch(root, readied);
+  assert.equal(record(root).state, 'ci-wait');
+  watch(root, readied);
+  assert.equal(record(root).state, 'review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
+});
+
+test('fleet#63: a held PR set to draft stays in hold; only review returns to the IC', () => {
+  const root = rootDir();
+  seed(root, { state: 'hold' });
+  watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'hold');
+  assert.equal(outbox(root).length, 1, 'only the seed hold page; the draft adds no wake');
+});
+
 test('fleet#34: a re-readied PR whose new head is already green wakes checks-settled in one tick', () => {
   const root = rootDir();
   seed(root, { state: 'review' });
