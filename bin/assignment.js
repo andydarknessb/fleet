@@ -10,11 +10,11 @@ const {
   getRecord,
   hasReservationEvidence,
   parseArgs,
+  proofFor,
   proofMatches,
   releaseRecord,
   reservationBaseline,
   reservationConflicts: workReservationConflicts,
-  reservationValuesOverlap,
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
@@ -222,26 +222,23 @@ function localExclusionReasons(issue, skipIssues, exclusions) {
 
 function reservationConflicts(issue, records) {
   return workReservationConflicts(activeRecords(records), issue.reservations)
-    .map((conflict) => ({ code: 'reservation-conflict', detail: `${conflict.field}:${conflict.value}`, owner: conflict.recordId, ownerIssue: conflict.issue }));
+    .map((conflict) => ({
+      code: 'reservation-conflict',
+      // A cross-field hit (fleet #60) names the reservation it collided with,
+      // since the field alone would read as a same-field clash.
+      detail: conflict.reservedField === conflict.field
+        ? `${conflict.field}:${conflict.value}`
+        : `${conflict.field}:${conflict.value} (${conflict.reservedField}:${conflict.reservedValue} reserved)`,
+      owner: conflict.recordId,
+      ownerIssue: conflict.issue,
+    }));
 }
 
-function independentPair(left, right) {
-  return RESERVATION_FIELDS.every((field) => {
-    const rightValues = (right.reservations?.[field] || []).map(String);
-    return !(left.reservations?.[field] || []).some((value) => rightValues.some((rightValue) => reservationValuesOverlap(field, value, rightValue)));
-  });
-}
-
+// The proof over a mix of active Work records and frontier issues is the Work
+// record proof (work-state's proofFor) over the pair each carries: an issue
+// number and its reservations. One builder, one conflict shape (fleet #60).
 function independenceProof(issues) {
-  const conflicts = [];
-  const issueNumber = (issue) => issue.number ?? issue.issue;
-  const missingReservations = issues.filter((issue) => !hasReservationEvidence(issue.reservations)).map(issueNumber);
-  for (let left = 0; left < issues.length; left += 1) {
-    for (let right = left + 1; right < issues.length; right += 1) {
-      if (!independentPair(issues[left], issues[right])) conflicts.push({ left: issueNumber(issues[left]), right: issueNumber(issues[right]) });
-    }
-  }
-  return { independent: conflicts.length === 0 && missingReservations.length === 0, candidates: issues.map(issueNumber), checkedFields: [...RESERVATION_FIELDS], conflicts, missingReservations };
+  return proofFor(issues.map((issue) => ({ issue: issue.number ?? issue.issue, reservations: issue.reservations })));
 }
 
 function hydrateActiveReservations(active, issues = []) {
