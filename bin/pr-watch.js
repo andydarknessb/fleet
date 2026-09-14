@@ -250,7 +250,26 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
     if (String(viewPr.state).toUpperCase() === 'MERGED') {
       return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing }) };
     }
-    if (viewIsOpen && viewPr.isDraft) return { actions: [] };   // paused work, not a decision
+    if (viewIsOpen && viewPr.isDraft) {
+      // fleet#63: a lead returns a PR to its IC with `gh pr ready --undo` and the
+      // head does not move, so the fleet#34 new-head walk below never fires and the
+      // record reads review until the IC pushes. The IC-hosted risk review is
+      // accepted only in implementing/revision/pr-open, so a fix that must be
+      // recorded before the push deadlocks. A draft PR while review is the lead's
+      // return: walk review -> revision here (a legal edge, no wake). The lead
+      // records its formal review before drafting, since formal is review-only.
+      // hold stays parked: a held PR is Cory's merge, not rework.
+      if (state === 'review') {
+        return {
+          actions: [{
+            kind: 'transition', to: 'revision',
+            evidence: `PR #${prNumber} returned to draft at ${String(viewPr.headRefOid).slice(0, 12)} while review; back with the IC`,
+            wake: null,
+          }],
+        };
+      }
+      return { actions: [] };   // paused work, not a decision
+    }
     return {
       actions: [{
         kind: 'transition', to: 'escalated',
