@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
@@ -553,9 +554,25 @@ function reservationConflicts(records, reservations, ignoreRecordId = null) {
   return conflicts;
 }
 
+// fleet#62: a proof is bound to the reservations it was computed over. Without
+// the digest, a proof printed for one explicit set satisfied `assign` under any
+// other non-conflicting set (candidates, fields and the two empty lists were the
+// whole comparison), so "pass the proof verbatim" bound nothing about WHAT was
+// being reserved. The expected side always carries a digest (it is computed
+// here, fresh); a supplied proof without one is a hand-authored proof and is
+// not the verbatim one.
+function reservationDigest(records) {
+  const canonical = [...records]
+    .map((record) => [Number(record.issue), Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((record.reservations?.[field] || []).map(String))].sort()]))])
+    .sort((left, right) => left[0] - right[0]);
+  return crypto.createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+}
+
 function proofMatches(expected, supplied) {
   return Boolean(expected?.independent)
     && Boolean(supplied?.independent)
+    && typeof expected.reservationDigest === 'string'
+    && supplied.reservationDigest === expected.reservationDigest
     && JSON.stringify([...(supplied.candidates || [])].map(Number).sort((a, b) => a - b)) === JSON.stringify([...expected.candidates].map(Number).sort((a, b) => a - b))
     && JSON.stringify([...(supplied.checkedFields || [])].map(String).sort()) === JSON.stringify([...expected.checkedFields].map(String).sort())
     && !(expected.conflicts || []).length
@@ -579,6 +596,7 @@ function proofFor(records) {
     checkedFields: [...RESERVATION_FIELDS],
     conflicts,
     missingReservations,
+    reservationDigest: reservationDigest(records),
   };
 }
 
@@ -1467,6 +1485,7 @@ module.exports = {
   parseArgs,
   proofFor,
   proofMatches,
+  reservationDigest,
   projectStatus,
   readEvents,
   readTenantConfigs,

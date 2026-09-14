@@ -572,7 +572,7 @@ function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, acto
 const FRONTIER_FLAGS = ['root', 'tenant', 'tenant-config', 'ready-label', 'fixture', 'repo', 'active', 'skip', 'now'];
 const FLAGS = Object.freeze({
   frontier: FRONTIER_FLAGS,
-  proof: [...FRONTIER_FLAGS, 'issue'],
+  proof: [...FRONTIER_FLAGS, 'issue', 'reservations'],
   assign: [
     ...FRONTIER_FLAGS, 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'risk', 'token-budget',
     'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof', 'reservations',
@@ -611,7 +611,7 @@ function cli(argv) {
   // parseArgs throws work-state's error class, which is also this binary's, so
   // a USAGE built there and one built here are the same to every caller.
   const args = parseArgs(rest, FLAGS[command]);
-  if (command === 'assign' && args.reservations === 'true') throw new WorkStateError('USAGE', '--reservations needs a JSON object value (fleet#33)');
+  if ((command === 'assign' || command === 'proof') && args.reservations === 'true') throw new WorkStateError('USAGE', '--reservations needs a JSON object value (fleet#33)');
   if (command === 'frontier') {
     const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
     const readyLabel = args['ready-label'] || config.readyLabel || 'ready-for-agent';
@@ -638,9 +638,15 @@ function cli(argv) {
       // computed here and passed back verbatim to `assign --independence-proof`; a
       // proof that reports conflicts is refused by reserve, never trimmed.
       const activeAssignments = reservationRecords.filter((record) => record.manifestPath && record.state !== 'retired');
-      const head = args.issue ? frontier.eligible.find((issue) => issue.number === Number(args.issue)) : frontier.eligible[0];
-      if (!head) throw new WorkStateError('NO_FRONTIER', `issue #${args.issue} is not on the frontier`, { excluded: frontier.excluded });
-      return { issue: head.number, activeAssignments: activeAssignments.map((record) => record.id), proof: independenceProof([...activeAssignments, head]) };
+      const found = args.issue ? frontier.eligible.find((issue) => issue.number === Number(args.issue)) : frontier.eligible[0];
+      if (!found) throw new WorkStateError('NO_FRONTIER', `issue #${args.issue} is not on the frontier`, { excluded: frontier.excluded });
+      // fleet#62: the same explicit set `assign --reservations` applies, applied
+      // the same way (the candidate re-normalized over it), so the printed proof
+      // IS the expectedProof reserve checks. Without it a prose-seam candidate
+      // could only ever print `missingReservations: [<itself>]`.
+      const explicit = explicitReservations(args.reservations);
+      const head = explicit ? normalizeIssue({ ...found, reservations: explicit }) : found;
+      return { issue: head.number, activeAssignments: activeAssignments.map((record) => record.id), reservations: head.reservations, proof: independenceProof([...activeAssignments, head]) };
     }
     if (args['base-sha'] && !args.fixture) throw new WorkStateError('BASE_RECONCILIATION_REQUIRED', 'production assignment must resolve base SHA from the fetched remote ref');
     const base = args['base-sha'] ? { remote: args.remote || 'origin', ref: args.ref || config.defaultBranch, sha: args['base-sha'] } : undefined;
