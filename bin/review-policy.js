@@ -22,7 +22,9 @@
 //                 A finding never carries its own `outcome`; the formal review
 //                 resolves the risk artifact's open findings; `reviewedSha` is
 //                 the tree the reviewer read (fleet#43). `--actor` defaults to
-//                 FLEET_NAME (fleet#46).
+//                 FLEET_NAME (fleet#46). Every SHA it is given is resolved
+//                 against the tenant repo before anything is written: an
+//                 object git does not know is refused UNKNOWN_COMMIT (fleet#67).
 //   plan-rereview a revision re-review inspects the changed range and the
 //                 unresolved findings, never the settled material.
 //   hold          a clean carve-out (or any PR requiring Cory) parks in the
@@ -201,9 +203,7 @@ function classifyFromGit(options = {}) {
   const { repoPath, baseRef, tenant, config } = options;
   const headRef = options.headRef || 'HEAD';
   if (!repoPath || !baseRef) throw new ReviewPolicyError('USAGE', 'repoPath and baseRef are required');
-  const git = (args) => execFileSync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
-  });
+  const git = (args) => gitInRepo(repoPath, args);
   // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01).
   const files = git(['diff', '--name-only', `${baseRef}...${headRef}`]).split(/\r?\n/).filter(Boolean);
   const diffText = git(['diff', `${baseRef}...${headRef}`]);
@@ -303,6 +303,56 @@ function buildFindings(stamp, suppliedFindings, priors, resolutions) {
     seen.add(finding.id);
   }
   return findings;
+}
+
+// --- fleet#67: a recorded head is a commit ---------------------------------
+// `record --kind risk` on endzone #1382 accepted headSha
+// 0f2fb0064a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c: the branch head's real 8-character
+// prefix followed by a padded pattern, and kept an idempotency key for it. The
+// risk chain, plan-rereview ranges and the merge-time head check all key off
+// these SHAs, so a typed or invented one made an artifact look as if it covered
+// a head nobody read. Every SHA the record is given (`--head-sha`, and
+// `--reviewed-sha` when it differs) is now resolved against the tenant repo
+// after a fetch of the record's PR branch, so a head pushed a moment ago still
+// resolves; a fetch that fails (offline, no such branch yet) is tolerated, a
+// missing object never is. The repo is `--repo-path` or the tenant file's
+// `repo`; with neither the record is refused, never skipped.
+
+function tenantRepoPath({ root, recordId, record, repoPath }) {
+  if (repoPath) return String(repoPath);
+  const tenant = record?.tenant || String(recordId).split(':')[0];
+  const file = path.join(root, 'tenants', `${tenant}.json`);
+  let configured = null;
+  if (fs.existsSync(file)) {
+    try { configured = loadTenant(root, tenant).repo || null; } catch { configured = null; }
+  }
+  if (!configured) {
+    throw new ReviewPolicyError('TENANT_REPO_UNKNOWN', `cannot resolve the head against a repository: pass --repo-path <tenant repo> or set "repo" in ${path.relative(root, file) || file} (fleet#67)`, { tenant, tenantFile: file });
+  }
+  return String(configured);
+}
+
+function gitInRepo(repoPath, args) {
+  return execFileSync('git', ['-C', repoPath, ...args], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) {
+  const repo = tenantRepoPath({ root, recordId, record, repoPath });
+  const run = git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args);
+  const branch = record?.assignment?.branch;
+  if (branch) {
+    try { run(['fetch', '--quiet', 'origin', String(branch)]); } catch { /* offline or not yet pushed: the object may still be local */ }
+  }
+  for (const { flag, sha } of shas) {
+    try {
+      run(['cat-file', '-e', `${sha}^{commit}`]);
+    } catch {
+      throw new ReviewPolicyError('UNKNOWN_COMMIT', `${flag} ${sha} is not a commit in ${repo}${branch ? ` (after fetching origin/${branch})` : ''}; a review is recorded at a head that exists, never at a typed or invented SHA (fleet#67)`, { flag, sha: String(sha), repoPath: repo, branch: branch || null });
+    }
+  }
+  return repo;
 }
 
 function recordReviewArtifact(options = {}) {
@@ -477,6 +527,14 @@ function recordReviewArtifact(options = {}) {
         throw new ReviewPolicyError('EMPTY_FINDINGS', `a ${kind} review with no findings must say so: pass --no-findings "<what was examined and what was concluded>" so the artifact is not read as lost content`);
       }
 
+      // fleet#67: the last guard before the write. It runs git (a fetch of the
+      // PR branch), so every cheaper refusal above keeps precedence over it;
+      // an artifact is never written for a head the tenant repo does not hold.
+      if (!written) {
+        const shas = [{ flag: '--head-sha', sha: String(headSha) }];
+        if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
+        verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
+      }
       if (!written) {
         written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
           schemaVersion: 1,
@@ -661,7 +719,7 @@ function classifyCli(rest) {
 // `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
 // each list is every flag its handler consumes; an unknown flag or command is
 // USAGE, exit 2, nothing on stdout.
-const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling'];
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling'];
 const COMMAND_FLAGS = Object.freeze({
   classify: CLASSIFY_FLAGS,
   record: RECORD_FLAGS,
@@ -688,10 +746,13 @@ function cli(argv) {
   // replay can never repair; FLEET_NAME is in every fleet session's environment.
   const actor = args.actor || process.env.FLEET_NAME || undefined;
   if (command === 'record') {
+    if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
     return recordReviewArtifact({
       root, recordId: args.id,
       expectedRevision: args['expected-revision'] !== undefined ? Number(args['expected-revision']) : undefined,
       kind: args.kind, headSha: args['head-sha'], reviewedSha: args['reviewed-sha'], actor, now: args.now,
+      // fleet#67: the repo the SHAs resolve against; the tenant file's `repo` otherwise.
+      repoPath: args['repo-path'],
       idempotencyKey: args['idempotency-key'], evidence: args.evidence,
       classification: args.classification ? JSON.parse(fs.existsSync(args.classification) ? fs.readFileSync(args.classification, 'utf8') : args.classification) : {},
       findings: args.findings ? JSON.parse(fs.existsSync(args.findings) ? fs.readFileSync(args.findings, 'utf8') : args.findings) : [],
@@ -728,7 +789,9 @@ if (require.main === module) {
     // recorded, and the message names the door that opens the state.
     // FINDING_CARRIES_OUTCOME and REVIEWED_SHA_MISMATCH (fleet#43) are refused
     // invocations too: nothing was recorded, and the message names the door.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING'].includes(error.code) ? 2 : 1;
+    // UNKNOWN_COMMIT and TENANT_REPO_UNKNOWN (fleet#67) likewise: nothing was
+    // recorded, and the message names the repo and the SHA.
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN'].includes(error.code) ? 2 : 1;
   }
 }
 
@@ -743,4 +806,5 @@ module.exports = {
   matchGlob,
   planRereview,
   recordReviewArtifact,
+  verifyRecordedCommits,
 };

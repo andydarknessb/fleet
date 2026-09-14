@@ -220,3 +220,40 @@ needs a risk artifact at that head, or it refuses with `RISK_REVIEW_MISSING`
 The guard sits in the record, not in a doc line, because the doc line already
 said "a triggered diff missing that artifact goes back to the IC" and the
 record accepted it anyway.
+
+## 8. A recorded head is a commit (fleet#67)
+
+**Observed.** `record --kind risk` on endzone #1382 accepted `headSha`
+`0f2fb0064a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c`: the branch head's real 8-character
+prefix followed by a padded pattern. The artifact landed, the record bumped a
+revision and kept an idempotency key for the invented head. A corrected
+`risk-002.json` followed 25 seconds later, so the chain self-healed; nothing
+had stopped the first one. Every reader of these SHAs (the risk chain, ruling
+5; `plan-rereview` ranges; the merge-time head check in project-lead.md) had
+been keyed off a head nobody could have read.
+
+**Ruled.** `record` resolves every SHA it is given (`--head-sha`, and
+`--reviewed-sha` when it differs) against the tenant repo before it writes:
+a fetch of the record's PR branch, then `git cat-file -e <sha>^{commit}`. An
+object git does not hold is refused `UNKNOWN_COMMIT` (exit 2, nothing
+written, no state touched, no key kept). The repo is `--repo-path`, or the
+tenant file's `repo`; with neither the record is refused
+`TENANT_REPO_UNKNOWN` rather than skipping the check. Three edges, on
+purpose:
+
+- The check is the last guard before the write, after every cheaper refusal
+  (state, kind, findings, classification, the risk chain), because it runs
+  git and a fetch; the refusal a caller sees first is the one that costs
+  nothing to compute.
+- A fetch that fails (offline, a branch not pushed yet) is tolerated: the
+  object may be local. A missing object never is.
+- An abbreviated SHA that names one commit is accepted as git accepts it. The
+  artifact stores what was given; the guard asks only whether it exists.
+
+A legacy artifact recorded before this section stands as written; a
+re-review or a later record at a real head supersedes it in the chain the way
+#1382's `risk-002.json` did. Two things stay as they were, on purpose: a
+replay (an idempotency key the record already holds) returns the artifact it
+recorded and writes nothing, so it is not re-resolved; and `plan-rereview`
+resolves nothing itself, because it is a reader of these SHAs and the formal
+record at that head is where the guard sits.
