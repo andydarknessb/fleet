@@ -50,28 +50,43 @@ function Escape-Rx { param([string]$Text) [regex]::Escape($Text) }
 if ($tool -in @('Bash', 'PowerShell')) {
   $cmd = "$($inp.tool_input.command)"
   # fleet#70: the rule reads the command being INVOKED, never prose that quotes one.
-  # Heredoc bodies (a ticket written with cat, a fixture, documentation) are dropped
-  # first, then the call is cut into shell segments (newline ; & && | || and the
-  # parentheses of a subshell) and only a segment whose command word is gh, after
-  # optional VAR=value prefixes, is a comment. A `gh issue create -b "run gh issue
-  # comment ..."` is not one, and neither is a heredoc line that says so.
-  $stripped = [regex]::Replace($cmd, '<<-?\s*(["'']?)(\w+)\1[^\r\n]*\r?\n[\s\S]*?\r?\n[ \t]*\2[ \t]*(?=\r?\n|$)', '<<HEREDOC_STRIPPED')
-  $segments = [regex]::Split($stripped, '\r?\n|;|&&|\|\||\||&|\(|\)')
+  # Bash heredoc bodies (a ticket written with cat, a fixture, documentation) are
+  # dropped first. Then every quoted string (PowerShell here-strings @'..'@ / @".."@,
+  # double and single quotes) is masked by a numbered token, so the call can be cut
+  # into shell segments on newline ; & && | || and subshell parentheses WITHOUT a
+  # metacharacter inside a body ever ending the body early. Only a segment whose
+  # command word is gh, after optional VAR=value prefixes, is a comment; its body and
+  # body-file arguments are read back through the mask. A `gh issue create -b "run
+  # gh issue comment ..."` is not a comment, and neither is a heredoc line that says
+  # so, while `-b "Approved (batch 41)"` is still the whole body it always was.
+  $stripped = [regex]::Replace($cmd, '<<-?\s*(["'']?)(\w+)\1[^\r\n]*\r?\n[\s\S]*?\r?\n[ \t]*\2[ \t]*(?=\r?\n|$)', '#heredoc-stripped')
+  $S = [string][char]1
+  $quoted = New-Object System.Collections.ArrayList
+  $masked = [regex]::Replace($stripped, '@''\r?\n[\s\S]*?\r?\n''@|@"\r?\n[\s\S]*?\r?\n"@|"(?:[^"\\]|\\.)*"|''[^'']*''',
+    [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [void]$quoted.Add($m.Value); "$S$($quoted.Count - 1)$S" })
+  $unmask = {
+    param([string]$Token)
+    if ($Token -notmatch "^$S(\d+)$S$") { return $Token }
+    $q = "$($quoted[[int]$Matches[1]])"
+    if ($q -match '^@[''"]\r?\n([\s\S]*?)\r?\n[''"]@$') { return $Matches[1] }
+    return $q.Substring(1, $q.Length - 2)
+  }
+  $segments = [regex]::Split($masked, '\r?\n|;|&&|\|\||\||&|\(|\)')
   $commentRx = '^\s*(?:\w+=\S*\s+)*gh\s+(?:(?:issue|pr)\s+comment\b|api\b.*\bcomments\b)'
   foreach ($segment in $segments) {
     if ($reason) { break }
     if ($segment -notmatch $commentRx) { continue }
     $bodies = @()
-    foreach ($m in [regex]::Matches($segment, '(?:-b|--body|(?:-f|-F|--field|--raw-field)\s+body=)\s*(?:"((?:[^"\\]|\\.)*)"|''([^'']*)''|(\S+))')) {
-      $bodies += @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) | Where-Object { $_ } | Select-Object -First 1
+    foreach ($m in [regex]::Matches($segment, '(?:-b|--body|(?:-f|-F|--field|--raw-field)\s+body=)\s*(\S+)')) {
+      $bodies += & $unmask $m.Groups[1].Value
     }
-    foreach ($m in [regex]::Matches($segment, '(?:--body-file|-F\s+body=@)\s*(?:"([^"]+)"|''([^'']+)''|(\S+))')) {
-      $file = @($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) | Where-Object { $_ } | Select-Object -First 1
+    foreach ($m in [regex]::Matches($segment, '(?:--body-file|-F\s+body=@)\s*(\S+)')) {
+      $file = & $unmask $m.Groups[1].Value
       if ($file -eq '-') {
         # fleet#70 case 1: a body on stdin cannot be inspected, so it cannot be cleared.
         # Refused on its own terms: the message names the cause and the one-step fix
         # instead of asserting a first word this guard never saw.
-        $reason = "the comment body is passed on stdin (--body-file - / body=@-), which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' or 'Re-propose' (those shapes are the tenant owner's alone, since the fleet acts under the owner's own GitHub login). Write the body to a file and pass --body-file <path>; the guard reads the file's first line $cite"
+        $reason = "the comment body is passed on stdin (--body-file - / body=@-), which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**) or 'Re-propose', since the fleet acts under the owner's own GitHub login. Write the body to a file and pass --body-file <path>; the guard reads the file's first line $cite"
         break
       }
       $filePath = Normalize-Path $file "$($inp.cwd)"

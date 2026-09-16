@@ -135,6 +135,21 @@ try {
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cd /e/repo && gh issue comment 1 -b "Approved"')) 'an Approved comment after cd &&' 'owner'
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'GH_PAGER= gh pr comment 2 --body "Approved, ship it"')) 'an Approved comment behind an env assignment' 'owner'
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 1276 --body-file $testRoot\approved-body.md; echo posted")) 'an Approved body file followed by another command' 'owner'
+  # ...and a shell metacharacter INSIDE a quoted body never cuts the body short.
+  foreach ($body in @('Approved; ship it', 'Approved | ship', 'Approved && merged', 'Approved (batch 41)', "Approved`nsecond line", 'Re-propose; smaller')) {
+    Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 -b `"$body`"")) "an Approved-shaped body containing a metacharacter ($body)" 'owner'
+  }
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body 'Approved (see #3); thanks'")) 'a single-quoted Approved body with metacharacters' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/5/comments -f body="Approved; batch 41"')) 'a gh api Approved body with a semicolon' 'owner'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "never use --body-file - from a session; write a file"')) 'prose naming --body-file - inside a real, inspectable body'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body-file `"$testRoot\proposal-body.md`"")) 'a double-quoted body-file path'
+  # The PowerShell tool goes through the same block: a here-string is a quoted body
+  # (inspected as one) and prose inside one is not a command.
+  Assert-Denied (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash "gh issue comment 5 --body @'`nApproved with: tier sonnet`n'@")) 'an Approved here-string body from the PowerShell tool' 'owner'
+  Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash "`$b = @'`nRun gh issue comment 1 --body-file - and it refuses`n'@; gh issue create --title x --body `$b")) 'a here-string quoting a gh comment invocation, then gh issue create'
+  Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash "gh issue comment 5 --body @'`n## Triage proposal (advisory)`n'@")) 'a proposal here-string body from the PowerShell tool'
+  # Pre-existing: a proposal body with parentheses passes because of the RULE, not because the parens cut the body.
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "Approved (advisory) proposal"')) 'an Approved body whose parentheses must not hide it' 'owner'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 
