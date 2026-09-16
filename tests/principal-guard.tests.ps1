@@ -116,6 +116,25 @@ try {
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 1298 --body "repropose please"') -AgentId 'w3') 'a repropose comment from a sub-agent'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1298 -b "The lead will re-propose the scope once #3 lands"')) 'the word re-propose later in a body'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh pr review 42 --approve -b "LGTM"')) 'a PR review approval (not a comment body)'
+  # fleet#70 case 1: a body on stdin cannot be inspected. Still refused, but the refusal
+  # says WHY and names the fix; it must not claim the body begins with "Approved".
+  $stdinRefusal = Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1474 --repo owner/repo --body-file -')
+  Assert-Denied $stdinRefusal 'a comment body passed on stdin' 'stdin'
+  Assert-True ("$($stdinRefusal.permissionDecisionReason)" -match '--body-file <path>') 'the stdin refusal must name the fix (write the body to a file and pass its path)'
+  Assert-True ("$($stdinRefusal.permissionDecisionReason)" -notmatch "begins 'Approved'") 'the stdin refusal must not claim the body begins with Approved'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1474/comments -F body=@-') -AgentId 'w4') 'a gh api comment body from stdin' 'stdin'
+  # fleet#70 case 2: the rule applies to the command being INVOKED, not to prose that
+  # quotes one. A heredoc that documents a `gh issue comment ... --body-file -` line,
+  # written by cat, then a `gh issue create` from that file, is not a comment.
+  $ticketCmd = "cat > $testRoot/ticket.md <<'EOF'`n## Repro`nRun gh issue comment 1 --repo owner/repo --body-file - and watch it refuse.`nEOF`ngh issue create --repo owner/repo --title x --body-file $testRoot/ticket.md"
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash $ticketCmd)) 'a heredoc quoting a gh comment invocation, followed by gh issue create'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue create --repo owner/repo --title x -b "Never run gh issue comment 1 --body-file - from a session"')) 'prose naming a gh comment invocation inside another command''s body'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash "cat > $testRoot/note.md <<'EOF'`nApproved with: nothing, this is a note`nEOF`necho done")) 'a heredoc whose text begins Approved but which is not a comment'
+  # ...and the real command still counts wherever it sits in the call.
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash "cat > $testRoot/x.md <<'EOF'`nsome prose`nEOF`ngh issue comment 1 -b `"Approved`"")) 'an Approved comment after a heredoc in the same call' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cd /e/repo && gh issue comment 1 -b "Approved"')) 'an Approved comment after cd &&' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'GH_PAGER= gh pr comment 2 --body "Approved, ship it"')) 'an Approved comment behind an env assignment' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 1276 --body-file $testRoot\approved-body.md; echo posted")) 'an Approved body file followed by another command' 'owner'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 
