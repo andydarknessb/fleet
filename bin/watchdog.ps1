@@ -42,6 +42,8 @@ try {
   $watchdogConfig = $null; try { $watchdogConfig = (Read-Json "$FleetHome\config\cycle.json").watchdog } catch {}
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['staleMinutes']) { $staleMinutes = [int]$watchdogConfig.staleMinutes }   # ticket 75: config/cycle.json watchdog.staleMinutes, default 45
   $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
+  $fleetDeadRepeatMinutes = 120   # ticket 78: pages.fleetDeadRepeatMinutes, default 120 (two hours)
+  if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatMinutes'] -and $pagesConfig.fleetDeadRepeatMinutes) { $fleetDeadRepeatMinutes = [int]$pagesConfig.fleetDeadRepeatMinutes }
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
@@ -639,15 +641,40 @@ try {
   $oldKeys = @(); if ($paged) { $oldKeys = @($paged.PSObject.Properties.Name) }
   $newConditions = @($conditions | Where-Object { $oldKeys -notcontains $_.key })
   $nextPaged = [pscustomobject]@{}
+  # Ticket 78 (ADR 0012): fleet-dead alone repeats once, at +fleetDeadRepeatMinutes
+  # (default 120), never a third time. firstPagedAt/repeatedAt live only on the
+  # fleet-dead entry; every other kind's entry is unchanged, so an old paged.json
+  # with neither field on any key still reads fine (both start $null).
+  $fleetDeadRepeatCondition = $null
   foreach ($c in $conditions) {
     $first = Now-Iso
-    if ($oldKeys -contains $c.key) { $first = $paged.($c.key).firstSeen }
-    $nextPaged | Add-Member -NotePropertyName $c.key -NotePropertyValue ([pscustomobject]@{ firstSeen = $first; lastSeen = (Now-Iso); detail = $c.detail })
+    $repeatedAt = $null
+    if ($oldKeys -contains $c.key) {
+      $prevEntry = $paged.($c.key)
+      $first = $prevEntry.firstSeen
+      if ($c.key -eq 'fleet-dead') {
+        if ($prevEntry.PSObject.Properties['repeatedAt']) { $repeatedAt = $prevEntry.repeatedAt }
+        if (-not $repeatedAt) {
+          $firstPagedAtUtc = ConvertTo-UtcDateTime $first
+          if ($firstPagedAtUtc -and ((New-TimeSpan -Start $firstPagedAtUtc -End $now).TotalMinutes -ge $fleetDeadRepeatMinutes)) {
+            $fleetDeadRepeatCondition = $c
+            $repeatedAt = Now-Iso
+          }
+        }
+      }
+    }
+    $entryObj = [pscustomobject]@{ firstSeen = $first; lastSeen = (Now-Iso); detail = $c.detail }
+    if ($c.key -eq 'fleet-dead') {
+      $entryObj | Add-Member -NotePropertyName firstPagedAt -NotePropertyValue $first -Force
+      $entryObj | Add-Member -NotePropertyName repeatedAt -NotePropertyValue $repeatedAt -Force
+    }
+    $nextPaged | Add-Member -NotePropertyName $c.key -NotePropertyValue $entryObj
   }
 
   # --- banner: rebuilt every run from current conditions; absent when healthy ---
   $bannerPath = "$FleetHome\state\watchdog\banner.txt"
   $newlyPagedResults = @()
+  $repeatPaged = $null
   if (-not $Verify) {
     if (@($conditions).Count -gt 0) {
       $lines = @("!! FLEET WATCHDOG - $(@($conditions).Count) condition(s) - $(Now-Iso)")
@@ -684,6 +711,15 @@ try {
       $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $pageUrl -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
       $newlyPagedResults += [pscustomobject]@{ key = $c.key; priority = $priority; page = $pageResult }
     }
+    # Ticket 78 (ADR 0012): a fleet-dead that self-healing could not revive pages
+    # once more at emergency, at +fleetDeadRepeatMinutes, and never a third time.
+    # A repeat is not a "newly seen" condition (it never left oldKeys), so it is
+    # never in $newConditions above and is sent separately here.
+    if ($fleetDeadRepeatCondition) {
+      $repeatBody = "$($fleetDeadRepeatCondition.detail) (repeat: fleet-dead has stood over $fleetDeadRepeatMinutes min with no third page to follow)"
+      $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority 'emergency' -Detail ([pscustomobject]@{ key = $fleetDeadRepeatCondition.key; repeat = $true }) -NoToast:$NoToast
+      $repeatPaged = [pscustomobject]@{ key = $fleetDeadRepeatCondition.key; priority = 'emergency'; page = $repeatResult }
+    }
   }
 
   # --- shadow log for the 08b parity comparison ---
@@ -698,7 +734,7 @@ try {
   }
   $entry = [pscustomobject]@{
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
-    conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults
+    conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults; repeatPaged = $repeatPaged
     checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes; triageWakes = $triageWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick

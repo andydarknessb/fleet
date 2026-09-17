@@ -739,9 +739,80 @@ try {
     if ($oldPushoverUrl77) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl77 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
   }
   Set-AgentsRows $noSentinelRows
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'   # drop ic-950 so it never reads as ic-vanished later
   Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # ===== Ticket 78 (ADR 0012): fleet-dead repeats once, two hours on, at emergency =====
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watch\wake-outbox.jsonl" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-901":{"tenant":"test","issue":901,"state":"implementing"}}}'
+  foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 90 }   # stale past the default 45-min threshold
+
+  $pushLog78 = Join-Path $testRoot 'pushover-requests-78.log'
+  [IO.File]::WriteAllText($pushLog78, '')
+  $pushMock78 = Start-MockPushover -LogPath $pushLog78 -Count 10
+  $oldPushoverUrl78 = $env:FLEET_PUSHOVER_URL
+  $env:FLEET_PUSHOVER_URL = $pushMock78.Prefix
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-78","user":"usr-78"}'
+
+  try {
+    # Case RP1 (red-tell): a fixture paged.json with fleet-dead first paged 121
+    # minutes ago pages once more at emergency, and repeatedAt is recorded.
+    $firstPagedAt121 = (Get-Date).ToUniversalTime().AddMinutes(-121).ToString('o')
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $firstPagedAt121 + '","lastSeen":"' + $firstPagedAt121 + '","detail":"stale"}}')
+    $rp1 = Run-Watchdog
+    Assert-True (@($rp1.conditions) -contains 'fleet-dead') 'fleet-dead must still be the active condition'
+    Assert-True ($null -ne $rp1.repeatPaged -and $rp1.repeatPaged.key -eq 'fleet-dead' -and $rp1.repeatPaged.priority -eq 'emergency') "a fleet-dead standing over $fleetDeadRepeatMinutes min must repeat-page at emergency (got $($rp1.repeatPaged | ConvertTo-Json -Compress))"
+    $rpBodies = @(Get-PostedBodies $pushLog78)
+    Assert-True ($rpBodies.Count -eq 1) 'exactly one repeat page must reach Pushover'
+    $rpForm = ConvertFrom-FormBody $rpBodies[0]
+    Assert-True ($rpForm.priority -eq '2') 'emergency must map to Pushover priority 2'
+    $pagedAfterRp1 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -ne $pagedAfterRp1.'fleet-dead'.repeatedAt -and "$($pagedAfterRp1.'fleet-dead'.repeatedAt)" -ne '') 'repeatedAt must be recorded after the repeat page'
+
+    # Case RP2: the next tick, still standing, repeats nothing (no third page).
+    $rp2 = Run-Watchdog
+    Assert-True ($null -eq $rp2.repeatPaged) 'a fleet-dead that already repeated must not repeat again'
+    Assert-True (@(Get-PostedBodies $pushLog78).Count -eq 1) 'no third page may reach Pushover'
+
+    # Case RP3: at 119 minutes (never yet repeated), no repeat page.
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog78, '')
+    $firstPagedAt119 = (Get-Date).ToUniversalTime().AddMinutes(-119).ToString('o')
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $firstPagedAt119 + '","lastSeen":"' + $firstPagedAt119 + '","detail":"stale"}}')
+    $rp3 = Run-Watchdog
+    Assert-True ($null -eq $rp3.repeatPaged) 'a fleet-dead standing under the repeat threshold must not repeat-page'
+    Assert-True (@(Get-PostedBodies $pushLog78).Count -eq 0) 'no repeat page at 119 minutes'
+
+    # Case RP4: only fleet-dead repeats - a permission-wait standing 300 minutes never does.
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog78, '')
+    foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }   # heal staleness so only permission-wait remains
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic-960") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-ic-960\state.json" ('{"needs":"approve Read: something","updatedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-15).ToString('o') + '"}')
+    $pwRow78 = '{"id":"job-ic-960","name":"ic-960","state":"working","status":"idle","pid":89,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-1)) + '}'
+    Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-960","role":"ic","tenant":"test","parent":"pl-test","issue":960,"status":"active"}]}'
+    Set-AgentsRows ($noSentinelRows.TrimEnd(']') + ',' + $pwRow78 + ']')
+    $oldPwAt = (Get-Date).ToUniversalTime().AddMinutes(-300).ToString('o')
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"permission-wait:ic-960:job-ic-960":{"firstSeen":"' + $oldPwAt + '","lastSeen":"' + $oldPwAt + '","detail":"stuck"}}')
+    $rp4 = Run-Watchdog
+    Assert-True ($null -eq $rp4.repeatPaged) 'only fleet-dead repeats; a 300-minute permission-wait must not'
+    Assert-True (@(Get-PostedBodies $pushLog78).Count -eq 0) 'an old standing permission-wait must not post a repeat'
+  } finally {
+    if ($pushMock78 -and $pushMock78.Job) { Stop-Job $pushMock78.Job -ErrorAction SilentlyContinue; Remove-Job $pushMock78.Job -Force -ErrorAction SilentlyContinue }
+    if ($oldPushoverUrl78) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl78 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Set-AgentsRows $noSentinelRows
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+  foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
   $null = Run-Watchdog
 
   Write-Output 'watchdog tests passed'

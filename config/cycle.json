@@ -58,7 +58,8 @@
       "state-hold": "normal",
       "passed-date": "normal"
     },
-    "defaultPriority": "normal"
+    "defaultPriority": "normal",
+    "fleetDeadRepeatMinutes": 120
   },
   "supervisor": {
     "parityHours": 48,
