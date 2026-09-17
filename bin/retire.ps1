@@ -30,14 +30,18 @@ Save-LiveRoster $live
 
 $ownedBefore = @(Get-OwnedWorktrees)
 $stillThere = $false
+$daemonListOk = $true
 if ($e.jobId) {
   & claude stop $e.jobId 2>$null | Out-Null
   & claude rm $e.jobId 2>$null | Out-Null
   # claude rm refuses when the session's worktree has uncommitted changes, and when it succeeds it
   # still leaves a clean worktree registered. A retired IC's leftovers are disposable (its work is in
   # the PR), so force-remove any worktree it owns whether or not the job went, then rm again if needed.
-  $stillThere = @(Get-DaemonSessions -All | Where-Object { $_.id -eq $e.jobId }).Count -gt 0
-  if ($e.cwd -and (Test-Path $e.cwd)) {
+  # -Strict, not the tolerant default: an unreadable daemon list must never look like "the job is
+  # gone" - that reading force-removed a live, still-writing session's worktree (review finding 11).
+  try { $stillThere = @(Get-DaemonSessions -All -Strict | Where-Object { $_.id -eq $e.jobId }).Count -gt 0 }
+  catch { $daemonListOk = $false }
+  if ($daemonListOk -and $e.cwd -and (Test-Path $e.cwd)) {
     foreach ($wt in @(Get-OwnedWorktrees)) {
       & git -C $e.cwd worktree unlock $wt.path 2>$null | Out-Null
       & git -C $e.cwd worktree remove --force --force $wt.path 2>$null | Out-Null
@@ -47,10 +51,12 @@ if ($e.jobId) {
     & git -C $e.cwd worktree prune 2>$null | Out-Null
     if ($stillThere) {
       & claude rm $e.jobId 2>$null | Out-Null
-      $stillThere = @(Get-DaemonSessions -All | Where-Object { $_.id -eq $e.jobId }).Count -gt 0
+      try { $stillThere = @(Get-DaemonSessions -All -Strict | Where-Object { $_.id -eq $e.jobId }).Count -gt 0 }
+      catch { $daemonListOk = $false }
     }
   }
-  if ($stillThere) { Write-Warning "job $($e.jobId) still exists after claude rm; inspect with: claude agents --json --all" }
+  if (-not $daemonListOk) { Write-Warning "daemon session list unreadable for job $($e.jobId); worktree cleanup skipped rather than guessed" }
+  elseif ($stillThere) { Write-Warning "job $($e.jobId) still exists after claude rm; inspect with: claude agents --json --all" }
 }
 $e.status = 'retired'
 $e | Add-Member -NotePropertyName retiredAt -NotePropertyValue (Now-Iso) -Force
@@ -70,7 +76,7 @@ $afterPaths = @($ownedAfter | ForEach-Object { $_.path })
 $removedWorktrees = @($ownedBefore | Where-Object { $afterPaths -notcontains $_.path } | ForEach-Object { $_.path })
 $remainingWorktrees = @($ownedAfter | ForEach-Object { $_.path })
 $worktreeCleanup = if ($ownedBefore.Count -eq 0 -and $ownedAfter.Count -eq 0) { 'none-owned' } elseif ($ownedAfter.Count -eq 0) { 'removed' } else { 'remaining' }
-$jobRemoval = if (-not $e.jobId) { 'no-job-recorded' } elseif ($stillThere) { 'still-present' } else { 'removed' }
+$jobRemoval = if (-not $e.jobId) { 'no-job-recorded' } elseif (-not $daemonListOk) { 'unknown' } elseif ($stillThere) { 'still-present' } else { 'removed' }
 Write-Output (@{
   retired = $Name
   reason = $Reason
