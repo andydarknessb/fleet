@@ -3,6 +3,10 @@ $ErrorActionPreference = 'Stop'
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
 function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
 function Get-EpochMs { param([datetime]$D) ([DateTimeOffset][datetime]::SpecifyKind($D.ToUniversalTime(), [DateTimeKind]::Utc)).ToUnixTimeMilliseconds() }
+# Ticket 77: newlyPaged entries are now { key, priority, page } objects (the
+# delivery result per condition), not bare key strings; existing assertions
+# read the keys back out through this helper.
+function Get-PagedKeys { param($NewlyPaged) @($NewlyPaged | ForEach-Object { $_.key }) }
 
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-watchdog-test-" + [guid]::NewGuid().ToString('N'))
@@ -69,7 +73,7 @@ try {
   Set-Heartbeat 'sentinel' 90
   $r2 = Run-Watchdog
   Assert-True (@($r2.conditions) -contains 'sentinel-stale') 'a 90-min sentinel heartbeat must raise sentinel-stale'
-  Assert-True (@($r2.newlyPaged) -contains 'sentinel-stale') 'the first sighting must page'
+  Assert-True ((Get-PagedKeys $r2.newlyPaged) -contains 'sentinel-stale') 'the first sighting must page'
   Assert-True (Test-Path "$testRoot\state\watchdog\banner.txt") 'a condition must write the banner'
   Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'sentinel-stale') 'the banner must name the condition'
   Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'threshold 45') 'the banner detail must carry the threshold'
@@ -119,7 +123,7 @@ try {
   Write-Utf8 "$testRoot\state\watchdog\paged.json" '{oops'
   $r3d = Run-Watchdog
   Assert-True (@($r3d.conditions) -contains 'fleet-dead') 'a corrupt paged.json must not stop condition detection'
-  Assert-True (@($r3d.newlyPaged) -contains 'fleet-dead') 'after quarantine the condition pages'
+  Assert-True ((Get-PagedKeys $r3d.newlyPaged) -contains 'fleet-dead') 'after quarantine the condition pages'
   Assert-True (@(Get-ChildItem "$testRoot\state\watchdog" -Filter 'paged.json.corrupt-*').Count -eq 1) 'the corrupt paged state must be quarantined'
   $null = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json   # valid again
 
@@ -135,7 +139,7 @@ try {
   Set-AgentsRows $stormRows
   $r5 = Run-Watchdog
   Assert-True (@($r5.conditions) -contains 'launch-retry:ic-901') 'two consecutive failed launches must trip the retry cap'
-  Assert-True (@($r5.newlyPaged) -contains 'launch-retry:ic-901') 'a retry trip must page'
+  Assert-True ((Get-PagedKeys $r5.newlyPaged) -contains 'launch-retry:ic-901') 'a retry trip must page'
   $skip = (Get-Content "$testRoot\state\skip\test.json" -Raw) | ConvertFrom-Json
   Assert-True ("$($skip.issues.'901')" -match 'launch-failed: 2 consecutive') 'the trip must write a launch-failed skip-hold'
   Assert-True ("$($skip.issues.'901')" -match 'spawn boom') 'the hold must carry the recorded failure detail'
@@ -238,7 +242,7 @@ try {
   $r9 = Run-Watchdog
   Assert-True ($r9.mode -eq 'shadow') 'a running Sentinel under the flag must keep the run in shadow'
   Assert-True (@($r9.conditions) -contains 'double-actor') 'a running Sentinel under the flag is the double-actor condition'
-  Assert-True (@($r9.newlyPaged) -contains 'double-actor') 'double-actor must page'
+  Assert-True ((Get-PagedKeys $r9.newlyPaged) -contains 'double-actor') 'double-actor must page'
   Assert-True (@(Get-AppliedLines).Count -eq 0) 'shadow must apply nothing'
   Assert-True ((Get-Content "$testRoot\state\sentinel\last-check.json" -Raw) -match 'live-sentinel-untouched') 'shadow must not own the canonical report'
 
@@ -277,7 +281,7 @@ try {
   Set-AgentsRows "[$dispRow,$plRow,$strayRow]"
   $r10d = Run-Watchdog
   Assert-True (@($r10d.conditions) -contains 'escalation:ic-777:stray') 'a stray must become an escalation condition'
-  Assert-True (@($r10d.newlyPaged) -contains 'escalation:ic-777:stray') 'a new escalation pages'
+  Assert-True ((Get-PagedKeys $r10d.newlyPaged) -contains 'escalation:ic-777:stray') 'a new escalation pages'
   Assert-True (@(Get-EscalationFiles '*-supervisor-ic-777-stray.json').Count -eq 1) 'a new escalation leaves one escalation file'
   Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'ic-777') 'the banner carries the escalation'
   $r10d2 = Run-Watchdog
@@ -620,6 +624,125 @@ try {
   Remove-Item "$testRoot\state\flags\triage-wake-off"
   Remove-Item "$testRoot\state\flags\principal-live"
   Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE
+
+  # ===== Ticket 77 (ADR 0012): conditions page through the door, by priority =====
+  # Reuses the local-HttpListener mock-Pushover pattern from tests/page.tests.ps1
+  # (a separate background job standing in for Pushover, since it must block on
+  # GetContext() while this script posts to it).
+  function Start-MockPushover {
+    param([string]$LogPath, [int]$Count = 10)
+    $port = Get-Random -Minimum 20000 -Maximum 40000
+    $prefix = "http://127.0.0.1:$port/"
+    $job = Start-Job -ScriptBlock {
+      param($Prefix, $LogPath, $RequestCount)
+      $listener = New-Object System.Net.HttpListener
+      $listener.Prefixes.Add($Prefix)
+      $listener.Start()
+      for ($i = 0; $i -lt $RequestCount; $i++) {
+        $context = $listener.GetContext()
+        $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
+        $body = $reader.ReadToEnd()
+        $reader.Close()
+        Add-Content -Path $LogPath -Value $body
+        $buffer = [Text.Encoding]::UTF8.GetBytes('{"status":1,"request":"test"}')
+        $context.Response.ContentLength64 = $buffer.Length
+        $context.Response.OutputStream.Write($buffer, 0, $buffer.Length)
+        $context.Response.OutputStream.Close()
+      }
+      $listener.Stop()
+    } -ArgumentList $prefix, $LogPath, $Count
+    Start-Sleep -Milliseconds 400
+    return [pscustomobject]@{ Job = $job; Prefix = $prefix }
+  }
+  function Get-PostedBodies { param([string]$LogPath) if (Test-Path $LogPath) { @(Get-Content $LogPath | Where-Object { $_ }) } else { @() } }
+  function ConvertFrom-FormBody {
+    param([string]$Body)
+    $result = @{}
+    foreach ($pair in ($Body -split '&')) {
+      if (-not $pair) { continue }
+      $parts = $pair -split '=', 2
+      $key = [Uri]::UnescapeDataString($parts[0])
+      $value = if ($parts.Count -gt 1) { [Uri]::UnescapeDataString($parts[1]) } else { '' }
+      $result[$key] = $value
+    }
+    return $result
+  }
+
+  # Clean baseline: static roster back to dispatcher/sentinel/pl-test, live roster
+  # carries one active IC (ic-950) so it is expected and never read as a stray.
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-950","role":"ic","tenant":"test","parent":"pl-test","issue":950,"status":"active"}]}'
+  Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\heartbeats\sentinel.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\flags\sentinel-off" 'page test'
+  foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
+  Set-AgentsRows $noSentinelRows
+  $null = Run-Watchdog   # settle the reset before asserting on a clean baseline
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
+  $pushLog = Join-Path $testRoot 'pushover-requests.log'
+  [IO.File]::WriteAllText($pushLog, '')
+  $pushMock = Start-MockPushover -LogPath $pushLog -Count 10
+  $oldPushoverUrl77 = $env:FLEET_PUSHOVER_URL
+  $env:FLEET_PUSHOVER_URL = $pushMock.Prefix
+  [IO.Directory]::CreateDirectory("$testRoot\state\pages") | Out-Null
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-77","user":"usr-77"}'
+
+  try {
+    # Fixture: ic-950 has waited 10 minutes on a permission prompt (default threshold 5 min).
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic-950") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-ic-950\state.json" ('{"needs":"approve Read: something","updatedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '"}')
+    $pwRow = '{"id":"job-ic-950","name":"ic-950","state":"working","status":"idle","pid":88,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-1)) + '}'
+    $jobStatePath77 = "$testRoot\profile\.claude\jobs\job-ic-950\state.json"
+    # ic-950's daemon row stays present for the whole section: dropping it would
+    # also raise (and page) ic-vanished, contaminating the POST counts below. Only
+    # its job-state `needs` field toggles between stuck and answered.
+    Set-AgentsRows ($noSentinelRows.TrimEnd(']') + ',' + $pwRow + ']')
+
+    # Case PG1 (red-tell): a permission-wait condition pages once through Send-FleetPage
+    # at high priority (Pushover priority 1).
+    $pg1 = Run-Watchdog
+    Assert-True ((Get-PagedKeys $pg1.newlyPaged) -contains 'permission-wait:ic-950:job-ic-950') 'a stuck permission prompt must page'
+    $pg1Entry = @($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]
+    Assert-True ($pg1Entry.priority -eq 'high') 'permission-wait must resolve to high priority'
+    $pgBodies1 = @(Get-PostedBodies $pushLog)
+    Assert-True ($pgBodies1.Count -eq 1) 'exactly one page must reach Pushover'
+    $pgForm1 = ConvertFrom-FormBody $pgBodies1[0]
+    Assert-True ($pgForm1.priority -eq '1') 'high must map to Pushover priority 1'
+
+    # Case PG2: the same standing condition pages nothing on a second tick.
+    $pg2 = Run-Watchdog
+    Assert-True (@($pg2.newlyPaged).Count -eq 0) 'a standing permission-wait must not page again'
+    Assert-True (@(Get-PostedBodies $pushLog).Count -eq 1) 'a standing permission-wait must post nothing new'
+
+    # Case PG3: the prompt is answered (condition clears), then a new one appears - pages once more.
+    Write-Utf8 $jobStatePath77 ('{"needs":"","updatedAt":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}')
+    $null = Run-Watchdog   # settle: the condition clears; no page for clearing
+    Write-Utf8 $jobStatePath77 ('{"needs":"approve Read: something","updatedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '"}')
+    $pg3 = Run-Watchdog
+    Assert-True ((Get-PagedKeys $pg3.newlyPaged) -contains 'permission-wait:ic-950:job-ic-950') 'a cleared-then-returned condition must page again'
+    Assert-True (@(Get-PostedBodies $pushLog).Count -eq 2) 'the second sighting must post again'
+
+    # Case PG4: a dispatcher respawn (a fault the fleet healed by itself) produces zero POSTs.
+    # The permission-wait condition is left standing (already paged, deduped) so
+    # the whole delta below is attributable to the respawn alone.
+    $postsBeforeRespawn = @(Get-PostedBodies $pushLog).Count
+    $stoppedDisp77 = $dispRow.Replace('"state":"working"', '"state":"stopped"')
+    Set-AgentsRows "[$stoppedDisp77,$plRow,$pwRow]"
+    $pg4 = Run-Watchdog
+    Assert-True (@($pg4.proposed.respawned | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'the check must respawn the stopped dispatcher'
+    Assert-True (@(Get-PostedBodies $pushLog).Count -eq $postsBeforeRespawn) 'a dispatcher respawn must produce zero POSTs'
+    Assert-True (@($pg4.notified | Where-Object { $_.name -eq 'dispatcher' -and $_.kind -eq 'respawned' -and $_.toastDelivered -eq $null }).Count -eq 1) 'a healed respawn is recorded log-only, never toasted'
+  } finally {
+    if ($pushMock -and $pushMock.Job) { Stop-Job $pushMock.Job -ErrorAction SilentlyContinue; Remove-Job $pushMock.Job -Force -ErrorAction SilentlyContinue }
+    if ($oldPushoverUrl77) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl77 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Set-AgentsRows $noSentinelRows
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
 
   Write-Output 'watchdog tests passed'
 } finally {

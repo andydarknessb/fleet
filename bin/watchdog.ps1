@@ -41,6 +41,7 @@ try {
   $staleMinutes = 45        # three missed 15-min Sentinel crons; the dispatcher uses the same threshold
   $watchdogConfig = $null; try { $watchdogConfig = (Read-Json "$FleetHome\config\cycle.json").watchdog } catch {}
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['staleMinutes']) { $staleMinutes = [int]$watchdogConfig.staleMinutes }   # ticket 75: config/cycle.json watchdog.staleMinutes, default 45
+  $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
@@ -63,6 +64,34 @@ try {
     $s = ("$Text" -replace '\s+', ' ').Trim()
     if ($s.Length -gt $Max) { $s = $s.Substring(0, $Max) + '...' }
     return $s
+  }
+
+  # --- ticket 77 (ADR 0012): resolve a condition's page priority. The ruling
+  # --- (issue-74.md) is hardcoded as the default so a bare fixture with no
+  # --- config/cycle.json still routes correctly; config/cycle.json pages.priority
+  # --- (ticket 76) overrides or adds entries, pages.defaultPriority overrides the
+  # --- normal fallback. Matched the way Test-CapExempt already matches
+  # --- cap.exemptNamePrefixes: a map key is a match when it is a PREFIX of the
+  # --- kind string (permission-wait:<name>:<job> starts with permission-wait),
+  # --- longest prefix wins so a specific kind is never shadowed by a shorter one.
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high' }
+  function Get-PagePriority {
+    param([string]$Kind, $PagesConfig)
+    $map = @{}
+    foreach ($k in $script:DefaultPagePriority.Keys) { $map[$k] = $script:DefaultPagePriority[$k] }
+    $default = 'normal'
+    if ($PagesConfig) {
+      if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
+        foreach ($p in $PagesConfig.priority.PSObject.Properties) { $map[$p.Name] = "$($p.Value)" }
+      }
+      if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority) { $default = "$($PagesConfig.defaultPriority)" }
+    }
+    $best = $null; $bestLen = -1
+    foreach ($k in $map.Keys) {
+      if ($k -and "$Kind".StartsWith($k) -and $k.Length -gt $bestLen) { $best = $map[$k]; $bestLen = $k.Length }
+    }
+    if ($best) { return $best }
+    return $default
   }
 
   # --- ticket 75 (ADR 0012): the two predicates the frontier wake already asked,
@@ -401,9 +430,10 @@ try {
       if ($previouslyNotified -contains $key) { $waiting += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned-again'; detail = "job $($r.jobId) respawned again ($($r.reason)); already notified" }; continue }
       $detail = "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task."
       Write-Escalation -From 'supervisor' -Kind 'respawned' -Detail $detail -Name "$($r.name)" -Parent "$($r.parent)"
-      $toast = $null
-      if ("$($r.name)" -eq 'dispatcher' -and -not $NoToast) { $toast = Send-FleetToast 'Fleet supervisor' "dispatcher respawned ($($r.reason)) - run bin\status.ps1" }
-      $notified += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned'; parent = "$($r.parent)"; toastDelivered = $toast }
+      # Ticket 77 (ADR 0012): a fault the fleet healed by itself is not a page - the
+      # dispatcher-respawn toast that used to fire here is gone. The escalation file
+      # and this notified entry are the record; nothing is delivered off-host for it.
+      $notified += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned'; parent = "$($r.parent)"; toastDelivered = $null }
     }
     foreach ($e in @($check.escalate)) {
       if ($pageKinds -notcontains "$($e.kind)") { $waiting += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; detail = Get-OneLine $e.detail 200 } }
@@ -559,40 +589,43 @@ try {
   }
 
   # --- page conditions ---
+  # Ticket 77 (ADR 0012): every condition now carries a `kind` (for Get-PagePriority)
+  # separate from its dedupe `key`, and an optional `url` (escalation file path or PR
+  # URL) for Send-FleetPage - populated only once a condition actually has one to give.
   $conditions = @()
-  if ($checkError) { $conditions += [pscustomobject]@{ key = 'check-failed'; detail = "sentinel-check could not run or report: $(Get-OneLine $checkError 300)" } }
-  foreach ($se in $stateErrors) { $conditions += [pscustomobject]@{ key = 'state-unreadable'; detail = $se } }
+  if ($checkError) { $conditions += [pscustomobject]@{ key = 'check-failed'; kind = 'check-failed'; detail = "sentinel-check could not run or report: $(Get-OneLine $checkError 300)"; url = $null } }
+  foreach ($se in $stateErrors) { $conditions += [pscustomobject]@{ key = 'state-unreadable'; kind = 'state-unreadable'; detail = $se; url = $null } }
   if ($sentinelOff -and $sentinelRow) {
-    $conditions += [pscustomobject]@{ key = 'double-actor'; detail = "state/flags/sentinel-off stands but a Sentinel session is running (job $($sentinelRow.id)); the supervisor stays in shadow so nothing acts twice. Stop that session (claude stop $($sentinelRow.id)) or run bin\rollback-sentinel.ps1" }
+    $conditions += [pscustomobject]@{ key = 'double-actor'; kind = 'double-actor'; detail = "state/flags/sentinel-off stands but a Sentinel session is running (job $($sentinelRow.id)); the supervisor stays in shadow so nothing acts twice. Stop that session (claude stop $($sentinelRow.id)) or run bin\rollback-sentinel.ps1"; url = $null }
   }
   if ($mode -eq 'live' -and $check) {
     foreach ($e in @($check.escalate)) {
       if ($pageKinds -notcontains "$($e.kind)") { continue }
-      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e }
+      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; kind = "$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e; url = $null }
     }
   }
   foreach ($pw in $permissionWaits) {
     $pwDetail = "$($pw.name) (job $($pw.job)) has waited $($pw.waitMin) min on a permission prompt no one can answer in a --bg session: $($pw.needs). Stop it (claude stop $($pw.job)) and relaunch on a model the CLI runs in auto mode, or attach and answer (claude attach $($pw.job))"
     # Keyed by job, not name: a stale daemon row and its relaunch can share a name, and one
     # key per job is also what lets a retired job's page clear while its successor's stands.
-    $conditions += [pscustomobject]@{ key = "permission-wait:$($pw.name):$($pw.job)"; detail = $pwDetail; escalation = [pscustomobject]@{ name = $pw.name; kind = 'permission-wait'; detail = $pwDetail; parent = $pw.parent } }
+    $conditions += [pscustomobject]@{ key = "permission-wait:$($pw.name):$($pw.job)"; kind = 'permission-wait'; detail = $pwDetail; escalation = [pscustomobject]@{ name = $pw.name; kind = 'permission-wait'; detail = $pwDetail; parent = $pw.parent }; url = $null }
   }
   $escCount = @(Get-ChildItem "$FleetHome\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count
   $checkEsc = 0; if ($check) { $checkEsc = @($check.escalate).Count }
   $pendingNote = "; $escCount escalation file(s) and $checkEsc check-reported escalation(s) have no live relay"
   if ($fleetDead) {
     $names = (@($staleStatics | ForEach-Object { "$($_.name):$($_.ageMin)m" }) -join ', ')
-    $conditions += [pscustomobject]@{ key = 'fleet-dead'; detail = "every static heartbeat is stale ($names; threshold $staleMinutes m) and work is waiting; the fleet is not self-healing$pendingNote" }
+    $conditions += [pscustomobject]@{ key = 'fleet-dead'; kind = 'fleet-dead'; detail = "every static heartbeat is stale ($names; threshold $staleMinutes m) and work is waiting; the fleet is not self-healing$pendingNote"; url = $null }
   } elseif ($idleTick) {
     # Ticket 75: every static heartbeat is stale but nothing is waiting for any
     # tenant - a session with nothing to do takes no turns too. Recorded via the
     # shadow line's idle flag below, never a condition.
   } elseif ($sentinelStale) {
     $age = @($staleStatics | Where-Object { $_.name -eq 'sentinel' })[0].ageMin
-    $conditions += [pscustomobject]@{ key = 'sentinel-stale'; detail = "sentinel heartbeat is $age min old (threshold $staleMinutes); respawns and escalation relay are not happening$pendingNote" }
+    $conditions += [pscustomobject]@{ key = 'sentinel-stale'; kind = 'sentinel-stale'; detail = "sentinel heartbeat is $age min old (threshold $staleMinutes); respawns and escalation relay are not happening$pendingNote"; url = $null }
   }
   foreach ($ev in ($tripEvals | Where-Object { $_.page })) {
-    $conditions += [pscustomobject]@{ key = "launch-retry:$($ev.name)"; detail = "$($ev.failures) consecutive failed launches of $($ev.name) (latest job $($ev.latestJob): $($ev.detail)); $($ev.disposition)" }
+    $conditions += [pscustomobject]@{ key = "launch-retry:$($ev.name)"; kind = 'launch-retry'; detail = "$($ev.failures) consecutive failed launches of $($ev.name) (latest job $($ev.latestJob): $($ev.detail)); $($ev.disposition)"; url = $null }
   }
 
   # --- page-once dedupe: a key pages when it appears; clearing and reappearing pages
@@ -614,7 +647,7 @@ try {
 
   # --- banner: rebuilt every run from current conditions; absent when healthy ---
   $bannerPath = "$FleetHome\state\watchdog\banner.txt"
-  $toastDelivered = $null
+  $newlyPagedResults = @()
   if (-not $Verify) {
     if (@($conditions).Count -gt 0) {
       $lines = @("!! FLEET WATCHDOG - $(@($conditions).Count) condition(s) - $(Now-Iso)")
@@ -640,10 +673,16 @@ try {
       Write-Escalation -From 'supervisor' -Kind "$($e.kind)" -Detail "$($e.detail)" -Name "$($e.name)" -Parent $parentName
       $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
     }
-    if (@($newConditions).Count -gt 0 -and -not $NoToast) {
-      $body = (@($newConditions | ForEach-Object { $_.key }) -join ', ')
-      # Send-FleetToast (_common.ps1) is shared with the ticket-07 notifier; the banner is the guaranteed channel.
-      $toastDelivered = Send-FleetToast 'Fleet watchdog' "$body - run bin\status.ps1"
+    # Ticket 77 (ADR 0012): every newly-seen condition pages through the one door,
+    # once, at the priority its kind resolves to (Get-PagePriority), carrying its
+    # link when it has one. -NoToast (tests) only skips Send-FleetPage's own toast;
+    # the Pushover POST and the pages.jsonl audit line always run. The banner above
+    # is the always-on host echo and is unaffected by delivery success or failure.
+    foreach ($c in $newConditions) {
+      $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
+      $pageUrl = $null; if ($c.PSObject.Properties['url'] -and $c.url) { $pageUrl = "$($c.url)" }
+      $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $pageUrl -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
+      $newlyPagedResults += [pscustomobject]@{ key = $c.key; priority = $priority; page = $pageResult }
     }
   }
 
@@ -659,8 +698,8 @@ try {
   }
   $entry = [pscustomobject]@{
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
-    conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
-    toastDelivered = $toastDelivered; checkError = $checkError; proposed = $proposed
+    conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults
+    checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes; triageWakes = $triageWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
   }
