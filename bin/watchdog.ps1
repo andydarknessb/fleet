@@ -39,6 +39,8 @@ try {
   $ErrorActionPreference = 'Continue'
   $now = (Get-Date).ToUniversalTime()
   $staleMinutes = 45        # three missed 15-min Sentinel crons; the dispatcher uses the same threshold
+  $watchdogConfig = $null; try { $watchdogConfig = (Read-Json "$FleetHome\config\cycle.json").watchdog } catch {}
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['staleMinutes']) { $staleMinutes = [int]$watchdogConfig.staleMinutes }   # ticket 75: config/cycle.json watchdog.staleMinutes, default 45
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
@@ -61,6 +63,86 @@ try {
     $s = ("$Text" -replace '\s+', ' ').Trim()
     if ($s.Length -gt $Max) { $s = $s.Substring(0, $Max) + '...' }
     return $s
+  }
+
+  # --- ticket 75 (ADR 0012): the two predicates the frontier wake already asked,
+  # --- lifted so fleet-dead's Test-WorkWaiting can ask the same questions without
+  # --- duplicating them. Behavior for the frontier-wake loop's own callers is
+  # --- unchanged: same inputs, same silence-on-error shape (evidence/reason).
+  # --- The .error field is new and exists only for Test-WorkWaiting, which - unlike
+  # --- the wake loop - must fail CLOSED (toward paging) when the planner itself
+  # --- could not answer, since a swallowed error there would look like "nothing
+  # --- waiting".
+  function Test-FrontierWaiting {
+    param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
+    $result = [pscustomobject]@{ evidence = @(); reason = ''; error = $null }
+    if (-not $NodeExe) { $result.error = 'node not found'; return $result }
+    $activeIcs = 0; if ($LiveRoster) { $activeIcs = @($LiveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $TenantName }).Count }
+    $maxIcs = 0; try { $maxIcs = [int]$Tenant.maxIcs } catch {}
+    if ($activeIcs -ge $maxIcs -or $LiveCount -ge $Cap) { $result.reason = "no slot (ICs $activeIcs/$maxIcs, cap $LiveCount/$Cap)"; return $result }
+    try {
+      $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $TenantName)
+      if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
+      $frontierRaw = & $NodeExe "$PSScriptRoot\assignment.js" @frontierArgs 2>$null | Out-String
+      $frontier = ConvertFrom-LastJsonLine $frontierRaw
+      if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $frontierRaw 200)"; return $result }
+      $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
+      if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
+    } catch { $result.error = "assignment.js threw: $(Get-OneLine $_.Exception.Message 200)" }
+    return $result
+  }
+
+  function Get-UnconsumedWakes {
+    # $Since bounds "before this lead's current session started" (the frontier
+    # wake's own use); fleet-dead has no lead session to bound by and passes
+    # $null. $ConsumedThrough is the frontier wake's delivery watermark for the
+    # tenant, shared so a wake that already woke the lead is not double-counted
+    # as fresh work waiting.
+    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null)
+    $kinds = @{}
+    $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
+    if (-not (Test-Path $outboxPath)) { return $kinds }
+    foreach ($rawLine in (Get-Content $outboxPath -ErrorAction SilentlyContinue)) {
+      if (-not $rawLine) { continue }
+      $o = $null; try { $o = $rawLine | ConvertFrom-Json } catch { continue }
+      if (-not $o -or -not $o.at -or "$($o.recordId)" -notlike "$TenantName`:*") { continue }
+      $atUtc = ConvertTo-UtcDateTime $o.at
+      if (-not $atUtc) { continue }
+      if ($Since -and $atUtc -le $Since) { continue }
+      if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
+      if (@('checks-settled', 'checks-failed', 'decision-needed') -notcontains "$($o.wake)") { continue }
+      $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
+    }
+    return $kinds
+  }
+
+  function Test-WorkWaiting {
+    # Ticket 75 (ADR 0012): is there work waiting for $TenantName - the second
+    # half of fleet-dead ("every static heartbeat stale AND work waiting"). Any
+    # one of a waiting frontier candidate, an in-flight active record, or an
+    # unconsumed wake is enough. hold and escalated (work-state.js
+    # DECISION_STATES) never count: a human, not the fleet, owns what happens
+    # next for those. An unreadable active.json or a failed planner call cannot
+    # prove there is nothing waiting, so both fail CLOSED (toward paging) rather
+    # than toward a silent idle tick.
+    param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap, $WakeState)
+    $activeWaitStates = @('assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision')
+    $active = $null
+    try { $active = Read-Json "$FleetHome\state\work\active.json" } catch { return $true }   # exists but unreadable: fail toward paging
+    if ($active -and $active.PSObject.Properties['records'] -and $active.records) {
+      foreach ($prop in $active.records.PSObject.Properties) {
+        $record = $prop.Value
+        if ("$($record.tenant)" -ne $TenantName) { continue }
+        if ($activeWaitStates -contains "$($record.state)") { return $true }
+      }
+    }
+    $fw = Test-FrontierWaiting -TenantName $TenantName -Tenant $Tenant -NodeExe $NodeExe -LiveRoster $LiveRoster -LiveCount $LiveCount -Cap $Cap
+    if ($fw.error) { return $true }   # a failed planner call cannot prove there is nothing waiting
+    if ($fw.evidence.Count -gt 0) { return $true }
+    $tenantState = $null; if ($WakeState -and $WakeState.PSObject.Properties['tenants'] -and $WakeState.tenants.PSObject.Properties[$TenantName]) { $tenantState = $WakeState.tenants.$TenantName }
+    $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
+    $kinds = Get-UnconsumedWakes -TenantName $TenantName -ConsumedThrough $consumedThrough
+    return ($kinds.Count -gt 0)
   }
 
   # --- mode (ticket 08b). Shadow while the rostered Sentinel is enabled. Live only when
@@ -146,7 +228,34 @@ try {
     $staleStatics += [pscustomobject]@{ name = $n; ageMin = $shown }
   }
   $sentinelStale = (-not $paused) -and (@($staleStatics | Where-Object { $_.name -eq 'sentinel' }).Count -gt 0)
-  $fleetDead = (-not $paused) -and ($staticNames.Count -gt 0) -and ($staleStatics.Count -ge $staticNames.Count)
+  $allStaticsStale = (-not $paused) -and ($staticNames.Count -gt 0) -and ($staleStatics.Count -ge $staticNames.Count)
+
+  # --- fleet-dead (ticket 75, ADR 0012): every static heartbeat stale is
+  # --- necessary but not sufficient - a session with nothing to do takes no
+  # --- turns and its heartbeat goes stale too, and that is not an outage.
+  # --- fleet-dead also requires work waiting for at least one tenant.
+  # --- Test-WorkWaiting reuses the same frontier and unconsumed-wake predicates
+  # --- the frontier wake asks below, so "there is a frontier wake pending" and
+  # --- "fleet-dead is pending" never disagree. Computed only when the staleness
+  # --- predicate already holds: a healthy fleet must not pay for a planner call
+  # --- every tick.
+  $nodeExe = $null; try { $nodeExe = Get-NodeExe } catch {}
+  $liveRoster = $null; try { $liveRoster = Get-LiveRoster } catch {}
+  $cap = 0; try { $cap = [int]$static.cap } catch {}
+  $liveCount = @($daemon | Where-Object { $_.pid -and ($staticNames -contains "$($_.name)" -or "$($_.name)" -match '^ic-') -and -not (Test-CapExempt "$($_.name)") }).Count
+  $fleetDead = $false
+  $idleTick = $false
+  if ($allStaticsStale) {
+    $wakeStateForDead = $null; try { $wakeStateForDead = Read-Json "$FleetHome\state\watchdog\frontier-wake.json" } catch {}
+    $anyWorkWaiting = $false
+    foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
+      $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
+      if (-not $tenant) { continue }
+      $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
+      if (Test-WorkWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap -WakeState $wakeStateForDead) { $anyWorkWaiting = $true; break }
+    }
+    if ($anyWorkWaiting) { $fleetDead = $true } else { $idleTick = $true }
+  }
 
   # --- launch retry storms: newest-first consecutive 'failed' rows per fleet name,
   # --- counting only rows started inside the window (daemon history never expires,
@@ -323,10 +432,8 @@ try {
   if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
   if ($mode -eq 'live' -and -not $Verify -and -not $paused -and -not $wakeOff) {
-    $nodeExe = $null; try { $nodeExe = Get-NodeExe } catch {}
-    $liveRoster = $null; try { $liveRoster = Get-LiveRoster } catch {}
-    $cap = 0; try { $cap = [int]$static.cap } catch {}
-    $liveCount = @($daemon | Where-Object { $_.pid -and ($staticNames -contains "$($_.name)" -or "$($_.name)" -match '^ic-') -and -not (Test-CapExempt "$($_.name)") }).Count
+    # nodeExe, liveRoster, cap and liveCount are computed once above (ticket 75:
+    # fleet-dead's Test-WorkWaiting needs them too, before this block even runs).
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
       $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
       if (-not $tenant) { continue }
@@ -339,39 +446,15 @@ try {
       $leadStartedAt = ConvertTo-UtcDateTime $leadRow.startedAt
       # Source 1: the planner's frontier, with an IC slot and a cap slot to launch into.
       if ($wakeSources -contains 'frontier' -and $nodeExe) {
-        $activeIcs = 0; if ($liveRoster) { $activeIcs = @($liveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $tenantName }).Count }
-        $maxIcs = 0; try { $maxIcs = [int]$tenant.maxIcs } catch {}
-        if ($activeIcs -lt $maxIcs -and $liveCount -lt $cap) {
-          try {
-            $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $tenantName)
-            if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
-            $frontierRaw = & $nodeExe "$PSScriptRoot\assignment.js" @frontierArgs 2>$null | Out-String
-            $frontier = ConvertFrom-LastJsonLine $frontierRaw
-            $eligible = @(); if ($frontier -and $frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
-            if ($eligible.Count -gt 0) { $wake.evidence += "frontier #$($eligible -join ', #')" }
-          } catch {}
-        } else { $wake.reason = "no slot (ICs $activeIcs/$maxIcs, cap $liveCount/$cap)" }
+        $fw = Test-FrontierWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap
+        if ($fw.evidence.Count -gt 0) { $wake.evidence += $fw.evidence } elseif ($fw.reason) { $wake.reason = $fw.reason }
       }
       # Source 2: PR-watcher wakes recorded since this lead session started and not yet delivered.
       if ($wakeSources -contains 'outbox') {
         $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
         $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
-        $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
-        if (Test-Path $outboxPath) {
-          $kinds = @{}
-          foreach ($rawLine in (Get-Content $outboxPath -ErrorAction SilentlyContinue)) {
-            if (-not $rawLine) { continue }
-            $o = $null; try { $o = $rawLine | ConvertFrom-Json } catch { continue }
-            if (-not $o -or -not $o.at -or "$($o.recordId)" -notlike "$tenantName`:*") { continue }
-            $atUtc = ConvertTo-UtcDateTime $o.at
-            if (-not $atUtc) { continue }
-            if ($leadStartedAt -and $atUtc -le $leadStartedAt) { continue }
-            if ($consumedThrough -and $atUtc -le $consumedThrough) { continue }
-            if (@('checks-settled', 'checks-failed', 'decision-needed') -notcontains "$($o.wake)") { continue }
-            $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
-          }
-          if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
-        }
+        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadStartedAt -ConsumedThrough $consumedThrough
+        if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
       }
       if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
       # Cooldown: the same evidence within the window means the last wake did not clear it; do not loop.
@@ -497,7 +580,11 @@ try {
   $pendingNote = "; $escCount escalation file(s) and $checkEsc check-reported escalation(s) have no live relay"
   if ($fleetDead) {
     $names = (@($staleStatics | ForEach-Object { "$($_.name):$($_.ageMin)m" }) -join ', ')
-    $conditions += [pscustomobject]@{ key = 'fleet-dead'; detail = "every static heartbeat is stale ($names; threshold $staleMinutes m); the fleet is not self-healing$pendingNote" }
+    $conditions += [pscustomobject]@{ key = 'fleet-dead'; detail = "every static heartbeat is stale ($names; threshold $staleMinutes m) and work is waiting; the fleet is not self-healing$pendingNote" }
+  } elseif ($idleTick) {
+    # Ticket 75: every static heartbeat is stale but nothing is waiting for any
+    # tenant - a session with nothing to do takes no turns too. Recorded via the
+    # shadow line's idle flag below, never a condition.
   } elseif ($sentinelStale) {
     $age = @($staleStatics | Where-Object { $_.name -eq 'sentinel' })[0].ageMin
     $conditions += [pscustomobject]@{ key = 'sentinel-stale'; detail = "sentinel heartbeat is $age min old (threshold $staleMinutes); respawns and escalation relay are not happening$pendingNote" }
@@ -573,7 +660,7 @@ try {
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = @($newConditions | ForEach-Object { $_.key })
     toastDelivered = $toastDelivered; checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes; triageWakes = $triageWakes
-    staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify
+    staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)
   if (-not $Verify) {

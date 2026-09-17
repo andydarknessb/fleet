@@ -29,7 +29,7 @@ function New-StormRows { param([string]$Name, [datetime]$FirstFail)
 }
 
 try {
-  foreach ($dir in 'bin','tenants','state','state/heartbeats','state/sentinel','state/skip','state/watchdog','state/escalations','profile/.claude/jobs/job-ic-901-2','repo','mock-bin') {
+  foreach ($dir in 'bin','tenants','state','state/heartbeats','state/sentinel','state/skip','state/watchdog','state/escalations','state/work','state/watch','profile/.claude/jobs/job-ic-901-2','repo','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
   foreach ($f in '_common.ps1','sentinel-check.ps1','watchdog.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
@@ -107,6 +107,13 @@ try {
   Assert-True (@($r3c.conditions).Count -eq 0) 'PAUSE must suppress staleness conditions'
   Assert-True ($r3c.paused -eq $true) 'the shadow log must record the pause'
   Remove-Item "$testRoot\state\PAUSE"
+
+  # Ticket 75: fleet-dead now also requires work waiting. An implementing record
+  # for the sole tenant gives every "all statics stale" case below real work to
+  # find, matching the original intent (self-healing is down while something is
+  # in flight); the "nothing to do" idle case ticket 75 carves out is tested in
+  # its own block near the end of this file.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-777":{"tenant":"test","issue":777,"state":"implementing"}}}'
 
   # Case 3d: a corrupt paged.json is quarantined, and a live condition still pages.
   Write-Utf8 "$testRoot\state\watchdog\paged.json" '{oops'
@@ -432,7 +439,80 @@ try {
   $w7 = Run-Watchdog
   Assert-True (@($w7.frontierWakes).Count -eq 0 -and @(Get-RotateCalls).Count -eq $callsBefore) 'the flag must disable the wake'
   Remove-Item "$testRoot\state\flags\frontier-wake-off"
+
+  # ===== Ticket 75 (ADR 0012): fleet-dead requires stale heartbeats AND work waiting =====
+  # A session with nothing to do takes no turns and its heartbeat goes stale too;
+  # that is not an outage. Reuses the frontier/wake fixtures already wired above
+  # (assignment.js, the tenant's maxIcs/readyLabel, the empty live roster).
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watch\wake-outbox.jsonl" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Write-Utf8 $wakeFixture '[]'
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = $wakeFixture
+  Set-AgentsRows $idleLeadRows
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 90 }
+
+  # Case FD1 (red-tell): all statics stale, empty frontier, no active records, no
+  # outbox lines -> today this raises fleet-dead; after, nothing, and the shadow
+  # line records idle.
+  $fd1 = Run-Watchdog
+  Assert-True (-not (@($fd1.conditions) -contains 'fleet-dead')) 'staleness alone must not raise fleet-dead when nothing is waiting'
+  Assert-True (@($fd1.conditions).Count -eq 0) 'an idle tick must raise no condition'
+  Assert-True ($fd1.idle -eq $true) 'an idle tick must record idle:true on the shadow line'
+
+  # Case FD2 (control a): a frontier candidate with a free slot must still page.
+  Write-Utf8 $wakeFixture '[{"number":701,"title":"Ready","url":"https://github.com/owner/repo/issues/701","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  $fd2 = Run-Watchdog
+  Assert-True (@($fd2.conditions) -contains 'fleet-dead') 'a waiting frontier candidate must still raise fleet-dead'
+  Assert-True ($fd2.idle -ne $true) 'a paging tick must not record idle'
+  Write-Utf8 $wakeFixture '[]'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD3 (control b): one implementing active record must still page.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-801":{"tenant":"test","issue":801,"state":"implementing"}}}'
+  $fd3 = Run-Watchdog
+  Assert-True (@($fd3.conditions) -contains 'fleet-dead') 'an implementing record must still raise fleet-dead'
+  Remove-Item "$testRoot\state\work\active.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD3b: a record in hold alone must not page.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-802":{"tenant":"test","issue":802,"state":"hold"}}}'
+  $fd3b = Run-Watchdog
+  Assert-True (-not (@($fd3b.conditions) -contains 'fleet-dead')) 'a hold record alone must not raise fleet-dead'
+  Assert-True ($fd3b.idle -eq $true) 'hold-only work must still read as idle'
+  Remove-Item "$testRoot\state\work\active.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD4 (control c): one unconsumed checks-settled outbox line must still page.
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ('{"at":"' + (Get-Date).ToUniversalTime().ToString('o') + '","recordId":"test:issue-9","wake":"checks-settled"}' + "`n")
+  $fd4 = Run-Watchdog
+  Assert-True (@($fd4.conditions) -contains 'fleet-dead') 'an unconsumed wake must still raise fleet-dead'
+  Remove-Item "$testRoot\state\watch\wake-outbox.jsonl"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD5 (control d): an unreadable active.json fails toward paging.
+  Write-Utf8 "$testRoot\state\work\active.json" '{oops'
+  $fd5 = Run-Watchdog
+  Assert-True (@($fd5.conditions) -contains 'fleet-dead') 'an unreadable active.json must fail toward paging'
+  Remove-Item "$testRoot\state\work\active.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD6: staleMinutes is configurable via config/cycle.json watchdog.staleMinutes.
+  Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"staleMinutes":30}}'
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-803":{"tenant":"test","issue":803,"state":"implementing"}}}'
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 40 }
+  $fd6 = Run-Watchdog
+  Assert-True (@($fd6.conditions) -contains 'fleet-dead') 'a 40-min heartbeat must trip a 30-min configured threshold'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'threshold 30') 'the configured staleMinutes must appear in the condition detail'
+  Remove-Item "$testRoot\config\cycle.json"
+  Remove-Item "$testRoot\state\work\active.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
 
   # ===== ADR 0011 (fleet #38): the triage wake =====
   # bin/triage.js runs for real against a fixture (FLEET_TRIAGE_ISSUES_FIXTURE); the mock

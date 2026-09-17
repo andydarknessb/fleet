@@ -43,6 +43,9 @@
     "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 },
     "principal": { "maxAgeHours": 24, "maxJobTokens": 250000 }
   },
+  "watchdog": {
+    "staleMinutes": 45
+  },
   "supervisor": {
     "parityHours": 48,
     "pairWindowMinutes": 10,
