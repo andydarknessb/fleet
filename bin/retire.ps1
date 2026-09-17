@@ -33,10 +33,11 @@ $stillThere = $false
 if ($e.jobId) {
   & claude stop $e.jobId 2>$null | Out-Null
   & claude rm $e.jobId 2>$null | Out-Null
-  # claude rm refuses when the session's worktree has uncommitted changes. A retired IC's leftovers are
-  # disposable (its work is in the PR), so force-remove any worktree it owns, then rm again.
+  # claude rm refuses when the session's worktree has uncommitted changes, and when it succeeds it
+  # still leaves a clean worktree registered. A retired IC's leftovers are disposable (its work is in
+  # the PR), so force-remove any worktree it owns whether or not the job went, then rm again if needed.
   $stillThere = @(Get-DaemonSessions -All | Where-Object { $_.id -eq $e.jobId }).Count -gt 0
-  if ($stillThere -and $e.cwd -and (Test-Path $e.cwd)) {
+  if ($e.cwd -and (Test-Path $e.cwd)) {
     foreach ($wt in @(Get-OwnedWorktrees)) {
       & git -C $e.cwd worktree unlock $wt.path 2>$null | Out-Null
       & git -C $e.cwd worktree remove --force --force $wt.path 2>$null | Out-Null
@@ -44,8 +45,10 @@ if ($e.jobId) {
       if ($br -and $br -like 'worktree-*') { & git -C $e.cwd branch -D $br 2>$null | Out-Null }
     }
     & git -C $e.cwd worktree prune 2>$null | Out-Null
-    & claude rm $e.jobId 2>$null | Out-Null
-    $stillThere = @(Get-DaemonSessions -All | Where-Object { $_.id -eq $e.jobId }).Count -gt 0
+    if ($stillThere) {
+      & claude rm $e.jobId 2>$null | Out-Null
+      $stillThere = @(Get-DaemonSessions -All | Where-Object { $_.id -eq $e.jobId }).Count -gt 0
+    }
   }
   if ($stillThere) { Write-Warning "job $($e.jobId) still exists after claude rm; inspect with: claude agents --json --all" }
 }

@@ -26,6 +26,7 @@ Assert-True ($reread -ge 0 -and $respawn -gt $reread) 'Sentinel must re-read the
 $retiring = $retire.IndexOf("`$e.status = 'retiring'")
 $stop = $retire.IndexOf('claude stop')
 Assert-True ($retiring -ge 0 -and $stop -gt $retiring) 'Retirement must publish the retiring marker before stopping the job'
+Assert-True ($retire -notmatch 'if \(\$stillThere -and [^\r\n]*\r?\n\s*foreach \(\$wt in') 'Owned-worktree removal must not depend on claude rm failing (a clean worktree survives a successful rm)'
 Assert-Match $retire 'worktreesRemaining' 'Retirement output must report still-registered owned worktrees'
 Assert-Match $retire "worktreeCleanup = if .*'none-owned'.*'removed'.*'remaining'" 'Retirement output must distinguish no worktree, removed worktree, and remaining worktree'
 
