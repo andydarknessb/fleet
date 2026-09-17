@@ -58,6 +58,8 @@ test('budgetConfig reads the ic block with defaults and isLive reads the flag', 
   fs.writeFileSync(path.join(root, 'state', 'flags', 'budget-live'), 'x');
   assert.equal(isLive({ root }), true);
   assert.deepEqual(BUDGET_STATES, ['implementing', 'revision', 'pr-open', 'ci-wait', 'review']);
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ ic: {} }));
+  assert.deepEqual(budgetConfig(root), { warnTokens: 50000, escalateTokens: 350000 });
 });
 
 test('below the warning threshold nothing is recorded, but the measurement is projected', async () => {

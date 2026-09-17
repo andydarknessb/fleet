@@ -5,7 +5,7 @@
 // thing across the fleet. Cache fields are never folded in.
 //
 // At config/cycle.json `ic.warnTokens` (50,000) the record gets ONE budget-warning event
-// carrying the measured count. At `ic.escalateTokens` (75,000) the record is escalated
+// carrying the measured count. At `ic.escalateTokens` (350,000) the record is escalated
 // with decision evidence, unless an approved extension (work-state.js budget --phase
 // extend) covers the spend; then the extension amount is the line. Escalation is a
 // human decision: the transition is a decision event and pages through the notifier.
@@ -23,7 +23,7 @@ const workState = require('./work-state');
 const { findTranscript, sumTranscriptTokens } = require('./rotation-policy');
 const { parseArgs } = workState;
 
-const DEFAULTS = Object.freeze({ warnTokens: 50000, escalateTokens: 75000 });
+const DEFAULTS = Object.freeze({ warnTokens: 50000, escalateTokens: 350000 });
 // hold is Cory's state and escalated is already a decision; merged and later are done.
 const BUDGET_STATES = Object.freeze(['implementing', 'revision', 'pr-open', 'ci-wait', 'review']);
 
