@@ -21,17 +21,35 @@ $ErrorActionPreference = 'Continue'
 
 $report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; worktrees = @(); tmpLitter = @(); escalations = @(); heartbeats = @() }
 
-function Get-ActiveWorkRecord {
-  # Record ids are "<tenant>:issue-<n>" (bin/work-state.js). A terminal record
-  # (retired/released/abandoned) is removed from active.json entirely, so its
-  # absence here can mean either "never existed" or "already settled" - callers
-  # tell those apart by checking GitHub, not by treating absence as done.
-  param([string]$Tenant, [int]$Issue)
-  $active = Read-Json "$FleetHome\state\work\active.json"
-  if (-not $active -or -not $active.records) { return $null }
-  $key = "${Tenant}:issue-$Issue"
-  if (@($active.records.PSObject.Properties.Name) -contains $key) { return $active.records.$key }
-  return $null
+function Read-ActiveWork {
+  # Tri-state, read ONCE: 'ok' (parsed, has a usable .records map - even an empty one,
+  # including a MISSING file, see below), or 'unreadable' (malformed, unparseable, or
+  # shaped wrong - a real reason not to trust it).
+  # A MISSING file is read as 'ok' with an empty map: bin/work-state.js's own
+  # ensureLayout creates state/work/active.json as {schemaVersion:1, records:{}} the
+  # first time any script touches the fleet, so "the file is not there yet" is that
+  # same empty shape, not corruption. A file that EXISTS but fails to parse, or parses
+  # to something without a .records object, is never assumed empty - that is corruption
+  # (a torn write, disk trouble) and must block every removal decision that depends on
+  # it, not just the one for the record it happened to be checking (fleet #88 review
+  # finding 3: reading absence off a broken file let a CLOSED-issue check license
+  # removing an `implementing` record's worktree).
+  $path = "$FleetHome\state\work\active.json"
+  if (-not (Test-Path -LiteralPath $path)) { return [pscustomobject]@{ status = 'ok'; records = $null } }
+  try {
+    $rawText = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop
+    $obj = $rawText | ConvertFrom-Json -ErrorAction Stop
+  } catch { return [pscustomobject]@{ status = 'unreadable'; records = $null } }
+  if ($null -eq $obj -or -not $obj.PSObject.Properties['records'] -or $null -eq $obj.records) { return [pscustomobject]@{ status = 'unreadable'; records = $null } }
+  return [pscustomobject]@{ status = 'ok'; records = $obj.records }
+}
+function Find-WorkRecord {
+  # status: 'unreadable' (active.json itself could not be trusted - caller must not
+  # decide anything from "no record"), 'found', or 'absent' (no such key, file was fine).
+  param($ActiveWork, [string]$Key)
+  if ($ActiveWork.status -eq 'unreadable') { return [pscustomobject]@{ status = 'unreadable'; record = $null } }
+  if ($ActiveWork.records -and (@($ActiveWork.records.PSObject.Properties.Name) -contains $Key)) { return [pscustomobject]@{ status = 'found'; record = $ActiveWork.records.$Key } }
+  return [pscustomobject]@{ status = 'absent'; record = $null }
 }
 
 function Test-IssueClosed {
@@ -46,6 +64,7 @@ function Test-IssueClosed {
 
 # --- worktree sweep: remove only when the Work record is settled AND the tree is
 # --- clean AND the branch is merged or gone on the remote; else list with the reason. ---
+$activeWork = Read-ActiveWork
 foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
   $t = Read-Json $tf.FullName
   if (-not $t -or -not (Test-Path $t.repo)) { continue }
@@ -66,15 +85,18 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
     $reasons = @()
 
     # Condition 1: the issue's Work record is merged, retired or released, OR the
-    # issue is closed with no active record.
+    # issue is closed with no active record. A torn/unparseable active.json is neither
+    # of those - it is UNKNOWN, and unknown never licenses removal (review finding 3).
     $recordOk = $false
     if ($null -eq $issue) {
       $reasons += 'could not determine an issue number from the worktree path or branch name'
     } else {
-      $record = Get-ActiveWorkRecord -Tenant $tenantName -Issue $issue
-      if ($record) {
-        if (@('merged', 'retired', 'released') -contains "$($record.state)") { $recordOk = $true }
-        else { $reasons += "issue #$issue`'s Work record is '$($record.state)', not merged/retired/released" }
+      $lookup = Find-WorkRecord -ActiveWork $activeWork -Key "${tenantName}:issue-$issue"
+      if ($lookup.status -eq 'unreadable') {
+        $reasons += 'state/work/active.json could not be read; issue record status unknown'
+      } elseif ($lookup.status -eq 'found') {
+        if (@('merged', 'retired', 'released') -contains "$($lookup.record.state)") { $recordOk = $true }
+        else { $reasons += "issue #$issue`'s Work record is '$($lookup.record.state)', not merged/retired/released" }
       } else {
         $closed = Test-IssueClosed -Github $t.github -Issue $issue
         if ($closed -eq $true) { $recordOk = $true }
@@ -83,10 +105,14 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
       }
     }
 
-    # Condition 2: nothing uncommitted or untracked in the worktree.
-    $statusRaw = (& git -C $path status --porcelain 2>$null | Out-String).Trim()
-    $clean = ($statusRaw -eq '')
-    if (-not $clean) { $reasons += 'git status --porcelain is not empty' }
+    # Condition 2: nothing uncommitted or untracked in the worktree. A failed status
+    # read (broken worktree, missing .git link, git error) is UNKNOWN, not clean.
+    $statusRaw = (& git -C $path status --porcelain 2>$null | Out-String)
+    $statusExit = $LASTEXITCODE
+    $clean = $false
+    if ($statusExit -ne 0) { $reasons += "git status --porcelain failed (exit $statusExit); worktree not provably clean" }
+    elseif ($statusRaw.Trim() -ne '') { $reasons += 'git status --porcelain is not empty' }
+    else { $clean = $true }
 
     # Condition 3: the branch is merged into the default branch, OR it is gone on the
     # remote. Tenant PRs are squash-merged, so ancestry alone (`git branch --merged`)
@@ -94,16 +120,33 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
     # actually catches those, and only when the tenant's GitHub repo deletes the head
     # branch on merge. See the ticket report for the fraction this literal OR leaves
     # listed when a repo keeps merged branches around.
-    $mergedList = (& git -C $t.repo branch --merged $def 2>$null | Out-String)
-    # git marks the branch line "* " for the checked-out branch in THIS worktree, or
-    # "+ " when it is checked out in a LINKED worktree (exactly our case: every branch
-    # here is checked out in the .claude/worktrees worktree we are judging) - a plain
-    # \*? missed the "+ " rows entirely and read every one of them as unmerged.
-    $ancestorMerged = ($mergedList -match "(?m)^[\*\+]?\s*$([regex]::Escape($br))\s*$")
-    $remoteRaw = (& git -C $t.repo ls-remote --heads origin $br 2>$null | Out-String).Trim()
-    $remoteGone = ($remoteRaw -eq '')
-    $branchOk = ($ancestorMerged -or $remoteGone)
-    if (-not $branchOk) { $reasons += 'branch is neither merged into the default branch nor deleted on the remote' }
+    $ancestorMerged = $false
+    $branchOk = $false
+    if (-not $def) {
+      $reasons += 'tenant has no defaultBranch configured; cannot evaluate merge ancestry'
+    } else {
+      $mergedList = (& git -C $t.repo branch --merged $def 2>$null | Out-String)
+      # git marks the branch line "* " for the checked-out branch in THIS worktree, or
+      # "+ " when it is checked out in a LINKED worktree (exactly our case: every branch
+      # here is checked out in the .claude/worktrees worktree we are judging) - a plain
+      # \*? missed the "+ " rows entirely and read every one of them as unmerged.
+      $ancestorMerged = ($mergedList -match "(?m)^[\*\+]?\s*$([regex]::Escape($br))\s*$")
+      $remoteRaw = (& git -C $t.repo ls-remote --heads origin $br 2>$null | Out-String).Trim()
+      $remoteExit = $LASTEXITCODE
+      if ($ancestorMerged) {
+        $branchOk = $true
+      } elseif ($remoteExit -ne 0) {
+        # The remote lookup itself failed (origin unreachable, network trouble, auth) -
+        # that is UNKNOWN, not "gone". Reading a failed lookup as "gone" would remove
+        # every unmerged worktree the instant the remote is unreachable (review
+        # finding 1, the blocker).
+        $reasons += "branch is not merged into the default branch and the remote lookup failed (git ls-remote exit $remoteExit); left listed rather than guessing"
+      } elseif ($remoteRaw -eq '') {
+        $branchOk = $true
+      } else {
+        $reasons += 'branch is neither merged into the default branch nor deleted on the remote'
+      }
+    }
 
     $entry = [ordered]@{ tenant = $tenantName; path = $path; branch = $br; issue = $issue }
     if ($recordOk -and $clean -and $branchOk) {
@@ -155,17 +198,34 @@ foreach ($item in $litterItems) {
 $escDir = "$FleetHome\state\escalations"
 if (Test-Path $escDir) {
   $archiveDir = "$escDir\archive"
-  $active = Read-Json "$FleetHome\state\work\active.json"
-  $activeProps = @(); if ($active -and $active.records) { $activeProps = @($active.records.PSObject.Properties) }
+  # A bare ":issue-<n>" suffix match can hit the wrong tenant's record when two
+  # tenants both have an issue #n (review finding 8); resolve the full "<tenant>:issue-<n>"
+  # key against every known tenant name instead. An escalation whose issue matches more
+  # than one tenant's active record is left alone too - there is no safe reading of it.
+  $tenantNames = @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue | ForEach-Object {
+      $tt = Read-Json $_.FullName
+      if ($tt -and $tt.name) { "$($tt.name)" } else { [IO.Path]::GetFileNameWithoutExtension($_.Name) }
+    })
   foreach ($f in @(Get-ChildItem $escDir -Filter *.json -ErrorAction SilentlyContinue)) {
     $esc = $null; try { $esc = Read-Json $f.FullName } catch {}
     $issue = $null
     if ($esc -and "$($esc.name)" -match '^ic-(\d+)$') { $issue = [int]$Matches[1] }
     $record = $null
+    $unresolved = $false
     if ($null -ne $issue) {
-      $hit = $activeProps | Where-Object { $_.Name -match ":issue-$issue$" } | Select-Object -First 1
-      if ($hit) { $record = $hit.Value }
+      if ($activeWork.status -eq 'unreadable') {
+        $unresolved = $true   # the whole map is untrustworthy; never guess from it
+      } else {
+        $hits = @()
+        foreach ($tn in $tenantNames) {
+          $lookup = Find-WorkRecord -ActiveWork $activeWork -Key "${tn}:issue-$issue"
+          if ($lookup.status -eq 'found') { $hits += $lookup.record }
+        }
+        if ($hits.Count -gt 1) { $unresolved = $true }   # ambiguous across tenants
+        elseif ($hits.Count -eq 1) { $record = $hits[0] }
+      }
     }
+    if ($unresolved) { continue }   # leave the file - see comment above
     $settle = $false; $why = ''
     if ($record) {
       if (@('escalated', 'hold') -notcontains "$($record.state)") { $settle = $true; $why = "issue #$issue`'s record is now '$($record.state)', no longer a decision state" }
@@ -180,8 +240,18 @@ if (Test-Path $escDir) {
     if ($Apply) {
       try {
         [IO.Directory]::CreateDirectory($archiveDir) | Out-Null
-        Move-Item -LiteralPath $f.FullName -Destination (Join-Path $archiveDir $f.Name) -Force -ErrorAction Stop
-        $entry.action = 'archived'
+        # Collision-safe: never clobber an earlier archived file of the same name
+        # (review finding 9). -Force alone would silently overwrite it.
+        $destName = $f.Name
+        $destPath = Join-Path $archiveDir $destName
+        $suffix = 1
+        while (Test-Path -LiteralPath $destPath) {
+          $destName = "$([IO.Path]::GetFileNameWithoutExtension($f.Name))-$suffix$([IO.Path]::GetExtension($f.Name))"
+          $destPath = Join-Path $archiveDir $destName
+          $suffix++
+        }
+        Move-Item -LiteralPath $f.FullName -Destination $destPath -ErrorAction Stop
+        $entry.action = 'archived'; $entry.archivedAs = $destName
       } catch { $entry.action = 'listed'; $entry.reason = "$why; move failed: $($_.Exception.Message)" }
     } else { $entry.action = 'would-archive' }
     $report.escalations += [pscustomobject]$entry
@@ -189,11 +259,34 @@ if (Test-Path $escDir) {
 }
 
 # --- stale state/heartbeats/ic-*.json for names off the live roster ---
+# Get-LiveRoster (bin/_common.ps1) substitutes an empty sessions list for a missing OR
+# unreadable state/roster.json - a fine default for reporting, but a destructive
+# decision here: it would read a broken roster as "nobody is live" and delete every
+# IC heartbeat, which is exactly what the Watchdog reads to judge the fleet dead
+# (review finding 5). Read the file ourselves and only act when it actually parsed.
 $hbDir = "$FleetHome\state\heartbeats"
 if (Test-Path $hbDir) {
-  $liveNames = @((Get-LiveRoster).sessions | ForEach-Object { "$($_.name)" })
+  $rosterPath = "$FleetHome\state\roster.json"
+  $rosterReadOk = $false
+  $liveNames = @()
+  if (Test-Path -LiteralPath $rosterPath) {
+    try {
+      $rosterRaw = Get-Content -LiteralPath $rosterPath -Raw -Encoding UTF8 -ErrorAction Stop
+      $rosterObj = $rosterRaw | ConvertFrom-Json -ErrorAction Stop
+      if ($rosterObj -and $rosterObj.PSObject.Properties['sessions']) {
+        $liveNames = @($rosterObj.sessions | ForEach-Object { "$($_.name)" })
+        $rosterReadOk = $true
+      }
+    } catch { $rosterReadOk = $false }
+  }
+  # A MISSING roster.json is ambiguous (unlike active.json, nothing here documents it as
+  # "freshly initialized, no sessions yet") - when unsure, treat it the same as unreadable.
   foreach ($f in @(Get-ChildItem $hbDir -Filter 'ic-*.json' -ErrorAction SilentlyContinue)) {
     $name = [IO.Path]::GetFileNameWithoutExtension($f.Name)
+    if (-not $rosterReadOk) {
+      $report.heartbeats += [pscustomobject]@{ file = $f.Name; name = $name; action = 'listed'; reason = 'state/roster.json unreadable; heartbeats left alone' }
+      continue
+    }
     if ($liveNames -contains $name) { continue }
     $entry = [ordered]@{ file = $f.Name; name = $name }
     if ($Apply) {
@@ -204,9 +297,10 @@ if (Test-Path $hbDir) {
   }
 }
 
-# --- report ---
+# --- report --- (the run's own timestamp, not just the date: two runs on one day must
+# --- not overwrite each other's report)
 [IO.Directory]::CreateDirectory("$FleetHome\state\janitor") | Out-Null
-$reportPath = "$FleetHome\state\janitor\$((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')).md"
+$reportPath = "$FleetHome\state\janitor\$((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd-HHmmssfff')).md"
 $lines = @("# Janitor run $($report.at)", '', "Mode: $(if ($Apply) { 'APPLY' } else { 'DRY RUN' })", '', '## Worktrees')
 if ($report.worktrees.Count -eq 0) { $lines += '(none)' }
 foreach ($w in $report.worktrees) {
