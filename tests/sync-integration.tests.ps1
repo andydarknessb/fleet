@@ -112,6 +112,85 @@ try {
   Assert-True ("$($r3.pushError)" -match 'refusing: branch protection active') 'pushError must carry the hook stderr text'
   Assert-True ($r3.escalate -eq $true -and $r3.kind -eq 'sync-refused') 'a refused push must escalate as sync-refused'
 
+  # --- Scenario C: `gh pr list` fails outright (simulated gh outage) on a real
+  # --- divergence. The old code treated "list failed" the same as "no PR yet" and
+  # --- created one on every tick (review finding 4); it must instead escalate naming
+  # --- the failure and never call `pr create` at all. ---
+  [IO.Directory]::CreateDirectory("$testRoot\mock-bin-outage") | Out-Null
+  Write-Utf8 "$testRoot\mock-bin-outage\gh.cmd" (
+    '@echo off' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="list" (echo gh: connection reset by peer 1>&2 & exit /b 1)' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="create" (echo x>> "' + $testRoot + '\pr-create-calls-outage.log" & echo https://github.com/owner/repo3/pull/999 & exit /b 0)' + "`r`n" +
+    'exit /b 0' + "`r`n"
+  )
+  $remoteC = "$testRoot\remoteC.git"; $repoC = "$testRoot\repoC"
+  Invoke-Git @('init', '--bare', '-q', $remoteC) | Out-Null
+  Invoke-Git @('clone', '-q', $remoteC, $repoC) | Out-Null
+  Invoke-Git @('-C', $repoC, 'config', 'user.email', 'a@b.com') | Out-Null
+  Invoke-Git @('-C', $repoC, 'config', 'user.name', 'a') | Out-Null
+  Invoke-Git @('-C', $repoC, 'checkout', '-q', '-b', 'main') | Out-Null
+  Invoke-Git @('-C', $repoC, 'commit', '-q', '--allow-empty', '-m', 'init') | Out-Null
+  Invoke-Git @('-C', $repoC, 'push', '-q', '-u', 'origin', 'main') | Out-Null
+  Invoke-Git @('-C', $repoC, 'checkout', '-q', '-b', 'integration') | Out-Null
+  Write-Utf8 "$repoC\release-only.txt" 'release content'
+  Invoke-Git @('-C', $repoC, 'add', '-A') | Out-Null
+  Invoke-Git @('-C', $repoC, 'commit', '-q', '-m', 'release-only change') | Out-Null
+  Invoke-Git @('-C', $repoC, 'push', '-q', '-u', 'origin', 'integration') | Out-Null
+  Invoke-Git @('-C', $repoC, 'checkout', '-q', 'main') | Out-Null
+  Write-Utf8 "$repoC\main-only.txt" 'main content'
+  Invoke-Git @('-C', $repoC, 'add', '-A') | Out-Null
+  Invoke-Git @('-C', $repoC, 'commit', '-q', '-m', 'main-only change') | Out-Null
+  Invoke-Git @('-C', $repoC, 'push', '-q', 'origin', 'main') | Out-Null
+  Write-Utf8 "$testRoot\tenants\c.json" (@{ name = 'c'; repo = $repoC; github = 'owner/repo3'; defaultBranch = 'main'; releaseBranch = 'integration' } | ConvertTo-Json -Compress)
+
+  $env:PATH = "$testRoot\mock-bin-outage;$oldPath"
+  $c1 = Run-Sync @('-Tenant', 'c')
+  Assert-True ($script:lastExit -eq 2) 'a divergence during a gh outage must still exit 2 (escalate)'
+  Assert-True (-not (Test-Path "$testRoot\pr-create-calls-outage.log")) 'gh pr create must never be called when gh pr list itself failed'
+  Assert-True ("$($c1.reason)" -match 'could not confirm whether a reconciliation PR already exists') 'the escalation must name why no PR was opened, not silently omit it'
+  Assert-True (-not "$($c1.prUrl)") 'no PR URL can be reported when none was safely confirmed or created'
+
+  $c2 = Run-Sync @('-Tenant', 'c')
+  Assert-True ($script:lastExit -eq 2) 'the next tick during the same outage must still escalate'
+  Assert-True (-not (Test-Path "$testRoot\pr-create-calls-outage.log")) 'a second tick during the same outage must still never create a PR (not "one per outage tick")'
+  $env:PATH = "$testRoot\mock-bin;$oldPath"
+
+  # --- Scenario D: `gh pr create` succeeds but writes to BOTH stdout and stderr, with
+  # --- stderr chatter arriving after the real URL. The old parse merged the streams
+  # --- with `2>&1` and took the merged stream's last line, which could grab the
+  # --- trailing stderr text instead of the URL (review finding 14). ---
+  [IO.Directory]::CreateDirectory("$testRoot\mock-bin-mixed") | Out-Null
+  Write-Utf8 "$testRoot\mock-bin-mixed\gh.cmd" (
+    '@echo off' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="list" (echo [] & exit /b 0)' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="create" (echo warning: a non-fatal notice 1>&2 & echo https://github.com/owner/repo4/pull/424 & echo trailing stderr chatter after success 1>&2 & exit /b 0)' + "`r`n" +
+    'exit /b 0' + "`r`n"
+  )
+  $remoteD = "$testRoot\remoteD.git"; $repoD = "$testRoot\repoD"
+  Invoke-Git @('init', '--bare', '-q', $remoteD) | Out-Null
+  Invoke-Git @('clone', '-q', $remoteD, $repoD) | Out-Null
+  Invoke-Git @('-C', $repoD, 'config', 'user.email', 'a@b.com') | Out-Null
+  Invoke-Git @('-C', $repoD, 'config', 'user.name', 'a') | Out-Null
+  Invoke-Git @('-C', $repoD, 'checkout', '-q', '-b', 'main') | Out-Null
+  Invoke-Git @('-C', $repoD, 'commit', '-q', '--allow-empty', '-m', 'init') | Out-Null
+  Invoke-Git @('-C', $repoD, 'push', '-q', '-u', 'origin', 'main') | Out-Null
+  Invoke-Git @('-C', $repoD, 'checkout', '-q', '-b', 'integration') | Out-Null
+  Write-Utf8 "$repoD\release-only.txt" 'release content'
+  Invoke-Git @('-C', $repoD, 'add', '-A') | Out-Null
+  Invoke-Git @('-C', $repoD, 'commit', '-q', '-m', 'release-only change') | Out-Null
+  Invoke-Git @('-C', $repoD, 'push', '-q', '-u', 'origin', 'integration') | Out-Null
+  Invoke-Git @('-C', $repoD, 'checkout', '-q', 'main') | Out-Null
+  Write-Utf8 "$repoD\main-only.txt" 'main content'
+  Invoke-Git @('-C', $repoD, 'add', '-A') | Out-Null
+  Invoke-Git @('-C', $repoD, 'commit', '-q', '-m', 'main-only change') | Out-Null
+  Invoke-Git @('-C', $repoD, 'push', '-q', 'origin', 'main') | Out-Null
+  Write-Utf8 "$testRoot\tenants\d.json" (@{ name = 'd'; repo = $repoD; github = 'owner/repo4'; defaultBranch = 'main'; releaseBranch = 'integration' } | ConvertTo-Json -Compress)
+
+  $env:PATH = "$testRoot\mock-bin-mixed;$oldPath"
+  $d1 = Run-Sync @('-Tenant', 'd')
+  Assert-True ("$($d1.prUrl)" -eq 'https://github.com/owner/repo4/pull/424') 'the URL must be read from stdout alone, never corrupted by interleaved stderr chatter'
+  $env:PATH = "$testRoot\mock-bin;$oldPath"
+
   Write-Output 'sync-integration tests passed'
 } finally {
   $env:PATH = $oldPath
