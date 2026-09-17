@@ -37,6 +37,10 @@ try {
   }
   foreach ($f in '_common.ps1','rotate.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\bin\rotation-policy.js", "$testRoot\bin\rotation-policy.js")
+  # rotation-policy.js has required ./work-state since 359dc20 (fleet #4's shared
+  # parseArgs); without this copy the whole suite died at module load with "Cannot
+  # find module './work-state'" before a single case ran (review finding 6).
+  [IO.File]::Copy("$sourceRoot\bin\work-state.js", "$testRoot\bin\work-state.js")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
 
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"}]}'
