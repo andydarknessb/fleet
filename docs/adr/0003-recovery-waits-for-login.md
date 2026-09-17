@@ -11,3 +11,5 @@ Auto-login on a desktop that holds Claude credentials, GitHub auth, and a live c
 ## Consequences
 
 "The fleet has been down since the last Windows update" is an accepted failure mode. If that becomes frequent, the fix is a cloud Routine that pages Cory when heartbeats go stale, not auto-login.
+
+Amended 2026-09-17 by ADR 0012: the off-host watcher is a dead-man service the Watchdog pings on every tick, not a cloud Routine. The decision above stands.
