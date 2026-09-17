@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { formatAge, buildSummary, runDailySummary, waitingRows, cli, DAILY_SUMMARY_FLAGS, DailySummaryError } = require('../bin/daily-summary');
+const { formatAge, buildSummary, runDailySummary, waitingRows, cli, exitCodeFor, DAILY_SUMMARY_FLAGS, DailySummaryError } = require('../bin/daily-summary');
 const workState = require('../bin/work-state');
 
 function rootDir() {
@@ -90,8 +90,9 @@ test('nothing waiting sends nothing: no page, no toast', () => {
   assert.equal(buildSummary({ root, now: NOW }), null);
   const send = sender();
   const result = runDailySummary({ root, now: NOW, send });
-  assert.deepEqual(result, { sent: false, count: 0 });
+  assert.deepEqual(result, { sent: false, attempted: false, count: 0 });
   assert.equal(send.calls.length, 0, 'an empty ledger must never call the sender');
+  assert.equal(exitCodeFor(result), 0, 'nothing waiting is always a clean exit');
 });
 
 test('a resolved decision (no longer hold/escalated) does not page; only current decision rows count', () => {
@@ -134,8 +135,28 @@ test('the default sender is pageSender (never called when nothing is waiting)', 
   // Nothing waiting: runDailySummary must return before ever building or calling
   // the default sender, so this never shells out even though no `send` is injected.
   const result = runDailySummary({ root, now: NOW });
-  assert.deepEqual(result, { sent: false, count: 0 });
+  assert.deepEqual(result, { sent: false, attempted: false, count: 0 });
   assert.equal(typeof pageSender, 'function');
+});
+
+// fleet#79 QA round 1, item 7: a failed send used to report sent:true anyway
+// (result.ok was never checked), so a dead 08:00 page would log INFO exit=0
+// the way run-daily-summary.ps1 grades its wrapped node call.
+test('a failed send reports sent:false with the detail, and the exit-code contract goes non-zero', () => {
+  const root = rootDir();
+  seedDecision(root, { issue: 30, to: 'escalated', enteredAt: hoursAgo(1) });
+  const failingSend = () => ({ ok: false, detail: 'pushover unconfigured' });
+  const result = runDailySummary({ root, now: NOW, send: failingSend });
+  assert.deepEqual(result, { sent: false, attempted: true, count: 1, detail: 'pushover unconfigured' });
+  assert.equal(exitCodeFor(result), 1, 'something was waiting and the send failed: main() must exit non-zero');
+});
+
+test('a sender that returns no result (or throws) is treated as a failed send, not a silent success', () => {
+  const root = rootDir();
+  seedDecision(root, { issue: 31, to: 'hold', enteredAt: hoursAgo(1) });
+  const result = runDailySummary({ root, now: NOW, send: () => undefined });
+  assert.equal(result.sent, false);
+  assert.equal(exitCodeFor(result), 1);
 });
 
 // --- fleet#2/#4 schema: unknown flags are refused -------------------------
@@ -165,4 +186,48 @@ test('waitingRows exposes the raw fold rows the summary is built from', () => {
   assert.equal(rows[0].issue, 7);
   assert.equal(rows[0].state, 'escalated');
   assert.equal(rows[0].ageMs, 4 * 3600 * 1000);
+});
+
+// fleet#79 QA round 1, item 8: the ticket's own "#issue state age" format
+// holds only while every waiting row is one tenant; once the fold spans more
+// than one, each row names its tenant, decided from the FULL waiting set
+// (before the cap) so the format never shifts with how many rows are shown.
+test('rows are prefixed with their tenant once the waiting set spans more than one', () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'tenants', 'otherco.json'), JSON.stringify({ name: 'otherco', github: 'owner/other' }));
+  seedDecision(root, { issue: 10, to: 'escalated', enteredAt: hoursAgo(5), tenant: 'endzone' });
+  seedDecision(root, { issue: 20, to: 'hold', enteredAt: hoursAgo(3), tenant: 'otherco' });
+  const summary = buildSummary({ root, now: NOW });
+  assert.deepEqual(summary.body.split('\n'), ['endzone #10 escalated 5h', 'otherco #20 hold 3h']);
+});
+
+test('a single-tenant ledger keeps the ticket\'s plain "#issue state age" format even with a second tenant configured but idle', () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'tenants', 'otherco.json'), JSON.stringify({ name: 'otherco', github: 'owner/other' }));
+  seedDecision(root, { issue: 11, to: 'escalated', enteredAt: hoursAgo(5), tenant: 'endzone' });
+  const summary = buildSummary({ root, now: NOW });
+  assert.deepEqual(summary.body.split('\n'), ['#11 escalated 5h']);
+});
+
+// fleet#79 QA round 1, item 9: formatAge(NaN) used to render "NaNm". A row
+// with an unparseable enteredStateAt (a corrupted or legacy ledger line -
+// isoNow() itself refuses to write one through the normal API, so this is
+// hand-appended, the only way to reach the case at all) must render "unknown"
+// and sort FIRST, not be silently treated as "just happened" and buried past
+// the cap by every genuinely-aged row.
+test('a row with an unparseable enteredStateAt renders age "unknown" and sorts first', () => {
+  assert.equal(formatAge(NaN), 'unknown');
+  const root = rootDir();
+  seedDecision(root, { issue: 8, to: 'escalated', enteredAt: hoursAgo(2) });
+  const eventsDir = path.join(root, 'state', 'events');
+  fs.mkdirSync(eventsDir, { recursive: true });
+  fs.appendFileSync(path.join(eventsDir, '2026-01-01.jsonl'), `${JSON.stringify({
+    recordId: 'endzone:issue-999', type: 'state-escalated', at: 'not-a-real-date', sequence: 1, revision: 1, actor: 'test', evidence: null, changes: {},
+  })}\n`, 'utf8');
+  const rows = waitingRows({ root, now: NOW });
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].issue, 999, 'the unparseable row sorts FIRST, never hidden behind a genuinely-aged one');
+  assert.ok(Number.isNaN(rows[0].ageMs));
+  const summary = buildSummary({ root, now: NOW });
+  assert.deepEqual(summary.body.split('\n'), ['#999 escalated unknown', '#8 escalated 2h']);
 });
