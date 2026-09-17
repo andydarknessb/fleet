@@ -109,6 +109,20 @@ try {
   # Case 5: the toast is skipped under -NoToast, never attempted.
   Assert-True ($r1.toast -eq 'skipped') '-NoToast must skip the toast, never attempt it'
 
+  # Case 6 (2026-09-17 review): Pushover rejects title > 250 or message > 1024
+  # chars with a 400; both are clamped with an ellipsis before the POST, the
+  # toast, or the audit line ever see them, and the call never throws.
+  $longTitle = 'T' * 300
+  $longBody = 'B' * 1100
+  $r6 = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title $longTitle -Body $longBody -Priority 'normal' -NoToast | ConvertFrom-Json
+  Assert-True ($r6.title.Length -eq 250 -and $r6.title.EndsWith('...')) 'an over-long title must clamp to 250 chars with an ellipsis'
+  Assert-True ($r6.body.Length -eq 1024 -and $r6.body.EndsWith('...')) 'an over-long body must clamp to 1024 chars with an ellipsis'
+  $form6 = ConvertFrom-FormBody (@(Get-PostedBodies $logPath) | Select-Object -Last 1)
+  Assert-True ($form6.title.Length -eq 250 -and $form6.message.Length -eq 1024) 'the clamped title and message, not the originals, must be what is posted'
+  $pagesLines6 = @(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ })
+  $lastAudit = $pagesLines6[-1] | ConvertFrom-Json
+  Assert-True ($lastAudit.title.Length -eq 250 -and $lastAudit.body.Length -eq 1024) 'the audit line must record the clamped values'
+
   Write-Output 'page tests passed'
 } finally {
   if ($mockJob) { Stop-Job $mockJob -ErrorAction SilentlyContinue; Remove-Job $mockJob -Force -ErrorAction SilentlyContinue }

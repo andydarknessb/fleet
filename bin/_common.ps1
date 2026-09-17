@@ -44,6 +44,13 @@ function Send-FleetPage {
     $Detail = $null,
     [switch]$NoToast
   )
+  # 2026-09-17 review (fleet #76): Pushover rejects title > 250 or message > 1024
+  # chars with a 400, and the page is lost. Ticket 77 routes real condition detail
+  # through this door, so clamp both here - the one door - rather than at every
+  # caller; an ellipsis marks a clamp, never a throw. Clamped values are what the
+  # toast, the POST and the pages.jsonl audit line all see.
+  $Title = "$Title"; if ($Title.Length -gt 250) { $Title = $Title.Substring(0, 247) + '...' }
+  $Body = "$Body"; if ($Body.Length -gt 1024) { $Body = $Body.Substring(0, 1021) + '...' }
   $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; priority = $Priority; toast = $null; pushover = $null; pushoverError = $null }
   # -NoToast (tests) skips the toast only: Pushover and the audit line always run.
   if ($NoToast) { $result.toast = 'skipped' } else { try { $result.toast = Send-FleetToast $Title $Body } catch { $result.toast = $false } }
