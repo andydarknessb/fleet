@@ -59,8 +59,71 @@ test('a pointer message names the record, revision, sequence, and artifact locat
   assert.ok(message.pointer.artifacts.includes('https://github.com/owner/repo/pull/77'));
   assert.match(message.title, /endzone #42/);
   assert.match(message.body, /endzone:issue-42 r\d+ seq\d+/);
-  assert.doesNotMatch(message.body, /closing linkage/, 'the evidence prose is pointed at, not copied');
+  // Ticket 79 (fleet#79): the pointer line (locations only) still never repeats the
+  // evidence prose, but the dedicated question line now deliberately surfaces one
+  // truncated clause of it - that is the whole point of "says what it is asking".
+  const [, evidenceLine, questionLine] = message.body.split('\n');
+  assert.doesNotMatch(evidenceLine, /closing linkage/, 'the evidence pointer line names locations, not prose');
+  assert.match(questionLine, /closing linkage/, 'the question line surfaces a truncated clause of the evidence');
   assert.deepEqual(validatePointerMessage(message), { valid: true, reasons: [] });
+});
+
+test('a pointer message carries a question pointed at the decision evidence and a url to the PR, else the issue', () => {
+  const root = rootDir();
+  const { id, sequence } = seed(root);
+  const record = workState.getRecord({ root, id });
+  const decision = workState.readEvents(root).find((event) => event.recordId === id && event.sequence === sequence);
+  const message = buildPointerMessage({ root, record, event: decision, tenantConfig: { github: 'owner/repo' } });
+  // seed()'s escalation evidence is 'wake:decision-needed; [pr-watch] checks settled
+  // but PR #77 carries no closing linkage for issue #42' - stripping the wake prefix
+  // leaves one semicolon-free clause, so the whole remainder is the question.
+  assert.equal(message.question, '[pr-watch] checks settled but PR #77 carries no closing linkage for issue #42');
+  assert.equal(message.url, 'https://github.com/owner/repo/pull/77');
+  assert.equal(message.priority, 'normal');
+  assert.match(message.body, /question: \[pr-watch\] checks settled/);
+  assert.match(message.body, /url: https:\/\/github\.com\/owner\/repo\/pull\/77/);
+  assert.deepEqual(validatePointerMessage(message), { valid: true, reasons: [] });
+
+  const noPr = workState.createRecord({
+    root, id: 'endzone:issue-9', tenant: 'endzone', issue: 9, state: 'implementing',
+    actor: 'test', idempotencyKey: 'c-9', now: at(),
+  });
+  const escalatedNoPr = workState.transitionRecord({
+    root, id: 'endzone:issue-9', to: 'escalated', expectedRevision: noPr.revision,
+    idempotencyKey: 't-9-escalated', actor: 'pr-watch', evidence: 'wake:decision-needed; no PR yet; needs a human call', now: at(),
+  });
+  const noPrRecord = workState.getRecord({ root, id: 'endzone:issue-9' });
+  const noPrEvent = workState.readEvents(root).find((event) => event.recordId === 'endzone:issue-9' && event.sequence === escalatedNoPr.eventSequence);
+  const noPrMessage = buildPointerMessage({ root, record: noPrRecord, event: noPrEvent, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(noPrMessage.url, 'https://github.com/owner/repo/issues/9', 'no PR: url falls back to the issue');
+  assert.equal(noPrMessage.question, 'no PR yet');
+});
+
+test('priority is high only when the decision evidence says a merge landed without a recorded formal review', () => {
+  const root = rootDir();
+  const { id, sequence } = seed(root);
+  const record = workState.getRecord({ root, id });
+  const decision = workState.readEvents(root).find((event) => event.recordId === id && event.sequence === sequence);
+  const normal = buildPointerMessage({ root, record, event: decision, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(normal.priority, 'normal');
+
+  // The exact wording pr-watch.js `mergedChain` (and review-policy.js's equivalent)
+  // append to a merge's evidence (fleet ticket 05 lower bound).
+  const mergedNoReview = { ...decision, evidence: 'observed merged at 2026-09-14T12:35:00.000Z (gh pr view 77); merged without a recorded formal review (ticket 05 lower bound)' };
+  const high = buildPointerMessage({ root, record, event: mergedNoReview, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(high.priority, 'high');
+});
+
+test('the default sender is pageSender (never called in shadow) and the default channel label is page', () => {
+  const { pageSender } = require('../bin/notify');
+  assert.equal(typeof pageSender, 'function');
+  assert.equal(typeof pageSender({ root: rootDir() }), 'function');
+  const root = rootDir();
+  const { id, sequence } = seed(root);
+  const send = sender();
+  runNotifier({ root, live: true, send, now: at() });
+  const record = workState.getRecord({ root, id });
+  assert.equal(record.notifications[String(sequence)].channel, 'page');
 });
 
 test('message fixtures: copied acceptance criteria are rejected, typed pointers accepted', () => {

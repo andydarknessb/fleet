@@ -19,6 +19,25 @@ const workState = require('./work-state');
 const { DECISION_STATES } = workState;
 const MAX_BODY_CHARS = 600;
 const MAX_BODY_LINES = 6;
+// The question line is one truncated clause, not a paragraph: 200 chars leaves
+// the fixed-cost lines (record pointer, evidence pointer, url) comfortable room
+// under MAX_BODY_CHARS with the body still four lines, well under MAX_BODY_LINES.
+const MAX_QUESTION_CHARS = 200;
+
+// ADR 0012 / fleet#76: `config/cycle.json` `pages.priority` is the one map every
+// page kind reads, Watchdog conditions and Notifier decisions alike (fleet#76
+// seeded it with this binary's own two decision kinds, `state-escalated` and
+// `state-hold`, both normal, plus the Watchdog's `merge-review-wake`, high).
+// These are the same three keys, read only, never written here (config/cycle.json
+// is outside ticket 79's scope): if the file is missing or a key is absent the
+// built-in defaults below stand in, so an unconfigured host still prioritizes a
+// merge-without-review page correctly instead of silently falling back to normal.
+const DEFAULT_PAGE_PRIORITY = Object.freeze({
+  'merge-review-wake': 'high',
+  'state-escalated': 'normal',
+  'state-hold': 'normal',
+});
+const DEFAULT_PAGE_PRIORITY_FALLBACK = 'normal';
 
 class NotifyError extends Error {
   constructor(code, message, details = {}) {
@@ -52,7 +71,43 @@ function isLive({ root, live } = {}) {
   return fs.existsSync(path.join(baseOf(root), 'state', 'flags', 'notifier-live'));
 }
 
-// Pointer message: what a page is allowed to carry. Locations, never content.
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+}
+
+// The evidence a decision transition carries can itself open with a
+// `wake:<kind>; ` prefix (work-state.js's own outbox strips the same prefix for
+// the same reason). What is left is clause-delimited by semicolons, not periods:
+// a mergedAt timestamp's fractional seconds, a token count, and `(gh pr view N)`
+// all carry dots that a naive sentence split would cut mid-word. The first
+// semicolon-delimited clause is the question; everything after it (thresholds,
+// extension text, "grant one with ...") is instruction the page does not repeat.
+function firstSentence(evidence) {
+  const stripped = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '').trim();
+  if (!stripped) return '';
+  const cut = stripped.indexOf(';');
+  const sentence = (cut === -1 ? stripped : stripped.slice(0, cut)).trim();
+  return sentence.length > MAX_QUESTION_CHARS ? `${sentence.slice(0, MAX_QUESTION_CHARS - 3)}...` : sentence;
+}
+
+// The one merge-without-review sentence pr-watch.js `mergedChain` and
+// review-policy.js's equivalent append is the sole reason a decision page
+// outranks the ordinary "Cory owns this" normal: everything else this binary
+// ever sees (an escalated linkage gap, a budget escalation, a hold) is normal.
+function decisionKind(event) {
+  return /merged without a recorded formal review/.test(String(event?.evidence || '')) ? 'merge-review-wake' : event.type;
+}
+
+function pagePriorityFor(base, kind) {
+  const config = readJson(path.join(base, 'config', 'cycle.json'), {}) || {};
+  const table = { ...DEFAULT_PAGE_PRIORITY, ...(config.pages?.priority || {}) };
+  return table[kind] || config.pages?.defaultPriority || DEFAULT_PAGE_PRIORITY_FALLBACK;
+}
+
+// Pointer message: what a page is allowed to carry. Locations, never content -
+// `question` is the record's own escalation or hold evidence pointed at in one
+// truncated clause, not the evidence copied in full, and `url` is the one link
+// worth tapping (the PR when there is one, else the issue).
 function buildPointerMessage({ root, record, event, tenantConfig = {} } = {}) {
   const base = baseOf(root);
   const state = event.type.slice('state-'.length);
@@ -63,15 +118,23 @@ function buildPointerMessage({ root, record, event, tenantConfig = {} } = {}) {
     `${path.join('state', 'events', `${String(event.at).slice(0, 10)}.jsonl`)}#seq-${event.sequence}`,
     path.join('state', 'status', 'DIGEST.md'),
   ];
-  if (repo && prNumber) artifacts.push(`https://github.com/${repo}/pull/${prNumber}`);
-  if (repo && record.issue) artifacts.push(`https://github.com/${repo}/issues/${record.issue}`);
+  const prUrl = repo && prNumber ? `https://github.com/${repo}/pull/${prNumber}` : null;
+  const issueUrl = repo && record.issue ? `https://github.com/${repo}/issues/${record.issue}` : null;
+  if (prUrl) artifacts.push(prUrl);
+  if (issueUrl) artifacts.push(issueUrl);
+  const url = prUrl || issueUrl || null;
+  const question = firstSentence(event.evidence);
+  const kind = decisionKind(event);
+  const priority = pagePriorityFor(base, kind);
   const pointer = { recordId: record.id, revision: record.revision, eventSequence: event.sequence, decisionType: event.type, artifacts };
   const title = `Fleet decision: ${record.tenant} #${record.issue}`;
   const body = [
     `${state} - ${record.id} r${record.revision} seq${event.sequence}${prNumber ? ` - PR #${prNumber}` : ''}`,
     `evidence: ${artifacts[1]} - digest: ${artifacts[2]} - run bin\\status.ps1`,
+    `question: ${question || '(none recorded)'}`,
+    `url: ${url || 'none'}`,
   ].join('\n');
-  return { title, body, pointer, base };
+  return { title, body, pointer, base, question, url, priority, kind };
 }
 
 // The fixture: a page is a typed pointer, not a copy of the issue, criteria,
@@ -151,6 +214,38 @@ function toastSender({ root, powershell = 'powershell.exe' } = {}) {
   };
 }
 
+// Ticket 79 (ADR 0012): the Notifier's default sender, through the one page door
+// (bin/send-page.ps1 -> Send-FleetPage) instead of the toast-only bin/send-toast.ps1.
+// Pushover and the pages.jsonl audit line always run there; the toast stays as the
+// on-host echo. Delivery is "ok" only on an actual Pushover post: an unconfigured
+// pushover.json (Cory has not wired his phone up yet) is a recorded, visible,
+// retryable failure here, same as a network error - never a silent success.
+function pageSender({ root, powershell = 'powershell.exe' } = {}) {
+  const script = path.join(baseOf(root), 'bin', 'send-page.ps1');
+  return (message) => {
+    try {
+      const args = [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+        '-Kind', message.kind || 'state-decision',
+        '-Title', message.title,
+        '-Body', message.body,
+        '-Priority', message.priority || 'normal',
+      ];
+      if (message.url) args.push('-Url', message.url);
+      const raw = execFileSync(powershell, args, {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000,
+      });
+      const last = String(raw).trim().split(/\r?\n/).pop() || '{}';
+      const result = JSON.parse(last);
+      if (result.pushover === true) return { ok: true, detail: 'pushover delivered' };
+      if (result.pushover === 'unconfigured') return { ok: false, detail: 'page channel unconfigured: state/pages/pushover.json is missing' };
+      return { ok: false, detail: `page channel failed: ${result.pushoverError || 'pushover not delivered'}` };
+    } catch (error) {
+      return { ok: false, detail: `page channel failed: ${String(error.stderr || error.message || error).slice(0, 200)}` };
+    }
+  };
+}
+
 function refreshDigest(root, tenants) {
   // Projections, not state: a failure here loses nothing the ledger does not hold.
   try {
@@ -164,8 +259,8 @@ function runNotifier(options = {}) {
   const base = baseOf(options.root);
   const live = isLive({ root: base, live: options.live });
   const actor = options.actor || 'notifier';
-  const channel = options.channel || 'toast';
-  const send = options.send || toastSender({ root: base });
+  const channel = options.channel || 'page';
+  const send = options.send || pageSender({ root: base });
   const compose = options.compose || buildPointerMessage;
   const configs = options.tenantConfigs || workState.readTenantConfigs(base);
   const now = options.now;
@@ -309,6 +404,7 @@ module.exports = {
   cli,
   findPendingDecisions,
   isLive,
+  pageSender,
   runNotifier,
   spawnNotifier,
   toastSender,
