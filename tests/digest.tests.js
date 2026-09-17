@@ -91,11 +91,14 @@ test('one decision event is one digest item, with its delivery state, before and
   assert.match(needs, /PR #102/);
   const authorityBefore = section(digest.content, "Cory's authority");
 
-  runNotifier({ root, live: true, send: () => ({ ok: true, detail: 'toast shown' }), now: '2026-09-01T07:30:00.000Z' });
+  // fleet#79 QA round 1, item 7 (scope exception: notify.js's default channel
+  // label moved from `toast` to `page` in ticket 79, so this fixture and
+  // assertion - outside #79's own file list - need the matching update).
+  runNotifier({ root, live: true, send: () => ({ ok: true, detail: 'pushover delivered' }), now: '2026-09-01T07:30:00.000Z' });
   digest = projectDigest({ root, now: '2026-09-01T08:00:00.000Z' });
   needs = section(digest.content, 'Needs Cory');
   assert.equal((needs.match(/endzone #1 /g) || []).length, 1, 'delivery adds state to the item, never a second item');
-  assert.match(needs, /notification: sent 2026-09-01T07:30:00\.000Z via toast \(attempt 1\)/);
+  assert.match(needs, /notification: sent 2026-09-01T07:30:00\.000Z via page \(attempt 1\)/);
   assert.equal(section(digest.content, "Cory's authority"), authorityBefore);
   assert.match(authorityBefore, /applies `ready-for-agent`/);
   assert.match(authorityBefore, /server\/db\/migrations\/\*\*/);

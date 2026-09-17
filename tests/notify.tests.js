@@ -6,7 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { execFileSync, spawnSync } = require('node:child_process');
-const { buildPointerMessage, validatePointerMessage, findPendingDecisions, runNotifier, isLive, spawnNotifier, cli, NOTIFY_FLAGS, NotifyError } = require('../bin/notify');
+const { buildPointerMessage, validatePointerMessage, findPendingDecisions, findPendingMergedWithoutReview, runNotifier, isLive, spawnNotifier, cli, NOTIFY_FLAGS, NotifyError, MERGE_REVIEW_WINDOW_HOURS } = require('../bin/notify');
 const workState = require('../bin/work-state');
 
 function rootDir() {
@@ -19,17 +19,55 @@ function rootDir() {
 let tick = 0;
 function at() { tick += 1; return new Date(Date.UTC(2026, 8, 1, 6, 0, tick)).toISOString(); }
 
-function seed(root, { issue = 42, prNumber = 77, to = 'escalated' } = {}) {
+// The real closing-linkage-missing template pr-watch.js ~302 emits (fleet#79
+// QA round 1, major 4): `${closingLinkageTag(viewPr)}: checks settled but PR
+// #${prNumber} carries no closing linkage for issue #${record.issue}; issue
+// closure must belong to the merge`, where closingLinkageTag is
+// `[pr-watch] closing-linkage body=<sha1-of-PR-body, 12 hex>`. `abc123def456`
+// stands in for that hash - byte-accurate everywhere else, so the per-kind
+// question rule in notify.js actually gets exercised the way it would for
+// real evidence, not a hand-simplified paraphrase.
+function closingLinkageEvidence({ issue = 42, prNumber = 77 } = {}) {
+  return `wake:decision-needed; [pr-watch] closing-linkage body=abc123def456: checks settled but PR #${prNumber} carries no closing linkage for issue #${issue}; issue closure must belong to the merge`;
+}
+
+function seed(root, { issue = 42, prNumber = 77, to = 'escalated', evidence } = {}) {
   const id = `endzone:issue-${issue}`;
   workState.createRecord({ root, id, tenant: 'endzone', issue, state: 'implementing', github: { issueNumber: issue, prNumber }, actor: 'test', idempotencyKey: `c-${issue}`, now: at() });
   let revision = 1;
   const hops = to === 'hold' ? ['pr-open', 'ci-wait', 'review', 'hold'] : ['pr-open', 'ci-wait', 'escalated'];
   let last = null;
   for (const state of hops) {
-    last = workState.transitionRecord({ root, id, to: state, expectedRevision: revision, idempotencyKey: `t-${issue}-${state}`, actor: 'pr-watch', evidence: state === 'escalated' ? 'wake:decision-needed; [pr-watch] checks settled but PR #77 carries no closing linkage for issue #42' : `to ${state}`, now: at() });
+    const isLast = state === hops[hops.length - 1];
+    const finalEvidence = evidence || closingLinkageEvidence({ issue, prNumber });
+    last = workState.transitionRecord({ root, id, to: state, expectedRevision: revision, idempotencyKey: `t-${issue}-${state}`, actor: 'pr-watch', evidence: isLast ? finalEvidence : `to ${state}`, now: at() });
     revision = last.revision;
   }
   return { id, revision, sequence: last.eventSequence };
+}
+
+// Walks a fresh record all the way to `merged` (pr-open -> ci-wait -> review ->
+// merged), the way pr-watch.js's `mergedChain` really does, with a formal-
+// review-missing evidence tail by default (fleet#79 QA round 1, blocker).
+// `testOnly: true` + an explicit githubState/githubMergedAt is the same shape
+// tests/work-state.tests.js uses to reach `merged` without a real `gh` call.
+function seedMerged(root, { issue, prNumber, evidence, mergedAt, tenant = 'endzone' } = {}) {
+  const id = `${tenant}:issue-${issue}`;
+  workState.createRecord({ root, id, tenant, issue, state: 'implementing', github: { issueNumber: issue, prNumber }, actor: 'test', idempotencyKey: `c-${issue}`, now: at() });
+  let revision = 1;
+  for (const state of ['pr-open', 'ci-wait', 'review']) {
+    const r = workState.transitionRecord({ root, id, to: state, expectedRevision: revision, idempotencyKey: `t-${issue}-${state}`, actor: 'pr-watch', evidence: `to ${state}`, now: at() });
+    revision = r.revision;
+  }
+  const mergedTimestamp = mergedAt || at();
+  const finalEvidence = evidence === undefined
+    ? `observed merged at ${mergedTimestamp} (gh pr view ${prNumber}); merged without a recorded formal review (ticket 05 lower bound)`
+    : evidence;
+  const merged = workState.transitionRecord({
+    root, id, to: 'merged', expectedRevision: revision, idempotencyKey: `t-${issue}-merged`, actor: 'pr-watch',
+    evidence: finalEvidence, now: mergedTimestamp, prNumber, githubState: 'MERGED', githubMergedAt: mergedTimestamp, testOnly: true,
+  });
+  return { id, revision: merged.revision, sequence: merged.eventSequence, at: mergedTimestamp };
 }
 
 function sender(outcome = { ok: true, detail: 'toast shown' }) {
@@ -60,11 +98,13 @@ test('a pointer message names the record, revision, sequence, and artifact locat
   assert.match(message.title, /endzone #42/);
   assert.match(message.body, /endzone:issue-42 r\d+ seq\d+/);
   // Ticket 79 (fleet#79): the pointer line (locations only) still never repeats the
-  // evidence prose, but the dedicated question line now deliberately surfaces one
-  // truncated clause of it - that is the whole point of "says what it is asking".
+  // evidence prose, but the dedicated question line now deliberately surfaces the
+  // ASK clause of it (QA round 1: pr-watch.js's closing-linkage-missing evidence
+  // puts the ask, "issue closure must belong to the merge", in its LAST clause,
+  // not its first) - that is the whole point of "says what it is asking".
   const [, evidenceLine, questionLine] = message.body.split('\n');
   assert.doesNotMatch(evidenceLine, /closing linkage/, 'the evidence pointer line names locations, not prose');
-  assert.match(questionLine, /closing linkage/, 'the question line surfaces a truncated clause of the evidence');
+  assert.match(questionLine, /issue closure must belong to the merge/, 'the question line surfaces the ask clause of the evidence');
   assert.deepEqual(validatePointerMessage(message), { valid: true, reasons: [] });
 });
 
@@ -74,13 +114,13 @@ test('a pointer message carries a question pointed at the decision evidence and 
   const record = workState.getRecord({ root, id });
   const decision = workState.readEvents(root).find((event) => event.recordId === id && event.sequence === sequence);
   const message = buildPointerMessage({ root, record, event: decision, tenantConfig: { github: 'owner/repo' } });
-  // seed()'s escalation evidence is 'wake:decision-needed; [pr-watch] checks settled
-  // but PR #77 carries no closing linkage for issue #42' - stripping the wake prefix
-  // leaves one semicolon-free clause, so the whole remainder is the question.
-  assert.equal(message.question, '[pr-watch] checks settled but PR #77 carries no closing linkage for issue #42');
+  // seed()'s escalation evidence is the real pr-watch.js closing-linkage-missing
+  // template (QA round 1): the per-kind rule picks its LAST clause, the ask
+  // ("issue closure must belong to the merge"), not the context clause before it.
+  assert.equal(message.question, 'issue closure must belong to the merge');
   assert.equal(message.url, 'https://github.com/owner/repo/pull/77');
   assert.equal(message.priority, 'normal');
-  assert.match(message.body, /question: \[pr-watch\] checks settled/);
+  assert.match(message.body, /question: issue closure must belong to the merge/);
   assert.match(message.body, /url: https:\/\/github\.com\/owner\/repo\/pull\/77/);
   assert.deepEqual(validatePointerMessage(message), { valid: true, reasons: [] });
 
@@ -112,6 +152,161 @@ test('priority is high only when the decision evidence says a merge landed witho
   const mergedNoReview = { ...decision, evidence: 'observed merged at 2026-09-14T12:35:00.000Z (gh pr view 77); merged without a recorded formal review (ticket 05 lower bound)' };
   const high = buildPointerMessage({ root, record, event: mergedNoReview, tenantConfig: { github: 'owner/repo' } });
   assert.equal(high.priority, 'high');
+  // QA round 1: the question states the urgent fact directly, not pr-watch.js's
+  // own "observed merged at <ts> (gh pr view N)" prose (which says how the
+  // watcher knows, not what Cory needs to act on).
+  assert.equal(high.question, 'PR #77 merged without a recorded formal review');
+  assert.equal(high.url, 'https://github.com/owner/repo/pull/77');
+});
+
+// fleet#79 QA round 1 (minor 6): send-page.ps1's `-Priority` is a PowerShell
+// ValidateSet of exactly emergency|high|normal; an out-of-set value there
+// throws and the page never posts. A typo'd config edit must never reach it.
+test('an out-of-set priority from config falls back to the built-in default for that kind, never an invalid value', () => {
+  const root = rootDir();
+  const { id, sequence } = seed(root);
+  const record = workState.getRecord({ root, id });
+  const decision = workState.readEvents(root).find((event) => event.recordId === id && event.sequence === sequence);
+
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ pages: { priority: { 'state-escalated': 'urgent' }, defaultPriority: 'also-bogus' } }));
+  const badMapValue = buildPointerMessage({ root, record, event: decision, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(badMapValue.priority, 'normal', 'falls back to state-escalated\'s own built-in default, not the also-invalid config default');
+
+  const mergedNoReview = { ...decision, evidence: 'observed merged at 2026-09-14T12:35:00.000Z (gh pr view 77); merged without a recorded formal review (ticket 05 lower bound)' };
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ pages: { priority: { 'merge-review-wake': 'URGENT' } } }));
+  const badMergeValue = buildPointerMessage({ root, record, event: mergedNoReview, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(badMergeValue.priority, 'high', 'falls back to merge-review-wake\'s own built-in default');
+
+  // A valid override is still honoured.
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ pages: { priority: { 'state-escalated': 'high' } } }));
+  const overridden = buildPointerMessage({ root, record, event: decision, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(overridden.priority, 'high');
+});
+
+// fleet#79 QA round 1: pr-watch.js and budget.js are outside ticket 79's scope,
+// so notify.js keeps its own copies of the priority sentence and the literal
+// evidence fragments its QUESTION_RULES table keys on. This is the guard: if
+// any of these wordings ever moves at the source, this test goes red instead
+// of the routing/question silently degrading (a priority silently dropping to
+// normal, or a question silently degrading to the less useful first clause).
+test('the merge-review sentence and every QUESTION_RULES fragment still match pr-watch.js and budget.js verbatim', () => {
+  const prWatchSource = fs.readFileSync(path.join(__dirname, '..', 'bin', 'pr-watch.js'), 'utf8');
+  const budgetSource = fs.readFileSync(path.join(__dirname, '..', 'bin', 'budget.js'), 'utf8');
+  assert.ok(prWatchSource.includes("const WATCHER_MARK = '[pr-watch]';"), 'pr-watch.js WATCHER_MARK wording moved; update notify.js\'s copy');
+  assert.ok(prWatchSource.includes('merged without a recorded formal review'), 'pr-watch.js\'s priority sentence moved; update notify.js MERGE_REVIEW_SENTENCE');
+  assert.ok(prWatchSource.includes('without a merge; the record needs a human decision'), 'pr-watch.js ~276 evidence wording moved; update notify.js QUESTION_RULES');
+  assert.ok(prWatchSource.includes('carries no closing linkage for issue #'), 'pr-watch.js ~302 evidence wording moved; update notify.js QUESTION_RULES');
+  assert.ok(prWatchSource.includes('issue closure must belong to the merge'), 'pr-watch.js ~302 ask clause wording moved; update notify.js QUESTION_RULES expectations');
+  assert.ok(prWatchSource.includes('closing linkage for issue #'), 'pr-watch.js ~336 evidence wording moved; update notify.js QUESTION_RULES');
+  assert.ok(prWatchSource.includes('disappeared from PR #'), 'pr-watch.js ~336 evidence wording moved; update notify.js QUESTION_RULES');
+  assert.ok(budgetSource.includes('job tokens >='), 'budget.js ~139 evidence wording moved; update notify.js QUESTION_RULES');
+  assert.ok(budgetSource.includes('grant one with work-state.js budget --phase extend, then resolve the escalation'), 'budget.js ~139 ask clause wording moved; update notify.js QUESTION_RULES expectations');
+});
+
+// fleet#79 QA round 1 (major 4): the first semicolon clause is often context,
+// not the ask. Every entry here is the launcher's REAL evidence shape (byte-
+// accurate, sample values substituted), collected from budget.js and
+// pr-watch.js; a caller with no fixed template (review-policy.js hold's free-
+// text --reason, work-state.js's CLI --evidence) falls back to the first
+// clause, same as before this table existed.
+const REAL_EVIDENCE_TEMPLATES = [
+  {
+    name: 'budget escalate (budget.js ~139): the ask is the last clause',
+    evidence: 'wake:decision-needed; budget: 350123 job tokens >= 350000; no extension; session ic-901; grant one with work-state.js budget --phase extend, then resolve the escalation',
+    question: 'grant one with work-state.js budget --phase extend, then resolve the escalation',
+  },
+  {
+    name: 'PR closed without a merge (pr-watch.js ~276): the ask is the last clause',
+    evidence: 'wake:decision-needed; [pr-watch] PR #77 is CLOSED without a merge; the record needs a human decision',
+    question: 'the record needs a human decision',
+  },
+  {
+    name: 'closing linkage missing after checks settled (pr-watch.js ~302): the ask is the last clause',
+    evidence: closingLinkageEvidence({ issue: 42, prNumber: 77 }),
+    question: 'issue closure must belong to the merge',
+  },
+  {
+    name: 'closing linkage disappeared (pr-watch.js ~336): one clause, no separate ask',
+    evidence: 'wake:decision-needed; [pr-watch] closing-linkage body=abc123def456: closing linkage for issue #42 disappeared from PR #77 while review',
+    question: '[pr-watch] closing-linkage body=abc123def456: closing linkage for issue #42 disappeared from PR #77 while review',
+  },
+  {
+    name: "a hold's free-text reason (review-policy.js) falls back to the first (only) clause",
+    evidence: "wake:decision-needed; PR #77 clean, parked for Cory's merge decision",
+    question: "PR #77 clean, parked for Cory's merge decision",
+  },
+  {
+    name: 'an empty first clause is skipped for the next non-empty one',
+    evidence: 'wake:decision-needed; ; the real ask',
+    question: 'the real ask',
+  },
+];
+
+test('question extraction: the per-kind table for real launcher evidence, first clause for anything else', () => {
+  const root = rootDir();
+  const { id, sequence } = seed(root);
+  const record = workState.getRecord({ root, id });
+  const decision = workState.readEvents(root).find((event) => event.recordId === id && event.sequence === sequence);
+  for (const { name, evidence, question } of REAL_EVIDENCE_TEMPLATES) {
+    const message = buildPointerMessage({ root, record, event: { ...decision, evidence }, tenantConfig: { github: 'owner/repo' } });
+    assert.equal(message.question, question, name);
+  }
+});
+
+// fleet#79 QA round 1 (major 2 + 3): the pointer always sends. A question that
+// would blow the body past MAX_BODY_LINES, or that trips a guard once
+// prefixed with "question: " (the prefix defeats the anchored checklist/
+// heading regexes - QA's exact probes), must be withheld and replaced, never
+// let the whole page fail validation.
+test('a question that would break validation is sanitised, withheld if needed, and the page still sends', () => {
+  const root = rootDir();
+  const { id, sequence } = seed(root);
+  const record = workState.getRecord({ root, id });
+  const decision = workState.readEvents(root).find((event) => event.recordId === id && event.sequence === sequence);
+
+  // Probe 1: embedded newlines used to push the body past 6 lines outright.
+  const newlineEvent = { ...decision, evidence: 'wake:decision-needed; line one\nline two\nline three\nline four' };
+  const newlineMessage = buildPointerMessage({ root, record, event: newlineEvent, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(newlineMessage.body.split('\n').length, 4, 'newlines inside the question collapse to one line, not new ones');
+  assert.equal(newlineMessage.question, 'line one line two line three line four');
+  assert.deepEqual(validatePointerMessage(newlineMessage), { valid: true, reasons: [] });
+
+  // Probe 2: a checklist marker, hidden behind "question: ", used to defeat the
+  // anchored guard and pass validation with copied criteria intact.
+  const checklistEvent = { ...decision, evidence: 'wake:decision-needed; - [ ] copied criterion' };
+  const checklistMessage = buildPointerMessage({ root, record, event: checklistEvent, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(checklistMessage.questionWithheld, true);
+  assert.match(checklistMessage.questionWithheldReason, /checklist/);
+  assert.equal(checklistMessage.question, 'see the record');
+  assert.deepEqual(validatePointerMessage(checklistMessage), { valid: true, reasons: [] });
+
+  // Probe 3: a heading marker, same defeat, this time QA's own "## Findings" example.
+  const headingEvent = { ...decision, evidence: 'wake:decision-needed; ## Findings from the review' };
+  const headingMessage = buildPointerMessage({ root, record, event: headingEvent, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(headingMessage.questionWithheld, true);
+  assert.match(headingMessage.questionWithheldReason, /heading/);
+  assert.equal(headingMessage.question, 'see the record');
+  assert.deepEqual(validatePointerMessage(headingMessage), { valid: true, reasons: [] });
+
+  // Probe 4: the "acceptance criteria" phrase itself.
+  const criteriaEvent = { ...decision, evidence: 'wake:decision-needed; copies Acceptance Criteria verbatim' };
+  const criteriaMessage = buildPointerMessage({ root, record, event: criteriaEvent, tenantConfig: { github: 'owner/repo' } });
+  assert.equal(criteriaMessage.questionWithheld, true);
+  assert.equal(criteriaMessage.question, 'see the record');
+
+  // Integration: runNotifier with an injected sender must still record `sent`,
+  // never `failed`, for each adversarial evidence, and surface the withhold.
+  for (const [label, evidence] of [['newline', newlineEvent.evidence], ['checklist', checklistEvent.evidence], ['heading', headingEvent.evidence]]) {
+    const r = rootDir();
+    const seeded = seed(r, { issue: 50, evidence });
+    const send = sender();
+    const run = runNotifier({ root: r, live: true, send, now: at() });
+    assert.deepEqual(run.handled.map((h) => h.outcome), ['sent'], `${label}: the pointer always sends`);
+    assert.equal(send.calls.length, 1, label);
+    if (label !== 'newline') assert.equal(run.handled[0].questionWithheld, true, label);
+    void seeded;
+  }
 });
 
 test('the default sender is pageSender (never called in shadow) and the default channel label is page', () => {
@@ -227,6 +422,105 @@ test('a decision resolved before the notifier ran is skipped; a hold pages like 
   assert.match(send.calls[1].body, /^hold/);
   const stale = runNotifier({ root, live: true, send, recordId: other.id, sequence: 2, now: at() });
   assert.deepEqual(stale.handled, []);
+});
+
+// fleet#79 QA round 1 (BLOCKER): `merged` is not a DECISION_STATE, so
+// findPendingDecisions alone never sees pr-watch.js's merge-without-review
+// wake - confirmed against the pre-fix bin/notify.js (fleet e9623b8) with a
+// record driven to `merged` through real work-state transitions exactly like
+// this: `runNotifier` returned `{ handled: [] }`, silently. This is that
+// pending source's own suite; every fixture here reaches `merged` through
+// seedMerged's real transitions, never a hand-made event.
+test('findPendingMergedWithoutReview finds a real merged-without-review event that findPendingDecisions cannot', () => {
+  const root = rootDir();
+  const merged = seedMerged(root, { issue: 60, prNumber: 160 });
+  assert.deepEqual(findPendingDecisions({ root }), [], 'the decision-state scan still finds nothing for a merged record');
+  const pending = findPendingMergedWithoutReview({ root, now: at() });
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].record.id, merged.id);
+  assert.equal(pending[0].event.type, 'state-merged');
+  assert.equal(pending[0].event.sequence, merged.sequence);
+});
+
+test('live: the merge-review wake pages once, at high priority, with the urgent question and the PR url', () => {
+  const root = rootDir();
+  const merged = seedMerged(root, { issue: 61, prNumber: 161 });
+  const send = sender();
+  const result = runNotifier({ root, live: true, send, now: at() });
+  assert.deepEqual(result.handled.map((h) => [h.recordId, h.sequence, h.outcome, h.via]), [[merged.id, merged.sequence, 'sent', 'fallback']]);
+  assert.equal(send.calls.length, 1);
+  const message = send.calls[0];
+  assert.equal(message.priority, 'high');
+  assert.equal(message.question, 'PR #161 merged without a recorded formal review');
+  assert.equal(message.url, 'https://github.com/owner/repo/pull/161');
+  // Recorded through the fallback file: workState.notifyRecord refuses a
+  // `state-merged` event outright (NOT_A_DECISION_EVENT), record state and
+  // activity notwithstanding, so this source's delivery record is never on
+  // the Work record itself.
+  const record = workState.getRecord({ root, id: merged.id });
+  assert.equal(record.notifications, undefined);
+  const fallbackLines = fs.readFileSync(path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(fallbackLines.length, 1);
+  assert.equal(fallbackLines[0].status, 'sent');
+  // Never repeats: a second run finds nothing pending.
+  const again = runNotifier({ root, live: true, send, now: at() });
+  assert.deepEqual(again.handled, []);
+  assert.equal(send.calls.length, 1);
+});
+
+test('shadow: the merge-review wake logs once and touches no record, same as a decision', () => {
+  const root = rootDir();
+  const merged = seedMerged(root, { issue: 62, prNumber: 162 });
+  const send = sender();
+  const result = runNotifier({ root, send, now: at() });
+  assert.deepEqual(result.handled.map((h) => h.outcome), ['shadow']);
+  const shadow = fs.readFileSync(path.join(root, 'state', 'notify', 'shadow.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(shadow.length, 1);
+  assert.equal(shadow[0].recordId, merged.id);
+  assert.equal(shadow[0].decisionType, 'state-merged');
+  assert.equal(workState.getRecord({ root, id: merged.id }).notifications, undefined, 'shadow touches no Work record');
+  assert.equal(send.calls.length, 0);
+});
+
+test('an event older than the 48h window is never paged; going live does not page merge history', () => {
+  const root = rootDir();
+  const old = seedMerged(root, { issue: 63, prNumber: 163, mergedAt: '2026-08-01T00:00:00.000Z' });
+  const now = '2026-09-01T00:00:00.000Z';
+  assert.ok((new Date(now) - new Date(old.at)) / 3600000 > MERGE_REVIEW_WINDOW_HOURS, 'the fixture really is older than the window');
+  assert.deepEqual(findPendingMergedWithoutReview({ root, now }), []);
+  const send = sender();
+  const result = runNotifier({ root, live: true, send, now });
+  assert.deepEqual(result.handled, []);
+  assert.equal(send.calls.length, 0);
+});
+
+test('a merge-review record that has already retired falls back to its own file, and that fallback dedupes too', () => {
+  const root = rootDir();
+  const merged = seedMerged(root, { issue: 64, prNumber: 164 });
+  // The IC's roster row is gone by the time a delayed sweep runs: merged ->
+  // retiring -> retired, fully archived, well before the notifier looks.
+  const retiring = workState.transitionRecord({ root, id: merged.id, to: 'retiring', expectedRevision: merged.revision, idempotencyKey: 'retire-64', actor: 'test', evidence: 'roster row gone', now: at() });
+  workState.transitionRecord({ root, id: merged.id, to: 'retired', expectedRevision: retiring.revision, idempotencyKey: 'retired-64', actor: 'test', evidence: 'retired', now: at() });
+  const record = workState.getRecord({ root, id: merged.id }); // archived, but still resolvable
+  assert.equal(record.state, 'retired');
+
+  const pending = findPendingMergedWithoutReview({ root, now: at() });
+  assert.equal(pending.length, 1, 'the source finds it whatever it has become since');
+
+  const send = sender();
+  const result = runNotifier({ root, live: true, send, now: at() });
+  assert.deepEqual(result.handled.map((h) => [h.recordId, h.outcome, h.via]), [[merged.id, 'sent', 'fallback']]);
+  assert.equal(send.calls.length, 1);
+  assert.equal(send.calls[0].priority, 'high');
+
+  const fallbackFile = path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl');
+  const fallbackLines = fs.readFileSync(fallbackFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(fallbackLines.length, 1);
+  assert.equal(fallbackLines[0].status, 'sent');
+  // Never repeats: the fallback file's own dedupe holds on a second sweep.
+  const again = runNotifier({ root, live: true, send, now: at() });
+  assert.deepEqual(again.handled, []);
+  assert.equal(send.calls.length, 1);
 });
 
 test('a message that fails the pointer fixture is never sent and is recorded as a failed delivery', () => {
