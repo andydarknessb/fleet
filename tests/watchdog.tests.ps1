@@ -815,6 +815,74 @@ try {
   foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
   $null = Run-Watchdog
 
+  # ===== 2026-09-17 QA fact for #77: every condition kind the Watchdog can build =====
+  # ===== resolves to a page priority on purpose (Get-PagePriority), never by =====
+  # ===== silent fallthrough. Kinds already exercised above are asserted here by =====
+  # ===== re-reading their captured results; ic-vanished, cap-exceeded, =====
+  # ===== pr-lookup-failed and branch-diverged are new since nothing earlier =====
+  # ===== in this suite builds them.
+  Assert-True ((@($r2.newlyPaged | Where-Object { $_.key -eq 'sentinel-stale' })[0]).priority -eq 'normal') 'sentinel-stale is deliberately normal (no ADR-ruled elevation)'
+  Assert-True ((@($r5.newlyPaged | Where-Object { $_.key -eq 'launch-retry:ic-901' })[0]).priority -eq 'high') 'launch-retry is ADR-ruled high'
+  Assert-True ((@($r7.newlyPaged | Where-Object { $_.key -eq 'check-failed' })[0]).priority -eq 'normal') 'check-failed is deliberately normal'
+  Assert-True ((@($r9.newlyPaged | Where-Object { $_.key -eq 'double-actor' })[0]).priority -eq 'normal') 'double-actor is deliberately normal'
+  Assert-True ((@($r10d.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-777:stray' })[0]).priority -eq 'normal') 'stray is deliberately normal'
+  Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
+  Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
+  Assert-True ($rp1.repeatPaged.priority -eq 'emergency') 'the fleet-dead repeat is ADR-ruled emergency'
+
+  # --- ic-vanished: an active IC on the live roster with no matching daemon row.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-971","role":"ic","tenant":"test","parent":"pl-test","issue":971,"status":"active"}]}'
+  $kpIv = Run-Watchdog
+  Assert-True (@($kpIv.conditions) -contains 'escalation:ic-971:ic-vanished') 'a vanished IC must raise ic-vanished'
+  $kpIvEntry = @($kpIv.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-971:ic-vanished' })[0]
+  Assert-True ($null -ne $kpIvEntry -and $kpIvEntry.priority -eq 'normal') 'ic-vanished is deliberately normal'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # --- cap-exceeded: lower the cap below the live fleet's current size.
+  Write-Utf8 "$testRoot\roster.json" '{"cap":1,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+  $kpCap = Run-Watchdog
+  Assert-True (@($kpCap.conditions) -contains 'escalation:fleet:cap-exceeded') 'exceeding the cap must raise cap-exceeded'
+  $kpCapEntry = @($kpCap.newlyPaged | Where-Object { $_.key -eq 'escalation:fleet:cap-exceeded' })[0]
+  Assert-True ($null -ne $kpCapEntry -and $kpCapEntry.priority -eq 'normal') 'cap-exceeded is deliberately normal'
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # --- pr-lookup-failed: a stale-heartbeat IC (not busy, no open-PR/skip cover) whose PR lookup fails.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-972","role":"ic","tenant":"test","parent":"pl-test","issue":972,"status":"active"}]}'
+  $icRow972 = '{"id":"job-ic-972","name":"ic-972","state":"working","status":"idle","pid":90,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-4)) + '}'
+  Set-AgentsRows ($noSentinelRows.TrimEnd(']') + ',' + $icRow972 + ']')
+  Set-Heartbeat 'ic-972' 150
+  $env:MOCK_GH_FAIL = '1'
+  $kpPr = Run-Watchdog
+  Remove-Item Env:MOCK_GH_FAIL
+  Assert-True (@($kpPr.conditions) -contains 'escalation:ic-972:pr-lookup-failed') 'a failed PR lookup on a stale IC must raise pr-lookup-failed'
+  $kpPrEntry = @($kpPr.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-972:pr-lookup-failed' })[0]
+  Assert-True ($null -ne $kpPrEntry -and $kpPrEntry.priority -eq 'normal') 'pr-lookup-failed is deliberately normal'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item "$testRoot\state\heartbeats\ic-972.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows $noSentinelRows
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # --- branch-diverged: the release/default branch sync reports content needing a human merge.
+  Write-Utf8 "$testRoot\bin\sync-integration.ps1" ('param([string]$Tenant,[switch]$Apply)' + "`r`n" + 'Write-Output (@{ escalate = $true; reason = "content on release not on default; a human merge is needed" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
+  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName releaseBranch -NotePropertyValue 'release' -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  $kpBd = Run-Watchdog
+  Assert-True (@($kpBd.conditions) -contains 'escalation:pl-test:branch-diverged') 'a diverged release branch must raise branch-diverged'
+  $kpBdEntry = @($kpBd.newlyPaged | Where-Object { $_.key -eq 'escalation:pl-test:branch-diverged' })[0]
+  Assert-True ($null -ne $kpBdEntry -and $kpBdEntry.priority -eq 'high') 'branch-diverged is ADR-ruled high'
+  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName releaseBranch -NotePropertyValue 'master' -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  Remove-Item "$testRoot\bin\sync-integration.ps1" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath

@@ -74,8 +74,22 @@ try {
   # --- (ticket 76) overrides or adds entries, pages.defaultPriority overrides the
   # --- normal fallback. Matched the way Test-CapExempt already matches
   # --- cap.exemptNamePrefixes: a map key is a match when it is a PREFIX of the
-  # --- kind string (permission-wait:<name>:<job> starts with permission-wait),
-  # --- longest prefix wins so a specific kind is never shadowed by a shorter one.
+  # --- kind string (permission-wait:<name>:<job> starts with permission-wait).
+  # --- For an `escalation:<name>:<kind>` condition the caller passes the
+  # --- escalation's own kind (branch-diverged, stray, ...), never the dedupe
+  # --- key with its `escalation:` prefix, or a ruled kind riding inside that
+  # --- prefix would silently miss its own map entry. Longest prefix wins so a
+  # --- specific kind is never shadowed by a shorter one.
+  # ---
+  # --- Every kind the Watchdog can build today, on purpose (tests/watchdog.tests.ps1
+  # --- walks this list): fleet-dead=emergency, permission-wait=high, launch-retry=high,
+  # --- branch-diverged=high (all ADR 0012-ruled); sentinel-stale, check-failed,
+  # --- state-unreadable, double-actor, and the check-escalation kinds stray,
+  # --- cap-exceeded, ic-vanished, pr-lookup-failed, blocked default to normal - none
+  # --- of these is a Cory decision the ADR names, so falling to pages.defaultPriority
+  # --- is the reasoned choice, not a silent gap. state-escalated, state-hold and
+  # --- merge-review-wake belong to the Notifier (#79) and never reach this function
+  # --- from here.
   $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)

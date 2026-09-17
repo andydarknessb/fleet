@@ -54,6 +54,7 @@
       "launch-retry": "high",
       "merge-review-wake": "high",
       "branch-diverged": "high",
+      "sync-refused": "high",
       "state-escalated": "normal",
       "state-hold": "normal",
       "passed-date": "normal"
