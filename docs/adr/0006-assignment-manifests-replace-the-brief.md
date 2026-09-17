@@ -202,6 +202,17 @@ legacy frontier and its parity observation are gone from `hooks/stop.ps1`
 (the hook now decides from `bin/assignment.js frontier` unconditionally), and
 `launch.ps1` refuses a `-Prompt` IC launch outright, with no flag and no
 `-Force` to bring it back. `bin/rollback-assignment.ps1` is deleted.
+
+QA review, same day: the door's own `-Recover` switch (`bin/recover.ps1`'s
+reboot-recovery relaunch of an IC) was an unconditional exemption, so any
+name at all restarted a `-Prompt` IC launch through it - the retirement
+above was not actually unconditional. Fixed: `-Recover` now lifts the
+no-manifest refusal only when the live roster already holds an active `ic`
+row of that exact name carrying a manifest path (the credential proving a
+genuine prior reservation); `recover.ps1` never passes `-Manifest` itself,
+only the row's own original `-Prompt`, so a validated recovery restarts
+exactly as it always did (no worktree, no manifest reconciliation) and an
+unvalidated `-Recover` gets no exemption at all.
 `bin/assignment-parity.js` was left in place (out of this ticket's named
 scope) since `bin/cutover-assignment.ps1` still runs its `report` gate; its
 `observe` command has no caller left. `_common.ps1`'s `Test-AssignmentLive`

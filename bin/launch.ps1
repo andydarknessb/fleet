@@ -2,7 +2,7 @@
 .SYNOPSIS  The only door for starting a fleet session (ADR 0002).
 .EXAMPLE   launch.ps1 -Role ic -Name ic-118 -Tenant endzone -Parent pl-endzone -Issue 118 -Prompt "..."
 .EXAMPLE   launch.ps1 -FromRoster dispatcher
-.EXAMPLE   launch.ps1 -FromRoster sentinel -DryRun
+.EXAMPLE   launch.ps1 -FromRoster pl-endzone -DryRun
 #>
 [CmdletBinding()]
 param(
@@ -11,8 +11,19 @@ param(
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
-  [switch]$Recover, # this session already holds its reservation (bin\recover.ps1): exempt from the
-                    # no-manifest IC refusal ONLY. Cap, PAUSE and maxIcs still apply.
+  [switch]$Recover, # bin\recover.ps1's reboot-recovery relaunch of an IC ONLY: honoured only when
+                    # the live roster already holds a row of that exact -Name, role ic, status
+                    # active, carrying a recorded manifest path (the credential proving it is a
+                    # genuinely reserved unit, not a fresh one) - that row's manifest field is
+                    # what is checked, never a -Manifest the caller passed alongside -Recover.
+                    # bin\recover.ps1 itself never passes -Manifest, only the IC's ORIGINAL
+                    # -Prompt (read from that same roster row): recovery restarts the crashed
+                    # process with its own history, it does not re-run manifest preconditions or
+                    # create a new worktree, so a validated -Recover does not set -Manifest here
+                    # either - it only lifts the no-manifest IC refusal below. A -Recover for any
+                    # other name (or one with no manifest on its row) gets no exemption at all
+                    # (QA fix, fleet #89: it used to accept any name unconditionally). Cap, PAUSE
+                    # and maxIcs still apply regardless.
   [switch]$DryRun   # do everything except start the session
 )
 . "$PSScriptRoot\_common.ps1"
@@ -21,6 +32,11 @@ $live = Get-LiveRoster
 $cwd = $null
 $t = $null
 $worktreePath = $null
+$recoverValidated = $false
+if ($Recover -and -not $Manifest -and ($Role -eq 'ic' -or ($Name -and $Name -match '^ic-'))) {
+  $recoverableRow = $live.sessions | Where-Object { $_.name -eq $Name -and $_.role -eq 'ic' -and $_.status -eq 'active' -and $_.manifest } | Select-Object -Last 1
+  $recoverValidated = [bool]$recoverableRow
+}
 if ($Manifest) {
   if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Write-Error "manifest '$Manifest' was not found"; exit 4 }
   $assignment = Read-Json $Manifest
@@ -65,12 +81,15 @@ if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and
 # manifest (assignment.js assign, then launch). The legacy -Prompt launch of an IC is
 # retired for good, not merely gated: there is no flag and no -Force to bring it back
 # (bin\rollback-assignment.ps1 is gone). A dry run still passes so the settings and
-# budget gates below stay reachable for every other IC test and rehearsal.
-# -Recover is the reboot path (bin\recover.ps1): that IC is already on the live roster,
-# so its unit is already reserved and re-launching it starts no second assignment. The
-# guard exists to stop a NEW unreserved unit, not to strand a crashed one.
-if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $Recover -and -not $DryRun) {
-  Write-Output (@{ launched = $false; reason = 'IC sessions launch only from a reserved manifest: reserve one with bin\assignment.js assign and launch it with assignment.js launch; the legacy prompt path was retired for good (fleet #89) and there is no flag to bring it back' } | ConvertTo-Json -Compress); exit 3
+# budget gates below stay reachable for every other IC test and rehearsal. $recoverValidated
+# (above) is the ONLY exemption left, and only once the name is proven genuinely recoverable:
+# a -Recover for a name that is not an active IC on the live roster with a manifest is
+# refused exactly like a bare -Prompt launch (QA fix, fleet #89: -Recover used to exempt
+# any name unconditionally).
+if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $recoverValidated -and -not $DryRun) {
+  $legacyRefusal = 'IC sessions launch only from a reserved manifest: reserve one with bin\assignment.js assign and launch it with assignment.js launch; the legacy prompt path was retired for good (fleet #89) and there is no flag to bring it back'
+  if ($Recover) { $legacyRefusal = "-Recover found no active IC named '$Name' with a recorded manifest on the live roster; there is nothing to recover, and -Recover carries no exemption of its own (fleet #89)" }
+  Write-Output (@{ launched = $false; reason = $legacyRefusal } | ConvertTo-Json -Compress); exit 3
 }
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"

@@ -7,7 +7,7 @@
       "tenant": null,
       "parent": "cory",
       "cwd": "C:\\Users\\Cory\\fleet",
-      "prompt": "You are the fleet's Dispatcher. Read C:\\Users\\Cory\\fleet\\README.md and your SessionStart context, then start your standing duties: schedule the daily digest, confirm the Sentinel and pl-endzone are alive via ListAgents, and wait for messages."
+      "prompt": "You are the fleet's Dispatcher. Read C:\\Users\\Cory\\fleet\\README.md and your SessionStart context, then start your standing duties: schedule the daily digest, confirm pl-endzone is alive via ListAgents, and wait for messages."
     },
     {
       "name": "pl-endzone",

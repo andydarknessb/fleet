@@ -12,9 +12,11 @@ Assert-Match $ic 'Closes #n.*only when.*every issue criterion' 'IC closing keywo
 Assert-Match $ic 'otherwise use `Refs #n`' 'IC instructions must provide the non-closing reference path'
 
 # The Sentinel role file (agents/sentinel.md) that once stated the open-PR stale-heartbeat
-# exemption in prose was retired by ticket 89 (after one release); the exemption is a
-# mechanical property of bin/sentinel-check.ps1, asserted below, and no longer duplicated
-# in a role file the Watchdog does not read.
+# exemption in prose was retired by ticket 89 (after one release); no assertion was added
+# in its place, because none was needed - the surviving assertions already cover the
+# mechanism mechanically: the `gh pr list` query right below finds the open PR, and the
+# `state=$state status=..., no open PR` respawn-reason assertion further down proves a
+# respawn never fires while one is open.
 Assert-Match $sentinel 'gh pr list.*--state open.*head:' 'Sentinel must query open PRs by the issue branch prefix'
 Assert-Match $sentinel 'skip\.issues' 'Sentinel must honor issue holds before stale-heartbeat respawn'
 Assert-Match $sentinel 'skip\.prs' 'Sentinel must annotate PR holds before stale-heartbeat respawn'

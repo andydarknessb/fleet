@@ -5,6 +5,10 @@
 # good; this fixture's own inline roster.json still carries a sentinel entry so
 # cutover-sentinel.ps1's own untouched behavior (it edits the live roster, never roster.json)
 # stays exercised.
+#
+# QA fix: bin/parity.js requires ./work-state, missing from this fixture's copy list since
+# commit 359dc20 (this suite was red on the ticket 89 base commit for that reason, same bug
+# as tests/rotation.tests.ps1); added below.
 $ErrorActionPreference = 'Stop'
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
@@ -51,7 +55,7 @@ try {
   foreach ($dir in 'bin','agents','tenants','state','state/heartbeats','state/sentinel','state/sentinel/shadow','state/sentinel/applied','state/skip','state/watchdog','state/escalations','state/events','state/sessions','state/flags','profile/.claude/jobs/job-s','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','cutover-sentinel.ps1','retire.ps1','launch.ps1','parity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','cutover-sentinel.ps1','retire.ps1','launch.ps1','parity.js','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   Write-Utf8 "$testRoot\agents\sentinel.md" "---`nname: sentinel`nmodel: sonnet`neffort: low`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","tenant":null,"parent":"cory","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"d"},{"name":"sentinel","role":"sentinel","tenant":null,"parent":"dispatcher","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"You are the Sentinel."}]}')
@@ -122,7 +126,7 @@ try {
   $r5 = Run-Script 'cutover-sentinel.ps1' @('-SkipTaskCheck')
   Assert-True ($lastExit -eq 0 -and $r5.cutover -eq $true) "cutover must succeed past the gates: $lastOut"
   Assert-True (Test-Path "$testRoot\state\flags\sentinel-off") 'cutover must write the flag'
-  Assert-True ((Get-Content "$testRoot\state\flags\sentinel-off" -Raw) -match 'rollback-sentinel') 'the flag must name the rollback path'
+  Assert-True ((Get-Content "$testRoot\state\flags\sentinel-off" -Raw) -match 'rollback window closed with fleet #89') 'the flag must say the rollback window is closed'
   Assert-True ((Get-LiveEntry 'sentinel').status -eq 'retired') 'cutover must retire the live Sentinel entry'
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^stop job-s' }).Count -eq 1) 'cutover must stop the Sentinel job'
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^rm job-s' }).Count -ge 1) 'cutover must remove the Sentinel job'

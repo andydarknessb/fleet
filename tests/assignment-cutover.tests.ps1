@@ -102,7 +102,7 @@ try {
   $r5 = Run-Script 'cutover-assignment.ps1' @('-Tenant', 'test')
   Assert-True ($lastExit -eq 0 -and $r5.cutover -eq $true) "cutover must succeed past the gates: $lastOut"
   Assert-True (Test-Path "$testRoot\state\flags\assignment-live") 'cutover must write the flag'
-  Assert-True ((Get-Content "$testRoot\state\flags\assignment-live" -Raw) -match 'rollback-assignment') 'the flag must name the rollback path'
+  Assert-True ((Get-Content "$testRoot\state\flags\assignment-live" -Raw) -match 'rollback window closed with fleet #89') 'the flag must say the rollback window is closed'
   $record = (Get-Content "$testRoot\state\assignment\cutover.json" -Raw) | ConvertFrom-Json
   Assert-True ($record.parity.evaluations -eq 24 -and $record.forced -eq $false) 'the cutover record must carry the parity evidence'
   Assert-True ($lastOut -match 'status.ps1') 'cutover must print the paperwork checklist'
@@ -125,16 +125,34 @@ try {
   # The refusal keys on the name as well as the role, the way the sibling Sentinel gate does.
   $r7d = Run-Script 'launch.ps1' @('-Role', 'sonnet-ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy')
   Assert-True ($lastExit -eq 3 -and $r7d.reason -match 'reserved manifest') "an ic-named launch must be refused whatever its -Role: $lastOut"
-  # Reboot recovery relaunches an IC that is ALREADY on the live roster, so its unit is already
-  # reserved: -Recover is exempt from this guard, or a reboot strands in-flight work.
+
+  # QA review of fleet #89: -Recover used to exempt ANY name from the guard, whether or not
+  # it was really on the live roster. ic-101 is NOT on the live roster here (state/roster.json
+  # is still '{"sessions":[]}' from setup), so this must be refused like any other -Prompt IC
+  # launch - a real launch, no PAUSE, no manifest: nothing but -Recover claims an exemption.
+  $r7qa = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy brief', '-Recover')
+  Assert-True ($lastExit -eq 3 -and $r7qa.launched -eq $false) "-Recover must not exempt a name that is not genuinely recoverable: $lastOut"
+  $liveAfterQa = (Get-Content "$testRoot\state\roster.json" -Raw) | ConvertFrom-Json
+  Assert-True (@($liveAfterQa.sessions | Where-Object { $_.name -eq 'ic-101' }).Count -eq 0) '-Recover must not have added ic-101 to the live roster'
+  $activeAfterQa = $null; try { $activeAfterQa = (Get-Content "$testRoot\state\work\active.json" -Raw) | ConvertFrom-Json } catch {}
+  Assert-True (-not $activeAfterQa -or $null -eq $activeAfterQa.records.PSObject.Properties['test:issue-101']) '-Recover must not have fabricated a Work record'
+
+  # Reboot recovery relaunches an IC that is genuinely on the live roster: bin/recover.ps1
+  # (read to build this fix) passes -Role/-Name/-Tenant/-Parent/-Issue/-Prompt straight from
+  # that archived roster row, never -Manifest; it restarts the crashed process with its own
+  # history, it does not re-run manifest preconditions or create a new worktree. The row's
+  # `manifest` field is the credential checked, not something re-launched from.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-101","role":"ic","tenant":"test","parent":"pl-test","issue":101,"status":"active","manifest":"state/manifests/assignment-101.json","workRecordId":"test:issue-101"}]}'
   $r7e = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover', '-DryRun')
-  Assert-True ($lastExit -eq 0 -and $r7e.dryRun -eq $true) "a -Recover relaunch must pass the no-manifest guard: $lastOut"
+  Assert-True ($lastExit -eq 0 -and $r7e.dryRun -eq $true -and $r7e.name -eq 'ic-101') "a genuine -Recover relaunch must pass the no-manifest guard: $lastOut"
+  Assert-True ($r7e.prompt -eq 'legacy') "-Recover must relaunch with the roster's own original -Prompt, unchanged, not a manifest-derived one: $lastOut"
   Assert-True ((Get-Content "$testRoot\bin\recover.ps1" -Raw) -match '-Prompt \$e\.prompt -Recover') 'recover.ps1 must pass -Recover when it relaunches an IC'
-  # -Recover exempts ONLY this guard: PAUSE still stops it.
+  # -Recover exempts ONLY this guard: PAUSE still stops it, even for a genuine recovery.
   Write-Utf8 "$testRoot\state\PAUSE" 'testing'
   $r7f = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover')
   Assert-True ($lastExit -eq 3 -and $r7f.reason -match 'PAUSE') "-Recover must not bypass PAUSE: $lastOut"
   Remove-Item "$testRoot\state\PAUSE"
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # Case 8: a manifest reserved by the planner launches through the door (dry run),
   # and the manifest carries the tenant's checks and CI gates as pointers.
