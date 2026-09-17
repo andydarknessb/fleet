@@ -22,32 +22,70 @@ function Get-CapExemptPrefixes {
   return $prefixes
 }
 function Test-CapExempt { param([string]$Name) foreach ($p in (Get-CapExemptPrefixes)) { if ("$Name".StartsWith($p)) { return $true } }; return $false }
-# Ticket 09: a high-priority alert for the actions Cory audits in real time (a watchdog
-# frontier wake). Three channels, none of them fatal: the Windows toast, a webhook POST
-# (Slack-compatible {"text": ...}) to the URL in FLEET_ALERT_WEBHOOK or
-# state/alerts/webhook.url (state/ is not committed, so the URL never lands in git), and
-# an append-only audit line in state/alerts/alerts.jsonl, which is the channel that
-# always works. Returns what was delivered so the caller can record it.
-function Send-FleetAlert {
-  param([string]$Kind, [string]$Title, [string]$Body, $Detail = $null, [switch]$NoToast)
-  $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; toast = $null; webhook = $null; webhookError = $null }
-  # -NoToast (tests) skips the toast only: the webhook and the audit line always run.
+# Ticket 76 (ADR 0012): the one page door. Every source that needs Cory - a decision
+# event through the Notifier, or a Watchdog condition - goes through this function to
+# one push service (Pushover), with a numeric priority per -Priority (emergency -> 2
+# with retry/expire so Pushover keeps re-alerting until acknowledged, high -> 1,
+# normal -> 0). The Windows toast stays as the on-host echo (-NoToast for tests);
+# Pushover and the audit line in state/pages/pages.jsonl are the channels that always
+# run. Credentials live in state/pages/pushover.json (state/ is not committed, so the
+# token never lands in git) and Cory has not necessarily written that file yet: an
+# unconfigured channel is a recorded result, never a throw - a condition-detecting run
+# must not crash because Cory hasn't wired his phone up. FLEET_PUSHOVER_URL overrides
+# the endpoint for tests (a local HttpListener).
+$script:PagePriorityValues = @{ emergency = 2; high = 1; normal = 0 }
+function Send-FleetPage {
+  param(
+    [Parameter(Mandatory = $true)][string]$Kind,
+    [Parameter(Mandatory = $true)][string]$Title,
+    [Parameter(Mandatory = $true)][string]$Body,
+    [Parameter(Mandatory = $true)][ValidateSet('emergency', 'high', 'normal')][string]$Priority,
+    [string]$Url = $null,
+    $Detail = $null,
+    [switch]$NoToast
+  )
+  $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; priority = $Priority; toast = $null; pushover = $null; pushoverError = $null }
+  # -NoToast (tests) skips the toast only: Pushover and the audit line always run.
   if ($NoToast) { $result.toast = 'skipped' } else { try { $result.toast = Send-FleetToast $Title $Body } catch { $result.toast = $false } }
-  $url = $env:FLEET_ALERT_WEBHOOK
-  if (-not $url) { try { $url = (Get-Content "$FleetHome\state\alerts\webhook.url" -Raw -ErrorAction Stop).Trim() } catch { $url = $null } }
-  if ($url) {
+  $creds = $null
+  try { $creds = Read-Json "$FleetHome\state\pages\pushover.json" } catch {}
+  if (-not $creds -or -not $creds.token -or -not $creds.user) {
+    $result.pushover = 'unconfigured'
+  } else {
+    $endpoint = $env:FLEET_PUSHOVER_URL
+    if (-not $endpoint) { $endpoint = 'https://api.pushover.net/1/messages.json' }
+    $priorityValue = $script:PagePriorityValues[$Priority]
+    $payload = @{ token = $creds.token; user = $creds.user; title = $Title; message = $Body; priority = $priorityValue }
+    if ($Url) { $payload.url = $Url }
+    # Pushover requires retry/expire only at priority 2 (emergency); any other
+    # priority refuses the request if they are present at all.
+    if ($priorityValue -eq 2) { $payload.retry = 120; $payload.expire = 7200 }
     try {
-      $payload = @{ text = "[$Kind] $Title`n$Body"; kind = $Kind; title = $Title; body = $Body; detail = $Detail; at = $result.at } | ConvertTo-Json -Compress -Depth 6
-      $null = Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json' -Body $payload -TimeoutSec 15
-      $result.webhook = $true
-    } catch { $result.webhook = $false; $result.webhookError = "$($_.Exception.Message)" }
-  } else { $result.webhook = 'unconfigured' }
+      $null = Invoke-RestMethod -Uri $endpoint -Method Post -Body $payload -TimeoutSec 15
+      $result.pushover = $true
+    } catch { $result.pushover = $false; $result.pushoverError = "$($_.Exception.Message)" }
+  }
   try {
-    [IO.Directory]::CreateDirectory("$FleetHome\state\alerts") | Out-Null
+    [IO.Directory]::CreateDirectory("$FleetHome\state\pages") | Out-Null
     $line = [ordered]@{}; foreach ($k in $result.Keys) { $line[$k] = $result[$k] }; $line.detail = $Detail
-    [IO.File]::AppendAllText("$FleetHome\state\alerts\alerts.jsonl", (($line | ConvertTo-Json -Compress -Depth 6) + [Environment]::NewLine), $script:Utf8)
+    [IO.File]::AppendAllText("$FleetHome\state\pages\pages.jsonl", (($line | ConvertTo-Json -Compress -Depth 6) + [Environment]::NewLine), $script:Utf8)
   } catch {}
   return [pscustomobject]$result
+}
+
+# Ticket 76 (ADR 0012): a wake of a session is logged and never paged (log-only kind).
+# The frontier wake and the triage wake used to go through Send-FleetAlert (toast +
+# webhook); that function is gone, but the audit trail state/alerts/alerts.jsonl
+# already carried must stay unbroken, so this writes the same line shape with
+# paged:false instead of POSTing anywhere.
+function Write-FleetWakeAudit {
+  param([string]$Kind, [string]$Title, [string]$Body, $Detail = $null)
+  $line = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; toast = 'skipped'; webhook = 'skipped'; webhookError = $null; paged = $false; detail = $Detail }
+  try {
+    [IO.Directory]::CreateDirectory("$FleetHome\state\alerts") | Out-Null
+    [IO.File]::AppendAllText("$FleetHome\state\alerts\alerts.jsonl", (($line | ConvertTo-Json -Compress -Depth 6) + [Environment]::NewLine), $script:Utf8)
+  } catch {}
+  return [pscustomobject]$line
 }
 function Get-ExpectedStaticSessions {
   # The static roster minus the rostered Sentinel while state/flags/sentinel-off stands

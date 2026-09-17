@@ -421,7 +421,9 @@ try {
   # --- wake per tenant per tick; never twice for the same evidence inside
   # --- frontierWake.cooldownMinutes; the boundary, PAUSE and rotation-off still apply
   # --- inside rotate.ps1; state/flags/frontier-wake-off disables it. Every executed wake is
-  # --- a high-priority alert (Send-FleetAlert: toast + webhook + state/alerts/alerts.jsonl).
+  # --- a log-only entry in state/alerts/alerts.jsonl (ticket 76, ADR 0012: a wake of a
+  # --- session is logged and never paged); Write-FleetWakeAudit keeps the same line
+  # --- shape Send-FleetAlert used to write, with paged:false.
   $frontierWakes = @()
   $wakeConfig = $null; try { $wakeConfig = (Read-Json "$FleetHome\config\cycle.json").frontierWake } catch {}
   $wakeCooldown = 60; if ($wakeConfig -and $wakeConfig.PSObject.Properties['cooldownMinutes']) { $wakeCooldown = [int]$wakeConfig.cooldownMinutes }
@@ -476,8 +478,8 @@ try {
       if ($rotated) {
         $wake.decision = 'woken'
         $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = (Now-Iso) }) -Force
-        # The alert always runs: -NoToast only skips the toast; the webhook and the audit line are the record.
-        try { $wake.alert = Send-FleetAlert 'frontier-wake' 'Fleet watchdog: frontier wake' "$leadName relaunched for $digest" ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; outcome = $wake.outcome }) -NoToast:$NoToast } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+        # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
+        try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $frontierWakes += [pscustomobject]$wake
     }
@@ -548,7 +550,7 @@ try {
       if ($tRotated) {
         $twake.decision = 'woken'
         $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest }) -Force
-        try { $twake.alert = Send-FleetAlert 'triage-wake' 'Fleet watchdog: triage wake' "$principalName relaunched for $tdigest" ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) -NoToast:$NoToast } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+        try { $twake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: triage wake' -Body "$principalName relaunched for $tdigest" -Detail ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $twake.decision = 'deferred'; if (-not $twake.reason) { $twake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($tRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $triageWakes += [pscustomobject]$twake
     }

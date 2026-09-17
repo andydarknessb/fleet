@@ -46,6 +46,20 @@
   "watchdog": {
     "staleMinutes": 45
   },
+  "pages": {
+    "priority": {
+      "fleet-dead": "emergency",
+      "dead-man-silence": "emergency",
+      "permission-wait": "high",
+      "launch-retry": "high",
+      "merge-review-wake": "high",
+      "branch-diverged": "high",
+      "state-escalated": "normal",
+      "state-hold": "normal",
+      "passed-date": "normal"
+    },
+    "defaultPriority": "normal"
+  },
   "supervisor": {
     "parityHours": 48,
     "pairWindowMinutes": 10,

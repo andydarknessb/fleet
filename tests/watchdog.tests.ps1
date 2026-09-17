@@ -440,6 +440,41 @@ try {
   Assert-True (@($w7.frontierWakes).Count -eq 0 -and @(Get-RotateCalls).Count -eq $callsBefore) 'the flag must disable the wake'
   Remove-Item "$testRoot\state\flags\frontier-wake-off"
 
+  # Case W8 (ticket 76, ADR 0012): a frontier wake writes one alerts.jsonl line
+  # and makes ZERO network calls, even with FLEET_ALERT_WEBHOOK configured
+  # (Send-FleetAlert is gone; before this ticket the wake POSTed to it).
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  $webhookLog = Join-Path $testRoot 'webhook-requests.log'
+  [IO.File]::WriteAllText($webhookLog, '')
+  $webhookPort = Get-Random -Minimum 20000 -Maximum 40000
+  $webhookPrefix = "http://127.0.0.1:$webhookPort/"
+  $webhookJob = Start-Job -ScriptBlock {
+    param($Prefix, $LogPath, $TimeoutMs)
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add($Prefix)
+    $listener.Start()
+    $asyncResult = $listener.BeginGetContext($null, $null)
+    if ($asyncResult.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+      $context = $listener.EndGetContext($asyncResult)
+      Add-Content -Path $LogPath -Value 'received a request'
+      $context.Response.OutputStream.Close()
+    }
+    $listener.Stop()
+  } -ArgumentList $webhookPrefix, $webhookLog, 1500
+  Start-Sleep -Milliseconds 400
+  $env:FLEET_ALERT_WEBHOOK = $webhookPrefix
+  Write-Utf8 $wakeFixture '[{"number":503,"title":"Ready","url":"https://github.com/owner/repo/issues/503","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  $alertsBeforeZeroPost = @(Get-AlertLines).Count
+  $wZero = Run-Watchdog
+  $wakeZero = @($wZero.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wakeZero.decision -eq 'woken') "this case needs a real wake to prove zero POSTs (got $($wakeZero.decision): $($wakeZero.reason))"
+  Assert-True (@(Get-AlertLines).Count -eq $alertsBeforeZeroPost + 1) 'a frontier wake must still write one alerts.jsonl line'
+  Wait-Job $webhookJob -Timeout 5 | Out-Null
+  Assert-True (-not (Get-Content $webhookLog -Raw)) 'a frontier wake must make zero POSTs even with a webhook configured'
+  Remove-Job $webhookJob -Force -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_ALERT_WEBHOOK
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+
   # ===== Ticket 75 (ADR 0012): fleet-dead requires stale heartbeats AND work waiting =====
   # A session with nothing to do takes no turns and its heartbeat goes stale too;
   # that is not an outage. Reuses the frontier/wake fixtures already wired above
