@@ -195,6 +195,20 @@ path under the flag): retire the legacy launch block from
 rollback script and the flag reader. Until then `bin/rollback-assignment.ps1`
 is the way back.
 
+## Status note - ticket 89, after one release, 2026-09-17
+
+Done: the legacy launch block is gone from `agents/project-lead.md`, the
+legacy frontier and its parity observation are gone from `hooks/stop.ps1`
+(the hook now decides from `bin/assignment.js frontier` unconditionally), and
+`launch.ps1` refuses a `-Prompt` IC launch outright, with no flag and no
+`-Force` to bring it back. `bin/rollback-assignment.ps1` is deleted.
+`bin/assignment-parity.js` was left in place (out of this ticket's named
+scope) since `bin/cutover-assignment.ps1` still runs its `report` gate; its
+`observe` command has no caller left. `_common.ps1`'s `Test-AssignmentLive`
+flag reader was also left in place, still read by `cutover-assignment.ps1`
+for its idempotency check, which is likewise out of this ticket's named
+scope; `launch.ps1` and `status.ps1` no longer call it.
+
 ## Status note - the reservation lag is closed, 2026-09-06
 
 `planner-includes` was not a set of historical differences waiting to age out of

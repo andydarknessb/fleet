@@ -10,9 +10,9 @@ param(
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, see $modelArgs below
-  [switch]$Force,   # bypass the cap and the assignment-live legacy-IC refusal (Cory only)
+  [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
   [switch]$Recover, # this session already holds its reservation (bin\recover.ps1): exempt from the
-                    # assignment-live legacy-IC refusal ONLY. Cap, PAUSE and maxIcs still apply.
+                    # no-manifest IC refusal ONLY. Cap, PAUSE and maxIcs still apply.
   [switch]$DryRun   # do everything except start the session
 )
 . "$PSScriptRoot\_common.ps1"
@@ -61,16 +61,16 @@ if ($Role -eq 'principal' -and -not $Tenant) { Write-Error "a principal needs -T
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
   Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live); use bin\rollback-sentinel.ps1 to restore it' } | ConvertTo-Json -Compress); exit 3
 }
-# 02/03 cutover: while the assignment planner is authoritative, an IC starts only from
-# a reserved manifest (assignment.js assign, then launch). A legacy -Prompt launch of
-# an IC is refused so no unit runs without a Work record and reservations; -Force
-# (Cory's hand) and a dry run still pass so rollback and rehearsal keep working.
-# rollback-assignment.ps1 removes the flag first, then legacy launches come through.
+# Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
+# manifest (assignment.js assign, then launch). The legacy -Prompt launch of an IC is
+# retired for good, not merely gated: there is no flag and no -Force to bring it back
+# (bin\rollback-assignment.ps1 is gone). A dry run still passes so the settings and
+# budget gates below stay reachable for every other IC test and rehearsal.
 # -Recover is the reboot path (bin\recover.ps1): that IC is already on the live roster,
 # so its unit is already reserved and re-launching it starts no second assignment. The
 # guard exists to stop a NEW unreserved unit, not to strand a crashed one.
-if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and (Test-AssignmentLive) -and -not $Force -and -not $Recover -and -not $DryRun) {
-  Write-Output (@{ launched = $false; reason = 'legacy IC launches are disabled by state/flags/assignment-live (the assignment planner is authoritative): reserve a manifest with bin\assignment.js assign and launch it with assignment.js launch; bin\rollback-assignment.ps1 restores the legacy path' } | ConvertTo-Json -Compress); exit 3
+if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $Recover -and -not $DryRun) {
+  Write-Output (@{ launched = $false; reason = 'IC sessions launch only from a reserved manifest: reserve one with bin\assignment.js assign and launch it with assignment.js launch; the legacy prompt path was retired for good (fleet #89) and there is no flag to bring it back' } | ConvertTo-Json -Compress); exit 3
 }
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"
