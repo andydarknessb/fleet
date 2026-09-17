@@ -5,14 +5,16 @@ function Assert-Match { param([string]$Text, [string]$Pattern, [string]$Message)
 
 $root = Split-Path -Parent $PSScriptRoot
 $ic = Get-Content "$root\agents\ic.md" -Raw -Encoding UTF8
-$sentinelRole = Get-Content "$root\agents\sentinel.md" -Raw -Encoding UTF8
 $sentinel = Get-Content "$root\bin\sentinel-check.ps1" -Raw -Encoding UTF8
 $retire = Get-Content "$root\bin\retire.ps1" -Raw -Encoding UTF8
 
 Assert-Match $ic 'Closes #n.*only when.*every issue criterion' 'IC closing keywords must be conditional on complete issue satisfaction'
 Assert-Match $ic 'otherwise use `Refs #n`' 'IC instructions must provide the non-closing reference path'
 
-Assert-Match $sentinelRole 'open PR.*never respawned for a stale heartbeat' 'Sentinel role must state the open-PR stale-heartbeat exemption'
+# The Sentinel role file (agents/sentinel.md) that once stated the open-PR stale-heartbeat
+# exemption in prose was retired by ticket 89 (after one release); the exemption is a
+# mechanical property of bin/sentinel-check.ps1, asserted below, and no longer duplicated
+# in a role file the Watchdog does not read.
 Assert-Match $sentinel 'gh pr list.*--state open.*head:' 'Sentinel must query open PRs by the issue branch prefix'
 Assert-Match $sentinel 'skip\.issues' 'Sentinel must honor issue holds before stale-heartbeat respawn'
 Assert-Match $sentinel 'skip\.prs' 'Sentinel must annotate PR holds before stale-heartbeat respawn'

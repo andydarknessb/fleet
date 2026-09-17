@@ -54,12 +54,12 @@ foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req 
 if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$') { Write-Error "name '$Name' does not match the fleet naming scheme"; exit 4 }
 if ($Role -eq 'principal' -and $Name -notmatch '^pe-') { Write-Error "a principal session is named pe-<tenant> (ADR 0011)"; exit 4 }
 if ($Role -eq 'principal' -and -not $Tenant) { Write-Error "a principal needs -Tenant (one per tenant, ADR 0011)"; exit 4 }
-# Ticket 08b: while the rostered Sentinel is cut over, the one door refuses to start a
+# Ticket 08b: while the rostered Sentinel is cut over (permanent since ticket 89 retired
+# its roster entry, role file and rollback script), the one door refuses to start a
 # second supervisor (not even with -Force: two actors is the failure cutover exists to
-# prevent). rollback-sentinel.ps1 removes the flag first, then comes through here. A
-# dry run still evaluates the other gates so rollback can be rehearsed.
+# prevent). A dry run still evaluates the other gates.
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
-  Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live); use bin\rollback-sentinel.ps1 to restore it' } | ConvertTo-Json -Compress); exit 3
+  Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live): bin\watchdog.ps1 is the supervisor now' } | ConvertTo-Json -Compress); exit 3
 }
 # Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
 # manifest (assignment.js assign, then launch). The legacy -Prompt launch of an IC is

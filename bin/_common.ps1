@@ -148,8 +148,8 @@ function Write-FleetWakeAudit {
 }
 function Get-ExpectedStaticSessions {
   # The static roster minus the rostered Sentinel while state/flags/sentinel-off stands
-  # (ticket 08b cutover): its roster.json entry stays as the rollback path, and nothing
-  # expects, launches, or recovers it until rollback-sentinel.ps1 removes the flag.
+  # (ticket 08b cutover, permanent since ticket 89 retired its roster.json entry, role
+  # file and rollback script): nothing expects, launches, or recovers a Sentinel session.
   param($Static)
   if (-not $Static) { $Static = Get-StaticRoster }
   $sessions = @(); if ($Static -and $Static.sessions) { $sessions = @($Static.sessions) }

@@ -77,3 +77,15 @@ updated to match; ADR-0001 itself is left as history.
   task), monitor, health checker"; update the README Shape diagram; after one
   release delete the roster entry and `agents/sentinel.md`, and retire the
   `sentinel` first-turn ceiling from `config/cycle.json`.
+
+## Status note - ticket 89, after one release, 2026-09-17
+
+Done: `roster.json`'s `sentinel` entry, `agents/sentinel.md`, and
+`bin/rollback-sentinel.ps1` are deleted; `config/cycle.json`'s
+`firstTurnCeilings.sentinel` is gone. `bin/status.ps1` no longer names the
+rollback script. `bin/sentinel-check.ps1` (the script the Watchdog runs) is
+untouched - it was never the rostered role, only the mechanical check the
+Sentinel and now the Watchdog both call. `state/flags/sentinel-off`, the
+launch door's Sentinel guard, and `bin/watchdog.ps1`/`bin/sentinel-check.ps1`'s
+shadow/live branching on it are left as they were: out of this ticket's named
+scope, and still the mechanism the Watchdog's live/shadow mode reads.

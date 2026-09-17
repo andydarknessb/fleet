@@ -43,8 +43,8 @@ _Avoid_: lead A, main agent, coordinator
 **Sentinel**:
 The retired lead that kept the fleet alive and within its cap as a rostered
 session until the 08b cutover (2026-09-04); the Watchdog task now does that
-work. Its roster entry and role file remain for one release as the rollback
-path and are then deleted.
+work. Its roster entry, role file and rollback script were deleted by ticket
+89 after one release.
 _Avoid_: watchdog (the task), monitor, health checker
 
 **Project lead**:
