@@ -137,3 +137,16 @@ in the ticket: shadow parity for notifications and reservations (no evidence
 can exist before those paths are live). The IC budget escalation is armed on
 2026-09-16 by restoring `ic.escalateTokens` from `escalateTokensAfterSoak`,
 after the summary has been read.
+
+## Status note - 2026-09-17
+
+The soak ended and the line was armed at 350,000, not 75,000, on Cory's ruling
+from the weekly audit. Nothing read `ic.soakUntil`, so the restore was missed
+on the day; both soak keys are removed from `config/cycle.json`. 75,000 was
+set when the heavy tickets ran on opus ICs (median 217,397) and sonnet units
+sat at a 52,023 median; amendment 14 moved those tickets onto sonnet, the
+sonnet median is now 133,209, and 75,000 would escalate 92 of the week's 134
+units. The escalation threshold is a runaway guard: 350,000 escalates 11 of
+134. What a unit is expected to cost stays a reported median, per model, and
+escalates nothing; its targets are set after the collector counts rotated
+sessions and the risk reviewer.

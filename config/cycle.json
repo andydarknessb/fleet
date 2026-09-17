@@ -21,9 +21,7 @@
   },
   "ic": {
     "warnTokens": 50000,
-    "escalateTokens": null,
-    "escalateTokensAfterSoak": 75000,
-    "soakUntil": "2026-09-16T00:00:00Z"
+    "escalateTokens": 350000
   },
   "frontierWake": {
     "cooldownMinutes": 60,
