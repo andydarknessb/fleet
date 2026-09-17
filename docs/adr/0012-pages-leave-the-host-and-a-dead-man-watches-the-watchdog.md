@@ -51,8 +51,9 @@ never-sleep power plan: simpler, and the dead-man covers what is left.
 - The Notifier's message keeps being a typed pointer and gains the one-line
   question and a link to where Cory rules. It still never copies criteria or
   findings.
-- Self-healing comes first and paging second. A `blocked`, stale session with
-  no permission prompt pending and work waiting is healed by role: a
+- Self-healing comes first and paging second. A `blocked` session with a
+  heartbeat stale for more than sixty minutes, no permission prompt pending
+  and work waiting is healed by role: a
   control-plane session by a Rotation with a wake reason (it reconstructs from
   canonical state, ADR 0005), an IC by `claude respawn` with the pid verified
   and a cap of two attempts. Only then is the fleet dead. Rotation's boundary

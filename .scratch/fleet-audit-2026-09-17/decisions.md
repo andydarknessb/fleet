@@ -8,7 +8,7 @@ Cory approved every recommendation in three rounds (Q1 to Q33). This file is the
 
 ## Workstream 1: pages reach Cory (ADR 0012)
 
-- **Page** is a glossary term: one off-host push, once per condition, two sources (Notifier decision events, Watchdog conditions), one delivery function. Rename the function away from "alert". Frontier and triage wakes stop going to it and are logged only.
+- **Page** is a glossary term: one off-host push, once per condition. Its two in-fleet sources (Notifier decision events and Watchdog conditions) share one delivery function; the off-host dead-man pages when Watchdog pings stop. Rename the in-fleet function away from "alert". Frontier and triage wakes stop going to it and are logged only.
 - Channel: Pushover. Emergency: `fleet-dead`, dead-man silence. High: permission-wait, launch-retry trip, merge without review, branch-diverged. Normal: a Ruling or Hold waiting, a passed date. Log only: `respawned`, wakes.
 - `fleet-dead` fires only when every static heartbeat is stale AND work is waiting: frontier non-empty with a free slot, OR a record in a fleet-owned state (assigned, implementing, revision, settled ci-wait, review), OR an unconsumed wake. `hold` and `escalated` never count. Stale with nothing waiting is recorded as idle.
 - A page never repeats, except: `fleet-dead` once more at emergency priority after 2 h; one daily summary at 8am Central of open "Needs Cory" items with ages, from the Digest.
@@ -36,7 +36,7 @@ Cory approved every recommendation in three rounds (Q1 to Q33). This file is the
 
 ## Workstream 5: measurement
 
-- Collector reads retired roster rows, attributes subagent transcripts (risk reviewer as its own line AND inside the hosting unit's total), normalizes model keys, keeps a verify-verdict history.
+- Collector reads retired roster rows, attributes Worker transcripts (risk reviewer as its own line AND inside the hosting unit's total), normalizes model keys, keeps a verify-verdict history.
 - `ic.escalateTokens` 350,000 now, as a runaway guard. The 60k median is reported, not judged; per-model targets after two clean weeks.
 - Weekly scorecard file each Monday; its headline rides the daily summary.
 - Reviewer audit: one zero-finding review on a diff over 150 lines per week gets an independent opus second read. Bug template gains "escaped from PR #".

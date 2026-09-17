@@ -85,13 +85,14 @@ is waiting. Stale with nothing waiting is idle, recorded and never paged.
 _Avoid_: ping, keepalive, health check
 
 **Page**:
-One off-host push to Cory, sent once per condition. It has two sources and one
-delivery path: a decision event (through the Notifier) and a Watchdog
-condition. A wake of a session is not a page and never reaches Cory's phone,
-and neither is a fault the fleet healed by itself. A page never repeats, with
-two exceptions: a dead fleet that self-healing could not revive pages once
-more at higher urgency, and one daily summary lists the decisions still
-waiting on Cory with their ages.
+One off-host push to Cory. In-fleet condition pages come from a decision event
+(through the Notifier) or a Watchdog condition and share one delivery function;
+the off-host dead-man service pages when Watchdog pings stop. A wake of a
+session is not a page and never reaches Cory's phone, and neither is a fault
+the fleet healed by itself. A condition page never repeats, with two
+exceptions: a dead fleet that self-healing could not revive pages once more at
+higher urgency, and one scheduled daily Page lists the decisions still waiting
+on Cory with their ages.
 _Avoid_: alert, notification, toast (the on-host echo of a page), ping
 
 **Cap**:
@@ -150,12 +151,14 @@ the parity log and pages Cory out of band - a toast and a red banner in the
 status view - only when self-healing is the casualty (the check cannot run,
 the Sentinel is stale, every static heartbeat is stale, or launches of one
 name keep failing), and acts on nothing. After cutover
-(`state/flags/sentinel-off`) it is the supervisor: the check applies, a
-missing static session launches through the one door, and a respawn or a
-new escalation of a paging kind leaves one escalation file and pages once;
-`blocked` is recorded, never paged. Two actors never run: a Sentinel session
-alive under the flag is the double-actor condition, and the Watchdog stays in
-shadow until it is gone.
+(`state/flags/sentinel-off`) it is the supervisor: the check applies and a
+missing static session launches through the one door. A fault healed by a
+respawn or Rotation is logged and never paged; a paging condition leaves one
+escalation file and pages only after self-healing fails. `blocked` alone is
+recorded; after sixty stale minutes with work waiting and no permission prompt,
+it enters that self-heal path. Two actors never run: a Sentinel session alive
+under the flag is the double-actor condition, and the Watchdog stays in shadow
+until it is gone.
 _Avoid_: sentinel (a session), monitor, health checker
 
 ### Work
