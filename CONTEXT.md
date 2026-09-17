@@ -79,7 +79,20 @@ _Avoid_: fleet config, session list, org chart
 **Heartbeat**:
 A timestamp a session records every time it finishes a turn. A stale heartbeat
 on a session that claims to be working is the signal for "alive but stuck".
+A session with nothing to do takes no turns, so a stale heartbeat alone is not
+a fault: the fleet is dead only when every static heartbeat is stale and work
+is waiting. Stale with nothing waiting is idle, recorded and never paged.
 _Avoid_: ping, keepalive, health check
+
+**Page**:
+One off-host push to Cory, sent once per condition. It has two sources and one
+delivery path: a decision event (through the Notifier) and a Watchdog
+condition. A wake of a session is not a page and never reaches Cory's phone,
+and neither is a fault the fleet healed by itself. A page never repeats, with
+two exceptions: a dead fleet that self-healing could not revive pages once
+more at higher urgency, and one daily summary lists the decisions still
+waiting on Cory with their ages.
+_Avoid_: alert, notification, toast (the on-host echo of a page), ping
 
 **Cap**:
 The maximum number of fleet sessions allowed to exist at once. Workers do not
@@ -226,7 +239,9 @@ output, never cache fields) summed over the IC session's transcript. The
 Work record gets one warning event at the warning threshold and is escalated
 at the escalation threshold unless an approved extension, granted by Cory
 through the state command with an amount and a reason, raises the line. The
-measurement is a projection (`state/budget/last.json`); only the crossings are
+escalation threshold is a runaway guard, set where few units reach it; what a
+unit is expected to cost is a tracked median per model, never a line that
+escalates. The measurement is a projection (`state/budget/last.json`); only the crossings are
 Fleet events. Live behind `state/flags/budget-live`; with the escalation
 threshold set to null it is warning-only (the soak ruled 2026-09-09), and
 `state/budget/summary.md` is the one place to read it.
@@ -271,7 +286,8 @@ one push, records the delivery as a Fleet event, and exits. A failed delivery
 is visible delivery state, not a reason to page again: only a retry
 authorization or a materially new decision event creates another attempt. Its
 message is a typed pointer (record id, revision, event sequence, artifact
-locations), never a copy of the issue, criteria, or findings.
+locations) with the one-line question and a link to where Cory rules, never a
+copy of the issue, criteria, or findings.
 _Avoid_: pager, alerter, notification session, reminder
 
 **Digest**:
@@ -301,6 +317,18 @@ A decision recorded on a ticket that settles a question the ticket's work
 depends on. A ruling is precedent for later tickets until it is explicitly
 overruled; whoever overrules one quotes it and says why.
 _Avoid_: decision (unqualified), verdict, call
+
+**Premise**:
+A fact about the tenant's code that a ticket's criteria depend on, stated with
+the commit it was read at. A false premise was never true and needs a Ruling
+to restate the ticket.
+_Avoid_: assumption, precondition, "mis-specified ticket"
+
+**Stale premise**:
+A Premise that was true at the commit it names and is false at assignment,
+because a later merge moved the code. Unlike a false premise it can be found
+mechanically, by re-reading the named paths that changed since that commit.
+_Avoid_: drift, outdated ticket
 
 **Triage proposal**:
 A Principal's advisory triage of one ticket, posted on the ticket in a fixed
