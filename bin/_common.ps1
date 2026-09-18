@@ -54,10 +54,22 @@ function Send-FleetPage {
   $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; priority = $Priority; toast = $null; pushover = $null; pushoverError = $null }
   # -NoToast (tests) skips the toast only: Pushover and the audit line always run.
   if ($NoToast) { $result.toast = 'skipped' } else { try { $result.toast = Send-FleetToast $Title $Body } catch { $result.toast = $false } }
-  $creds = $null
-  try { $creds = Read-Json "$FleetHome\state\pages\pushover.json" } catch {}
-  if (-not $creds -or -not $creds.token -or -not $creds.user) {
+  # 2026-09-17 review (fleet #76): a malformed pushover.json (bad JSON) and a
+  # half-filled one (token or user missing) both used to record the same
+  # 'unconfigured' as a plain absent file - true for "never wired up", false
+  # for "wired up wrong". Test-Path first distinguishes absent from present-but-
+  # broken (Read-Json's own catch cannot: it returns $null for both an absent
+  # file and a caught parse error). Never throws; never records token/user.
+  $credsPath = "$FleetHome\state\pages\pushover.json"
+  $credsExists = Test-Path $credsPath
+  $creds = $null; $credsReadFailed = $false
+  if ($credsExists) { try { $creds = Read-Json $credsPath } catch { $credsReadFailed = $true } }
+  if (-not $credsExists) {
     $result.pushover = 'unconfigured'
+  } elseif ($credsReadFailed -or -not $creds) {
+    $result.pushover = 'creds-unreadable'
+  } elseif (-not $creds.token -or -not $creds.user) {
+    $result.pushover = 'creds-incomplete'
   } else {
     $endpoint = $env:FLEET_PUSHOVER_URL
     if (-not $endpoint) { $endpoint = 'https://api.pushover.net/1/messages.json' }
