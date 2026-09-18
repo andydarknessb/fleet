@@ -51,11 +51,33 @@ try {
   $oldStart = (Get-Date).AddHours(-16)
   $healthyRows = '[{"id":"job-d","name":"dispatcher","state":"working","status":"idle","pid":11,"startedAt":' + (Get-EpochMs $oldStart) + '},{"id":"job-s","name":"sentinel","state":"working","status":"idle","pid":12,"startedAt":' + (Get-EpochMs $oldStart.AddSeconds(1)) + '},{"id":"job-p","name":"pl-test","state":"working","status":"busy","pid":13,"startedAt":' + (Get-EpochMs $oldStart.AddSeconds(2)) + '}]'
   Set-AgentsRows $healthyRows
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
+  # Ticket 85: `claude respawn` in production either replaces the pid or it does not;
+  # the mock must be able to show both. mock-respawn.ps1 bumps the matching row's pid
+  # (a real respawn) unless MOCK_RESPAWN_NOOP=1 (the wedged-dispatcher no-op case).
+  $mockRespawnPs1 = @'
+param([string]$JobId)
+if ($env:MOCK_RESPAWN_NOOP -eq '1') { exit 0 }
+$agentsPath = 'TESTROOT\mock-agents.json'
+$counterPath = 'TESTROOT\mock-respawn-counter.txt'
+$n = 1
+if (Test-Path $counterPath) { try { $n = [int]((Get-Content $counterPath -Raw).Trim()) + 1 } catch { $n = 1 } }
+Set-Content -Path $counterPath -Value $n -Encoding ASCII
+$parsed = (Get-Content $agentsPath -Raw) | ConvertFrom-Json
+$rows = @($parsed)
+foreach ($r in $rows) { if ("$($r.id)" -eq $JobId) { $r.pid = 70000 + $n } }
+$json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 }) -join ',') + ']'
+[IO.File]::WriteAllText($agentsPath, $json, (New-Object Text.UTF8Encoding $false))
+'@
+  Write-Utf8 "$testRoot\mock-bin\mock-respawn.ps1" ($mockRespawnPs1.Replace('TESTROOT', $testRoot))
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'if "%1"=="respawn" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" %2' + "`r`n" + 'exit /b 0' + "`r`n")
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_GH_FAIL%"=="1" (echo gh down 1>&2 & exit /b 9)' + "`r`n" + 'if "%3"=="902" (echo {"state":"CLOSED"}) else if "%2"=="view" (echo {"state":"OPEN"}) else echo []' + "`r`n" + 'exit /b 0' + "`r`n")
 
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
+  # Ticket 85: Do-Respawn's bounded re-read defaults to 20s; the suite scales it down
+  # so a genuine no-op respawn-failed case never actually sleeps for real.
+  $env:FLEET_RESPAWN_VERIFY_MS = '50'
+  $env:FLEET_RESPAWN_VERIFY_POLL_MS = '10'
 
   # Case 1: healthy fleet -> no conditions, no banner, shadow line written, live last-check untouched.
   foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }
@@ -334,7 +356,7 @@ try {
 
   # Case 10g-strict: an unreadable daemon list under the flag must not read as "no Sentinel running".
   $env:MOCK_CLAUDE_FAIL = '1'
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'if "%1"=="respawn" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" %2' + "`r`n" + 'exit /b 0' + "`r`n")
   $appliedBefore = @(Get-AppliedLines).Count
   $r10s = Run-Watchdog
   Remove-Item Env:MOCK_CLAUDE_FAIL
@@ -1076,12 +1098,54 @@ try {
   Assert-True (-not (@($realConfig.pages.priority.PSObject.Properties.Name) -contains 'passed-date')) 'the passed-date placeholder must not remain now that dated: is real'
   Assert-True ("$($realConfig.pages.priority.dated)" -eq 'normal') "the real config's dated priority must be normal"
 
+  # ===== Ticket 85: Do-Respawn verifies the pid actually changed =====
+  # The 2026-09-05 incident: ~120 consecutive "applied" respawns of a wedged
+  # dispatcher were logged applied and did nothing, because Do-Respawn trusted
+  # `claude respawn`'s own exit code instead of re-reading the daemon. A custom
+  # -ReportPath keeps this direct check from disturbing state/sentinel/last-check.json
+  # (the canonical-report marker earlier cases assert on).
+  $wedgedDispRow = '{"id":"job-d-wedge","name":"dispatcher","state":"failed","pid":11,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-30)) + '}'
+  $ticket85ReportPath = Join-Path $testRoot 'ticket85-check.json'
+  Remove-Item "$testRoot\state\sentinel\applied" -Recurse -Force -ErrorAction SilentlyContinue
+
+  # Red-tell: the mock's respawn leaves mock-agents.json unchanged (the wedge
+  # persists). Today this is logged "respawned"; after the fix it is
+  # "respawn-failed" and the applied ledger never claims a success that did not happen.
+  Set-AgentsRows "[$wedgedDispRow]"
+  $env:MOCK_RESPAWN_NOOP = '1'
+  $noOp = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog -ReportPath $ticket85ReportPath | Out-String) | ConvertFrom-Json
+  Remove-Item Env:MOCK_RESPAWN_NOOP
+  Assert-True (@($noOp.respawned | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 0) 'a no-op respawn must not be reported as respawned'
+  Assert-True (@($noOp.respawnFailed | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'a no-op respawn must be classified respawn-failed'
+  $ticket85LedgerFile = Get-ChildItem "$testRoot\state\sentinel\applied" -Filter *.jsonl | Select-Object -First 1
+  $ticket85Ledger = @(Get-Content $ticket85LedgerFile.FullName | ForEach-Object { $_ | ConvertFrom-Json })
+  Assert-True (@($ticket85Ledger[-1].respawnFailed | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'the applied ledger must record respawn-failed, never a false "respawned"'
+  Assert-True (@($ticket85Ledger[-1].respawned).Count -eq 0) 'the applied ledger must not also claim the same tick respawned'
+
+  # A genuine respawn (the mock actually replaces the pid, matching a real relaunch)
+  # is still reported respawned - the fix only catches the no-op case.
+  Set-AgentsRows "[$wedgedDispRow]"
+  $ok = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog -ReportPath $ticket85ReportPath | Out-String) | ConvertFrom-Json
+  Assert-True (@($ok.respawned | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'a respawn that actually changes the pid must still be reported respawned'
+  Assert-True (@($ok.respawnFailed).Count -eq 0) 'a genuine respawn must not be classified respawn-failed'
+
+  # This direct check's ledger/report/daemon-fixture side effects must not leak past
+  # this block (state/sentinel/applied's line count is asserted on by earlier,
+  # order-sensitive live-mode cases).
+  Remove-Item "$testRoot\state\sentinel\applied" -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item $ticket85ReportPath -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\mock-respawn-counter.txt" -ErrorAction SilentlyContinue
+  Set-AgentsRows $noSentinelRows
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_RESPAWN_NOOP -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_RESPAWN_VERIFY_MS -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_RESPAWN_VERIFY_POLL_MS -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-watchdog-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

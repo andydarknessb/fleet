@@ -26,11 +26,28 @@ try {
   Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{},"prs":{}}'
   & git -C "$testRoot\repo" init --quiet
 
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" '@echo off
-if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9
-if "%MOCK_SENTINEL_ROW%"=="1" (if "%1"=="agents" echo [{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":900,"startedAt":"2026-08-28T00:00:00Z"},{"id":"job-s","name":"sentinel","state":"working","status":"idle","pid":12,"startedAt":"2026-08-28T00:00:00Z"}]) else (if "%1"=="agents" echo [{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":900,"startedAt":"2026-08-28T00:00:00Z"}])
-exit /b 0
-'
+  # Ticket 85: Do-Respawn now verifies the pid actually changed, so a mock respawn
+  # that never moves ic-900's pid would wrongly read as respawn-failed here. This
+  # helper bumps a counter on "respawn" and reports the daemon pid off it, so a
+  # respawn attempt this file expects to succeed genuinely looks like one.
+  $mockRespawnPs1 = @'
+param([string]$Mode, [string]$SentinelRow = '0')
+$counterPath = 'TESTROOT\mock-respawn-counter.txt'
+$n = 0
+if (Test-Path $counterPath) { try { $n = [int]((Get-Content $counterPath -Raw).Trim()) } catch { $n = 0 } }
+if ($Mode -eq 'bump') {
+  Set-Content -Path $counterPath -Value ($n + 1) -Encoding ASCII
+  exit 0
+}
+$icPid = 900 + $n
+if ($SentinelRow -eq '1') {
+  Write-Output ('[{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":' + $icPid + ',"startedAt":"2026-08-28T00:00:00Z"},{"id":"job-s","name":"sentinel","state":"working","status":"idle","pid":12,"startedAt":"2026-08-28T00:00:00Z"}]')
+} else {
+  Write-Output ('[{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":' + $icPid + ',"startedAt":"2026-08-28T00:00:00Z"}]')
+}
+'@
+  Write-Utf8 "$testRoot\mock-bin\mock-respawn.ps1" ($mockRespawnPs1.Replace('TESTROOT', $testRoot))
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="respawn" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" bump' + "`r`n" + 'if "%1"=="agents" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" agents %MOCK_SENTINEL_ROW%' + "`r`n" + 'exit /b 0' + "`r`n")
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" '@echo off
 if "%MOCK_GH_FAIL%"=="1" (echo simulated gh failure 1>&2 & exit /b 7)
 if "%MOCK_PR%"=="1" (echo [{"number":777,"headRefName":"fleet/900-fix"}] & exit /b 0)
@@ -40,6 +57,10 @@ exit /b 0
 
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
+  # Ticket 85: Do-Respawn's bounded re-read defaults to 20s; scaled down so this
+  # suite never actually sleeps for it.
+  $env:FLEET_RESPAWN_VERIFY_MS = '50'
+  $env:FLEET_RESPAWN_VERIFY_POLL_MS = '10'
 
   $env:MOCK_PR = '1'; $env:MOCK_GH_FAIL = '0'
   $withPr = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
@@ -164,6 +185,8 @@ exit /b 0
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_SENTINEL_ROW -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_RESPAWN_VERIFY_MS -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_RESPAWN_VERIFY_POLL_MS -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-sentinel-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {
