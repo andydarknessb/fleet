@@ -550,6 +550,83 @@ try {
   Remove-Item "$testRoot\state\work\active.json"
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 90 }   # FD6 left them at 40 min, under the default 45-min threshold restored above
+
+  # ===== 2026-09-17 review (fleet #75-1): an unreadable tenant config, or zero =====
+  # ===== readable tenants, counts as work waiting (fails CLOSED) =====
+  $goodTenantJson = Get-Content "$testRoot\tenants\test.json" -Raw
+
+  # Case FD7 (red-tell): the only tenant file is corrupt, with a real implementing
+  # record in flight -> must fail toward paging, never read as idle.
+  Write-Utf8 "$testRoot\tenants\test.json" '{oops'
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-804":{"tenant":"test","issue":804,"state":"implementing"}}}'
+  $fd7 = Run-Watchdog
+  Assert-True (@($fd7.conditions) -contains 'fleet-dead') 'an unreadable tenant config must fail toward paging'
+  Assert-True ($fd7.idle -ne $true) 'an unreadable tenant config must not record idle'
+  Write-Utf8 "$testRoot\tenants\test.json" $goodTenantJson
+  Remove-Item "$testRoot\state\work\active.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD8 (red-tell): zero tenant files at all -> fails toward paging even with
+  # nothing else to go on.
+  Remove-Item "$testRoot\tenants\test.json"
+  $fd8 = Run-Watchdog
+  Assert-True (@($fd8.conditions) -contains 'fleet-dead') 'zero tenant files must fail toward paging'
+  Write-Utf8 "$testRoot\tenants\test.json" $goodTenantJson
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # ===== 2026-09-17 review (fleet #75-3): a record's state that work-state.js does =====
+  # ===== not recognize at all counts as waiting; the ruled six stay the waiting =====
+  # ===== set among KNOWN states. Walks the real STATES enum so a new state turns =====
+  # ===== this suite red until someone decides it. =====
+  $statesRaw = & node -e "process.stdout.write(JSON.stringify(require(process.argv[1]).STATES))" "$testRoot\bin\work-state.js" | Out-String
+  $allKnownStates = @(($statesRaw.Trim() | ConvertFrom-Json) | ForEach-Object { "$_" })
+  Assert-True ($allKnownStates.Count -gt 0) 'the real work-state.js STATES enum must be readable for this test to mean anything'
+  $ruledWaitingStates = @('assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision')
+  foreach ($state in $allKnownStates) {
+    Write-Utf8 "$testRoot\state\work\active.json" ('{"schemaVersion":1,"records":{"test-900":{"tenant":"test","issue":900,"state":"' + $state + '"}}}')
+    $rState = Run-Watchdog
+    $expectWaiting = $ruledWaitingStates -contains $state
+    $isDead = (@($rState.conditions) -contains 'fleet-dead')
+    Assert-True ($isDead -eq $expectWaiting) "state '$state' must classify as $(if ($expectWaiting) { 'waiting' } else { 'not waiting' }) (got fleet-dead=$isDead)"
+    Remove-Item "$testRoot\state\work\active.json"
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  }
+  # Case FD9 (red-tell): a state work-state.js has never heard of must fail toward
+  # paging, not read as no work (QA used "quarantined").
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-901":{"tenant":"test","issue":901,"state":"quarantined"}}}'
+  $fd9 = Run-Watchdog
+  Assert-True (@($fd9.conditions) -contains 'fleet-dead') 'an unrecognized state must fail toward paging'
+  Remove-Item "$testRoot\state\work\active.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # ===== 2026-09-17 review (fleet #75-4): the assignment.js frontier call is bounded =====
+  # ===== and made at most once per tenant per tick =====
+  # A "node" that logs every invocation and then blocks for ~20s before answering -
+  # the shape of QA's repro (a 20s-blocking node shim making a 61s tick).
+  # state/flags/triage-wake-off is set here so the Principal's SEPARATE, unbounded
+  # triage.js call (a different script, a different ticket) does not also hit this
+  # same shim and confound the "at most once" count this case exists to prove.
+  Write-Utf8 "$testRoot\state\flags\triage-wake-off" 'x'
+  Write-Utf8 "$testRoot\mock-bin\slow-node.cmd" ('@echo off' + "`r`n" + 'echo called >> "%~dp0slow-node-calls.log"' + "`r`n" + 'ping -n 21 127.0.0.1 >nul' + "`r`n" + 'echo {}' + "`r`n")
+  Remove-Item "$testRoot\mock-bin\slow-node-calls.log" -ErrorAction SilentlyContinue
+  $oldNodePath = $env:FLEET_NODE_PATH
+  $env:FLEET_NODE_PATH = "$testRoot\mock-bin\slow-node.cmd"
+  try {
+    $fd10Start = Get-Date
+    $fd10 = Run-Watchdog
+    $fd10Elapsed = ((Get-Date) - $fd10Start).TotalSeconds
+    Assert-True ($fd10Elapsed -lt 20) "a wedged planner call must not wedge the tick (took $([int]$fd10Elapsed)s)"
+    Assert-True (@($fd10.conditions) -contains 'fleet-dead') 'a timed-out planner call is a planner failure and must fail toward paging'
+    $slowNodeCalls = @(Get-Content "$testRoot\mock-bin\slow-node-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ })
+    Assert-True ($slowNodeCalls.Count -eq 1) "at most one planner invocation per tenant per tick (got $($slowNodeCalls.Count))"
+  } finally {
+    if ($oldNodePath) { $env:FLEET_NODE_PATH = $oldNodePath } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\state\flags\triage-wake-off"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
   foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
 

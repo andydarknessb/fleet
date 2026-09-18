@@ -48,6 +48,7 @@ try {
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
+  $frontierTimeoutSec = 15  # ticket 75 review: assignment.js frontier normally answers in ~1-2s; bounded so a wedged gh call cannot wedge the tick
   $permissionWaitMinutes = $PermissionWaitMinutes  # fleet #28: a permission prompt in a --bg session has no approver; ic-1208 sat 12 min unseen
 
   function Get-HeartbeatAgeMinutes {
@@ -196,22 +197,46 @@ try {
   # --- the wake loop - must fail CLOSED (toward paging) when the planner itself
   # --- could not answer, since a swallowed error there would look like "nothing
   # --- waiting".
+  # 2026-09-17 review (fleet #75): a per-tick cache keyed by tenant - Test-WorkWaiting
+  # (fleet-dead) and the frontier wake block can both ask this in the same tick, and
+  # the answer cannot change mid-tick (LiveRoster/LiveCount/Cap are fixed snapshots
+  # taken once above), so the second ask reuses the first's answer instead of
+  # spending another assignment.js invocation (QA measured three serial calls
+  # ballooning a tick to 61s against a 20s-blocking node shim).
+  $script:frontierWaitingCache = @{}
   function Test-FrontierWaiting {
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
+    if ($script:frontierWaitingCache.ContainsKey($TenantName)) { return $script:frontierWaitingCache[$TenantName] }
     $result = [pscustomobject]@{ evidence = @(); reason = ''; error = $null }
-    if (-not $NodeExe) { $result.error = 'node not found'; return $result }
+    if (-not $NodeExe) { $result.error = 'node not found'; $script:frontierWaitingCache[$TenantName] = $result; return $result }
     $activeIcs = 0; if ($LiveRoster) { $activeIcs = @($LiveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $TenantName }).Count }
     $maxIcs = 0; try { $maxIcs = [int]$Tenant.maxIcs } catch {}
-    if ($activeIcs -ge $maxIcs -or $LiveCount -ge $Cap) { $result.reason = "no slot (ICs $activeIcs/$maxIcs, cap $LiveCount/$Cap)"; return $result }
+    if ($activeIcs -ge $maxIcs -or $LiveCount -ge $Cap) { $result.reason = "no slot (ICs $activeIcs/$maxIcs, cap $LiveCount/$Cap)"; $script:frontierWaitingCache[$TenantName] = $result; return $result }
+    # Bounded the way the sentinel-check child is bounded (Start-Process + WaitForExit
+    # + Kill, above): a wedged assignment.js (a hung gh call inside it) must not wedge
+    # the whole tick. A timeout is recorded as a planner failure - Test-WorkWaiting
+    # already fails CLOSED (toward paging) on $result.error, so a hung planner still
+    # pages rather than reading as a silent idle tick.
+    $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $TenantName)
+    if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
+    $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
     try {
-      $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $TenantName)
-      if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
-      $frontierRaw = & $NodeExe "$PSScriptRoot\assignment.js" @frontierArgs 2>$null | Out-String
-      $frontier = ConvertFrom-LastJsonLine $frontierRaw
-      if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $frontierRaw 200)"; return $result }
-      $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
-      if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
-    } catch { $result.error = "assignment.js threw: $(Get-OneLine $_.Exception.Message 200)" }
+      $p = Start-Process -FilePath $NodeExe -ArgumentList (@("$PSScriptRoot\assignment.js") + $frontierArgs) -NoNewWindow -PassThru -RedirectStandardOutput $childOut -RedirectStandardError $childErr
+      if (-not $p.WaitForExit($frontierTimeoutSec * 1000)) {
+        try { $p.Kill() } catch {}
+        $result.error = "assignment.js timed out after ${frontierTimeoutSec}s and was killed"
+      } else {
+        $frontierRaw = ''; try { $frontierRaw = Get-Content $childOut -Raw -ErrorAction SilentlyContinue } catch {}
+        $frontier = ConvertFrom-LastJsonLine $frontierRaw
+        if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $frontierRaw 200)" }
+        else {
+          $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
+          if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
+        }
+      }
+    } catch { $result.error = "assignment.js could not start: $(Get-OneLine $_.Exception.Message 200)" }
+    finally { Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue }
+    $script:frontierWaitingCache[$TenantName] = $result
     return $result
   }
 
@@ -239,15 +264,41 @@ try {
     return $kinds
   }
 
+  # 2026-09-17 review (fleet #75): the ruled six waiting states were a
+  # hardcoded PowerShell list duplicating bin/work-state.js STATES, so a record
+  # in a state that list had never heard of (QA used "quarantined") silently
+  # read as no work. This asks work-state.js what it actually knows, once per
+  # tick (not once per record), so Test-WorkWaiting can invert the unknown
+  # case: a state work-state.js does not recognize at all cannot be trusted as
+  # "known, not waiting" and fails CLOSED. $null (node missing, or the query
+  # itself failed) means "cannot verify any state" - every caller below treats
+  # that the same as an unknown state.
+  $script:knownWorkStatesCache = $null; $script:knownWorkStatesFetched = $false
+  function Get-KnownWorkStates {
+    param($NodeExe)
+    if ($script:knownWorkStatesFetched) { return $script:knownWorkStatesCache }
+    $script:knownWorkStatesFetched = $true
+    if (-not $NodeExe) { return $null }
+    try {
+      $raw = & $NodeExe -e "process.stdout.write(JSON.stringify(require(process.argv[1]).STATES))" "$PSScriptRoot\work-state.js" 2>$null | Out-String
+      $states = ("$raw".Trim()) | ConvertFrom-Json
+      if ($states) { $script:knownWorkStatesCache = @($states | ForEach-Object { "$_" }) }
+    } catch {}
+    return $script:knownWorkStatesCache
+  }
+
   function Test-WorkWaiting {
     # Ticket 75 (ADR 0012): is there work waiting for $TenantName - the second
     # half of fleet-dead ("every static heartbeat stale AND work waiting"). Any
     # one of a waiting frontier candidate, an in-flight active record, or an
     # unconsumed wake is enough. hold and escalated (work-state.js
     # DECISION_STATES) never count: a human, not the fleet, owns what happens
-    # next for those. An unreadable active.json or a failed planner call cannot
-    # prove there is nothing waiting, so both fail CLOSED (toward paging) rather
-    # than toward a silent idle tick.
+    # next for those, and neither do the other known-terminal states (merged,
+    # retiring, retired, released, abandoned) - the ruled six are exactly the
+    # waiting set AMONG KNOWN states. A record in a state work-state.js does
+    # not know at all is unclassifiable, not proof of nothing waiting, and
+    # fails CLOSED exactly like an unreadable active.json or a failed planner
+    # call already do.
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap, $WakeState)
     $activeWaitStates = @('assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision')
     $active = $null
@@ -256,7 +307,10 @@ try {
       foreach ($prop in $active.records.PSObject.Properties) {
         $record = $prop.Value
         if ("$($record.tenant)" -ne $TenantName) { continue }
-        if ($activeWaitStates -contains "$($record.state)") { return $true }
+        $state = "$($record.state)"
+        if ($activeWaitStates -contains $state) { return $true }
+        $known = Get-KnownWorkStates -NodeExe $NodeExe
+        if (-not $known -or ($known -notcontains $state)) { return $true }   # unrecognized (or unverifiable): fail toward paging
       }
     }
     $fw = Test-FrontierWaiting -TenantName $TenantName -Tenant $Tenant -NodeExe $NodeExe -LiveRoster $LiveRoster -LiveCount $LiveCount -Cap $Cap
@@ -371,12 +425,23 @@ try {
   if ($allStaticsStale) {
     $wakeStateForDead = $null; try { $wakeStateForDead = Read-Json "$FleetHome\state\watchdog\frontier-wake.json" } catch {}
     $anyWorkWaiting = $false
+    $readableTenants = 0
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
-      $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
+      $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch { continue }
       if (-not $tenant) { continue }
+      $readableTenants++
       $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
       if (Test-WorkWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap -WakeState $wakeStateForDead) { $anyWorkWaiting = $true; break }
     }
+    # 2026-09-17 review (fleet #75): an unreadable tenant config (the only tenant
+    # file corrupt) or zero tenant files at all left this loop with nothing to
+    # check and $anyWorkWaiting false by default - recording idle and paging
+    # nothing even with real work in flight. Zero READABLE tenants (whichever
+    # reason) cannot prove nothing is waiting, so it fails CLOSED the same way an
+    # unreadable active.json already does in Test-WorkWaiting. A tenant file that
+    # IS readable and genuinely has no work waiting is unaffected: this only
+    # fires when nothing could be checked at all.
+    if (-not $anyWorkWaiting -and $readableTenants -eq 0) { $anyWorkWaiting = $true }
     if ($anyWorkWaiting) { $fleetDead = $true } else { $idleTick = $true }
   }
 
