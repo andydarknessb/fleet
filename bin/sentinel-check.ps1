@@ -18,7 +18,7 @@ function Write-AppliedLedger {
     $okCount = 0; if ($Report.ok) { $okCount = @($Report.ok).Count }
     $line = [ordered]@{
       at = $Report.at; actor = $Actor; applied = $true
-      respawned = @($Report.respawned); respawnFailed = @($Report.respawnFailed); launchNeeded = @($Report.launchNeeded); escalate = @($Report.escalate)
+      respawned = @($Report.respawned); respawnFailed = @($Report.respawnFailed); respawnDeferred = @($Report.respawnDeferred); launchNeeded = @($Report.launchNeeded); escalate = @($Report.escalate)
       retired = @($Report.retired); worktrees = @($Report.worktrees); sync = @($Report.sync); pause = $Report.pause; okCount = $okCount
     }
     if ($Report.daemonReadError) { $line.daemonReadError = $Report.daemonReadError }
@@ -34,7 +34,7 @@ $now = (Get-Date).ToUniversalTime()
 if ($Apply -and $Actor -eq 'sentinel' -and (Test-SentinelOff)) {
   $refused = [ordered]@{
     at = (Now-Iso); applied = $false; refused = 'state/flags/sentinel-off stands: the rostered Sentinel is retired and the watchdog task supervises; nothing applied'
-    respawned = @(); respawnFailed = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
+    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
   }
   [pscustomobject]$refused | ConvertTo-Json -Depth 6
   exit 0
@@ -47,7 +47,7 @@ $daemon = $null
 try { $daemon = Get-DaemonSessions -All -Strict } catch {
   $errorReport = [ordered]@{
     at = (Now-Iso); applied = [bool]$Apply; daemonReadError = "$($_.Exception.Message)"
-    respawned = @(); respawnFailed = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null
+    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null
     ok = @([pscustomobject]@{ name = 'daemon-read'; detail = 'session list unreadable; proposing nothing this tick (a bad read must not look like an empty fleet)' })
   }
   if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
@@ -56,7 +56,7 @@ try { $daemon = Get-DaemonSessions -All -Strict } catch {
   [pscustomobject]$errorReport | ConvertTo-Json -Depth 6
   exit 0
 }
-$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
+$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
 
 function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name } | Sort-Object startedAt -Descending | Select-Object -First 1 }
 function Heartbeat-Age {
@@ -69,10 +69,19 @@ function Heartbeat-Age {
 # code says nothing about whether a new process actually replaced the old one. Bounded so
 # a wedged daemon read cannot hang a tick; injectable so the test suite never sleeps
 # the real 20s.
-$script:RespawnVerifyBoundMs = 20000
+# 2026-09-17 QA (fleet #85 review #2): the verify wait is serial per session -
+# three wedged statics used to cost 60s of the 180s check bound at the old 20s
+# default; nine would kill the whole check (check-failed, masking the real
+# cause). Default cut to 10s/1s polls, and at most RespawnVerifyCap
+# verifications run per tick; anything past the cap is deferred to the next
+# tick rather than paying for another wait.
+$script:RespawnVerifyBoundMs = 10000
 if ($env:FLEET_RESPAWN_VERIFY_MS) { try { $script:RespawnVerifyBoundMs = [int]$env:FLEET_RESPAWN_VERIFY_MS } catch {} }
-$script:RespawnVerifyPollMs = 500
+$script:RespawnVerifyPollMs = 1000
 if ($env:FLEET_RESPAWN_VERIFY_POLL_MS) { try { $script:RespawnVerifyPollMs = [int]$env:FLEET_RESPAWN_VERIFY_POLL_MS } catch {} }
+$script:RespawnVerifyCap = 2
+if ($env:FLEET_RESPAWN_VERIFY_CAP) { try { $script:RespawnVerifyCap = [int]$env:FLEET_RESPAWN_VERIFY_CAP } catch {} }
+$script:RespawnVerifyCount = 0
 function Test-RespawnVerified {
   # Strict re-read of the daemon row for $Name, bounded: a pid that is present and
   # differs from $PreviousPid (or appears where there was none) proves a new process
@@ -108,6 +117,14 @@ function Do-Respawn {
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
     return
   }
+  if ($script:RespawnVerifyCount -ge $script:RespawnVerifyCap) {
+    # 2026-09-17 QA (fleet #85 review #2): the verify wait is what makes each
+    # respawn costly, not the respawn command itself - past the cap this tick,
+    # skip both rather than pay for a wait this tick cannot afford.
+    $script:report.respawnDeferred += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "verify cap ($($script:RespawnVerifyCap)) reached this tick; deferred to the next tick: $reason" }
+    return
+  }
+  $script:RespawnVerifyCount++
   & claude respawn $row.id 2>&1 | Out-Null
   if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid) {
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
@@ -134,8 +151,15 @@ foreach ($e in ($live.sessions | Where-Object { $_.status -eq 'active' -and $_.r
 # rather than a second copy of it. Control-plane roles are healed by the
 # Watchdog itself, through rotate.ps1, never through this path.
 if ($HealRespawn) {
+  # 2026-09-17 QA (fleet #85 review #10): a defense-in-depth refusal, independent
+  # of $expected membership (sentinel-off, say, drops 'sentinel' from $expected
+  # entirely, which must never read as "safe to respawn" here) - a control-plane
+  # name is healed only through rotate.ps1, by the Watchdog, never this path.
+  $healRespawnControlPlaneNames = ($HealRespawn -eq 'dispatcher') -or ($HealRespawn -eq 'sentinel') -or ($HealRespawn -match '^pl-') -or ($HealRespawn -match '^pe-')
   $target = $expected | Where-Object { $_.name -eq $HealRespawn } | Select-Object -First 1
-  if (-not $target) {
+  if ($healRespawnControlPlaneNames -or ($target -and (@('dispatcher', 'project-lead', 'principal', 'sentinel') -contains "$($target.role)"))) {
+    $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = $(if ($target) { $target.parent } else { '' }); reason = "heal-respawn refused: '$HealRespawn' is a control-plane name/role, healed only through rotate.ps1" }
+  } elseif (-not $target) {
     $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = ''; reason = 'heal-respawn: not an expected session (roster changed underfoot)' }
   } else {
     $row = Latest-Row $HealRespawn
