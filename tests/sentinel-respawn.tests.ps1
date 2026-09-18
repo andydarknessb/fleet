@@ -177,6 +177,16 @@ exit /b 0
   Assert-True ("$($swept.pause)" -match 'cleared: rate-limit window passed' -and -not (Test-Path $pauseFile)) 'a passed rate-limit window is still cleared'
   Remove-Item $signalFile
 
+  # 2026-09-18 QA (review 2, NIT): the control-plane -HealRespawn refusal was
+  # unasserted anywhere - QA replaced the guard with `if ($false)` and the suite
+  # stayed green. -HealRespawn dispatcher/sentinel/pl-*/pe-* must always refuse,
+  # by name, independent of whether the name is even in the roster fixture here.
+  foreach ($cpName in 'dispatcher', 'sentinel', 'pl-test', 'pe-test') {
+    $cpRefused = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog -HealRespawn $cpName | Out-String) | ConvertFrom-Json
+    Assert-True (@($cpRefused.respawnFailed | Where-Object { $_.name -eq $cpName -and "$($_.reason)" -match 'control-plane' }).Count -eq 1) "-HealRespawn $cpName must refuse as control-plane, never attempt a respawn"
+    Assert-True (@($cpRefused.respawned | Where-Object { $_.name -eq $cpName }).Count -eq 0) "-HealRespawn $cpName must never report a respawn"
+  }
+
   Write-Output 'sentinel respawn tests passed'
 } finally {
   $env:PATH = $oldPath

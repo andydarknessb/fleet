@@ -743,6 +743,26 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ($h6Heal.Count -eq 1 -and $h6Heal[0].action -eq 'respawn' -and $h6Heal[0].ok -eq $true) 'an IC heal must be reported as a successful respawn action'
   $h6RespawnReport = Get-Content "$testRoot\state\watchdog\last-heal-respawn.json" -Raw | ConvertFrom-Json
   Assert-True (@($h6RespawnReport.respawned | Where-Object { $_.name -eq 'ic-950' }).Count -eq 1) 'the heal-respawn call must have actually respawned ic-950'
+
+  # Case H6b (2026-09-18 QA, review 2, MINOR, red-tell): the report path was not
+  # cleared before the call, so a child that dies before writing anything left
+  # LAST TICK's report (a stale success, from H6 just above) to be read as this
+  # tick's result. Replace sentinel-check.ps1 with a wrapper whose -HealRespawn
+  # branch writes nothing at all and exits non-zero (the regular check still
+  # delegates to the real script); the stale success from H6 must not survive.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows "[$dispRow,$plRow,$icRow]"
+  Set-Heartbeat 'ic-950' 61
+  $sentinelCheckReal = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check.real.ps1" $sentinelCheckReal
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + 'if ($HealRespawn) { exit 1 }' + "`r`n" + '& "$PSScriptRoot\sentinel-check.real.ps1" @PSBoundParameters')
+  $h6b = Run-Watchdog
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $sentinelCheckReal
+  Remove-Item "$testRoot\bin\sentinel-check.real.ps1" -ErrorAction SilentlyContinue
+  Assert-True (-not (Test-Path "$testRoot\state\watchdog\last-heal-respawn.json")) 'the stale report must be removed before the call, and never rewritten by a child that writes nothing'
+  $h6bHeal = @($h6b.healed | Where-Object { $_.name -eq 'ic-950' })
+  Assert-True ($h6bHeal.Count -eq 1 -and $h6bHeal[0].ok -eq $false) 'a heal-respawn child that writes nothing must be read as failed, never a stale success'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # Case H7 (2026-09-17 QA, fleet #84 review #5, ruling pending Cory's own): a
@@ -878,6 +898,18 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@($h13b.conditions) -contains 'launch-retry:dispatcher') 'the second no-op respawn must trip launch-retry:dispatcher'
   $h13Entry = @($h13b.newlyPaged | Where-Object { $_.key -eq 'launch-retry:dispatcher' })[0]
   Assert-True ($null -ne $h13Entry -and $h13Entry.priority -eq 'high') 'launch-retry must resolve to high priority and page once'
+
+  # Case H13c (2026-09-18 QA, review 2, MINOR, red-tell): a corrupt
+  # respawn-failed.json must fail CLOSED (consistent with heal.json/H9) - never
+  # reset to empty and overwritten, which would silently drop the attempt
+  # history just recorded above and re-arm an unlimited retry.
+  Write-Utf8 "$testRoot\state\watchdog\respawn-failed.json" '{oops'
+  $env:MOCK_RESPAWN_NOOP = '1'
+  $h13c = Run-Watchdog
+  Remove-Item Env:MOCK_RESPAWN_NOOP
+  Assert-True ($h13c.respawnFailStateUnreadable -eq $true) 'a corrupt respawn-failed.json must be recorded as unreadable on the shadow line'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\respawn-failed.json" -Raw) -eq '{oops') 'a corrupt respawn-failed.json must not be silently reset or overwritten'
+
   Remove-Item "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue

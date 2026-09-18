@@ -645,29 +645,37 @@ try {
   # --- the same key and priority the daemon-row storm already uses. A later
   # --- successful respawn for the same name clears its count.
   $respawnFailTrips = @()
+  $respawnFailStateUnreadable = $false
   if ($mode -eq 'live' -and $check) {
     $respawnFailPath = "$FleetHome\state\watchdog\respawn-failed.json"
-    $respawnFailState = $null; try { $respawnFailState = Read-Json $respawnFailPath } catch {}
-    if (-not $respawnFailState) { $respawnFailState = [pscustomobject]@{} }
-    $respawnFailChanged = $false
-    foreach ($r in @($check.respawned)) {
-      $rn = "$($r.name)"
-      if ($rn -and $respawnFailState.PSObject.Properties[$rn]) { $respawnFailState.PSObject.Properties.Remove($rn); $respawnFailChanged = $true }
-    }
-    $respawnFailWindowStart = $now.AddHours(-$retryWindowHours)
-    foreach ($rf in @($check.respawnFailed)) {
-      $rn = "$($rf.name)"; if (-not $rn) { continue }
-      $rfPrior = $null; if ($respawnFailState.PSObject.Properties[$rn]) { $rfPrior = $respawnFailState.$rn }
-      $rfAttempts = @(); if ($rfPrior -and $rfPrior.PSObject.Properties['attempts']) { $rfAttempts = @($rfPrior.attempts | Where-Object { $_ }) }
-      $rfRecent = @($rfAttempts | Where-Object { $ts = ConvertTo-UtcDateTime $_; $ts -and $ts -ge $respawnFailWindowStart })
-      $rfRecent += (Now-Iso)
-      $respawnFailState | Add-Member -NotePropertyName $rn -NotePropertyValue ([pscustomobject]@{ attempts = @($rfRecent); lastReason = "$($rf.reason)" }) -Force
-      $respawnFailChanged = $true
-      if ($rfRecent.Count -ge $retryCap) { $respawnFailTrips += [pscustomobject]@{ name = $rn; failures = $rfRecent.Count; reason = "$($rf.reason)" } }
-      else { $waiting += [pscustomobject]@{ name = $rn; kind = 'respawn-failed'; detail = "no-op respawn ($($rf.reason)); attempt $($rfRecent.Count)/$retryCap before this trips launch-retry" } }
-    }
-    if ($respawnFailChanged) {
-      try { $rfTmp = "$respawnFailPath.tmp"; Write-Json $rfTmp $respawnFailState; Move-Item -Force $rfTmp $respawnFailPath } catch {}
+    $respawnFailState = $null
+    try { $respawnFailState = Read-Json $respawnFailPath } catch { $respawnFailStateUnreadable = $true }
+    # 2026-09-18 QA (review 2, MINOR, consistency with heal.json/H9): a corrupt
+    # file must fail CLOSED - never reset to empty and overwritten, which would
+    # silently drop every session's attempt history and re-arm an unlimited
+    # retry. Skip the whole decision this tick; record it on the shadow line.
+    if (-not $respawnFailStateUnreadable) {
+      if (-not $respawnFailState) { $respawnFailState = [pscustomobject]@{} }
+      $respawnFailChanged = $false
+      foreach ($r in @($check.respawned)) {
+        $rn = "$($r.name)"
+        if ($rn -and $respawnFailState.PSObject.Properties[$rn]) { $respawnFailState.PSObject.Properties.Remove($rn); $respawnFailChanged = $true }
+      }
+      $respawnFailWindowStart = $now.AddHours(-$retryWindowHours)
+      foreach ($rf in @($check.respawnFailed)) {
+        $rn = "$($rf.name)"; if (-not $rn) { continue }
+        $rfPrior = $null; if ($respawnFailState.PSObject.Properties[$rn]) { $rfPrior = $respawnFailState.$rn }
+        $rfAttempts = @(); if ($rfPrior -and $rfPrior.PSObject.Properties['attempts']) { $rfAttempts = @($rfPrior.attempts | Where-Object { $_ }) }
+        $rfRecent = @($rfAttempts | Where-Object { $ts = ConvertTo-UtcDateTime $_; $ts -and $ts -ge $respawnFailWindowStart })
+        $rfRecent += (Now-Iso)
+        $respawnFailState | Add-Member -NotePropertyName $rn -NotePropertyValue ([pscustomobject]@{ attempts = @($rfRecent); lastReason = "$($rf.reason)" }) -Force
+        $respawnFailChanged = $true
+        if ($rfRecent.Count -ge $retryCap) { $respawnFailTrips += [pscustomobject]@{ name = $rn; failures = $rfRecent.Count; reason = "$($rf.reason)" } }
+        else { $waiting += [pscustomobject]@{ name = $rn; kind = 'respawn-failed'; detail = "no-op respawn ($($rf.reason)); attempt $($rfRecent.Count)/$retryCap before this trips launch-retry" } }
+      }
+      if ($respawnFailChanged) {
+        try { $rfTmp = "$respawnFailPath.tmp"; Write-Json $rfTmp $respawnFailState; Move-Item -Force $rfTmp $respawnFailPath } catch {}
+      }
     }
   }
 
@@ -779,6 +787,13 @@ try {
         }
         $healRespawnInvocations++
         $healRespawnReportPath = "$FleetHome\state\watchdog\last-heal-respawn.json"
+        # 2026-09-18 QA (review 2, MINOR): the report path was not cleared before
+        # the call, so a child that died before writing (crash, kill, a bug) left
+        # LAST TICK's report to be read as this tick's result - a stale success
+        # silently suppressed fleet-dead. Remove it first; a missing report after
+        # the call is unambiguously "this heal-respawn failed", never treated as
+        # unknown or (worse) a leftover success.
+        Remove-Item $healRespawnReportPath -ErrorAction SilentlyContinue
         $healRaw = ''; $healOut = $null
         # sentinel-check.ps1 prints its report with ConvertTo-Json -Depth 6 (no
         # -Compress) - a multi-line pretty JSON that ConvertFrom-LastJsonLine
@@ -787,7 +802,8 @@ try {
         # watchdog.ps1 already reads the main check's own report; stdout is
         # captured only for the failure-message fallback below.
         try { $healRaw = & "$PSScriptRoot\sentinel-check.ps1" -Apply -Actor watchdog -HealRespawn $healName -ReportPath $healRespawnReportPath 2>&1 | Out-String } catch {}
-        try { $healOut = Read-Json $healRespawnReportPath } catch {}
+        $healOut = $null
+        if (Test-Path $healRespawnReportPath) { try { $healOut = Read-Json $healRespawnReportPath } catch {} }
         $healOk = [bool]($healOut -and @($healOut.respawned | Where-Object { "$($_.name)" -eq $healName }).Count -gt 0)
         $healOutcome = if ($healOut) { $healOut } else { Get-OneLine $healRaw 200 }
         $healActuallyRan = $true   # the call was issued regardless of outcome (a no-op still counts, ticket 85)
@@ -1234,7 +1250,7 @@ try {
     checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; triageWakes = $triageWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
-    healStateUnreadable = [bool]$healStateUnreadable
+    healStateUnreadable = [bool]$healStateUnreadable; respawnFailStateUnreadable = [bool]$respawnFailStateUnreadable
     deadMan = $deadMan
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)
