@@ -688,7 +688,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $h2 = Run-Watchdog
   Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH2) 'a permission prompt must never be healed'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\heal.json")) 'a permission prompt must not even count as a heal attempt'
-  Assert-True (@($h2.healed).Count -eq 0) 'a permission prompt must not appear as healed on the shadow line'
+  # 2026-09-17 QA (fleet #84 review #5): a non-empty `needs` is now recorded on
+  # the shadow line WHY it was not healed (ok:false, action:none), not silently
+  # dropped - the ruling this implements is provisional pending Cory's own.
+  $h2Entry = @($h2.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h2Entry.Count -eq 1 -and $h2Entry[0].ok -eq $false -and $h2Entry[0].action -eq 'none' -and "$($h2Entry[0].reason)" -match 'needs is not empty') 'a permission prompt must be recorded as not healed, with the reason, never actually healed'
 
   # Case H3 (control): heartbeat 59 min (under the 60-min threshold) must not heal.
   Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
@@ -731,14 +735,180 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $h6 = Run-Watchdog
   Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH6) 'an IC heal must never go through rotate.ps1'
   $h6Heal = @($h6.healed | Where-Object { $_.name -eq 'ic-950' })
-  Assert-True ($h6Heal.Count -eq 1 -and $h6Heal[0].action -eq 'respawn') 'an IC heal must be reported as a respawn action'
+  # 2026-09-17 QA (fleet #85 review #6): the mock respawn always succeeding is
+  # not enough proof by itself (QA broke it and the suite stayed green because
+  # nothing asserted `ok`) - also read last-heal-respawn.json (the -HealRespawn
+  # call's own report) to prove the mock was actually invoked, and with ic-950's
+  # name specifically.
+  Assert-True ($h6Heal.Count -eq 1 -and $h6Heal[0].action -eq 'respawn' -and $h6Heal[0].ok -eq $true) 'an IC heal must be reported as a successful respawn action'
+  $h6RespawnReport = Get-Content "$testRoot\state\watchdog\last-heal-respawn.json" -Raw | ConvertFrom-Json
+  Assert-True (@($h6RespawnReport.respawned | Where-Object { $_.name -eq 'ic-950' }).Count -eq 1) 'the heal-respawn call must have actually respawned ic-950'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  # Case H7 (2026-09-17 QA, fleet #84 review #5, ruling pending Cory's own): a
+  # non-empty needs ("waiting for user input" - an AskUserQuestion or a plain
+  # human wait, `^approve ` alone does not cover it), a missing needs key, and
+  # an unreadable job state must all NOT heal, each recorded with its own reason.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  $blockedPlRowH7 = $plRow.Replace('"state":"working"', '"state":"blocked"')
+  Set-AgentsRows "[$dispRow,$blockedPlRowH7]"
+  Set-Heartbeat 'pl-test' 61
+
+  Write-Utf8 $jobPStatePath '{"needs":"waiting for user input","updatedAt":"2026-01-01T00:00:00Z"}'
+  $rotateCountBeforeH7a = @(Get-RotateCalls).Count
+  $h7a = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7a) '"waiting for user input" must not be healed'
+  $h7aEntry = @($h7a.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h7aEntry.Count -eq 1 -and $h7aEntry[0].ok -eq $false -and "$($h7aEntry[0].reason)" -match 'needs is not empty') 'the reason must name the non-empty needs'
+
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $jobPStatePath '{"updatedAt":"2026-01-01T00:00:00Z"}'
+  $rotateCountBeforeH7b = @(Get-RotateCalls).Count
+  $h7b = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7b) 'a missing needs key must not be healed'
+  $h7bEntry = @($h7b.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h7bEntry.Count -eq 1 -and $h7bEntry[0].ok -eq $false -and "$($h7bEntry[0].reason)" -match 'no needs key') 'the reason must name the missing needs key'
+
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $jobPStatePath '{oops'
+  $rotateCountBeforeH7c = @(Get-RotateCalls).Count
+  $h7c = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7c) 'an unreadable job state must not be healed'
+  $h7cEntry = @($h7c.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h7cEntry.Count -eq 1 -and $h7cEntry[0].ok -eq $false -and "$($h7cEntry[0].reason)" -match 'unreadable') 'the reason must name the unreadable job state'
+
+  # Case H8 (fleet #84 review #7): a session with NO heartbeat file at all reads
+  # as stale for healing too (matching fleet-dead's own treatment of "never
+  # seen"), not skipped.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+  Remove-Item "$testRoot\state\heartbeats\pl-test.json" -ErrorAction SilentlyContinue
+  $rotateHealCountBeforeH8 = @(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count
+  $h8 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count -eq $rotateHealCountBeforeH8 + 1) 'a missing heartbeat must be healed as stale'
+  Set-Heartbeat 'pl-test' 61
+
+  # Case H9 (fleet #84 review #8): a corrupt heal.json must fail toward NOT
+  # healing (never a silently reset cap) and be recorded on the shadow line.
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\watchdog\heal.json" '{oops'
+  $rotateCountBeforeH9 = @(Get-RotateCalls).Count
+  $h9 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH9) 'a corrupt heal.json must heal nothing this tick'
+  Assert-True ($h9.healStateUnreadable -eq $true) 'a corrupt heal.json must be recorded as unreadable on the shadow line'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\heal.json" -Raw) -eq '{oops') 'a corrupt heal.json must not be silently reset or overwritten'
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+
+  # Case H10 (fleet #84 review #4): rotate.ps1 refusing (PAUSE, rotation-off, or
+  # a deferred safe boundary - MOCK_ROTATE_DEFER stands in for all three) must
+  # not count as an attempt; it is recorded, with its reason, and never counted.
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  $env:MOCK_ROTATE_DEFER = '1'
+  $h10 = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_DEFER
+  $h10Entry = @($h10.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h10Entry.Count -eq 1 -and $h10Entry[0].refused -eq $true) 'a deferred rotate must be recorded as refused'
+  Assert-True (-not (Test-Path "$testRoot\state\watchdog\heal.json")) 'a refused rotate must not count as an attempt'
+
+  # Case H11 (fleet #84 review #3): a heal that succeeds THIS tick must not also
+  # raise fleet-dead in the same tick - counts as fresh. Pre-seeded with one
+  # prior attempt each (healCap is 2) so this tick is their LAST allowed heal;
+  # the next tick is capped and the same staleness pages fleet-dead normally.
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-d") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-d\state.json" '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+  Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+  $blockedDispH11 = $dispRow.Replace('"state":"working"', '"state":"blocked"')
+  $blockedPlH11 = $plRow.Replace('"state":"working"', '"state":"blocked"')
+  Set-AgentsRows "[$blockedDispH11,$blockedPlH11]"
+  foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 61 }
+  $healSeedAt = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+  Write-Utf8 "$testRoot\state\watchdog\heal.json" ('{"dispatcher":{"attempts":["' + $healSeedAt + '"],"lastAction":"rotate","lastOk":true,"lastAt":"' + $healSeedAt + '"},"pl-test":{"attempts":["' + $healSeedAt + '"],"lastAction":"rotate","lastOk":true,"lastAt":"' + $healSeedAt + '"}}')
+  $h11a = Run-Watchdog
+  Assert-True (@($h11a.healed | Where-Object { $_.ok -eq $true }).Count -eq 2) 'both blocked+stale statics must heal this tick (their last allowed attempt)'
+  Assert-True (-not (@($h11a.conditions) -contains 'fleet-dead')) 'a tick that healed must not also page fleet-dead'
+  $h11b = Run-Watchdog
+  Assert-True (@($h11b.healed | Where-Object { $_.ok -eq $true }).Count -eq 0) 'a capped session must heal no more'
+  Assert-True (@($h11b.conditions) -contains 'fleet-dead') 'once healing is capped, the same staleness must page fleet-dead'
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
+  # Case H12 (fleet #84 review #13): in shadow mode, the heal decision is
+  # PROPOSED (recorded on the shadow line) without acting - rotate.ps1 is never
+  # called and heal.json is never written.
+  Remove-Item "$testRoot\state\flags\sentinel-off" -ErrorAction SilentlyContinue
+  $blockedPlH12 = $plRow.Replace('"state":"working"', '"state":"blocked"')
+  Set-AgentsRows "[$dispRow,$blockedPlH12]"
+  Set-Heartbeat 'pl-test' 61
+  $rotateCountBeforeH12 = @(Get-RotateCalls).Count
+  $h12 = Run-Watchdog
+  Assert-True ($h12.mode -eq 'shadow') 'this case must run in shadow to test proposal-only healing'
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH12) 'shadow must never call rotate.ps1'
+  Assert-True (-not (Test-Path "$testRoot\state\watchdog\heal.json")) 'shadow must never write heal.json'
+  $h12Entry = @($h12.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h12Entry.Count -eq 1 -and $h12Entry[0].proposed -eq $true -and $h12Entry[0].action -eq 'rotate') 'shadow must propose the heal action on the shadow line'
+  Write-Utf8 "$testRoot\state\flags\sentinel-off" 'restored after the shadow heal-proposal case'
 
   Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\last-heal-respawn.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
   Set-AgentsRows $healthyRows
   foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }
+  $null = Run-Watchdog
+
+  # ===== 2026-09-17 QA (fleet #85 review BLOCKER): a no-op respawn must feed =====
+  # ===== the launch-retry cap exactly as a genuinely failed launch does =====
+  Set-AgentsRows $noSentinelRows
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
+  $null = Run-Watchdog
+  Set-Heartbeat 'dispatcher' 130   # past the 120-min stale-heartbeat-respawn threshold
+  $env:MOCK_RESPAWN_NOOP = '1'
+  $h13a = Run-Watchdog
+  Assert-True (-not (@($h13a.conditions) -contains 'launch-retry:dispatcher')) 'the first no-op respawn must not yet trip launch-retry'
+  Assert-True (@($h13a.waiting | Where-Object { $_.name -eq 'dispatcher' -and $_.kind -eq 'respawn-failed' }).Count -eq 1) 'the first failure must be recorded as waiting'
+  $h13b = Run-Watchdog
+  Remove-Item Env:MOCK_RESPAWN_NOOP
+  Assert-True (@($h13b.conditions) -contains 'launch-retry:dispatcher') 'the second no-op respawn must trip launch-retry:dispatcher'
+  $h13Entry = @($h13b.newlyPaged | Where-Object { $_.key -eq 'launch-retry:dispatcher' })[0]
+  Assert-True ($null -ne $h13Entry -and $h13Entry.priority -eq 'high') 'launch-retry must resolve to high priority and page once'
+  Remove-Item "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Set-Heartbeat 'dispatcher' 5
+  $null = Run-Watchdog
+
+  # ===== 2026-09-17 QA (fleet #85 review #2): the verify wait is bounded per =====
+  # ===== session AND capped per tick - three wedged statics must not cost 3x =====
+  # ===== the wait, and only the cap (2) are actually attempted this tick =====
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"},{"name":"pl-extra","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+  $wedgeStart = (Get-Date).AddHours(-3)
+  $wedgedRows = '[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + (Get-EpochMs $wedgeStart) + '},{"id":"job-pe2","name":"pl-extra","state":"working","status":"idle","pid":15,"startedAt":' + (Get-EpochMs $wedgeStart) + '}]'
+  Set-AgentsRows $wedgedRows
+  foreach ($n in 'dispatcher','pl-test','pl-extra') { Set-Heartbeat $n 130 }
+  $env:MOCK_RESPAWN_NOOP = '1'
+  $oldVerifyMs14 = $env:FLEET_RESPAWN_VERIFY_MS
+  $env:FLEET_RESPAWN_VERIFY_MS = '300'
+  $h14Start = Get-Date
+  $h14 = Run-Watchdog
+  $h14Elapsed = ((Get-Date) - $h14Start).TotalSeconds
+  $env:FLEET_RESPAWN_VERIFY_MS = $oldVerifyMs14
+  Remove-Item Env:MOCK_RESPAWN_NOOP
+  Assert-True ($h14Elapsed -lt 15) "three wedged statics must not cost 3x the verify wait (took $([int]$h14Elapsed)s)"
+  $h14Report = Get-Content "$testRoot\state\sentinel\last-check.json" -Raw | ConvertFrom-Json
+  Assert-True (@($h14Report.respawnFailed).Count -eq 2) 'only the verify cap (2) may actually attempt respawn this tick'
+  Assert-True (@($h14Report.respawnDeferred).Count -eq 1) 'the third wedged static must be deferred, not attempted'
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+  Set-AgentsRows $healthyRows
+  foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
 
   # ===== ADR 0011 (fleet #38): the triage wake =====
