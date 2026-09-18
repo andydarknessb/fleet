@@ -119,15 +119,6 @@ try {
 
   # --- ticket 81 (ADR 0012): a passed date, in config or on a Notice, pages once
   # --- (normal priority) and clears when the key or paragraph goes.
-  function Get-ShortHash {
-    # A short, stable id for a Notice paragraph's dedupe key: content-based (not
-    # a file-position index) so reordering paragraphs never reshuffles which one
-    # is "new" to page.
-    param([string]$Text)
-    $md5 = [System.Security.Cryptography.MD5]::Create()
-    try { $hashBytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)) } finally { $md5.Dispose() }
-    return ([BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, 8).ToLowerInvariant()
-  }
   function Find-ExpiredUntilKeys {
     # Walks a parsed JSON object (config/cycle.json) recursively for any property
     # whose name ends in "Until" (case-sensitive: camelCase config keys) and whose
@@ -142,7 +133,11 @@ try {
     if ($Obj -is [System.Management.Automation.PSCustomObject]) {
       foreach ($prop in $Obj.PSObject.Properties) {
         $childPath = if ($Path) { "$Path.$($prop.Name)" } else { "$($prop.Name)" }
-        if ("$($prop.Name)".EndsWith('Until') -and ($prop.Value -is [string])) {
+        # 2026-09-17 QA (fleet #81 review #9): [datetime]::TryParse accepts far more
+        # than a date - "1.5" parses as a valid (if bizarre) date/time and false-paged.
+        # An ISO date shape gate before ever trying to parse keeps this to what
+        # `*Until` config values are actually meant to hold.
+        if ("$($prop.Name)".EndsWith('Until') -and ($prop.Value -is [string]) -and ("$($prop.Value)" -match '^\d{4}-\d{2}-\d{2}')) {
           $parsed = [datetime]::MinValue
           if ([datetime]::TryParse("$($prop.Value)", [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$parsed)) {
             if ($now.Date -gt $parsed.ToUniversalTime().Date) { $found += [pscustomobject]@{ where = $childPath; value = "$($prop.Value)" } }
@@ -160,16 +155,30 @@ try {
     # still in the file - the identical regex and past-date rule
     # hooks/session-start.ps1 uses to drop an expired paragraph from context.
     # This function only READS; it never edits or clears the notice itself.
+    #
+    # 2026-09-17 QA (fleet #81 review #3): keying on a hash of the WHOLE paragraph
+    # meant editing one character of a still-expired paragraph (a typo fix, a
+    # clarifying sentence) changed its key, so the old key read as "cleared" and
+    # the new one paged again - live state/notices/project-lead.md already carries
+    # two expired paragraphs today, both one edit away from a false page. Key on
+    # the file, the [until] date itself, and this paragraph's ordinal among
+    # paragraphs sharing that same date in that file: stable across edits that
+    # leave the date and the paragraph's position alone, still distinct from a
+    # same-file, same-date paragraph the file doesn't reorder relative to it.
     $found = @()
     foreach ($noticeFile in @(Get-ChildItem "$FleetHome\state\notices" -Filter *.md -ErrorAction SilentlyContinue)) {
       $raw = ''; try { $raw = Get-Content $noticeFile.FullName -Raw -Encoding UTF8 } catch { continue }
       if (-not $raw -or -not $raw.Trim()) { continue }
+      $ordinalByDate = @{}
       foreach ($para in (($raw -replace "`r`n", "`n") -split '\n\s*\n')) {
         $p = $para.Trim(); if (-not $p) { continue }
         if ($p -notmatch '\[until (\d{4}-\d{2}-\d{2})\]') { continue }
+        $dateStr = $Matches[1]
         $limit = [datetime]::MinValue
-        if (-not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$limit)) { continue }
-        if ($now.Date -gt $limit.Date) { $found += [pscustomobject]@{ where = "notice:$($noticeFile.Name):$(Get-ShortHash $p)"; value = $Matches[1] } }
+        if (-not [datetime]::TryParseExact($dateStr, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$limit)) { continue }
+        $ordinal = 0; if ($ordinalByDate.ContainsKey($dateStr)) { $ordinal = $ordinalByDate[$dateStr] }
+        $ordinalByDate[$dateStr] = $ordinal + 1
+        if ($now.Date -gt $limit.Date) { $found += [pscustomobject]@{ where = "notice:$($noticeFile.Name):$dateStr#$ordinal"; value = $dateStr } }
       }
     }
     return $found
@@ -208,6 +217,34 @@ try {
   # taken once above), so the second ask reuses the first's answer instead of
   # spending another assignment.js invocation (QA measured three serial calls
   # ballooning a tick to 61s against a 20s-blocking node shim).
+  # 2026-09-17 QA (fleet #81 review #2): the shared bound the planner call already
+  # used, extracted so the triage call below can reuse it instead of being a second,
+  # unbounded copy of the same Start-Process/WaitForExit/Kill shape.
+  function Invoke-BoundedExe {
+    param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec)
+    $result = [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = $null }
+    $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
+    try {
+      $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -PassThru -RedirectStandardOutput $childOut -RedirectStandardError $childErr
+      # 2026-09-17 QA repro: .NET only latches the exit-code plumbing once something
+      # touches the process handle; skip this and a fast-exiting child's .ExitCode
+      # reads back $null even on a clean exit (triage.js exits well under a second
+      # against a fixture, and this cost the triage wake test its evidence entirely).
+      $null = $p.Handle
+      if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        try { $p.Kill() } catch {}
+        $result.timedOut = $true
+      } else {
+        $result.exitCode = $p.ExitCode
+      }
+    } catch { $result.startError = "$($_.Exception.Message)" }
+    finally {
+      try { $result.stdout = Get-Content $childOut -Raw -ErrorAction SilentlyContinue } catch {}
+      try { $result.stderr = Get-Content $childErr -Raw -ErrorAction SilentlyContinue } catch {}
+      Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue
+    }
+    return $result
+  }
   $script:frontierWaitingCache = @{}
   function Test-FrontierWaiting {
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
@@ -217,30 +254,24 @@ try {
     $activeIcs = 0; if ($LiveRoster) { $activeIcs = @($LiveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $TenantName }).Count }
     $maxIcs = 0; try { $maxIcs = [int]$Tenant.maxIcs } catch {}
     if ($activeIcs -ge $maxIcs -or $LiveCount -ge $Cap) { $result.reason = "no slot (ICs $activeIcs/$maxIcs, cap $LiveCount/$Cap)"; $script:frontierWaitingCache[$TenantName] = $result; return $result }
-    # Bounded the way the sentinel-check child is bounded (Start-Process + WaitForExit
-    # + Kill, above): a wedged assignment.js (a hung gh call inside it) must not wedge
-    # the whole tick. A timeout is recorded as a planner failure - Test-WorkWaiting
-    # already fails CLOSED (toward paging) on $result.error, so a hung planner still
-    # pages rather than reading as a silent idle tick.
+    # Bounded (Invoke-BoundedExe: Start-Process + WaitForExit + Kill): a wedged
+    # assignment.js (a hung gh call inside it) must not wedge the whole tick. A
+    # timeout is recorded as a planner failure - Test-WorkWaiting already fails
+    # CLOSED (toward paging) on $result.error, so a hung planner still pages
+    # rather than reading as a silent idle tick.
     $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $TenantName)
     if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
-    $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
-    try {
-      $p = Start-Process -FilePath $NodeExe -ArgumentList (@("$PSScriptRoot\assignment.js") + $frontierArgs) -NoNewWindow -PassThru -RedirectStandardOutput $childOut -RedirectStandardError $childErr
-      if (-not $p.WaitForExit($frontierTimeoutSec * 1000)) {
-        try { $p.Kill() } catch {}
-        $result.error = "assignment.js timed out after ${frontierTimeoutSec}s and was killed"
-      } else {
-        $frontierRaw = ''; try { $frontierRaw = Get-Content $childOut -Raw -ErrorAction SilentlyContinue } catch {}
-        $frontier = ConvertFrom-LastJsonLine $frontierRaw
-        if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $frontierRaw 200)" }
-        else {
-          $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
-          if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
-        }
+    $bounded = Invoke-BoundedExe -FilePath $NodeExe -ArgumentList (@("$PSScriptRoot\assignment.js") + $frontierArgs) -TimeoutSec $frontierTimeoutSec
+    if ($bounded.startError) { $result.error = "assignment.js could not start: $(Get-OneLine $bounded.startError 200)" }
+    elseif ($bounded.timedOut) { $result.error = "assignment.js timed out after ${frontierTimeoutSec}s and was killed" }
+    else {
+      $frontier = ConvertFrom-LastJsonLine $bounded.stdout
+      if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $bounded.stdout 200)" }
+      else {
+        $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
+        if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
       }
-    } catch { $result.error = "assignment.js could not start: $(Get-OneLine $_.Exception.Message 200)" }
-    finally { Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue }
+    }
     $script:frontierWaitingCache[$TenantName] = $result
     return $result
   }
@@ -784,13 +815,21 @@ try {
       $frontier = $null
       if (-not $triageNode) { $twake.frontierError = 'node not found (FLEET_NODE_PATH or PATH)' }
       else {
-        try {
-          $triageArgs = @('frontier', '--root', $FleetHome, '--tenant', $tenantName)
-          if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $triageArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
-          $triageRaw = & $triageNode "$PSScriptRoot\triage.js" @triageArgs 2>&1 | Out-String
-          if ($LASTEXITCODE -ne 0) { $twake.frontierError = "triage.js exited $LASTEXITCODE`: $(Get-OneLine $triageRaw 200)" }
-          else { $frontier = ConvertFrom-LastJsonLine $triageRaw; if (-not $frontier) { $twake.frontierError = "triage.js returned no JSON: $(Get-OneLine $triageRaw 200)" } }
-        } catch { $twake.frontierError = "triage.js threw: $(Get-OneLine $_.Exception.Message 200)" }
+        # 2026-09-17 QA (fleet #81 review #2): this call used to be unbounded and ran
+        # BEFORE the PAUSE check below, so a wedged gh call stalled even a paused
+        # tick. Bounded the same way the assignment.js planner call is (shared
+        # Invoke-BoundedExe). The PAUSE check stays after it on purpose: this
+        # frontier feeds state/watchdog/triage-frontier.json, the shadow record Cory
+        # reads every tick (paused or not) to decide when to flip principal-live: it
+        # must stay fresh regardless of PAUSE. Bounding is what actually fixes the
+        # stall; reordering would just stop refreshing the shadow file while paused.
+        $triageArgs = @('frontier', '--root', $FleetHome, '--tenant', $tenantName)
+        if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $triageArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
+        $triageBounded = Invoke-BoundedExe -FilePath $triageNode -ArgumentList (@("$PSScriptRoot\triage.js") + $triageArgs) -TimeoutSec $frontierTimeoutSec
+        if ($triageBounded.startError) { $twake.frontierError = "triage.js could not start: $(Get-OneLine $triageBounded.startError 200)" }
+        elseif ($triageBounded.timedOut) { $twake.frontierError = "triage.js timed out after ${frontierTimeoutSec}s and was killed" }
+        elseif ($triageBounded.exitCode -ne 0) { $twake.frontierError = "triage.js exited $($triageBounded.exitCode)`: $(Get-OneLine (($triageBounded.stdout + ' ' + $triageBounded.stderr)) 200)" }
+        else { $frontier = ConvertFrom-LastJsonLine $triageBounded.stdout; if (-not $frontier) { $twake.frontierError = "triage.js returned no JSON: $(Get-OneLine $triageBounded.stdout 200)" } }
       }
       if ($frontier) {
         $twake.counts = $frontier.counts

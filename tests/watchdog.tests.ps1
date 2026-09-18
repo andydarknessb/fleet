@@ -805,6 +805,26 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6) 'an unreadable frontier must not rotate'
   $env:FLEET_TRIAGE_ISSUES_FIXTURE = $triageFixture
 
+  # Case T6b (2026-09-17 QA, fleet #81 review #2): the triage frontier call is
+  # bounded - previously unbounded and run BEFORE the PAUSE check below it, so a
+  # wedged gh call inside triage.js stalled even a PAUSED tick. Reuses the
+  # blocking node shim from the ticket 75-4 planner-boundedness case.
+  Write-Utf8 "$testRoot\state\PAUSE" 'reason=test; setAt=now; until='
+  Remove-Item "$testRoot\mock-bin\slow-node-calls.log" -ErrorAction SilentlyContinue
+  $oldNodePathT6b = $env:FLEET_NODE_PATH
+  $env:FLEET_NODE_PATH = "$testRoot\mock-bin\slow-node.cmd"
+  try {
+    $t6bStart = Get-Date
+    $t6b = Run-Watchdog
+    $t6bElapsed = ((Get-Date) - $t6bStart).TotalSeconds
+    Assert-True ($t6bElapsed -lt 20) "a wedged triage call must not stall a paused tick (took $([int]$t6bElapsed)s)"
+    $tw6b = @($t6b.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+    Assert-True ("$($tw6b.frontierError)" -match 'timed out') "a timed-out triage call must be recorded as a frontier failure (got $($tw6b.frontierError))"
+  } finally {
+    if ($oldNodePathT6b) { $env:FLEET_NODE_PATH = $oldNodePathT6b } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+
   # Case T7: state/flags/triage-wake-off disables the block entirely.
   Write-Utf8 "$testRoot\state\flags\triage-wake-off" 'x'
   $t7 = Run-Watchdog
@@ -1344,10 +1364,13 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@($dt2.newlyPaged).Count -eq 0) 'a standing dated condition must not page again'
   Assert-True (@($dt2.conditions) -contains 'dated:config.ic.soakUntil') 'it stays a condition while the key stands'
 
-  # Case DT3 (red-tell): removing the key clears the condition.
-  Remove-Item "$testRoot\config\cycle.json"
+  # Case DT3 (red-tell): removing just the key (not the whole config file) clears
+  # the condition - proving the key-removal path itself, not merely "config
+  # unreadable" as a side effect of deleting the file outright.
+  Write-Utf8 "$testRoot\config\cycle.json" '{"ic":{}}'
   $dt3 = Run-Watchdog
   Assert-True (-not (@($dt3.conditions) -contains 'dated:config.ic.soakUntil')) 'removing the key must clear the dated condition'
+  Remove-Item "$testRoot\config\cycle.json"
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   $null = Run-Watchdog
@@ -1356,6 +1379,17 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Write-Utf8 "$testRoot\config\cycle.json" '{"ic":{"soakUntil":"2099-01-01T00:00:00Z"}}'
   $dt4 = Run-Watchdog
   Assert-True (@(@($dt4.conditions) | Where-Object { $_ -like 'dated:*' }).Count -eq 0) 'a future *Until must not raise dated'
+  Remove-Item "$testRoot\config\cycle.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # Case DT4b (2026-09-17 QA #9, red-tell): a non-date string in a *Until key
+  # (`[datetime]::TryParse` accepts far more than a date - "1.5" parses as a
+  # bizarre but "valid" date/time) must not raise dated.
+  Write-Utf8 "$testRoot\config\cycle.json" '{"ic":{"soakUntil":"1.5"}}'
+  $dt4b = Run-Watchdog
+  Assert-True (@(@($dt4b.conditions) | Where-Object { $_ -like 'dated:*' }).Count -eq 0) '"1.5" must not be read as a passed date'
   Remove-Item "$testRoot\config\cycle.json"
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
@@ -1370,6 +1404,24 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\notices\all.md"
   $dt6 = Run-Watchdog
   Assert-True (@(@($dt6.conditions) | Where-Object { $_ -like 'dated:notice:*' }).Count -eq 0) 'removing the notice file must clear its dated condition'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # Case DT6b (2026-09-17 QA #3, red-tell): editing a word inside a still-expired
+  # notice paragraph must NOT read as a new condition (the old content-hash key
+  # changed on any edit, so the "old" key looked cleared and a wording fix paged
+  # again). Also proves two same-date paragraphs in one file get distinct keys.
+  Write-Utf8 "$testRoot\state\notices\all.md" ("Old policy retired. [until 2020-01-01]" + "`n`n" + "Another old note. [until 2020-01-01]")
+  $dt6b1 = Run-Watchdog
+  $dt6bKeys = @(@($dt6b1.conditions) | Where-Object { $_ -like 'dated:notice:all.md:*' })
+  Assert-True ($dt6bKeys.Count -eq 2) 'two same-date paragraphs in one file must raise two distinct dated conditions'
+  Write-Utf8 "$testRoot\state\notices\all.md" ("Old policy retired, now with a typo fixed. [until 2020-01-01]" + "`n`n" + "Another old note. [until 2020-01-01]")
+  $dt6b2 = Run-Watchdog
+  Assert-True (@($dt6b2.newlyPaged).Count -eq 0) 'editing a word in a still-expired paragraph must not read as a new condition'
+  $dt6bKeys2 = @(@($dt6b2.conditions) | Where-Object { $_ -like 'dated:notice:all.md:*' })
+  Assert-True ((($dt6bKeys2 | Sort-Object) -join ',') -eq (($dt6bKeys | Sort-Object) -join ',')) 'the same two keys must still stand after the edit'
+  Remove-Item "$testRoot\state\notices\all.md"
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   $null = Run-Watchdog
