@@ -883,6 +883,122 @@ try {
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   $null = Run-Watchdog
 
+  # ===== Ticket 81 (ADR 0012): dead-man ping every tick; passed dates page once =====
+  function Start-MockDeadMan {
+    # A local HttpListener standing in for the off-host dead-man service,
+    # answering every GET with 200 (the shape Start-MockPushover already uses
+    # for POSTs in tests/page.tests.ps1, adapted to a plain GET).
+    param([string]$LogPath, [int]$Count = 20)
+    $port = Get-Random -Minimum 20000 -Maximum 40000
+    $prefix = "http://127.0.0.1:$port/"
+    $job = Start-Job -ScriptBlock {
+      param($Prefix, $LogPath, $RequestCount)
+      $listener = New-Object System.Net.HttpListener
+      $listener.Prefixes.Add($Prefix)
+      $listener.Start()
+      for ($i = 0; $i -lt $RequestCount; $i++) {
+        $context = $listener.GetContext()
+        Add-Content -Path $LogPath -Value $context.Request.HttpMethod
+        $buffer = [Text.Encoding]::UTF8.GetBytes('ok')
+        $context.Response.ContentLength64 = $buffer.Length
+        $context.Response.OutputStream.Write($buffer, 0, $buffer.Length)
+        $context.Response.OutputStream.Close()
+      }
+      $listener.Stop()
+    } -ArgumentList $prefix, $LogPath, $Count
+    Start-Sleep -Milliseconds 400
+    return [pscustomobject]@{ Job = $job; Prefix = $prefix }
+  }
+
+  $dmLog = Join-Path $testRoot 'deadman-requests.log'
+  [IO.File]::WriteAllText($dmLog, '')
+  $dmMock = Start-MockDeadMan -LogPath $dmLog -Count 20
+  [IO.Directory]::CreateDirectory("$testRoot\state\pages") | Out-Null
+  Write-Utf8 "$testRoot\state\pages\deadman.url" $dmMock.Prefix
+
+  try {
+    # Case DM1 (red-tell): a normal tick pings the dead-man exactly once.
+    $dm1 = Run-Watchdog
+    Assert-True ($dm1.deadMan.configured -eq $true -and $dm1.deadMan.ok -eq $true) "a configured deadman.url must ping successfully (got $($dm1.deadMan | ConvertTo-Json -Compress))"
+    Assert-True (@(Get-Content $dmLog | Where-Object { $_ }).Count -eq 1) 'exactly one GET must reach the dead-man per tick'
+
+    # Case DM2 (red-tell): PAUSE does not suppress the ping - one more GET.
+    Write-Utf8 "$testRoot\state\PAUSE" 'reason=test; setAt=now; until='
+    $dm2 = Run-Watchdog
+    Remove-Item "$testRoot\state\PAUSE"
+    Assert-True ($dm2.deadMan.ok -eq $true) 'the ping must still succeed under PAUSE'
+    Assert-True (@(Get-Content $dmLog | Where-Object { $_ }).Count -eq 2) 'PAUSE must not suppress the dead-man ping'
+
+    # Case DM3: -Verify still pings; only fleet-state writes and toasts are skipped under -Verify.
+    $dm3 = Run-Watchdog -Verify
+    Assert-True ($dm3.deadMan.ok -eq $true) '-Verify must still ping the dead-man'
+    Assert-True (@(Get-Content $dmLog | Where-Object { $_ }).Count -eq 3) '-Verify pings too'
+
+    # Case DM4: an absent deadman.url is recorded, never thrown, and attempts no GET.
+    Remove-Item "$testRoot\state\pages\deadman.url"
+    $dm4 = Run-Watchdog
+    Assert-True ($dm4.deadMan.configured -eq $false -and $null -eq $dm4.deadMan.ok) 'an absent deadman.url must be recorded, not thrown'
+    Assert-True (@(Get-Content $dmLog | Where-Object { $_ }).Count -eq 3) 'no GET is attempted when unconfigured'
+    Write-Utf8 "$testRoot\state\pages\deadman.url" $dmMock.Prefix
+  } finally {
+    if ($dmMock -and $dmMock.Job) { Stop-Job $dmMock.Job -ErrorAction SilentlyContinue; Remove-Job $dmMock.Job -Force -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\state\pages\deadman.url" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # --- dated:<where>: a passed date in config/cycle.json under a key ending in "Until".
+  # Case DT1 (red-tell): a soakUntil that passed raises dated:config.ic.soakUntil once.
+  Write-Utf8 "$testRoot\config\cycle.json" '{"ic":{"soakUntil":"2026-09-16T00:00:00Z"}}'
+  $dt1 = Run-Watchdog
+  Assert-True (@($dt1.conditions) -contains 'dated:config.ic.soakUntil') 'an expired *Until config key must raise a dated condition'
+  $dt1Entry = @($dt1.newlyPaged | Where-Object { $_.key -eq 'dated:config.ic.soakUntil' })[0]
+  Assert-True ($null -ne $dt1Entry -and $dt1Entry.priority -eq 'normal') 'a dated condition is normal priority'
+
+  # Case DT2: standing, no repeat page (dated is not fleet-dead; it never repeats).
+  $dt2 = Run-Watchdog
+  Assert-True (@($dt2.newlyPaged).Count -eq 0) 'a standing dated condition must not page again'
+  Assert-True (@($dt2.conditions) -contains 'dated:config.ic.soakUntil') 'it stays a condition while the key stands'
+
+  # Case DT3 (red-tell): removing the key clears the condition.
+  Remove-Item "$testRoot\config\cycle.json"
+  $dt3 = Run-Watchdog
+  Assert-True (-not (@($dt3.conditions) -contains 'dated:config.ic.soakUntil')) 'removing the key must clear the dated condition'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # Case DT4: a future *Until (not yet passed) must not raise a condition.
+  Write-Utf8 "$testRoot\config\cycle.json" '{"ic":{"soakUntil":"2099-01-01T00:00:00Z"}}'
+  $dt4 = Run-Watchdog
+  Assert-True (@(@($dt4.conditions) | Where-Object { $_ -like 'dated:*' }).Count -eq 0) 'a future *Until must not raise dated'
+  Remove-Item "$testRoot\config\cycle.json"
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # Case DT5: an expired [until YYYY-MM-DD] paragraph on a Notice board also raises dated,
+  # and clears when the file (or the paragraph) is gone.
+  [IO.Directory]::CreateDirectory("$testRoot\state\notices") | Out-Null
+  Write-Utf8 "$testRoot\state\notices\all.md" 'Old policy retired. [until 2020-01-01]'
+  $dt5 = Run-Watchdog
+  Assert-True (@(@($dt5.conditions) | Where-Object { $_ -like 'dated:notice:all.md:*' }).Count -eq 1) 'an expired notice paragraph must raise a dated condition'
+  Remove-Item "$testRoot\state\notices\all.md"
+  $dt6 = Run-Watchdog
+  Assert-True (@(@($dt6.conditions) | Where-Object { $_ -like 'dated:notice:*' }).Count -eq 0) 'removing the notice file must clear its dated condition'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
+  # Case DT7: the real config/cycle.json names `dated` (ticket 81 renamed the
+  # `passed-date` placeholder #76 keyed before this kind existed) at normal
+  # priority, and no longer carries the dead placeholder.
+  $realConfig = Get-Content "$sourceRoot\config\cycle.json" -Raw | ConvertFrom-Json
+  Assert-True (@($realConfig.pages.priority.PSObject.Properties.Name) -contains 'dated') "config/cycle.json pages.priority must name 'dated'"
+  Assert-True (-not (@($realConfig.pages.priority.PSObject.Properties.Name) -contains 'passed-date')) 'the passed-date placeholder must not remain now that dated: is real'
+  Assert-True ("$($realConfig.pages.priority.dated)" -eq 'normal') "the real config's dated priority must be normal"
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath

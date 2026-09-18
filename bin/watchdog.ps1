@@ -44,6 +44,7 @@ try {
   $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
   $fleetDeadRepeatMinutes = 120   # ticket 78: pages.fleetDeadRepeatMinutes, default 120 (two hours)
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatMinutes'] -and $pagesConfig.fleetDeadRepeatMinutes) { $fleetDeadRepeatMinutes = [int]$pagesConfig.fleetDeadRepeatMinutes }
+  $fullCycleConfig = $null; try { $fullCycleConfig = Read-Json "$FleetHome\config\cycle.json" } catch {}   # ticket 81: recursive scan for keys ending in Until
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
@@ -108,6 +109,83 @@ try {
     }
     if ($best) { return $best }
     return $default
+  }
+
+  # --- ticket 81 (ADR 0012): a passed date, in config or on a Notice, pages once
+  # --- (normal priority) and clears when the key or paragraph goes.
+  function Get-ShortHash {
+    # A short, stable id for a Notice paragraph's dedupe key: content-based (not
+    # a file-position index) so reordering paragraphs never reshuffles which one
+    # is "new" to page.
+    param([string]$Text)
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try { $hashBytes = $md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)) } finally { $md5.Dispose() }
+    return ([BitConverter]::ToString($hashBytes) -replace '-', '').Substring(0, 8).ToLowerInvariant()
+  }
+  function Find-ExpiredUntilKeys {
+    # Walks a parsed JSON object (config/cycle.json) recursively for any property
+    # whose name ends in "Until" (case-sensitive: camelCase config keys) and whose
+    # string value parses as a UTC date strictly before today - the same
+    # date-only "passed" rule hooks/session-start.ps1 already uses for
+    # `[until YYYY-MM-DD]` notice paragraphs. $Path accumulates the dotted key
+    # path the condition names as its `where`. A value that is not a string, or
+    # does not parse as a date, is not a date field: skipped, not an error.
+    param($Obj, [string]$Path)
+    $found = @()
+    if ($null -eq $Obj) { return $found }
+    if ($Obj -is [System.Management.Automation.PSCustomObject]) {
+      foreach ($prop in $Obj.PSObject.Properties) {
+        $childPath = if ($Path) { "$Path.$($prop.Name)" } else { "$($prop.Name)" }
+        if ("$($prop.Name)".EndsWith('Until') -and ($prop.Value -is [string])) {
+          $parsed = [datetime]::MinValue
+          if ([datetime]::TryParse("$($prop.Value)", [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$parsed)) {
+            if ($now.Date -gt $parsed.ToUniversalTime().Date) { $found += [pscustomobject]@{ where = $childPath; value = "$($prop.Value)" } }
+          }
+        }
+        $found += (Find-ExpiredUntilKeys -Obj $prop.Value -Path $childPath)
+      }
+    } elseif ($Obj -is [array] -or ($Obj -is [Collections.IList])) {
+      for ($i = 0; $i -lt $Obj.Count; $i++) { $found += (Find-ExpiredUntilKeys -Obj $Obj[$i] -Path "$Path[$i]") }
+    }
+    return $found
+  }
+  function Find-ExpiredNoticeDates {
+    # state/notices/*.md paragraphs whose [until YYYY-MM-DD] has passed and is
+    # still in the file - the identical regex and past-date rule
+    # hooks/session-start.ps1 uses to drop an expired paragraph from context.
+    # This function only READS; it never edits or clears the notice itself.
+    $found = @()
+    foreach ($noticeFile in @(Get-ChildItem "$FleetHome\state\notices" -Filter *.md -ErrorAction SilentlyContinue)) {
+      $raw = ''; try { $raw = Get-Content $noticeFile.FullName -Raw -Encoding UTF8 } catch { continue }
+      if (-not $raw -or -not $raw.Trim()) { continue }
+      foreach ($para in (($raw -replace "`r`n", "`n") -split '\n\s*\n')) {
+        $p = $para.Trim(); if (-not $p) { continue }
+        if ($p -notmatch '\[until (\d{4}-\d{2}-\d{2})\]') { continue }
+        $limit = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$limit)) { continue }
+        if ($now.Date -gt $limit.Date) { $found += [pscustomobject]@{ where = "notice:$($noticeFile.Name):$(Get-ShortHash $p)"; value = $Matches[1] } }
+      }
+    }
+    return $found
+  }
+  function Send-DeadManPing {
+    # Ticket 81 (ADR 0012): the off-host dead-man service pages Cory when these
+    # pings stop, so this must run at the end of EVERY tick - PAUSE or not - and
+    # never fail the tick. state/pages/deadman.url is not committed and Cory has
+    # not necessarily written it yet: absent file, empty content, or a failed GET
+    # are all recorded here and never thrown. Read fresh every tick (not cached)
+    # in case Cory rotates the URL. 5s timeout: this must never be the thing that
+    # makes a tick slow.
+    $result = [pscustomobject]@{ configured = $false; ok = $null; error = $null }
+    $urlPath = "$FleetHome\state\pages\deadman.url"
+    if (-not (Test-Path $urlPath)) { return $result }
+    $url = ''
+    try { $url = (Get-Content $urlPath -Raw -Encoding UTF8).Trim() } catch { $result.error = "deadman.url unreadable: $(Get-OneLine $_.Exception.Message 150)"; return $result }
+    if (-not $url) { return $result }
+    $result.configured = $true
+    try { $null = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 5; $result.ok = $true }
+    catch { $result.ok = $false; $result.error = Get-OneLine $_.Exception.Message 150 }
+    return $result
   }
 
   # --- ticket 75 (ADR 0012): the two predicates the frontier wake already asked,
@@ -643,6 +721,15 @@ try {
   foreach ($ev in ($tripEvals | Where-Object { $_.page })) {
     $conditions += [pscustomobject]@{ key = "launch-retry:$($ev.name)"; kind = 'launch-retry'; detail = "$($ev.failures) consecutive failed launches of $($ev.name) (latest job $($ev.latestJob): $($ev.detail)); $($ev.disposition)"; url = $null }
   }
+  # Ticket 81 (ADR 0012): a date that has passed, in config or on a Notice, is
+  # a condition of its own - normal priority, one page per key, cleared the
+  # moment the key or the paragraph is gone.
+  $datedItems = @()
+  if ($fullCycleConfig) { $datedItems += (Find-ExpiredUntilKeys -Obj $fullCycleConfig -Path 'config') }
+  $datedItems += (Find-ExpiredNoticeDates)
+  foreach ($d in $datedItems) {
+    $conditions += [pscustomobject]@{ key = "dated:$($d.where)"; kind = 'dated'; detail = "$($d.where) passed ($($d.value)) and is still in place"; url = $null }
+  }
 
   # --- page-once dedupe: a key pages when it appears; clearing and reappearing pages
   # --- again. A corrupt paged.json is quarantined, never fatal: the pager must not die
@@ -736,6 +823,14 @@ try {
     }
   }
 
+  # Ticket 81 (ADR 0012): the dead-man ping runs at the end of EVERY tick -
+  # PAUSE, -Verify, a live or a shadow run, all alike - because the only exit
+  # paths from this script's main body are this point and the crash handler
+  # below, and a fleet that goes silent BECAUSE it crashed is exactly what the
+  # dead-man service is for. It never fails the tick (Send-DeadManPing never
+  # throws) and is unconditional: no `if (-not $Verify)` guard here.
+  $deadMan = Send-DeadManPing
+
   # --- shadow log for the 08b parity comparison ---
   $proposed = $null
   if ($check) {
@@ -752,6 +847,7 @@ try {
     checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes; triageWakes = $triageWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
+    deadMan = $deadMan
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)
   if (-not $Verify) {
