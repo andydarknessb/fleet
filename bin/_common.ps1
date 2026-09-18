@@ -34,6 +34,34 @@ function Test-CapExempt { param([string]$Name) foreach ($p in (Get-CapExemptPref
 # must not crash because Cory hasn't wired his phone up. FLEET_PUSHOVER_URL overrides
 # the endpoint for tests (a local HttpListener).
 $script:PagePriorityValues = @{ emergency = 2; high = 1; normal = 0 }
+# Cory's ruling 2026-09-18 (fleet #76): Pushover's own guidance is one retry, after a
+# short wait, on a 5xx, a failed connection, or a timeout with no reply at all - never
+# on a 4xx (the request itself is wrong; retrying repeats the same rejection). Split
+# out so Send-FleetPage can call it once, then once more, without duplicating the
+# classify-and-post logic. $Response is $null for a connection failure or a timeout:
+# neither ever reached an HTTP status, so both default to retryable.
+function Invoke-FleetPagePost {
+  param($Endpoint, $Payload, [int]$TimeoutSec = 15)
+  try {
+    $null = Invoke-RestMethod -Uri $Endpoint -Method Post -Body $Payload -TimeoutSec $TimeoutSec
+    return [pscustomobject]@{ ok = $true; error = $null; retryable = $false }
+  } catch {
+    $statusCode = $null
+    $response = $null
+    try { $response = $_.Exception.Response } catch {}
+    if ($response -and $response.PSObject.Properties['StatusCode']) { try { $statusCode = [int]$response.StatusCode } catch {} }
+    $retryable = $true
+    if ($statusCode -and $statusCode -ge 400 -and $statusCode -lt 500) { $retryable = $false }
+    return [pscustomobject]@{ ok = $false; error = "$($_.Exception.Message)"; retryable = $retryable }
+  }
+}
+# The 5s wait is injectable (env FLEET_PAGE_RETRY_DELAY_MS, or -RetryDelayMs) so
+# tests/page.tests.ps1 does not pay the real delay for every retry case.
+function Get-FleetPageRetryDelayMs {
+  $ms = 5000
+  if ($env:FLEET_PAGE_RETRY_DELAY_MS) { try { $ms = [int]$env:FLEET_PAGE_RETRY_DELAY_MS } catch {} }
+  return $ms
+}
 function Send-FleetPage {
   param(
     [Parameter(Mandatory = $true)][string]$Kind,
@@ -42,7 +70,8 @@ function Send-FleetPage {
     [Parameter(Mandatory = $true)][ValidateSet('emergency', 'high', 'normal')][string]$Priority,
     [string]$Url = $null,
     $Detail = $null,
-    [switch]$NoToast
+    [switch]$NoToast,
+    [int]$RetryDelayMs = -1   # -1 = use Get-FleetPageRetryDelayMs (env or the 5s default)
   )
   # 2026-09-17 review (fleet #76): Pushover rejects title > 250 or message > 1024
   # chars with a 400, and the page is lost. Ticket 77 routes real condition detail
@@ -51,7 +80,7 @@ function Send-FleetPage {
   # toast, the POST and the pages.jsonl audit line all see.
   $Title = "$Title"; if ($Title.Length -gt 250) { $Title = $Title.Substring(0, 247) + '...' }
   $Body = "$Body"; if ($Body.Length -gt 1024) { $Body = $Body.Substring(0, 1021) + '...' }
-  $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; priority = $Priority; toast = $null; pushover = $null; pushoverError = $null }
+  $result = [ordered]@{ at = (Now-Iso); kind = $Kind; title = $Title; body = $Body; priority = $Priority; toast = $null; pushover = $null; pushoverError = $null; attempts = 0 }
   # -NoToast (tests) skips the toast only: Pushover and the audit line always run.
   if ($NoToast) { $result.toast = 'skipped' } else { try { $result.toast = Send-FleetToast $Title $Body } catch { $result.toast = $false } }
   # 2026-09-17 review (fleet #76): a malformed pushover.json (bad JSON) and a
@@ -79,10 +108,21 @@ function Send-FleetPage {
     # Pushover requires retry/expire only at priority 2 (emergency); any other
     # priority refuses the request if they are present at all.
     if ($priorityValue -eq 2) { $payload.retry = 120; $payload.expire = 7200 }
-    try {
-      $null = Invoke-RestMethod -Uri $endpoint -Method Post -Body $payload -TimeoutSec 15
-      $result.pushover = $true
-    } catch { $result.pushover = $false; $result.pushoverError = "$($_.Exception.Message)" }
+    # Cory's ruling 2026-09-18 (fleet #76): one retry, after a wait, on a 5xx, a
+    # failed connection, or a timeout with no reply - never on a 4xx. A duplicate
+    # Pushover delivery from a timed-out request that actually went through is
+    # acceptable (Pushover's own guidance). `attempts` (1 or 2) and the final
+    # result both land in the pages.jsonl audit line below unchanged.
+    $post = Invoke-FleetPagePost -Endpoint $endpoint -Payload $payload
+    $result.attempts = 1
+    if (-not $post.ok -and $post.retryable) {
+      $delayMs = if ($RetryDelayMs -ge 0) { $RetryDelayMs } else { Get-FleetPageRetryDelayMs }
+      Start-Sleep -Milliseconds $delayMs
+      $post = Invoke-FleetPagePost -Endpoint $endpoint -Payload $payload
+      $result.attempts = 2
+    }
+    $result.pushover = $post.ok
+    $result.pushoverError = $post.error
   }
   try {
     [IO.Directory]::CreateDirectory("$FleetHome\state\pages") | Out-Null

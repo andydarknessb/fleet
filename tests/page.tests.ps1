@@ -55,10 +55,15 @@ function ConvertFrom-FormBody {
   return $result
 }
 
+$oldRetryDelayMs = $env:FLEET_PAGE_RETRY_DELAY_MS
+
 try {
   foreach ($dir in 'bin', 'state/pages') { [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null }
   foreach ($f in '_common.ps1', 'send-page.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-123","user":"usr-456"}'
+  # Cory's ruling 2026-09-18 (fleet #76): Send-FleetPage waits 5s before its one
+  # retry - injectable so this suite does not pay that delay for real.
+  $env:FLEET_PAGE_RETRY_DELAY_MS = '50'
 
   $logPath = Join-Path $testRoot 'pushover-requests.log'
   [IO.File]::WriteAllText($logPath, '')
@@ -176,46 +181,97 @@ try {
     Start-Sleep -Milliseconds 400
     return [pscustomobject]@{ Job = $job; Prefix = $prefix }
   }
+  function Start-MockPushoverSequence {
+    # Answers a sequence of requests, one HTTP status per request in order, then
+    # stops - for asserting an exact retry count and per-attempt outcome (Cory's
+    # ruling 2026-09-18, fleet #76: one retry after a wait on a 5xx, a failed
+    # connection, or a timeout; never on a 4xx).
+    param([string]$LogPath, [int[]]$StatusCodes)
+    $port = Get-Random -Minimum 20000 -Maximum 40000
+    $prefix = "http://127.0.0.1:$port/"
+    $job = Start-Job -ScriptBlock {
+      param($Prefix, $LogPath, $Codes)
+      $listener = New-Object System.Net.HttpListener
+      $listener.Prefixes.Add($Prefix)
+      $listener.Start()
+      foreach ($code in $Codes) {
+        $context = $listener.GetContext()
+        $reader = New-Object IO.StreamReader($context.Request.InputStream, $context.Request.ContentEncoding)
+        $body = $reader.ReadToEnd(); $reader.Close()
+        Add-Content -Path $LogPath -Value $body
+        $context.Response.StatusCode = $code
+        $respBody = if ($code -eq 200) { '{"status":1,"request":"test"}' } else { '{"status":0,"errors":["denied"]}' }
+        $buffer = [Text.Encoding]::UTF8.GetBytes($respBody)
+        $context.Response.ContentLength64 = $buffer.Length
+        $context.Response.OutputStream.Write($buffer, 0, $buffer.Length)
+        $context.Response.OutputStream.Close()
+      }
+      $listener.Stop()
+    } -ArgumentList $prefix, $LogPath, $StatusCodes
+    Start-Sleep -Milliseconds 400
+    return [pscustomobject]@{ Job = $job; Prefix = $prefix }
+  }
 
   $statusMock = $null
   try {
-    # Case 10: HTTP 4xx (400, a rejected request) is a recorded failure, never a throw.
+    # Case 10 (red-tell, ruling 4): HTTP 4xx (400, a rejected request) is a
+    # recorded failure, never a throw, and is never retried - exactly one POST.
     $statusMock = Start-MockPushoverStatus -StatusCode 400
     $oldUrlForStatus = $env:FLEET_PUSHOVER_URL
     $env:FLEET_PUSHOVER_URL = $statusMock.Prefix
     $r10 = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body '4xx test' -Priority 'normal' -NoToast | ConvertFrom-Json
     Assert-True ($r10.pushover -eq $false -and "$($r10.pushoverError)" -ne '') 'an HTTP 4xx must record pushover:false with an error, never throw'
-    Stop-Job $statusMock.Job -ErrorAction SilentlyContinue; Remove-Job $statusMock.Job -Force -ErrorAction SilentlyContinue
-
-    # Case 11: HTTP 5xx (503, Pushover down) is a recorded failure, never a throw.
-    $statusMock = Start-MockPushoverStatus -StatusCode 503
-    $env:FLEET_PUSHOVER_URL = $statusMock.Prefix
-    $r11 = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body '5xx test' -Priority 'normal' -NoToast | ConvertFrom-Json
-    Assert-True ($r11.pushover -eq $false -and "$($r11.pushoverError)" -ne '') 'an HTTP 5xx must record pushover:false with an error, never throw'
+    Assert-True ($r10.attempts -eq 1) 'an HTTP 4xx must never retry - exactly one attempt'
     Stop-Job $statusMock.Job -ErrorAction SilentlyContinue; Remove-Job $statusMock.Job -Force -ErrorAction SilentlyContinue
     $statusMock = $null
 
-    # Case 12: connection refused (nothing listening on the port) is a recorded
-    # failure, never a throw.
+    # Case 11 (red-tell, ruling 4): a 503 then a 200 - one retry after the wait,
+    # delivered on the second attempt, exactly two real POSTs, attempts:2.
+    $seqLog503then200 = Join-Path $testRoot 'pushover-503-200.log'
+    [IO.File]::WriteAllText($seqLog503then200, '')
+    $seqMock1 = Start-MockPushoverSequence -LogPath $seqLog503then200 -StatusCodes @(503, 200)
+    $env:FLEET_PUSHOVER_URL = $seqMock1.Prefix
+    $r11 = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body '503 then 200 test' -Priority 'normal' -NoToast | ConvertFrom-Json
+    Assert-True ($r11.pushover -eq $true) 'a 503 then a 200 must eventually deliver'
+    Assert-True ($r11.attempts -eq 2) 'a 503 then a 200 must record two attempts'
+    Assert-True (@(Get-PostedBodies $seqLog503then200).Count -eq 2) 'a 503 then a 200 must produce exactly two POSTs'
+    Stop-Job $seqMock1.Job -ErrorAction SilentlyContinue; Remove-Job $seqMock1.Job -Force -ErrorAction SilentlyContinue
+
+    # Case 12 (red-tell, ruling 4): two consecutive 500s - one retry, still
+    # failed, exactly two real POSTs, pushover:false, attempts:2.
+    $seqLog500then500 = Join-Path $testRoot 'pushover-500-500.log'
+    [IO.File]::WriteAllText($seqLog500then500, '')
+    $seqMock2 = Start-MockPushoverSequence -LogPath $seqLog500then500 -StatusCodes @(500, 500)
+    $env:FLEET_PUSHOVER_URL = $seqMock2.Prefix
+    $r12 = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body '500 then 500 test' -Priority 'normal' -NoToast | ConvertFrom-Json
+    Assert-True ($r12.pushover -eq $false -and "$($r12.pushoverError)" -ne '') 'two consecutive 500s must record pushover:false with an error, never throw'
+    Assert-True ($r12.attempts -eq 2) 'two consecutive 500s must record two attempts'
+    Assert-True (@(Get-PostedBodies $seqLog500then500).Count -eq 2) 'two consecutive 500s must produce exactly two POSTs'
+    Stop-Job $seqMock2.Job -ErrorAction SilentlyContinue; Remove-Job $seqMock2.Job -Force -ErrorAction SilentlyContinue
+
+    # Case 13 (red-tell, ruling 4): connection refused (nothing listening on
+    # the port) is a recorded failure, never a throw, and retries once - two attempts.
     $refusedPort = Get-Random -Minimum 20000 -Maximum 40000
     $env:FLEET_PUSHOVER_URL = "http://127.0.0.1:$refusedPort/"
-    $r12 = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body 'connection refused test' -Priority 'normal' -NoToast | ConvertFrom-Json
-    Assert-True ($r12.pushover -eq $false -and "$($r12.pushoverError)" -ne '') 'a refused connection must record pushover:false with an error, never throw'
+    $r13Refused = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body 'connection refused test' -Priority 'normal' -NoToast | ConvertFrom-Json
+    Assert-True ($r13Refused.pushover -eq $false -and "$($r13Refused.pushoverError)" -ne '') 'a refused connection must record pushover:false with an error, never throw'
+    Assert-True ($r13Refused.attempts -eq 2) 'a refused connection must retry once, recording two attempts'
   } finally {
     if ($statusMock -and $statusMock.Job) { Stop-Job $statusMock.Job -ErrorAction SilentlyContinue; Remove-Job $statusMock.Job -Force -ErrorAction SilentlyContinue }
     if ($oldUrlForStatus) { $env:FLEET_PUSHOVER_URL = $oldUrlForStatus } else { $env:FLEET_PUSHOVER_URL = $mock.Prefix }
   }
 
-  # Case 13 (2026-09-17 QA, fleet #77 review #6): -Url reaches the actual POST.
-  $r13 = & "$testRoot\bin\send-page.ps1" -Kind 'escalation:ic-1:stray' -Title 'Fleet watchdog' -Body 'a stray session' -Priority 'normal' -Url 'C:\fleet\state\escalations\20260917T000000Z-supervisor-ic-1-stray.json' -NoToast | ConvertFrom-Json
-  Assert-True ($r13.pushover -eq $true) 'a page carrying -Url must still post to Pushover'
-  $form13 = ConvertFrom-FormBody (@(Get-PostedBodies $logPath) | Select-Object -Last 1)
-  Assert-True ($form13.url -eq 'C:\fleet\state\escalations\20260917T000000Z-supervisor-ic-1-stray.json') 'the -Url value must reach the actual Pushover POST'
+  # Case 14 (2026-09-17 QA, fleet #77 review #6): -Url reaches the actual POST.
+  $r14 = & "$testRoot\bin\send-page.ps1" -Kind 'escalation:ic-1:stray' -Title 'Fleet watchdog' -Body 'a stray session' -Priority 'normal' -Url 'C:\fleet\state\escalations\20260917T000000Z-supervisor-ic-1-stray.json' -NoToast | ConvertFrom-Json
+  Assert-True ($r14.pushover -eq $true) 'a page carrying -Url must still post to Pushover'
+  $form14 = ConvertFrom-FormBody (@(Get-PostedBodies $logPath) | Select-Object -Last 1)
+  Assert-True ($form14.url -eq 'C:\fleet\state\escalations\20260917T000000Z-supervisor-ic-1-stray.json') 'the -Url value must reach the actual Pushover POST'
 
   Write-Output 'page tests passed'
 } finally {
   if ($mockJob) { Stop-Job $mockJob -ErrorAction SilentlyContinue; Remove-Job $mockJob -Force -ErrorAction SilentlyContinue }
   if ($oldPushoverUrl) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  if ($oldRetryDelayMs) { $env:FLEET_PAGE_RETRY_DELAY_MS = $oldRetryDelayMs } else { Remove-Item Env:FLEET_PAGE_RETRY_DELAY_MS -ErrorAction SilentlyContinue }
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-page-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

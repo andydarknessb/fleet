@@ -12,6 +12,11 @@ $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-watchdog-test-" + [guid]::NewGuid().ToString('N'))
 $oldPath = $env:PATH
 $oldProfile = $env:USERPROFILE
+$oldRetryDelayMs = $env:FLEET_PAGE_RETRY_DELAY_MS
+# Cory's ruling 2026-09-18 (fleet #76): Send-FleetPage now waits 5s before its
+# one retry on a 5xx, a failed connection or a timeout - injectable so a
+# dead-port paging case in this suite does not pay that delay for real.
+$env:FLEET_PAGE_RETRY_DELAY_MS = '50'
 
 function Set-Heartbeat { param([string]$Name, [double]$AgeMinutes)
   $at = (Get-Date).ToUniversalTime().AddMinutes(-$AgeMinutes).ToString('o')
@@ -1754,6 +1759,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
+  if ($oldRetryDelayMs) { $env:FLEET_PAGE_RETRY_DELAY_MS = $oldRetryDelayMs } else { Remove-Item Env:FLEET_PAGE_RETRY_DELAY_MS -ErrorAction SilentlyContinue }
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   Remove-Item Env:MOCK_RESPAWN_NOOP -ErrorAction SilentlyContinue
