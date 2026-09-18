@@ -206,6 +206,12 @@ try {
     if ($oldUrlForStatus) { $env:FLEET_PUSHOVER_URL = $oldUrlForStatus } else { $env:FLEET_PUSHOVER_URL = $mock.Prefix }
   }
 
+  # Case 13 (2026-09-17 QA, fleet #77 review #6): -Url reaches the actual POST.
+  $r13 = & "$testRoot\bin\send-page.ps1" -Kind 'escalation:ic-1:stray' -Title 'Fleet watchdog' -Body 'a stray session' -Priority 'normal' -Url 'C:\fleet\state\escalations\20260917T000000Z-supervisor-ic-1-stray.json' -NoToast | ConvertFrom-Json
+  Assert-True ($r13.pushover -eq $true) 'a page carrying -Url must still post to Pushover'
+  $form13 = ConvertFrom-FormBody (@(Get-PostedBodies $logPath) | Select-Object -Last 1)
+  Assert-True ($form13.url -eq 'C:\fleet\state\escalations\20260917T000000Z-supervisor-ic-1-stray.json') 'the -Url value must reach the actual Pushover POST'
+
   Write-Output 'page tests passed'
 } finally {
   if ($mockJob) { Stop-Job $mockJob -ErrorAction SilentlyContinue; Remove-Job $mockJob -Force -ErrorAction SilentlyContinue }

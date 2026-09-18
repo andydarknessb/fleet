@@ -198,6 +198,10 @@ function Write-Escalation {
   if ($Name -and $Kind) { $suffix = "$suffix-$(($Kind -replace '[^a-zA-Z0-9_.-]', '_'))" }
   $file = "$FleetHome\state\escalations\$stamp-$From$suffix.json"
   Write-Json $file ([pscustomobject]$obj)
+  # 2026-09-17 QA (fleet #77 review #6): returning the path lets a caller (the
+  # Watchdog's page conditions) carry it as the condition's `url` without
+  # recomputing the filename; existing callers all discard the return value.
+  return $file
 }
 function Send-FleetToast {
   # Windows toast through the PowerShell AppUserModelId (no BurntToast dependency).

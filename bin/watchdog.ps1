@@ -593,7 +593,7 @@ try {
       $currentRespawnKeys += $key
       if ($previouslyNotified -contains $key) { $waiting += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned-again'; detail = "job $($r.jobId) respawned again ($($r.reason)); already notified" }; continue }
       $detail = "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task."
-      Write-Escalation -From 'supervisor' -Kind 'respawned' -Detail $detail -Name "$($r.name)" -Parent "$($r.parent)"
+      Write-Escalation -From 'supervisor' -Kind 'respawned' -Detail $detail -Name "$($r.name)" -Parent "$($r.parent)" | Out-Null
       # Ticket 77 (ADR 0012): a fault the fleet healed by itself is not a page - the
       # dispatcher-respawn toast that used to fire here is gone. The escalation file
       # and this notified entry are the record; nothing is delivered off-host for it.
@@ -877,44 +877,55 @@ try {
     $conditions += [pscustomobject]@{ key = "dated:$($d.where)"; kind = 'dated'; detail = "$($d.where) passed ($($d.value)) and is still in place"; url = $null }
   }
 
-  # --- page-once dedupe: a key pages when it appears; clearing and reappearing pages
-  # --- again. A corrupt paged.json is quarantined, never fatal: the pager must not die
-  # --- of its own state while a real condition stands.
+  # --- page-once-DELIVERED dedupe (2026-09-17 QA, fleet #77 review BLOCKER): a key
+  # --- is not "paged" (and so exempt from re-attempt) until Send-FleetPage actually
+  # --- confirms delivery (pushover:true, recorded as deliveredAt). Before this fix,
+  # --- paged.json was written for every condition BEFORE the send, so a page whose
+  # --- delivery failed - unconfigured, a 4xx/5xx, refused, timed out - was marked
+  # --- paged and never retried; with pushover.json not yet written, every standing
+  # --- condition would have been permanently "paged" without ever reaching Cory.
+  # --- A failed attempt (a real pushover:false, never unconfigured/creds-*) counts
+  # --- toward `attempts`; past 3 the entry gives up (gaveUpAt) and a log-only line
+  # --- records it, so a truly undeliverable page does not retry forever either.
+  # --- `unconfigured`/`creds-unreadable`/`creds-incomplete` count as no attempt at
+  # --- all and never set deliveredAt: the entry stays exactly as it was, so the
+  # --- first tick after Cory wires his phone up delivers it. A corrupt paged.json
+  # --- is quarantined, never fatal: the pager must not die of its own state while a
+  # --- real condition stands.
   $pagedPath = "$FleetHome\state\watchdog\paged.json"
   $paged = $null
   try { $paged = Read-Json $pagedPath } catch {
     if (-not $Verify) { try { Move-Item $pagedPath "$pagedPath.corrupt-$($now.ToString('yyyyMMddTHHmmssZ'))" -Force } catch {} }
   }
   $oldKeys = @(); if ($paged) { $oldKeys = @($paged.PSObject.Properties.Name) }
-  $newConditions = @($conditions | Where-Object { $oldKeys -notcontains $_.key })
+  $pageMaxAttempts = 3
   $nextPaged = [pscustomobject]@{}
-  # Ticket 78 (ADR 0012): fleet-dead alone repeats once, at +fleetDeadRepeatMinutes
-  # (default 120), never a third time. firstPagedAt/repeatedAt live only on the
-  # fleet-dead entry; every other kind's entry is unchanged, so an old paged.json
-  # with neither field on any key still reads fine (both start $null).
-  $fleetDeadRepeatCondition = $null
+  # First pass: pure state carry-forward, no side effects (safe under -Verify too).
+  # A pre-this-fix entry (only firstSeen/lastSeen/detail: none of deliveredAt/
+  # attempts/gaveUpAt exist) predates delivery tracking; the old code already
+  # attempted every newly-seen condition the tick it appeared, so it is treated as
+  # delivered at firstSeen here - this fix must not flood re-deliveries for
+  # conditions the old code already paged.
   foreach ($c in $conditions) {
-    $first = Now-Iso
-    $repeatedAt = $null
-    if ($oldKeys -contains $c.key) {
-      $prevEntry = $paged.($c.key)
-      $first = $prevEntry.firstSeen
-      if ($c.key -eq 'fleet-dead') {
-        if ($prevEntry.PSObject.Properties['repeatedAt']) { $repeatedAt = $prevEntry.repeatedAt }
-        if (-not $repeatedAt) {
-          $firstPagedAtUtc = ConvertTo-UtcDateTime $first
-          if ($firstPagedAtUtc -and ((New-TimeSpan -Start $firstPagedAtUtc -End $now).TotalMinutes -ge $fleetDeadRepeatMinutes)) {
-            $fleetDeadRepeatCondition = $c
-            $repeatedAt = Now-Iso
-          }
-        }
-      }
+    $isNew = ($oldKeys -notcontains $c.key)
+    $prevEntry = if ($isNew) { $null } else { $paged.($c.key) }
+    $first = if ($prevEntry -and $prevEntry.PSObject.Properties['firstSeen']) { "$($prevEntry.firstSeen)" } else { (Now-Iso) }
+    $deliveredAt = if ($prevEntry -and $prevEntry.PSObject.Properties['deliveredAt']) { $prevEntry.deliveredAt } else { $null }
+    $attempts = 0; if ($prevEntry -and $prevEntry.PSObject.Properties['attempts']) { try { $attempts = [int]$prevEntry.attempts } catch {} }
+    $lastAttemptAt = if ($prevEntry -and $prevEntry.PSObject.Properties['lastAttemptAt']) { $prevEntry.lastAttemptAt } else { $null }
+    $lastError = if ($prevEntry -and $prevEntry.PSObject.Properties['lastError']) { $prevEntry.lastError } else { $null }
+    $gaveUpAt = if ($prevEntry -and $prevEntry.PSObject.Properties['gaveUpAt']) { $prevEntry.gaveUpAt } else { $null }
+    $repeatedAt = if ($prevEntry -and $prevEntry.PSObject.Properties['repeatedAt']) { $prevEntry.repeatedAt } else { $null }
+    $url = if ($prevEntry -and $prevEntry.PSObject.Properties['url']) { $prevEntry.url } else { $null }
+    if ($prevEntry -and -not ($prevEntry.PSObject.Properties['deliveredAt'] -or $prevEntry.PSObject.Properties['attempts'] -or $prevEntry.PSObject.Properties['gaveUpAt'])) {
+      $deliveredAt = $first
     }
-    $entryObj = [pscustomobject]@{ firstSeen = $first; lastSeen = (Now-Iso); detail = $c.detail }
-    if ($c.key -eq 'fleet-dead') {
-      $entryObj | Add-Member -NotePropertyName firstPagedAt -NotePropertyValue $first -Force
-      $entryObj | Add-Member -NotePropertyName repeatedAt -NotePropertyValue $repeatedAt -Force
+    $entryObj = [pscustomobject]@{
+      firstSeen = $first; lastSeen = (Now-Iso); detail = $c.detail
+      deliveredAt = $deliveredAt; attempts = $attempts; lastAttemptAt = $lastAttemptAt; lastError = $lastError; gaveUpAt = $gaveUpAt
+      url = $url
     }
+    if ($c.key -eq 'fleet-dead') { $entryObj | Add-Member -NotePropertyName repeatedAt -NotePropertyValue $repeatedAt -Force }
     $nextPaged | Add-Member -NotePropertyName $c.key -NotePropertyValue $entryObj
   }
 
@@ -934,47 +945,83 @@ try {
     } else {
       Remove-Item $bannerPath -ErrorAction SilentlyContinue
     }
-    Write-Json $pagedPath $nextPaged
     $nextNotified = [pscustomobject]@{}
     foreach ($k in $currentRespawnKeys) { $nextNotified | Add-Member -NotePropertyName $k -NotePropertyValue (Now-Iso) -Force }
     Write-Json $notifiedPath $nextNotified
-    # A check escalation pages once per new name:kind and leaves one escalation file
-    # (the evidence the Dispatcher role and status.ps1 already read); while it stands,
-    # the banner carries it and nothing is re-filed or re-sent.
-    foreach ($c in @($newConditions | Where-Object { $_.PSObject.Properties['escalation'] -and $_.escalation })) {
-      $e = $c.escalation
-      $parentName = ''; if ($e.PSObject.Properties['parent']) { $parentName = "$($e.parent)" }
-      Write-Escalation -From 'supervisor' -Kind "$($e.kind)" -Detail "$($e.detail)" -Name "$($e.name)" -Parent $parentName
-      $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
+
+    # Second pass: side effects. A NEW escalation-carrying condition files its one
+    # escalation file here (never re-filed while it stands) and its path becomes the
+    # condition's `url`; every condition not yet delivered and not given up gets one
+    # Send-FleetPage attempt this tick, at the priority its kind resolves to
+    # (Get-PagePriority), carrying its link when it has one - an escalation file
+    # path, or a PR URL where a condition carries one, else omitted. -NoToast (tests)
+    # only skips Send-FleetPage's own toast; the Pushover POST and the pages.jsonl
+    # audit line always run. The banner above is the always-on host echo and is
+    # unaffected by delivery success or failure.
+    foreach ($c in $conditions) {
+      $isNew = ($oldKeys -notcontains $c.key)
+      $entry = $nextPaged.($c.key)
+
+      if ($isNew -and $c.PSObject.Properties['escalation'] -and $c.escalation) {
+        $e = $c.escalation
+        $parentName = ''; if ($e.PSObject.Properties['parent']) { $parentName = "$($e.parent)" }
+        $escFile = Write-Escalation -From 'supervisor' -Kind "$($e.kind)" -Detail "$($e.detail)" -Name "$($e.name)" -Parent $parentName
+        if ($escFile) { $entry.url = "$escFile" }
+        $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
+      }
+      if (-not $entry.url -and $c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
+
+      if (-not $entry.deliveredAt -and -not $entry.gaveUpAt) {
+        $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
+        $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $entry.url -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
+        # `-contains`/`-eq` against a boolean literal on the LEFT coerces any
+        # non-empty string (e.g. 'unconfigured') to $true - `-is [bool]` is the
+        # only type-exact way to tell a real true/false outcome from a string one.
+        $countsAsAttempt = ($pageResult.pushover -is [bool])
+        if ($pageResult.pushover -eq $true) {
+          $entry.deliveredAt = Now-Iso
+        } elseif ($countsAsAttempt) {
+          $entry.attempts++
+          $entry.lastAttemptAt = Now-Iso
+          $entry.lastError = "$($pageResult.pushoverError)"
+          if ($entry.attempts -ge $pageMaxAttempts) {
+            $entry.gaveUpAt = Now-Iso
+            try { Write-FleetWakeAudit -Kind 'page-gave-up' -Title 'Fleet watchdog: page delivery gave up' -Body "$($c.key) failed $($entry.attempts) delivery attempts; giving up (last error: $($entry.lastError))" -Detail ([pscustomobject]@{ key = $c.key; attempts = $entry.attempts; lastError = $entry.lastError }) | Out-Null } catch {}
+          }
+        }
+        # A brand-new condition always reports (whatever the outcome, matching
+        # "the first sighting must page"); a standing condition only reports a REAL
+        # attempt (delivered or a genuine failure) - a standing unconfigured retry
+        # is silent every tick until configured, never re-announced as "newly paged".
+        if ($isNew -or $countsAsAttempt) { $newlyPagedResults += [pscustomobject]@{ key = $c.key; priority = $priority; page = $pageResult } }
+      }
+
+      # Ticket 78 (ADR 0012, 2026-09-17 QA review #7/#8): fleet-dead alone repeats
+      # once, at +fleetDeadRepeatMinutes past its DELIVERY time (an undelivered page
+      # has no repeat clock to run), never a third time. An unparseable or
+      # future-dated deliveredAt fails toward repeating NOW rather than silently
+      # losing the one repeat the ADR grants.
+      if ($c.key -eq 'fleet-dead' -and $entry.deliveredAt -and -not $entry.repeatedAt) {
+        $deliveredAtUtc = ConvertTo-UtcDateTime $entry.deliveredAt
+        $dueNow = (-not $deliveredAtUtc) -or ($deliveredAtUtc -gt $now) -or ((New-TimeSpan -Start $deliveredAtUtc -End $now).TotalMinutes -ge $fleetDeadRepeatMinutes)
+        if ($dueNow) {
+          $entry.repeatedAt = Now-Iso
+          $repeatBody = "$($c.detail) (repeat: fleet-dead has stood over $fleetDeadRepeatMinutes min with no third page to follow)"
+          $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority 'emergency' -Detail ([pscustomobject]@{ key = $c.key; repeat = $true }) -NoToast:$NoToast
+          $repeatPaged = [pscustomobject]@{ key = $c.key; priority = 'emergency'; page = $repeatResult }
+        }
+      }
     }
-    # Ticket 77 (ADR 0012): every newly-seen condition pages through the one door,
-    # once, at the priority its kind resolves to (Get-PagePriority), carrying its
-    # link when it has one. -NoToast (tests) only skips Send-FleetPage's own toast;
-    # the Pushover POST and the pages.jsonl audit line always run. The banner above
-    # is the always-on host echo and is unaffected by delivery success or failure.
-    foreach ($c in $newConditions) {
-      $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
-      $pageUrl = $null; if ($c.PSObject.Properties['url'] -and $c.url) { $pageUrl = "$($c.url)" }
-      $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $pageUrl -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
-      $newlyPagedResults += [pscustomobject]@{ key = $c.key; priority = $priority; page = $pageResult }
-    }
-    # Ticket 78 (ADR 0012): a fleet-dead that self-healing could not revive pages
-    # once more at emergency, at +fleetDeadRepeatMinutes, and never a third time.
-    # A repeat is not a "newly seen" condition (it never left oldKeys), so it is
-    # never in $newConditions above and is sent separately here.
-    if ($fleetDeadRepeatCondition) {
-      $repeatBody = "$($fleetDeadRepeatCondition.detail) (repeat: fleet-dead has stood over $fleetDeadRepeatMinutes min with no third page to follow)"
-      $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority 'emergency' -Detail ([pscustomobject]@{ key = $fleetDeadRepeatCondition.key; repeat = $true }) -NoToast:$NoToast
-      $repeatPaged = [pscustomobject]@{ key = $fleetDeadRepeatCondition.key; priority = 'emergency'; page = $repeatResult }
-    }
+    Write-Json $pagedPath $nextPaged
   }
 
-  # Ticket 81 (ADR 0012): the dead-man ping runs at the end of EVERY tick -
-  # PAUSE, -Verify, a live or a shadow run, all alike - because the only exit
-  # paths from this script's main body are this point and the crash handler
-  # below, and a fleet that goes silent BECAUSE it crashed is exactly what the
-  # dead-man service is for. It never fails the tick (Send-DeadManPing never
-  # throws) and is unconditional: no `if (-not $Verify)` guard here.
+  # Ticket 81 (ADR 0012): the dead-man ping runs at the end of every tick that
+  # reaches this point - PAUSE, -Verify, a live or a shadow run, all alike - and
+  # is unconditional here: no `if (-not $Verify)` guard. It deliberately does NOT
+  # run from the crash handler below: a Watchdog that is itself crash-looping
+  # never gets here, its pings stop, and that silence is exactly what the
+  # off-host dead-man service exists to catch. It never fails a tick that does
+  # reach it (Send-DeadManPing never throws).
   $deadMan = Send-DeadManPing
 
   # --- shadow log for the 08b parity comparison ---

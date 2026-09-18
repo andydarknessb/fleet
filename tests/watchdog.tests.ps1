@@ -912,16 +912,28 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ((Get-PagedKeys $pg3.newlyPaged) -contains 'permission-wait:ic-950:job-ic-950') 'a cleared-then-returned condition must page again'
     Assert-True (@(Get-PostedBodies $pushLog).Count -eq 2) 'the second sighting must post again'
 
-    # Case PG4: a dispatcher respawn (a fault the fleet healed by itself) produces zero POSTs.
+    # Case PG4 (2026-09-17 QA hardened): a dispatcher respawn (a fault the fleet
+    # healed by itself) produces zero POSTs, zero pages.jsonl lines, and is
+    # recorded log-only (one escalation file, one `notified` entry). The old
+    # (ticket-76-removed) code toasted a respawned dispatcher directly, outside
+    # Send-FleetPage - -NoToast on THIS test's Run-Watchdog call would not have
+    # caught that, since it only suppresses Send-FleetPage's own toast; this case
+    # is the control the review asked for that a reintroduced bare toast call
+    # would actually surface (verified by hand: temporarily restoring the old
+    # `Send-FleetToast` call here pops a real toast when this case runs).
     # The permission-wait condition is left standing (already paged, deduped) so
     # the whole delta below is attributable to the respawn alone.
     $postsBeforeRespawn = @(Get-PostedBodies $pushLog).Count
+    $pagesLinesBeforeRespawn = @(Get-Content "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue | Where-Object { $_ }).Count
+    $escFilesBeforeRespawn = @(Get-EscalationFiles '*-supervisor-dispatcher-respawned.json').Count
     $stoppedDisp77 = $dispRow.Replace('"state":"working"', '"state":"stopped"')
     Set-AgentsRows "[$stoppedDisp77,$plRow,$pwRow]"
     $pg4 = Run-Watchdog
     Assert-True (@($pg4.proposed.respawned | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'the check must respawn the stopped dispatcher'
     Assert-True (@(Get-PostedBodies $pushLog).Count -eq $postsBeforeRespawn) 'a dispatcher respawn must produce zero POSTs'
+    Assert-True (@(Get-Content "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue | Where-Object { $_ }).Count -eq $pagesLinesBeforeRespawn) 'a dispatcher respawn must add no Send-FleetPage audit line to pages.jsonl'
     Assert-True (@($pg4.notified | Where-Object { $_.name -eq 'dispatcher' -and $_.kind -eq 'respawned' -and $_.toastDelivered -eq $null }).Count -eq 1) 'a healed respawn is recorded log-only, never toasted'
+    Assert-True (@(Get-EscalationFiles '*-supervisor-dispatcher-respawned.json').Count -eq $escFilesBeforeRespawn + 1) 'a healed respawn leaves exactly one new escalation file, the log-only record'
   } finally {
     if ($pushMock -and $pushMock.Job) { Stop-Job $pushMock.Job -ErrorAction SilentlyContinue; Remove-Job $pushMock.Job -Force -ErrorAction SilentlyContinue }
     if ($oldPushoverUrl77) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl77 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
@@ -933,12 +945,173 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   $null = Run-Watchdog
 
+  # ===== 2026-09-17 QA (fleet #77 review BLOCKER): a page is not "paged" (and so =====
+  # ===== exempt from re-attempt) until Send-FleetPage confirms delivery =====
+  $oldPushoverUrlDr = $env:FLEET_PUSHOVER_URL
+  $retryPushLog = Join-Path $testRoot 'pushover-retry.log'
+  [IO.File]::WriteAllText($retryPushLog, '')
+  # Back to shadow (sentinel expected again) for a plain, mode-independent
+  # sentinel-stale condition to retry against; paging fires in shadow too
+  # (never gated on mode), and restored to live at the end of this block.
+  Remove-Item "$testRoot\state\flags\sentinel-off" -ErrorAction SilentlyContinue
+  try {
+    Set-Heartbeat 'sentinel' 90
+
+    # Case DR1 (red-tell): a dead port (nothing listening) on tick 1 -> attempted
+    # (the first sighting always reports), not delivered, attempts=1.
+    $deadPort = Get-Random -Minimum 20000 -Maximum 40000
+    $env:FLEET_PUSHOVER_URL = "http://127.0.0.1:$deadPort/"
+    Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-dr","user":"usr-dr"}'
+    $dr1 = Run-Watchdog
+    Assert-True ((Get-PagedKeys $dr1.newlyPaged) -contains 'sentinel-stale') 'a first attempt, even a failed one, must report as newly paged'
+    $pagedDr1 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -eq $pagedDr1.'sentinel-stale'.deliveredAt -and $pagedDr1.'sentinel-stale'.attempts -eq 1) 'a connection-refused attempt must not be marked delivered, and must count'
+
+    # Case DR2: the listener comes up -> tick 2 delivers, exactly one real POST.
+    $drMock = Start-MockPushover -LogPath $retryPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $drMock.Prefix
+    $dr2 = Run-Watchdog
+    $pagedDr2 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -ne $pagedDr2.'sentinel-stale'.deliveredAt) 'a successful retry must set deliveredAt'
+    Assert-True (@(Get-PostedBodies $retryPushLog).Count -eq 1) 'exactly one real POST must reach Pushover once it answers'
+    Stop-Job $drMock.Job -ErrorAction SilentlyContinue; Remove-Job $drMock.Job -Force -ErrorAction SilentlyContinue
+
+    # Case DR3: standing, already delivered -> tick 3 attempts and posts nothing more.
+    $postsBeforeDr3 = @(Get-PostedBodies $retryPushLog).Count
+    $dr3 = Run-Watchdog
+    Assert-True (@($dr3.newlyPaged).Count -eq 0) 'a delivered condition must not attempt again'
+    Assert-True (@(Get-PostedBodies $retryPushLog).Count -eq $postsBeforeDr3) 'a delivered condition must post nothing more'
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
+    # Case DR4: unconfigured on ticks 1-2 (never counts as an attempt, never
+    # blocks a retry), then configured on tick 3 -> exactly one POST, on tick 3.
+    Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+    Set-Heartbeat 'sentinel' 90
+    $dr4a = Run-Watchdog
+    Assert-True ((Get-PagedKeys $dr4a.newlyPaged) -contains 'sentinel-stale') 'a first sighting must report even while unconfigured'
+    $dr4b = Run-Watchdog
+    Assert-True (@($dr4b.newlyPaged).Count -eq 0) 'a standing unconfigured retry must not report again'
+    $drMock2 = Start-MockPushover -LogPath $retryPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $drMock2.Prefix
+    Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-dr2","user":"usr-dr2"}'
+    $postsBeforeDr4c = @(Get-PostedBodies $retryPushLog).Count
+    $dr4c = Run-Watchdog
+    Assert-True (@(Get-PostedBodies $retryPushLog).Count -eq $postsBeforeDr4c + 1) 'the tick after credentials appear must deliver, with exactly one POST'
+    Stop-Job $drMock2.Job -ErrorAction SilentlyContinue; Remove-Job $drMock2.Job -Force -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
+    # Case DR5: three real failed attempts -> gaveUpAt is set and a fourth tick
+    # attempts, and posts, nothing more.
+    Set-Heartbeat 'sentinel' 90
+    Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-giveup","user":"usr-giveup"}'
+    $refusedPortGiveUp = Get-Random -Minimum 20000 -Maximum 40000
+    $env:FLEET_PUSHOVER_URL = "http://127.0.0.1:$refusedPortGiveUp/"
+    $null = Run-Watchdog; $null = Run-Watchdog; $null = Run-Watchdog
+    $pagedGiveUp = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($pagedGiveUp.'sentinel-stale'.attempts -eq 3 -and $null -ne $pagedGiveUp.'sentinel-stale'.gaveUpAt) 'three failed attempts must give up'
+    $dr5d = Run-Watchdog
+    Assert-True (@($dr5d.newlyPaged).Count -eq 0) 'a given-up condition must not attempt a fourth time'
+  } finally {
+    if ($drMock -and $drMock.Job) { Stop-Job $drMock.Job -ErrorAction SilentlyContinue; Remove-Job $drMock.Job -Force -ErrorAction SilentlyContinue }
+    if ($drMock2 -and $drMock2.Job) { Stop-Job $drMock2.Job -ErrorAction SilentlyContinue; Remove-Job $drMock2.Job -Force -ErrorAction SilentlyContinue }
+    if ($oldPushoverUrlDr) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrlDr } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Write-Utf8 "$testRoot\state\flags\sentinel-off" 'restored after the delivery-retry block'
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\heartbeats\sentinel.json" -ErrorAction SilentlyContinue
+  foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
+  $null = Run-Watchdog
+
+  # ===== 2026-09-17 QA (fleet #77 review #5): a configured pages block is honoured: =====
+  # ===== a per-kind priority override, and fleetDeadRepeatMinutes governing the =====
+  # ===== repeat clock, not the 120-minute default =====
+  $oldPushoverUrlCfg = $env:FLEET_PUSHOVER_URL
+  $cfgPushLog = Join-Path $testRoot 'pushover-cfg.log'
+  [IO.File]::WriteAllText($cfgPushLog, '')
+  $cfgMock = $null
+  Remove-Item "$testRoot\state\flags\sentinel-off" -ErrorAction SilentlyContinue   # shadow: sentinel expected again
+  try {
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"priority":{"sentinel-stale":"high"},"defaultPriority":"normal","fleetDeadRepeatMinutes":10}}'
+    Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-cfg","user":"usr-cfg"}'
+    $cfgMock = Start-MockPushover -LogPath $cfgPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $cfgMock.Prefix
+    Set-Heartbeat 'sentinel' 90
+    $cfg1 = Run-Watchdog
+    $cfgEntry = @($cfg1.newlyPaged | Where-Object { $_.key -eq 'sentinel-stale' })[0]
+    Assert-True ($null -ne $cfgEntry -and $cfgEntry.priority -eq 'high') "a configured pages.priority override must be honoured (got $($cfgEntry.priority))"
+    Stop-Job $cfgMock.Job -ErrorAction SilentlyContinue; Remove-Job $cfgMock.Job -Force -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\heartbeats\sentinel.json" -ErrorAction SilentlyContinue
+    Write-Utf8 "$testRoot\state\flags\sentinel-off" 'restored for the fleet-dead half of this case'
+
+    # A fleet-dead delivered 11 minutes ago is due under the configured 10-minute
+    # window (the hardcoded 120-minute default would not have fired here).
+    $cfgMock = Start-MockPushover -LogPath $cfgPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $cfgMock.Prefix
+    $deliveredAt11 = (Get-Date).ToUniversalTime().AddMinutes(-11).ToString('o')
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $deliveredAt11 + '","lastSeen":"' + $deliveredAt11 + '","detail":"stale","deliveredAt":"' + $deliveredAt11 + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
+    foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 90 }
+    Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-951":{"tenant":"test","issue":951,"state":"implementing"}}}'
+    $cfg2 = Run-Watchdog
+    Assert-True ($null -ne $cfg2.repeatPaged -and $cfg2.repeatPaged.key -eq 'fleet-dead') "an 11-minute-old delivery must repeat under a configured 10-minute window (got $($cfg2.repeatPaged | ConvertTo-Json -Compress))"
+  } finally {
+    if ($cfgMock -and $cfgMock.Job) { Stop-Job $cfgMock.Job -ErrorAction SilentlyContinue; Remove-Job $cfgMock.Job -Force -ErrorAction SilentlyContinue }
+    if ($oldPushoverUrlCfg) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrlCfg } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+  foreach ($n in 'dispatcher', 'sentinel', 'pl-test') { Set-Heartbeat $n 5 }
+  $null = Run-Watchdog
+
+  # ===== 2026-09-17 QA (fleet #77 review #6): a condition's escalation file path =====
+  # ===== becomes its `url`, and that url reaches the actual Pushover POST =====
+  $oldPushoverUrlLink = $env:FLEET_PUSHOVER_URL
+  $urlPushLog = Join-Path $testRoot 'pushover-url.log'
+  [IO.File]::WriteAllText($urlPushLog, '')
+  $urlMock = $null
+  try {
+    Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-url","user":"usr-url"}'
+    $urlMock = Start-MockPushover -LogPath $urlPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $urlMock.Prefix
+    $strayRowUrl = '{"id":"job-url-stray","name":"ic-888","state":"working","status":"idle","pid":88,"startedAt":' + (Get-EpochMs $oldStart) + '}'
+    Set-AgentsRows "[$dispRow,$plRow,$strayRowUrl]"
+    $null = Run-Watchdog
+    $urlEntry = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw | ConvertFrom-Json).'escalation:ic-888:stray'
+    Assert-True ($null -ne $urlEntry.url -and (Test-Path $urlEntry.url)) 'an escalation condition''s url must be its escalation file path'
+    $urlBodies = @(Get-PostedBodies $urlPushLog)
+    Assert-True ($urlBodies.Count -eq 1) 'exactly one POST for the stray condition'
+    $urlForm = ConvertFrom-FormBody $urlBodies[0]
+    Assert-True ($urlForm.url -eq $urlEntry.url) 'the escalation file path must reach the actual Pushover POST'
+  } finally {
+    if ($urlMock -and $urlMock.Job) { Stop-Job $urlMock.Job -ErrorAction SilentlyContinue; Remove-Job $urlMock.Job -Force -ErrorAction SilentlyContinue }
+    if ($oldPushoverUrlLink) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrlLink } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Set-AgentsRows $noSentinelRows
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
   # ===== Ticket 78 (ADR 0012): fleet-dead repeats once, two hours on, at emergency =====
   Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watch\wake-outbox.jsonl" -ErrorAction SilentlyContinue
   Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-901":{"tenant":"test","issue":901,"state":"implementing"}}}'
   foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 90 }   # stale past the default 45-min threshold
 
+  # 2026-09-17 QA (fleet #78 review): this is a TEST-script-local constant matching
+  # the real default (config/cycle.json is absent in this fixture) - the watchdog's
+  # own $fleetDeadRepeatMinutes lives in its own process and was never in scope
+  # here, so interpolating it below silently printed an empty string.
+  $fleetDeadRepeatMinutes = 120
   $pushLog78 = Join-Path $testRoot 'pushover-requests-78.log'
   [IO.File]::WriteAllText($pushLog78, '')
   $pushMock78 = Start-MockPushover -LogPath $pushLog78 -Count 10
