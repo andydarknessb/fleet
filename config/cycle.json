@@ -44,7 +44,9 @@
     "principal": { "maxAgeHours": 24, "maxJobTokens": 250000 }
   },
   "watchdog": {
-    "staleMinutes": 45
+    "staleMinutes": 45,
+    "healStaleMinutes": 60,
+    "healCap": 2
   },
   "pages": {
     "priority": {

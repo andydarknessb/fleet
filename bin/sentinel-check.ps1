@@ -4,7 +4,7 @@
   worktree sweep (merged fleet branches, >7 days, unlocked), PAUSE on a rate-limit signal, clear a PAUSE it set once its window passes.
   Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC). The Sentinel session acts on those.
 #>
-param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel')
+param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel', [string]$HealRespawn = '')
 . "$PSScriptRoot\_common.ps1"
 function Write-AppliedLedger {
   # Ticket 08b parity evidence: every -Apply tick appends what it did to
@@ -127,6 +127,31 @@ $expected = @()
 foreach ($s in (Get-ExpectedStaticSessions $static)) { $expected += [pscustomobject]@{ name = $s.name; role = $s.role; parent = $s.parent; tenant = $s.tenant; issue = $null; static = $true } }
 foreach ($e in ($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' })) { $expected += [pscustomobject]@{ name = $e.name; role = $e.role; parent = $e.parent; tenant = $e.tenant; issue = $e.issue; static = $false } }
 
+# Ticket 84: heal a blocked, stale IC through the ticket 85 Do-Respawn path (a
+# no-op still counts as respawn-failed). The Watchdog decides WHETHER to heal
+# (needs, heartbeat age, and Test-WorkWaiting all live there, ticket 75) and
+# calls this script back with the one name to act on - reusing Do-Respawn here
+# rather than a second copy of it. Control-plane roles are healed by the
+# Watchdog itself, through rotate.ps1, never through this path.
+if ($HealRespawn) {
+  $target = $expected | Where-Object { $_.name -eq $HealRespawn } | Select-Object -First 1
+  if (-not $target) {
+    $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = ''; reason = 'heal-respawn: not an expected session (roster changed underfoot)' }
+  } else {
+    $row = Latest-Row $HealRespawn
+    if (-not $row) {
+      $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = $target.parent; reason = 'heal-respawn: no job known to the daemon' }
+    } else {
+      Do-Respawn $row $target 'heal: blocked, stale, work waiting'
+    }
+  }
+  if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
+  Write-Json $ReportPath ([pscustomobject]$report)
+  Write-AppliedLedger $report
+  [pscustomobject]$report | ConvertTo-Json -Depth 6
+  exit 0
+}
+
 foreach ($x in $expected) {
   $row = Latest-Row $x.name
   if (-not $row) {
@@ -176,7 +201,10 @@ foreach ($x in $expected) {
     # rows (`claude agents --json --all`, verified 2026-08-26: id,cwd,kind,startedAt,sessionId,name,state,pid,status)
     # carry no field that says which. Report it as input-wait of unknown kind with the job's own detail text;
     # never assert a cause this script did not measure. Never respawned: a respawn would discard the prompt.
-    $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'blocked'; detail = "waiting on input, kind unknown (daemon rows carry no prompt kind); job detail: $($js.detail); not respawned by design"; parent = $x.parent }
+    # Ticket 84: tenant/role ride along so the Watchdog can decide whether to heal
+    # this blocked, possibly-stale session without a second daemon/job-state read
+    # for the same row - the mechanical check here still never acts on it itself.
+    $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'blocked'; detail = "waiting on input, kind unknown (daemon rows carry no prompt kind); job detail: $($js.detail); not respawned by design"; parent = $x.parent; tenant = $x.tenant; role = $x.role }
     continue
   }
   if ($state -eq 'failed') { Do-Respawn $row $x 'state failed'; continue }

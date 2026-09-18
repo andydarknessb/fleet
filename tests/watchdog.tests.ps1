@@ -652,6 +652,95 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
   foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
 
+  # ===== Ticket 84: heal a blocked, stale session when work is waiting =====
+  # Reuses the fixtures wired above: assignment.js runs for real against
+  # $wakeFixture, rotate.ps1 is the same recording mock, tenant "test" already
+  # carries readyLabel/maxIcs/ownerLogin, and live supervision (sentinel-off) still
+  # stands.
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-p") | Out-Null
+  $jobPStatePath = "$testRoot\profile\.claude\jobs\job-p\state.json"
+  $blockedPlRow = $plRow.Replace('"state":"working"', '"state":"blocked"')
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = $wakeFixture
+  Write-Utf8 $wakeFixture '[{"number":901,"title":"Ready","url":"https://github.com/owner/repo/issues/901","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows "[$dispRow,$blockedPlRow]"
+
+  # Case H1 (red-tell): pl-endzone-equivalent (pl-test) blocked, needs empty,
+  # heartbeat 61 min, one frontier issue. Today: one blocked escalation, no action.
+  # After: one rotate.ps1 -Name pl-test -Wake call on the mock.
+  Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+  Set-Heartbeat 'pl-test' 61
+  $h1 = Run-Watchdog
+  Assert-True (@($h1.waiting | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'blocked' }).Count -eq 1) 'blocked must still be recorded under waiting'
+  Assert-True (@($h1.conditions).Count -eq 0) 'a heal action must still never page'
+  Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count -eq 1) 'a healed control-plane session must go through rotate.ps1 -Wake'
+  $h1Heal = @($h1.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h1Heal.Count -eq 1 -and $h1Heal[0].action -eq 'rotate' -and $h1Heal[0].ok -eq $true) 'the shadow line must record a successful rotate heal'
+  $healState1 = (Get-Content "$testRoot\state\watchdog\heal.json" -Raw) | ConvertFrom-Json
+  Assert-True (@($healState1.'pl-test'.attempts).Count -eq 1) 'the heal attempt must be counted for the session'
+
+  # Case H2 (control): needs "approve Bash" (a real permission prompt) must never heal.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $jobPStatePath '{"needs":"approve Bash","updatedAt":"2026-01-01T00:00:00Z"}'
+  $rotateCountBeforeH2 = @(Get-RotateCalls).Count
+  $h2 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH2) 'a permission prompt must never be healed'
+  Assert-True (-not (Test-Path "$testRoot\state\watchdog\heal.json")) 'a permission prompt must not even count as a heal attempt'
+  Assert-True (@($h2.healed).Count -eq 0) 'a permission prompt must not appear as healed on the shadow line'
+
+  # Case H3 (control): heartbeat 59 min (under the 60-min threshold) must not heal.
+  Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+  Set-Heartbeat 'pl-test' 59
+  $rotateCountBeforeH3 = @(Get-RotateCalls).Count
+  $h3 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH3) 'a heartbeat under the threshold must not heal'
+  Assert-True (@($h3.healed).Count -eq 0) 'an unstale heartbeat must not appear as healed'
+
+  # Case H4 (control): empty frontier and no active records -> nothing waiting -> must not heal.
+  Set-Heartbeat 'pl-test' 61
+  Write-Utf8 $wakeFixture '[]'
+  $rotateCountBeforeH4 = @(Get-RotateCalls).Count
+  $h4 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH4) 'nothing waiting must not heal'
+  Assert-True (@($h4.healed).Count -eq 0) 'nothing waiting must not appear as healed'
+  Write-Utf8 $wakeFixture '[{"number":901,"title":"Ready","url":"https://github.com/owner/repo/issues/901","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+
+  # Case H5 (control): a third attempt within 24h must not heal past the cap (2).
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  $healNowIso = (Get-Date).ToUniversalTime().ToString('o')
+  Write-Utf8 "$testRoot\state\watchdog\heal.json" ('{"pl-test":{"attempts":["' + $healNowIso + '","' + $healNowIso + '"]}}')
+  $rotateCountBeforeH5 = @(Get-RotateCalls).Count
+  $h5 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH5) 'a third attempt within 24h must not heal past the cap'
+  Assert-True (@($h5.healed).Count -eq 0) 'a capped session must not appear as healed'
+  Assert-True (@($h5.waiting | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'blocked' }).Count -eq 1) 'a capped session must still be recorded as blocked'
+
+  # Case H6: an IC's heal goes through the ticket 85 Do-Respawn path, not rotate.ps1.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-950","role":"ic","tenant":"test","parent":"pl-test","issue":950,"status":"active"}]}'
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic950") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-ic950\state.json" '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+  $icRow = '{"id":"job-ic950","name":"ic-950","state":"blocked","status":"idle","pid":950,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-3)) + '}'
+  Set-AgentsRows "[$dispRow,$plRow,$icRow]"
+  Set-Heartbeat 'ic-950' 61
+  $rotateCountBeforeH6 = @(Get-RotateCalls).Count
+  $h6 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH6) 'an IC heal must never go through rotate.ps1'
+  $h6Heal = @($h6.healed | Where-Object { $_.name -eq 'ic-950' })
+  Assert-True ($h6Heal.Count -eq 1 -and $h6Heal[0].action -eq 'respawn') 'an IC heal must be reported as a respawn action'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\last-heal-respawn.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows $healthyRows
+  foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }
+  Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
+
   # ===== ADR 0011 (fleet #38): the triage wake =====
   # bin/triage.js runs for real against a fixture (FLEET_TRIAGE_ISSUES_FIXTURE); the mock
   # rotate.ps1 above records the wake. Without principal-live the frontier is only recorded.

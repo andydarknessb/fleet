@@ -41,6 +41,11 @@ try {
   $staleMinutes = 45        # three missed 15-min Sentinel crons; the dispatcher uses the same threshold
   $watchdogConfig = $null; try { $watchdogConfig = (Read-Json "$FleetHome\config\cycle.json").watchdog } catch {}
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['staleMinutes']) { $staleMinutes = [int]$watchdogConfig.staleMinutes }   # ticket 75: config/cycle.json watchdog.staleMinutes, default 45
+  $healStaleMinutes = 60    # ticket 84: config/cycle.json watchdog.healStaleMinutes, default 60
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['healStaleMinutes']) { $healStaleMinutes = [int]$watchdogConfig.healStaleMinutes }
+  $healCap = 2              # ticket 84: config/cycle.json watchdog.healCap, default 2 (per session, per 24h)
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['healCap']) { $healCap = [int]$watchdogConfig.healCap }
+  $healWindowHours = 24
   $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
   $fleetDeadRepeatMinutes = 120   # ticket 78: pages.fleetDeadRepeatMinutes, default 120 (two hours)
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatMinutes'] -and $pagesConfig.fleetDeadRepeatMinutes) { $fleetDeadRepeatMinutes = [int]$pagesConfig.fleetDeadRepeatMinutes }
@@ -560,7 +565,7 @@ try {
   # --- same job respawned tick after tick (a session that will not stay up) is ONE
   # --- condition: state/watchdog/notified.json holds the respawns of the previous tick,
   # --- and a name:job seen there is neither re-filed nor re-toasted.
-  $launches = @(); $notified = @(); $waiting = @()
+  $launches = @(); $notified = @(); $waiting = @(); $healed = @()
   $notifiedPath = "$FleetHome\state\watchdog\notified.json"
   $previouslyNotified = @()
   try { $prevNotified = Read-Json $notifiedPath; if ($prevNotified) { $previouslyNotified = @($prevNotified.PSObject.Properties.Name) } } catch {}
@@ -597,6 +602,82 @@ try {
     foreach ($e in @($check.escalate)) {
       if ($pageKinds -notcontains "$($e.kind)") { $waiting += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; detail = Get-OneLine $e.detail 200 } }
     }
+
+    # --- ticket 84 (ADR 0012): heal a blocked, stale session when work is waiting for
+    # --- its tenant. sentinel-check's mechanical check still only ever records 'blocked'
+    # --- (a daemon row cannot tell a permission prompt from any other wait, unchanged
+    # --- above); healing decides on top of that report, here, where Test-WorkWaiting
+    # --- (ticket 75) already lives and $nodeExe/$liveRoster/$cap/$liveCount are already
+    # --- this tick's snapshot - sentinel-check runs as a separate process and cannot call
+    # --- it without a second copy. Never for a real permission prompt (needs starts with
+    # --- "approve "); never before the heartbeat clears healStaleMinutes; never past
+    # --- healCap attempts in 24h - the session then stays stale for fleet-dead rather
+    # --- than being retried forever in silence. Control-plane roles (dispatcher,
+    # --- project-lead, principal) are rotated here, directly; an IC is healed through
+    # --- the ticket 85 Do-Respawn path, called back into sentinel-check.ps1 by name so a
+    # --- no-op still counts as failed. The fleet's real failure this closes: two
+    # --- multi-hour outages where every session sat blocked and nothing ever tried again.
+    $controlPlaneHealRoles = @('dispatcher', 'project-lead', 'principal')
+    $healStatePath = "$FleetHome\state\watchdog\heal.json"
+    $healState = $null; try { $healState = Read-Json $healStatePath } catch {}
+    if (-not $healState) { $healState = [pscustomobject]@{} }
+    $healWindowStart = $now.AddHours(-$healWindowHours)
+    $healed = @()
+    $healChanged = $false
+    foreach ($e in @($check.escalate | Where-Object { "$($_.kind)" -eq 'blocked' })) {
+      $healName = "$($e.name)"
+      if (-not $healName) { continue }
+      $healRow = $daemon | Where-Object { "$($_.name)" -eq $healName } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      $healJs = $null; if ($healRow) { try { $healJs = Get-JobState $healRow.id } catch {} }
+      $healNeeds = ''; if ($healJs -and $healJs.PSObject.Properties['needs']) { $healNeeds = "$($healJs.needs)" }
+      if ($healNeeds -match '^approve ') { continue }   # a real permission prompt: never healed
+      $healAge = Get-HeartbeatAgeMinutes $healName
+      if ($null -eq $healAge -or $healAge -le $healStaleMinutes) { continue }
+      $healPrior = $null
+      if ($healState.PSObject.Properties[$healName]) { $healPrior = $healState.$healName }
+      $healPriorAttempts = @()
+      if ($healPrior -and $healPrior.PSObject.Properties['attempts']) { $healPriorAttempts = @($healPrior.attempts | Where-Object { $_ }) }
+      $healRecentAttempts = @($healPriorAttempts | Where-Object { $ts = ConvertTo-UtcDateTime $_; $ts -and $ts -ge $healWindowStart })
+      if ($healRecentAttempts.Count -ge $healCap) { continue }   # past the cap: the stale heartbeat stands for fleet-dead, not retried in silence
+      # Test-WorkWaiting (ticket 75): computed here, lazily, only for a candidate that
+      # already cleared needs/heartbeat - a healthy fleet never pays for the extra
+      # planner call. A session with no single tenant (dispatcher) is healed when ANY
+      # tenant has work waiting; a scoped role (project-lead, principal, an IC) checks
+      # only its own.
+      $healTenantName = "$($e.tenant)"
+      $healWorkWaiting = $false
+      $healWakeState = $null; try { $healWakeState = Read-Json "$FleetHome\state\watchdog\frontier-wake.json" } catch {}
+      $healTenantFiles = if ($healTenantName) { @(Get-ChildItem "$FleetHome\tenants" -Filter "$healTenantName.json" -ErrorAction SilentlyContinue) } else { @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue) }
+      foreach ($healTenantFile in $healTenantFiles) {
+        $healTenantObj = $null; try { $healTenantObj = Read-Json $healTenantFile.FullName } catch { continue }
+        if (-not $healTenantObj) { continue }
+        $healTName = "$($healTenantObj.name)"; if (-not $healTName) { $healTName = $healTenantFile.BaseName }
+        if (Test-WorkWaiting -TenantName $healTName -Tenant $healTenantObj -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap -WakeState $healWakeState) { $healWorkWaiting = $true; break }
+      }
+      if (-not $healWorkWaiting) { continue }
+      $healRole = "$($e.role)"
+      $healAction = if ($controlPlaneHealRoles -contains $healRole) { 'rotate' } else { 'respawn' }
+      $healReason = "heal: blocked, heartbeat $([int]$healAge)m stale (threshold $healStaleMinutes), work waiting"
+      $healOk = $false
+      $healOutcome = $null
+      if ($healAction -eq 'rotate') {
+        $healRaw = ''; $healOut = $null
+        try { $healRaw = & "$PSScriptRoot\rotate.ps1" -Name $healName -Wake $healReason 2>&1 | Out-String; $healOut = ConvertFrom-LastJsonLine $healRaw } catch {}
+        $healOk = [bool]($healOut -and $healOut.PSObject.Properties['rotated'] -and (@($healOut.rotated) -contains $healName))
+        $healOutcome = if ($healOut) { $healOut } else { Get-OneLine $healRaw 200 }
+      } else {
+        $healRespawnReportPath = "$FleetHome\state\watchdog\last-heal-respawn.json"
+        $healRaw = ''; $healOut = $null
+        try { $healRaw = & "$PSScriptRoot\sentinel-check.ps1" -Apply -Actor watchdog -HealRespawn $healName -ReportPath $healRespawnReportPath 2>&1 | Out-String; $healOut = ConvertFrom-LastJsonLine $healRaw } catch {}
+        $healOk = [bool]($healOut -and @($healOut.respawned | Where-Object { "$($_.name)" -eq $healName }).Count -gt 0)
+        $healOutcome = if ($healOut) { $healOut } else { Get-OneLine $healRaw 200 }
+      }
+      $healPriorAttempts += (Now-Iso)
+      $healState | Add-Member -NotePropertyName $healName -NotePropertyValue ([pscustomobject]@{ attempts = @($healPriorAttempts); lastAction = $healAction; lastOk = $healOk; lastAt = (Now-Iso) }) -Force
+      $healChanged = $true
+      $healed += [pscustomobject]@{ name = $healName; role = $healRole; tenant = $healTenantName; action = $healAction; ok = $healOk; reason = $healReason; outcome = $healOutcome; attempt = $healRecentAttempts.Count + 1 }
+    }
+    if ($healChanged) { try { Write-Json $healStatePath $healState } catch {} }
   }
 
   # --- frontier wake (ticket 09, ruling 2, Cory 2026-09-09). No script can message a
@@ -910,7 +991,7 @@ try {
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults; repeatPaged = $repeatPaged
     checkError = $checkError; proposed = $proposed
-    launches = $launches; notified = $notified; waiting = $waiting; frontierWakes = $frontierWakes; triageWakes = $triageWakes
+    launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; triageWakes = $triageWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
     deadMan = $deadMan
   }
