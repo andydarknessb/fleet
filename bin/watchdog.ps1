@@ -241,7 +241,14 @@ try {
     finally {
       try { $result.stdout = Get-Content $childOut -Raw -ErrorAction SilentlyContinue } catch {}
       try { $result.stderr = Get-Content $childErr -Raw -ErrorAction SilentlyContinue } catch {}
-      Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue
+      # 2026-09-18 QA (review 2, NIT): on the timeout path the just-killed process
+      # can still hold its redirect handles for a moment, so the first Remove-Item
+      # silently leaked both temp files. One short-delay retry, then give up
+      # silently (never fail the tick over two leaked temp files).
+      try { Remove-Item $childOut, $childErr -ErrorAction Stop } catch {
+        Start-Sleep -Milliseconds 200
+        try { Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue } catch {}
+      }
     }
     return $result
   }

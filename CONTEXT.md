@@ -147,8 +147,9 @@ _Avoid_: restart, refresh, recycle
 **Watchdog**:
 The scheduled task, never a session, that runs the mechanical check every
 fifteen minutes. While the rostered Sentinel is enabled it shadows: it keeps
-the parity log and pages Cory out of band - a toast and a red banner in the
-status view - only when self-healing is the casualty (the check cannot run,
+the parity log and pages Cory out of band - a Pushover page by priority, with
+a toast as the on-host echo and the red banner in the status view unchanged -
+only when self-healing is the casualty (the check cannot run,
 the Sentinel is stale, every static heartbeat is stale, or launches of one
 name keep failing), and acts on nothing. After cutover
 (`state/flags/sentinel-off`) it is the supervisor: the check applies and a
