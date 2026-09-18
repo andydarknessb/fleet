@@ -62,6 +62,25 @@ function Test-IssueClosed {
   return ("$($obj.state)" -eq 'CLOSED')
 }
 
+function Test-BranchMergedPr {
+  # Ruling 3 (fleet #88, 2026-09-18): the tenant squash-merges, so a branch that is the
+  # head of a MERGED pull request counts as merged even when ancestry and the remote
+  # both say otherwise. Fail CLOSED like Test-IssueClosed: a non-zero gh exit or output
+  # that does not parse to JSON is UNKNOWN ($null), never read as "not merged". Only a
+  # parsed list counts - empty means a genuine, known no; one or more entries is a yes.
+  param([string]$Github, [string]$Branch)
+  if (-not $Github) { return $null }
+  $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $raw = & gh pr list -R $Github --head $Branch --state merged --json number,mergedAt 2>&1 } finally { $ErrorActionPreference = $previous }
+  if ($LASTEXITCODE -ne 0) { return $null }   # unreadable: never read as merged
+  # `@(...)` wrapped AROUND the ConvertFrom-Json pipeline collapses a genuinely empty
+  # JSON array ("[]") into a one-element array holding that empty array, instead of a
+  # zero-count array - assign first, then wrap, so an empty list reads as Count 0.
+  try { $parsed = ($raw | Out-String).Trim() | ConvertFrom-Json } catch { return $null }
+  $list = @($parsed)
+  return ($list.Count -gt 0)
+}
+
 # --- worktree sweep: remove only when the Work record is settled AND the tree is
 # --- clean AND the branch is merged or gone on the remote; else list with the reason. ---
 $activeWork = Read-ActiveWork
@@ -122,6 +141,7 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
     # listed when a repo keeps merged branches around.
     $ancestorMerged = $false
     $branchOk = $false
+    $mergeLeg = $null   # which leg of condition 3 satisfied it: ancestor / remote-gone / merged-pr
     if (-not $def) {
       $reasons += 'tenant has no defaultBranch configured; cannot evaluate merge ancestry'
     } else {
@@ -134,7 +154,7 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
       $remoteRaw = (& git -C $t.repo ls-remote --heads origin $br 2>$null | Out-String).Trim()
       $remoteExit = $LASTEXITCODE
       if ($ancestorMerged) {
-        $branchOk = $true
+        $branchOk = $true; $mergeLeg = 'ancestor'
       } elseif ($remoteExit -ne 0) {
         # The remote lookup itself failed (origin unreachable, network trouble, auth) -
         # that is UNKNOWN, not "gone". Reading a failed lookup as "gone" would remove
@@ -142,13 +162,26 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
         # finding 1, the blocker).
         $reasons += "branch is not merged into the default branch and the remote lookup failed (git ls-remote exit $remoteExit); left listed rather than guessing"
       } elseif ($remoteRaw -eq '') {
-        $branchOk = $true
+        $branchOk = $true; $mergeLeg = 'remote-gone'
       } else {
-        $reasons += 'branch is neither merged into the default branch nor deleted on the remote'
+        # Ruling 3 (fleet #88, 2026-09-18): the fleet squash-merges, so ancestry fails
+        # on construction for nearly every finished branch, and the tenant routinely
+        # leaves the remote branch in place too. A MERGED pull request whose head is
+        # this branch is a third, independent leg - see Test-BranchMergedPr for the
+        # fail-closed read.
+        $prMerged = Test-BranchMergedPr -Github $t.github -Branch $br
+        if ($prMerged -eq $true) {
+          $branchOk = $true; $mergeLeg = 'merged-pr'
+        } elseif ($prMerged -eq $false) {
+          $reasons += 'branch is neither merged into the default branch, deleted on the remote, nor the head of a merged pull request'
+        } else {
+          $reasons += 'branch is not merged into the default branch, still present on the remote, and the merged-pull-request lookup could not be read (gh pr list failed or returned no parseable JSON); left listed rather than guessing'
+        }
       }
     }
 
     $entry = [ordered]@{ tenant = $tenantName; path = $path; branch = $br; issue = $issue }
+    if ($mergeLeg) { $entry.mergeLeg = $mergeLeg }
     if ($recordOk -and $clean -and $branchOk) {
       if ($Apply) {
         & git -C $t.repo worktree remove $path 2>$null   # never --force: a refusal here means our own checks missed something
@@ -305,8 +338,9 @@ $lines = @("# Janitor run $($report.at)", '', "Mode: $(if ($Apply) { 'APPLY' } e
 if ($report.worktrees.Count -eq 0) { $lines += '(none)' }
 foreach ($w in $report.worktrees) {
   $issueTxt = if ($w.issue) { ", issue #$($w.issue)" } else { '' }
+  $legTxt = if ($w.mergeLeg) { ", leg $($w.mergeLeg)" } else { '' }
   $reasonTxt = if ($w.reason) { ": $($w.reason)" } else { '' }
-  $lines += "- [$($w.action)] $($w.tenant) $($w.path) (branch $($w.branch)$issueTxt)$reasonTxt"
+  $lines += "- [$($w.action)] $($w.tenant) $($w.path) (branch $($w.branch)$issueTxt$legTxt)$reasonTxt"
 }
 $lines += '', '## Temp litter (state/tmp-*, TEMP/fleet-work-state-*)'
 if ($report.tmpLitter.Count -eq 0) { $lines += '(none)' }

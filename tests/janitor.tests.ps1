@@ -201,6 +201,14 @@ try {
   Write-Utf8 "$testRoot\state\heartbeats\ic-77.json" (@{ at = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress)
   Write-Utf8 "$testRoot\state\heartbeats\ic-88.json" (@{ at = (Get-Date).ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress)
 
+  # gh mock for the main fixture: only '90-clean-unmerged' (ancestor false, remote still
+  # present) ever reaches the merged-PR leg here, and it has no merged PR - an empty,
+  # successfully-parsed list is a known no, keeping this scenario's outcome exactly what
+  # it was before ruling 3 added the third leg.
+  [IO.Directory]::CreateDirectory("$testRoot\mock-bin") | Out-Null
+  Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  $oldPathMain = $env:PATH; $env:PATH = "$testRoot\mock-bin;$oldPathMain"
+
   # ================= -DryRun (the default): report only, touch nothing =================
   # -TempRoot is passed even in dry run: the real %TEMP% must never be enumerated by this suite.
   $dry = Run-Janitor @('-TempRoot', "$testRoot\os-temp")
@@ -254,6 +262,8 @@ try {
 
   Assert-True (Test-Path $applied.reportPath) 'the run must write its report file'
   Assert-True ((Get-Content $applied.reportPath -Raw) -match 'Janitor run') 'the report must be readable prose, not just the JSON line'
+
+  $env:PATH = $oldPathMain
 
   # ================= review-round safety checks: a failed/unreadable input must be =================
   # ================= UNKNOWN, listed, and never license a removal or a deletion    =================
@@ -343,6 +353,88 @@ try {
   Assert-True (-not (Test-Path "$rootAR\state\escalations\esc-x.json")) 'the newly settled escalation must still be moved out of the live directory'
   $archivedNow = @(Get-ChildItem "$rootAR\state\escalations\archive" -Filter 'esc-x*.json')
   Assert-True ($archivedNow.Count -eq 2) 'the collision must produce a second, disambiguated archive file rather than dropping the new one'
+
+  # --- Ruling 3 (fleet #88, 2026-09-18): a MERGED pull request whose head is the
+  # --- worktree's branch is a third leg of condition 3 - the fleet squash-merges, so
+  # --- ancestry fails on construction, and the tenant here also leaves the remote
+  # --- branch in place, so neither of the first two legs can catch it. ---
+  function New-MiniTenantRepoUnmerged {
+    # Same clean-and-pushed shape as New-MiniTenantRepo, but the branch is never merged
+    # into main by ancestry and its remote copy is never deleted - the squash-merge
+    # shape the ruling names, where only a merged-PR lookup can settle condition 3.
+    param([string]$Root, [string]$TenantName, [int]$Issue, [string]$BranchSlug)
+    $remote = "$Root\remote-$TenantName.git"; $repo = "$Root\repo-$TenantName"
+    Invoke-Git @('init', '--bare', '-q', $remote) | Out-Null
+    Invoke-Git @('clone', '-q', $remote, $repo) | Out-Null
+    Invoke-Git @('-C', $repo, 'config', 'user.email', 'a@b.com') | Out-Null
+    Invoke-Git @('-C', $repo, 'config', 'user.name', 'a') | Out-Null
+    Invoke-Git @('-C', $repo, 'checkout', '-q', '-b', 'main') | Out-Null
+    Invoke-Git @('-C', $repo, 'commit', '-q', '--allow-empty', '-m', 'init') | Out-Null
+    Invoke-Git @('-C', $repo, 'push', '-q', '-u', 'origin', 'main') | Out-Null
+    $branch = "$Issue-$BranchSlug"
+    Invoke-Git @('-C', $repo, 'branch', $branch, 'main') | Out-Null
+    Invoke-Git @('-C', $repo, 'checkout', '-q', $branch) | Out-Null
+    Write-Utf8 "$repo\f.txt" 'x'
+    Invoke-Git @('-C', $repo, 'add', '-A') | Out-Null
+    Invoke-Git @('-C', $repo, 'commit', '-q', '-m', 'work') | Out-Null
+    Invoke-Git @('-C', $repo, 'push', '-q', '-u', 'origin', $branch) | Out-Null
+    Invoke-Git @('-C', $repo, 'checkout', '-q', 'main') | Out-Null
+    $wt = "$Root\.claude\worktrees\$branch"
+    Invoke-Git @('-C', $repo, 'worktree', 'add', '-q', $wt, $branch) | Out-Null
+    return [pscustomobject]@{ repo = $repo; branch = $branch; worktree = $wt }
+  }
+  function Write-GhPrListMock { param([string]$BinDir, [string]$Body, [int]$ExitCode)
+    [IO.Directory]::CreateDirectory($BinDir) | Out-Null
+    Write-Utf8 "$BinDir\gh.cmd" ('@echo off' + "`r`n" + "echo $Body" + "`r`n" + "exit /b $ExitCode" + "`r`n")
+  }
+
+  # (a) a merged PR for the head branch -> removed under -Apply, would-remove with leg
+  # merged-pr under -DryRun.
+  $rootMP = New-MiniRoot 'merged-pr-ok'
+  $tenMP = New-MiniTenantRepoUnmerged -Root $rootMP -TenantName 'mp' -Issue 300 -BranchSlug 'squashed'
+  Write-Utf8 "$rootMP\tenants\mp.json" (@{ name = 'mp'; repo = $tenMP.repo; github = 'owner/repo'; defaultBranch = 'main' } | ConvertTo-Json -Compress)
+  Write-Utf8 "$rootMP\state\work\active.json" (@{ schemaVersion = 1; records = @{ 'mp:issue-300' = @{ state = 'merged' } } } | ConvertTo-Json -Depth 6)
+  Write-GhPrListMock -BinDir "$rootMP\mock-bin" -Body '[{"number":501,"mergedAt":"2026-09-18T00:00:00Z"}]' -ExitCode 0
+  $oldPathMP = $env:PATH; $env:PATH = "$rootMP\mock-bin;$oldPathMP"
+  $dryMP = Run-JanitorAt -Root $rootMP -Arguments @('-TempRoot', "$rootMP\mini-temp")
+  $wtMPDry = Find-Worktree $dryMP '300-squashed'
+  Assert-True ($wtMPDry.action -eq 'would-remove' -and "$($wtMPDry.mergeLeg)" -eq 'merged-pr') 'a branch that is the head of a merged PR must be would-remove with leg merged-pr in dry run'
+  $appliedMP = Run-JanitorAt -Root $rootMP -Arguments @('-Apply', '-TempRoot', "$rootMP\mini-temp")
+  $env:PATH = $oldPathMP
+  $wtMPApplied = Find-Worktree $appliedMP '300-squashed'
+  Assert-True ($wtMPApplied.action -eq 'removed' -and "$($wtMPApplied.mergeLeg)" -eq 'merged-pr') 'a branch that is the head of a merged PR must be removed under -Apply'
+  Assert-True (-not (Test-Path $tenMP.worktree)) 'the merged-pr removal must actually remove the worktree'
+
+  # (b) gh pr list exits non-zero -> UNKNOWN, listed, kept (never read as "not merged").
+  $rootMF = New-MiniRoot 'merged-pr-gh-fails'
+  $tenMF = New-MiniTenantRepoUnmerged -Root $rootMF -TenantName 'mf' -Issue 301 -BranchSlug 'squashed'
+  Write-Utf8 "$rootMF\tenants\mf.json" (@{ name = 'mf'; repo = $tenMF.repo; github = 'owner/repo'; defaultBranch = 'main' } | ConvertTo-Json -Compress)
+  Write-Utf8 "$rootMF\state\work\active.json" (@{ schemaVersion = 1; records = @{ 'mf:issue-301' = @{ state = 'merged' } } } | ConvertTo-Json -Depth 6)
+  Write-GhPrListMock -BinDir "$rootMF\mock-bin" -Body 'gh: rate limited' -ExitCode 1
+  $oldPathMF = $env:PATH; $env:PATH = "$rootMF\mock-bin;$oldPathMF"
+  $repMF = Run-JanitorAt -Root $rootMF -Arguments @('-Apply', '-TempRoot', "$rootMF\mini-temp")
+  $env:PATH = $oldPathMF
+  $wtMF = Find-Worktree $repMF '301-squashed'
+  Assert-True ($wtMF.action -eq 'listed' -and "$($wtMF.reason)" -match 'merged-pull-request lookup could not be read' -and -not $wtMF.mergeLeg) 'a failed gh pr list must be UNKNOWN, listed, never removed'
+  Assert-True (Test-Path $tenMF.worktree) 'a worktree must survive a failed merged-PR lookup'
+
+  # (c) gh pr list succeeds but returns an empty list -> a known no, listed, kept.
+  $rootME = New-MiniRoot 'merged-pr-empty'
+  $tenME = New-MiniTenantRepoUnmerged -Root $rootME -TenantName 'me' -Issue 302 -BranchSlug 'squashed'
+  Write-Utf8 "$rootME\tenants\me.json" (@{ name = 'me'; repo = $tenME.repo; github = 'owner/repo'; defaultBranch = 'main' } | ConvertTo-Json -Compress)
+  Write-Utf8 "$rootME\state\work\active.json" (@{ schemaVersion = 1; records = @{ 'me:issue-302' = @{ state = 'merged' } } } | ConvertTo-Json -Depth 6)
+  Write-GhPrListMock -BinDir "$rootME\mock-bin" -Body '[]' -ExitCode 0
+  $oldPathME = $env:PATH; $env:PATH = "$rootME\mock-bin;$oldPathME"
+  $repME = Run-JanitorAt -Root $rootME -Arguments @('-Apply', '-TempRoot', "$rootME\mini-temp")
+  $env:PATH = $oldPathME
+  $wtME = Find-Worktree $repME '302-squashed'
+  Assert-True ($wtME.action -eq 'listed' -and "$($wtME.reason)" -match 'nor the head of a merged pull request' -and -not $wtME.mergeLeg) 'an empty merged-PR list is a known no, listed, never removed'
+  Assert-True (Test-Path $tenME.worktree) 'a worktree must survive an empty merged-PR list'
+
+  # (d) existing cases unchanged: the ancestor and remote-gone legs still resolve, and
+  # now also record which leg satisfied condition 3.
+  Assert-True ("$((Find-Worktree $applied '88-clean-merged').mergeLeg)" -eq 'ancestor') 'an ancestor-merged branch must record leg ancestor'
+  Assert-True ("$((Find-Worktree $applied '91-clean-squashed').mergeLeg)" -eq 'remote-gone') 'a branch gone on the remote must record leg remote-gone'
 
   # --- two runs on the same day must not overwrite each other's report ---
   $rootRP = New-MiniRoot 'report-unique'
