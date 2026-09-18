@@ -1021,7 +1021,7 @@ try {
   if ($checkError) { $conditions += [pscustomobject]@{ key = 'check-failed'; kind = 'check-failed'; detail = "sentinel-check could not run or report: $(Get-OneLine $checkError 300)"; url = $null } }
   foreach ($se in $stateErrors) { $conditions += [pscustomobject]@{ key = 'state-unreadable'; kind = 'state-unreadable'; detail = $se; url = $null } }
   if ($sentinelOff -and $sentinelRow) {
-    $conditions += [pscustomobject]@{ key = 'double-actor'; kind = 'double-actor'; detail = "state/flags/sentinel-off stands but a Sentinel session is running (job $($sentinelRow.id)); the supervisor stays in shadow so nothing acts twice. Stop that session (claude stop $($sentinelRow.id)) or run bin\rollback-sentinel.ps1"; url = $null }
+    $conditions += [pscustomobject]@{ key = 'double-actor'; kind = 'double-actor'; detail = "state/flags/sentinel-off stands but a Sentinel session is running (job $($sentinelRow.id)); the supervisor stays in shadow so nothing acts twice. Stop that session: claude stop $($sentinelRow.id)"; url = $null }
   }
   if ($mode -eq 'live' -and $check) {
     foreach ($e in @($check.escalate)) {
