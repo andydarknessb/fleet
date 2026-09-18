@@ -90,14 +90,15 @@ try {
   # ---
   # --- Every kind the Watchdog can build today, on purpose (tests/watchdog.tests.ps1
   # --- walks this list): fleet-dead=emergency, permission-wait=high, launch-retry=high,
-  # --- branch-diverged=high (all ADR 0012-ruled); sentinel-stale, check-failed,
+  # --- branch-diverged=high, human-wait=normal (all ADR 0012-ruled, human-wait by
+  # --- Cory's 2026-09-18 heal ruling); sentinel-stale, check-failed,
   # --- state-unreadable, double-actor, and the check-escalation kinds stray,
   # --- cap-exceeded, ic-vanished, pr-lookup-failed, blocked default to normal - none
   # --- of these is a Cory decision the ADR names, so falling to pages.defaultPriority
   # --- is the reasoned choice, not a silent gap. state-escalated, state-hold and
   # --- merge-review-wake belong to the Notifier (#79) and never reach this function
   # --- from here.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'human-wait' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -371,7 +372,7 @@ try {
   # --- the flag pages (double-actor) and this run stays in shadow. -Verify never applies.
   $supervisorConfig = $null
   try { $supervisorConfig = (Read-Json "$FleetHome\config\cycle.json").supervisor } catch {}
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged')
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'human-wait')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
@@ -709,6 +710,7 @@ try {
   if (-not $healStateUnreadable -and -not $healState) { $healState = [pscustomobject]@{} }
   $healWindowStart = $now.AddHours(-$healWindowHours)
   $healed = @()
+  $humanWaits = @()   # Cory's ruling 2026-09-18 (fleet #84): a session asking a human pages, once, normal priority
   $healChanged = $false
   $healRespawnInvocations = 0
   $healRespawnInvocationCap = 2   # review #2: same per-tick cap as sentinel-check's own verify cap
@@ -717,21 +719,32 @@ try {
       $healName = "$($e.name)"
       if (-not $healName) { continue }
       $healRow = $daemon | Where-Object { "$($_.name)" -eq $healName } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
-      # review #5 (Cory's ruling pending): `^approve ` alone does not cover
-      # AskUserQuestion or a plain human wait (sentinel-check's own comment says
-      # so). Until ruled, heal ONLY when the job state read cleanly AND `needs` is
-      # a present, empty (or whitespace) string; any non-empty needs, a missing
-      # key, or an unreadable job state is NOT healed, recorded with why.
+      # Cory's ruling 2026-09-18 (fleet #84): the daemon deletes the `needs` key
+      # rather than ever writing an empty string, so "present, empty" (the old
+      # rule) never actually fired - 51 of 52 real job states, including a
+      # working dispatcher, carry no `needs` key at all. Heal when the job state
+      # read cleanly AND `needs` is absent or whitespace-only. Any non-empty
+      # `needs` is a session asking a human: `^approve ` alone is a permission
+      # prompt (paged already, below, at high priority - never doubled here);
+      # anything else is a plain ask (a question, "reply ...", an
+      # AskUserQuestion) and raises its own `human-wait` page instead of
+      # healing. An unreadable job state or no daemon row to read it from is
+      # NOT healed and never pages - there is nothing to relay.
       $healJs = $null; $healJsReadOk = $false
       if ($healRow) { try { $healJs = Get-JobState $healRow.id; $healJsReadOk = $true } catch { $healJsReadOk = $false } }
-      $healNeedsOk = $false; $healNeedsReason = ''
+      $healNeedsOk = $false; $healNeedsReason = ''; $healNeedsValue = $null
       if (-not $healRow) { $healNeedsReason = 'no daemon row to read job state from' }
       elseif (-not $healJsReadOk -or $null -eq $healJs) { $healNeedsReason = 'job state unreadable' }
-      elseif (-not $healJs.PSObject.Properties['needs']) { $healNeedsReason = 'job state has no needs key' }
-      elseif ("$($healJs.needs)".Trim() -ne '') { $healNeedsReason = "needs is not empty: $(Get-OneLine "$($healJs.needs)" 100)" }
-      else { $healNeedsOk = $true }
+      else {
+        $healNeedsRaw = if ($healJs.PSObject.Properties['needs']) { "$($healJs.needs)" } else { '' }
+        if ($healNeedsRaw.Trim() -eq '') { $healNeedsOk = $true }
+        else { $healNeedsReason = "needs is not empty: $(Get-OneLine $healNeedsRaw 100)"; $healNeedsValue = $healNeedsRaw }
+      }
       if (-not $healNeedsOk) {
         $healed += [pscustomobject]@{ name = $healName; role = "$($e.role)"; tenant = "$($e.tenant)"; action = 'none'; ok = $false; proposed = ($mode -ne 'live'); reason = "not healed: $healNeedsReason" }
+        if ($healNeedsValue -and $healNeedsValue -notmatch '^approve ') {
+          $humanWaits += [pscustomobject]@{ name = $healName; needs = (Get-OneLine $healNeedsValue 200) }
+        }
         continue
       }
       # review #7: a MISSING heartbeat file must read as stale for healing too,
@@ -1013,6 +1026,15 @@ try {
     # Keyed by job, not name: a stale daemon row and its relaunch can share a name, and one
     # key per job is also what lets a retired job's page clear while its successor's stands.
     $conditions += [pscustomobject]@{ key = "permission-wait:$($pw.name):$($pw.job)"; kind = 'permission-wait'; detail = $pwDetail; escalation = [pscustomobject]@{ name = $pw.name; kind = 'permission-wait'; detail = $pwDetail; parent = $pw.parent }; url = $null }
+  }
+  # Cory's ruling 2026-09-18 (fleet #84): a blocked, stale session whose `needs`
+  # is a plain ask to a human (never a permission prompt - that is
+  # permission-wait's condition, above, never doubled here) pages once, normal
+  # priority, so the ask reaches Cory instead of dying with the session when it
+  # is later rotated or respawned away. Keyed by name (not job): the same
+  # standing ask clears the moment `needs` clears, whichever job answers it.
+  foreach ($hw in $humanWaits) {
+    $conditions += [pscustomobject]@{ key = "human-wait:$($hw.name)"; kind = 'human-wait'; detail = $hw.needs; url = $null }
   }
   $escCount = @(Get-ChildItem "$FleetHome\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count
   $checkEsc = 0; if ($check) { $checkEsc = @($check.escalate).Count }

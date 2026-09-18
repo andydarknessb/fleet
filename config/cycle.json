@@ -59,7 +59,8 @@
       "sync-refused": "high",
       "state-escalated": "normal",
       "state-hold": "normal",
-      "dated": "normal"
+      "dated": "normal",
+      "human-wait": "normal"
     },
     "defaultPriority": "normal",
     "fleetDeadRepeatMinutes": 120
@@ -69,7 +70,7 @@
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "human-wait"]
   },
   "assignment": {
     "parityEvaluations": 20,

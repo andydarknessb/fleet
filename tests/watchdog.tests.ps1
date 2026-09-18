@@ -688,11 +688,15 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $h2 = Run-Watchdog
   Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH2) 'a permission prompt must never be healed'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\heal.json")) 'a permission prompt must not even count as a heal attempt'
-  # 2026-09-17 QA (fleet #84 review #5): a non-empty `needs` is now recorded on
-  # the shadow line WHY it was not healed (ok:false, action:none), not silently
-  # dropped - the ruling this implements is provisional pending Cory's own.
+  # 2026-09-17 QA (fleet #84 review #5): a non-empty `needs` is recorded on the
+  # shadow line WHY it was not healed (ok:false, action:none), not silently
+  # dropped.
   $h2Entry = @($h2.healed | Where-Object { $_.name -eq 'pl-test' })
   Assert-True ($h2Entry.Count -eq 1 -and $h2Entry[0].ok -eq $false -and $h2Entry[0].action -eq 'none' -and "$($h2Entry[0].reason)" -match 'needs is not empty') 'a permission prompt must be recorded as not healed, with the reason, never actually healed'
+  # Case H2b (control, Cory's ruling 2026-09-18, fleet #84): `^approve ` still
+  # only raises permission-wait (unchanged, tested in the paging section below)
+  # and must never also raise human-wait - a permission prompt is never doubled.
+  Assert-True (-not (@($h2.conditions) -contains 'human-wait:pl-test')) 'a permission prompt must never raise human-wait'
 
   # Case H3 (control): heartbeat 59 min (under the 60-min threshold) must not heal.
   Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
@@ -765,40 +769,73 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ($h6bHeal.Count -eq 1 -and $h6bHeal[0].ok -eq $false) 'a heal-respawn child that writes nothing must be read as failed, never a stale success'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
-  # Case H7 (2026-09-17 QA, fleet #84 review #5, ruling pending Cory's own): a
-  # non-empty needs ("waiting for user input" - an AskUserQuestion or a plain
-  # human wait, `^approve ` alone does not cover it), a missing needs key, and
-  # an unreadable job state must all NOT heal, each recorded with its own reason.
+  # ===== Cory's ruling 2026-09-18 (fleet #84): the daemon DELETES `needs` =====
+  # ===== rather than ever writing an empty string, so "present, empty" (the =====
+  # ===== old rule) never actually fired. Heal when the job state read cleanly =====
+  # ===== AND `needs` is absent or whitespace-only; any other non-empty needs =====
+  # ===== is a session asking a human and pages human-wait instead of healing. =====
   Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   $blockedPlRowH7 = $plRow.Replace('"state":"working"', '"state":"blocked"')
   Set-AgentsRows "[$dispRow,$blockedPlRowH7]"
   Set-Heartbeat 'pl-test' 61
 
-  Write-Utf8 $jobPStatePath '{"needs":"waiting for user input","updatedAt":"2026-01-01T00:00:00Z"}'
-  $rotateCountBeforeH7a = @(Get-RotateCalls).Count
-  $h7a = Run-Watchdog
-  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7a) '"waiting for user input" must not be healed'
-  $h7aEntry = @($h7a.healed | Where-Object { $_.name -eq 'pl-test' })
-  Assert-True ($h7aEntry.Count -eq 1 -and $h7aEntry[0].ok -eq $false -and "$($h7aEntry[0].reason)" -match 'needs is not empty') 'the reason must name the non-empty needs'
-
-  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
-  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  # Case H7a (red-tell, ruling 2): a MISSING needs key - the real shape of 51 of
+  # 52 job states on disk, including a working dispatcher - must now heal.
   Write-Utf8 $jobPStatePath '{"updatedAt":"2026-01-01T00:00:00Z"}'
-  $rotateCountBeforeH7b = @(Get-RotateCalls).Count
-  $h7b = Run-Watchdog
-  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7b) 'a missing needs key must not be healed'
-  $h7bEntry = @($h7b.healed | Where-Object { $_.name -eq 'pl-test' })
-  Assert-True ($h7bEntry.Count -eq 1 -and $h7bEntry[0].ok -eq $false -and "$($h7bEntry[0].reason)" -match 'no needs key') 'the reason must name the missing needs key'
+  $rotateHealCountBeforeH7a = @(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count
+  $h7a = Run-Watchdog
+  Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count -eq $rotateHealCountBeforeH7a + 1) 'a missing needs key must now be healed'
+  $h7aEntry = @($h7a.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h7aEntry.Count -eq 1 -and $h7aEntry[0].ok -eq $true) 'a missing needs key must be recorded as a successful heal'
 
+  # Case H7b (red-tell, ruling 2): whitespace-only needs must heal too.
   Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
-  Write-Utf8 $jobPStatePath '{oops'
+  Set-AgentsRows "[$dispRow,$blockedPlRowH7]"
+  Set-Heartbeat 'pl-test' 61
+  Write-Utf8 $jobPStatePath '{"needs":"   ","updatedAt":"2026-01-01T00:00:00Z"}'
+  $rotateHealCountBeforeH7b = @(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count
+  $h7b = Run-Watchdog
+  Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pl-test|heal:*' }).Count -eq $rotateHealCountBeforeH7b + 1) 'whitespace-only needs must be healed'
+  $h7bEntry = @($h7b.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h7bEntry.Count -eq 1 -and $h7bEntry[0].ok -eq $true) 'whitespace-only needs must be recorded as a successful heal'
+
+  # Case H7c (red-tell, ruling 2): a plain ask to a human ("reply go to merge
+  # PR #41" - the one real blocked row on disk) must NOT heal, and must page a
+  # new human-wait:<name> condition once, at normal priority, carrying the
+  # needs text as its detail; a standing human-wait must not page again.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows "[$dispRow,$blockedPlRowH7]"
+  Set-Heartbeat 'pl-test' 61
+  Write-Utf8 $jobPStatePath '{"needs":"reply go to merge PR #41","updatedAt":"2026-01-01T00:00:00Z"}'
   $rotateCountBeforeH7c = @(Get-RotateCalls).Count
   $h7c = Run-Watchdog
-  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7c) 'an unreadable job state must not be healed'
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7c) 'a plain human ask must not be healed'
   $h7cEntry = @($h7c.healed | Where-Object { $_.name -eq 'pl-test' })
-  Assert-True ($h7cEntry.Count -eq 1 -and $h7cEntry[0].ok -eq $false -and "$($h7cEntry[0].reason)" -match 'unreadable') 'the reason must name the unreadable job state'
+  Assert-True ($h7cEntry.Count -eq 1 -and $h7cEntry[0].ok -eq $false -and "$($h7cEntry[0].reason)" -match 'needs is not empty') 'the reason must name the non-empty needs'
+  Assert-True (@($h7c.conditions) -contains 'human-wait:pl-test') 'a plain human ask must raise human-wait'
+  $h7cPaged = @($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })
+  Assert-True ($h7cPaged.Count -eq 1 -and $h7cPaged[0].priority -eq 'normal') 'human-wait must page once, at normal priority'
+  Assert-True ("$($h7cPaged[0].page.body)" -eq 'reply go to merge PR #41') 'the page body must carry the needs text through Get-OneLine'
+  $h7c2 = Run-Watchdog
+  Assert-True (@($h7c2.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' }).Count -eq 0) 'a standing human-wait must not page again next tick'
+  Assert-True (@($h7c2.conditions) -contains 'human-wait:pl-test') 'the standing human-wait condition itself must still be recorded'
+
+  # Case H7d (red-tell, ruling 2): an unreadable job state must not heal and
+  # must page nothing - there is no needs text to relay.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows "[$dispRow,$blockedPlRowH7]"
+  Set-Heartbeat 'pl-test' 61
+  Write-Utf8 $jobPStatePath '{oops'
+  $rotateCountBeforeH7d = @(Get-RotateCalls).Count
+  $h7d = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH7d) 'an unreadable job state must not be healed'
+  $h7dEntry = @($h7d.healed | Where-Object { $_.name -eq 'pl-test' })
+  Assert-True ($h7dEntry.Count -eq 1 -and $h7dEntry[0].ok -eq $false -and "$($h7dEntry[0].reason)" -match 'unreadable') 'the reason must name the unreadable job state'
+  Assert-True (@($h7d.conditions).Count -eq 0) 'an unreadable job state must page nothing'
 
   # Case H8 (fleet #84 review #7): a session with NO heartbeat file at all reads
   # as stale for healing too (matching fleet-dead's own treatment of "never
@@ -1470,6 +1507,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r10d.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-777:stray' })[0]).priority -eq 'normal') 'stray is deliberately normal'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
+  Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'
   Assert-True ($rp1.repeatPaged.priority -eq 'emergency') 'the fleet-dead repeat is ADR-ruled emergency'
 
   # --- ic-vanished: an active IC on the live roster with no matching daemon row.

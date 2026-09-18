@@ -156,8 +156,11 @@ name keep failing), and acts on nothing. After cutover
 missing static session launches through the one door. A fault healed by a
 respawn or Rotation is logged and never paged; a paging condition leaves one
 escalation file and pages only after self-healing fails. `blocked` alone is
-recorded; after sixty stale minutes with work waiting and no permission prompt,
-it enters that self-heal path. Two actors never run: a Sentinel session alive
+recorded; after sixty stale minutes with work waiting and an absent or
+whitespace-only `needs`, it enters that self-heal path. A permission prompt
+(`^approve `) still only pages, at high priority, never healed; any other
+non-empty `needs` is a session asking a human, and pages once, at normal
+priority, instead of healing. Two actors never run: a Sentinel session alive
 under the flag is the double-actor condition, and the Watchdog stays in shadow
 until it is gone.
 _Avoid_: sentinel (a session), monitor, health checker
