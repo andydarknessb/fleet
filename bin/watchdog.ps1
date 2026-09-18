@@ -1031,6 +1031,17 @@ try {
   foreach ($d in $datedItems) {
     $conditions += [pscustomobject]@{ key = "dated:$($d.where)"; kind = 'dated'; detail = "$($d.where) passed ($($d.value)) and is still in place"; url = $null }
   }
+  # 2026-09-18 QA (review 2, NIT): one name can raise launch-retry:<name> twice in
+  # a tick (the daemon-row storm scan and the respawn-failed trip both key on the
+  # same name) - the duplicate Add-Member below discarded silently, but a single
+  # failed delivery attempt still burned two entries' worth of retry budget for
+  # one condition. Dedupe by key, first-wins, before anything downstream sees them.
+  $seenConditionKeys = @{}
+  $conditions = @($conditions | Where-Object {
+    if ($seenConditionKeys.ContainsKey($_.key)) { return $false }
+    $seenConditionKeys[$_.key] = $true
+    return $true
+  })
 
   # --- page-once-DELIVERED dedupe (2026-09-17 QA, fleet #77 review BLOCKER): a key
   # --- is not "paged" (and so exempt from re-attempt) until Send-FleetPage actually
@@ -1053,7 +1064,19 @@ try {
     if (-not $Verify) { try { Move-Item $pagedPath "$pagedPath.corrupt-$($now.ToString('yyyyMMddTHHmmssZ'))" -Force } catch {} }
   }
   $oldKeys = @(); if ($paged) { $oldKeys = @($paged.PSObject.Properties.Name) }
+  # 2026-09-18 QA (fleet #77 review 2, MAJOR): gaveUpAt was permanent until the
+  # condition cleared - a wrong token in pushover.json meant 3 failed ticks, then
+  # silence forever (no POST, no toast beyond the log-only page-gave-up line, no
+  # fleet-dead repeat) even once Cory fixed it. A given-up entry is eligible
+  # again after pages.retryAfterMinutes (default 60), or immediately once
+  # state/pages/pushover.json is newer than gaveUpAt (Cory just fixed it).
   $pageMaxAttempts = 3
+  if ($pagesConfig -and $pagesConfig.PSObject.Properties['maxAttempts'] -and $pagesConfig.maxAttempts) { $pageMaxAttempts = [int]$pagesConfig.maxAttempts }
+  $pageRetryAfterMinutes = 60
+  if ($pagesConfig -and $pagesConfig.PSObject.Properties['retryAfterMinutes'] -and $pagesConfig.retryAfterMinutes) { $pageRetryAfterMinutes = [int]$pagesConfig.retryAfterMinutes }
+  $pushoverCredsPath = "$FleetHome\state\pages\pushover.json"
+  $pushoverCredsMtime = $null
+  if (Test-Path $pushoverCredsPath) { try { $pushoverCredsMtime = (Get-Item $pushoverCredsPath).LastWriteTimeUtc } catch {} }
   $nextPaged = [pscustomobject]@{}
   # First pass: pure state carry-forward, no side effects (safe under -Verify too).
   # A pre-this-fix entry (only firstSeen/lastSeen/detail: none of deliveredAt/
@@ -1125,6 +1148,22 @@ try {
         $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
       }
       if (-not $entry.url -and $c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
+
+      # review 2: a given-up entry gets one more chance once the retry window has
+      # passed, or right away once pushover.json was touched after the give-up
+      # (fail toward retrying on an unparseable gaveUpAt too). Otherwise the toast
+      # still fires every tick (it is free; the on-host echo of "this is still
+      # broken" should not stop just because Pushover delivery gave up).
+      if ($entry.gaveUpAt) {
+        $gaveUpAtUtc = ConvertTo-UtcDateTime $entry.gaveUpAt
+        $eligibleAgain = (-not $gaveUpAtUtc) -or ($pushoverCredsMtime -and $pushoverCredsMtime -gt $gaveUpAtUtc) -or ((New-TimeSpan -Start $gaveUpAtUtc -End $now).TotalMinutes -ge $pageRetryAfterMinutes)
+        if ($eligibleAgain) {
+          $entry.gaveUpAt = $null
+          $entry.attempts = 0
+        } elseif (-not $NoToast) {
+          try { Send-FleetToast 'Fleet watchdog' "$($c.detail) (still failing delivery; last error: $($entry.lastError))" | Out-Null } catch {}
+        }
+      }
 
       if (-not $entry.deliveredAt -and -not $entry.gaveUpAt) {
         $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig

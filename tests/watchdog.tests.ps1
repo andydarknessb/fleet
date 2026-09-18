@@ -1193,8 +1193,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
 
-    # Case DR5: three real failed attempts -> gaveUpAt is set and a fourth tick
-    # attempts, and posts, nothing more.
+    # Case DR5: three real failed attempts -> gaveUpAt is set and a fourth tick,
+    # still inside pages.retryAfterMinutes, attempts and posts nothing more.
     Set-Heartbeat 'sentinel' 90
     Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-giveup","user":"usr-giveup"}'
     $refusedPortGiveUp = Get-Random -Minimum 20000 -Maximum 40000
@@ -1203,10 +1203,47 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     $pagedGiveUp = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
     Assert-True ($pagedGiveUp.'sentinel-stale'.attempts -eq 3 -and $null -ne $pagedGiveUp.'sentinel-stale'.gaveUpAt) 'three failed attempts must give up'
     $dr5d = Run-Watchdog
-    Assert-True (@($dr5d.newlyPaged).Count -eq 0) 'a given-up condition must not attempt a fourth time'
+    Assert-True (@($dr5d.newlyPaged).Count -eq 0) 'a given-up condition must not attempt a fourth time within retryAfterMinutes'
+
+    # Case DR6 (2026-09-18 QA, fleet #77 review 2 MAJOR, red-tell): gaveUpAt used
+    # to be permanent until the condition cleared - a wrong token meant silence
+    # forever even once fixed. 61 minutes after giving up (past the default
+    # 60-minute pages.retryAfterMinutes), the next tick gets one more real
+    # attempt.
+    $drMock6 = Start-MockPushover -LogPath $retryPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $drMock6.Prefix
+    $giveUpAt61 = (Get-Date).ToUniversalTime().AddMinutes(-61).ToString('o')
+    $pagedGiveUp.'sentinel-stale'.gaveUpAt = $giveUpAt61
+    ($pagedGiveUp | ConvertTo-Json -Depth 8 -Compress) | Set-Content "$testRoot\state\watchdog\paged.json" -Encoding UTF8
+    $postsBeforeDr6 = @(Get-PostedBodies $retryPushLog).Count
+    $dr6 = Run-Watchdog
+    Assert-True (@(Get-PostedBodies $retryPushLog).Count -eq $postsBeforeDr6 + 1) 'a given-up condition must retry once retryAfterMinutes has passed'
+    $pagedDr6 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -ne $pagedDr6.'sentinel-stale'.deliveredAt -and $null -eq $pagedDr6.'sentinel-stale'.gaveUpAt) 'a successful retry after the window must clear gaveUpAt and set deliveredAt'
+    Stop-Job $drMock6.Job -ErrorAction SilentlyContinue; Remove-Job $drMock6.Job -Force -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
+    # Case DR7: give up again, then touch pushover.json (Cory fixed the token) -
+    # the very next tick retries immediately, without waiting out retryAfterMinutes.
+    Set-Heartbeat 'sentinel' 90
+    $env:FLEET_PUSHOVER_URL = "http://127.0.0.1:$refusedPortGiveUp/"
+    $null = Run-Watchdog; $null = Run-Watchdog; $null = Run-Watchdog
+    $pagedGiveUp2 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -ne $pagedGiveUp2.'sentinel-stale'.gaveUpAt) 'three failed attempts must give up (again, for this case)'
+    Start-Sleep -Milliseconds 50   # ensure the touched mtime is measurably later
+    Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-fixed","user":"usr-fixed"}'
+    $drMock7 = Start-MockPushover -LogPath $retryPushLog -Count 5
+    $env:FLEET_PUSHOVER_URL = $drMock7.Prefix
+    $postsBeforeDr7 = @(Get-PostedBodies $retryPushLog).Count
+    $dr7 = Run-Watchdog
+    Assert-True (@(Get-PostedBodies $retryPushLog).Count -eq $postsBeforeDr7 + 1) 'touching pushover.json after a give-up must retry immediately, not wait out retryAfterMinutes'
+    Stop-Job $drMock7.Job -ErrorAction SilentlyContinue; Remove-Job $drMock7.Job -Force -ErrorAction SilentlyContinue
   } finally {
     if ($drMock -and $drMock.Job) { Stop-Job $drMock.Job -ErrorAction SilentlyContinue; Remove-Job $drMock.Job -Force -ErrorAction SilentlyContinue }
     if ($drMock2 -and $drMock2.Job) { Stop-Job $drMock2.Job -ErrorAction SilentlyContinue; Remove-Job $drMock2.Job -Force -ErrorAction SilentlyContinue }
+    if ($drMock6 -and $drMock6.Job) { Stop-Job $drMock6.Job -ErrorAction SilentlyContinue; Remove-Job $drMock6.Job -Force -ErrorAction SilentlyContinue }
+    if ($drMock7 -and $drMock7.Job) { Stop-Job $drMock7.Job -ErrorAction SilentlyContinue; Remove-Job $drMock7.Job -Force -ErrorAction SilentlyContinue }
     if ($oldPushoverUrlDr) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrlDr } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
   }
   Write-Utf8 "$testRoot\state\flags\sentinel-off" 'restored after the delivery-retry block'
