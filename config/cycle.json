@@ -63,14 +63,16 @@
       "human-wait": "normal"
     },
     "defaultPriority": "normal",
-    "fleetDeadRepeatMinutes": 120
+    "fleetDeadRepeatMinutes": 120,
+    "maxAttempts": 3,
+    "retryAfterMinutes": 60
   },
   "supervisor": {
     "parityHours": 48,
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "human-wait"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "human-wait"]
   },
   "assignment": {
     "parityEvaluations": 20,

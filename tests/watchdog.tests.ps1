@@ -1568,6 +1568,25 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   $null = Run-Watchdog
 
+  # --- 2026-09-18 QA (merge seam #87/#77, red-tell): a push refused mid-apply
+  # --- (kind sync-refused, pushError, no reason - #87's own shape, distinct from
+  # --- branch-diverged's reason/no-pushError) must page as sync-refused with a
+  # --- non-empty body, not fall through to a hardcoded 'branch-diverged' with an
+  # --- empty detail (Get-OneLine $null), which Pushover would reject with a 400.
+  Write-Utf8 "$testRoot\bin\sync-integration.ps1" ('param([string]$Tenant,[switch]$Apply)' + "`r`n" + 'Write-Output (@{ escalate = $true; kind = "sync-refused"; pushError = "! [remote rejected] (protected branch hook declined)" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
+  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName releaseBranch -NotePropertyValue 'release' -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  $kpSr = Run-Watchdog
+  Assert-True (@($kpSr.conditions) -contains 'escalation:pl-test:sync-refused') 'a refused push must raise sync-refused, not branch-diverged'
+  $kpSrEntry = @($kpSr.newlyPaged | Where-Object { $_.key -eq 'escalation:pl-test:sync-refused' })[0]
+  Assert-True ($null -ne $kpSrEntry -and $kpSrEntry.priority -eq 'high') 'sync-refused must resolve to high priority (config/cycle.json pages.priority is not dead)'
+  $kpSrPaged = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+  Assert-True ("$($kpSrPaged.'escalation:pl-test:sync-refused'.detail)".Trim() -ne '' -and "$($kpSrPaged.'escalation:pl-test:sync-refused'.detail)" -match 'protected branch hook declined') 'the pushError must reach the condition detail, never an empty body'
+  (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName releaseBranch -NotePropertyValue 'master' -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  Remove-Item "$testRoot\bin\sync-integration.ps1" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
   # ===== Ticket 81 (ADR 0012): dead-man ping every tick; passed dates page once =====
   function Start-MockDeadMan {
     # A local HttpListener standing in for the off-host dead-man service,
