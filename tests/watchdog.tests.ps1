@@ -1163,6 +1163,28 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     $rp4 = Run-Watchdog
     Assert-True ($null -eq $rp4.repeatPaged) 'only fleet-dead repeats; a 300-minute permission-wait must not'
     Assert-True (@(Get-PostedBodies $pushLog78).Count -eq 0) 'an old standing permission-wait must not post a repeat'
+
+    # Case RP5 (fleet #78 review #7, red-tell): an unparseable deliveredAt must
+    # fail toward repeating NOW rather than silently losing the one repeat the
+    # ADR grants.
+    Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+    Set-AgentsRows $noSentinelRows
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog78, '')
+    Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-952":{"tenant":"test","issue":952,"state":"implementing"}}}'
+    foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 90 }
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" '{"fleet-dead":{"firstSeen":"garbage","lastSeen":"garbage","detail":"stale","deliveredAt":"garbage","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}'
+    $rp5 = Run-Watchdog
+    Assert-True ($null -ne $rp5.repeatPaged -and $rp5.repeatPaged.key -eq 'fleet-dead') 'an unparseable deliveredAt must repeat now, not lose the repeat silently'
+
+    # Case RP6: a future-dated deliveredAt (clock skew) must also repeat now.
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog78, '')
+    $futureAt = (Get-Date).ToUniversalTime().AddHours(1).ToString('o')
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $futureAt + '","lastSeen":"' + $futureAt + '","detail":"stale","deliveredAt":"' + $futureAt + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
+    $rp6 = Run-Watchdog
+    Assert-True ($null -ne $rp6.repeatPaged -and $rp6.repeatPaged.key -eq 'fleet-dead') 'a future-dated deliveredAt must repeat now, not lose the repeat silently'
+    Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   } finally {
     if ($pushMock78 -and $pushMock78.Job) { Stop-Job $pushMock78.Job -ErrorAction SilentlyContinue; Remove-Job $pushMock78.Job -Force -ErrorAction SilentlyContinue }
     if ($oldPushoverUrl78) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl78 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
