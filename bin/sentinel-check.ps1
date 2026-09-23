@@ -325,7 +325,21 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
   if ($res) {
     $res | Add-Member -NotePropertyName tenant -NotePropertyValue $t.name -Force
     $report.sync += $res
-    if ($res.escalate) { $report.escalate += [pscustomobject]@{ name = "pl-$($t.name)"; kind = 'branch-diverged'; detail = $res.reason; parent = 'dispatcher' } }
+    if ($res.escalate) {
+      # 2026-09-18 QA (merge seam #87/#77): sync-integration.ps1 emits kind
+      # 'sync-refused' (with pushError, no reason) for a refused push, distinct
+      # from 'branch-diverged' (reason, no pushError) - hardcoding 'branch-
+      # diverged' here made config/cycle.json pages.priority["sync-refused"]
+      # dead, dropped it from supervisor.pageKinds, AND emptied the page body
+      # (Get-OneLine $null) for a refused push, which Pushover rejects with a
+      # 400 - a push refused by branch protection paged nothing at all.
+      $syncKind = if ($res.PSObject.Properties['kind'] -and $res.kind) { "$($res.kind)" } else { 'branch-diverged' }
+      $syncDetail = if ($res.PSObject.Properties['reason'] -and $res.reason) { "$($res.reason)" }
+        elseif ($res.PSObject.Properties['pushError'] -and $res.pushError) { "push refused: $($res.pushError)" }
+        elseif ($res.PSObject.Properties['prUrl'] -and $res.prUrl) { "$($res.prUrl)" }
+        else { "$syncKind for tenant $($t.name) (no further detail reported)" }
+      $report.escalate += [pscustomobject]@{ name = "pl-$($t.name)"; kind = $syncKind; detail = $syncDetail; parent = 'dispatcher' }
+    }
   }
 }
 

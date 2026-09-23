@@ -53,6 +53,17 @@ function Test-SafeBoundary {
   try { $row = Get-DaemonSessions -Strict | Where-Object { $_.name -eq $SessionName } | Select-Object -First 1 }
   catch { return [pscustomobject]@{ safe = $false; reason = "daemon session list unreadable ($($_.Exception.Message)); deferring" } }
   if ($row -and "$($row.status)" -eq 'busy') { return [pscustomobject]@{ safe = $false; reason = 'session is mid-turn (status busy)' } }
+  # A pending permission prompt (fleet #28's `needs`, e.g. "approve Read: ...") is the
+  # same standing as busy: the session is stopped mid-wait, not idle, and -Force does
+  # not override it (observed 2026-09-06: age-based rotation retired a blocked
+  # dispatcher that was only waiting on a prompt). Get-JobState is shared from
+  # _common.ps1, the same reader watchdog.ps1 and sentinel-check.ps1 use.
+  if ($row) {
+    $js = $null; try { $js = Get-JobState $row.id } catch {}
+    if ($js -and $js.PSObject.Properties['needs'] -and "$($js.needs)" -match '^approve ') {
+      return [pscustomobject]@{ safe = $false; reason = "session has a pending permission prompt ($($js.needs))" }
+    }
+  }
   if (Test-Path "$FleetHome\state\work\.lock") { return [pscustomobject]@{ safe = $false; reason = 'work-state lock is held (mutation in flight)' } }
   $pending = @(Get-ChildItem "$FleetHome\state\work\pending" -Filter *.json -ErrorAction SilentlyContinue)
   if ($pending.Count -gt 0) { return [pscustomobject]@{ safe = $false; reason = "$($pending.Count) pending work-state journal(s) awaiting recovery" } }

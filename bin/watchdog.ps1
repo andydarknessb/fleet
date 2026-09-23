@@ -98,7 +98,11 @@ try {
   # --- is the reasoned choice, not a silent gap. state-escalated, state-hold and
   # --- merge-review-wake belong to the Notifier (#79) and never reach this function
   # --- from here.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'human-wait' = 'normal' }
+  # 2026-09-18 QA (merge seam #87/#77): 'sync-refused' joins the hardcoded
+  # default alongside 'branch-diverged' - both are ADR-ruled high, and a bare
+  # fixture with no config/cycle.json pages.priority override must still route
+  # a refused push to high, not fall through to 'normal'.
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'human-wait' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -372,7 +376,11 @@ try {
   # --- the flag pages (double-actor) and this run stays in shadow. -Verify never applies.
   $supervisorConfig = $null
   try { $supervisorConfig = (Read-Json "$FleetHome\config\cycle.json").supervisor } catch {}
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'human-wait')
+  # 2026-09-18 QA (merge seam #87/#77): 'sync-refused' joins the hardcoded default
+  # so a bare fixture with no config/cycle.json supervisor.pageKinds override
+  # still pages a refused push, the same reasoning ticket 77's Get-PagePriority
+  # default already documents for its own hardcoded map.
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'human-wait')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
