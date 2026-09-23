@@ -93,6 +93,35 @@ function Get-DaemonSessions {
   return @($obj)
 }
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
+# Claude Code 2.1.281 refuses `claude --bg` in a workspace whose trust dialog was never
+# accepted ("Workspace not trusted. Run `claude` in <dir> once and accept the trust
+# prompt, then retry.") and creates no session; earlier builds skipped the dialog for
+# background sessions. Trust lives in ~/.claude.json `projects.<path>.hasTrustDialogAccepted`
+# and inherits from a trusted ancestor (verified 2026-09-23: a fresh subdirectory of the
+# trusted C: repo launched, the untrusted E: repo root did not, and three #1579 launches
+# into a fresh worktree under it produced no session). Paths compare with either slash
+# and without case; a missing or unreadable config is untrusted (fail closed).
+function Test-WorkspaceTrusted {
+  param([string]$Path)
+  $cfg = $null
+  try { $cfg = Read-Json "$env:USERPROFILE\.claude.json" } catch { $cfg = $null }
+  if (-not $cfg -or -not $cfg.projects) { return $false }
+  $trusted = @()
+  foreach ($prop in $cfg.projects.PSObject.Properties) {
+    if ($prop.Value -and $prop.Value.PSObject.Properties['hasTrustDialogAccepted'] -and $prop.Value.hasTrustDialogAccepted -eq $true) {
+      $trusted += ("$($prop.Name)" -replace '\\', '/').TrimEnd('/')
+    }
+  }
+  $probe = ("$Path" -replace '\\', '/').TrimEnd('/')
+  while ($probe) {
+    foreach ($tp in $trusted) { if ([string]::Equals($tp, $probe, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    $idx = $probe.LastIndexOf('/')
+    if ($idx -le 0) { break }
+    $probe = $probe.Substring(0, $idx)
+    if ($probe -match '^[A-Za-z]:$') { break }
+  }
+  return $false
+}
 function Get-FleetNames {
   param($Live, $Static)
   $n = @((Get-ExpectedStaticSessions $Static) | ForEach-Object { $_.name })

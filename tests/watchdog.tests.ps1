@@ -52,6 +52,9 @@ try {
 
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
+  # Claude Code 2.1.281 trust pre-flight (launch.ps1 Test-WorkspaceTrusted): trust the test root so every path under it launches.
+  [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
+  [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))
 
   # Case 1: healthy fleet -> no conditions, no banner, shadow line written, live last-check untouched.
   foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }

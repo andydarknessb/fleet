@@ -333,7 +333,34 @@ if ($DryRun) {
   exit 0
 }
 
+# Trust pre-flight (fleet #104): since Claude Code 2.1.281 `claude --bg` refuses an
+# untrusted workspace and creates no session. Checked here, after every other gate and
+# before the worktree and branch exist, so an untrusted tenant fails closed with the fix
+# named instead of an empty "produced no session". An assignment worktree inherits the
+# tenant repo's trust, so the repo path is what has to be trusted.
+# state/flags/launch-trust-check-off is the rollback if a later CLI changes the rule.
+if (-not (Test-Path "$FleetHome\state\flags\launch-trust-check-off") -and -not (Test-WorkspaceTrusted $cwd)) {
+  $trustReason = "workspace not trusted: Claude Code 2.1.281+ refuses ``claude --bg`` in '$cwd' until its trust prompt is accepted; run ``claude`` there once as Cory, accept the prompt, and relaunch (state/flags/launch-trust-check-off skips this check)"
+  $released = $false
+  if ($Manifest) { try { Invalidate-Manifest "launch refused: $trustReason"; $released = $true } catch {} }
+  Write-Output (@{ launched = $false; reason = $trustReason; cwd = $cwd; reservationReleased = $released } | ConvertTo-Json -Compress); exit 7
+}
+
 $worktreePath = $null
+$expectedBase = $null
+# A failed launch must leave neither the assignment worktree nor its branch: `worktree add
+# -b` created both, and the orphan fleet/<issue>-... branch made every retry's worktree add
+# fail (2026-09-23, #1579 x3, pl-endzone deleted each by hand). The branch goes only while
+# its tip is still the manifest base, so a branch that gained a commit is never discarded.
+function Remove-FailedAssignmentWorktree {
+  if (-not $Manifest) { return }
+  if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) { & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null }
+  & git -C $t.repo worktree prune 2>$null | Out-Null
+  $branch = [string]$assignment.branch
+  if (-not $branch) { return }
+  $tip = (& git -C $t.repo rev-parse --verify --quiet "refs/heads/$branch" 2>$null | Out-String).Trim()
+  if ($tip -and $expectedBase -and $tip -eq $expectedBase) { & git -C $t.repo branch -D $branch 2>$null | Out-Null }
+}
 if ($Manifest) {
   $baseRemote = [string]$assignment.base.remote
   $baseRef = [string]$assignment.base.ref
@@ -348,7 +375,7 @@ if ($Manifest) {
   if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
   New-Item -ItemType Directory -Force $worktreeParent | Out-Null
   & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { try { Invalidate-Manifest "launch failed: could not create the assignment worktree from $expectedBase" } catch {}; Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
+  if ($LASTEXITCODE -ne 0) { Remove-FailedAssignmentWorktree; try { Invalidate-Manifest "launch failed: could not create the assignment worktree from $expectedBase" } catch {}; Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
   $cwd = $worktreePath
 }
 
@@ -367,10 +394,7 @@ try {
   $out = $Prompt | & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
 } catch {
   if ($locationPushed) { Pop-Location; $locationPushed = $false }
-  if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
-    & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null
-    & git -C $t.repo worktree prune 2>$null | Out-Null
-  }
+  Remove-FailedAssignmentWorktree
   throw
 } finally {
   if ($locationPushed) { Pop-Location }
@@ -381,20 +405,21 @@ for ($i = 0; $i -lt 20 -and -not $row; $i++) {
   $row = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
 }
 if (-not $row) {
-  if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
-    & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null
-    & git -C $t.repo worktree prune 2>$null | Out-Null
-  }
+  Remove-FailedAssignmentWorktree
   $failedRow = Get-DaemonSessions -All |
     Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
     Select-Object -First 1
   $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
   $detail = if ($jobState -and $jobState.detail) { "$($jobState.detail)" } else { $null }
+  # When the CLI created no job at all, its own output is the only evidence (2.1.281's
+  # "Workspace not trusted" refusal reached the manifest as "produced no session ()").
+  $why = if ($detail) { $detail } else { ("$out" -replace '\s+', ' ').Trim() }
+  if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
   # A manifest whose launch produced no session must not keep its reservation: the
   # planner would exclude the issue as `reserved` and a fresh assign would hit
   # RESERVATION_CONFLICT. Release it so the next decision can reserve again.
   $released = $false
-  if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($detail)"; $released = $true } catch {} }
+  if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($why)"; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released } | ConvertTo-Json -Compress); exit 5
 }
 
