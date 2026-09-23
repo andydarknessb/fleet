@@ -101,6 +101,9 @@ try {
     'exit /b 0' + "`r`n")
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
+  # Claude Code 2.1.281 trust pre-flight (launch.ps1 Test-WorkspaceTrusted): trust the test root so every path under it launches.
+  [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
+  [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))
   [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs") | Out-Null
 
   # Case 1: a real manifest launch succeeds and runs the shadow projector.

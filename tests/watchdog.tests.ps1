@@ -79,6 +79,9 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
 
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
+  # Claude Code 2.1.281 trust pre-flight (launch.ps1 Test-WorkspaceTrusted): trust the test root so every path under it launches.
+  [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
+  [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))
   # Ticket 85: Do-Respawn's bounded re-read defaults to 20s; the suite scales it down
   # so a genuine no-op respawn-failed case never actually sleeps for real.
   $env:FLEET_RESPAWN_VERIFY_MS = '50'
