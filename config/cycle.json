@@ -43,12 +43,34 @@
     "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 },
     "principal": { "maxAgeHours": 24, "maxJobTokens": 250000 }
   },
+  "watchdog": {
+    "staleMinutes": 45,
+    "healStaleMinutes": 60,
+    "healCap": 2
+  },
+  "pages": {
+    "priority": {
+      "fleet-dead": "emergency",
+      "dead-man-silence": "emergency",
+      "permission-wait": "high",
+      "launch-retry": "high",
+      "merge-review-wake": "high",
+      "branch-diverged": "high",
+      "sync-refused": "high",
+      "state-escalated": "normal",
+      "state-hold": "normal",
+      "dated": "normal",
+      "human-wait": "normal"
+    },
+    "defaultPriority": "normal",
+    "fleetDeadRepeatMinutes": 120
+  },
   "supervisor": {
     "parityHours": 48,
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "human-wait"]
   },
   "assignment": {
     "parityEvaluations": 20,

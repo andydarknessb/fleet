@@ -147,16 +147,20 @@ _Avoid_: restart, refresh, recycle
 **Watchdog**:
 The scheduled task, never a session, that runs the mechanical check every
 fifteen minutes. While the rostered Sentinel is enabled it shadows: it keeps
-the parity log and pages Cory out of band - a toast and a red banner in the
-status view - only when self-healing is the casualty (the check cannot run,
+the parity log and pages Cory out of band - a Pushover page by priority, with
+a toast as the on-host echo and the red banner in the status view unchanged -
+only when self-healing is the casualty (the check cannot run,
 the Sentinel is stale, every static heartbeat is stale, or launches of one
 name keep failing), and acts on nothing. After cutover
 (`state/flags/sentinel-off`) it is the supervisor: the check applies and a
 missing static session launches through the one door. A fault healed by a
 respawn or Rotation is logged and never paged; a paging condition leaves one
 escalation file and pages only after self-healing fails. `blocked` alone is
-recorded; after sixty stale minutes with work waiting and no permission prompt,
-it enters that self-heal path. Two actors never run: a Sentinel session alive
+recorded; after sixty stale minutes with work waiting and an absent or
+whitespace-only `needs`, it enters that self-heal path. A permission prompt
+(`^approve `) still only pages, at high priority, never healed; any other
+non-empty `needs` is a session asking a human, and pages once, at normal
+priority, instead of healing. Two actors never run: a Sentinel session alive
 under the flag is the double-actor condition, and the Watchdog stays in shadow
 until it is gone.
 _Avoid_: sentinel (a session), monitor, health checker
