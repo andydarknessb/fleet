@@ -858,8 +858,8 @@ test('shadow projection cannot resurrect an abandoned attempt from its stale ros
 // undefined; `release --revision 3` compared NaN to the revision and got
 // STALE_REVISION; `transition --no-notify` (for --no-notifier) launched the
 // notifier anyway, and `budget --token 5000` recorded a budget phase with no
-// tokens. Every case below goes through `cli`, the door launch.ps1,
-// rollback-assignment.ps1 and the role files use.
+// tokens. Every case below goes through `cli`, the door launch.ps1 and the
+// role files use.
 //
 // Red-tell: with bin/work-state.js stashed back to parseArgs(rest) and no
 // FLAGS, every USAGE case below fails (the typo resolves to undefined instead

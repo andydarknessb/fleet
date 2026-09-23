@@ -3,20 +3,20 @@
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 if (Test-Path "$FleetHome\state\watchdog\banner.txt") { Write-Host (Get-Content "$FleetHome\state\watchdog\banner.txt" -Raw -Encoding UTF8) -ForegroundColor Red }
 if (Test-Paused) { Write-Output "PAUSE: $(Get-Content "$FleetHome\state\PAUSE" -Raw)" }
-# Who supervises (ticket 08b): the rostered Sentinel until cutover, the watchdog task after.
+# Who supervises (ticket 08b, permanent since ticket 89): the watchdog task; the rostered
+# Sentinel's roster entry and role file are retired, so the shadow branch below is now vestigial.
 $lastRun = $null; try { $lastRun = Read-Json "$FleetHome\state\watchdog\last-run.json" } catch {}
 $lastRunText = 'no watchdog run recorded'
 $lastRunAt = if ($lastRun) { ConvertTo-UtcDateTime $lastRun.at } else { $null }
 if ($lastRunAt) { $lastRunText = "last watchdog tick $([int]((Get-Date).ToUniversalTime() - $lastRunAt).TotalMinutes) min ago ($($lastRun.mode))" }
-if (Test-SentinelOff) { Write-Output "supervisor: watchdog task (state/flags/sentinel-off; rollback: bin\rollback-sentinel.ps1); $lastRunText" }
+if (Test-SentinelOff) { Write-Output "supervisor: watchdog task (state/flags/sentinel-off); $lastRunText" }
 else { Write-Output "supervisor: rostered sentinel session (watchdog in shadow); $lastRunText" }
-# Who assigns (02/03 cutover): the lead's Stop-hook frontier plus a legacy brief until cutover,
-# the assignment planner (manifests + Work-record reservations) after.
+# Who assigns (02/03 cutover, permanent since ticket 89): the assignment planner
+# (manifests + Work-record reservations); the legacy Stop-hook frontier is retired.
 $pendingManifests = 0
 try { $pendingManifests = @(Get-ChildItem "$FleetHome\state\manifests" -Filter *.json -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch '\.(invalidated|acknowledged)\.json$' -and -not (Test-Path "$($_.FullName).acknowledged.json") -and -not (Test-Path "$($_.FullName).invalidated.json") }).Count } catch {}
 $assignmentText = "$pendingManifests manifest(s) pending acknowledgment"
-if (Test-AssignmentLive) { Write-Output "assignment: planner authoritative (state/flags/assignment-live; rollback: bin\rollback-assignment.ps1); $assignmentText" }
-else { Write-Output "assignment: legacy Stop-hook frontier (planner observed in shadow: bin\assignment-parity.js report); $assignmentText" }
+Write-Output "assignment: planner authoritative; $assignmentText"
 # Ticket 09: IC budgets (bin/budget.js, shadow until state/flags/budget-live) and the ledger verdict.
 $budgetLast = $null; try { $budgetLast = Read-Json "$FleetHome\state\budget\last.json" } catch {}
 if ($budgetLast) {

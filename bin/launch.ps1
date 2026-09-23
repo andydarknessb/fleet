@@ -2,7 +2,7 @@
 .SYNOPSIS  The only door for starting a fleet session (ADR 0002).
 .EXAMPLE   launch.ps1 -Role ic -Name ic-118 -Tenant endzone -Parent pl-endzone -Issue 118 -Prompt "..."
 .EXAMPLE   launch.ps1 -FromRoster dispatcher
-.EXAMPLE   launch.ps1 -FromRoster sentinel -DryRun
+.EXAMPLE   launch.ps1 -FromRoster pl-endzone -DryRun
 #>
 [CmdletBinding()]
 param(
@@ -10,9 +10,20 @@ param(
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5 (the project-lead default), see $modelArgs below
-  [switch]$Force,   # bypass the cap and the assignment-live legacy-IC refusal (Cory only)
-  [switch]$Recover, # this session already holds its reservation (bin\recover.ps1): exempt from the
-                    # assignment-live legacy-IC refusal ONLY. Cap, PAUSE and maxIcs still apply.
+  [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
+  [switch]$Recover, # bin\recover.ps1's reboot-recovery relaunch of an IC ONLY: honoured only when
+                    # the live roster already holds a row of that exact -Name, role ic, status
+                    # active, carrying a recorded manifest path (the credential proving it is a
+                    # genuinely reserved unit, not a fresh one) - that row's manifest field is
+                    # what is checked, never a -Manifest the caller passed alongside -Recover.
+                    # bin\recover.ps1 itself never passes -Manifest, only the IC's ORIGINAL
+                    # -Prompt (read from that same roster row): recovery restarts the crashed
+                    # process with its own history, it does not re-run manifest preconditions or
+                    # create a new worktree, so a validated -Recover does not set -Manifest here
+                    # either - it only lifts the no-manifest IC refusal below. A -Recover for any
+                    # other name (or one with no manifest on its row) gets no exemption at all
+                    # (QA fix, fleet #89: it used to accept any name unconditionally). Cap, PAUSE
+                    # and maxIcs still apply regardless.
   [switch]$DryRun   # do everything except start the session
 )
 . "$PSScriptRoot\_common.ps1"
@@ -21,6 +32,11 @@ $live = Get-LiveRoster
 $cwd = $null
 $t = $null
 $worktreePath = $null
+$recoverValidated = $false
+if ($Recover -and -not $Manifest -and ($Role -eq 'ic' -or ($Name -and $Name -match '^ic-'))) {
+  $recoverableRow = $live.sessions | Where-Object { $_.name -eq $Name -and $_.role -eq 'ic' -and $_.status -eq 'active' -and $_.manifest } | Select-Object -Last 1
+  $recoverValidated = [bool]$recoverableRow
+}
 if ($Manifest) {
   if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Write-Error "manifest '$Manifest' was not found"; exit 4 }
   $assignment = Read-Json $Manifest
@@ -54,23 +70,26 @@ foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req 
 if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$') { Write-Error "name '$Name' does not match the fleet naming scheme"; exit 4 }
 if ($Role -eq 'principal' -and $Name -notmatch '^pe-') { Write-Error "a principal session is named pe-<tenant> (ADR 0011)"; exit 4 }
 if ($Role -eq 'principal' -and -not $Tenant) { Write-Error "a principal needs -Tenant (one per tenant, ADR 0011)"; exit 4 }
-# Ticket 08b: while the rostered Sentinel is cut over, the one door refuses to start a
+# Ticket 08b: while the rostered Sentinel is cut over (permanent since ticket 89 retired
+# its roster entry, role file and rollback script), the one door refuses to start a
 # second supervisor (not even with -Force: two actors is the failure cutover exists to
-# prevent). rollback-sentinel.ps1 removes the flag first, then comes through here. A
-# dry run still evaluates the other gates so rollback can be rehearsed.
+# prevent). A dry run still evaluates the other gates.
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
-  Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live); use bin\rollback-sentinel.ps1 to restore it' } | ConvertTo-Json -Compress); exit 3
+  Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live): bin\watchdog.ps1 is the supervisor now' } | ConvertTo-Json -Compress); exit 3
 }
-# 02/03 cutover: while the assignment planner is authoritative, an IC starts only from
-# a reserved manifest (assignment.js assign, then launch). A legacy -Prompt launch of
-# an IC is refused so no unit runs without a Work record and reservations; -Force
-# (Cory's hand) and a dry run still pass so rollback and rehearsal keep working.
-# rollback-assignment.ps1 removes the flag first, then legacy launches come through.
-# -Recover is the reboot path (bin\recover.ps1): that IC is already on the live roster,
-# so its unit is already reserved and re-launching it starts no second assignment. The
-# guard exists to stop a NEW unreserved unit, not to strand a crashed one.
-if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and (Test-AssignmentLive) -and -not $Force -and -not $Recover -and -not $DryRun) {
-  Write-Output (@{ launched = $false; reason = 'legacy IC launches are disabled by state/flags/assignment-live (the assignment planner is authoritative): reserve a manifest with bin\assignment.js assign and launch it with assignment.js launch; bin\rollback-assignment.ps1 restores the legacy path' } | ConvertTo-Json -Compress); exit 3
+# Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
+# manifest (assignment.js assign, then launch). The legacy -Prompt launch of an IC is
+# retired for good, not merely gated: there is no flag and no -Force to bring it back
+# (bin\rollback-assignment.ps1 is gone). A dry run still passes so the settings and
+# budget gates below stay reachable for every other IC test and rehearsal. $recoverValidated
+# (above) is the ONLY exemption left, and only once the name is proven genuinely recoverable:
+# a -Recover for a name that is not an active IC on the live roster with a manifest is
+# refused exactly like a bare -Prompt launch (QA fix, fleet #89: -Recover used to exempt
+# any name unconditionally).
+if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $recoverValidated -and -not $DryRun) {
+  $legacyRefusal = 'IC sessions launch only from a reserved manifest: reserve one with bin\assignment.js assign and launch it with assignment.js launch; the legacy prompt path was retired for good (fleet #89) and there is no flag to bring it back'
+  if ($Recover) { $legacyRefusal = "-Recover found no active IC named '$Name' with a recorded manifest on the live roster; there is nothing to recover, and -Recover carries no exemption of its own (fleet #89)" }
+  Write-Output (@{ launched = $false; reason = $legacyRefusal } | ConvertTo-Json -Compress); exit 3
 }
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"

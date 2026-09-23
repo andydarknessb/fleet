@@ -13,9 +13,9 @@
        goes live at its next tick once no Sentinel session is running.
     2. Retire the live Sentinel session through bin/retire.ps1 (roster marker, stop, rm).
     3. Record state/sentinel/cutover.json and print the paperwork checklist.
-  The roster.json entry and agents/sentinel.md stay untouched for one release: they are
-  the rollback path (bin/rollback-sentinel.ps1). Event ledgers, the applied ledger, and
-  the shadow log are never touched by cutover or rollback.
+  The roster.json entry, agents/sentinel.md and bin/rollback-sentinel.ps1 were deleted by
+  fleet #89 after one release: the rollback window is closed, and rollback now means a git
+  revert. Event ledgers, the applied ledger, and the shadow log are never touched by cutover.
 .EXAMPLE   cutover-sentinel.ps1 -DryRun          # evaluate the gates, change nothing
 .EXAMPLE   cutover-sentinel.ps1                  # cut over when the gates hold
 .EXAMPLE   cutover-sentinel.ps1 -Force           # Cory's hand: cut over past a failed gate (recorded)
@@ -37,7 +37,7 @@ function Emit { param($Obj, [int]$Code) Write-Output ($Obj | ConvertTo-Json -Com
 
 if (Test-SentinelOff) {
   $existing = $null; try { $existing = Read-Json $cutoverPath } catch {}
-  Emit ([ordered]@{ cutover = $false; alreadyCutOver = $true; flag = $flagPath; record = $existing; hint = 'rollback with bin\rollback-sentinel.ps1' }) 0
+  Emit ([ordered]@{ cutover = $false; alreadyCutOver = $true; flag = $flagPath; record = $existing; hint = 'the rollback window closed with fleet #89; rollback is now a git revert' }) 0
 }
 
 # --- gates ---
@@ -90,7 +90,7 @@ if ($DryRun) { Emit $plan 0 }
 
 # --- act ---
 [IO.Directory]::CreateDirectory("$FleetHome\state\flags") | Out-Null
-[IO.File]::WriteAllText($flagPath, "cut over $(Now-Iso) by bin\cutover-sentinel.ps1 (forced=$([bool]$Force)). The rostered Sentinel is disabled; bin\watchdog.ps1 supervises. Rollback: bin\rollback-sentinel.ps1$([Environment]::NewLine)", $Utf8)
+[IO.File]::WriteAllText($flagPath, "cut over $(Now-Iso) by bin\cutover-sentinel.ps1 (forced=$([bool]$Force)). The rostered Sentinel is disabled; bin\watchdog.ps1 supervises. The rollback window closed with fleet #89; rollback is now a git revert.$([Environment]::NewLine)", $Utf8)
 
 $retired = [ordered]@{ path = 'none'; detail = 'no live Sentinel entry or session found' }
 $live = Get-LiveRoster
@@ -116,6 +116,6 @@ Write-Json $cutoverPath ([pscustomobject]$record)
 Write-Output 'Cut over. Paperwork for this release (by hand, see docs/adr/0004 status note):'
 Write-Output '  - CONTEXT.md: rewrite the Sentinel entry (retired actor; text in the ADR 0004 status note).'
 Write-Output '  - README.md: the Shape diagram and the Sentinel rows now describe the rollback path.'
-Write-Output '  - roster.json: keep the sentinel entry (rollback) for one release, then delete it with agents/sentinel.md.'
+Write-Output '  - roster.json: keep the sentinel entry (rollback) for one release, then delete it with agents/sentinel.md (done by fleet #89; the rollback window is now closed).'
 Write-Output '  - Watch bin\status.ps1: "supervisor: watchdog live" and no double-actor banner at the next tick.'
 Emit ([ordered]@{ cutover = $true; forced = [bool]$Force; flag = $flagPath; retired = $retired; parity = $paritySummary; record = $cutoverPath }) 0

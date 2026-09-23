@@ -10,7 +10,8 @@
   instant the project lead's Stop hook decides from the planner's frontier and tells the lead to
   reserve and launch through assignment.js, and launch.ps1 refuses a legacy IC prompt launch
   (-Force and -DryRun still pass). Nothing running is touched: active ICs, Work records, event
-  ledgers, and manifests are all left as they are. Rollback: bin/rollback-assignment.ps1.
+  ledgers, and manifests are all left as they are. The rollback window closed with fleet #89
+  (bin/rollback-assignment.ps1 is deleted); rollback now means a git revert.
 .EXAMPLE   cutover-assignment.ps1 -DryRun          # evaluate the gates, change nothing
 .EXAMPLE   cutover-assignment.ps1                  # cut over when the gates hold
 .EXAMPLE   cutover-assignment.ps1 -Force           # Cory's hand: cut over past a failed gate (recorded)
@@ -30,7 +31,7 @@ function Emit { param($Obj, [int]$Code) Write-Output ($Obj | ConvertTo-Json -Com
 
 if (Test-AssignmentLive) {
   $existing = $null; try { $existing = Read-Json $cutoverPath } catch {}
-  Emit ([ordered]@{ cutover = $false; alreadyCutOver = $true; flag = $flagPath; record = $existing; hint = 'rollback with bin\rollback-assignment.ps1' }) 0
+  Emit ([ordered]@{ cutover = $false; alreadyCutOver = $true; flag = $flagPath; record = $existing; hint = 'the rollback window closed with fleet #89; rollback is now a git revert' }) 0
 }
 
 # --- gates ---
@@ -68,7 +69,7 @@ if ($DryRun) { Emit $plan 0 }
 
 # --- act ---
 [IO.Directory]::CreateDirectory("$FleetHome\state\flags") | Out-Null
-[IO.File]::WriteAllText($flagPath, "cut over $(Now-Iso) by bin\cutover-assignment.ps1 (forced=$([bool]$Force)). The assignment planner (bin\assignment.js) is the authoritative frontier and IC launch path; launch.ps1 refuses a legacy IC prompt launch. Rollback: bin\rollback-assignment.ps1$([Environment]::NewLine)", $Utf8)
+[IO.File]::WriteAllText($flagPath, "cut over $(Now-Iso) by bin\cutover-assignment.ps1 (forced=$([bool]$Force)). The assignment planner (bin\assignment.js) is the authoritative frontier and IC launch path; launch.ps1 refuses a legacy IC prompt launch. The rollback window closed with fleet #89; rollback is now a git revert.$([Environment]::NewLine)", $Utf8)
 $record = [ordered]@{ at = (Now-Iso); tenant = $Tenant; forced = [bool]$Force; overridden = $overridden; parity = $paritySummary; flag = $flagPath; rollbacks = @() }
 [IO.Directory]::CreateDirectory("$FleetHome\state\assignment") | Out-Null
 Write-Json $cutoverPath ([pscustomobject]$record)

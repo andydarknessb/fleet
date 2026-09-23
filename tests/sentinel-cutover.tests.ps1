@@ -1,7 +1,14 @@
-# Ticket 08b: cutover-sentinel.ps1 / rollback-sentinel.ps1 against a fixture fleet with a
-# mock `claude`, a mock daemon list, generated parity logs, and the real retire.ps1 and
-# launch.ps1. The Sentinel is removed only past the parity gate, its roster.json entry
-# survives as the rollback path, and neither direction touches a ledger.
+# Ticket 08b: cutover-sentinel.ps1 against a fixture fleet with a mock `claude`, a mock
+# daemon list, generated parity logs, and the real retire.ps1 and launch.ps1. The Sentinel
+# is removed only past the parity gate, and cutover touches no ledger. Ticket 89 (after one
+# release) retired bin/rollback-sentinel.ps1, agents/sentinel.md and the roster entry for
+# good; this fixture's own inline roster.json still carries a sentinel entry so
+# cutover-sentinel.ps1's own untouched behavior (it edits the live roster, never roster.json)
+# stays exercised.
+#
+# QA fix: bin/parity.js requires ./work-state, missing from this fixture's copy list since
+# commit 359dc20 (this suite was red on the ticket 89 base commit for that reason, same bug
+# as tests/rotation.tests.ps1); added below.
 $ErrorActionPreference = 'Stop'
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
@@ -48,7 +55,7 @@ try {
   foreach ($dir in 'bin','agents','tenants','state','state/heartbeats','state/sentinel','state/sentinel/shadow','state/sentinel/applied','state/skip','state/watchdog','state/escalations','state/events','state/sessions','state/flags','profile/.claude/jobs/job-s','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','cutover-sentinel.ps1','rollback-sentinel.ps1','retire.ps1','launch.ps1','parity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','cutover-sentinel.ps1','retire.ps1','launch.ps1','parity.js','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   Write-Utf8 "$testRoot\agents\sentinel.md" "---`nname: sentinel`nmodel: sonnet`neffort: low`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","tenant":null,"parent":"cory","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"d"},{"name":"sentinel","role":"sentinel","tenant":null,"parent":"dispatcher","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"You are the Sentinel."}]}')
@@ -86,6 +93,15 @@ try {
   Assert-True ((Get-LiveEntry 'sentinel').status -eq 'active') 'a refused cutover must not retire the Sentinel'
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^(stop|rm) ' }).Count -eq 0) 'a refused cutover must not stop anything'
 
+  # Case 1b: -Force overrides the failing parity gate and records the override. A dry run here
+  # (this fixture can only go through one REAL cutover; ticket 89 removed the rollback path that
+  # used to reset it for a second one) so the later plain cutover (Case 5) still has a clean flag
+  # to write.
+  $r1f = Run-Script 'cutover-sentinel.ps1' @('-SkipTaskCheck', '-Force', '-DryRun')
+  Assert-True ($lastExit -eq 0 -and $r1f.dryRun -eq $true -and $r1f.cutover -eq $false -and $r1f.forced -eq $true) "-Force must override the failing parity gate on a dry run: $lastOut"
+  Assert-True ((@($r1f.overridden) -join ' ') -match 'parity') 'a forced dry run must record what it would override'
+  Assert-True (-not (Test-Path "$testRoot\state\flags\sentinel-off")) 'a forced dry run must not write the flag'
+
   # Case 2: parity holds but the Sentinel is mid-turn -> refused, and -Force does not override the boundary.
   Write-ParityLogs 49
   Write-Utf8 "$testRoot\mock-agents.json" $rowsBusySentinel
@@ -113,7 +129,7 @@ try {
   $r5 = Run-Script 'cutover-sentinel.ps1' @('-SkipTaskCheck')
   Assert-True ($lastExit -eq 0 -and $r5.cutover -eq $true) "cutover must succeed past the gates: $lastOut"
   Assert-True (Test-Path "$testRoot\state\flags\sentinel-off") 'cutover must write the flag'
-  Assert-True ((Get-Content "$testRoot\state\flags\sentinel-off" -Raw) -match 'rollback-sentinel') 'the flag must name the rollback path'
+  Assert-True ((Get-Content "$testRoot\state\flags\sentinel-off" -Raw) -match 'rollback window closed with fleet #89') 'the flag must say the rollback window is closed'
   Assert-True ((Get-LiveEntry 'sentinel').status -eq 'retired') 'cutover must retire the live Sentinel entry'
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^stop job-s' }).Count -eq 1) 'cutover must stop the Sentinel job'
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^rm job-s' }).Count -ge 1) 'cutover must remove the Sentinel job'
@@ -139,45 +155,9 @@ try {
   Assert-True ($lastExit -eq 0 -and $r7b.dryRun -eq $true) 'a dry run of the Sentinel launch must still evaluate under the flag'
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^--bg' }).Count -eq 0) 'nothing may have launched'
 
-  # Case 8: rollback -DryRun changes nothing.
-  $r8 = Run-Script 'rollback-sentinel.ps1' @('-DryRun')
-  Assert-True ($lastExit -eq 0 -and $r8.dryRun -eq $true -and $r8.launchPlan.dryRun -eq $true) 'rollback dry run must show the launch plan'
-  Assert-True (Test-Path "$testRoot\state\flags\sentinel-off") 'rollback dry run must keep the flag'
-
-  # Case 9: rollback whose launch fails restores the flag (a fleet with no supervisor is worse).
-  $env:MOCK_LAUNCH_FAIL = '1'
-  $r9 = Run-Script 'rollback-sentinel.ps1'
-  Remove-Item Env:MOCK_LAUNCH_FAIL
-  Assert-True ($lastExit -ne 0 -and $r9.rolledBack -eq $false -and $r9.flagRestored -eq $true) 'a failed relaunch must report and restore the flag'
-  Assert-True (Test-Path "$testRoot\state\flags\sentinel-off") 'the flag must be back after a failed relaunch'
-  Write-Utf8 "$testRoot\mock-agents.json" $rowsAfterRm
-
-  # Case 10: rollback restores the old actor through the one door without touching ledgers.
-  $bgBefore = @(Get-ClaudeCalls | Where-Object { $_ -match '^--bg' }).Count
-  $r10 = Run-Script 'rollback-sentinel.ps1'
-  Assert-True ($lastExit -eq 0 -and $r10.rolledBack -eq $true) "rollback must succeed: $lastOut"
-  Assert-True (-not (Test-Path "$testRoot\state\flags\sentinel-off")) 'rollback must remove the flag'
-  Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^--bg --name sentinel --agent sentinel' }).Count -eq ($bgBefore + 1)) 'rollback must launch through launch.ps1 (claude --bg with the roster identity)'
-  $entry = Get-LiveEntry 'sentinel'
-  Assert-True ($entry.status -eq 'active' -and $entry.jobId -eq 'job-s2') 'rollback must record the new Sentinel session on the live roster'
-  $record2 = (Get-Content "$testRoot\state\sentinel\cutover.json" -Raw) | ConvertFrom-Json
-  Assert-True (@($record2.rollbacks).Count -eq 1 -and $record2.rollbacks[0].jobId -eq 'job-s2') 'rollback must append its record'
-  Assert-True ((Get-Hash "$testRoot\state\events\2026-09-01.jsonl") -eq $eventsHash) 'rollback must not touch the event ledger'
-  Assert-True ((Get-Hash $appliedFile) -eq $appliedHash) 'rollback must not touch the applied ledger'
-  $r10b = Run-Script 'rollback-sentinel.ps1'
-  Assert-True ($lastExit -eq 0 -and $r10b.rolledBack -eq $false) 'rollback without the flag is a no-op'
-
-  # Case 11: -Force cuts over past a failed parity gate and records the override.
-  Remove-Item "$testRoot\state\sentinel\shadow\*"
-  Write-Utf8 "$testRoot\mock-agents.json" $rowsAfterLaunch
-  Write-Utf8 "$testRoot\mock-agents-after-rm.json" $rowsAfterRm
-  $r11 = Run-Script 'cutover-sentinel.ps1' @('-SkipTaskCheck')
-  Assert-True ($lastExit -eq 3) 'without shadow evidence the gate fails again'
-  $r11f = Run-Script 'cutover-sentinel.ps1' @('-SkipTaskCheck', '-Force')
-  Assert-True ($lastExit -eq 0 -and $r11f.cutover -eq $true -and $r11f.forced -eq $true) "-Force must cut over past the parity gate: $lastOut"
-  $record3 = (Get-Content "$testRoot\state\sentinel\cutover.json" -Raw) | ConvertFrom-Json
-  Assert-True ($record3.forced -eq $true -and (@($record3.overridden) -join ' ') -match 'parity') 'a forced cutover must record what it overrode'
-  Assert-True ((Get-LiveEntry 'sentinel').status -eq 'retired' -and (Get-LiveEntry 'sentinel').jobId -eq 'job-s2') 'the forced cutover retires the relaunched Sentinel'
+  # Ticket 89 (08b, after one release): bin/rollback-sentinel.ps1 is gone, so there is no
+  # rollback case left to exercise here. -Force overriding a failing gate is covered by
+  # Case 1b, on a dry run, before the fixture's one real cutover (Case 5).
 
   Write-Output 'sentinel cutover tests passed'
 } finally {

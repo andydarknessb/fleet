@@ -1,6 +1,7 @@
-# 02/03 cutover: the project lead's Stop hook against a fixture fleet with mock `gh` and
-# `claude`. Without the flag the hook decides from its legacy frontier and records the
-# planner beside it; with the flag it decides from the planner, and a planner failure
+# Ticket 89 (ADR 0006, after one release): the project lead's Stop hook against a fixture
+# fleet with mock `gh` and `claude`. The hook decides from the assignment planner alone,
+# unconditionally - the legacy frontier and the parity observation it used to record
+# beside the planner's answer are retired for good, no flag involved. A planner failure
 # launches nothing and files one escalation. The session-start hook prints the
 # acknowledgment command with the record's current revision for a manifest-launched IC.
 $ErrorActionPreference = 'Stop'
@@ -26,26 +27,20 @@ function Run-Stop {
   return $out
 }
 function Get-Continue { (Get-Content "$testRoot\state\continue\pl-test.json" -Raw) | ConvertFrom-Json }
-function Get-ShadowLines { @(Get-ChildItem "$testRoot\state\assignment\shadow" -Filter *.jsonl -ErrorAction SilentlyContinue | ForEach-Object { Get-Content $_.FullName } | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }) }
 
 try {
   foreach ($dir in 'bin','hooks','tenants','config','state','state/heartbeats','state/continue','state/skip','state/escalations','state/work','state/events','state/flags','state/notices','state/exclusions','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','check-policy.ps1','assignment.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','check-policy.ps1','assignment.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   foreach ($f in 'stop.ps1','session-start.ps1') { [IO.File]::Copy("$sourceRoot\hooks\$f", "$testRoot\hooks\$f") }
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   Write-Utf8 "$testRoot\tenants\test.json" '{"name":"test","github":"owner/repo","readyLabel":"ready-for-agent","defaultBranch":"integration","branchPrefix":"fleet/","maxIcs":2,"ciGates":["test-build"],"watchedChecks":[],"ignoredChecks":[],"repo":"C:/nowhere"}'
   Write-Utf8 "$testRoot\gh-pr.json" '[]'
-  Write-Utf8 "$testRoot\gh-issue.json" '[{"number":101}]'
-  Write-Utf8 "$testRoot\gh-deps.json" '[{"number":101,"issue_dependencies_summary":{"blocked_by":0}}]'
-  Write-Utf8 "$testRoot\gh-graphql.json" '{"data":{"repository":{"issues":{"nodes":[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":{"nodes":[{"name":"ready-for-agent"}]},"assignees":{"nodes":[]},"blockedBy":{"nodes":[],"pageInfo":{"hasNextPage":false}},"subIssues":{"nodes":[],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" +
     'if "%1"=="pr" type "' + $testRoot + '\gh-pr.json"' + "`r`n" +
-    'if "%1"=="issue" type "' + $testRoot + '\gh-issue.json"' + "`r`n" +
-    'if "%1"=="api" (if "%2"=="graphql" (type "' + $testRoot + '\gh-graphql.json") else (type "' + $testRoot + '\gh-deps.json"))' + "`r`n" +
     'exit /b 0' + "`r`n")
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
   $env:PATH = "$testRoot\mock-bin;$oldPath"
@@ -54,36 +49,25 @@ try {
   Write-Utf8 "$testRoot\issues-fixture.json" '[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
   $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-fixture.json"
 
-  # Case 1: no flag -> the legacy frontier decides; the planner is recorded beside it, agreeing.
+  # Case 1: the hook continues on the assignment frontier unconditionally, no flag needed.
   $out1 = Run-Stop
-  Assert-True ($lastExit -eq 2 -and $out1 -match 'frontier issue\(s\) #101') "without the flag the hook must continue on the legacy frontier: exit $lastExit :: $out1"
-  $lines1 = @(Get-ShadowLines)
-  Assert-True ($lines1.Count -eq 1 -and $lines1[0].mode -eq 'shadow' -and $lines1[0].agree -eq $true -and @($lines1[0].hook.frontier) -contains 101 -and @($lines1[0].planner.frontier) -contains 101) "the hook must record one agreeing shadow evaluation: $($lines1 | ConvertTo-Json -Compress)"
+  Assert-True ($lastExit -eq 2 -and $out1 -match 'assignment frontier #101' -and $out1 -match 'assignment\.js assign') "the hook must continue on the assignment frontier: exit $lastExit :: $out1"
 
-  # Case 2: the flag stands -> the planner's frontier decides and the lead is pointed at assignment.js.
-  Write-Utf8 "$testRoot\state\flags\assignment-live" 'test'
-  $out2 = Run-Stop
-  Assert-True ($lastExit -eq 2 -and $out2 -match 'assignment frontier #101' -and $out2 -match 'assignment\.js assign') "under the flag the hook must continue on the planner frontier: exit $lastExit :: $out2"
-  $lines2 = @(Get-ShadowLines)
-  Assert-True ($lines2.Count -eq 2 -and $lines2[1].mode -eq 'live') 'the live evaluation must be recorded as live'
-
-  # Case 3: the flag stands and the planner cannot run -> nothing launches, one escalation is filed, once.
+  # Case 2: the planner cannot run -> nothing launches, one escalation is filed, once (fail closed;
+  # there is no legacy frontier left to fall back to).
   $env:FLEET_NODE_PATH = "$testRoot\no-such-node.exe"
-  $out3 = Run-Stop
-  Assert-True ($lastExit -eq 0) "a planner failure under the flag must stop the lead (exit $lastExit): $out3"
+  $out2 = Run-Stop
+  Assert-True ($lastExit -eq 0) "a planner failure must stop the lead (exit $lastExit): $out2"
   Assert-True ((Get-Continue).stoppedBecause -match 'planner') 'the stop reason must name the planner'
   $esc = @(Get-ChildItem "$testRoot\state\escalations" -Filter *.json)
-  Assert-True ($esc.Count -eq 1 -and ((Get-Content $esc[0].FullName -Raw) | ConvertFrom-Json).kind -eq 'assignment-planner-failed') 'a planner failure under the flag must file one escalation'
+  Assert-True ($esc.Count -eq 1 -and ((Get-Content $esc[0].FullName -Raw) | ConvertFrom-Json).kind -eq 'assignment-planner-failed') 'a planner failure must file one escalation'
   $null = Run-Stop
   Assert-True (@(Get-ChildItem "$testRoot\state\escalations" -Filter *.json).Count -eq 1) 'a repeated planner failure must not file a second escalation'
-  Assert-True (@(Get-ShadowLines).Count -eq 2) 'a planner that could not run records no evaluation'
-
-  # Case 4: no flag and no planner -> the legacy frontier still decides (the shadow observation is best effort).
-  Remove-Item "$testRoot\state\flags\assignment-live"
-  $out4 = Run-Stop
-  Assert-True ($lastExit -eq 2 -and $out4 -match 'frontier issue\(s\) #101') "without the flag a missing planner must not block the legacy frontier: exit $lastExit :: $out4"
   Remove-Item Env:FLEET_NODE_PATH
 
+  # Case 3: the planner is reachable again -> the assignment frontier decides as in Case 1.
+  $out3 = Run-Stop
+  Assert-True ($lastExit -eq 2 -and $out3 -match 'assignment frontier #101') "recovery: the hook must continue on the assignment frontier again: exit $lastExit :: $out3"
 
   # fleet#51: "CI settled" used to be read from live GitHub while `record --kind formal` reads
   # the Work record, which the watcher advances on a five-minute tick; the hook continued the

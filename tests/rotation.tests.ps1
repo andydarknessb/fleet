@@ -9,6 +9,7 @@ function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllTex
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-rotation-test-" + [guid]::NewGuid().ToString('N'))
 $oldPath = $env:PATH
+$oldProfile = $env:USERPROFILE
 
 function Set-LiveRoster { param([string]$LaunchedAt, [string]$Status = 'active')
   Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @(@{ name = 'dispatcher'; role = 'dispatcher'; tenant = $null; sessionId = 'sess-old'; jobId = 'job-old'; status = $Status; launchedAt = $LaunchedAt }) } | ConvertTo-Json -Depth 8)
@@ -31,11 +32,15 @@ $idleRow = '[{"id":"job-old","name":"dispatcher","state":"working","status":"idl
 $busyRow = $idleRow.Replace('"status":"idle"', '"status":"busy"')
 
 try {
-  foreach ($dir in 'bin','tenants','config','state','state/work','state/work/pending','state/events','state/rotation','state/flags','state/heartbeats','mock-bin') {
+  foreach ($dir in 'bin','tenants','config','state','state/work','state/work/pending','state/events','state/rotation','state/flags','state/heartbeats','mock-bin','profile') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
   foreach ($f in '_common.ps1','rotate.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\bin\rotation-policy.js", "$testRoot\bin\rotation-policy.js")
+  # rotation-policy.js has required ./work-state since 359dc20 (fleet #4's shared
+  # parseArgs); without this copy the whole suite died at module load with "Cannot
+  # find module './work-state'" before a single case ran (review finding 6).
+  [IO.File]::Copy("$sourceRoot\bin\work-state.js", "$testRoot\bin\work-state.js")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
 
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"}]}'
@@ -78,6 +83,7 @@ console.log(JSON.stringify({ ok: true }));
 '@
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
   $env:PATH = "$testRoot\mock-bin;$oldPath"
+  $env:USERPROFILE = "$testRoot\profile"
 
   $young = (Get-Date).ToUniversalTime().AddHours(-2).ToString('o')
   $old = (Get-Date).ToUniversalTime().AddHours(-30).ToString('o')
@@ -101,6 +107,23 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'dispatcher') 'the replacement must launch through launch.ps1 -FromRoster'
   Assert-True (Test-Path "$testRoot\reconcile-calls.log") 'active Work records must be reconciled before the replacement acts'
   Assert-True ($intent.newSessionId -eq 'sess-new') 'the intent must record the replacement session'
+
+  # Case 2b: an age-due idle session with a pending permission prompt (job state
+  # `needs` matching "approve ...") must defer, not rotate - the boundary check did
+  # not read `needs` before this fix, so it rotated a blocked-on-a-prompt session.
+  # -Force does not override this boundary (same standing as busy).
+  Set-LiveRoster $old; Set-AgentsRows $idleRow; Reset-Markers
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-old") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-old\state.json" '{"needs":"approve Read: some/secret.env","updatedAt":"2026-09-06T12:00:00.000Z"}'
+  $r2b = Run-Rotate @('-Auto')
+  Assert-True (@($r2b.rotated).Count -eq 0) 'a session with a pending permission prompt must not rotate'
+  Assert-True (@($r2b.deferred).Count -eq 1 -and "$($r2b.deferred)" -match 'approve') 'the deferral must name the pending permission prompt'
+  Assert-True (-not (Test-Path "$testRoot\state\rotation\dispatcher.json")) 'a deferred rotation must write no intent'
+  Assert-True (-not (Test-Path "$testRoot\retire-calls.log")) 'a deferred rotation must not stop the session'
+  $r2c = Run-Rotate @('-Name', 'dispatcher', '-Force')
+  Assert-True (@($r2c.rotated).Count -eq 0) '-Force must not override a pending permission prompt'
+  Assert-True (@($r2c.outcomes | Where-Object { $_.status -eq 'deferred' }).Count -eq 1) '-Force still defers on a pending prompt, same standing as busy'
+  Remove-Item "$testRoot\profile\.claude\jobs\job-old" -Recurse -Force
 
   # Case 3: mid-turn session -> deferred, no intent, no stop.
   Set-LiveRoster $old; Set-AgentsRows $busyRow; Reset-Markers
@@ -224,6 +247,7 @@ console.log(JSON.stringify({ ok: true }));
   Write-Output 'rotation tests passed'
 } finally {
   $env:PATH = $oldPath
+  $env:USERPROFILE = $oldProfile
   Remove-Item Env:MOCK_LAUNCH_FAIL, Env:MOCK_RETIRE_FAIL, Env:MOCK_CLAUDE_FAIL -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-rotation-test-'
