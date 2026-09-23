@@ -43,8 +43,8 @@ _Avoid_: lead A, main agent, coordinator
 **Sentinel**:
 The retired lead that kept the fleet alive and within its cap as a rostered
 session until the 08b cutover (2026-09-04); the Watchdog task now does that
-work. Its roster entry and role file remain for one release as the rollback
-path and are then deleted.
+work. Its roster entry, role file and rollback script were deleted by ticket
+89 after one release.
 _Avoid_: watchdog (the task), monitor, health checker
 
 **Project lead**:
@@ -259,10 +259,11 @@ The ordered set of ready Units of work the fleet may launch next: open,
 carrying the tenant's ready label, unassigned, with no open blockers, not a
 spec parent, not marked ready for human work, not reserved by an active Work
 record, and not under a Frontier exclusion; oldest first. The assignment
-planner (`bin/assignment.js`) computes it from GitHub facts; the project
-lead's Stop hook records its own legacy computation beside it for parity
-(`bin/assignment-parity.js`) and, once `state/flags/assignment-live` stands,
-decides from the planner's answer.
+planner (`bin/assignment.js`) computes it from GitHub facts, and the project
+lead's Stop hook decides from the planner's answer alone; the hook's own
+legacy computation and the parity observation it recorded beside the
+planner's (`bin/assignment-parity.js`) were retired for good by ticket 89
+after one release (ADR 0006).
 _Avoid_: queue, backlog, ready list
 
 **Assignment manifest**:
