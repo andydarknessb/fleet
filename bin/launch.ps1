@@ -8,8 +8,8 @@
 param(
   [string]$Role, [string]$Name, [string]$Tenant, [string]$Parent, [string]$Prompt, [int]$Issue,
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
-  [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable')]
-  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, see $modelArgs below
+  [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5')]
+  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5 (the project-lead default), see $modelArgs below
   [switch]$Force,   # bypass the cap and the assignment-live legacy-IC refusal (Cory only)
   [switch]$Recover, # this session already holds its reservation (bin\recover.ps1): exempt from the
                     # assignment-live legacy-IC refusal ONLY. Cap, PAUSE and maxIcs still apply.
@@ -260,8 +260,11 @@ Write-Json $settingsPath $settings
 # 2026-09-11, so no fleet #28-style refusal). Other tokens keep their CLI aliases.
 # A principal launched with no -Model runs the role file's `model: fable` alias;
 # pin that path too so the two spellings resolve to the same id.
-$modelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1' }
+# A project lead launched with no -Model runs Opus 5.5 (owner ruling 2026-09-23),
+# pinned for the same reason; CLI 2.1.280 admits claude-opus-5-5 to auto mode.
+$modelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5' }
 if (-not $Model -and $Role -eq 'principal') { $Model = 'fable' }
+if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
 $modelArgs = @()
 if ($Model) {
   $resolvedModel = if ($modelPins.ContainsKey($Model)) { $modelPins[$Model] } else { $Model }
