@@ -17,7 +17,7 @@ Assert-Match $ic 'otherwise use `Refs #n`' 'IC instructions must provide the non
 # mechanism mechanically: the `gh pr list` query right below finds the open PR, and the
 # `state=$state status=..., no open PR` respawn-reason assertion further down proves a
 # respawn never fires while one is open.
-Assert-Match $sentinel 'gh pr list.*--state open.*head:' 'Sentinel must query open PRs by the issue branch prefix'
+Assert-Match $sentinel "'pr', 'list'.*'--state', 'open'.*head:" 'Sentinel must query open PRs by the issue branch prefix'   # fleet #101: bounded, so an argument list
 Assert-Match $sentinel 'skip\.issues' 'Sentinel must honor issue holds before stale-heartbeat respawn'
 Assert-Match $sentinel 'skip\.prs' 'Sentinel must annotate PR holds before stale-heartbeat respawn'
 Assert-Match $sentinel 'pr-lookup-failed' 'Sentinel must fail safe when the PR lookup fails'

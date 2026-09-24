@@ -224,41 +224,7 @@ try {
   # taken once above), so the second ask reuses the first's answer instead of
   # spending another assignment.js invocation (QA measured three serial calls
   # ballooning a tick to 61s against a 20s-blocking node shim).
-  # 2026-09-17 QA (fleet #81 review #2): the shared bound the planner call already
-  # used, extracted so the triage call below can reuse it instead of being a second,
-  # unbounded copy of the same Start-Process/WaitForExit/Kill shape.
-  function Invoke-BoundedExe {
-    param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec)
-    $result = [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = $null }
-    $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
-    try {
-      $p = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -PassThru -RedirectStandardOutput $childOut -RedirectStandardError $childErr
-      # 2026-09-17 QA repro: .NET only latches the exit-code plumbing once something
-      # touches the process handle; skip this and a fast-exiting child's .ExitCode
-      # reads back $null even on a clean exit (triage.js exits well under a second
-      # against a fixture, and this cost the triage wake test its evidence entirely).
-      $null = $p.Handle
-      if (-not $p.WaitForExit($TimeoutSec * 1000)) {
-        try { $p.Kill() } catch {}
-        $result.timedOut = $true
-      } else {
-        $result.exitCode = $p.ExitCode
-      }
-    } catch { $result.startError = "$($_.Exception.Message)" }
-    finally {
-      try { $result.stdout = Get-Content $childOut -Raw -ErrorAction SilentlyContinue } catch {}
-      try { $result.stderr = Get-Content $childErr -Raw -ErrorAction SilentlyContinue } catch {}
-      # 2026-09-18 QA (review 2, NIT): on the timeout path the just-killed process
-      # can still hold its redirect handles for a moment, so the first Remove-Item
-      # silently leaked both temp files. One short-delay retry, then give up
-      # silently (never fail the tick over two leaked temp files).
-      try { Remove-Item $childOut, $childErr -ErrorAction Stop } catch {
-        Start-Sleep -Milliseconds 200
-        try { Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue } catch {}
-      }
-    }
-    return $result
-  }
+  # fleet #101: Invoke-BoundedExe now lives in _common.ps1 (sentinel-check.ps1 shares it) and records a timeout by name in $script:BoundedTimeouts.
   $script:frontierWaitingCache = @{}
   function Test-FrontierWaiting {
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
@@ -275,7 +241,7 @@ try {
     # rather than reading as a silent idle tick.
     $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $TenantName)
     if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
-    $bounded = Invoke-BoundedExe -FilePath $NodeExe -ArgumentList (@("$PSScriptRoot\assignment.js") + $frontierArgs) -TimeoutSec $frontierTimeoutSec
+    $bounded = Invoke-BoundedExe -FilePath $NodeExe -ArgumentList (@("$PSScriptRoot\assignment.js") + $frontierArgs) -TimeoutSec $frontierTimeoutSec -Name "node assignment.js frontier $TenantName"
     if ($bounded.startError) { $result.error = "assignment.js could not start: $(Get-OneLine $bounded.startError 200)" }
     elseif ($bounded.timedOut) { $result.error = "assignment.js timed out after ${frontierTimeoutSec}s and was killed" }
     else {
@@ -330,8 +296,10 @@ try {
     $script:knownWorkStatesFetched = $true
     if (-not $NodeExe) { return $null }
     try {
-      $raw = & $NodeExe -e "process.stdout.write(JSON.stringify(require(process.argv[1]).STATES))" "$PSScriptRoot\work-state.js" 2>$null | Out-String
-      $states = ("$raw".Trim()) | ConvertFrom-Json
+      # fleet #101: bounded like the planner call; a timeout leaves the cache $null (unverifiable, fails toward paging).
+      $bounded = Invoke-BoundedExe -FilePath $NodeExe -ArgumentList @('-e', 'process.stdout.write(JSON.stringify(require(process.argv[1]).STATES))', "$PSScriptRoot\work-state.js") -TimeoutSec $frontierTimeoutSec -Name 'node work-state.js STATES'
+      if ($bounded.timedOut -or $bounded.startError -or $bounded.exitCode -ne 0) { return $null }
+      $states = ("$($bounded.stdout)".Trim()) | ConvertFrom-Json
       if ($states) { $script:knownWorkStatesCache = @($states | ForEach-Object { "$_" }) }
     } catch {}
     return $script:knownWorkStatesCache
@@ -406,7 +374,10 @@ try {
   # --- source: stdout/stderr may carry warnings and must not fail a healthy run or cost
   # --- 08b its parity data. Deleting the file first makes its existence proof of a
   # --- fresh, completed check.
-  $reportPath = if ($Verify) { Join-Path $env:TEMP 'fleet-watchdog-verify-check.json' } elseif ($mode -eq 'live') { "$FleetHome\state\sentinel\last-check.json" } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
+  # fleet #100: -Verify writes nothing under state/, so its report goes to a
+  # per-run temp file (removed once read); a fixed name let two concurrent
+  # -Verify ticks delete or overwrite each other's report.
+  $reportPath = if ($Verify) { Join-Path $env:TEMP "fleet-watchdog-verify-check-$PID-$([guid]::NewGuid().ToString('N')).json" } elseif ($mode -eq 'live') { "$FleetHome\state\sentinel\last-check.json" } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
   if (-not $Verify) { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; [IO.Directory]::CreateDirectory("$FleetHome\state\sentinel") | Out-Null }
   Remove-Item $reportPath -ErrorAction SilentlyContinue
   $check = $null; $checkError = ''; $checkExit = $null
@@ -418,6 +389,7 @@ try {
     if (-not $p.WaitForExit($checkTimeoutSec * 1000)) {
       try { $p.Kill() } catch {}
       $checkError = "sentinel-check timed out after ${checkTimeoutSec}s and was killed"
+      [void]$script:BoundedTimeouts.Add([pscustomobject]@{ call = 'sentinel-check.ps1'; timeoutSec = $checkTimeoutSec; at = (Now-Iso) })
     } else { $checkExit = $p.ExitCode }
   } catch { $checkError = "sentinel-check could not start: $($_.Exception.Message)" }
   if (-not $checkError) {
@@ -428,6 +400,7 @@ try {
     }
   }
   Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue
+  if ($Verify) { Remove-Item $reportPath -ErrorAction SilentlyContinue }
   # A live check just respawned or retired sessions; the staleness grace below must read
   # the rows as they are now, not the pre-action snapshot, or the curing tick pages.
   if ($mode -eq 'live') { try { $daemon = Get-DaemonSessions -All -Strict } catch {} }
@@ -581,8 +554,8 @@ try {
             $ghState = ''
             if ($t -and $t.github) {
               try {
-                $ghRaw = & gh issue view $issue -R $t.github --json state 2>$null | Out-String
-                if ($LASTEXITCODE -eq 0) { try { $ghState = "$(($ghRaw | ConvertFrom-Json).state)" } catch {} }
+                $ghRun = Invoke-BoundedCommand -Command 'gh' -ArgumentList @('issue', 'view', $issue, '-R', $t.github, '--json', 'state') -TimeoutSec 30 -Name "gh issue view $issue"
+                if ($ghRun.exitCode -eq 0) { try { $ghState = "$(("$($ghRun.stdout)".Trim() | ConvertFrom-Json).state)" } catch {} }
               } catch {}
             }
             if ($ghState -eq 'CLOSED') {
@@ -834,6 +807,7 @@ try {
         try { $healRaw = & "$PSScriptRoot\sentinel-check.ps1" -Apply -Actor watchdog -HealRespawn $healName -ReportPath $healRespawnReportPath 2>&1 | Out-String } catch {}
         $healOut = $null
         if (Test-Path $healRespawnReportPath) { try { $healOut = Read-Json $healRespawnReportPath } catch {} }
+        if ($healOut -and $healOut.PSObject.Properties['timeouts']) { foreach ($healTimeout in @($healOut.timeouts)) { if ($healTimeout) { [void]$script:BoundedTimeouts.Add($healTimeout) } } }   # fleet #101 review: the heal-respawn check's named timeouts reach the shadow line too
         $healOk = [bool]($healOut -and @($healOut.respawned | Where-Object { "$($_.name)" -eq $healName }).Count -gt 0)
         $healOutcome = if ($healOut) { $healOut } else { Get-OneLine $healRaw 200 }
         $healActuallyRan = $true   # the call was issued regardless of outcome (a no-op still counts, ticket 85)
@@ -973,7 +947,7 @@ try {
         # stall; reordering would just stop refreshing the shadow file while paused.
         $triageArgs = @('frontier', '--root', $FleetHome, '--tenant', $tenantName)
         if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $triageArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
-        $triageBounded = Invoke-BoundedExe -FilePath $triageNode -ArgumentList (@("$PSScriptRoot\triage.js") + $triageArgs) -TimeoutSec $frontierTimeoutSec
+        $triageBounded = Invoke-BoundedExe -FilePath $triageNode -ArgumentList (@("$PSScriptRoot\triage.js") + $triageArgs) -TimeoutSec $frontierTimeoutSec -Name "node triage.js $tenantName"
         if ($triageBounded.startError) { $twake.frontierError = "triage.js could not start: $(Get-OneLine $triageBounded.startError 200)" }
         elseif ($triageBounded.timedOut) { $twake.frontierError = "triage.js timed out after ${frontierTimeoutSec}s and was killed" }
         elseif ($triageBounded.exitCode -ne 0) { $twake.frontierError = "triage.js exited $($triageBounded.exitCode)`: $(Get-OneLine (($triageBounded.stdout + ' ' + $triageBounded.stderr)) 200)" }
@@ -1297,7 +1271,7 @@ try {
     if (-not (Test-Path "$FleetHome\.git")) {
       $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'unmanaged'; detail = 'FleetHome is not a git checkout' }
     } else {
-      $deployBounded = Invoke-BoundedExe -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\deploy-live.ps1", '-FleetHome', "$FleetHome") -TimeoutSec $deployTimeoutSec
+      $deployBounded = Invoke-BoundedExe -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\deploy-live.ps1", '-FleetHome', "$FleetHome") -TimeoutSec $deployTimeoutSec -Name 'deploy-live.ps1'
       $deployAnswer = if ($deployBounded.stdout) { ConvertFrom-LastJsonLine $deployBounded.stdout } else { $null }
       if ($deployBounded.timedOut) { $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'refused:timeout'; detail = "deploy-live.ps1 did not finish within $deployTimeoutSec s" } }
       elseif ($deployBounded.startError) { $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'refused:start-failed'; detail = (Get-OneLine $deployBounded.startError 200) } }
@@ -1328,6 +1302,8 @@ try {
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
     healStateUnreadable = [bool]$healStateUnreadable; respawnFailStateUnreadable = [bool]$respawnFailStateUnreadable
     deadMan = $deadMan
+    # fleet #101: every bounded child that timed out this tick, by name - the tick's own and the check's.
+    timeouts = @(@($script:BoundedTimeouts) + @(if ($check -and $check.PSObject.Properties['timeouts']) { $check.timeouts }) | Where-Object { $_ })
     deploy = $(if ($deploy) { [pscustomobject]@{ from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome } } else { $null })
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

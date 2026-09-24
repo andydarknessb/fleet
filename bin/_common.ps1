@@ -250,6 +250,71 @@ function Get-NodeExe {
   if (-not $node) { throw 'Node was not found. Set FLEET_NODE_PATH to the node.exe used by the fleet.' }
   return $node.Source
 }
+# fleet #101: every read-only child a Watchdog tick starts (node, gh, git) runs
+# through Invoke-BoundedExe - Start-Process + WaitForExit + Kill, output via temp
+# files - and a timeout is recorded by name in $script:BoundedTimeouts, so a
+# wedged call costs its own bound and the shadow line says which one it was,
+# instead of the tick (or the check's 180s) absorbing it unnamed. Lifted from
+# watchdog.ps1 (ticket 75 review) so sentinel-check.ps1 shares the one shape.
+$script:BoundedTimeouts = New-Object System.Collections.ArrayList
+function ConvertTo-ProcessArgument {
+  param([string]$Arg)
+  if ($Arg -and $Arg -notmatch '[\s"]') { return $Arg }
+  $escaped = ($Arg -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1'
+  return '"' + $escaped + '"'
+}
+function Invoke-BoundedExe {
+  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '')
+  $result = [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = $null }
+  $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
+  try {
+    $argLine = (@($ArgumentList) | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-ProcessArgument "$_" }) -join ' '
+    $startArgs = @{ FilePath = $FilePath; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $childOut; RedirectStandardError = $childErr }
+    if ($argLine) { $startArgs.ArgumentList = $argLine }
+    $p = Start-Process @startArgs
+    # 2026-09-17 QA repro: .NET only latches the exit-code plumbing once something
+    # touches the process handle; skip this and a fast-exiting child's .ExitCode
+    # reads back $null even on a clean exit.
+    $null = $p.Handle
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+      try { $p.Kill() } catch {}
+      $result.timedOut = $true
+      $label = if ($Name) { $Name } else { [IO.Path]::GetFileName($FilePath) }
+      [void]$script:BoundedTimeouts.Add([pscustomobject]@{ call = $label; timeoutSec = $TimeoutSec; at = (Now-Iso) })
+    } else {
+      $result.exitCode = $p.ExitCode
+    }
+  } catch { $result.startError = "$($_.Exception.Message)" }
+  finally {
+    try { $result.stdout = Get-Content $childOut -Raw -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
+    try { $result.stderr = Get-Content $childErr -Raw -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
+    # 2026-09-18 QA (review 2, NIT): on the timeout path the just-killed process
+    # can still hold its redirect handles for a moment; one short-delay retry,
+    # then give up silently (never fail the tick over two leaked temp files).
+    try { Remove-Item $childOut, $childErr -ErrorAction Stop } catch {
+      Start-Sleep -Milliseconds 200
+      try { Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue } catch {}
+    }
+  }
+  return $result
+}
+# A command by name (gh, git) resolved to something Start-Process can run: an
+# .exe/.cmd/.bat on PATH, never a .ps1 shim or an extensionless sh script.
+function Resolve-ExePath {
+  param([string]$Command)
+  $hit = Get-Command $Command -CommandType Application -All -ErrorAction SilentlyContinue | Where-Object { @('.exe', '.cmd', '.bat') -contains [IO.Path]::GetExtension($_.Source).ToLowerInvariant() } | Select-Object -First 1
+  if ($hit) { return $hit.Source }
+  return $null
+}
+function Invoke-BoundedCommand {
+  # Invoke-BoundedExe for a PATH command. A command that cannot be resolved is a
+  # startError, which every caller already treats as a failed lookup.
+  param([string]$Command, [string[]]$ArgumentList, [int]$TimeoutSec = 30, [string]$Name = '')
+  $exe = Resolve-ExePath $Command
+  if (-not $exe) { return [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = "$Command not found on PATH" } }
+  if (-not $Name) { $Name = "$Command $((@($ArgumentList) | Select-Object -First 2) -join ' ')" }
+  return Invoke-BoundedExe -FilePath $exe -ArgumentList $ArgumentList -TimeoutSec $TimeoutSec -Name $Name
+}
 function ConvertFrom-LastJsonLine {
   param($Text)
   try { return ("$Text".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
