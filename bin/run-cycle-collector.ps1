@@ -39,4 +39,17 @@ $exitCode = $LASTEXITCODE
 $level = if ($exitCode -eq 0) { 'INFO' } else { 'ERROR' }
 $entry = "$(Now-Iso) $level exit=$exitCode`r`n$output"
 [IO.File]::AppendAllText($logPath, "$entry`r`n", $Utf8)
+
+# #132: the weekly second read runs beside the collector. It is idempotent per week
+# (one pick, recorded in state/second-read/picks.jsonl), so a daily run files at most one
+# issue a week. Its outcome is logged; it never changes the collector's exit code.
+# state/flags/second-read-off stops it.
+if (Test-Path "$FleetHome\state\flags\second-read-off") {
+  [IO.File]::AppendAllText($logPath, "$(Now-Iso) INFO second-read skipped: state/flags/second-read-off`r`n`r`n", $Utf8)
+} else {
+  $readOutput = & $nodeExecutable "$FleetHome\bin\second-read.js" --now $untilText 2>&1 | Out-String
+  $readExit = $LASTEXITCODE
+  $readLevel = if ($readExit -eq 0) { 'INFO' } else { 'ERROR' }
+  [IO.File]::AppendAllText($logPath, "$(Now-Iso) $readLevel second-read exit=$readExit`r`n$readOutput`r`n", $Utf8)
+}
 if ($exitCode -ne 0) { exit $exitCode }
