@@ -466,6 +466,114 @@ function repostReviewStatus(options = {}) {
   return { artifact: formal.artifact, ...posted };
 }
 
+// --- #116: attest, the review gate for a PR with no Work record -------------
+// Cory's interactive PRs and Dependabot's have no Work record, so `record` (keyed
+// by --id) cannot serve them, and under ADR 0014 every PR into the default
+// branch needs the status. `attest` takes the PR, the head that was reviewed and
+// a findings artifact, holds the artifact to the record door's guards, keeps a
+// copy under state/reviews/<tenant>_pr-<n>/attest-NNN.json and posts the status
+// exactly as a formal record does. The head must be the PR's current head: an
+// attestation of a head the PR has moved past would stamp a tree nobody read.
+
+function readAttestArtifact(file) {
+  if (!file || file === 'true' || !fs.existsSync(file)) {
+    throw new ReviewPolicyError('INVALID_ARTIFACT', `findings artifact not found: ${file}`);
+  }
+  let content;
+  try {
+    let text = fs.readFileSync(file, 'utf8');
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    content = JSON.parse(text);
+  } catch (error) {
+    throw new ReviewPolicyError('INVALID_ARTIFACT', `${file} is not JSON: ${error.message}`);
+  }
+  if (!content || typeof content !== 'object' || Array.isArray(content)) {
+    throw new ReviewPolicyError('INVALID_ARTIFACT', `${file} must be an object with a "findings" array or a "noFindings" statement`);
+  }
+  const findings = content.findings === undefined || content.findings === null ? [] : content.findings;
+  if (!Array.isArray(findings)) throw new ReviewPolicyError('INVALID_ARTIFACT', `${file}: "findings" must be an array`);
+  const { noFindings } = content;
+  if (noFindings !== undefined && noFindings !== null) {
+    if (typeof noFindings !== 'string' || !noFindings.trim()) {
+      throw new ReviewPolicyError('INVALID_ARTIFACT', `${file}: "noFindings" is a one-sentence statement of what was examined and concluded`);
+    }
+    if (findings.length) {
+      throw new ReviewPolicyError('INVALID_ARTIFACT', `${file} carries ${findings.length} finding(s) and a noFindings statement; it is one or the other`);
+    }
+  } else if (!findings.length) {
+    throw new ReviewPolicyError('EMPTY_FINDINGS', `${file} has no findings and no "noFindings" statement; a clean review says so, so the artifact is not read as lost content (fleet#18)`);
+  }
+  // The record guard (fleet#43): the artifact says what the reviewer found, never
+  // what closed it. `record` forces a supplied status open; an attestation has
+  // no later review to resolve it, so a closed status is refused outright.
+  findings.forEach((finding, index) => {
+    if (finding && typeof finding === 'object' && finding.status !== undefined && finding.status !== 'open') {
+      throw new ReviewPolicyError('FINDING_CARRIES_OUTCOME', `finding ${finding.id || `#${index + 1}`} carries status '${finding.status}'; an attested finding is open, and a finding that was fixed before the attestation is not a finding of this head`, { finding: finding.id || index + 1, field: 'status' });
+    }
+  });
+  return { findings, noFindings: typeof noFindings === 'string' ? noFindings.trim() : null };
+}
+
+function attestPullRequest(options = {}) {
+  const root = path.resolve(options.root || DEFAULT_ROOT);
+  const { tenantName, headSha, artifactPath, actor } = options;
+  const prNumber = Number(options.prNumber);
+  if (!tenantName || tenantName === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new ReviewPolicyError('USAGE', 'attest needs --pr <number>');
+  if (!headSha || headSha === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --head <sha>');
+  if (!artifactPath || artifactPath === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --artifact <path>');
+  const tenantFile = path.join(root, 'tenants', `${tenantName}.json`);
+  if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${tenantName}': ${tenantFile} does not exist`);
+  const tenant = loadTenant(root, tenantName);
+  if (typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) {
+    throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenantName} names no reviewStatus; there is no status to attest`);
+  }
+  if (!tenant.github) throw new ReviewPolicyError('USAGE', `tenant ${tenantName} has no "github" slug`);
+
+  // The artifact first: every refusal that needs no network keeps precedence.
+  const supplied = readAttestArtifact(artifactPath);
+  buildFindings('pending', supplied.findings, [], null);
+
+  const gh = options.gh || defaultGh;
+  let currentHead;
+  try {
+    const raw = gh(['pr', 'view', String(prNumber), '-R', tenant.github, '--json', 'headRefOid']);
+    currentHead = String(JSON.parse(raw).headRefOid || '');
+  } catch (error) {
+    throw new ReviewPolicyError('PR_HEAD_UNREADABLE', `could not read PR #${prNumber}'s head from ${tenant.github}: ${String(error.stderr || error.message || error).trim().slice(0, 300)}`);
+  }
+  if (!/^[0-9a-f]{40}$/i.test(currentHead)) throw new ReviewPolicyError('PR_HEAD_UNREADABLE', `PR #${prNumber} reported no head commit`);
+
+  const repo = options.repoPath || tenant.repo;
+  if (!repo) throw new ReviewPolicyError('TENANT_REPO_UNKNOWN', `cannot resolve --head against a repository: pass --repo-path <tenant repo> or set "repo" in ${tenantFile}`);
+  const run = options.git ? (args) => options.git(args, repo) : (args) => gitInRepo(repo, args);
+  try { run(['fetch', '--quiet', 'origin', `+refs/pull/${prNumber}/head`]); } catch { /* offline: the object may still be local */ }
+  try {
+    run(['cat-file', '-e', `${headSha}^{commit}`]);
+  } catch {
+    throw new ReviewPolicyError('UNKNOWN_COMMIT', `--head ${headSha} is not a commit in ${repo} (after fetching PR #${prNumber}); an attestation names a head that exists (fleet#67)`, { flag: '--head', sha: String(headSha), repoPath: repo });
+  }
+  const head = fullSha(headSha, repo, options.git);
+  if (head.toLowerCase() !== currentHead.toLowerCase()) {
+    throw new ReviewPolicyError('STALE_HEAD', `PR #${prNumber} has moved: its head is ${currentHead}, not ${head}; review ${currentHead} and attest that`, { currentHead, headSha: head });
+  }
+
+  const written = writeArtifactExclusive(root, `${tenantName}:pr-${prNumber}`, 'attest', (stamp) => ({
+    schemaVersion: 1,
+    kind: 'attest',
+    tenant: tenantName,
+    pr: prNumber,
+    headSha: head,
+    reviewer: actor || 'unknown',
+    at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
+    source: path.resolve(artifactPath),
+    noFindings: supplied.noFindings,
+    findings: buildFindings(stamp, supplied.findings, [], null),
+  }));
+  const posted = postReviewStatus({ tenant, headSha: head, artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh });
+  return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
+}
+
 function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, kind, headSha, actor } = options;
@@ -848,6 +956,7 @@ const COMMAND_FLAGS = Object.freeze({
   record: RECORD_FLAGS,
   'plan-rereview': ['root', 'id', 'head-sha'],
   hold: ['root', 'id', 'expected-revision', 'reason', 'actor', 'now', 'idempotency-key', 'no-notifier'],
+  attest: ['root', 'tenant', 'pr', 'head', 'artifact', 'repo-path', 'actor', 'now'],
 });
 
 function cli(argv) {
@@ -895,6 +1004,13 @@ function cli(argv) {
       riskRuling: args['risk-ruling'],
     });
   }
+  if (command === 'attest') {
+    if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
+    return attestPullRequest({
+      root, tenantName: args.tenant, prNumber: args.pr, headSha: args.head, artifactPath: args.artifact,
+      repoPath: args['repo-path'], actor, now: args.now,
+    });
+  }
   if (command === 'plan-rereview') {
     return planRereview({ root, recordId: args.id, headSha: args['head-sha'] });
   }
@@ -932,7 +1048,9 @@ if (require.main === module) {
     // UNKNOWN_COMMIT and TENANT_REPO_UNKNOWN (fleet#67) likewise: nothing was
     // recorded, and the message names the repo and the SHA.
     // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING'].includes(error.code) ? 2 : 1;
+    // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
+    // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 
@@ -941,6 +1059,7 @@ module.exports = {
   COMMAND_FLAGS,
   ReviewPolicyError,
   SEVERITIES,
+  attestPullRequest,
   classifyChange,
   cli,
   classifyFromGit,

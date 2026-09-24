@@ -13,6 +13,7 @@ const {
   planRereview,
   holdRecord,
   repostReviewStatus,
+  attestPullRequest,
 } = require('../bin/review-policy');
 const workState = require('../bin/work-state');
 const { spawnSync: runGit } = require('node:child_process');
@@ -1894,4 +1895,126 @@ test('#115: the binary exits 3 when the status post fails, with the artifact rec
   assert.match(run.stderr, /--repost/);
   const repost = spawnSync(process.execPath, [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--repost', '--findings', '[]'], { encoding: 'utf8', windowsHide: true });
   assert.equal(repost.status, 2, 'a repost takes no review content');
+});
+
+// --- #116: `attest` posts fleet-review for a PR with no Work record (ADR 0014) ---
+// Cory's interactive PRs and Dependabot's have no Work record, so `record` (which
+// needs --id) cannot serve them; 54 interactive PRs merged into endzone
+// `integration` in the audited week. `attest` takes the PR, its head and a findings
+// artifact, keeps a copy under state/reviews/<tenant>_pr-<n>/, and posts the same
+// status. Red-tell: with bin/review-policy.js reverted, `attest` is an unknown command.
+
+function attestFixture({ prHead } = {}) {
+  const root = rootDir();
+  const { repo, head, prior } = commitIn(root);
+  reviewTenant(root, { repo });
+  const calls = [];
+  const gh = (args) => {
+    calls.push(args);
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: prHead || head });
+    return '{}';
+  };
+  const artifact = (content) => {
+    const file = path.join(root, `review-${calls.length}-${Math.random().toString(16).slice(2)}.json`);
+    fs.writeFileSync(file, JSON.stringify(content));
+    return file;
+  };
+  return { root, repo, head, prior, calls, gh, artifact };
+}
+
+const statusCalls = (calls) => calls.filter((call) => call[0] === 'api');
+
+test('#116: an attest at the PR head with a clean artifact posts success and keeps a copy', () => {
+  const { root, head, calls, gh, artifact } = attestFixture();
+  const attested = attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact({ noFindings: 'read the whole diff; nothing wrong' }), actor: 'cory', gh });
+  assert.deepEqual(calls[0].slice(0, 3), ['pr', 'view', '1601']);
+  assert.ok(calls[0].includes('owner/Endzone'), 'the PR is read from the tenant repo');
+  const posts = statusCalls(calls);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0][3], `repos/owner/Endzone/statuses/${head}`);
+  assert.equal(statusField(posts[0], 'state'), 'success');
+  assert.equal(statusField(posts[0], 'context'), 'fleet-review');
+  assert.equal(attested.statusPosted, true);
+  assert.equal(attested.artifact, 'state/reviews/endzone_pr-1601/attest-001.json');
+  const stored = JSON.parse(fs.readFileSync(path.join(root, attested.artifact), 'utf8'));
+  assert.equal(stored.kind, 'attest');
+  assert.equal(stored.pr, 1601);
+  assert.equal(stored.headSha, head);
+  assert.equal(stored.reviewer, 'cory');
+  assert.equal(stored.noFindings, 'read the whole diff; nothing wrong');
+  const second = attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact({ findings: [{ file: 'a.js', claim: 'x', severity: 'major', category: 'correctness' }] }), actor: 'cory', gh });
+  assert.equal(second.artifact, 'state/reviews/endzone_pr-1601/attest-002.json', 'a second attestation is its own file');
+  assert.equal(second.status.state, 'failure', 'an open major posts failure, exactly as a formal record would');
+});
+
+test('#116: an attest at an older head is refused, naming the new head', () => {
+  const { root, prior, head, calls, gh, artifact } = attestFixture();
+  assert.throws(
+    () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: prior, artifactPath: artifact({ noFindings: 'clean' }), gh }),
+    (error) => error.code === 'STALE_HEAD' && error.message.includes(head) && error.currentHead === head,
+  );
+  assert.equal(statusCalls(calls).length, 0, 'nothing is posted');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'reviews', 'endzone_pr-1601')), false, 'nothing is kept');
+});
+
+test('#116: a head the tenant repo does not hold is refused UNKNOWN_COMMIT', () => {
+  const invented = '0123456'.padEnd(40, 'a');
+  const { root, gh, artifact } = attestFixture({ prHead: invented });
+  assert.throws(
+    () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: invented, artifactPath: artifact({ noFindings: 'clean' }), gh }),
+    (error) => error.code === 'UNKNOWN_COMMIT',
+  );
+});
+
+test('#116: an artifact whose finding says status resolved is refused, by the record guard', () => {
+  const { root, head, calls, gh, artifact } = attestFixture();
+  for (const finding of [
+    { file: 'a.js', claim: 'x', severity: 'nit', category: 'style', status: 'resolved' },
+    { file: 'a.js', claim: 'x', severity: 'nit', category: 'style', outcome: 'fixed' },
+  ]) {
+    assert.throws(
+      () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact({ findings: [finding] }), gh }),
+      (error) => error.code === 'FINDING_CARRIES_OUTCOME',
+    );
+  }
+  assert.equal(statusCalls(calls).length, 0);
+});
+
+test('#116: the artifact is held to the record door: severity enum, category, and never silent', () => {
+  const { root, head, gh, artifact } = attestFixture();
+  const refuse = (content, code) => assert.throws(
+    () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact(content), gh }),
+    (error) => error.code === code,
+    JSON.stringify(content),
+  );
+  refuse({ findings: [{ file: 'a.js', claim: 'x', severity: 'high', category: 'correctness' }] }, 'INVALID_FINDING');
+  refuse({ findings: [{ file: 'a.js', claim: 'x', severity: 'nit' }] }, 'INVALID_FINDING');
+  refuse({ findings: [] }, 'EMPTY_FINDINGS');
+  refuse({ noFindings: '   ' }, 'INVALID_ARTIFACT');
+  refuse({ findings: [{ file: 'a.js', claim: 'x', severity: 'nit', category: 'style' }], noFindings: 'clean' }, 'INVALID_ARTIFACT');
+  refuse([1, 2], 'INVALID_ARTIFACT');
+  const missing = path.join(root, 'nope.json');
+  assert.throws(() => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: missing, gh }), (error) => error.code === 'INVALID_ARTIFACT');
+});
+
+test('#116: the binary attests, refuses unknown flags as USAGE, and exits 3 when the post fails', () => {
+  const { root, head, artifact } = attestFixture();
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const clean = artifact({ noFindings: 'clean' });
+  const typo = spawnSync(process.execPath, [bin, 'attest', '--root', root, '--tenant', 'endzone', '--pr', '1601', '--head', head, '--artifact', clean, '--head-sha', head], { encoding: 'utf8', windowsHide: true });
+  assert.equal(typo.status, 2);
+  assert.equal(typo.stdout, '');
+  assert.match(JSON.parse(typo.stderr).message, /unknown flag --head-sha\b/);
+  for (const drop of ['--tenant', '--pr', '--head', '--artifact']) {
+    const args = ['--root', root, '--tenant', 'endzone', '--pr', '1601', '--head', head, '--artifact', clean];
+    const at = args.indexOf(drop);
+    args.splice(at, 2);
+    const run = spawnSync(process.execPath, [bin, 'attest', ...args], { encoding: 'utf8', windowsHide: true });
+    assert.equal(run.status, 2, `missing ${drop}`);
+    assert.equal(JSON.parse(run.stderr).code, 'USAGE');
+  }
+  // gh that always fails (node reading `pr` as a script path): the PR head cannot be read, so nothing is attested.
+  const offline = spawnSync(process.execPath, [bin, 'attest', '--root', root, '--tenant', 'endzone', '--pr', '1601', '--head', head, '--artifact', clean], { encoding: 'utf8', windowsHide: true, env: { ...process.env, FLEET_GH: process.execPath } });
+  assert.equal(offline.status, 1, offline.stderr);
+  assert.equal(JSON.parse(offline.stderr).code, 'PR_HEAD_UNREADABLE');
 });
