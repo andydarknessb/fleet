@@ -1,3 +1,6 @@
 state/*
 !state/.gitkeep
 .claude/worktrees/
+
+# PowerShell ModuleAnalysisCache: written here when a test redirects LOCALAPPDATA; never tracked
+Microsoft/
