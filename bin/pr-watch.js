@@ -183,7 +183,7 @@ function mergedChain(hops, viewPr, prNumber, evidencePrefix, { formalReviewMissi
     kind: 'transition', to,
     evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})${to === 'merged' && formalReviewMissing ? '; merged without a recorded formal review (ticket 05 lower bound)' : ''}`,
     wake: to === 'merged' && formalReviewMissing ? 'decision-needed' : null,
-    reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, evidence: `gh pr view ${prNumber}` } : null,
+    reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, headRefOid: viewPr.headRefOid || undefined, evidence: `gh pr view ${prNumber}` } : null,
     observe: index === hops.length - 1 ? { pr: viewPr, evaluation: evaluateChecks({ ciGates: [], watchedChecks: [], ignoredChecks: [] }, viewPr.statusCheckRollup), closing: null } : null,
   }));
 }
@@ -260,6 +260,19 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
       // records its formal review before drafting, since formal is review-only.
       // hold stays parked: a held PR is Cory's merge, not rework.
       if (state === 'review') {
+        // #118: the state door refuses a third send-back (SEND_BACK_LIMIT). The
+        // draft is the lead's third return, so it becomes the decision the door
+        // asks for, once, rather than a transition that fails every tick.
+        const sendBacks = workState.sendBackCount(record);
+        if (sendBacks >= workState.SEND_BACK_LIMIT - 1) {
+          return {
+            actions: [{
+              kind: 'transition', to: 'escalated',
+              evidence: `${WATCHER_MARK} PR #${prNumber} returned to draft at ${String(viewPr.headRefOid).slice(0, 12)} for a third send-back after ${sendBacks}; the door refuses it (SEND_BACK_LIMIT, #118): the lead restates the criterion and the disagreement needs a Ruling`,
+              wake: 'decision-needed',
+            }],
+          };
+        }
         return {
           actions: [{
             kind: 'transition', to: 'revision',

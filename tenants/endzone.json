@@ -54,6 +54,7 @@
     "test:server:sweep": "six backtest sweep files, ~35 min (issue #80)",
     "test:server:all": "everything, ~42 min; never per commit"
   },
+  "reviewStatus": "fleet-review",
   "ciGates": ["test-build", "guards", "browser-security", "migration-smoke", "dependency-audit-root", "dependency-audit-server"],
   "watchedChecks": ["scan", "discover", "reproduce"],
   "ignoredChecks": ["Supabase Preview"],

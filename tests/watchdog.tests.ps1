@@ -1787,6 +1787,31 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (-not (@($realConfig.pages.priority.PSObject.Properties.Name) -contains 'passed-date')) 'the passed-date placeholder must not remain now that dated: is real'
   Assert-True ("$($realConfig.pages.priority.dated)" -eq 'normal') "the real config's dated priority must be normal"
 
+  # ===== #113 (ADR 0013): the deploy step =====
+  # The fixture home is not a git checkout, so the step is `unmanaged` and spawns
+  # nothing; the shadow line carries it. A refusal recorded by a tick pages on the
+  # next one, once, at normal priority, and clears when the refusal ends.
+  # Red-tell: before #113 the shadow line has no `deploy` and a refused deploy.json
+  # raises nothing.
+  $dp0 = Run-Watchdog
+  Assert-True ($dp0.deploy.outcome -eq 'unmanaged') "a FleetHome that is not a checkout is unmanaged, got '$($dp0.deploy.outcome)'"
+  Assert-True (-not (@($dp0.conditions) | Where-Object { $_ -like 'deploy-refused:*' })) 'unmanaged raises nothing'
+  Write-Utf8 "$testRoot\state\watchdog\deploy.json" '{"at":"2026-09-24T00:00:00Z","from":"aaa","to":"bbb","outcome":"refused:not-on-live","detail":"the live checkout is on master, not live"}'
+  $dp1 = Run-Watchdog
+  Assert-True (@($dp1.conditions) -contains 'deploy-refused:not-on-live') 'a refused deploy raises deploy-refused:<reason>'
+  $dp1Entry = @($dp1.newlyPaged | Where-Object { $_.key -eq 'deploy-refused:not-on-live' })[0]
+  Assert-True ($null -ne $dp1Entry -and $dp1Entry.priority -eq 'normal') 'a deploy refusal pages at normal priority'
+  $dp2 = Run-Watchdog
+  Assert-True (-not (@($dp2.conditions) -contains 'deploy-refused:not-on-live')) 'the condition clears once the refusal ends'
+  Write-Utf8 "$testRoot\state\watchdog\deploy.json" '{"outcome":"master-red","detail":"fleet-ci concluded failure"}'
+  $dp3 = Run-Watchdog
+  Assert-True (-not (@($dp3.conditions) | Where-Object { $_ -like 'deploy-*' })) 'a red master stops deploys and pages nothing'
+  $dpVerify = Run-Watchdog -Verify
+  Assert-True ($null -eq $dpVerify.deploy) '-Verify moves no code'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
+
   # ===== Ticket 85: Do-Respawn verifies the pid actually changed =====
   # The 2026-09-05 incident: ~120 consecutive "applied" respawns of a wedged
   # dispatcher were logged applied and did nothing, because Do-Respawn trusted

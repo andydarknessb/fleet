@@ -53,6 +53,7 @@ try {
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
+  $deployTimeoutSec = 120   # #113: fetch + one gh call + a fast-forward; bounded so a wedged network cannot wedge the tick
   $frontierTimeoutSec = 15  # ticket 75 review: assignment.js frontier normally answers in ~1-2s; bounded so a wedged gh call cannot wedge the tick
   $permissionWaitMinutes = $PermissionWaitMinutes  # fleet #28: a permission prompt in a --bg session has no approver; ic-1208 sat 12 min unseen
 
@@ -102,7 +103,8 @@ try {
   # default alongside 'branch-diverged' - both are ADR-ruled high, and a bare
   # fixture with no config/cycle.json pages.priority override must still route
   # a refused push to high, not fall through to 'normal'.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'human-wait' = 'normal' }
+  # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -1058,6 +1060,15 @@ try {
   foreach ($d in $datedItems) {
     $conditions += [pscustomobject]@{ key = "dated:$($d.where)"; kind = 'dated'; detail = "$($d.where) passed ($($d.value)) and is still in place"; url = $null }
   }
+  # #113 (ADR 0013): the previous tick's deploy step refused to move `live`
+  # (not on live, dirty, diverged, fetch or CI unreadable). One page per
+  # reason at normal priority; the condition clears when the refusal ends.
+  $lastDeploy = $null; try { $lastDeploy = Read-Json "$FleetHome\state\watchdog\deploy.json" } catch {}
+  if ($lastDeploy -and "$($lastDeploy.outcome)" -like 'refused:*') {
+    $reason = "$($lastDeploy.outcome)".Substring('refused:'.Length)
+    $deployDetail = "the live checkout did not advance ($reason): $(Get-OneLine "$($lastDeploy.detail)" 250)"
+    $conditions += [pscustomobject]@{ key = "deploy-refused:$reason"; kind = 'deploy-refused'; detail = $deployDetail; url = $null }
+  }
   # 2026-09-18 QA (review 2, NIT): one name can raise launch-retry:<name> twice in
   # a tick (the daemon-row storm scan and the respawn-failed trip both key on the
   # same name) - the duplicate Add-Member below discarded silently, but a single
@@ -1245,6 +1256,34 @@ try {
   # reach it (Send-DeadManPing never throws).
   $deadMan = Send-DeadManPing
 
+  # #113 (ADR 0013): the deploy step, after the dead-man ping so a slow fetch or
+  # gh call never delays it. bin/deploy-live.ps1 fast-forwards the live
+  # checkout's `live` ref to origin/master when master's `fleet-ci` check is
+  # green; state/flags/deploy-hold freezes it; it never does a non-fast-forward
+  # and a refusal says why. Bounded like the planner call. A FleetHome that is
+  # not a git checkout (a test fixture) is `unmanaged` and spawns nothing.
+  # -Verify writes nothing, so it moves no code either. A refusal pages on the
+  # next tick through the ordinary condition path (deploy-refused:<reason>,
+  # normal priority, once per reason, cleared when the refusal ends);
+  # master-red and master-pending are a red or running CI, never a page.
+  $deploy = $null
+  if (-not $Verify) {
+    if (-not (Test-Path "$FleetHome\.git")) {
+      $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'unmanaged'; detail = 'FleetHome is not a git checkout' }
+    } else {
+      $deployBounded = Invoke-BoundedExe -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\deploy-live.ps1", '-FleetHome', "$FleetHome") -TimeoutSec $deployTimeoutSec -Name 'deploy-live.ps1'
+      $deployAnswer = if ($deployBounded.stdout) { ConvertFrom-LastJsonLine $deployBounded.stdout } else { $null }
+      if ($deployBounded.timedOut) { $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'refused:timeout'; detail = "deploy-live.ps1 did not finish within $deployTimeoutSec s" } }
+      elseif ($deployBounded.startError) { $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'refused:start-failed'; detail = (Get-OneLine $deployBounded.startError 200) } }
+      elseif (-not $deployAnswer -or -not $deployAnswer.outcome) { $deploy = [pscustomobject]@{ from = $null; to = $null; outcome = 'refused:unreadable'; detail = (Get-OneLine "exit $($deployBounded.exitCode): $($deployBounded.stdout) $($deployBounded.stderr)" 200) } }
+      else { $deploy = [pscustomobject]@{ from = $deployAnswer.from; to = $deployAnswer.to; outcome = "$($deployAnswer.outcome)"; detail = $deployAnswer.detail } }
+    }
+    try {
+      [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null
+      Write-Json "$FleetHome\state\watchdog\deploy.json" ([pscustomobject]@{ at = (Now-Iso); from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome; detail = $deploy.detail })
+    } catch {}
+  }
+
   # --- shadow log for the 08b parity comparison ---
   $proposed = $null
   if ($check) {
@@ -1265,6 +1304,7 @@ try {
     deadMan = $deadMan
     # fleet #101: every bounded child that timed out this tick, by name - the tick's own and the check's.
     timeouts = @(@($script:BoundedTimeouts) + @(if ($check -and $check.PSObject.Properties['timeouts']) { $check.timeouts }) | Where-Object { $_ })
+    deploy = $(if ($deploy) { [pscustomobject]@{ from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome } } else { $null })
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)
   if (-not $Verify) {

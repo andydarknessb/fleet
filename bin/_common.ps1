@@ -200,15 +200,16 @@ function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\
 # and without case; a missing or unreadable config is untrusted (fail closed).
 function Test-WorkspaceTrusted {
   param([string]$Path)
-  $cfg = $null
-  try { $cfg = Read-Json "$env:USERPROFILE\.claude.json" } catch { $cfg = $null }
-  if (-not $cfg -or -not $cfg.projects) { return $false }
-  $trusted = @()
-  foreach ($prop in $cfg.projects.PSObject.Properties) {
-    if ($prop.Value -and $prop.Value.PSObject.Properties['hasTrustDialogAccepted'] -and $prop.Value.hasTrustDialogAccepted -eq $true) {
-      $trusted += ("$($prop.Name)" -replace '\\', '/').TrimEnd('/')
-    }
-  }
+  # Node, not ConvertFrom-Json: the CLI writes project keys that differ only in case
+  # ('C:/x' and 'c:/x'), which Windows PowerShell rejects as duplicate keys, and a
+  # failed parse would read every workspace as untrusted.
+  $cfgPath = "$env:USERPROFILE\.claude.json"
+  if (-not (Test-Path -LiteralPath $cfgPath)) { return $false }
+  $js = "const fs=require('fs');const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8').replace(/^\uFEFF/,''));for(const [k,v] of Object.entries(j.projects||{})){if(v&&v.hasTrustDialogAccepted===true)console.log(k)}"
+  $lines = $null
+  try { $lines = & (Get-NodeExe) -e $js $cfgPath 2>$null } catch { return $false }
+  if ($LASTEXITCODE -ne 0) { return $false }
+  $trusted = @($lines | Where-Object { $_ } | ForEach-Object { ("$_" -replace '\\', '/').TrimEnd('/') })
   $probe = ("$Path" -replace '\\', '/').TrimEnd('/')
   while ($probe) {
     foreach ($tp in $trusted) { if ([string]::Equals($tp, $probe, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
