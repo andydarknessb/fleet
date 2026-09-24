@@ -6,6 +6,9 @@ $installer = Get-Content "$fleetHome\bin\install-cycle-collector-task.ps1" -Raw
 if ($runner -notmatch "measure-cycle\.js") { throw 'collector runner does not invoke measure-cycle.js' }
 if ($runner -notmatch "--since|--until|--now") { throw 'collector runner must use a bounded deterministic window' }
 if ($runner -notmatch "state\\metrics") { throw 'collector runner must write under state/metrics' }
+# #132: the weekly second read runs beside the collector, behind its rollback flag.
+if ($runner -notmatch "second-read.js") { throw "collector runner does not invoke second-read.js" }
+if ($runner -notmatch "second-read-off") { throw "collector runner must honour state/flags/second-read-off" }
 if ($installer -notmatch "Register-ScheduledTask") { throw 'collector installer must register a scheduled task' }
 if ($installer -notmatch "Fleet cycle collector") { throw 'collector task name changed unexpectedly' }
 

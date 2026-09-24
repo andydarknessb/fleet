@@ -7,13 +7,18 @@
 // every file an archived record's evidence index points at exists and actually holds that
 // record's events. The verdict is written to state/verify/last.json, which the 30-day
 // event archival consults before it moves anything (work-state.js archiveExpiredEvents):
-// no verified ledger, no archival. Read-only apart from that verdict.
+// no verified ledger, no archival. #129: every run also appends one compact line (time,
+// pass, totals, findings by kind, acknowledged count; no per-record detail) to
+// state/verify/history.jsonl, which keeps the most recent 90 days, so a failing verdict
+// overwritten by a passing one still leaves a trace. Archival reads last.json only.
+// Read-only apart from those two files.
 
 const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 
 const TERMINAL = 'retired';
+const HISTORY_DAYS = 90;
 
 // fleet#4: a typo'd flag must be refused, not silently ignored (the parity of this
 // with a genuine FAIL verdict matters: both currently exit 2, so a caller reading only
@@ -262,7 +267,49 @@ function verifyLedger({ root, now, sample } = {}) {
   const dir = path.join(base, 'state', 'verify');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'last.json'), `${JSON.stringify(result, null, 2)}\n`, 'utf8');
+  appendHistory(dir, result);
   return result;
+}
+
+// #129: one compact line per run, never per-record detail.
+function historyLine(result) {
+  return {
+    at: result.at,
+    pass: result.pass,
+    totals: result.totals,
+    findingsByKind: result.findingsByKind,
+    acknowledged: (result.acknowledged || []).length,
+  };
+}
+
+function parseHistory(text) {
+  const lines = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try { lines.push(JSON.parse(line)); } catch { /* a torn line is skipped */ }
+  }
+  return lines;
+}
+
+// Lines older than HISTORY_DAYS before this run, and any line that no longer parses,
+// are trimmed on the write, which replaces the file whole through a temp file.
+function appendHistory(dir, result) {
+  const file = path.join(dir, 'history.jsonl');
+  const cutoff = Date.parse(result.at) - HISTORY_DAYS * 24 * 60 * 60 * 1000;
+  const previous = fs.existsSync(file) ? parseHistory(fs.readFileSync(file, 'utf8')) : [];
+  const kept = previous.filter((line) => {
+    const ms = Date.parse(line && line.at);
+    return Number.isNaN(cutoff) || (Number.isFinite(ms) && ms >= cutoff);
+  });
+  kept.push(historyLine(result));
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, kept.map((line) => `${JSON.stringify(line)}\n`).join(''), 'utf8');
+  fs.renameSync(temp, file);
+}
+
+function readHistory(root) {
+  const file = path.join(baseOf(root), 'state', 'verify', 'history.jsonl');
+  return fs.existsSync(file) ? parseHistory(fs.readFileSync(file, 'utf8')) : [];
 }
 
 function cli(argv) {
@@ -306,4 +353,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { reviewFinding, sameCommit, verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError };
+module.exports = { HISTORY_DAYS, readHistory, reviewFinding, sameCommit, verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError };

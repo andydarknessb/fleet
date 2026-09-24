@@ -391,13 +391,14 @@ test('buildReport computes per-unit ratios, the IC median, and budget verdicts',
   assert.equal(u.controlPlaneFreshReductionVsBaseline, 0.85);
   assert.equal(u.budgets.controlPlaneFreshReduction.pass, true);
   assert.equal(u.budgets.projectLeadFreshPerMergedPr.pass, true);
-  assert.equal(u.budgets.icJobTokensMedian.pass, true);
+  assert.equal(u.budgets.icJobTokensMedian.pass, null, '#128: the IC median is reported, not judged');
+  assert.equal(u.budgets.icJobTokensMedian.reference, 60000);
   assert.deepEqual(report.sample.excludedByReason, { abandoned: 2, 'no-pr': 1 });
   const empty = buildReport([], [], { sessionMetrics: sessions, budgets: { icJobTokensMedian: 60000 } });
   assert.equal(empty.unitMetrics.controlPlaneFreshPerCompletedUnit, null, 'no units: no ratio, no verdict');
   assert.equal(empty.unitMetrics.budgets.icJobTokensMedian.pass, null);
   const text = renderSummary(report);
-  assert.match(text, /IC job tokens median: 55000 \(p90 70000; limit 60000\) PASS/);
+  assert.match(text, /^IC job tokens median: 55000 \(p90 70000; reference 60000, not a verdict\)$/m);
   assert.match(text, /project-lead fresh per merged PR: 20000 over 3 merged PR\(s\) \(limit 25000; per completed unit 20000\) PASS/);
   assert.match(text, /reduction vs baseline 85%, target 70%/);
   // Merged PRs are counted from merge events, and the median is a true median on an even count.
@@ -446,7 +447,7 @@ test('the seven-day report names its own window and is persisted as JSON', () =>
   assert.equal(path.basename(result.summaryJsonArtifact), 'seven-day-2026-09-02.json');
   const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
   assert.equal(json.unitMetrics.completedUnits, 1);
-  assert.equal(json.unitMetrics.budgets.icJobTokensMedian.limit, 60000);
+  assert.equal(json.unitMetrics.budgets.icJobTokensMedian.reference, 60000);
 });
 
 // --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
@@ -487,4 +488,337 @@ test('cli: a correct invocation still works, matching the direct call', () => {
   assert.equal(viaCli.report.sample.completedUnits, 1);
   assert.equal(path.basename(viaCli.dailyArtifact), 'daily-2026-09-02.json');
   assert.equal(path.basename(viaCli.summaryArtifact), 'seven-day-2026-09-02.md');
+});
+
+// --- WS5 (#91) fixtures: one transcript per session, parameterised -------------------
+// A session transcript named `name` with role `role`, one assistant turn at `at` on
+// `model` that merges `pr` (so an IC session reads as a merged unit).
+function sessionTranscript({ sessionId, name, role = 'ic', model = 'claude-sonnet-5', at = '2026-09-01T00:00:00.000Z', input = 100, output = 10, creation = 0, pr = null }) {
+  return [
+    { type: 'custom-title', customTitle: name, sessionId },
+    { type: 'agent-setting', agentSetting: role, sessionId },
+    { ...assistant({ uuid: `${sessionId}-a1`, timestamp: at, content: [{ type: 'text', text: pr ? `Standards and Spec review passed. PR #${pr} merged.` : 'Turn complete.' }], usage: { input, output, creation }, model }), sessionId },
+  ].map(line).join('\n');
+}
+
+function icRow(issue, sessionId, extra = {}) {
+  return { name: `ic-${issue}`, role: 'ic', tenant: 'endzone', issue, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId, ...extra };
+}
+
+// --- #124: one model key per model family --------------------------------------------
+// Red-tell: before the change a unit on `sonnet` and one on `claude-sonnet-5` report
+// two rows.
+const { modelFamily } = require('../bin/measure-cycle');
+
+test('#124: modelFamily folds aliases and full ids onto one family key and keeps unknowns as written', () => {
+  assert.deepEqual(modelFamily('sonnet'), { key: 'sonnet', recognized: true });
+  assert.deepEqual(modelFamily('claude-sonnet-5'), { key: 'sonnet', recognized: true });
+  assert.deepEqual(modelFamily('claude-opus-5-5[1m]'), { key: 'opus', recognized: true });
+  assert.deepEqual(modelFamily('Opus'), { key: 'opus', recognized: true });
+  assert.deepEqual(modelFamily('claude-haiku-4-5-20251001'), { key: 'haiku', recognized: true });
+  assert.deepEqual(modelFamily('fable'), { key: 'fable', recognized: true });
+  assert.deepEqual(modelFamily('claude-fable-5-1'), { key: 'fable', recognized: true });
+  assert.deepEqual(modelFamily('gpt-9-turbo'), { key: 'gpt-9-turbo', recognized: false });
+  assert.deepEqual(modelFamily(null), { key: 'unknown', recognized: false });
+  assert.deepEqual(modelFamily(''), { key: 'unknown', recognized: false });
+});
+
+test('#124: a unit on `sonnet` and one on `claude-sonnet-5` report one sonnet row carrying both', () => {
+  const a = parseTranscript(sessionTranscript({ sessionId: 's-a', name: 'ic-1', model: 'sonnet', pr: 101 }), 'fixture/s-a.jsonl');
+  const b = parseTranscript(sessionTranscript({ sessionId: 's-b', name: 'ic-2', model: 'claude-sonnet-5', pr: 102 }), 'fixture/s-b.jsonl');
+  const cycles = buildCycleRecords({
+    roster: { sessions: [icRow(1, 's-a'), icRow(2, 's-b')] },
+    transcripts: [a, b],
+    pullRequestStates: { 'endzone:101': { state: 'MERGED', mergedAt: '2026-09-01T00:00:30.000Z' }, 'endzone:102': { state: 'MERGED', mergedAt: '2026-09-01T00:00:30.000Z' } },
+  });
+  const report = buildReport(cycles.records, cycles.excluded, { sessionMetrics: cycles.sessionMetrics });
+  assert.deepEqual(Object.keys(report.byModel), ['sonnet']);
+  assert.equal(report.byModel.sonnet.units, 2);
+  assert.equal(report.byModel.sonnet.sessions, 2);
+  assert.deepEqual(report.units.map((u) => [u.model, u.modelRaw]), [['sonnet', 'sonnet'], ['sonnet', 'claude-sonnet-5']]);
+  assert.deepEqual(report.sessions.map((s) => s.model), ['sonnet', 'sonnet']);
+  assert.deepEqual(report.unrecognizedModels, []);
+});
+
+test('#124: an unknown model string is kept as written and listed under unrecognized with its unit count', () => {
+  const a = parseTranscript(sessionTranscript({ sessionId: 's-a', name: 'ic-1', model: 'gpt-9-turbo', pr: 101 }), 'fixture/s-a.jsonl');
+  const cycles = buildCycleRecords({
+    roster: { sessions: [icRow(1, 's-a')] },
+    transcripts: [a],
+    pullRequestStates: { 'endzone:101': { state: 'MERGED', mergedAt: '2026-09-01T00:00:30.000Z' } },
+  });
+  const report = buildReport(cycles.records, cycles.excluded, { sessionMetrics: cycles.sessionMetrics });
+  assert.equal(report.byModel['gpt-9-turbo'].units, 1);
+  assert.deepEqual(report.unrecognizedModels, [{ model: 'gpt-9-turbo', units: 1, sessions: 1 }]);
+  assert.match(renderSummary(report), /unrecognized models: gpt-9-turbo \(1 unit/);
+});
+
+test('#124: a synthetic assistant row does not name the session model', () => {
+  const parsed = parseTranscript([
+    { type: 'custom-title', customTitle: 'ic-1', sessionId: 's-1' },
+    assistant({ uuid: 'syn', timestamp: '2026-09-01T00:00:00.000Z', content: [{ type: 'text', text: 'No response requested.' }], usage: { input: 0, output: 0 }, model: '<synthetic>' }),
+    assistant({ uuid: 'real', timestamp: '2026-09-01T00:00:01.000Z', content: [{ type: 'text', text: 'ok' }], usage: { input: 1, output: 1 }, model: 'claude-sonnet-5' }),
+  ].map(line).join('\n'), 'fixture/s-1.jsonl');
+  assert.equal(parsed.model, 'claude-sonnet-5');
+});
+
+// --- #125: the collector counts sessions that rotation retired ----------------------
+// Red-tell: the rotated-lead fixture counts only the live lead session before the change.
+function rotationFixture({ retiredLines, rosterSessions, transcripts, subagents = {} }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-retired-'));
+  const dir = path.join(root, 'transcripts', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: rosterSessions }));
+  fs.writeFileSync(path.join(root, 'archive', 'roster-retired-full.jsonl'), `${retiredLines.map((l) => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n')}\n`);
+  for (const [sessionId, text] of Object.entries(transcripts)) fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), text);
+  for (const [sessionId, agents] of Object.entries(subagents)) {
+    const agentDir = path.join(dir, sessionId, 'subagents');
+    fs.mkdirSync(agentDir, { recursive: true });
+    for (const agent of agents) {
+      fs.writeFileSync(path.join(agentDir, `agent-${agent.id}.jsonl`), agent.text);
+      if (agent.meta) fs.writeFileSync(path.join(agentDir, `agent-${agent.id}.meta.json`), JSON.stringify(agent.meta));
+    }
+  }
+  return collectFromFiles({
+    transcriptsDir: path.join(root, 'transcripts'), rosterPath: path.join(root, 'roster.json'), outputDir: path.join(root, 'out'),
+    since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', generatedAt: '2026-09-02T00:00:00.000Z', verifyGithub: false,
+    configPath: path.join(root, 'no-config.json'),
+  });
+}
+const leadRow = (sessionId, extra = {}) => ({ name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', sessionId, ...extra });
+
+test('#125: a lead rotated mid-window counts both the retired and the live session in the control-plane total', () => {
+  const result = rotationFixture({
+    rosterSessions: [leadRow('pl-new', { status: 'active', launchedAt: '2026-09-01T12:00:00.000Z' })],
+    retiredLines: [leadRow('pl-old', { status: 'retired', launchedAt: '2026-08-31T12:00:00.000Z', retiredAt: '2026-09-01T11:59:00.000Z' })],
+    transcripts: {
+      'pl-old': sessionTranscript({ sessionId: 'pl-old', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T06:00:00.000Z', input: 1000, output: 0 }),
+      'pl-new': sessionTranscript({ sessionId: 'pl-new', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T13:00:00.000Z', input: 300, output: 0 }),
+    },
+  });
+  const daily = result.dailyReport;
+  assert.equal(daily.roles['project-lead'].sessions, 2);
+  assert.equal(daily.metrics.controlPlaneFreshTokens, 1300);
+  assert.deepEqual(daily.sample.sessionSources, { live: 1, retired: 1 });
+});
+
+test('#125: a retired session whose transcript has no role still counts under its roster role', () => {
+  const text = [assistant({ uuid: 'x', timestamp: '2026-09-01T06:00:00.000Z', content: [{ type: 'text', text: 'ok' }], usage: { input: 50, output: 0 } })].map((r) => line({ ...r, sessionId: 'd-old' })).join('\n');
+  const result = rotationFixture({
+    rosterSessions: [],
+    retiredLines: [{ name: 'dispatcher', role: 'dispatcher', sessionId: 'd-old', status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T07:00:00.000Z' }],
+    transcripts: { 'd-old': text },
+  });
+  assert.equal(result.dailyReport.roles.dispatcher.sessions, 1);
+  assert.equal(result.dailyReport.metrics.controlPlaneFreshTokens, 50);
+});
+
+test('#125: a session present in both the roster and the retired log counts once', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(7, 's-7'), leadRow('pl-1', { status: 'active' })],
+    retiredLines: [icRow(7, 's-7'), leadRow('pl-1', { status: 'retired', retiredAt: '2026-09-01T20:00:00.000Z' })],
+    transcripts: {
+      's-7': sessionTranscript({ sessionId: 's-7', name: 'ic-7', at: '2026-09-01T00:00:10.000Z', pr: 707 }),
+      'pl-1': sessionTranscript({ sessionId: 'pl-1', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T01:00:00.000Z' }),
+    },
+  });
+  const daily = result.dailyReport;
+  assert.equal(daily.sample.completedUnits, 1);
+  assert.equal(daily.sessions.length, 2);
+  assert.equal(daily.roles['project-lead'].sessions, 1);
+  assert.deepEqual(daily.sample.sessionSources, { live: 2, retired: 0 });
+});
+
+test('#125: an IC respawned for the same issue is one unit whose tokens are both sessions', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(8, 's-8b')],
+    retiredLines: [icRow(8, 's-8a', { retiredAt: '2026-09-01T00:00:30.000Z', retiredBecause: 'respawn' })],
+    transcripts: {
+      's-8a': sessionTranscript({ sessionId: 's-8a', name: 'ic-8', at: '2026-09-01T00:00:05.000Z', input: 400, output: 40 }),
+      's-8b': sessionTranscript({ sessionId: 's-8b', name: 'ic-8', at: '2026-09-01T00:00:40.000Z', input: 100, output: 10, pr: 808 }),
+    },
+  });
+  const daily = result.dailyReport;
+  assert.equal(daily.sample.completedUnits, 1);
+  assert.equal(daily.units[0].metrics.jobTokens, 550);
+  assert.equal(daily.units[0].sessions, 2);
+  assert.deepEqual(daily.units[0].pullRequests, [808]);
+});
+
+test('#125: the summary names the live and retired session counts', () => {
+  const result = rotationFixture({
+    rosterSessions: [leadRow('pl-new', { status: 'active' })],
+    retiredLines: [leadRow('pl-old', { status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T11:59:00.000Z' })],
+    transcripts: {
+      'pl-old': sessionTranscript({ sessionId: 'pl-old', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T06:00:00.000Z' }),
+      'pl-new': sessionTranscript({ sessionId: 'pl-new', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T13:00:00.000Z' }),
+    },
+  });
+  assert.match(fs.readFileSync(result.summaryArtifact, 'utf8'), /sessions: 1 live, 1 retired \(rotated out\)/);
+});
+
+test('#125: a torn line in the retired log is listed as skipped and the run completes', () => {
+  const result = rotationFixture({
+    rosterSessions: [leadRow('pl-new', { status: 'active' })],
+    retiredLines: [leadRow('pl-old', { status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T11:59:00.000Z' }), '{"name":"pl-endzone","role":"proj'],
+    transcripts: {
+      'pl-old': sessionTranscript({ sessionId: 'pl-old', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T06:00:00.000Z' }),
+      'pl-new': sessionTranscript({ sessionId: 'pl-new', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T13:00:00.000Z' }),
+    },
+  });
+  assert.equal(result.dailyReport.roles['project-lead'].sessions, 2);
+  assert.deepEqual(result.dailyReport.retiredLog.skipped, [{ line: 2, reason: 'unparseable' }]);
+  assert.match(fs.readFileSync(result.summaryArtifact, 'utf8'), /retired log: 1 torn line\(s\) skipped/);
+});
+
+test('#125: a retired row that ended before the window is not read', () => {
+  const result = rotationFixture({
+    rosterSessions: [],
+    retiredLines: [leadRow('pl-ancient', { status: 'retired', launchedAt: '2026-08-01T00:00:00.000Z', retiredAt: '2026-08-02T00:00:00.000Z' })],
+    transcripts: { 'pl-ancient': sessionTranscript({ sessionId: 'pl-ancient', name: 'pl-endzone', role: 'project-lead', at: '2026-08-01T06:00:00.000Z' }) },
+  });
+  assert.equal(result.dailyReport.sessions.length, 0);
+  assert.equal(result.report.sessions.length, 0);
+});
+
+// --- #126: the risk reviewer's spend is attributed to the unit that hosted it --------
+// Red-tell: before the change a qa-reviewer subagent's tokens appear nowhere.
+function agentTranscript({ sessionId, agentId, model = 'claude-opus-5-5', input, output, at = '2026-09-01T00:00:20.000Z' }) {
+  return [{ ...assistant({ uuid: `${agentId}-1`, timestamp: at, content: [{ type: 'text', text: 'Review complete: no findings.' }], usage: { input, output }, model }), sessionId, agentId, isSidechain: true }].map(line).join('\n');
+}
+const icSession = (sessionId, pr) => sessionTranscript({ sessionId, name: 'ic-9', at: '2026-09-01T00:00:10.000Z', input: 100, output: 10, pr });
+
+test('#126: a qa-reviewer subagent is a risk-reviewer line and is inside the hosting unit total', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9')],
+    retiredLines: [],
+    transcripts: { 's-9': icSession('s-9', 909) },
+    subagents: { 's-9': [{ id: 'q1', text: agentTranscript({ sessionId: 's-9', agentId: 'q1', input: 1000, output: 100 }), meta: { agentType: 'qa-reviewer', model: 'opus' } }] },
+  });
+  const report = result.dailyReport;
+  const [unit] = report.units;
+  assert.equal(unit.metrics.ownJobTokens, 110);
+  assert.equal(unit.metrics.riskReviewerJobTokens, 1100);
+  assert.equal(unit.metrics.jobTokens, 1210, 'the unit total includes the reviewer');
+  assert.deepEqual(report.riskReviewer, { runs: 1, jobTokens: 1100, freshTokens: 1100, byModel: { opus: { runs: 1, jobTokens: 1100 } } });
+  assert.match(fs.readFileSync(result.summaryArtifact, 'utf8'), /risk reviewer \(qa-reviewer\): 1 run\(s\), 1100 job tokens \(opus 1\)/);
+});
+
+test('#126: a subagent with no meta file counts in the unit total under unknown and is listed', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9')],
+    retiredLines: [],
+    transcripts: { 's-9': icSession('s-9', 909) },
+    subagents: { 's-9': [{ id: 'm1', text: agentTranscript({ sessionId: 's-9', agentId: 'm1', model: 'claude-sonnet-5', input: 40, output: 2 }) }] },
+  });
+  const report = result.dailyReport;
+  assert.equal(report.units[0].metrics.jobTokens, 152);
+  assert.equal(report.subagents.byAgentType.unknown.runs, 1);
+  assert.equal(report.subagents.byAgentType.unknown.jobTokens, 42);
+  assert.equal(report.subagentsWithoutMeta.length, 1);
+  assert.equal(report.subagentsWithoutMeta[0].agentId, 'm1');
+  assert.equal(report.subagentsWithoutMeta[0].session, 's-9');
+  assert.equal(report.riskReviewer.runs, 0);
+});
+
+test('#126: the unit total equals the session plus all its subagents, summarized by agent type', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9')],
+    retiredLines: [],
+    transcripts: { 's-9': icSession('s-9', 909) },
+    subagents: { 's-9': [
+      { id: 'q1', text: agentTranscript({ sessionId: 's-9', agentId: 'q1', input: 1000, output: 100 }), meta: { agentType: 'qa-reviewer', model: 'opus' } },
+      { id: 'r1', text: agentTranscript({ sessionId: 's-9', agentId: 'r1', model: 'claude-haiku-4-5-20251001', input: 30, output: 3 }), meta: { agentType: 'researcher', model: 'haiku' } },
+      { id: 'r2', text: agentTranscript({ sessionId: 's-9', agentId: 'r2', model: 'claude-haiku-4-5-20251001', input: 20, output: 2 }), meta: { agentType: 'researcher', model: 'haiku' } },
+    ] },
+  });
+  const report = result.dailyReport;
+  const metrics = report.units[0].metrics;
+  assert.equal(metrics.subagentRuns, 3);
+  assert.equal(metrics.jobTokens, metrics.ownJobTokens + metrics.subagentJobTokens);
+  assert.equal(metrics.jobTokens, 110 + 1100 + 33 + 22);
+  assert.deepEqual(report.subagents.byAgentType.researcher, { runs: 2, jobTokens: 55, freshTokens: 55, byModel: { haiku: { runs: 2, jobTokens: 55 } } });
+  assert.equal(report.subagents.runs, 3);
+  assert.equal(report.sessions.length, 1, 'a subagent transcript is never read as a session of its own');
+});
+
+test('#126: with an empty roster, subagent transcripts are still not read as sessions', () => {
+  const result = rotationFixture({
+    rosterSessions: [],
+    retiredLines: [],
+    transcripts: { 'pl-x': sessionTranscript({ sessionId: 'pl-x', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T01:00:00.000Z', input: 10, output: 0 }) },
+    subagents: { 'pl-x': [{ id: 'r1', text: agentTranscript({ sessionId: 'pl-x', agentId: 'r1', input: 5, output: 0, at: '2026-09-01T01:00:05.000Z' }), meta: { agentType: 'researcher', model: 'haiku' } }] },
+  });
+  assert.equal(result.dailyReport.sessions.length, 1);
+  assert.equal(result.dailyReport.roles['project-lead'].metrics.jobTokens, 15, 'the lead carries its researcher');
+});
+
+// --- #128: the IC token median is reported, not judged ------------------------------
+// Red-tell: before the change the median carries PASS/FAIL against 60000 and there is
+// no per-family figure.
+const familyUnit = (issue, model, job) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', model, merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: job, jobTokens: job, cacheReadInputTokens: 0 } });
+const familyUnits = [familyUnit(1, 'sonnet', 100000), familyUnit(2, 'sonnet', 140000), familyUnit(3, 'sonnet', 300000), familyUnit(4, 'haiku', 20000), familyUnit(5, 'haiku', 40000)];
+const nullTargets = { haiku: null, sonnet: null, opus: null, fable: null };
+
+test('#128: with every per-model target null, the median and p90 print per family with no verdict', () => {
+  const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedianReference: 60000, icJobTokensTargets: nullTargets } });
+  const byModel = report.unitMetrics.icByModel;
+  assert.deepEqual(byModel.sonnet, { units: 3, jobTokensMedian: 140000, jobTokensP90: 300000, target: null, pass: null });
+  assert.deepEqual(byModel.haiku, { units: 2, jobTokensMedian: 30000, jobTokensP90: 40000, target: null, pass: null });
+  assert.equal(report.unitMetrics.budgets.icJobTokensMedian.pass, null);
+  const text = renderSummary(report);
+  assert.match(text, /^IC job tokens median: 100000 \(p90 300000; reference 60000, not a verdict\)$/m);
+  assert.match(text, /^- sonnet: median 140000, p90 300000 over 3 unit\(s\) \(no target\)$/m);
+  assert.match(text, /^- haiku: median 30000, p90 40000 over 2 unit\(s\) \(no target\)$/m);
+  const icLines = text.split('\n').filter((l) => /^IC job tokens median|^- (sonnet|haiku):/.test(l));
+  assert.ok(icLines.every((l) => !/PASS|FAIL/.test(l)), 'no verdict on any IC median line');
+});
+
+test('#128: setting one family target judges that family only', () => {
+  const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedianReference: 60000, icJobTokensTargets: { ...nullTargets, haiku: 35000 } } });
+  const byModel = report.unitMetrics.icByModel;
+  assert.equal(byModel.haiku.target, 35000);
+  assert.equal(byModel.haiku.pass, true);
+  assert.equal(byModel.sonnet.pass, null);
+  const text = renderSummary(report);
+  assert.match(text, /^- haiku: median 30000, p90 40000 over 2 unit\(s\) \(target 35000\) PASS$/m);
+  assert.match(text, /^- sonnet: .*\(no target\)$/m);
+  const failing = buildReport(familyUnits, [], { budgets: { icJobTokensTargets: { ...nullTargets, haiku: 25000 } } });
+  assert.equal(failing.unitMetrics.icByModel.haiku.pass, false);
+  assert.match(renderSummary(failing), /^- haiku: .*\(target 25000\) FAIL$/m);
+});
+
+test('#128: the legacy icJobTokensMedian key is read as the reference, never a verdict', () => {
+  const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedian: 60000 } });
+  assert.equal(report.unitMetrics.budgets.icJobTokensMedian.reference, 60000);
+  assert.equal(report.unitMetrics.budgets.icJobTokensMedian.pass, null);
+});
+
+test('#128: the seven-day JSON carries the per-family figures, and the shipped config has null targets', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  assert.deepEqual(shipped.budgets.icJobTokensTargets, nullTargets);
+  assert.equal(shipped.budgets.icJobTokensMedianReference, 60000);
+  assert.equal(shipped.budgets.icJobTokensMedian, undefined, 'the judged key is gone');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const transcripts = path.join(root, 'transcripts');
+  fs.mkdirSync(path.join(transcripts, 'p'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{ name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1' }] }));
+  fs.writeFileSync(path.join(transcripts, 'p', 'session-1.jsonl'), fixtureTranscript());
+  const result = collectFromFiles({ transcriptsDir: transcripts, rosterPath: path.join(root, 'roster.json'), outputDir: path.join(root, 'out'), since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', generatedAt: '2026-09-01T12:00:00.000Z', verifyGithub: false, configPath: path.join(__dirname, '..', 'config', 'cycle.json') });
+  const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
+  assert.deepEqual(json.unitMetrics.icByModel.sonnet, { units: 1, jobTokensMedian: 68, jobTokensP90: 68, target: null, pass: null });
+});
+
+test('#125 review: a unit whose earlier session retired before the window still sums every session', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9b', { retiredAt: '2026-09-01T00:01:00.000Z' })],
+    retiredLines: [icRow(9, 's-9a', { launchedAt: '2026-08-20T00:00:00.000Z', retiredAt: '2026-08-20T05:00:00.000Z', retiredBecause: 'respawn' })],
+    transcripts: {
+      's-9a': sessionTranscript({ sessionId: 's-9a', name: 'ic-9', at: '2026-08-20T01:00:00.000Z', input: 700, output: 70 }),
+      's-9b': sessionTranscript({ sessionId: 's-9b', name: 'ic-9', at: '2026-09-01T00:00:40.000Z', input: 100, output: 10, pr: 909 }),
+    },
+  });
+  assert.equal(result.dailyReport.units[0].sessions, 2);
+  assert.equal(result.dailyReport.units[0].metrics.jobTokens, 880);
 });

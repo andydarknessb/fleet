@@ -231,3 +231,33 @@ test('a row with an unparseable enteredStateAt renders age "unknown" and sorts f
   const summary = buildSummary({ root, now: NOW });
   assert.deepEqual(summary.body.split('\n'), ['#999 escalated unknown', '#8 escalated 2h']);
 });
+
+// --- #131: the weekly scorecard's headline rides the daily page ----------------------
+// Red-tell: before the change the page carries the waiting rows only.
+function writeCard(root, monday, headline) {
+  const dir = path.join(root, 'state', 'metrics');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `scorecard-${monday}.json`), JSON.stringify({ week: { label: `${monday}..x` }, headline }));
+}
+
+test('#131: the page carries the latest scorecard headline when one exists', () => {
+  const root = rootDir();
+  seedDecision(root, { issue: 1, to: 'escalated', enteredAt: hoursAgo(3) });
+  writeCard(root, '2026-09-07', { area: 'Throughput', status: 'weak', result: 'old' });
+  writeCard(root, '2026-09-14', { area: 'Review gate', status: 'weak', result: '1 merge without a formal review' });
+  const summary = buildSummary({ root, now: NOW });
+  assert.deepEqual(summary.body.split('\n'), ['#1 escalated 3h', 'Scorecard 2026-09-14..x: weakest row Review gate (weak): 1 merge without a formal review']);
+  assert.equal(summary.count, 1, 'the headline is not a waiting row');
+});
+
+test('#131: with no scorecard file the headline line is omitted, never faked', () => {
+  const root = rootDir();
+  seedDecision(root, { issue: 1, to: 'escalated', enteredAt: hoursAgo(3) });
+  assert.deepEqual(buildSummary({ root, now: NOW }).body.split('\n'), ['#1 escalated 3h']);
+});
+
+test('#131: a scorecard alone never turns a quiet day into a page', () => {
+  const root = rootDir();
+  writeCard(root, '2026-09-14', { area: 'Review gate', status: 'weak', result: 'x' });
+  assert.equal(buildSummary({ root, now: NOW }), null);
+});

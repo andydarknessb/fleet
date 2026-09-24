@@ -30,7 +30,22 @@
     "baselineControlPlaneFreshPerCompletedUnit": 201505,
     "controlPlaneFreshReduction": 0.7,
     "projectLeadFreshPerMergedPr": 25000,
-    "icJobTokensMedian": 60000
+    "icJobTokensMedianReference": 60000,
+    "icJobTokensTargets": { "haiku": null, "sonnet": null, "opus": null, "fable": null }
+  },
+  "secondRead": {
+    "repo": "andydarknessb/fleet",
+    "label": "second-read",
+    "minChangedLines": 150,
+    "maxPrLookups": 50
+  },
+  "scorecard": {
+    "cycleTimeMedianHours": { "watch": 2, "weak": 6 },
+    "tailHours": 12,
+    "sentBackRate": { "watch": 0.3, "weak": 0.45 },
+    "escapedRate": { "weak": 0.05 },
+    "fleetDeadRate": { "watch": 0.02, "weak": 0.1 },
+    "maxPrLookups": 50
   },
   "review": {
     "trivialMaxChangedLines": 25,
