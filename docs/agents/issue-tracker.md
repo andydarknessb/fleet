@@ -1,30 +1,35 @@
-# Issue tracker: Local Markdown
+# Issue tracker: GitHub
 
-Issues and specs for the fleet itself live as markdown files in `.scratch/`. (Tenants keep their own trackers; this file is only about work on the fleet.)
+Issues and specs for the fleet itself live as GitHub issues on `andydarknessb/fleet`. (Tenants keep their own trackers; this file is only about work on the fleet.) Use the `gh` CLI for all operations; run inside `C:\Users\Cory\fleet` or a fleet worktree, or pass `-R andydarknessb/fleet`.
+
+Ruled 2026-09-24: this replaced the earlier `.scratch/` markdown tracker. Fleet tickets had been filed on GitHub in practice for weeks, and `bin/second-read.js` files its weekly `second-read` issue there (#132). Existing `.scratch/` notes stay where they are as history; file new work as issues.
 
 ## Conventions
 
-- One feature per directory: `.scratch/<feature-slug>/`
-- The spec is `.scratch/<feature-slug>/spec.md`
-- Implementation issues are one file per ticket at `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01`, never a single combined tickets file
-- Triage state is recorded as a `Status:` line near the top of each issue file (see `triage-labels.md` for the role strings)
-- Comments and conversation history append to the bottom of the file under a `## Comments` heading
+- **Create an issue**: `gh issue create --title "..." --body-file <file>`. Write long bodies with a file, not a heredoc.
+- **Read an issue**: `gh issue view <number> --comments`.
+- **List issues**: `gh issue list --state open --json number,title,labels` with `--label` and `--state` filters.
+- **Comment on an issue**: `gh issue comment <number> --body-file <file>`
+- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
+- **Close**: `gh issue close <number> --comment "..."`
+- **Specs and their tickets**: a spec is an issue; its tickets are linked as native sub-issues, with native blocked-by edges between them (see Wayfinding below for the API calls).
+- Labels in use: `enhancement`, `bug`, `documentation`, `second-read` (weekly reviewer audit, filed by `bin/second-read.js`), plus the triage roles in `triage-labels.md`.
 
 ## When a skill says "publish to the issue tracker"
 
-Create a new file under `.scratch/<feature-slug>/` (creating the directory if needed).
+Create a GitHub issue on `andydarknessb/fleet`.
 
 ## When a skill says "fetch the relevant ticket"
 
-Read the file at the referenced path. The user will normally pass the path or the issue number directly.
+Run `gh issue view <number> --comments -R andydarknessb/fleet`.
 
 ## Wayfinding operations
 
-Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.
+Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
 
-- **Map**: `.scratch/<effort>/map.md`, the Notes / Decisions-so-far / Fog body.
-- **Child ticket**: `.scratch/<effort>/issues/NN-<slug>.md`, numbered from `01`, with the question in the body. A `Type:` line records the ticket type (`research`/`prototype`/`grilling`/`task`); a `Status:` line records `claimed`/`resolved`.
-- **Blocking**: a `Blocked by: NN, NN` line near the top. A ticket is unblocked when every file it lists is `resolved`.
-- **Frontier**: scan `.scratch/<effort>/issues/` for files that are open, unblocked, and unclaimed; first by number wins.
-- **Claim**: set `Status: claimed` and save before any work.
-- **Resolve**: append the answer under an `## Answer` heading, set `Status: resolved`, then append a context pointer (gist + link) to the map's Decisions-so-far in `map.md`.
+- **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body.
+- **Child ticket**: an issue linked to the map as a GitHub sub-issue. Labels: `wayfinder:<type>` (`research`/`prototype`/`grilling`/`task`). Once claimed, the ticket is assigned to the driving session's login.
+- **Blocking**: native issue dependencies: `gh api --method POST repos/andydarknessb/fleet/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`, where `<blocker-db-id>` is `gh api repos/andydarknessb/fleet/issues/<n> --jq .id`. A ticket is unblocked when every blocker is closed.
+- **Frontier**: the map's open children with no open blocker and no assignee; first in map order wins.
+- **Claim**: `gh issue edit <n> --add-assignee @me` before any work.
+- **Resolve**: `gh issue comment <n>` with the answer, `gh issue close <n>`, then append a context pointer (gist + link) to the map's Decisions-so-far.
