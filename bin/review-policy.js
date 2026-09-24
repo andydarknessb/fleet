@@ -227,6 +227,23 @@ function readArtifact(root, relativePath) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+// fleet#103: a formal artifact records the risk artifact only on the link that
+// consumed it (later links hold null), so "already consumed" means any link in
+// the prior chain, not just the immediate one. A missing or cyclic link stops
+// the walk, and the risk chain is walked again rather than silently skipped.
+function riskConsumedInChain(root, priorArtifactData, riskPath) {
+  const seen = new Set();
+  let link = priorArtifactData;
+  while (link) {
+    if (link.riskArtifact === riskPath) return true;
+    const next = link.priorArtifact;
+    if (!next || seen.has(next)) return false;
+    seen.add(next);
+    link = readArtifact(root, next);
+  }
+  return false;
+}
+
 function openFindings(artifact) {
   return (artifact.findings || []).filter((finding) => finding.status === 'open');
 }
@@ -480,7 +497,7 @@ function recordReviewArtifact(options = {}) {
       let riskArtifactMissing = false;
       if (kind === 'formal') {
         const risk = record.review?.risk || null;
-        const consumedByPrior = risk && priorArtifactData && priorArtifactData.riskArtifact === risk.artifact;
+        const consumedByPrior = risk && riskConsumedInChain(root, priorArtifactData, risk.artifact);
         if (risk && !consumedByPrior) {
           riskArtifact = risk.artifact;
           const riskData = readArtifact(root, risk.artifact);
