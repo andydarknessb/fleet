@@ -347,6 +347,11 @@ function findPendingMergedWithoutReview({ root, tenant, recordId, sequence, now 
     let record;
     try { record = workState.getRecord({ root: base, id: event.recordId }); } catch { continue; }
     if (tenant && record.tenant !== tenant) continue;
+    // The door settles active and retired (archived) records only. A merged record
+    // later escalated and abandoned lives in state/abandons, where a notification
+    // event would break reusableAbandonedRecord; skip it rather than refuse it
+    // (skipped:not_found) on every sweep for 48h.
+    if (['released', 'abandoned'].includes(record.state)) continue;
     const entry = record.notifications?.[String(event.sequence)] || null;
     if (entry && !(entry.status === 'failed' && entry.retryAuthorized)) continue;
     pending.push({ record, event, entry });

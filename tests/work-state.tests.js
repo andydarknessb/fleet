@@ -793,6 +793,33 @@ test('fleet#99: the merge-review fact stays claimable after the record retires a
   assert.deepEqual(verified.records.flatMap((record) => record.findings), []);
 });
 
+test('fleet#99: a claim on an archived record recovers from every kill point to exactly one event', () => {
+  for (const killPoint of ['after-journal', 'after-record', 'after-event']) {
+    const root = rootDir();
+    const merged = mergeUnreviewed(root);
+    const retiring = move(root, 'endzone:issue-42', merged.revision, 'retiring', 'k-6', 'roster row gone', '2026-09-01T05:00:06.000Z');
+    const retired = move(root, 'endzone:issue-42', retiring.revision, 'retired', 'k-7', 'retired', '2026-09-01T05:00:07.000Z');
+    assert.throws(() => notify(root, 'claim', retired.revision, 6, { killPoint }), { code: 'KILL_POINT' });
+    const stored = getRecord({ root, id: 'endzone:issue-42' });
+    assert.equal(stored.state, 'retired', killPoint);
+    assert.equal(stored.notifications['6'].status, 'claimed', killPoint);
+    assert.equal(readEvents(root).filter((event) => event.type === 'notification-attempted').length, 1, killPoint);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-42'], undefined, killPoint);
+    assert.deepEqual(require('../bin/verify-events').verifyLedger({ root }).records.flatMap((record) => record.findings), [], killPoint);
+  }
+});
+
+test('fleet#99: a decision event on an archived record is still NOT_FOUND', () => {
+  const root = rootDir();
+  const merged = mergeUnreviewed(root);
+  const escalated = move(root, 'endzone:issue-42', merged.revision, 'escalated', 'd-6', 'retirement blocked', '2026-09-01T05:00:06.000Z');
+  const retiring = move(root, 'endzone:issue-42', escalated.revision, 'retiring', 'd-7', 'unblocked', '2026-09-01T05:00:07.000Z');
+  const retired = move(root, 'endzone:issue-42', retiring.revision, 'retired', 'd-8', 'retired', '2026-09-01T05:00:08.000Z');
+  assert.throws(() => notify(root, 'claim', retired.revision, escalated.eventSequence), { code: 'NOT_FOUND' });
+  // The merge-review fact on the same archived record is still claimable.
+  assert.equal(notify(root, 'claim', retired.revision, 6).record.notifications['6'].status, 'claimed');
+});
+
 test('twenty concurrent claims for one decision event produce exactly one claim', () => {
   const root = rootDir();
   const escalated = escalate(root);
