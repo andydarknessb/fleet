@@ -321,20 +321,44 @@ function metricsForTranscript(transcript) {
   };
 }
 
-function sessionMetricForTranscript(transcript) {
+function sessionMetricForTranscript(transcript, row = null) {
   return {
     sessionId: transcript.sessionId,
-    name: transcript.name,
-    role: transcript.role,
+    name: transcript.name || row?.name || null,
+    // #125: a retired session's transcript may carry no agent-setting row; its roster
+    // row still says what it was.
+    role: transcript.role || row?.role || null,
     issue: transcript.issue,
     model: modelFamily(transcript.model).key,
     modelRaw: transcript.model || null,
     effort: transcript.effort,
+    source: row?.source || (row ? 'live' : 'unrostered'),
     firstTimestamp: transcript.firstTimestamp,
     lastTimestamp: transcript.lastTimestamp,
     metrics: metricsForTranscript(transcript),
     evidence: { transcript: transcript.sourcePath, transcriptSessionId: transcript.sessionId },
   };
+}
+
+// #125: several sessions can work one issue (a respawn, or a rotation that replaced the
+// roster row); the unit's figures are all of them. Numbers add, the command-class counts
+// merge, and the first-useful-turn figure is the earliest session's.
+function combineMetrics(list) {
+  if (list.length === 1) return list[0];
+  const combined = { toolCallsByCommandClass: {} };
+  for (const metrics of list) {
+    for (const [key, value] of Object.entries(metrics)) {
+      if (typeof value === 'number') combined[key] = (combined[key] || 0) + value;
+    }
+    for (const [key, value] of Object.entries(metrics.toolCallsByCommandClass || {})) addCount(combined.toolCallsByCommandClass, key, value);
+  }
+  combined.firstUsefulTurnCacheCreationInputTokens = list[0].firstUsefulTurnCacheCreationInputTokens || 0;
+  return combined;
+}
+
+function rowTime(row) {
+  const value = Date.parse(row.retiredAt || row.launchedAt || row.startedAt || '');
+  return Number.isFinite(value) ? value : 0;
 }
 
 function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allowTranscriptEvidence = false, verificationErrors = {} }) {
@@ -349,36 +373,55 @@ function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allo
       byName.set(transcript.name, matches);
     }
   }
-  const sessionMetrics = (transcripts || []).map(sessionMetricForTranscript);
-  const records = [];
-  const excluded = [];
+  const rowBySessionId = new Map(rows.filter((row) => row.sessionId).map((row) => [row.sessionId, row]));
+  const sessionMetrics = (transcripts || []).map((transcript) => sessionMetricForTranscript(transcript, rowBySessionId.get(transcript.sessionId) || null));
+  // #125: IC rows grouped by tenant and issue. The group's state is its live roster row
+  // when it has one (else its latest retired row); its figures are every session in it.
+  const groups = new Map();
   for (const row of rows) {
     if (String(row.role || '').toLowerCase() !== 'ic' || !Number.isInteger(Number(row.issue)) || Number(row.issue) <= 0) continue;
+    const key = `${row.tenant || ''}:${Number(row.issue)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const records = [];
+  const excluded = [];
+  for (const group of groups.values()) {
+    const live = group.filter((row) => row.source !== 'retired');
+    const row = (live.length ? live : group).slice().sort((a, b) => rowTime(b) - rowTime(a))[0];
     const identity = { name: row.name || null, tenant: row.tenant || null, issue: Number(row.issue) };
     if (!row.retiredAt || String(row.status || '').toLowerCase() !== 'retired') {
       excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.launchedAt || row.startedAt || null, reason: 'not-retired', evidence: 'state/roster.json' });
       continue;
     }
     const namedMatches = byName.get(row.name) || [];
-    const transcript = (row.sessionId && bySessionId.get(row.sessionId)) || (namedMatches.length === 1 ? namedMatches[0] : null);
-    if (!transcript) {
+    const found = [];
+    for (const member of group) {
+      const transcript = (member.sessionId && bySessionId.get(member.sessionId)) || (group.length === 1 && namedMatches.length === 1 ? namedMatches[0] : null);
+      if (transcript && !found.includes(transcript)) found.push(transcript);
+    }
+    if (found.length === 0) {
       excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.launchedAt || row.startedAt || null, reason: 'missing-transcript', evidence: 'transcript directory' });
       continue;
     }
-    if (transcript.issue !== null && transcript.issue !== identity.issue) {
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.launchedAt || row.startedAt || null, reason: 'issue-mismatch', evidence: transcript.sourcePath });
+    const matching = found.filter((transcript) => transcript.issue === null || transcript.issue === identity.issue);
+    if (matching.length === 0) {
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.launchedAt || row.startedAt || null, reason: 'issue-mismatch', evidence: found[0].sourcePath });
       continue;
     }
-    if (transcript.pullRequests.length === 0) {
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'missing-pull-request', evidence: transcript.sourcePath });
+    matching.sort((a, b) => String(a.firstTimestamp || '').localeCompare(String(b.firstTimestamp || '')));
+    const primary = (row.sessionId && matching.find((transcript) => transcript.sessionId === row.sessionId)) || matching[matching.length - 1];
+    const pullRequests = [...new Set(matching.flatMap((transcript) => transcript.pullRequests))].sort((a, b) => a - b);
+    if (pullRequests.length === 0) {
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'missing-pull-request', evidence: primary.sourcePath });
       continue;
     }
-    const verifiedMerge = transcript.pullRequests.some((number) => {
+    const verifiedMerge = pullRequests.some((number) => {
       const state = pullRequestStates?.[`${identity.tenant}:${number}`];
       return state && String(state.state).toUpperCase() === 'MERGED' && state.mergedAt;
     });
     if (pullRequestStates && !verifiedMerge) {
-      const errors = transcript.pullRequests
+      const errors = pullRequests
         .map((number) => verificationErrors[`${identity.tenant}:${number}`])
         .filter(Boolean);
       // Amendment 9: a unit whose every PR GitHub reports CLOSED without a merge is
@@ -386,7 +429,7 @@ function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allo
       // terminal classifications, excluded from budget denominators and never re-reported
       // as verification errors. Anything else stays `github-merge-unverified` (a real read
       // failure, retried next run).
-      const observed = transcript.pullRequests.map((number) => pullRequestStates[`${identity.tenant}:${number}`]).filter(Boolean);
+      const observed = pullRequests.map((number) => pullRequestStates[`${identity.tenant}:${number}`]).filter(Boolean);
       const isClosed = (s) => String(s.state).toUpperCase() === 'CLOSED' && !s.mergedAt;
       const isUnreturned = (s) => /not returned/i.test(String(s.error || ''));
       const noneReturned = observed.length > 0 && observed.every(isUnreturned);
@@ -394,49 +437,96 @@ function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allo
       // unit was abandoned. Every PR unreturned: it never had one GitHub knows about.
       const allClosed = !noneReturned && observed.length > 0 && observed.every((s) => isClosed(s) || isUnreturned(s)) && observed.some(isClosed);
       const reason = allClosed ? 'abandoned' : (noneReturned ? 'no-pr' : 'github-merge-unverified');
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason, terminal: reason !== 'github-merge-unverified', verificationErrors: reason === 'github-merge-unverified' ? errors : [], pullRequests: transcript.pullRequests, evidence: transcript.sourcePath });
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason, terminal: reason !== 'github-merge-unverified', verificationErrors: reason === 'github-merge-unverified' ? errors : [], pullRequests, evidence: primary.sourcePath });
       continue;
     }
     if (!pullRequestStates && !allowTranscriptEvidence) {
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'github-merge-unverified', pullRequests: transcript.pullRequests, evidence: transcript.sourcePath });
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'github-merge-unverified', pullRequests, evidence: primary.sourcePath });
       continue;
     }
-    if (!pullRequestStates && !transcript.merged) {
-      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'missing-merge-evidence', pullRequests: transcript.pullRequests, evidence: transcript.sourcePath });
+    if (!pullRequestStates && !matching.some((transcript) => transcript.merged)) {
+      excluded.push({ ...identity, retiredAt: row.retiredAt || null, startedAt: row.startedAt || null, reason: 'missing-merge-evidence', pullRequests, evidence: primary.sourcePath });
       continue;
     }
     const mergeEvents = pullRequestStates
-      ? transcript.pullRequests
+      ? pullRequests
         .map((number) => ({ number, ...pullRequestStates[`${identity.tenant}:${number}`], source: 'github' }))
         .filter((event) => String(event.state).toUpperCase() === 'MERGED' && event.mergedAt)
-      : transcript.mergeEvents;
+      : matching.flatMap((transcript) => transcript.mergeEvents);
     records.push({
       tenant: row.tenant || null,
       issue: identity.issue,
-      session: row.name || transcript.name || null,
-      sessionId: row.sessionId || transcript.sessionId || null,
+      session: row.name || primary.name || null,
+      sessionId: row.sessionId || primary.sessionId || null,
+      sessions: matching.length,
       role: 'ic',
-      model: modelFamily(row.model || transcript.model).key,
-      modelRaw: row.model || transcript.model || null,
-      effort: row.effort || transcript.effort || null,
-      pullRequests: transcript.pullRequests,
+      model: modelFamily(row.model || primary.model).key,
+      modelRaw: row.model || primary.model || null,
+      effort: row.effort || primary.effort || null,
+      pullRequests,
       merged: true,
       mergeVerification: pullRequestStates ? 'github' : 'transcript',
       mergeEvents,
       retiredAt: row.retiredAt,
       completedAt: row.retiredAt,
       outcome: 'merged-and-retired',
-      metrics: metricsForTranscript(transcript),
+      metrics: combineMetrics(matching.map(metricsForTranscript)),
       evidence: {
-        roster: 'state/roster.json',
-        transcript: transcript.sourcePath,
-        transcriptSessionId: transcript.sessionId,
+        roster: row.source === 'retired' ? 'state/archive/roster-retired-full.jsonl' : 'state/roster.json',
+        transcript: primary.sourcePath,
+        transcriptSessionId: primary.sessionId,
+        transcripts: matching.map((transcript) => transcript.sourcePath),
       },
     });
   }
   records.sort((a, b) => String(a.tenant).localeCompare(String(b.tenant)) || a.issue - b.issue);
   excluded.sort((a, b) => String(a.tenant).localeCompare(String(b.tenant)) || a.issue - b.issue);
   return { records, excluded, sessionMetrics };
+}
+
+// #125: the retired-row archive retire.ps1 appends to. A torn or unreadable line is
+// reported and skipped, never fatal; a missing file is an empty archive.
+function loadRetiredRows(file) {
+  const result = { path: file || null, rows: [], skipped: [], missing: false };
+  if (!file || !fs.existsSync(file)) { result.missing = true; return result; }
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (error) {
+    result.skipped.push({ line: 0, reason: `unreadable: ${error.message}` });
+    return result;
+  }
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  text.split(/\r?\n/).forEach((raw, index) => {
+    if (!raw.trim()) return;
+    let row;
+    try { row = JSON.parse(raw); } catch { result.skipped.push({ line: index + 1, reason: 'unparseable' }); return; }
+    if (!row || typeof row !== 'object' || (!row.sessionId && !row.name)) { result.skipped.push({ line: index + 1, reason: 'no session identity' }); return; }
+    result.rows.push(row);
+  });
+  return result;
+}
+
+// #125: the session set is the live roster plus every retired row that overlaps the
+// window [lower, upper) (either bound may be null: unbounded). A session in both counts
+// once, as its live row; the same session appended twice to the archive counts once.
+function mergeSessionRows(rosterRows, retiredRows, { lower = null, upper = null } = {}) {
+  const keyOf = (row) => row.sessionId || `${row.name}@${row.launchedAt || row.startedAt || ''}`;
+  const seen = new Set();
+  const merged = [];
+  for (const row of rosterRows) {
+    seen.add(keyOf(row));
+    merged.push({ ...row, source: 'live' });
+  }
+  for (const row of retiredRows) {
+    const key = keyOf(row);
+    if (seen.has(key)) continue;
+    const start = Date.parse(row.launchedAt || row.startedAt || '');
+    const end = Date.parse(row.retiredAt || '');
+    if (lower !== null && Number.isFinite(end) && end < lower) continue;
+    if (upper !== null && Number.isFinite(start) && start >= upper) continue;
+    seen.add(key);
+    merged.push({ ...row, source: 'retired' });
+  }
+  return merged;
 }
 
 // A true median at 0.5 (the mean of the two middle values on an even count); other
@@ -513,7 +603,7 @@ function sum(records, selector) {
   return records.reduce((total, record) => total + asNumber(selector(record)), 0);
 }
 
-function buildReport(records, excluded, { generatedAt, since, until, sessionMetrics = [], verificationErrors = [], budgets = null } = {}) {
+function buildReport(records, excluded, { generatedAt, since, until, sessionMetrics = [], verificationErrors = [], budgets = null, retiredLog = null } = {}) {
   const units = records || [];
   const controlPlaneSessions = (sessionMetrics || []).filter((session) => CONTROL_PLANE_ROLES.has(session.role));
   const observed = [
@@ -568,7 +658,7 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
       projectLeadFreshPerMergedPr: 'project-lead fresh tokens divided by merged pull requests (one per completed unit) in the window',
       icJobTokensMedian: 'median over completed units of the IC session job tokens (input + output; the rotation and budget definition)',
     },
-    sample: { completedUnits: units.length, excludedUnits: (excluded || []).length, excludedByReason: (excluded || []).reduce((acc, item) => { acc[item.reason] = (acc[item.reason] || 0) + 1; return acc; }, {}) },
+    sample: { sessionSources: sessionSources(sessionMetrics || []), completedUnits: units.length, excludedUnits: (excluded || []).length, excludedByReason: (excluded || []).reduce((acc, item) => { acc[item.reason] = (acc[item.reason] || 0) + 1; return acc; }, {}) },
     metrics,
     unitMetrics: unitMetrics(units, roles, budgets),
     ...modelBreakdown(units, sessionMetrics || []),
@@ -577,7 +667,17 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
     units,
     excluded: excluded || [],
     verificationErrors: verificationErrors || [],
+    retiredLog: retiredLog ? { path: retiredLog.path, rows: retiredLog.rows.length, missing: retiredLog.missing, skipped: retiredLog.skipped } : null,
   };
+}
+
+// #125: where each session in the window came from: the live roster, or the retired-row
+// archive (a session rotation replaced). `unrostered` appears only when a transcript was
+// read with no row at all (an empty roster reads every transcript).
+function sessionSources(sessions) {
+  const counts = { live: 0, retired: 0 };
+  for (const session of sessions) addCount(counts, session.source || 'live');
+  return counts;
 }
 
 function renderSummary(report) {
@@ -586,6 +686,8 @@ function renderSummary(report) {
     '',
     `period: ${report.period.since || 'unbounded'} → ${report.period.until || 'unbounded'}`,
     `completed units: ${report.sample.completedUnits}`,
+    `sessions: ${report.sample.sessionSources?.live || 0} live, ${report.sample.sessionSources?.retired || 0} retired (rotated out)${report.sample.sessionSources?.unrostered ? `, ${report.sample.sessionSources.unrostered} unrostered` : ''}`,
+    ...((report.retiredLog?.skipped || []).length ? [`retired log: ${report.retiredLog.skipped.length} torn line(s) skipped (${report.retiredLog.skipped.map((entry) => `line ${entry.line}: ${entry.reason}`).join('; ')})`] : []),
     `excluded units: ${report.sample.excludedUnits}`,
     '',
     `fresh tokens: ${report.metrics.freshTokens}`,
@@ -637,7 +739,7 @@ class MeasureCycleError extends Error {
   }
 }
 
-const MEASURE_CYCLE_FLAGS = ['transcripts', 'roster', 'out', 'since', 'until', 'now', 'no-verify-github'];
+const MEASURE_CYCLE_FLAGS = ['transcripts', 'roster', 'retired', 'out', 'since', 'until', 'now', 'no-verify-github'];
 
 function defaultTranscriptsDir() {
   const home = process.env.USERPROFILE || process.env.HOME || '';
@@ -713,7 +815,7 @@ function verifyPullRequests(records, tenantConfigs) {
   return { states, errors };
 }
 
-function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigsDir, since, until, generatedAt, verifyGithub = true, configPath } = {}) {
+function collectFromFiles({ transcriptsDir, rosterPath, retiredPath, outputDir, tenantConfigsDir, since, until, generatedAt, verifyGithub = true, configPath } = {}) {
   let budgets = null;
   try {
     const raw = fs.readFileSync(path.resolve(configPath || path.join(__dirname, '..', 'config', 'cycle.json')), 'utf8');
@@ -722,8 +824,18 @@ function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigs
   const resolvedRoster = path.resolve(rosterPath || path.join(__dirname, '..', 'state', 'roster.json'));
   const resolvedTranscripts = path.resolve(transcriptsDir || defaultTranscriptsDir());
   const resolvedOutput = path.resolve(outputDir || path.join(__dirname, '..', 'state', 'metrics'));
-  const roster = JSON.parse(fs.readFileSync(resolvedRoster, 'utf8'));
-  const rosterRows = Array.isArray(roster) ? roster : (roster && Array.isArray(roster.sessions) ? roster.sessions : []);
+  const liveRoster = JSON.parse(fs.readFileSync(resolvedRoster, 'utf8'));
+  const liveRows = Array.isArray(liveRoster) ? liveRoster : (liveRoster && Array.isArray(liveRoster.sessions) ? liveRoster.sessions : []);
+  // #125: rotation replaces a roster row, so the retired-row archive beside the roster
+  // (state/archive/roster-retired-full.jsonl) supplies the sessions it replaced. With
+  // --until the archive is read for the widest window reported (the requested --since or
+  // the trailing seven days, whichever reaches further back); without it, all of it.
+  const retiredLog = loadRetiredRows(path.resolve(retiredPath || path.join(path.dirname(resolvedRoster), 'archive', 'roster-retired-full.jsonl')));
+  const untilMs = until ? new Date(until).getTime() : NaN;
+  const sinceMs = since ? new Date(since).getTime() : NaN;
+  const readLower = Number.isFinite(untilMs) ? Math.min(untilMs - 7 * 24 * 60 * 60 * 1000, Number.isFinite(sinceMs) ? sinceMs : Infinity) : null;
+  const rosterRows = mergeSessionRows(liveRows, retiredLog.rows, { lower: readLower, upper: Number.isFinite(untilMs) ? untilMs : null });
+  const roster = { sessions: rosterRows };
   const wantedSessionIds = new Set(rosterRows.map((row) => row.sessionId).filter(Boolean));
   const allTranscriptFiles = listTranscriptFiles(resolvedTranscripts);
   let transcriptFiles = allTranscriptFiles.filter((file) => {
@@ -786,6 +898,7 @@ function collectFromFiles({ transcriptsDir, rosterPath, outputDir, tenantConfigs
     sessionMetrics: window.filteredSessions,
     verificationErrors,
     budgets,
+    retiredLog,
   });
   const dailyReport = buildReport(dailyWindow.filtered, dailyWindow.filteredExcluded, reportOptions(dailyWindow, dailyLower, true));
   const summaryReport = buildReport(summaryWindow.filtered, summaryWindow.filteredExcluded, reportOptions(summaryWindow, summaryLower, false));
@@ -813,6 +926,7 @@ function cli(argv) {
   return collectFromFiles({
     transcriptsDir: args.transcripts,
     rosterPath: args.roster,
+    retiredPath: args.retired,
     outputDir: args.out,
     since: args.since,
     until: args.until,
@@ -848,6 +962,8 @@ module.exports = {
   percentile,
   buildCycleRecords,
   buildReport,
+  loadRetiredRows,
+  mergeSessionRows,
   classifyTurns,
   cli,
   collectFromFiles,

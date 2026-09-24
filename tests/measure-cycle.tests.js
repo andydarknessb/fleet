@@ -560,3 +560,123 @@ test('#124: a synthetic assistant row does not name the session model', () => {
   ].map(line).join('\n'), 'fixture/s-1.jsonl');
   assert.equal(parsed.model, 'claude-sonnet-5');
 });
+
+// --- #125: the collector counts sessions that rotation retired ----------------------
+// Red-tell: the rotated-lead fixture counts only the live lead session before the change.
+function rotationFixture({ retiredLines, rosterSessions, transcripts, subagents = {} }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-retired-'));
+  const dir = path.join(root, 'transcripts', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: rosterSessions }));
+  fs.writeFileSync(path.join(root, 'archive', 'roster-retired-full.jsonl'), `${retiredLines.map((l) => (typeof l === 'string' ? l : JSON.stringify(l))).join('\n')}\n`);
+  for (const [sessionId, text] of Object.entries(transcripts)) fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), text);
+  for (const [sessionId, agents] of Object.entries(subagents)) {
+    const agentDir = path.join(dir, sessionId, 'subagents');
+    fs.mkdirSync(agentDir, { recursive: true });
+    for (const agent of agents) {
+      fs.writeFileSync(path.join(agentDir, `agent-${agent.id}.jsonl`), agent.text);
+      if (agent.meta) fs.writeFileSync(path.join(agentDir, `agent-${agent.id}.meta.json`), JSON.stringify(agent.meta));
+    }
+  }
+  return collectFromFiles({
+    transcriptsDir: path.join(root, 'transcripts'), rosterPath: path.join(root, 'roster.json'), outputDir: path.join(root, 'out'),
+    since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', generatedAt: '2026-09-02T00:00:00.000Z', verifyGithub: false,
+    configPath: path.join(root, 'no-config.json'),
+  });
+}
+const leadRow = (sessionId, extra = {}) => ({ name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', sessionId, ...extra });
+
+test('#125: a lead rotated mid-window counts both the retired and the live session in the control-plane total', () => {
+  const result = rotationFixture({
+    rosterSessions: [leadRow('pl-new', { status: 'active', launchedAt: '2026-09-01T12:00:00.000Z' })],
+    retiredLines: [leadRow('pl-old', { status: 'retired', launchedAt: '2026-08-31T12:00:00.000Z', retiredAt: '2026-09-01T11:59:00.000Z' })],
+    transcripts: {
+      'pl-old': sessionTranscript({ sessionId: 'pl-old', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T06:00:00.000Z', input: 1000, output: 0 }),
+      'pl-new': sessionTranscript({ sessionId: 'pl-new', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T13:00:00.000Z', input: 300, output: 0 }),
+    },
+  });
+  const daily = result.dailyReport;
+  assert.equal(daily.roles['project-lead'].sessions, 2);
+  assert.equal(daily.metrics.controlPlaneFreshTokens, 1300);
+  assert.deepEqual(daily.sample.sessionSources, { live: 1, retired: 1 });
+});
+
+test('#125: a retired session whose transcript has no role still counts under its roster role', () => {
+  const text = [assistant({ uuid: 'x', timestamp: '2026-09-01T06:00:00.000Z', content: [{ type: 'text', text: 'ok' }], usage: { input: 50, output: 0 } })].map((r) => line({ ...r, sessionId: 'd-old' })).join('\n');
+  const result = rotationFixture({
+    rosterSessions: [],
+    retiredLines: [{ name: 'dispatcher', role: 'dispatcher', sessionId: 'd-old', status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T07:00:00.000Z' }],
+    transcripts: { 'd-old': text },
+  });
+  assert.equal(result.dailyReport.roles.dispatcher.sessions, 1);
+  assert.equal(result.dailyReport.metrics.controlPlaneFreshTokens, 50);
+});
+
+test('#125: a session present in both the roster and the retired log counts once', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(7, 's-7'), leadRow('pl-1', { status: 'active' })],
+    retiredLines: [icRow(7, 's-7'), leadRow('pl-1', { status: 'retired', retiredAt: '2026-09-01T20:00:00.000Z' })],
+    transcripts: {
+      's-7': sessionTranscript({ sessionId: 's-7', name: 'ic-7', at: '2026-09-01T00:00:10.000Z', pr: 707 }),
+      'pl-1': sessionTranscript({ sessionId: 'pl-1', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T01:00:00.000Z' }),
+    },
+  });
+  const daily = result.dailyReport;
+  assert.equal(daily.sample.completedUnits, 1);
+  assert.equal(daily.sessions.length, 2);
+  assert.equal(daily.roles['project-lead'].sessions, 1);
+  assert.deepEqual(daily.sample.sessionSources, { live: 2, retired: 0 });
+});
+
+test('#125: an IC respawned for the same issue is one unit whose tokens are both sessions', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(8, 's-8b')],
+    retiredLines: [icRow(8, 's-8a', { retiredAt: '2026-09-01T00:00:30.000Z', retiredBecause: 'respawn' })],
+    transcripts: {
+      's-8a': sessionTranscript({ sessionId: 's-8a', name: 'ic-8', at: '2026-09-01T00:00:05.000Z', input: 400, output: 40 }),
+      's-8b': sessionTranscript({ sessionId: 's-8b', name: 'ic-8', at: '2026-09-01T00:00:40.000Z', input: 100, output: 10, pr: 808 }),
+    },
+  });
+  const daily = result.dailyReport;
+  assert.equal(daily.sample.completedUnits, 1);
+  assert.equal(daily.units[0].metrics.jobTokens, 550);
+  assert.equal(daily.units[0].sessions, 2);
+  assert.deepEqual(daily.units[0].pullRequests, [808]);
+});
+
+test('#125: the summary names the live and retired session counts', () => {
+  const result = rotationFixture({
+    rosterSessions: [leadRow('pl-new', { status: 'active' })],
+    retiredLines: [leadRow('pl-old', { status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T11:59:00.000Z' })],
+    transcripts: {
+      'pl-old': sessionTranscript({ sessionId: 'pl-old', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T06:00:00.000Z' }),
+      'pl-new': sessionTranscript({ sessionId: 'pl-new', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T13:00:00.000Z' }),
+    },
+  });
+  assert.match(fs.readFileSync(result.summaryArtifact, 'utf8'), /sessions: 1 live, 1 retired \(rotated out\)/);
+});
+
+test('#125: a torn line in the retired log is listed as skipped and the run completes', () => {
+  const result = rotationFixture({
+    rosterSessions: [leadRow('pl-new', { status: 'active' })],
+    retiredLines: [leadRow('pl-old', { status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T11:59:00.000Z' }), '{"name":"pl-endzone","role":"proj'],
+    transcripts: {
+      'pl-old': sessionTranscript({ sessionId: 'pl-old', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T06:00:00.000Z' }),
+      'pl-new': sessionTranscript({ sessionId: 'pl-new', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T13:00:00.000Z' }),
+    },
+  });
+  assert.equal(result.dailyReport.roles['project-lead'].sessions, 2);
+  assert.deepEqual(result.dailyReport.retiredLog.skipped, [{ line: 2, reason: 'unparseable' }]);
+  assert.match(fs.readFileSync(result.summaryArtifact, 'utf8'), /retired log: 1 torn line\(s\) skipped/);
+});
+
+test('#125: a retired row that ended before the window is not read', () => {
+  const result = rotationFixture({
+    rosterSessions: [],
+    retiredLines: [leadRow('pl-ancient', { status: 'retired', launchedAt: '2026-08-01T00:00:00.000Z', retiredAt: '2026-08-02T00:00:00.000Z' })],
+    transcripts: { 'pl-ancient': sessionTranscript({ sessionId: 'pl-ancient', name: 'pl-endzone', role: 'project-lead', at: '2026-08-01T06:00:00.000Z' }) },
+  });
+  assert.equal(result.dailyReport.sessions.length, 0);
+  assert.equal(result.report.sessions.length, 0);
+});
