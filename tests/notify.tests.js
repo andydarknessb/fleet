@@ -447,21 +447,18 @@ test('live: the merge-review wake pages once, at high priority, with the urgent 
   const merged = seedMerged(root, { issue: 61, prNumber: 161 });
   const send = sender();
   const result = runNotifier({ root, live: true, send, now: at() });
-  assert.deepEqual(result.handled.map((h) => [h.recordId, h.sequence, h.outcome, h.via]), [[merged.id, merged.sequence, 'sent', 'fallback']]);
+  assert.deepEqual(result.handled.map((h) => [h.recordId, h.sequence, h.outcome]), [[merged.id, merged.sequence, 'sent']]);
   assert.equal(send.calls.length, 1);
   const message = send.calls[0];
   assert.equal(message.priority, 'high');
   assert.equal(message.question, 'PR #161 merged without a recorded formal review');
   assert.equal(message.url, 'https://github.com/owner/repo/pull/161');
-  // Recorded through the fallback file: workState.notifyRecord refuses a
-  // `state-merged` event outright (NOT_A_DECISION_EVENT), record state and
-  // activity notwithstanding, so this source's delivery record is never on
-  // the Work record itself.
+  // fleet#99: recorded through the work-state door like any decision, never
+  // in the old state/notify/merge-review-fallback.jsonl.
   const record = workState.getRecord({ root, id: merged.id });
-  assert.equal(record.notifications, undefined);
-  const fallbackLines = fs.readFileSync(path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  assert.equal(fallbackLines.length, 1);
-  assert.equal(fallbackLines[0].status, 'sent');
+  assert.equal(record.notifications[String(merged.sequence)].status, 'sent');
+  assert.deepEqual(workState.readEvents(root).filter((event) => event.type.startsWith('notification-')).map((event) => [event.type, event.changes.decisionType]), [['notification-attempted', 'state-merged'], ['notification-sent', 'state-merged']]);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl')), false);
   // Never repeats: a second run finds nothing pending.
   const again = runNotifier({ root, live: true, send, now: at() });
   assert.deepEqual(again.handled, []);
@@ -494,7 +491,7 @@ test('an event older than the 48h window is never paged; going live does not pag
   assert.equal(send.calls.length, 0);
 });
 
-test('a merge-review record that has already retired falls back to its own file, and that fallback dedupes too', () => {
+test('a merge-review record that has already retired still records through the door, and dedupes there', () => {
   const root = rootDir();
   const merged = seedMerged(root, { issue: 64, prNumber: 164 });
   // The IC's roster row is gone by the time a delayed sweep runs: merged ->
@@ -509,15 +506,15 @@ test('a merge-review record that has already retired falls back to its own file,
 
   const send = sender();
   const result = runNotifier({ root, live: true, send, now: at() });
-  assert.deepEqual(result.handled.map((h) => [h.recordId, h.outcome, h.via]), [[merged.id, 'sent', 'fallback']]);
+  assert.deepEqual(result.handled.map((h) => [h.recordId, h.outcome]), [[merged.id, 'sent']]);
   assert.equal(send.calls.length, 1);
   assert.equal(send.calls[0].priority, 'high');
 
-  const fallbackFile = path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl');
-  const fallbackLines = fs.readFileSync(fallbackFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  assert.equal(fallbackLines.length, 1);
-  assert.equal(fallbackLines[0].status, 'sent');
-  // Never repeats: the fallback file's own dedupe holds on a second sweep.
+  const archived = workState.getRecord({ root, id: merged.id });
+  assert.equal(archived.state, 'retired');
+  assert.equal(archived.notifications[String(merged.sequence)].status, 'sent');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl')), false);
+  // Never repeats: the archived record's own entry holds on a second sweep.
   const again = runNotifier({ root, live: true, send, now: at() });
   assert.deepEqual(again.handled, []);
   assert.equal(send.calls.length, 1);

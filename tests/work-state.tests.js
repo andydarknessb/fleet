@@ -732,6 +732,67 @@ test('a claim needs a decision event whose state the record still occupies', () 
   assert.equal(claimed.record.notifications['5'], undefined);
 });
 
+// fleet#99: the merge-without-review page (ADR 0012, high priority) rides the
+// `state-merged` event pr-watch writes, so it records through this door like a
+// decision, not in a notifier-side fallback file. Unlike a decision it is a fact
+// that never resolves: it stays claimable after the record moves on, even once
+// retired and archived.
+function mergeUnreviewed(root) {
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'm-1', 'ack', '2026-09-01T05:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 'm-2', 'PR #77', '2026-09-01T05:00:02.000Z');
+  move(root, 'endzone:issue-42', 3, 'ci-wait', 'm-3', 'CI', '2026-09-01T05:00:03.000Z');
+  move(root, 'endzone:issue-42', 4, 'review', 'm-4', 'settled', '2026-09-01T05:00:04.000Z');
+  return move(root, 'endzone:issue-42', 5, 'merged', 'm-5', 'observed merged at 2026-09-01T05:00:05.000Z (gh pr view 77); merged without a recorded formal review (ticket 05 lower bound)', '2026-09-01T05:00:05.000Z');
+}
+
+test('fleet#99: a merged-without-review event is claimed and settled through the door', () => {
+  const root = rootDir();
+  const merged = mergeUnreviewed(root);
+  assert.equal(merged.eventSequence, 6);
+  const claimed = notify(root, 'claim', merged.revision, 6);
+  assert.equal(claimed.record.notifications['6'].status, 'claimed');
+  const sent = notify(root, 'sent', claimed.revision, 6, { detail: 'pushover delivered' });
+  assert.equal(sent.record.notifications['6'].status, 'sent');
+  assert.throws(() => notify(root, 'claim', sent.revision, 6), { code: 'NOTIFICATION_ALREADY_SENT' });
+  const events = readEvents(root).filter((event) => event.type.startsWith('notification-'));
+  assert.deepEqual(events.map((event) => [event.type, event.changes.decisionType]), [['notification-attempted', 'state-merged'], ['notification-sent', 'state-merged']]);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'merge-review-fallback.jsonl')), false);
+});
+
+test('fleet#99: a plain merged event (a reviewed merge) is still not notifiable', () => {
+  const root = rootDir();
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'p-1', 'ack', '2026-09-01T05:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 'p-2', 'PR #77', '2026-09-01T05:00:02.000Z');
+  move(root, 'endzone:issue-42', 3, 'ci-wait', 'p-3', 'CI', '2026-09-01T05:00:03.000Z');
+  move(root, 'endzone:issue-42', 4, 'review', 'p-4', 'settled', '2026-09-01T05:00:04.000Z');
+  const merged = move(root, 'endzone:issue-42', 5, 'merged', 'p-5', 'observed merged at 2026-09-01T05:00:05.000Z (gh pr view 77)', '2026-09-01T05:00:05.000Z');
+  assert.throws(() => notify(root, 'claim', merged.revision, 6), { code: 'NOT_A_DECISION_EVENT' });
+});
+
+test('fleet#99: the merge-review fact stays claimable after the record retires and is archived, and the ledger still verifies', () => {
+  const root = rootDir();
+  const merged = mergeUnreviewed(root);
+  const retiring = move(root, 'endzone:issue-42', merged.revision, 'retiring', 'm-6', 'roster row gone', '2026-09-01T05:00:06.000Z');
+  move(root, 'endzone:issue-42', retiring.revision, 'retired', 'm-7', 'retired', '2026-09-01T05:00:07.000Z');
+  const archived = getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(archived.state, 'retired');
+  const later = (second) => ({ now: `2026-09-01T06:00:${String(second).padStart(2, '0')}.000Z` });
+  const claimed = notify(root, 'claim', archived.revision, 6, later(10));
+  assert.equal(claimed.record.notifications['6'].status, 'claimed');
+  const failed = notify(root, 'failed', claimed.revision, 6, { detail: 'page channel unconfigured', ...later(11) });
+  const authorized = notify(root, 'authorize-retry', failed.revision, 6, { actor: 'cory', evidence: 'pushover wired up', ...later(12) });
+  const again = notify(root, 'claim', authorized.revision, 6, later(13));
+  assert.equal(again.record.notifications['6'].attempt, 2);
+  const stored = getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(stored.state, 'retired');
+  assert.equal(stored.notifications['6'].status, 'claimed');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-42'], undefined);
+  const verified = require('../bin/verify-events').verifyLedger({ root });
+  assert.deepEqual(verified.records.flatMap((record) => record.findings), []);
+});
+
 test('twenty concurrent claims for one decision event produce exactly one claim', () => {
   const root = rootDir();
   const escalated = escalate(root);

@@ -32,6 +32,14 @@ const TRANSITIONS = Object.freeze({
 const DECISION_EVENT_TYPES = Object.freeze(['state-escalated', 'state-hold']);
 const DECISION_STATES = Object.freeze(DECISION_EVENT_TYPES.map((type) => type.slice('state-'.length)));
 const NOTIFICATION_PHASES = Object.freeze(['claim', 'sent', 'failed', 'authorize-retry']);
+// fleet#99 (ADR 0012): pr-watch.js appends this sentence to the `state-merged`
+// evidence when a PR merged with no formal review recorded. That event is
+// notifiable too, but it is a fact rather than a decision: it never resolves, so
+// it stays claimable after the record leaves `merged`, archived included.
+const MERGE_REVIEW_SENTENCE = 'merged without a recorded formal review';
+function isMergeReviewEvent(event) {
+  return event?.type === 'state-merged' && String(event.evidence || '').includes(MERGE_REVIEW_SENTENCE);
+}
 
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
@@ -1117,7 +1125,10 @@ function notifyRecord(options = {}) {
   if (!Number.isInteger(decisionSequence) || decisionSequence <= 0) throw new WorkStateError('MISSING_DECISION_SEQUENCE', 'decisionSequence is required');
   return withLock(root, (p) => {
     const active = activeState(p);
-    const record = active.records[String(options.id)];
+    // fleet#99: a retired (archived) record is read too, but only a merge-review
+    // event may be notified on it; a decision event there stays NOT_FOUND.
+    const archived = active.records[String(options.id)] ? null : readJson(archiveFile(p, String(options.id)))?.record || null;
+    const record = active.records[String(options.id)] || archived;
     if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
     const replay = replayIfKnown(record, key);
     if (replay) return replay;
@@ -1126,16 +1137,18 @@ function notifyRecord(options = {}) {
       throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     }
     const decision = eventLines(p).find((event) => event.recordId === record.id && Number(event.sequence) === decisionSequence);
-    if (!decision || !DECISION_EVENT_TYPES.includes(decision.type)) {
+    const mergeReview = isMergeReviewEvent(decision);
+    if (!decision || (!DECISION_EVENT_TYPES.includes(decision.type) && !mergeReview)) {
       throw new WorkStateError('NOT_A_DECISION_EVENT', `event ${decisionSequence} on ${record.id} is not a decision event`);
     }
-    const decisionState = decision.type.slice('state-'.length);
+    if (archived && !mergeReview) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    const decisionState = mergeReview ? null : decision.type.slice('state-'.length);
     const current = record.notifications?.[String(decisionSequence)] || null;
     const now = isoNow(options.now);
     let entry;
     let type;
     if (phase === 'claim') {
-      if (record.state !== decisionState) throw new WorkStateError('DECISION_RESOLVED', `record is ${record.state}; decision ${decisionSequence} (${decisionState}) no longer stands`);
+      if (decisionState && record.state !== decisionState) throw new WorkStateError('DECISION_RESOLVED', `record is ${record.state}; decision ${decisionSequence} (${decisionState}) no longer stands`);
       if (current?.status === 'sent') throw new WorkStateError('NOTIFICATION_ALREADY_SENT', `decision ${decisionSequence} was already notified`);
       if (current?.status === 'claimed') throw new WorkStateError('NOTIFICATION_ALREADY_CLAIMED', `decision ${decisionSequence} has a notification in flight (claimed ${current.at})`);
       if (current?.status === 'failed' && !current.retryAuthorized) throw new WorkStateError('NOTIFICATION_RETRY_REQUIRES_AUTHORIZATION', `decision ${decisionSequence} failed delivery; a retry needs authorize-retry`);
@@ -1165,7 +1178,10 @@ function notifyRecord(options = {}) {
       type, actor: options.actor, at: now, idempotencyKey: key, evidence: options.evidence,
       changes: { decisionSequence, decisionType: decision.type, status: entry.status, attempt: entry.attempt, channel: entry.channel, detail: entry.detail || null, retryAuthorized: entry.retryAuthorized },
     });
-    commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
+    // An archived record is rewritten in place (afterRecord null keeps it out of
+    // active.json; archiveRecord re-indexes its event files after the append).
+    if (archived) commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, event, archiveRecord: next, killPoint: options.killPoint });
+    else commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: next, event, killPoint: options.killPoint });
     return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: next };
   });
 }
@@ -1465,6 +1481,8 @@ function cli(argv) {
 
 module.exports = {
   DECISION_EVENT_TYPES,
+  isMergeReviewEvent,
+  MERGE_REVIEW_SENTENCE,
   DECISION_STATES,
   FLAGS,
   NOTIFICATION_PHASES,
