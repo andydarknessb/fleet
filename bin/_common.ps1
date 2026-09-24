@@ -285,8 +285,8 @@ function Invoke-BoundedExe {
     }
   } catch { $result.startError = "$($_.Exception.Message)" }
   finally {
-    try { $result.stdout = Get-Content $childOut -Raw -ErrorAction SilentlyContinue } catch {}
-    try { $result.stderr = Get-Content $childErr -Raw -ErrorAction SilentlyContinue } catch {}
+    try { $result.stdout = Get-Content $childOut -Raw -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
+    try { $result.stderr = Get-Content $childErr -Raw -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}
     # 2026-09-18 QA (review 2, NIT): on the timeout path the just-killed process
     # can still hold its redirect handles for a moment; one short-delay retry,
     # then give up silently (never fail the tick over two leaked temp files).

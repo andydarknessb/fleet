@@ -276,7 +276,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $verifyPathFiles = @(Get-ChildItem $testRoot -Filter 'verify-report-path-*.txt')
   $verifyPaths = @($verifyPathFiles | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() } | Where-Object { $_ })
   Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheck8b
-  Remove-Item "$testRoot\bin\sentinel-check-real.ps1"; $verifyPathFiles | Remove-Item
+  Remove-Item "$testRoot\bin\sentinel-check-real.ps1"; $verifyPathFiles | Remove-Item; Remove-Item "$testRoot\verify-*.out", "$testRoot\verify-*.err"
   Assert-True ($verifyPaths.Count -eq 4) "each -Verify tick must run the check once (got $($verifyPaths.Count))"
   Assert-True (@($verifyPaths | Sort-Object -Unique).Count -eq 4) "each -Verify tick must hand the check its own report path (got: $($verifyPaths -join ', '))"
   foreach ($vp in $verifyPaths) { Assert-True (-not (Test-Path $vp)) "a -Verify tick must remove its report after reading it ($vp)" }

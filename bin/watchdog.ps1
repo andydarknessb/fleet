@@ -805,6 +805,7 @@ try {
         try { $healRaw = & "$PSScriptRoot\sentinel-check.ps1" -Apply -Actor watchdog -HealRespawn $healName -ReportPath $healRespawnReportPath 2>&1 | Out-String } catch {}
         $healOut = $null
         if (Test-Path $healRespawnReportPath) { try { $healOut = Read-Json $healRespawnReportPath } catch {} }
+        if ($healOut -and $healOut.PSObject.Properties['timeouts']) { foreach ($healTimeout in @($healOut.timeouts)) { if ($healTimeout) { [void]$script:BoundedTimeouts.Add($healTimeout) } } }   # fleet #101 review: the heal-respawn check's named timeouts reach the shadow line too
         $healOk = [bool]($healOut -and @($healOut.respawned | Where-Object { "$($_.name)" -eq $healName }).Count -gt 0)
         $healOutcome = if ($healOut) { $healOut } else { Get-OneLine $healRaw 200 }
         $healActuallyRan = $true   # the call was issued regardless of outcome (a no-op still counts, ticket 85)
