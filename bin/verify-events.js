@@ -100,7 +100,9 @@ function sameCommit(a, b) {
 }
 
 function mergedHeadOf(record) {
-  return record?.github?.observation?.headSha || record?.github?.headSha || null;
+  // #114 review: the head reconciled at the merge itself (github.mergedHeadSha) is
+  // authoritative; the last pr-watch observation is the fallback for older records.
+  return record?.github?.mergedHeadSha || record?.github?.observation?.headSha || record?.github?.headSha || null;
 }
 
 // Acknowledged history (config/review-exceptions.json): `{recordId, head, ruling}`

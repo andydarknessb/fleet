@@ -2123,3 +2123,17 @@ test('#118: a finding still open in the chain is not a repeat; repeats belongs t
     (error) => error.code === 'INVALID_FINDING' && /formal/.test(error.message),
   );
 });
+
+test('#118 review: a repeats finding blocks the review status whatever its severity', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const { revision, second } = settledChain(root);
+  const { calls, gh } = stubGh();
+  recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'ccc3333', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] }, priorArtifact: second.artifact, gh,
+    findings: [{ file: 'b.js', claim: 'phantom again', severity: 'minor', category: 'correctness', repeats: 'formal-001-f2' }],
+    idempotencyKey: 'rb118', now: '2026-09-24T04:50:00.000Z',
+  });
+  assert.equal(statusField(calls[0], 'state'), 'failure', 'a record escalated for a Ruling must not carry a green status');
+});

@@ -124,7 +124,7 @@ test('#119: closing keywords: Closes #12 for issue 11 is a defect; one Closes #1
   assert.equal(closingDefects('Closes #12', 11).length, 1);
   assert.match(closingDefects('Closes #12', 11)[0].detail, /closes #12, not #11/);
   assert.deepEqual(closingDefects('Fixes #11', 11), []);
-  assert.deepEqual(closingDefects('fixes: owner/repo#11', 11), []);
+  assert.deepEqual(closingDefects('fixes: owner/repo#11', 11, 'owner/repo'), []);
   assert.deepEqual(closingDefects('Refs #11\nLeaves the migration for Cory.', 11), []);
   assert.equal(closingDefects('Closes #11\nResolves #11', 11).length, 1);
   assert.equal(closingDefects('Closes #11 and closes #13', 11).length, 1);
@@ -157,4 +157,26 @@ test('#119: the tenant lintCommand runs when set, and a nonzero exit is a defect
   assert.match(failing.defects[0].detail, /exited 1: a\.js: 1 problem/);
   const none = checkPullRequest({ repo, base, issue: 11, bodyText: CLEAN_BODY, issueBody: ISSUE, tenant: {}, lintRunner: () => { throw new Error('must not run'); } });
   assert.equal(none.ok, true);
+});
+
+// --- #119 review follow-ups -------------------------------------------------------
+
+test('#119 review: a bare Refs line explains nothing; a closing keyword into another repo is not this issue', () => {
+  assert.equal(closingDefects('Refs #11', 11).length, 1, 'a bare Refs line is a defect');
+  assert.deepEqual(closingDefects('Refs #11: the migration stays with Cory', 11), []);
+  assert.equal(closingDefects('Closes other/repo#11', 11, 'owner/Endzone').length, 1);
+  assert.match(closingDefects('Closes other/repo#11', 11, 'owner/Endzone')[0].detail, /another repository/);
+  assert.deepEqual(closingDefects('Closes owner/Endzone#11', 11, 'owner/Endzone'), []);
+});
+
+test('#119 review: a filler cell answers nothing; an issue with no checkboxes has no table to check', () => {
+  const filler = ['| Criterion | Evidence |', '|---|---|', '| the | x |', '| ok | y |'].join('\n');
+  assert.equal(criteriaDefects(filler, ISSUE, 11).filter((d) => /no row for criterion/.test(d.detail)).length, 2);
+  assert.deepEqual(criteriaDefects('Closes #11', '## What\nProse only, no checkboxes.', 11), []);
+});
+
+test('#119 review: a removed common-word local, or a name code still uses, is not a stale reference', () => {
+  const diff = ['--- a/x.js', '+++ b/x.js', '-const result = 1;', '-function keepMe() {', '+function other() {'].join('\n');
+  const grep = (name) => (name === 'keepMe' ? 'src/y.js:4:  keepMe(); // keepMe is still called here\nREADME.md:2:keepMe docs' : 'README.md:9:the result is fine');
+  assert.deepEqual(checkPullRequest({ repo: '.', base: 'x', issue: 11, bodyText: CLEAN_BODY, issueBody: ISSUE, diffText: diff, grep }).defects, []);
 });

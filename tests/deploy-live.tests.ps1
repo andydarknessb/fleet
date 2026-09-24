@@ -44,7 +44,7 @@ function New-Fixture {
 }
 
 function Set-Check { param($F, [string]$Status, [string]$Conclusion, [int]$Id = 1)
-  $run = if ($Status) { '{"id":' + $Id + ',"name":"fleet-ci","status":"' + $Status + '","conclusion":' + $(if ($Conclusion) { '"' + $Conclusion + '"' } else { 'null' }) + '}' } else { '' }
+  $run = if ($Status) { '{"id":' + $Id + ',"name":"fleet-ci","app":{"slug":"github-actions"},"status":"' + $Status + '","conclusion":' + $(if ($Conclusion) { '"' + $Conclusion + '"' } else { 'null' }) + '}' } else { '' }
   Write-Utf8 "$($F.root)\check-runs.json" ('{"total_count":' + $(if ($run) { 1 } else { 0 }) + ',"check_runs":[' + $run + ']}')
 }
 
@@ -77,8 +77,13 @@ try {
 
   # A re-run that went green supersedes the earlier failure (the newest run decides).
   $f = New-Fixture 'rerun'
-  Write-Utf8 "$($f.root)\check-runs.json" '{"total_count":2,"check_runs":[{"id":7,"name":"fleet-ci","status":"completed","conclusion":"success"},{"id":3,"name":"fleet-ci","status":"completed","conclusion":"failure"}]}'
+  Write-Utf8 "$($f.root)\check-runs.json" '{"total_count":2,"check_runs":[{"id":7,"name":"fleet-ci","app":{"slug":"github-actions"},"status":"completed","conclusion":"success"},{"id":3,"name":"fleet-ci","app":{"slug":"github-actions"},"status":"completed","conclusion":"failure"}]}'
   Assert-True ((Deploy $f).outcome -eq 'advanced') 'the newest run decides'
+
+  # A green run from another app is not fleet-ci.
+  $f = New-Fixture 'spoof'
+  Write-Utf8 "$($f.root)\check-runs.json" '{"total_count":1,"check_runs":[{"id":9,"name":"fleet-ci","app":{"slug":"some-app"},"status":"completed","conclusion":"success"}]}'
+  Assert-True ((Deploy $f).outcome -eq 'master-pending') 'a check run from another app never advances live'
 
   # deploy-hold freezes even a green master.
   $f = New-Fixture 'held'

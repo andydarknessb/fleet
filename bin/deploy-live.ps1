@@ -78,8 +78,9 @@ $ghExit = $LASTEXITCODE
 $checkText = (@($checkJson | ForEach-Object { "$_" }) -join "`n").Trim()
 if ($ghExit -ne 0) { Finish 'refused:ci-unreadable' "gh api exited ${ghExit}: $checkText" }
 $runs = $null
-try { $runs = @(($checkText | ConvertFrom-Json).check_runs | Where-Object { $_.name -eq $CheckName }) } catch { Finish 'refused:ci-unreadable' "check-runs is not JSON: $checkText" }
+try { $runs = @(($checkText | ConvertFrom-Json).check_runs | Where-Object { $_.name -eq $CheckName -and "$($_.app.slug)" -eq 'github-actions' }) } catch { Finish 'refused:ci-unreadable' "check-runs is not JSON: $checkText" }
 if ($runs.Count -eq 0) { Finish 'master-pending' "no $CheckName check run on $head yet" }
+# Only the Actions app's run counts: any app can post a check run named fleet-ci.
 # The newest run decides (a re-run supersedes a failure).
 $latest = $runs | Sort-Object { [long]$_.id } | Select-Object -Last 1
 if ("$($latest.status)" -ne 'completed') { Finish 'master-pending' "$CheckName is $($latest.status) on $head" }

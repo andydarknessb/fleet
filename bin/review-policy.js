@@ -395,6 +395,10 @@ const NON_BLOCKING_SEVERITIES = Object.freeze(['minor', 'nit', 'low', 'info', 't
 const STATUS_DESCRIPTION_LIMIT = 140; // GitHub's cap on a commit status description
 
 function isBlockingFinding(finding) {
+  // #118 review: a finding raised again after it was settled escalates the record
+  // for a Ruling, so it blocks whatever its severity: a green status would let
+  // GitHub merge the PR the Ruling is about.
+  if (finding?.repeats) return true;
   return !NON_BLOCKING_SEVERITIES.includes(String(finding?.severity || '').trim().toLowerCase());
 }
 

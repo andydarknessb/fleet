@@ -320,3 +320,13 @@ test('verify-events: a refused invocation exits 64 (EX_USAGE), never the FAIL ve
   assert.equal(typo.stdout, '');
   assert.equal(JSON.parse(typo.stderr).code, 'USAGE');
 });
+
+test('#114 review: the head reconciled at the merge wins over an older observation', () => {
+  const root = rootDir();
+  const id = unit(root, 40, ['pr-open', 'review', 'merged'], { formalAt: HEAD, mergedHead: HEAD });
+  const file = path.join(root, 'state', 'work', 'active.json');
+  const active = JSON.parse(fs.readFileSync(file, 'utf8'));
+  active.records[id].github.mergedHeadSha = 'd'.repeat(40);
+  fs.writeFileSync(file, JSON.stringify(active));
+  assert.equal(verifyLedger({ root }).findingsByKind['merged-without-review'], 1, 'the review was of an older head than the one that merged');
+});

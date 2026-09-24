@@ -1049,3 +1049,11 @@ test('#118: a replay of an accepted second send-back still replays; hold is unaf
   const held = transitionRecord({ root, id: 'endzone:issue-42', to: 'hold', expectedRevision: revision, idempotencyKey: 'hold', actor: 'pl', evidence: 'wake:decision-needed; carve-out', now: '2026-09-24T00:00:00.000Z' });
   assert.equal(held.record.state, 'hold');
 });
+
+test('#114 review: a merge reconciled with its head records github.mergedHeadSha', () => {
+  const root = rootDir();
+  let revision = recordInReview(root);
+  const merged = transitionRecord({ root, id: 'endzone:issue-42', to: 'merged', expectedRevision: revision, idempotencyKey: 'merge', actor: 'pr-watch', evidence: 'observed merged',
+    reconciledObservation: { state: 'MERGED', mergedAt: '2026-09-24T01:00:00Z', headRefOid: 'e'.repeat(40), evidence: 'gh pr view 77' }, now: '2026-09-24T01:00:00.000Z' });
+  assert.equal(merged.record.github.mergedHeadSha, 'e'.repeat(40));
+});

@@ -864,7 +864,7 @@ function transitionRecord(options = {}) {
       idempotency: { ...record.idempotency },
     };
     if (prNumber) next.github = { ...record.github, prNumber };
-    if (githubObservation) next.github = { ...next.github, lastObservedState: githubObservation.state, mergedAt: githubObservation.mergedAt, evidence: githubObservation.evidence || options.evidence };
+    if (githubObservation) next.github = { ...next.github, lastObservedState: githubObservation.state, mergedAt: githubObservation.mergedAt, evidence: githubObservation.evidence || options.evidence, ...(githubObservation.headRefOid ? { mergedHeadSha: String(githubObservation.headRefOid) } : {}) };
     if (to === 'escalated') {
       next.prior_state = record.state;
       next.decisionEvidence = options.evidence;

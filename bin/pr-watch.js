@@ -183,7 +183,7 @@ function mergedChain(hops, viewPr, prNumber, evidencePrefix, { formalReviewMissi
     kind: 'transition', to,
     evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})${to === 'merged' && formalReviewMissing ? '; merged without a recorded formal review (ticket 05 lower bound)' : ''}`,
     wake: to === 'merged' && formalReviewMissing ? 'decision-needed' : null,
-    reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, evidence: `gh pr view ${prNumber}` } : null,
+    reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, headRefOid: viewPr.headRefOid || undefined, evidence: `gh pr view ${prNumber}` } : null,
     observe: index === hops.length - 1 ? { pr: viewPr, evaluation: evaluateChecks({ ciGates: [], watchedChecks: [], ignoredChecks: [] }, viewPr.statusCheckRollup), closing: null } : null,
   }));
 }

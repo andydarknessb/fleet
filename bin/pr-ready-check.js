@@ -109,6 +109,13 @@ function commentPart(line) {
   return '';
 }
 
+// Only names that read as identifiers, never as English: an inner capital
+// (fooBar, FleetPage), an underscore, or a hyphenated Verb-Noun. A removed
+// `const result =` must not flag every comment that says "result" (#119 review).
+function looksLikeIdentifier(name) {
+  return /^.+[A-Z]/.test(name) && /[a-z]/.test(name) || /_/.test(name) || /^[A-Z][a-z]+-[A-Z]/.test(name);
+}
+
 function staleReferences({ repo, base, head, diffText, grep }) {
   const names = removedIdentifiers(diffText !== undefined ? diffText : git(repo, ['diff', `${base}...${head}`]));
   const defects = [];
@@ -120,19 +127,25 @@ function staleReferences({ repo, base, head, diffText, grep }) {
       throw error;
     }
   });
-  for (const name of names) {
+  for (const name of names.filter(looksLikeIdentifier)) {
     const word = new RegExp(`(^|[^\\w$])${escapeRegExp(name)}([^\\w$]|$)`);
     const hits = new Map();
+    let stillInCode = false;
     for (const raw of String(search(name) || '').split(/\r?\n/).filter(Boolean)) {
       // `<head>:<path>:<line>:<text>`; the head prefix is absent under a stubbed grep.
       const match = /^(?:[^:]+:)?(.+?):(\d+):(.*)$/.exec(raw.startsWith(`${head}:`) ? raw.slice(head.length + 1) : raw);
       if (!match) continue;
       const [, file, lineNumber, text] = match;
       const isDoc = DOC_EXTENSIONS.includes(path.extname(file).toLowerCase());
-      if (!(isDoc ? word.test(text) : word.test(commentPart(text)))) continue;
+      const comment = isDoc ? '' : commentPart(text);
+      // A name code at the head still uses is not gone: another declaration or
+      // a same-named local elsewhere keeps a comment about it honest.
+      if (!isDoc && word.test(comment ? text.slice(0, text.length - comment.length) : text)) { stillInCode = true; break; }
+      if (!(isDoc ? word.test(text) : word.test(comment))) continue;
       if (!hits.has(file)) hits.set(file, []);
       hits.get(file).push(Number(lineNumber));
     }
+    if (stillInCode) continue;
     for (const [file, lines] of hits) {
       defects.push({ kind: 'stale-reference', detail: `${file}:${lines.join(',')} still names \`${name}\`, which this diff removes or renames; update the ${DOC_EXTENSIONS.includes(path.extname(file).toLowerCase()) ? 'doc' : 'comment'}` });
     }
@@ -144,20 +157,31 @@ function staleReferences({ repo, base, head, diffText, grep }) {
 
 const CLOSING = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+((?:[\w.-]+\/[\w.-]+)?#(\d+))/gi;
 
-function closingDefects(body, issue) {
+function closingDefects(body, issue, repoSlug = null) {
   const defects = [];
   const keywords = [];
   CLOSING.lastIndex = 0;
-  for (let match = CLOSING.exec(body); match; match = CLOSING.exec(body)) keywords.push({ text: match[0].trim(), issue: Number(match[2]) });
-  for (const keyword of keywords.filter((entry) => entry.issue !== Number(issue))) {
-    defects.push({ kind: 'closing-keyword', detail: `"${keyword.text}" closes #${keyword.issue}, not #${issue}; a PR closes only its own issue` });
+  for (let match = CLOSING.exec(body); match; match = CLOSING.exec(body)) {
+    const prefix = match[1].slice(0, match[1].indexOf('#'));
+    // `owner/repo#n` closes an issue in that repo: only the tenant's own slug is this issue.
+    const sameRepo = !prefix || (repoSlug && prefix.toLowerCase() === `${String(repoSlug).toLowerCase()}`);
+    keywords.push({ text: match[0].trim(), issue: Number(match[2]), sameRepo });
   }
-  const own = keywords.filter((entry) => entry.issue === Number(issue));
+  for (const keyword of keywords.filter((entry) => !entry.sameRepo || entry.issue !== Number(issue))) {
+    defects.push({ kind: 'closing-keyword', detail: keyword.sameRepo
+      ? `"${keyword.text}" closes #${keyword.issue}, not #${issue}; a PR closes only its own issue`
+      : `"${keyword.text}" closes an issue in another repository; a PR closes only its own issue` });
+  }
+  const own = keywords.filter((entry) => entry.sameRepo && entry.issue === Number(issue));
   if (own.length > 1) defects.push({ kind: 'closing-keyword', detail: `the body closes #${issue} ${own.length} times; use exactly one closing keyword` });
   if (!keywords.length) {
-    const refs = new RegExp(`^\\s*(?:[-*]\\s*)?Refs?\\s+#${Number(issue)}\\b`, 'im');
-    if (!refs.test(body)) {
-      defects.push({ kind: 'closing-keyword', detail: `no closing keyword: write "Closes #${issue}" when every criterion is met, or a "Refs #${issue}" line naming what remains (ic.md step 6)` });
+    // `Refs #n` plus the explanation: words after it on the line, or the next line.
+    const lines = String(body || '').split(/\r?\n/);
+    const at = lines.findIndex((line) => new RegExp(`^\\s*(?:[-*]\\s*)?Refs?\\s+#${Number(issue)}\\b`, 'i').test(line));
+    const rest = at === -1 ? '' : lines[at].replace(new RegExp(`^.*?#${Number(issue)}\\b`), '');
+    const explained = at !== -1 && (/[A-Za-z]{3,}.*\s.*[A-Za-z]{3,}/.test(rest) || (lines.slice(at + 1).find((line) => line.trim()) || '').trim().length > 0);
+    if (!explained) {
+      defects.push({ kind: 'closing-keyword', detail: `no closing keyword: write "Closes #${issue}" when every criterion is met, or a "Refs #${issue}" line followed by what remains and why (ic.md step 6)` });
     }
   }
   return defects;
@@ -202,6 +226,9 @@ function rowAnswers(row, criterion, index) {
   const cell = normalize(row.criterion);
   if (!cell) return false;
   if (new RegExp(`^(?:ac\\s*)?${index + 1}$`).test(cell)) return true;
+  // Text matching needs at least three words, so a filler cell ("the", "ok")
+  // never answers a criterion (#119 review).
+  if (cell.split(' ').length < 3) return false;
   const wanted = normalize(criterion).split(' ').slice(0, 6).join(' ');
   const given = cell.split(' ').slice(0, 6).join(' ');
   return wanted.startsWith(given) || given.startsWith(wanted) || normalize(criterion).includes(cell);
@@ -209,6 +236,9 @@ function rowAnswers(row, criterion, index) {
 
 function criteriaDefects(body, issueBody, issue) {
   const criteria = acceptanceCriteria(issueBody);
+  // An issue with no checkboxes (a fleet ticket written in prose) has nothing to
+  // count rows against, so the table cannot be checked mechanically (#119 review).
+  if (!criteria.length) return [];
   const rows = tableRows(body);
   if (rows === null) {
     return [{ kind: 'criteria-table', detail: `no "| Criterion | Evidence |" table in the body; add one row per acceptance criterion of #${issue} (${criteria.length})` }];
@@ -274,7 +304,7 @@ function checkPullRequest(options = {}) {
   const tenant = options.tenant || null;
   const defects = [
     ...staleReferences({ repo, base, head, diffText: options.diffText, grep: options.grep }),
-    ...closingDefects(bodyText, issue),
+    ...closingDefects(bodyText, issue, tenant?.github || null),
     ...criteriaDefects(bodyText, options.issueBody !== undefined ? options.issueBody : issueBodyOf({ issue, tenant, repo, gh: options.gh }), issue),
     ...lintDefects({ repo, command: tenant?.lintCommand, run: options.lintRunner }),
   ];
