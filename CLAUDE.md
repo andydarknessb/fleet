@@ -6,7 +6,7 @@ Operating guide: `README.md`. Vocabulary: `CONTEXT.md`. Decisions: `docs/adr/`.
 
 ### Issue tracker
 
-Work on the fleet itself is tracked as local markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+Work on the fleet itself is tracked in GitHub Issues on `andydarknessb/fleet` using `gh`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

@@ -1,6 +1,6 @@
 # Triage Labels
 
-The skills speak in terms of five canonical triage roles. This file maps those roles to the strings used in this repo's issue tracker (the `Status:` line of a `.scratch/` ticket).
+The skills speak in terms of five canonical triage roles. This file maps those roles to the strings used in this repo's issue tracker (GitHub labels on `andydarknessb/fleet`; create one with `gh label create` on first use).
 
 | Label in mattpocock/skills | Label in our tracker | Meaning                                  |
 | -------------------------- | -------------------- | ---------------------------------------- |
