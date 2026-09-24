@@ -721,3 +721,48 @@ test('fleet#62: proof refuses a bare --reservations and an unknown flag as USAGE
   assert.throws(() => cli(['proof', ...common, '--reservation', '{}']), (error) => error.code === 'USAGE' && /unknown flag --reservation/.test(error.message));
   assert.throws(() => cli(['proof', ...common, '--reservations', '{"files":["a.js"]}']), (error) => error.code === 'USAGE' && /unknown field/.test(error.message));
 });
+
+// One Work record ledger serves every tenant. Unscoped, endzone's three ICs on
+// src/ paths refused nidus's walking skeleton (#2) at every door: the frontier
+// marked it `reserved` by endzone's own #2 and conflicted its src/ paths with
+// endzone's, and assign counted endzone's three toward nidus's third
+// (2026-09-24, nidus excl-2-1).
+function crossTenantFixture() {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'nidus.json'), JSON.stringify({ name: 'nidus', readyLabel: 'ready-for-agent', maxIcs: 2, defaultBranch: 'main' }));
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', readyLabel: 'ready-for-agent', maxIcs: 3, defaultBranch: 'integration' }));
+  const endzone = [[1610, 'src/widgets/player-pool'], [1611, 'src/entities/waiver-bid'], [2, 'src/app']]
+    .map(([number, component]) => ({ issue: number, reservations: { components: [component] } }));
+  for (const [index, record] of endzone.entries()) {
+    reserveRecord({ root, id: `endzone:issue-${record.issue}`, tenant: 'endzone', issue: record.issue, manifestPath: `m${record.issue}`, reservations: record.reservations, independenceProof: index === 2 ? independenceProof(endzone) : undefined, idempotencyKey: `reserve-${record.issue}`, now: '2026-09-24T00:00:00.000Z' });
+  }
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(2, { body: 'Create `src/app/index.ts`.' })]));
+  return { root, fixture };
+}
+
+test('a tenant frontier ignores another tenant\'s records: same issue number and same src path', () => {
+  const { root, fixture } = crossTenantFixture();
+  const nidus = cli(['frontier', '--root', root, '--tenant', 'nidus', '--fixture', fixture]);
+  assert.deepEqual(nidus.eligible.map((entry) => entry.number), [2]);
+  const endzone = cli(['frontier', '--root', root, '--tenant', 'endzone', '--fixture', fixture]);
+  assert.deepEqual(endzone.excluded[0].reasons.map((reason) => reason.code), ['reserved', 'reservation-conflict'], 'the owning tenant still sees its own records');
+});
+
+test('a tenant\'s proof and assign do not count another tenant\'s assignments', () => {
+  const { root, fixture } = crossTenantFixture();
+  const common = ['--root', root, '--tenant', 'nidus', '--fixture', fixture];
+  const printed = cli(['proof', ...common]);
+  assert.deepEqual(printed.activeAssignments, []);
+  assert.deepEqual(printed.proof.candidates, [2]);
+  const assigned = cli(['assign', ...common, '--base-sha', 'a'.repeat(40), '--now', '2026-09-24T01:00:00.000Z']);
+  assert.equal(assigned.reservation.record.id, 'nidus:issue-2');
+  assert.equal(getRecord({ root, id: 'endzone:issue-2' }).tenant, 'endzone', 'the other tenant\'s same-numbered record is untouched');
+});
+
+test('an active record naming no tenant still conflicts, so scoping cannot fail open', () => {
+  const active = [{ id: 'legacy:issue-8', issue: 8, state: 'implementing', reservations: { components: ['src/shared'] } }];
+  const frontier = selectFrontier({ issues: [issue(3, { body: 'Change `src/shared/x.js`.' })], readyLabel: 'ready-for-agent', active, tenant: 'nidus', now: '2026-09-24T00:00:00.000Z' });
+  assert.equal(frontier.excluded[0].reasons[0].code, 'reservation-conflict');
+});

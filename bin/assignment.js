@@ -9,6 +9,7 @@ const {
   WorkStateError,
   getRecord,
   hasReservationEvidence,
+  isForeignRecord,
   parseArgs,
   proofFor,
   proofMatches,
@@ -201,10 +202,10 @@ function normalizeIssue(issue) {
   };
 }
 
-function activeRecords(records) {
-  if (Array.isArray(records)) return records;
-  if (records?.records) return Object.values(records.records);
-  return Object.values(records || {});
+// Given a tenant, another tenant's records drop out (work-state isForeignRecord).
+function activeRecords(records, tenant) {
+  const all = Array.isArray(records) ? records : Object.values(records?.records || records || {});
+  return all.filter((record) => !isForeignRecord(record, tenant));
 }
 
 // Ticket 07: structured Frontier exclusions (bin/exclusions.js projection) are the
@@ -241,9 +242,9 @@ function independenceProof(issues) {
   return proofFor(issues.map((issue) => ({ issue: issue.number ?? issue.issue, reservations: issue.reservations })));
 }
 
-function hydrateActiveReservations(active, issues = []) {
+function hydrateActiveReservations(active, issues = [], tenant) {
   const byIssue = new Map(issues.map(normalizeIssue).map((issue) => [issue.number, issue]));
-  return activeRecords(active).map((record) => {
+  return activeRecords(active, tenant).map((record) => {
     if (hasReservationEvidence(record.reservations)) return record;
     const issue = byIssue.get(Number(record.issue));
     if (!issue || issue.commentsTruncated || !hasReservationEvidence(issue.reservations)) return record;
@@ -254,9 +255,9 @@ function hydrateActiveReservations(active, issues = []) {
   });
 }
 
-function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3 } = {}) {
+function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3, tenant } = {}) {
   const candidates = (frontier?.eligible || []).map(normalizeIssue);
-  const activeAssignments = hydrateActiveReservations(active, issues).filter((record) => record.manifestPath && record.state !== 'retired');
+  const activeAssignments = hydrateActiveReservations(active, issues, tenant).filter((record) => record.manifestPath && record.state !== 'retired');
   const selected = [];
   for (const candidate of candidates) {
     if (activeAssignments.length + selected.length >= Math.min(2, maxIcs)) break;
@@ -279,11 +280,12 @@ function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3 } = {}
 // excluding on it made an issue permanently invisible to the frontier (reviewed 2026-09-06,
 // ADR 0006). A genuinely foreign assignee still excludes. Leave it unset for a tenant whose
 // issues are really owned by several accounts.
-function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, now } = {}) {
+function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, tenant, now } = {}) {
   const foreign = (assignee) => !fleetIdentity || String(assignee).toLowerCase() !== String(fleetIdentity).toLowerCase();
   if (!Array.isArray(issues)) throw new WorkStateError('INVALID_GITHUB_FIXTURE', 'issues must be an array');
   const normalized = issues.map(normalizeIssue);
-  const activeByIssue = new Map(activeRecords(active).filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
+  const scoped = activeRecords(active, tenant);
+  const activeByIssue = new Map(scoped.filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
   const eligible = [];
   const excluded = [];
   for (const issue of normalized) {
@@ -298,7 +300,7 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
     reasons.push(...localExclusionReasons(issue, skipIssues, exclusions));
     if (activeByIssue.has(issue.number)) reasons.push({ code: 'reserved', detail: `active Work record ${activeByIssue.get(issue.number).id}` });
-    reasons.push(...reservationConflicts(issue, active));
+    reasons.push(...reservationConflicts(issue, scoped));
     if (reasons.length) excluded.push({ issue: issue.number, reasons });
     else eligible.push(issue);
   }
@@ -449,9 +451,9 @@ function explicitReservations(value) {
 }
 
 function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, now, actor = 'assignment-planner', runner } = {}) {
-  const proofRecords = hydrateActiveReservations(active, issues);
+  const proofRecords = hydrateActiveReservations(active, issues, tenant);
   const explicit = explicitReservations(reservations);
-  const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
+  const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, tenant, now });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
   // fleet#33: an assignment with no reservation at all is a derivation failure far
@@ -614,10 +616,11 @@ function cli(argv) {
   if ((command === 'assign' || command === 'proof') && args.reservations === 'true') throw new WorkStateError('USAGE', '--reservations needs a JSON object value (fleet#33)');
   if (command === 'frontier') {
     const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
+    const tenant = args.tenant || 'endzone';
     const readyLabel = args['ready-label'] || config.readyLabel || 'ready-for-agent';
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: args.repo || config.github, readyLabel, fetchDetails: true });
-    const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant: args.tenant || 'endzone', now: args.now });
-    return selectFrontier({ issues, readyLabel, active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${args.tenant || 'endzone'}.json`)), exclusions, fleetIdentity: config.fleetIdentity, now: args.now });
+    const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
+    return selectFrontier({ issues, readyLabel, active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`)), exclusions, fleetIdentity: config.fleetIdentity, tenant, now: args.now });
   }
   if (command === 'assign' || command === 'proof') {
     // One loader for both doors: the tenant file names the repo and ready label, the
@@ -627,10 +630,10 @@ function cli(argv) {
     const readyLabel = config.readyLabel || args['ready-label'] || 'ready-for-agent';
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github || args.repo, readyLabel, fetchDetails: true });
     const active = readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json'));
-    const reservationRecords = hydrateActiveReservations(active, issues);
+    const reservationRecords = hydrateActiveReservations(active, issues, tenant);
     const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`));
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
-    const frontier = selectFrontier({ issues, readyLabel, active: reservationRecords, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, now: args.now });
+    const frontier = selectFrontier({ issues, readyLabel, active: reservationRecords, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, tenant, now: args.now });
     if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'no eligible issue', { excluded: frontier.excluded });
     if (command === 'proof') {
       // The machine-readable independence proof a third assignment must carry: the
