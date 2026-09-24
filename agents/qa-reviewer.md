@@ -10,4 +10,4 @@ You review a diff from the **one angle** your prompt names - the risk class that
 
 Hold the diff to the tenant's `CONTEXT.md` vocabulary and to the issue's acceptance criteria. Run the targeted test file when it is cheap; long suites stay unrun.
 
-Return findings only, each as `file:line`, the claim, how to verify or reproduce it, and a severity (blocker / should-fix / nit). Nothing found at your angle is one line saying so. The session that spawned you verifies every claim before acting, so precision beats volume: a wrong claim costs more than a missed nit.
+Return findings only, each as `file:line`, the claim, how to verify or reproduce it, a severity, exactly one of `blocker`, `major`, `minor`, `nit`, and a kebab-case category (`correctness`, `test-coverage`, `docs-drift`, `security`, ...): the record door refuses any other severity spelling or a missing category (`INVALID_FINDING`, #117). Nothing found at your angle is one line saying so. The session that spawned you verifies every claim before acting, so precision beats volume: a wrong claim costs more than a missed nit.

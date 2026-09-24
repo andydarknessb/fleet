@@ -277,7 +277,28 @@ function writeArtifactExclusive(root, recordId, kind, buildContent) {
 // by the review that verified the close, through --resolutions (ADR 0009, 5).
 const RESOLUTION_LIKE_FIELDS = Object.freeze(['outcome', 'resolution']);
 
+// #117: the audit counted 485 findings with 12+ severity spellings and 41 blank,
+// so nothing downstream (the fleet-review status, the repeat escalation) could
+// read a severity. Every supplied finding names one from the enum and a
+// kebab-case category; carried findings are history and keep what they say.
+const SEVERITIES = Object.freeze(['blocker', 'major', 'minor', 'nit']);
+const CATEGORY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+function validateSuppliedFinding(finding, index) {
+  const name = finding && finding.id ? `${finding.id} (#${index + 1})` : `#${index + 1}`;
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} is not an object`, { finding: index + 1 });
+  }
+  if (!SEVERITIES.includes(finding.severity)) {
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has severity ${finding.severity === undefined ? '(none)' : `'${finding.severity}'`}; severity is one of ${SEVERITIES.join(', ')} (#117)`, { finding: finding.id || index + 1, field: 'severity', allowed: SEVERITIES });
+  }
+  if (typeof finding.category !== 'string' || !CATEGORY_PATTERN.test(finding.category)) {
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has category ${finding.category === undefined ? '(none)' : `'${finding.category}'`}; category is a non-empty kebab-case string such as correctness, test-coverage or docs-drift (#117)`, { finding: finding.id || index + 1, field: 'category' });
+  }
+}
+
 function buildFindings(stamp, suppliedFindings, priors, resolutions) {
+  (suppliedFindings || []).forEach(validateSuppliedFinding);
   // Caller fields never override the forced-open status: openFindings gates the
   // unresolved-findings guard on it.
   const findings = (suppliedFindings || []).map((finding, index) => {
@@ -355,6 +376,296 @@ function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) 
   return repo;
 }
 
+// --- #115: the fleet-review commit status (ADR 0014) ------------------------
+// "No merge without a recorded formal review" lived in the lead's role file,
+// and pr-watch could only see a merge, never stop one: endzone #1241 and #1263
+// merged on 2026-09-12 with no review. A formal record now posts a commit
+// status on the head it reviewed, under the tenant's `reviewStatus` context,
+// and the tenant's branch ruleset requires it (#120). The status is evidence
+// that a review was recorded for that commit: `success` when no open finding
+// is blocking, `failure` otherwise. A carried finding with a legacy severity
+// is blocking unless it reads as minor or nit, so an unreadable severity
+// fails closed. A failed post never undoes the record: the artifact and the
+// `review-recorded` event stand, the result says `statusPosted: false`, the
+// CLI exits 3, and `record --repost --id <id>` posts again. A tenant with no
+// `reviewStatus` posts nothing. `reviewStatus` is not in `ciGates`: review
+// waits for the gates, so a gate that waits for the review would deadlock.
+
+const NON_BLOCKING_SEVERITIES = Object.freeze(['minor', 'nit', 'low', 'info', 'trivial', 'suggestion', 'cosmetic']);
+const STATUS_DESCRIPTION_LIMIT = 140; // GitHub's cap on a commit status description
+
+function isBlockingFinding(finding) {
+  // #118 review: a finding raised again after it was settled escalates the record
+  // for a Ruling, so it blocks whatever its severity: a green status would let
+  // GitHub merge the PR the Ruling is about.
+  if (finding?.repeats) return true;
+  return !NON_BLOCKING_SEVERITIES.includes(String(finding?.severity || '').trim().toLowerCase());
+}
+
+function reviewStatusFor(artifact, artifactPath) {
+  const open = openFindings(artifact || {});
+  const blocking = open.filter(isBlockingFinding);
+  const state = blocking.length ? 'failure' : 'success';
+  const tally = open.length ? `${open.length} open, ${blocking.length} blocking` : 'no open findings';
+  return { state, description: `${tally}; ${artifactPath}`.slice(0, STATUS_DESCRIPTION_LIMIT) };
+}
+
+function defaultGh(args) {
+  // FLEET_GH names another executable (the tests use one that always fails).
+  return execFileSync(process.env.FLEET_GH || 'gh', args, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000, maxBuffer: 16 * 1024 * 1024,
+  });
+}
+
+function tenantFor(root, name) {
+  if (!name) return null;
+  const file = path.join(root, 'tenants', `${name}.json`);
+  if (!fs.existsSync(file)) return null;
+  return loadTenant(root, name);
+}
+
+// The status API wants the full SHA; a head recorded before fleet#67 may be
+// abbreviated, so it is expanded in the tenant repo when that repo answers.
+function fullSha(sha, repoPath, git) {
+  if (!repoPath) return String(sha);
+  try {
+    const run = git ? (args) => git(args, repoPath) : (args) => gitInRepo(repoPath, args);
+    const resolved = String(run(['rev-parse', '--verify', `${sha}^{commit}`]) || '').trim();
+    return /^[0-9a-f]{40}$/i.test(resolved) ? resolved : String(sha);
+  } catch {
+    return String(sha);
+  }
+}
+
+function postReviewStatus({ tenant, headSha, artifact, artifactPath, gh }) {
+  if (!tenant || typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) return null;
+  const context = tenant.reviewStatus.trim();
+  const { state, description } = reviewStatusFor(artifact, artifactPath);
+  const status = { context, state, sha: String(headSha), description };
+  if (!tenant.github) return { statusPosted: false, status, statusError: `tenant ${tenant.name || ''} has no "github" slug to post ${context} to` };
+  try {
+    (gh || defaultGh)(['api', '--method', 'POST', `repos/${tenant.github}/statuses/${headSha}`,
+      '-f', `state=${state}`, '-f', `context=${context}`, '-f', `description=${description}`]);
+    return { statusPosted: true, status };
+  } catch (error) {
+    const detail = String(error.stderr || error.message || error).trim().slice(0, 500);
+    return { statusPosted: false, status, statusError: detail || 'gh exited nonzero' };
+  }
+}
+
+function repostReviewStatus(options = {}) {
+  const root = path.resolve(options.root || DEFAULT_ROOT);
+  const { recordId } = options;
+  if (!recordId) throw new ReviewPolicyError('USAGE', '--repost needs --id <record>');
+  const record = workState.getRecord({ root, id: recordId });
+  const formal = record.review?.formal;
+  if (!formal) throw new ReviewPolicyError('NO_PRIOR_REVIEW', `no formal review is recorded for ${recordId}; nothing to repost`);
+  const artifact = readArtifact(root, formal.artifact);
+  if (artifact === null) throw new ReviewPolicyError('ARTIFACT_MISSING', `the recorded formal artifact ${formal.artifact} is missing; its status cannot be derived`);
+  const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+  let repoPath = options.repoPath || null;
+  if (!repoPath) { try { repoPath = tenantRepoPath({ root, recordId, record }); } catch { repoPath = null; } }
+  const posted = postReviewStatus({ tenant, headSha: fullSha(formal.headSha, repoPath, options.git), artifact, artifactPath: formal.artifact, gh: options.gh });
+  if (!posted) throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenant?.name || record.tenant} names no reviewStatus; nothing is posted`);
+  return { artifact: formal.artifact, ...posted };
+}
+
+// --- #116: attest, the review gate for a PR with no Work record -------------
+// Cory's interactive PRs and Dependabot's have no Work record, so `record` (keyed
+// by --id) cannot serve them, and under ADR 0014 every PR into the default
+// branch needs the status. `attest` takes the PR, the head that was reviewed and
+// a findings artifact, holds the artifact to the record door's guards, keeps a
+// copy under state/reviews/<tenant>_pr-<n>/attest-NNN.json and posts the status
+// exactly as a formal record does. The head must be the PR's current head: an
+// attestation of a head the PR has moved past would stamp a tree nobody read.
+
+function readAttestArtifact(file) {
+  if (!file || file === 'true' || !fs.existsSync(file)) {
+    throw new ReviewPolicyError('INVALID_ARTIFACT', `findings artifact not found: ${file}`);
+  }
+  let content;
+  try {
+    let text = fs.readFileSync(file, 'utf8');
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    content = JSON.parse(text);
+  } catch (error) {
+    throw new ReviewPolicyError('INVALID_ARTIFACT', `${file} is not JSON: ${error.message}`);
+  }
+  if (!content || typeof content !== 'object' || Array.isArray(content)) {
+    throw new ReviewPolicyError('INVALID_ARTIFACT', `${file} must be an object with a "findings" array or a "noFindings" statement`);
+  }
+  const findings = content.findings === undefined || content.findings === null ? [] : content.findings;
+  if (!Array.isArray(findings)) throw new ReviewPolicyError('INVALID_ARTIFACT', `${file}: "findings" must be an array`);
+  const { noFindings } = content;
+  if (noFindings !== undefined && noFindings !== null) {
+    if (typeof noFindings !== 'string' || !noFindings.trim()) {
+      throw new ReviewPolicyError('INVALID_ARTIFACT', `${file}: "noFindings" is a one-sentence statement of what was examined and concluded`);
+    }
+    if (findings.length) {
+      throw new ReviewPolicyError('INVALID_ARTIFACT', `${file} carries ${findings.length} finding(s) and a noFindings statement; it is one or the other`);
+    }
+  } else if (!findings.length) {
+    throw new ReviewPolicyError('EMPTY_FINDINGS', `${file} has no findings and no "noFindings" statement; a clean review says so, so the artifact is not read as lost content (fleet#18)`);
+  }
+  // The record guard (fleet#43): the artifact says what the reviewer found, never
+  // what closed it. `record` forces a supplied status open; an attestation has
+  // no later review to resolve it, so a closed status is refused outright.
+  findings.forEach((finding, index) => {
+    if (finding && typeof finding === 'object' && finding.status !== undefined && finding.status !== 'open') {
+      throw new ReviewPolicyError('FINDING_CARRIES_OUTCOME', `finding ${finding.id || `#${index + 1}`} carries status '${finding.status}'; an attested finding is open, and a finding that was fixed before the attestation is not a finding of this head`, { finding: finding.id || index + 1, field: 'status' });
+    }
+  });
+  return { findings, noFindings: typeof noFindings === 'string' ? noFindings.trim() : null };
+}
+
+function attestPullRequest(options = {}) {
+  const root = path.resolve(options.root || DEFAULT_ROOT);
+  const { tenantName, headSha, artifactPath, actor } = options;
+  const prNumber = Number(options.prNumber);
+  if (!tenantName || tenantName === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
+  if (!Number.isInteger(prNumber) || prNumber <= 0) throw new ReviewPolicyError('USAGE', 'attest needs --pr <number>');
+  if (!headSha || headSha === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --head <sha>');
+  if (!artifactPath || artifactPath === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --artifact <path>');
+  const tenantFile = path.join(root, 'tenants', `${tenantName}.json`);
+  if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${tenantName}': ${tenantFile} does not exist`);
+  const tenant = loadTenant(root, tenantName);
+  if (typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) {
+    throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenantName} names no reviewStatus; there is no status to attest`);
+  }
+  if (!tenant.github) throw new ReviewPolicyError('USAGE', `tenant ${tenantName} has no "github" slug`);
+
+  // The artifact first: every refusal that needs no network keeps precedence.
+  const supplied = readAttestArtifact(artifactPath);
+  buildFindings('pending', supplied.findings, [], null);
+
+  const gh = options.gh || defaultGh;
+  let currentHead;
+  try {
+    const raw = gh(['pr', 'view', String(prNumber), '-R', tenant.github, '--json', 'headRefOid']);
+    currentHead = String(JSON.parse(raw).headRefOid || '');
+  } catch (error) {
+    throw new ReviewPolicyError('PR_HEAD_UNREADABLE', `could not read PR #${prNumber}'s head from ${tenant.github}: ${String(error.stderr || error.message || error).trim().slice(0, 300)}`);
+  }
+  if (!/^[0-9a-f]{40}$/i.test(currentHead)) throw new ReviewPolicyError('PR_HEAD_UNREADABLE', `PR #${prNumber} reported no head commit`);
+
+  const repo = options.repoPath || tenant.repo;
+  if (!repo) throw new ReviewPolicyError('TENANT_REPO_UNKNOWN', `cannot resolve --head against a repository: pass --repo-path <tenant repo> or set "repo" in ${tenantFile}`);
+  const run = options.git ? (args) => options.git(args, repo) : (args) => gitInRepo(repo, args);
+  try { run(['fetch', '--quiet', 'origin', `+refs/pull/${prNumber}/head`]); } catch { /* offline: the object may still be local */ }
+  try {
+    run(['cat-file', '-e', `${headSha}^{commit}`]);
+  } catch {
+    throw new ReviewPolicyError('UNKNOWN_COMMIT', `--head ${headSha} is not a commit in ${repo} (after fetching PR #${prNumber}); an attestation names a head that exists (fleet#67)`, { flag: '--head', sha: String(headSha), repoPath: repo });
+  }
+  const head = fullSha(headSha, repo, options.git);
+  if (head.toLowerCase() !== currentHead.toLowerCase()) {
+    throw new ReviewPolicyError('STALE_HEAD', `PR #${prNumber} has moved: its head is ${currentHead}, not ${head}; review ${currentHead} and attest that`, { currentHead, headSha: head });
+  }
+
+  const written = writeArtifactExclusive(root, `${tenantName}:pr-${prNumber}`, 'attest', (stamp) => ({
+    schemaVersion: 1,
+    kind: 'attest',
+    tenant: tenantName,
+    pr: prNumber,
+    headSha: head,
+    reviewer: actor || 'unknown',
+    at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
+    source: path.resolve(artifactPath),
+    noFindings: supplied.noFindings,
+    findings: buildFindings(stamp, supplied.findings, [], null),
+  }));
+  const posted = postReviewStatus({ tenant, headSha: head, artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh });
+  return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
+}
+
+// --- #118: re-review discipline at the door (ADR 0014 Consequences) ---------
+// On endzone #1240 one finding was re-raised five times at a cost of 569k
+// tokens. A finding may carry `repeats: <prior finding id>`, naming a finding
+// this record's formal chain settled as `resolved` or `not-real`; the review
+// still records, and the record goes to `escalated` with a decision-needed
+// wake instead of back to the IC, because the lead and the IC disagree about
+// a settled point and another round will not settle it. The newest
+// resolution of an id wins while walking the chain back.
+
+const REPEATABLE_RESOLUTIONS = Object.freeze(['resolved', 'not-real']);
+
+function chainResolutions(root, newestArtifact) {
+  const settled = new Map();
+  const seen = new Set();
+  let cursor = newestArtifact;
+  while (cursor && !seen.has(cursor) && seen.size < 100) {
+    seen.add(cursor);
+    const data = readArtifact(root, cursor);
+    if (!data) break;
+    for (const [id, resolution] of Object.entries(data.resolutions || {})) {
+      if (!settled.has(id)) settled.set(id, resolution);
+    }
+    cursor = data.priorArtifact || null;
+  }
+  return settled;
+}
+
+function validateRepeats({ root, recordId, kind, prior, repeating }) {
+  if (kind !== 'formal') {
+    throw new ReviewPolicyError('INVALID_FINDING', 'a finding carrying `repeats` belongs to a formal re-review: it escalates the record for a Ruling (#118)', { field: 'repeats' });
+  }
+  const settled = chainResolutions(root, prior ? prior.artifact : null);
+  for (const finding of repeating) {
+    const target = finding.repeats;
+    if (typeof target !== 'string' || !target.trim()) {
+      throw new ReviewPolicyError('INVALID_FINDING', `a finding's repeats names the prior finding id it raises again (#118), got ${JSON.stringify(target)}`, { field: 'repeats' });
+    }
+    if (!REPEATABLE_RESOLUTIONS.includes(settled.get(target))) {
+      throw new ReviewPolicyError('INVALID_FINDING', `repeats '${target}' names no finding resolved or not-real earlier in ${recordId}'s review chain${settled.has(target) ? ` (it is ${settled.get(target)})` : ''}; an open finding is carried with --resolutions still-open, not repeated (#118)`, { field: 'repeats', repeats: target });
+    }
+  }
+}
+
+// Everything after a formal record commits: the review status (#115) and the
+// repeat escalation (#118). It never throws, because the caller's terminal
+// cleanup would delete an artifact the record now references; a failure is
+// reported in the result and the CLI exits 3.
+function afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, written, result, repeating, actor, options }) {
+  const out = {};
+  try {
+    const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+    const posted = postReviewStatus({
+      tenant, headSha: fullSha(headSha, verifiedRepo, options.git),
+      artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh: options.gh,
+    });
+    if (posted) Object.assign(out, posted);
+  } catch (error) {
+    Object.assign(out, { statusPosted: false, statusError: `status not derived: ${String(error.message || error).slice(0, 300)}` });
+  }
+  if (repeating.length) {
+    try {
+      const stored = readArtifact(root, written.relative) || { findings: [] };
+      const pairs = (stored.findings || []).filter((finding) => finding.repeats).map((finding) => `${finding.id} repeats ${finding.repeats}`);
+      let revision = result.revision;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const moved = workState.transitionRecord({
+            root, id: recordId, to: 'escalated', expectedRevision: revision,
+            idempotencyKey: `repeat-escalation:${written.relative}`, actor, now: options.now,
+            evidence: `wake:decision-needed; same finding raised twice, needs a Ruling: ${pairs.join(', ')} (${written.relative}, #118)`,
+          });
+          if (moved.paged && options.notifier) {
+            try { options.notifier({ root, recordId, sequence: moved.eventSequence }); } catch { /* the outbox line stands; the watcher's notifier retries */ }
+          }
+          out.escalated = { state: 'escalated', repeats: pairs, paged: Boolean(moved.paged) };
+          break;
+        } catch (error) {
+          if (error.code === 'STALE_REVISION' && attempt < STALE_RETRY_LIMIT) { revision = workState.getRecord({ root, id: recordId }).revision; continue; }
+          throw error;
+        }
+      }
+    } catch (error) {
+      out.escalated = { state: null, error: `${error.code || 'ERROR'}: ${String(error.message || error).slice(0, 300)}` };
+    }
+  }
+  return out;
+}
+
 function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, kind, headSha, actor } = options;
@@ -399,6 +710,7 @@ function recordReviewArtifact(options = {}) {
     ? Number(options.expectedRevision) : null;
 
   let written = null;
+  let verifiedRepo = null;
   try {
     for (let attempt = 0; ; attempt += 1) {
       const record = workState.getRecord({ root, id: recordId });
@@ -513,6 +825,9 @@ function recordReviewArtifact(options = {}) {
       // build also raises DUPLICATE_FINDING_ID before any file exists.
       const supplied = options.findings || [];
       const noFindings = options.noFindings;
+      // #118: `repeats` names a finding this record's chain already settled.
+      const repeating = supplied.filter((finding) => finding && typeof finding === 'object' && finding.repeats !== undefined);
+      if (repeating.length) validateRepeats({ root, recordId, kind, prior, repeating });
       const preview = buildFindings('pending', supplied, priors, resolutions);
       if (noFindings !== undefined) {
         if (typeof noFindings !== 'string' || !noFindings.trim() || noFindings === 'true') {
@@ -533,7 +848,7 @@ function recordReviewArtifact(options = {}) {
       if (!written) {
         const shas = [{ flag: '--head-sha', sha: String(headSha) }];
         if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
-        verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
+        verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
       }
       if (!written) {
         written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
@@ -576,7 +891,8 @@ function recordReviewArtifact(options = {}) {
             priorArtifact: prior ? prior.artifact : null,
           },
         });
-        return { artifact: written.relative, result };
+        if (kind !== 'formal') return { artifact: written.relative, result };
+        return { artifact: written.relative, result, ...afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, written, result, repeating, actor, options }) };
       } catch (error) {
         // A routine concurrent bump (pr-watch observing the PR) is retried when
         // the caller did not pin a revision; everything else is terminal.
@@ -719,12 +1035,13 @@ function classifyCli(rest) {
 // `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
 // each list is every flag its handler consumes; an unknown flag or command is
 // USAGE, exit 2, nothing on stdout.
-const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling'];
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'repost'];
 const COMMAND_FLAGS = Object.freeze({
   classify: CLASSIFY_FLAGS,
   record: RECORD_FLAGS,
   'plan-rereview': ['root', 'id', 'head-sha'],
   hold: ['root', 'id', 'expected-revision', 'reason', 'actor', 'now', 'idempotency-key', 'no-notifier'],
+  attest: ['root', 'tenant', 'pr', 'head', 'artifact', 'repo-path', 'actor', 'now'],
 });
 
 function cli(argv) {
@@ -745,6 +1062,16 @@ function cli(argv) {
   // whenever --actor was omitted (and the documented line omitted it), which a
   // replay can never repair; FLEET_NAME is in every fleet session's environment.
   const actor = args.actor || process.env.FLEET_NAME || undefined;
+  if (command === 'record' && args.repost !== undefined) {
+    // #115: post the status again for the latest formal artifact; no new review.
+    if (args.repost !== 'true') throw new ReviewPolicyError('USAGE', '--repost takes no value');
+    const content = ['kind', 'head-sha', 'reviewed-sha', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'classification', 'expected-revision', 'idempotency-key'].filter((flag) => args[flag] !== undefined);
+    if (content.length) {
+      throw new ReviewPolicyError('USAGE', `--repost posts the recorded formal review's status again and takes no review content: drop ${content.map((flag) => `--${flag}`).join(', ')}`);
+    }
+    if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
+    return repostReviewStatus({ root, recordId: args.id, repoPath: args['repo-path'] });
+  }
   if (command === 'record') {
     if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
     return recordReviewArtifact({
@@ -760,6 +1087,15 @@ function cli(argv) {
       resolutions: args.resolutions ? JSON.parse(args.resolutions) : null,
       priorArtifact: args['prior-artifact'],
       riskRuling: args['risk-ruling'],
+      // #118: a repeats escalation pages through the notifier like `hold` does.
+      notifier: require('./notify').spawnNotifier,
+    });
+  }
+  if (command === 'attest') {
+    if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
+    return attestPullRequest({
+      root, tenantName: args.tenant, prNumber: args.pr, headSha: args.head, artifactPath: args.artifact,
+      repoPath: args['repo-path'], actor, now: args.now,
     });
   }
   if (command === 'plan-rereview') {
@@ -781,6 +1117,18 @@ if (require.main === module) {
       process.stderr.write(`replayed: ${answer.ignored.findings} finding(s) and ${answer.ignored.resolutions} resolution(s) supplied were NOT written; the recorded artifact ${answer.artifact} stands (a re-review at the same head links --prior-artifact; fleet#19)\n`);
     }
     process.stdout.write(`${JSON.stringify(answer)}\n`);
+    if (answer && answer.statusPosted === false) {
+      // #115: the review is recorded and only its status is missing. Exit 3 so
+      // the caller sees it, and name the one command that repairs it.
+      const context = answer.status?.context || 'review';
+      process.stderr.write(`${JSON.stringify({ code: 'STATUS_NOT_POSTED', message: `the review stands (${answer.artifact}) but the ${context} status was not posted: ${answer.statusError}; run review-policy.js record --repost --id <record> once gh answers` })}\n`);
+      process.exitCode = 3;
+    }
+    if (answer && answer.escalated && answer.escalated.state === null) {
+      // #118: the review is recorded but the repeat escalation did not land.
+      process.stderr.write(`${JSON.stringify({ code: 'ESCALATION_NOT_RECORDED', message: `the review stands (${answer.artifact}) but the record was not escalated for its repeated finding: ${answer.escalated.error}; escalate it by hand (work-state.js transition --to escalated)` })}\n`);
+      process.exitCode = 3;
+    }
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
     // A refused invocation exits 2 so a caller reading only the status cannot
@@ -791,7 +1139,10 @@ if (require.main === module) {
     // invocations too: nothing was recorded, and the message names the door.
     // UNKNOWN_COMMIT and TENANT_REPO_UNKNOWN (fleet#67) likewise: nothing was
     // recorded, and the message names the repo and the SHA.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN'].includes(error.code) ? 2 : 1;
+    // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
+    // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
+    // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 
@@ -799,6 +1150,8 @@ module.exports = {
   CLASSIFY_FLAGS,
   COMMAND_FLAGS,
   ReviewPolicyError,
+  SEVERITIES,
+  attestPullRequest,
   classifyChange,
   cli,
   classifyFromGit,
@@ -806,5 +1159,7 @@ module.exports = {
   matchGlob,
   planRereview,
   recordReviewArtifact,
+  repostReviewStatus,
+  reviewStatusFor,
   verifyRecordedCommits,
 };

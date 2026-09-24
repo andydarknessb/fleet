@@ -1,0 +1,48 @@
+# #112 (ADR 0013): the full-suite authority for fleet master. One aggregate runner,
+# suites serial, on Windows (the .tests.ps1 suites are Windows PowerShell 5.1).
+# The job name `fleet-ci` is stable: the Watchdog's deploy step (#113) reads the
+# check run of that name on origin/master's head before it advances `live`.
+name: fleet-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: fleet-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-ci:
+    name: fleet-ci
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      # The host checkout runs with core.autocrlf false; the suites compare bytes.
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The host's major version (C:\Users\Cory\fleet runs Node 24).
+          node-version: 24
+      - name: Git identity for fixture repositories
+        run: |
+          git config --global user.name "fleet-ci"
+          git config --global user.email "fleet-ci@users.noreply.github.com"
+          git config --global init.defaultBranch master
+      - name: Run every suite, serially
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File bin\test-all.ps1 -LogDir "$env:RUNNER_TEMP\fleet-test-logs"
+      - name: Keep suite logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-test-logs
+          path: ${{ runner.temp }}\fleet-test-logs
+          if-no-files-found: ignore
