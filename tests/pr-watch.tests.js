@@ -671,3 +671,36 @@ test('#118: a third return to draft escalates for a Ruling instead of failing ev
   watch(root, third);
   assert.equal(record(root).state, 'escalated', 'the next tick does nothing more');
 });
+
+// run-pr-watch.ps1 (the scheduled tick, the only production caller) passes no
+// --tenant. The moment a second tenant file landed (nidus, 2026-09-24 20:10Z)
+// every tick died on `--tenant required (2 tenants configured)`, so no PR was
+// discovered and no checks-settled wake reached a project lead.
+function twoTenantRoot() {
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-63', issue: 63, state: 'ci-wait', prNumber: 163 });
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/endzone', branchPrefix: 'fleet/', ciGates: [] }));
+  fs.writeFileSync(path.join(root, 'tenants', 'nidus.json'), JSON.stringify({ name: 'nidus', github: 'owner/nidus', branchPrefix: 'fleet/', ciGates: [] }));
+  return root;
+}
+
+test('with no --tenant the watcher ticks every configured tenant', () => {
+  const root = twoTenantRoot();
+  const result = cli(['--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true']);
+  assert.deepEqual(Object.keys(result.tenants).sort(), ['endzone', 'nidus']);
+  assert.equal(result.tenants.endzone.records, 1, 'endzone\'s record was watched');
+  assert.equal(result.tenants.nidus.records, 0);
+  const health = JSON.parse(fs.readFileSync(path.join(root, 'state', 'watch', 'health.json'), 'utf8'));
+  assert.deepEqual(Object.keys(health.tenants).sort(), ['endzone', 'nidus'], 'health.json reports every tenant, not the last one ticked');
+  assert.equal(health.ok, result.ok);
+});
+
+test('one tenant\'s failure does not blind the watcher to the others', () => {
+  const root = twoTenantRoot();
+  fs.writeFileSync(path.join(root, 'tenants', 'aaa-broken.json'), '{ not json');
+  const result = cli(['--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true']);
+  assert.equal(result.ok, false);
+  assert.match(result.tenants['aaa-broken'].error, /JSON/);
+  assert.equal(result.tenants.endzone.records, 1, 'endzone is still watched after the broken tenant');
+});
