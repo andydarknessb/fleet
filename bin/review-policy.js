@@ -376,6 +376,96 @@ function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) 
   return repo;
 }
 
+// --- #115: the fleet-review commit status (ADR 0014) ------------------------
+// "No merge without a recorded formal review" lived in the lead's role file,
+// and pr-watch could only see a merge, never stop one: endzone #1241 and #1263
+// merged on 2026-09-12 with no review. A formal record now posts a commit
+// status on the head it reviewed, under the tenant's `reviewStatus` context,
+// and the tenant's branch ruleset requires it (#120). The status is evidence
+// that a review was recorded for that commit: `success` when no open finding
+// is blocking, `failure` otherwise. A carried finding with a legacy severity
+// is blocking unless it reads as minor or nit, so an unreadable severity
+// fails closed. A failed post never undoes the record: the artifact and the
+// `review-recorded` event stand, the result says `statusPosted: false`, the
+// CLI exits 3, and `record --repost --id <id>` posts again. A tenant with no
+// `reviewStatus` posts nothing. `reviewStatus` is not in `ciGates`: review
+// waits for the gates, so a gate that waits for the review would deadlock.
+
+const NON_BLOCKING_SEVERITIES = Object.freeze(['minor', 'nit', 'low', 'info', 'trivial', 'suggestion', 'cosmetic']);
+const STATUS_DESCRIPTION_LIMIT = 140; // GitHub's cap on a commit status description
+
+function isBlockingFinding(finding) {
+  return !NON_BLOCKING_SEVERITIES.includes(String(finding?.severity || '').trim().toLowerCase());
+}
+
+function reviewStatusFor(artifact, artifactPath) {
+  const open = openFindings(artifact || {});
+  const blocking = open.filter(isBlockingFinding);
+  const state = blocking.length ? 'failure' : 'success';
+  const tally = open.length ? `${open.length} open, ${blocking.length} blocking` : 'no open findings';
+  return { state, description: `${tally}; ${artifactPath}`.slice(0, STATUS_DESCRIPTION_LIMIT) };
+}
+
+function defaultGh(args) {
+  // FLEET_GH names another executable (the tests use one that always fails).
+  return execFileSync(process.env.FLEET_GH || 'gh', args, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000, maxBuffer: 16 * 1024 * 1024,
+  });
+}
+
+function tenantFor(root, name) {
+  if (!name) return null;
+  const file = path.join(root, 'tenants', `${name}.json`);
+  if (!fs.existsSync(file)) return null;
+  return loadTenant(root, name);
+}
+
+// The status API wants the full SHA; a head recorded before fleet#67 may be
+// abbreviated, so it is expanded in the tenant repo when that repo answers.
+function fullSha(sha, repoPath, git) {
+  if (!repoPath) return String(sha);
+  try {
+    const run = git ? (args) => git(args, repoPath) : (args) => gitInRepo(repoPath, args);
+    const resolved = String(run(['rev-parse', '--verify', `${sha}^{commit}`]) || '').trim();
+    return /^[0-9a-f]{40}$/i.test(resolved) ? resolved : String(sha);
+  } catch {
+    return String(sha);
+  }
+}
+
+function postReviewStatus({ tenant, headSha, artifact, artifactPath, gh }) {
+  if (!tenant || typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) return null;
+  const context = tenant.reviewStatus.trim();
+  const { state, description } = reviewStatusFor(artifact, artifactPath);
+  const status = { context, state, sha: String(headSha), description };
+  if (!tenant.github) return { statusPosted: false, status, statusError: `tenant ${tenant.name || ''} has no "github" slug to post ${context} to` };
+  try {
+    (gh || defaultGh)(['api', '--method', 'POST', `repos/${tenant.github}/statuses/${headSha}`,
+      '-f', `state=${state}`, '-f', `context=${context}`, '-f', `description=${description}`]);
+    return { statusPosted: true, status };
+  } catch (error) {
+    const detail = String(error.stderr || error.message || error).trim().slice(0, 500);
+    return { statusPosted: false, status, statusError: detail || 'gh exited nonzero' };
+  }
+}
+
+function repostReviewStatus(options = {}) {
+  const root = path.resolve(options.root || DEFAULT_ROOT);
+  const { recordId } = options;
+  if (!recordId) throw new ReviewPolicyError('USAGE', '--repost needs --id <record>');
+  const record = workState.getRecord({ root, id: recordId });
+  const formal = record.review?.formal;
+  if (!formal) throw new ReviewPolicyError('NO_PRIOR_REVIEW', `no formal review is recorded for ${recordId}; nothing to repost`);
+  const artifact = readArtifact(root, formal.artifact);
+  if (artifact === null) throw new ReviewPolicyError('ARTIFACT_MISSING', `the recorded formal artifact ${formal.artifact} is missing; its status cannot be derived`);
+  const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+  let repoPath = options.repoPath || null;
+  if (!repoPath) { try { repoPath = tenantRepoPath({ root, recordId, record }); } catch { repoPath = null; } }
+  const posted = postReviewStatus({ tenant, headSha: fullSha(formal.headSha, repoPath, options.git), artifact, artifactPath: formal.artifact, gh: options.gh });
+  if (!posted) throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenant?.name || record.tenant} names no reviewStatus; nothing is posted`);
+  return { artifact: formal.artifact, ...posted };
+}
+
 function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, kind, headSha, actor } = options;
@@ -420,6 +510,7 @@ function recordReviewArtifact(options = {}) {
     ? Number(options.expectedRevision) : null;
 
   let written = null;
+  let verifiedRepo = null;
   try {
     for (let attempt = 0; ; attempt += 1) {
       const record = workState.getRecord({ root, id: recordId });
@@ -554,7 +645,7 @@ function recordReviewArtifact(options = {}) {
       if (!written) {
         const shas = [{ flag: '--head-sha', sha: String(headSha) }];
         if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
-        verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
+        verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
       }
       if (!written) {
         written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
@@ -597,6 +688,17 @@ function recordReviewArtifact(options = {}) {
             priorArtifact: prior ? prior.artifact : null,
           },
         });
+        // #115: a formal record posts the tenant's review status on the head it
+        // reviewed. After the commit, outside the retry: a failed post never
+        // undoes the record (the caller sees statusPosted: false, exit 3).
+        if (kind === 'formal') {
+          const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+          const posted = postReviewStatus({
+            tenant, headSha: fullSha(headSha, verifiedRepo, options.git),
+            artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh: options.gh,
+          });
+          if (posted) return { artifact: written.relative, result, ...posted };
+        }
         return { artifact: written.relative, result };
       } catch (error) {
         // A routine concurrent bump (pr-watch observing the PR) is retried when
@@ -740,7 +842,7 @@ function classifyCli(rest) {
 // `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
 // each list is every flag its handler consumes; an unknown flag or command is
 // USAGE, exit 2, nothing on stdout.
-const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling'];
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'repost'];
 const COMMAND_FLAGS = Object.freeze({
   classify: CLASSIFY_FLAGS,
   record: RECORD_FLAGS,
@@ -766,6 +868,16 @@ function cli(argv) {
   // whenever --actor was omitted (and the documented line omitted it), which a
   // replay can never repair; FLEET_NAME is in every fleet session's environment.
   const actor = args.actor || process.env.FLEET_NAME || undefined;
+  if (command === 'record' && args.repost !== undefined) {
+    // #115: post the status again for the latest formal artifact; no new review.
+    if (args.repost !== 'true') throw new ReviewPolicyError('USAGE', '--repost takes no value');
+    const content = ['kind', 'head-sha', 'reviewed-sha', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'classification', 'expected-revision', 'idempotency-key'].filter((flag) => args[flag] !== undefined);
+    if (content.length) {
+      throw new ReviewPolicyError('USAGE', `--repost posts the recorded formal review's status again and takes no review content: drop ${content.map((flag) => `--${flag}`).join(', ')}`);
+    }
+    if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
+    return repostReviewStatus({ root, recordId: args.id, repoPath: args['repo-path'] });
+  }
   if (command === 'record') {
     if (args['repo-path'] === 'true') throw new ReviewPolicyError('USAGE', '--repo-path needs a path (fleet#67)');
     return recordReviewArtifact({
@@ -802,6 +914,13 @@ if (require.main === module) {
       process.stderr.write(`replayed: ${answer.ignored.findings} finding(s) and ${answer.ignored.resolutions} resolution(s) supplied were NOT written; the recorded artifact ${answer.artifact} stands (a re-review at the same head links --prior-artifact; fleet#19)\n`);
     }
     process.stdout.write(`${JSON.stringify(answer)}\n`);
+    if (answer && answer.statusPosted === false) {
+      // #115: the review is recorded and only its status is missing. Exit 3 so
+      // the caller sees it, and name the one command that repairs it.
+      const context = answer.status?.context || 'review';
+      process.stderr.write(`${JSON.stringify({ code: 'STATUS_NOT_POSTED', message: `the review stands (${answer.artifact}) but the ${context} status was not posted: ${answer.statusError}; run review-policy.js record --repost --id <record> once gh answers` })}\n`);
+      process.exitCode = 3;
+    }
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: error.message })}\n`);
     // A refused invocation exits 2 so a caller reading only the status cannot
@@ -829,5 +948,7 @@ module.exports = {
   matchGlob,
   planRereview,
   recordReviewArtifact,
+  repostReviewStatus,
+  reviewStatusFor,
   verifyRecordedCommits,
 };

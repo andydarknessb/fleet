@@ -12,6 +12,7 @@ const {
   recordReviewArtifact: recordAgainstRepo,
   planRereview,
   holdRecord,
+  repostReviewStatus,
 } = require('../bin/review-policy');
 const workState = require('../bin/work-state');
 const { spawnSync: runGit } = require('node:child_process');
@@ -1747,4 +1748,150 @@ test('#117: the binary refuses an off-enum severity with exit 2 and writes nothi
   assert.equal(run.stdout, '');
   assert.equal(JSON.parse(run.stderr).code, 'INVALID_FINDING');
   assertNothingWritten(root);
+});
+
+// --- #115: `record --kind formal` posts the fleet-review commit status (ADR 0014) ---
+// A review lived in the lead's role file and a script "cannot block" a merge; on
+// 2026-09-12 endzone #1241 and #1263 merged with none. The formal record now posts
+// `fleet-review` on the reviewed head, which the tenant ruleset requires (#120).
+// Red-tell: with bin/review-policy.js reverted, the stub gh records no call.
+
+const FULL_HEAD = 'f'.repeat(40);
+
+function reviewTenant(root, extra = {}) {
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ ...TENANT, github: 'owner/Endzone', reviewStatus: 'fleet-review', ...extra }));
+}
+
+function stubGh({ fail = false } = {}) {
+  const calls = [];
+  const gh = (args) => {
+    calls.push(args);
+    if (fail) { const error = new Error('HTTP 502'); error.stderr = 'gh: HTTP 502 Bad Gateway'; throw error; }
+    return '{}';
+  };
+  return { calls, gh };
+}
+
+function statusField(call, name) {
+  const index = call.findIndex((arg, i) => call[i - 1] === '-f' && arg.startsWith(`${name}=`));
+  return index === -1 ? undefined : call[index].slice(name.length + 1);
+}
+
+function formalRecord(root, revision, gh, extra = {}) {
+  return recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: FULL_HEAD, actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] }, gh,
+    idempotencyKey: 'formal-115', now: '2026-09-24T03:00:00.000Z', ...extra,
+  });
+}
+
+test('#115: a clean formal record posts one success fleet-review status on the reviewed head', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const { calls, gh } = stubGh();
+  const recorded = formalRecord(root, revision, gh, { noFindings: 'read the whole diff; nothing wrong' });
+  assert.equal(calls.length, 1);
+  const call = calls[0];
+  assert.deepEqual(call.slice(0, 4), ['api', '--method', 'POST', `repos/owner/Endzone/statuses/${FULL_HEAD}`]);
+  assert.equal(statusField(call, 'state'), 'success');
+  assert.equal(statusField(call, 'context'), 'fleet-review');
+  assert.match(statusField(call, 'description'), new RegExp(recorded.artifact.replace(/[.]/g, '\\.')));
+  assert.equal(recorded.statusPosted, true);
+  assert.equal(recorded.status.state, 'success');
+});
+
+test('#115: a formal record with an open major posts failure; only minor and nit findings post success', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const { calls, gh } = stubGh();
+  formalRecord(root, revision, gh, { findings: [{ file: 'a.js', claim: 'x', severity: 'major', category: 'correctness' }, { file: 'b.js', claim: 'y', severity: 'nit', category: 'style' }] });
+  assert.equal(statusField(calls[0], 'state'), 'failure');
+  assert.match(statusField(calls[0], 'description'), /1 blocking/);
+
+  const root2 = rootDir();
+  reviewTenant(root2);
+  const revision2 = seedRecord(root2);
+  const second = stubGh();
+  formalRecord(root2, revision2, second.gh, { findings: [{ file: 'a.js', claim: 'x', severity: 'minor', category: 'correctness' }, { file: 'b.js', claim: 'y', severity: 'nit', category: 'style' }] });
+  assert.equal(statusField(second.calls[0], 'state'), 'success');
+});
+
+test('#115: a risk record posts nothing', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root, { state: 'implementing' });
+  const { calls, gh } = stubGh();
+  const recorded = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'risk', headSha: FULL_HEAD, actor: 'ic-42',
+    classification: RISK, findings: RISK_FINDINGS, gh, idempotencyKey: 'risk-115',
+  });
+  assert.equal(calls.length, 0);
+  assert.equal(recorded.statusPosted, undefined);
+});
+
+test('#115: a tenant with no reviewStatus posts nothing', () => {
+  const root = rootDir();
+  reviewTenant(root, { reviewStatus: undefined });
+  const revision = seedRecord(root);
+  const { calls, gh } = stubGh();
+  const recorded = formalRecord(root, revision, gh, { noFindings: 'clean' });
+  assert.equal(calls.length, 0);
+  assert.equal(recorded.statusPosted, undefined);
+});
+
+test('#115: a failed post leaves the artifact and the review-recorded event, and says so', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const { calls, gh } = stubGh({ fail: true });
+  const recorded = formalRecord(root, revision, gh, { noFindings: 'clean' });
+  assert.equal(calls.length, 1);
+  assert.equal(recorded.statusPosted, false);
+  assert.match(recorded.statusError, /502/);
+  assert.ok(fs.existsSync(path.join(root, recorded.artifact)), 'the artifact stands');
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).review.formal.artifact, recorded.artifact, 'the record stands');
+  assert.ok(workState.readEvents(root).some((event) => event.type === 'review-recorded' && event.changes.kind === 'formal'));
+});
+
+test('#115: --repost posts again for the latest formal artifact without a new review', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const failed = stubGh({ fail: true });
+  const recorded = formalRecord(root, revision, failed.gh, { findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'security' }] });
+  const before = workState.getRecord({ root, id: 'endzone:issue-42' }).revision;
+  const { calls, gh } = stubGh();
+  const reposted = repostReviewStatus({ root, recordId: 'endzone:issue-42', gh });
+  assert.equal(reposted.statusPosted, true);
+  assert.equal(reposted.artifact, recorded.artifact);
+  assert.equal(calls.length, 1);
+  assert.equal(statusField(calls[0], 'state'), 'failure');
+  assert.equal(calls[0][3], `repos/owner/Endzone/statuses/${FULL_HEAD}`);
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, before, 'a repost records nothing');
+  assert.throws(() => repostReviewStatus({ root: rootDir(), recordId: 'endzone:issue-42', gh }), (error) => ['NOT_FOUND', 'NO_PRIOR_REVIEW'].includes(error.code));
+});
+
+test('#115: the binary exits 3 when the status post fails, with the artifact recorded', () => {
+  const root = rootDir();
+  const { repo, head } = commitIn(root);
+  reviewTenant(root, { repo });
+  const revision = seedRecord(root);
+  // A gh that always fails: node itself, which reads `api` as a script path it cannot find.
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const run = spawnSync(process.execPath, [
+    bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
+    '--kind', 'formal', '--head-sha', head, '--actor', 'pl-endzone', '--classification', '{"tier":"normal","triggers":[]}',
+    '--no-findings', 'clean',
+  ], { encoding: 'utf8', windowsHide: true, env: { ...process.env, FLEET_GH: process.execPath } });
+  assert.equal(run.status, 3, run.stderr);
+  const answer = JSON.parse(run.stdout);
+  assert.equal(answer.statusPosted, false);
+  assert.ok(fs.existsSync(path.join(root, answer.artifact)));
+  assert.match(run.stderr, /--repost/);
+  const repost = spawnSync(process.execPath, [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--repost', '--findings', '[]'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(repost.status, 2, 'a repost takes no review content');
 });
