@@ -682,6 +682,26 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   } finally {
     if ($oldNodePath) { $env:FLEET_NODE_PATH = $oldNodePath } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
   }
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD11 (fleet #101 red-tell): every child the tick starts is bounded and
+  # named on timeout. A known, non-waiting record makes Test-WorkWaiting ask
+  # work-state.js for its STATES; against a 60s-blocking node that read was
+  # unbounded and held the tick for the full minute, recorded nowhere.
+  Write-Utf8 "$testRoot\mock-bin\slower-node.cmd" ('@echo off' + "`r`n" + 'ping -n 61 127.0.0.1 >nul' + "`r`n" + 'echo []' + "`r`n")
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-905":{"tenant":"test","issue":905,"state":"merged"}}}'
+  $env:FLEET_NODE_PATH = "$testRoot\mock-bin\slower-node.cmd"
+  try {
+    $fd11Start = Get-Date
+    $fd11 = Run-Watchdog
+    $fd11Elapsed = ((Get-Date) - $fd11Start).TotalSeconds
+    Assert-True ($fd11Elapsed -lt 45) "a wedged work-state.js read must not hold the tick (took $([int]$fd11Elapsed)s)"
+    Assert-True (@($fd11.timeouts | Where-Object { "$($_.call)" -match 'work-state\.js' }).Count -eq 1) "the shadow line must name the call that timed out (timeouts: $($fd11.timeouts | ConvertTo-Json -Compress))"
+    Assert-True (@($fd11.conditions) -contains 'fleet-dead') 'an unverifiable state still fails toward paging'
+  } finally {
+    if ($oldNodePath) { $env:FLEET_NODE_PATH = $oldNodePath } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\state\work\active.json"
   Remove-Item "$testRoot\state\flags\triage-wake-off"
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue

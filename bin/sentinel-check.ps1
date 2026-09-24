@@ -170,6 +170,7 @@ if ($HealRespawn) {
     }
   }
   if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
+  $report.timeouts = @($script:BoundedTimeouts)   # fleet #101: named timeouts reach the watchdog's shadow line
   Write-Json $ReportPath ([pscustomobject]$report)
   Write-AppliedLedger $report
   [pscustomobject]$report | ConvertTo-Json -Depth 6
@@ -236,7 +237,7 @@ foreach ($x in $expected) {
   if ($state -eq 'done') {
     if ($x.role -eq 'ic' -and $x.tenant) {
       $t = Read-Json "$FleetHome\tenants\$($x.tenant).json"
-      $st = (& gh issue view $x.issue -R $t.github --json state 2>$null | Out-String)
+      $st = "$((Invoke-BoundedCommand -Command 'gh' -ArgumentList @('issue', 'view', "$($x.issue)", '-R', $t.github, '--json', 'state') -TimeoutSec 30 -Name "gh issue view $($x.issue)").stdout)"   # fleet #101: bounded; a timeout reads as not CLOSED
       if ($st -match '"CLOSED"') {
         if ($Apply) { & "$PSScriptRoot\retire.ps1" -Name $x.name -Reason 'issue closed' | Out-Null }
         $report.retired += $x.name
@@ -259,14 +260,13 @@ foreach ($x in $expected) {
         }
 
         $headPrefix = "$($t.branchPrefix)$($x.issue)-"
-        $previousErrorAction = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        try {
-          $prRaw = @(& gh pr list -R $t.github --state open --search "head:$headPrefix" --json number,headRefName 2>&1)
-          $ghExit = $LASTEXITCODE
-        } finally {
-          $ErrorActionPreference = $previousErrorAction
-        }
+        # fleet #101: bounded and named; a timeout is a failed lookup that says so.
+        $prRun = Invoke-BoundedCommand -Command 'gh' -ArgumentList @('pr', 'list', '-R', $t.github, '--state', 'open', '--search', "head:$headPrefix", '--json', 'number,headRefName') -TimeoutSec 30 -Name "gh pr list $($t.github) head:$headPrefix"
+        $ghExit = $prRun.exitCode
+        $prRaw = @("$($prRun.stdout)".Trim())
+        if ($prRun.timedOut) { $prRaw = @('gh pr list timed out after 30s and was killed') }
+        elseif ($prRun.startError) { $prRaw = @("gh pr list could not start: $($prRun.startError)") }
+        elseif ($ghExit -ne 0) { $prRaw = @("$($prRun.stderr)".Trim(), "$($prRun.stdout)".Trim()) | Where-Object { $_ } }
         if ($ghExit -ne 0) {
           $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'pr-lookup-failed'; detail = "stale-heartbeat PR lookup failed for $($t.github): $($prRaw -join ' ')"; parent = $x.parent }
           continue
@@ -347,16 +347,17 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
 foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
   $t = Read-Json $tf.FullName
   if (-not (Test-Path $t.repo)) { continue }
-  $wt = ((& git -C $t.repo worktree list --porcelain 2>$null | Out-String) -replace "`r", '') -split "`n`n"
+  # fleet #101: the sweep's git reads are bounded and named (the removals under -Apply are a mutating door and are not killed mid-way).
+  $wt = ("$((Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', $t.repo, 'worktree', 'list', '--porcelain') -TimeoutSec 30 -Name "git worktree list $($t.name)").stdout)" -replace "`r", '') -split "`n`n"
   foreach ($blk in $wt) {
     if ($blk -notmatch 'worktree (.+)') { continue }
     $path = $Matches[1].Trim()
     if ($path -notmatch '[\\/]\.claude[\\/]worktrees[\\/]') { continue }
     if ($blk -notmatch 'branch refs/heads/(.+)') { continue }
     $br = $Matches[1].Trim()
-    $mergedList = (& git -C $t.repo branch --merged $t.defaultBranch 2>$null | Out-String)
+    $mergedList = "$((Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', $t.repo, 'branch', '--merged', $t.defaultBranch) -TimeoutSec 30 -Name "git branch --merged $($t.name)").stdout)"
     $merged = $mergedList -match [regex]::Escape($br)
-    $lastTs = & git -C $t.repo log -1 --format=%ct $br 2>$null
+    $lastTs = "$((Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', $t.repo, 'log', '-1', '--format=%ct', $br) -TimeoutSec 30 -Name "git log $br").stdout)".Trim()
     $ageDays = 0
     if ($lastTs) { $ageDays = ($now - [DateTimeOffset]::FromUnixTimeSeconds([long]$lastTs).UtcDateTime).TotalDays }
     if ($merged -and $ageDays -gt 7 -and ($blk -notmatch 'locked')) {
@@ -367,6 +368,7 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
 }
 
 if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
+$report.timeouts = @($script:BoundedTimeouts)   # fleet #101: named timeouts reach the watchdog's shadow line
 Write-Json $ReportPath ([pscustomobject]$report)
 Write-AppliedLedger $report
 [pscustomobject]$report | ConvertTo-Json -Depth 6
