@@ -2018,3 +2018,108 @@ test('#116: the binary attests, refuses unknown flags as USAGE, and exits 3 when
   assert.equal(offline.status, 1, offline.stderr);
   assert.equal(JSON.parse(offline.stderr).code, 'PR_HEAD_UNREADABLE');
 });
+
+// --- #118: a finding raised again after it was settled escalates for a Ruling ------
+// On endzone #1240 one finding was re-raised five times (569k tokens). A finding may
+// now say `repeats: <prior finding id>`, naming a finding in the record's chain that
+// was resolved as `resolved` or `not-real`; the review still records, and the record
+// goes to `escalated` (not back to the IC) with a decision-needed wake.
+// Red-tell: with bin/review-policy.js reverted, the record stays in `review`.
+
+function cycleBackToReview(root, revision, round) {
+  for (const [index, to] of ['revision', 'pr-open', 'ci-wait', 'review'].entries()) {
+    revision = workState.transitionRecord({ root, id: 'endzone:issue-42', to, expectedRevision: revision, idempotencyKey: `c118-${round}-${to}`, actor: 'test', evidence: 'cycle', now: `2026-09-24T04:${round}${index}:00.000Z` }).revision;
+  }
+  return revision;
+}
+
+function settledChain(root) {
+  let revision = seedRecord(root);
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'aaa1111', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [{ file: 'a.js', claim: 'null deref', severity: 'major', category: 'correctness' }, { file: 'b.js', claim: 'phantom', severity: 'minor', category: 'correctness' }],
+    idempotencyKey: 'f118-1', now: '2026-09-24T04:00:00.000Z',
+  });
+  revision = cycleBackToReview(root, first.result.revision, 1);
+  const second = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'bbb2222', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] }, priorArtifact: first.artifact,
+    resolutions: { 'formal-001-f1': 'resolved', 'formal-001-f2': 'not-real' },
+    noFindings: 'the changed range fixes the null deref; nothing new',
+    idempotencyKey: 'f118-2', now: '2026-09-24T04:20:00.000Z',
+  });
+  revision = cycleBackToReview(root, second.result.revision, 3);
+  return { revision, first, second };
+}
+
+test('#118: a formal review carrying a repeats finding records and moves the record to escalated, not revision', () => {
+  const root = rootDir();
+  const { revision, second } = settledChain(root);
+  const third = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'ccc3333', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] }, priorArtifact: second.artifact,
+    findings: [{ file: 'a.js', claim: 'null deref is back', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
+    idempotencyKey: 'f118-3', now: '2026-09-24T04:40:00.000Z',
+  });
+  assert.ok(fs.existsSync(path.join(root, third.artifact)), 'the review still records');
+  const stored = JSON.parse(fs.readFileSync(path.join(root, third.artifact), 'utf8'));
+  assert.equal(stored.findings[0].repeats, 'formal-001-f1');
+  const rec = workState.getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(rec.review.formal.artifact, third.artifact);
+  assert.equal(rec.state, 'escalated');
+  assert.equal(rec.prior_state, 'review');
+  assert.match(rec.decisionEvidence, /same finding raised twice, needs a Ruling/);
+  assert.match(rec.decisionEvidence, /formal-003-f1 repeats formal-001-f1/);
+  assert.equal(third.escalated.state, 'escalated');
+  const wakes = fs.readFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(wakes.filter((w) => w.wake === 'decision-needed').length, 1);
+});
+
+test('#118: repeats may name a not-real finding too; a repeats naming nothing settled is refused and writes nothing', () => {
+  const root = rootDir();
+  const { revision, second } = settledChain(root);
+  const base = {
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'ccc3333', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] }, priorArtifact: second.artifact, now: '2026-09-24T04:40:00.000Z',
+  };
+  for (const repeats of ['formal-009-f1', '', 42]) {
+    assert.throws(
+      () => recordReviewArtifact({ ...base, idempotencyKey: `bad-${repeats}`, findings: [{ file: 'a.js', claim: 'x', severity: 'major', category: 'correctness', repeats }] }),
+      (error) => error.code === 'INVALID_FINDING' && /repeats/.test(error.message),
+      `repeats ${JSON.stringify(repeats)}`,
+    );
+  }
+  const dir = path.join(root, 'state', 'reviews', 'endzone_issue-42');
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['formal-001.json', 'formal-002.json'], 'a refused repeats writes nothing');
+  const notReal = recordReviewArtifact({ ...base, idempotencyKey: 'ok', findings: [{ file: 'b.js', claim: 'phantom again', severity: 'minor', category: 'correctness', repeats: 'formal-001-f2' }] });
+  assert.equal(notReal.escalated.state, 'escalated');
+});
+
+test('#118: a finding still open in the chain is not a repeat; repeats belongs to a formal review', () => {
+  const root = rootDir();
+  let revision = seedRecord(root);
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'aaa1111', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [{ file: 'a.js', claim: 'x', severity: 'major', category: 'correctness' }],
+    idempotencyKey: 'o118-1', now: '2026-09-24T05:00:00.000Z',
+  });
+  revision = cycleBackToReview(root, first.result.revision, 5);
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'bbb2222', actor: 'pl-endzone',
+      classification: { tier: 'normal', triggers: [] }, priorArtifact: first.artifact,
+      resolutions: { 'formal-001-f1': 'still-open' },
+      findings: [{ file: 'a.js', claim: 'x again', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
+      idempotencyKey: 'o118-2', now: '2026-09-24T05:30:00.000Z',
+    }),
+    (error) => error.code === 'INVALID_FINDING' && /resolved or not-real/.test(error.message),
+  );
+  const root2 = rootDir();
+  const revision2 = seedRecord(root2, { state: 'implementing' });
+  assert.throws(
+    () => recordReviewArtifact({ root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2, kind: 'risk', headSha: 'ddd4444', actor: 'ic-42', classification: RISK, findings: [{ ...RISK_FINDINGS[0], repeats: 'risk-001-f1' }] }),
+    (error) => error.code === 'INVALID_FINDING' && /formal/.test(error.message),
+  );
+});

@@ -770,11 +770,29 @@ function createRecord(options = {}) {
   });
 }
 
+// #118 (ADR 0014 Consequences): a send-back is a `review -> revision` transition.
+// On endzone #1240 one finding was re-raised five times at a cost of 569k tokens,
+// and nothing counted. The count is derived from the record's own committed
+// transitions (its idempotency map), so it covers records created before this
+// rule and resets with a fresh reservation, which starts a new attempt. The
+// door refuses the third; `hold` and `escalated` are unaffected.
+const SEND_BACK_LIMIT = 3;
+
+function sendBackCount(record) {
+  return Object.values(record?.idempotency || {}).filter((entry) => entry && entry.type === 'transition:review->revision').length;
+}
+
 function validateTransition(record, to, options) {
   if (!STATES.includes(to)) throw new WorkStateError('INVALID_STATE', `unknown state '${to}'`);
   const allowed = TRANSITIONS[record.state] || [];
   const fromEscalated = record.state === 'escalated';
   if (!allowed.includes(to)) throw new WorkStateError('INVALID_TRANSITION', `${record.state} -> ${to} is not allowed`);
+  if (record.state === 'review' && to === 'revision') {
+    const sendBacks = sendBackCount(record);
+    if (sendBacks >= SEND_BACK_LIMIT - 1) {
+      throw new WorkStateError('SEND_BACK_LIMIT', `${record.id} has been sent back ${sendBacks} times; a third send-back is refused (#118). Escalate with the criterion restated (transition --to escalated) so the disagreement gets a Ruling instead of another round`, { sendBacks, limit: SEND_BACK_LIMIT });
+    }
+  }
   if (to === 'hold' && !record.github?.prNumber) throw new WorkStateError('MISSING_PR_EVIDENCE', 'hold requires github.prNumber');
   if (to === 'merged') {
     const observation = options.githubObservation;
@@ -1500,6 +1518,8 @@ module.exports = {
   reserveRecord,
   shadowProject,
   transitionRecord,
+  sendBackCount,
+  SEND_BACK_LIMIT,
 };
 
 // The CLI runs after the exports are set: bin/notify.js is required lazily from

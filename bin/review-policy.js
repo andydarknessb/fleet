@@ -574,6 +574,94 @@ function attestPullRequest(options = {}) {
   return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
 }
 
+// --- #118: re-review discipline at the door (ADR 0014 Consequences) ---------
+// On endzone #1240 one finding was re-raised five times at a cost of 569k
+// tokens. A finding may carry `repeats: <prior finding id>`, naming a finding
+// this record's formal chain settled as `resolved` or `not-real`; the review
+// still records, and the record goes to `escalated` with a decision-needed
+// wake instead of back to the IC, because the lead and the IC disagree about
+// a settled point and another round will not settle it. The newest
+// resolution of an id wins while walking the chain back.
+
+const REPEATABLE_RESOLUTIONS = Object.freeze(['resolved', 'not-real']);
+
+function chainResolutions(root, newestArtifact) {
+  const settled = new Map();
+  const seen = new Set();
+  let cursor = newestArtifact;
+  while (cursor && !seen.has(cursor) && seen.size < 100) {
+    seen.add(cursor);
+    const data = readArtifact(root, cursor);
+    if (!data) break;
+    for (const [id, resolution] of Object.entries(data.resolutions || {})) {
+      if (!settled.has(id)) settled.set(id, resolution);
+    }
+    cursor = data.priorArtifact || null;
+  }
+  return settled;
+}
+
+function validateRepeats({ root, recordId, kind, prior, repeating }) {
+  if (kind !== 'formal') {
+    throw new ReviewPolicyError('INVALID_FINDING', 'a finding carrying `repeats` belongs to a formal re-review: it escalates the record for a Ruling (#118)', { field: 'repeats' });
+  }
+  const settled = chainResolutions(root, prior ? prior.artifact : null);
+  for (const finding of repeating) {
+    const target = finding.repeats;
+    if (typeof target !== 'string' || !target.trim()) {
+      throw new ReviewPolicyError('INVALID_FINDING', `a finding's repeats names the prior finding id it raises again (#118), got ${JSON.stringify(target)}`, { field: 'repeats' });
+    }
+    if (!REPEATABLE_RESOLUTIONS.includes(settled.get(target))) {
+      throw new ReviewPolicyError('INVALID_FINDING', `repeats '${target}' names no finding resolved or not-real earlier in ${recordId}'s review chain${settled.has(target) ? ` (it is ${settled.get(target)})` : ''}; an open finding is carried with --resolutions still-open, not repeated (#118)`, { field: 'repeats', repeats: target });
+    }
+  }
+}
+
+// Everything after a formal record commits: the review status (#115) and the
+// repeat escalation (#118). It never throws, because the caller's terminal
+// cleanup would delete an artifact the record now references; a failure is
+// reported in the result and the CLI exits 3.
+function afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, written, result, repeating, actor, options }) {
+  const out = {};
+  try {
+    const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+    const posted = postReviewStatus({
+      tenant, headSha: fullSha(headSha, verifiedRepo, options.git),
+      artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh: options.gh,
+    });
+    if (posted) Object.assign(out, posted);
+  } catch (error) {
+    Object.assign(out, { statusPosted: false, statusError: `status not derived: ${String(error.message || error).slice(0, 300)}` });
+  }
+  if (repeating.length) {
+    try {
+      const stored = readArtifact(root, written.relative) || { findings: [] };
+      const pairs = (stored.findings || []).filter((finding) => finding.repeats).map((finding) => `${finding.id} repeats ${finding.repeats}`);
+      let revision = result.revision;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const moved = workState.transitionRecord({
+            root, id: recordId, to: 'escalated', expectedRevision: revision,
+            idempotencyKey: `repeat-escalation:${written.relative}`, actor, now: options.now,
+            evidence: `wake:decision-needed; same finding raised twice, needs a Ruling: ${pairs.join(', ')} (${written.relative}, #118)`,
+          });
+          if (moved.paged && options.notifier) {
+            try { options.notifier({ root, recordId, sequence: moved.eventSequence }); } catch { /* the outbox line stands; the watcher's notifier retries */ }
+          }
+          out.escalated = { state: 'escalated', repeats: pairs, paged: Boolean(moved.paged) };
+          break;
+        } catch (error) {
+          if (error.code === 'STALE_REVISION' && attempt < STALE_RETRY_LIMIT) { revision = workState.getRecord({ root, id: recordId }).revision; continue; }
+          throw error;
+        }
+      }
+    } catch (error) {
+      out.escalated = { state: null, error: `${error.code || 'ERROR'}: ${String(error.message || error).slice(0, 300)}` };
+    }
+  }
+  return out;
+}
+
 function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, kind, headSha, actor } = options;
@@ -733,6 +821,9 @@ function recordReviewArtifact(options = {}) {
       // build also raises DUPLICATE_FINDING_ID before any file exists.
       const supplied = options.findings || [];
       const noFindings = options.noFindings;
+      // #118: `repeats` names a finding this record's chain already settled.
+      const repeating = supplied.filter((finding) => finding && typeof finding === 'object' && finding.repeats !== undefined);
+      if (repeating.length) validateRepeats({ root, recordId, kind, prior, repeating });
       const preview = buildFindings('pending', supplied, priors, resolutions);
       if (noFindings !== undefined) {
         if (typeof noFindings !== 'string' || !noFindings.trim() || noFindings === 'true') {
@@ -796,18 +887,8 @@ function recordReviewArtifact(options = {}) {
             priorArtifact: prior ? prior.artifact : null,
           },
         });
-        // #115: a formal record posts the tenant's review status on the head it
-        // reviewed. After the commit, outside the retry: a failed post never
-        // undoes the record (the caller sees statusPosted: false, exit 3).
-        if (kind === 'formal') {
-          const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
-          const posted = postReviewStatus({
-            tenant, headSha: fullSha(headSha, verifiedRepo, options.git),
-            artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh: options.gh,
-          });
-          if (posted) return { artifact: written.relative, result, ...posted };
-        }
-        return { artifact: written.relative, result };
+        if (kind !== 'formal') return { artifact: written.relative, result };
+        return { artifact: written.relative, result, ...afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, written, result, repeating, actor, options }) };
       } catch (error) {
         // A routine concurrent bump (pr-watch observing the PR) is retried when
         // the caller did not pin a revision; everything else is terminal.
@@ -1002,6 +1083,8 @@ function cli(argv) {
       resolutions: args.resolutions ? JSON.parse(args.resolutions) : null,
       priorArtifact: args['prior-artifact'],
       riskRuling: args['risk-ruling'],
+      // #118: a repeats escalation pages through the notifier like `hold` does.
+      notifier: require('./notify').spawnNotifier,
     });
   }
   if (command === 'attest') {
@@ -1035,6 +1118,11 @@ if (require.main === module) {
       // the caller sees it, and name the one command that repairs it.
       const context = answer.status?.context || 'review';
       process.stderr.write(`${JSON.stringify({ code: 'STATUS_NOT_POSTED', message: `the review stands (${answer.artifact}) but the ${context} status was not posted: ${answer.statusError}; run review-policy.js record --repost --id <record> once gh answers` })}\n`);
+      process.exitCode = 3;
+    }
+    if (answer && answer.escalated && answer.escalated.state === null) {
+      // #118: the review is recorded but the repeat escalation did not land.
+      process.stderr.write(`${JSON.stringify({ code: 'ESCALATION_NOT_RECORDED', message: `the review stands (${answer.artifact}) but the record was not escalated for its repeated finding: ${answer.escalated.error}; escalate it by hand (work-state.js transition --to escalated)` })}\n`);
       process.exitCode = 3;
     }
   } catch (error) {
