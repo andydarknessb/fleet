@@ -680,3 +680,75 @@ test('#125: a retired row that ended before the window is not read', () => {
   assert.equal(result.dailyReport.sessions.length, 0);
   assert.equal(result.report.sessions.length, 0);
 });
+
+// --- #126: the risk reviewer's spend is attributed to the unit that hosted it --------
+// Red-tell: before the change a qa-reviewer subagent's tokens appear nowhere.
+function agentTranscript({ sessionId, agentId, model = 'claude-opus-5-5', input, output, at = '2026-09-01T00:00:20.000Z' }) {
+  return [{ ...assistant({ uuid: `${agentId}-1`, timestamp: at, content: [{ type: 'text', text: 'Review complete: no findings.' }], usage: { input, output }, model }), sessionId, agentId, isSidechain: true }].map(line).join('\n');
+}
+const icSession = (sessionId, pr) => sessionTranscript({ sessionId, name: 'ic-9', at: '2026-09-01T00:00:10.000Z', input: 100, output: 10, pr });
+
+test('#126: a qa-reviewer subagent is a risk-reviewer line and is inside the hosting unit total', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9')],
+    retiredLines: [],
+    transcripts: { 's-9': icSession('s-9', 909) },
+    subagents: { 's-9': [{ id: 'q1', text: agentTranscript({ sessionId: 's-9', agentId: 'q1', input: 1000, output: 100 }), meta: { agentType: 'qa-reviewer', model: 'opus' } }] },
+  });
+  const report = result.dailyReport;
+  const [unit] = report.units;
+  assert.equal(unit.metrics.ownJobTokens, 110);
+  assert.equal(unit.metrics.riskReviewerJobTokens, 1100);
+  assert.equal(unit.metrics.jobTokens, 1210, 'the unit total includes the reviewer');
+  assert.deepEqual(report.riskReviewer, { runs: 1, jobTokens: 1100, freshTokens: 1100, byModel: { opus: { runs: 1, jobTokens: 1100 } } });
+  assert.match(fs.readFileSync(result.summaryArtifact, 'utf8'), /risk reviewer \(qa-reviewer\): 1 run\(s\), 1100 job tokens \(opus 1\)/);
+});
+
+test('#126: a subagent with no meta file counts in the unit total under unknown and is listed', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9')],
+    retiredLines: [],
+    transcripts: { 's-9': icSession('s-9', 909) },
+    subagents: { 's-9': [{ id: 'm1', text: agentTranscript({ sessionId: 's-9', agentId: 'm1', model: 'claude-sonnet-5', input: 40, output: 2 }) }] },
+  });
+  const report = result.dailyReport;
+  assert.equal(report.units[0].metrics.jobTokens, 152);
+  assert.equal(report.subagents.byAgentType.unknown.runs, 1);
+  assert.equal(report.subagents.byAgentType.unknown.jobTokens, 42);
+  assert.equal(report.subagentsWithoutMeta.length, 1);
+  assert.equal(report.subagentsWithoutMeta[0].agentId, 'm1');
+  assert.equal(report.subagentsWithoutMeta[0].session, 's-9');
+  assert.equal(report.riskReviewer.runs, 0);
+});
+
+test('#126: the unit total equals the session plus all its subagents, summarized by agent type', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9')],
+    retiredLines: [],
+    transcripts: { 's-9': icSession('s-9', 909) },
+    subagents: { 's-9': [
+      { id: 'q1', text: agentTranscript({ sessionId: 's-9', agentId: 'q1', input: 1000, output: 100 }), meta: { agentType: 'qa-reviewer', model: 'opus' } },
+      { id: 'r1', text: agentTranscript({ sessionId: 's-9', agentId: 'r1', model: 'claude-haiku-4-5-20251001', input: 30, output: 3 }), meta: { agentType: 'researcher', model: 'haiku' } },
+      { id: 'r2', text: agentTranscript({ sessionId: 's-9', agentId: 'r2', model: 'claude-haiku-4-5-20251001', input: 20, output: 2 }), meta: { agentType: 'researcher', model: 'haiku' } },
+    ] },
+  });
+  const report = result.dailyReport;
+  const metrics = report.units[0].metrics;
+  assert.equal(metrics.subagentRuns, 3);
+  assert.equal(metrics.jobTokens, metrics.ownJobTokens + metrics.subagentJobTokens);
+  assert.equal(metrics.jobTokens, 110 + 1100 + 33 + 22);
+  assert.deepEqual(report.subagents.byAgentType.researcher, { runs: 2, jobTokens: 55, freshTokens: 55, byModel: { haiku: { runs: 2, jobTokens: 55 } } });
+  assert.equal(report.subagents.runs, 3);
+  assert.equal(report.sessions.length, 1, 'a subagent transcript is never read as a session of its own');
+});
+
+test('#126: with an empty roster, subagent transcripts are still not read as sessions', () => {
+  const result = rotationFixture({
+    rosterSessions: [],
+    retiredLines: [],
+    transcripts: { 'pl-x': sessionTranscript({ sessionId: 'pl-x', name: 'pl-endzone', role: 'project-lead', at: '2026-09-01T01:00:00.000Z', input: 10, output: 0 }) },
+    subagents: { 'pl-x': [{ id: 'r1', text: agentTranscript({ sessionId: 'pl-x', agentId: 'r1', input: 5, output: 0, at: '2026-09-01T01:00:05.000Z' }), meta: { agentType: 'researcher', model: 'haiku' } }] },
+  });
+  assert.equal(result.dailyReport.sessions.length, 1);
+  assert.equal(result.dailyReport.roles['project-lead'].metrics.jobTokens, 15, 'the lead carries its researcher');
+});

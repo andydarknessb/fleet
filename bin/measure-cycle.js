@@ -298,8 +298,52 @@ function classifyTurns(turns) {
   });
 }
 
+// #126: a subagent's own figures. The risk reviewer is the `qa-reviewer` agent type; an
+// agent with no meta file is `unknown`.
+const RISK_REVIEWER_TYPE = 'qa-reviewer';
+function subagentFigures(agent) {
+  const usage = agent.usage || {};
+  return {
+    agentType: agent.agentType || 'unknown',
+    model: modelFamily(agent.model).key,
+    inputTokens: asNumber(usage.inputTokens),
+    outputTokens: asNumber(usage.outputTokens),
+    cacheCreationInputTokens: asNumber(usage.cacheCreationInputTokens),
+    cacheReadInputTokens: asNumber(usage.cacheReadInputTokens),
+    jobTokens: asNumber(usage.inputTokens) + asNumber(usage.outputTokens),
+    freshTokens: asNumber(usage.inputTokens) + asNumber(usage.outputTokens) + asNumber(usage.cacheCreationInputTokens),
+  };
+}
+
+// { type: { runs, jobTokens, freshTokens, byModel: { key: { runs, jobTokens } } } }
+function addAgentType(target, type, figures) {
+  const entry = target[type] || (target[type] = { runs: 0, jobTokens: 0, freshTokens: 0, byModel: {} });
+  entry.runs += asNumber(figures.runs ?? 1);
+  entry.jobTokens += asNumber(figures.jobTokens);
+  entry.freshTokens += asNumber(figures.freshTokens);
+  const models = figures.byModel || { [figures.model]: { runs: 1, jobTokens: figures.jobTokens } };
+  for (const [key, value] of Object.entries(models)) {
+    const model = entry.byModel[key] || (entry.byModel[key] = { runs: 0, jobTokens: 0 });
+    model.runs += asNumber(value.runs);
+    model.jobTokens += asNumber(value.jobTokens);
+  }
+}
+
 function metricsForTranscript(transcript) {
-  const usage = transcript.usage;
+  const own = transcript.usage;
+  // #126: a session's figures include every subagent it hosted (the risk reviewer,
+  // researchers, reviewers); `own*` keeps the session alone, `subagent*` the rest.
+  const agents = (transcript.subagents || []).map((agent) => ({ ...subagentFigures(agent), agentId: agent.agentId || null, sourcePath: agent.sourcePath || null, hasMeta: agent.hasMeta !== false }));
+  const agentSum = (key) => agents.reduce((total, agent) => total + agent[key], 0);
+  const risk = agents.filter((agent) => agent.agentType === RISK_REVIEWER_TYPE);
+  const subagentsByType = {};
+  for (const agent of agents) addAgentType(subagentsByType, agent.agentType, agent);
+  const usage = {
+    inputTokens: own.inputTokens + agentSum('inputTokens'),
+    outputTokens: own.outputTokens + agentSum('outputTokens'),
+    cacheCreationInputTokens: own.cacheCreationInputTokens + agentSum('cacheCreationInputTokens'),
+    cacheReadInputTokens: own.cacheReadInputTokens + agentSum('cacheReadInputTokens'),
+  };
   return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
@@ -307,6 +351,16 @@ function metricsForTranscript(transcript) {
     cacheReadInputTokens: usage.cacheReadInputTokens,
     freshTokens: usage.inputTokens + usage.outputTokens + usage.cacheCreationInputTokens,
     jobTokens: usage.inputTokens + usage.outputTokens,
+    ownJobTokens: own.inputTokens + own.outputTokens,
+    ownFreshTokens: own.inputTokens + own.outputTokens + own.cacheCreationInputTokens,
+    subagentRuns: agents.length,
+    subagentJobTokens: agentSum('jobTokens'),
+    subagentFreshTokens: agentSum('freshTokens'),
+    riskReviewerRuns: risk.length,
+    riskReviewerJobTokens: risk.reduce((total, agent) => total + agent.jobTokens, 0),
+    riskReviewerFreshTokens: risk.reduce((total, agent) => total + agent.freshTokens, 0),
+    subagentsByType,
+    subagentsWithoutMeta: agents.filter((agent) => !agent.hasMeta).map((agent) => ({ session: transcript.sessionId, agentId: agent.agentId, transcript: agent.sourcePath })),
     firstUsefulTurnCacheCreationInputTokens: transcript.firstUsefulTurnCacheCreationInputTokens || 0,
     assistantMessages: transcript.assistantMessages,
     userMessages: transcript.userMessages,
@@ -345,12 +399,14 @@ function sessionMetricForTranscript(transcript, row = null) {
 // merge, and the first-useful-turn figure is the earliest session's.
 function combineMetrics(list) {
   if (list.length === 1) return list[0];
-  const combined = { toolCallsByCommandClass: {} };
+  const combined = { toolCallsByCommandClass: {}, subagentsByType: {}, subagentsWithoutMeta: [] };
   for (const metrics of list) {
     for (const [key, value] of Object.entries(metrics)) {
       if (typeof value === 'number') combined[key] = (combined[key] || 0) + value;
     }
     for (const [key, value] of Object.entries(metrics.toolCallsByCommandClass || {})) addCount(combined.toolCallsByCommandClass, key, value);
+    for (const [type, value] of Object.entries(metrics.subagentsByType || {})) addAgentType(combined.subagentsByType, type, value);
+    combined.subagentsWithoutMeta.push(...(metrics.subagentsWithoutMeta || []));
   }
   combined.firstUsefulTurnCacheCreationInputTokens = list[0].firstUsefulTurnCacheCreationInputTokens || 0;
   return combined;
@@ -652,22 +708,46 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
     period: { since: since || null, until: until || null },
     metricDefinitions: {
       freshTokens: 'input + output + cache-creation tokens; cache-read tokens are excluded',
-      jobTokens: 'input + output tokens only; cache fields are reported separately',
-      controlPlaneFreshTokens: 'fresh tokens from Dispatcher, project-lead, Sentinel, and notifier sessions',
+      jobTokens: 'input + output tokens only, the session plus every subagent it hosted (#126); ownJobTokens is the session alone; cache fields are reported separately',
+      controlPlaneFreshTokens: 'fresh tokens from Dispatcher, project-lead, Principal, Sentinel, and notifier sessions, live and rotated out (#125)',
       controlPlaneFreshPerCompletedUnit: 'control-plane fresh tokens divided by completed units in the window',
       projectLeadFreshPerMergedPr: 'project-lead fresh tokens divided by merged pull requests (one per completed unit) in the window',
-      icJobTokensMedian: 'median over completed units of the IC session job tokens (input + output; the rotation and budget definition)',
+      icJobTokensMedian: 'median over completed units of whole-life IC job tokens: every session that worked the issue plus their subagents (#125, #126). Not the budget.js figure, which measures one live session',
     },
     sample: { sessionSources: sessionSources(sessionMetrics || []), completedUnits: units.length, excludedUnits: (excluded || []).length, excludedByReason: (excluded || []).reduce((acc, item) => { acc[item.reason] = (acc[item.reason] || 0) + 1; return acc; }, {}) },
     metrics,
     unitMetrics: unitMetrics(units, roles, budgets),
     ...modelBreakdown(units, sessionMetrics || []),
+    ...subagentBreakdown(observed),
     sessions: sessionMetrics || [],
     roles,
     units,
     excluded: excluded || [],
     verificationErrors: verificationErrors || [],
     retiredLog: retiredLog ? { path: retiredLog.path, rows: retiredLog.rows.length, missing: retiredLog.missing, skipped: retiredLog.skipped } : null,
+  };
+}
+
+// #126: subagents across the observed set (completed units plus control-plane sessions,
+// the same set every other total uses, so an IC session is never counted twice). The
+// risk reviewer is its own line; every subagent is also inside its host's totals.
+function subagentBreakdown(observed) {
+  const byAgentType = {};
+  const withoutMeta = [];
+  for (const metrics of observed) {
+    for (const [type, value] of Object.entries(metrics.subagentsByType || {})) addAgentType(byAgentType, type, value);
+    withoutMeta.push(...(metrics.subagentsWithoutMeta || []));
+  }
+  const risk = byAgentType[RISK_REVIEWER_TYPE] || { runs: 0, jobTokens: 0, freshTokens: 0, byModel: {} };
+  const entries = Object.values(byAgentType);
+  return {
+    riskReviewer: { runs: risk.runs, jobTokens: risk.jobTokens, freshTokens: risk.freshTokens, byModel: risk.byModel },
+    subagents: {
+      runs: entries.reduce((total, entry) => total + entry.runs, 0),
+      jobTokens: entries.reduce((total, entry) => total + entry.jobTokens, 0),
+      byAgentType: Object.fromEntries(Object.entries(byAgentType).sort(([a], [b]) => a.localeCompare(b))),
+    },
+    subagentsWithoutMeta: withoutMeta,
   };
 }
 
@@ -715,6 +795,12 @@ function renderSummary(report) {
   lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (limit ${show(b.projectLeadFreshPerMergedPr?.limit)}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
   lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; limit ${show(u.budgets?.icJobTokensMedian?.limit)})${mark(u.budgets?.icJobTokensMedian?.pass)}`);
   lines.push(`IC fresh tokens median: ${show(u.icFreshTokensMedian)}`);
+  const risk = report.riskReviewer || { runs: 0, jobTokens: 0, byModel: {} };
+  const riskModels = Object.entries(risk.byModel || {}).map(([key, value]) => `${key} ${value.runs}`).join(', ');
+  lines.push(`risk reviewer (qa-reviewer): ${risk.runs} run(s), ${risk.jobTokens} job tokens${riskModels ? ` (${riskModels})` : ''}; counted inside each hosting unit's total`);
+  const agentTypes = Object.entries(report.subagents?.byAgentType || {});
+  lines.push(`subagents by type: ${agentTypes.length ? agentTypes.map(([type, value]) => `${type} ${value.runs} run(s)/${value.jobTokens} job`).join(', ') : 'none'}`);
+  if ((report.subagentsWithoutMeta || []).length) lines.push(`subagents without a meta file (counted as unknown): ${report.subagentsWithoutMeta.map((entry) => `${entry.session}/${entry.agentId}`).join(', ')}`);
   lines.push(`exclusions by reason: ${JSON.stringify(report.sample.excludedByReason || {})}`);
   const models = Object.entries(report.byModel || {});
   lines.push(`models: ${models.length ? models.map(([key, entry]) => `${key} ${entry.units} unit(s)/${entry.sessions} session(s)`).join(', ') : 'none'}`);
@@ -753,11 +839,38 @@ function listTranscriptFiles(root) {
     const directory = pending.pop();
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const candidate = path.join(directory, entry.name);
-      if (entry.isDirectory()) pending.push(candidate);
+      // #126: subagent transcripts belong to their host session, never a session of their own.
+      if (entry.isDirectory()) { if (entry.name !== 'subagents') pending.push(candidate); }
       else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(candidate);
     }
   }
   return files.sort();
+}
+
+// #126: a session's subagents live beside its transcript as
+// <sessionId>/subagents/agent-<id>.jsonl, each with agent-<id>.meta.json naming its
+// agentType and model. A missing or unreadable meta file leaves the agent `unknown`.
+function readSubagents(sessionFile) {
+  const dir = path.join(path.dirname(sessionFile), path.basename(sessionFile, '.jsonl'), 'subagents');
+  if (!fs.existsSync(dir)) return [];
+  const agents = [];
+  for (const name of fs.readdirSync(dir).filter((entry) => entry.startsWith('agent-') && entry.endsWith('.jsonl')).sort()) {
+    const file = path.join(dir, name);
+    const agentId = name.slice('agent-'.length, -'.jsonl'.length);
+    let meta = null;
+    try { meta = JSON.parse(fs.readFileSync(path.join(dir, `agent-${agentId}.meta.json`), 'utf8')); } catch { meta = null; }
+    let parsed;
+    try { parsed = parseTranscript(fs.readFileSync(file, 'utf8'), file); } catch { continue; }
+    agents.push({
+      agentId,
+      agentType: meta?.agentType || 'unknown',
+      model: meta?.model || parsed.model || null,
+      hasMeta: Boolean(meta),
+      usage: parsed.usage,
+      sourcePath: file,
+    });
+  }
+  return agents;
 }
 
 function loadTenantConfigs(tenantConfigsDir) {
@@ -841,7 +954,7 @@ function collectFromFiles({ transcriptsDir, rosterPath, retiredPath, outputDir, 
   let transcriptFiles = allTranscriptFiles.filter((file) => {
     return wantedSessionIds.size === 0 || wantedSessionIds.has(path.basename(file, '.jsonl'));
   });
-  const transcripts = transcriptFiles.map((file) => parseTranscript(fs.readFileSync(file, 'utf8'), file));
+  const transcripts = transcriptFiles.map((file) => ({ ...parseTranscript(fs.readFileSync(file, 'utf8'), file), subagents: readSubagents(file) }));
   let cycles = buildCycleRecords({ roster, transcripts, allowTranscriptEvidence: true });
   let verificationErrors = [];
   if (verifyGithub) {
@@ -963,6 +1076,8 @@ module.exports = {
   buildCycleRecords,
   buildReport,
   loadRetiredRows,
+  readSubagents,
+  RISK_REVIEWER_TYPE,
   mergeSessionRows,
   classifyTurns,
   cli,
