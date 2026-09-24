@@ -133,7 +133,11 @@ function reviewFinding(record, events, exceptions) {
     .map((event) => String(event.changes.headSha));
   const reviewed = mergedHead ? formalHeads.some((head) => sameCommit(head, mergedHead)) : formalHeads.length > 0;
   if (reviewed) return null;
-  const exception = mergedHead && exceptions.find((entry) => entry.recordId === record.id && sameCommit(entry.head, mergedHead));
+  // Ruling 2026-09-24: a record the watcher merged before it recorded heads
+  // (endzone #601) has none; its entry says `head: "unrecorded"` and matches only
+  // a record that really has no merged head.
+  const exception = exceptions.find((entry) => entry.recordId === record.id
+    && (mergedHead ? sameCommit(entry.head, mergedHead) : entry.head === 'unrecorded'));
   if (exception) return { acknowledged: { kind: 'merged-without-review-acknowledged', recordId: record.id, mergedHead, ruling: exception.ruling } };
   return { finding: { kind: 'merged-without-review', mergedHead, formalHeads } };
 }

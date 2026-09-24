@@ -283,12 +283,26 @@ test('#114: an unreadable review-exceptions file fails closed', () => {
   assert.equal(result.findingsByKind['review-exceptions-unreadable'], 1);
 });
 
-test('#114: the shipped exceptions file names only endzone #1241 and #1263, each with a ruling', () => {
+test('ruling 2026-09-24: `head: "unrecorded"` acknowledges only a record with no merged head', () => {
+  const root = rootDir();
+  const id = unit(root, 40, ['pr-open', 'review', 'merged'], { formalAt: null, mergedHead: null });
+  writeExceptions(root, [{ recordId: id, head: 'unrecorded', ruling: 'r' }]);
+  assert.equal(verifyLedger({ root }).pass, true);
+  const root2 = rootDir();
+  const id2 = unit(root2, 41, ['pr-open', 'review', 'merged'], { formalAt: null });
+  writeExceptions(root2, [{ recordId: id2, head: 'unrecorded', ruling: 'r' }]);
+  assert.equal(verifyLedger({ root: root2 }).findingsByKind['merged-without-review'], 1, 'a record with a real merged head is not matched by "unrecorded"');
+});
+
+// The shipped file is the Ruling of record: #1241/#1263 (retro review) plus the
+// 2026-09-24 ruling's three classes. Adding a record means adding a ruling.
+test('#114: every shipped exception names a head and a ruling, and the set is the ruled one', () => {
   const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'review-exceptions.json'), 'utf8'));
-  assert.deepEqual(shipped.exceptions.map((e) => e.recordId).sort(), ['endzone:issue-1241', 'endzone:issue-1263']);
+  const ruled = [1241, 1263, 601, 602, 615, 619, 620, 633, 636, 641, 642, 733, 769, 787, 883, 1312, 1578].map((n) => `endzone:issue-${n}`);
+  assert.deepEqual(shipped.exceptions.map((e) => e.recordId).sort(), ruled.sort());
   for (const entry of shipped.exceptions) {
-    assert.match(entry.head, /^[0-9a-f]{40}$/);
-    assert.match(entry.ruling, /#1545/);
+    assert.match(entry.head, /^([0-9a-f]{40}|unrecorded)$/, entry.recordId);
+    assert.match(entry.ruling, /#1545|Ruling 2026-09-24/, entry.recordId);
   }
 });
 
