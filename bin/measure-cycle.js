@@ -562,10 +562,22 @@ function loadRetiredRows(file) {
 }
 
 // #125: the session set is the live roster plus every retired row that overlaps the
-// window [lower, upper) (either bound may be null: unbounded). A session in both counts
-// once, as its live row; the same session appended twice to the archive counts once.
+// window [lower, upper) (either bound may be null: unbounded), plus every retired IC row
+// of an issue already in the set. A session in both counts once, as its live row; the
+// same session appended twice to the archive counts once.
 function mergeSessionRows(rosterRows, retiredRows, { lower = null, upper = null } = {}) {
   const keyOf = (row) => row.sessionId || `${row.name}@${row.launchedAt || row.startedAt || ''}`;
+  const overlaps = (row) => {
+    const start = Date.parse(row.launchedAt || row.startedAt || '');
+    const end = Date.parse(row.retiredAt || '');
+    if (lower !== null && Number.isFinite(end) && end < lower) return false;
+    if (upper !== null && Number.isFinite(start) && start >= upper) return false;
+    return true;
+  };
+  // A unit's figures are whole-life: once any of an issue's IC rows is in the set, every
+  // retired session of that issue is too, even one that retired before the window.
+  const icKey = (row) => (String(row.role || '').toLowerCase() === 'ic' && Number(row.issue) > 0 ? `${row.tenant || ''}:${Number(row.issue)}` : null);
+  const wantedIssues = new Set([...rosterRows, ...retiredRows].filter(overlaps).map(icKey).filter(Boolean));
   const seen = new Set();
   const merged = [];
   for (const row of rosterRows) {
@@ -575,10 +587,7 @@ function mergeSessionRows(rosterRows, retiredRows, { lower = null, upper = null 
   for (const row of retiredRows) {
     const key = keyOf(row);
     if (seen.has(key)) continue;
-    const start = Date.parse(row.launchedAt || row.startedAt || '');
-    const end = Date.parse(row.retiredAt || '');
-    if (lower !== null && Number.isFinite(end) && end < lower) continue;
-    if (upper !== null && Number.isFinite(start) && start >= upper) continue;
+    if (!overlaps(row) && !wantedIssues.has(icKey(row))) continue;
     seen.add(key);
     merged.push({ ...row, source: 'retired' });
   }

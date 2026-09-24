@@ -809,3 +809,16 @@ test('#128: the seven-day JSON carries the per-family figures, and the shipped c
   const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
   assert.deepEqual(json.unitMetrics.icByModel.sonnet, { units: 1, jobTokensMedian: 68, jobTokensP90: 68, target: null, pass: null });
 });
+
+test('#125 review: a unit whose earlier session retired before the window still sums every session', () => {
+  const result = rotationFixture({
+    rosterSessions: [icRow(9, 's-9b', { retiredAt: '2026-09-01T00:01:00.000Z' })],
+    retiredLines: [icRow(9, 's-9a', { launchedAt: '2026-08-20T00:00:00.000Z', retiredAt: '2026-08-20T05:00:00.000Z', retiredBecause: 'respawn' })],
+    transcripts: {
+      's-9a': sessionTranscript({ sessionId: 's-9a', name: 'ic-9', at: '2026-08-20T01:00:00.000Z', input: 700, output: 70 }),
+      's-9b': sessionTranscript({ sessionId: 's-9b', name: 'ic-9', at: '2026-09-01T00:00:40.000Z', input: 100, output: 10, pr: 909 }),
+    },
+  });
+  assert.equal(result.dailyReport.units[0].sessions, 2);
+  assert.equal(result.dailyReport.units[0].metrics.jobTokens, 880);
+});

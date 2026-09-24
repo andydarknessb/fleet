@@ -121,3 +121,11 @@ test('#124: the budget summary by-model tables use the same folded keys as the s
   const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
   assert.match(md, /unrecognized models: gpt-9-turbo \(1 unit\)/);
 });
+
+test('#126 review: the collector section says its figures are whole-life, not the budget measure', () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'state', 'metrics', 'seven-day-2026-09-09.json'), JSON.stringify({ period: {}, units: [{ model: 'sonnet', metrics: { jobTokens: 1 } }] }));
+  buildSummary({ root, now: '2026-09-09T04:00:00.000Z' });
+  const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
+  assert.match(md, /## Completed units by model, whole-life \(every session plus subagents; not the live budget measure\)/);
+});

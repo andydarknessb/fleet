@@ -31,7 +31,7 @@ class SecondReadError extends Error {
 }
 
 const SECOND_READ_FLAGS = ['root', 'now', 'dry-run'];
-const DEFAULTS = Object.freeze({ repo: 'andydarknessb/fleet', label: 'second-read', minChangedLines: 150 });
+const DEFAULTS = Object.freeze({ repo: 'andydarknessb/fleet', label: 'second-read', minChangedLines: 150, maxPrLookups: 50 });
 
 function baseOf(root) { return path.resolve(root || path.join(__dirname, '..')); }
 function readJson(file, fallback) {
@@ -84,6 +84,8 @@ function selectSecondRead({ root, now, gh = defaultGh } = {}) {
   const candidates = [];
   const errors = [];
   const seen = new Set();
+  let lookups = 0;
+  let skippedForCap = 0;
   for (const event of events) {
     if (event.type !== 'review-recorded' || event.changes?.kind !== 'formal' || !inWeek(week, event.at)) continue;
     const relative = String(event.changes.artifact || '');
@@ -97,6 +99,10 @@ function selectSecondRead({ root, now, gh = defaultGh } = {}) {
     const pr = prs.get(event.recordId) || null;
     const entry = { recordId: event.recordId, tenant, repo, pr, artifact: relative, reviewer: artifact.reviewer || event.actor || 'unknown', reviewedAt: event.at, headSha: event.changes.headSha || artifact.headSha || null, statement: artifact.noFindings.trim() };
     if (!repo || !pr) { errors.push({ ...entry, error: !repo ? `no GitHub repo for tenant ${tenant}` : 'no PR number on the record' }); continue; }
+    // Each size is one bounded GitHub read; past secondRead.maxPrLookups the rest of the
+    // week's zero-finding reviews are counted, not sized.
+    if (lookups >= settings.maxPrLookups) { skippedForCap += 1; continue; }
+    lookups += 1;
     let size;
     try { size = JSON.parse(gh(['pr', 'view', String(pr), '-R', repo, '--json', 'additions,deletions,changedFiles'])); } catch (error) {
       errors.push({ ...entry, error: String(error.message || error).split('\n')[0] });
@@ -110,14 +116,14 @@ function selectSecondRead({ root, now, gh = defaultGh } = {}) {
   }
   candidates.sort((a, b) => b.changedLines - a.changedLines || a.pr - b.pr || a.artifact.localeCompare(b.artifact));
   const pick = candidates.find((candidate) => !candidate.alreadyPicked) || null;
-  return { week, settings, candidates, pick, errors };
+  return { week, settings, candidates, pick, errors, skippedForCap };
 }
 
-function renderIssueBody(pick, week) {
+function renderIssueBody(pick, week, settings = DEFAULTS) {
   const prUrl = `https://github.com/${pick.repo}/pull/${pick.pr}`;
   const prompt = `Second read of ${prUrl} at head ${pick.headSha}. Its formal review (${pick.artifact}) recorded no findings: "${pick.statement.replace(/"/g, "'")}". Review the whole diff from the angle: correctness and spec, the angle a formal review owns. Return findings with file:line, severity and category, or one line saying you agree.`;
   return [
-    `Weekly reviewer audit (fleet #132, spec #91) for ${week.label}: one zero-finding formal review on a diff over 150 changed lines, picked for an independent opus second read. The pick is the largest such diff not already read.`,
+    `Weekly reviewer audit (fleet #132, spec #91) for ${week.label}: one zero-finding formal review on a diff over ${settings.minChangedLines} changed lines, picked for an independent opus second read. The pick is the largest such diff not already read.`,
     '',
     `- PR: ${prUrl} (${pick.recordId})`,
     `- Diff size: ${pick.changedLines} changed lines (${pick.additions} additions, ${pick.deletions} deletions, ${pick.changedFiles} files)`,
@@ -153,17 +159,17 @@ function fileSecondRead({ root, now, gh = defaultGh, dryRun = false } = {}) {
   if (already) return { outcome: 'already-picked', week, pick: already, message: `second read for ${week.label} already filed: ${already.issueUrl || already.artifact}` };
   const selection = selectSecondRead({ root: base, now: at, gh });
   if (!selection.pick) {
-    return { outcome: 'no-candidate', week, candidates: selection.candidates, errors: selection.errors, message: `no zero-finding formal review on a diff over ${selection.settings.minChangedLines} changed lines in ${week.label}; nothing filed` };
+    return { outcome: 'no-candidate', week, candidates: selection.candidates, errors: selection.errors, skippedForCap: selection.skippedForCap, message: `no zero-finding formal review on a diff over ${selection.settings.minChangedLines} changed lines in ${week.label}; nothing filed` };
   }
   const { pick, settings } = selection;
   const title = `Second read: PR #${pick.pr} (${pick.tenant}), zero-finding review on ${pick.changedLines} changed lines, week ${week.label}`;
-  const body = renderIssueBody(pick, week);
-  if (dryRun) return { outcome: 'would-file', week, pick, candidates: selection.candidates, errors: selection.errors, title, body };
+  const body = renderIssueBody(pick, week, settings);
+  if (dryRun) return { outcome: 'would-file', week, pick, candidates: selection.candidates, errors: selection.errors, skippedForCap: selection.skippedForCap, title, body };
   gh(['label', 'create', settings.label, '-R', settings.repo, '--color', '5319E7', '--description', 'Weekly opus second read of a zero-finding review (fleet #132)', '--force']);
   const url = String(gh(['issue', 'create', '-R', settings.repo, '--title', title, '--label', settings.label, '--body', body])).trim().split(/\r?\n/).pop();
   const number = Number((url.match(/\/issues\/(\d+)$/) || [])[1]) || null;
   appendPick(base, { week: week.label, at, recordId: pick.recordId, tenant: pick.tenant, pr: pick.pr, changedLines: pick.changedLines, reviewer: pick.reviewer, artifact: pick.artifact, issueUrl: url, issueNumber: number });
-  return { outcome: 'filed', week, pick, candidates: selection.candidates, errors: selection.errors, issue: { url, number } };
+  return { outcome: 'filed', week, pick, candidates: selection.candidates, errors: selection.errors, skippedForCap: selection.skippedForCap, issue: { url, number } };
 }
 
 function cli(argv) {
@@ -180,7 +186,7 @@ function cli(argv) {
 if (require.main === module) {
   try {
     const result = cli(process.argv.slice(2));
-    process.stdout.write(`${JSON.stringify({ outcome: result.outcome, week: result.week.label, pr: result.pick?.pr ?? null, changedLines: result.pick?.changedLines ?? null, issue: result.issue?.url || result.pick?.issueUrl || null, candidates: (result.candidates || []).length, errors: (result.errors || []).map((e) => `${e.recordId} PR ${e.pr}: ${e.error}`), message: result.message || null })}\n`);
+    process.stdout.write(`${JSON.stringify({ outcome: result.outcome, week: result.week.label, pr: result.pick?.pr ?? null, changedLines: result.pick?.changedLines ?? null, issue: result.issue?.url || result.pick?.issueUrl || null, candidates: (result.candidates || []).length, skippedForCap: result.skippedForCap || 0, errors: (result.errors || []).map((e) => `${e.recordId} PR ${e.pr}: ${e.error}`), message: result.message || null })}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: String(error.message || error) })}\n`);
     process.exitCode = error.code === 'USAGE' ? 2 : 1;

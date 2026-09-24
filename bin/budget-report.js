@@ -146,7 +146,7 @@ function render(s) {
     const b = s.live.byModel[m];
     lines.push(`- ${m}: measured ${b.measured}, unmeasured ${b.unmeasured}, over warn ${b.warn}, over escalate ${b.escalate}; median job tokens ${b.medianJobTokens ?? 'n/a'}, max ${b.maxJobTokens ?? 'n/a'}`);
   }
-  lines.push('', `## Completed units by model (${s.completed.source || 'no collector report'})`, '');
+  lines.push('', `## Completed units by model, whole-life (every session plus subagents; not the live budget measure) (${s.completed.source || 'no collector report'})`, '');
   const doneModels = Object.keys(s.completed.byModel).sort();
   if (!doneModels.length) lines.push('No completed units in the collector window.');
   for (const m of doneModels) {

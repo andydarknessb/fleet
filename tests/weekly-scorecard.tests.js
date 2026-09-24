@@ -227,3 +227,9 @@ test('#131: a dry run writes nothing under state/ and tells the collector so', (
   assert.equal(card.artifacts, undefined);
   assert.equal(fs.existsSync(path.join(root, 'state', 'metrics')), false);
 });
+
+test('#131 review: the IC cost table cell carries the per-family medians', () => {
+  const row = build().rows.find((r) => r.key === 'icCost');
+  assert.match(row.result, /whole-life: haiku median 30000 \(1 unit\), sonnet median 60000 \(3 units\)/);
+  assert.match(row.result, /budget\.js 1 warning\(s\), 1 escalation\(s\)/);
+});

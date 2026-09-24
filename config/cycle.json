@@ -36,7 +36,8 @@
   "secondRead": {
     "repo": "andydarknessb/fleet",
     "label": "second-read",
-    "minChangedLines": 150
+    "minChangedLines": 150,
+    "maxPrLookups": 50
   },
   "scorecard": {
     "cycleTimeMedianHours": { "watch": 2, "weak": 6 },

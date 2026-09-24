@@ -90,6 +90,8 @@ function defaultGh(args) {
 }
 
 // A dry run writes nothing under state/: its collector output goes to a temp directory.
+// measure-cycle.js is required here, not at the top, so bin/daily-summary.js (which reads
+// this module for the headline) never loads the collector.
 function defaultCollect({ base, week, dryRun = false }) {
   const { collectFromFiles } = require('./measure-cycle');
   const os = require('node:os');
@@ -320,7 +322,7 @@ function icCostRow(base, events, week, collect, dryRun) {
   const status = judged.some((entry) => entry.pass === false) ? 'weak' : (judged.length ? 'good' : 'n/a');
   return {
     figures: { collector, budget },
-    result: `whole-life median ${collector.medianJobTokens ?? 'n/a'} job tokens (p90 ${collector.p90JobTokens ?? 'n/a'}), reported not judged; budget.js ${budget.warnings} warning(s), ${budget.escalations} escalation(s)`,
+    result: `whole-life: ${Object.keys(byModel).length ? Object.entries(byModel).map(([key, entry]) => `${key} median ${entry.jobTokensMedian ?? 'n/a'} (${plural(entry.units, 'unit')})`).join(', ') : 'no completed unit'}, reported not judged; budget.js ${budget.warnings} warning(s), ${budget.escalations} escalation(s)`,
     status,
   };
 }

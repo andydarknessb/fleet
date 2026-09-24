@@ -164,3 +164,21 @@ test('#132: cli refuses an unknown flag', () => {
     return true;
   });
 });
+
+test('#132 review: GitHub size lookups are capped and the cap is reported', () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ secondRead: { repo: 'andydarknessb/fleet', label: 'second-read', minChangedLines: 150, maxPrLookups: 2 } }));
+  const stub = ghStub(threeQualifying(root));
+  const selection = selectSecondRead({ root, now: NOW, gh: stub.gh });
+  assert.equal(stub.calls.filter((a) => a[0] === 'pr').length, 2);
+  assert.equal(selection.skippedForCap, 2, 'two zero-finding reviews were never sized');
+});
+
+test('#132 review: the issue body states the configured threshold, not a hardcoded one', () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ secondRead: { repo: 'andydarknessb/fleet', minChangedLines: 300 } }));
+  const { pick, week, settings } = selectSecondRead({ root, now: NOW, gh: ghStub(threeQualifying(root)).gh });
+  const body = renderIssueBody(pick, week, settings);
+  assert.match(body, /over 300 changed lines/);
+  assert.doesNotMatch(body, /over 150 changed lines/);
+});
