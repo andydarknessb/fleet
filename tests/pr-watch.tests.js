@@ -178,6 +178,7 @@ test('settled gates with linkage move to review, wake checks-settled once, and t
   const wakes = outbox(root);
   assert.equal(wakes.length, 1);
   assert.equal(wakes[0].wake, 'checks-settled');
+  assert.equal(wakes[0].actor, 'pr-watch', 'fleet#141: an observe wake names its writer');
   const wakeEvent = events(root).find((e) => e.sequence === wakes[0].eventSequence && e.recordId === wakes[0].recordId);
   assert.match(wakeEvent.evidence, /^wake:checks-settled; /);
   const before = events(root).length;
@@ -197,6 +198,8 @@ test('settled gates without linkage reach decision-needed with the watcher mark,
   assert.equal(rec.prior_state, 'ci-wait');
   assert.ok(String(rec.decisionEvidence).includes(WATCHER_MARK));
   assert.equal(outbox(root)[0].wake, 'decision-needed');
+  // fleet#141: the watcher's own decision-needed carries its actor, so the frontier wake still delivers it to the lead.
+  assert.equal(outbox(root)[0].actor, 'pr-watch');
   // Ticket 07: the decision event launches one notifier, pointed at that event.
   assert.deepEqual(launches, [{ root, recordId: 'endzone:issue-42', sequence: outbox(root)[0].eventSequence }]);
   watch(root, f, { notifier: (launch) => launches.push(launch) });

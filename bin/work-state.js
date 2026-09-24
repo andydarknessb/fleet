@@ -861,7 +861,7 @@ function transitionRecord(options = {}) {
     // PR-less record used to reach every ledger but that one. A replay repairs
     // a missing line (a crash between commit and append) and never duplicates.
     const pageDecision = (result) => (DECISION_STATES.includes(to)
-      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, now: options.now }) }
+      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, now: options.now }) }
       : result);
     const replay = replayIfKnown(record, key);
     if (replay) return pageDecision(replay);
@@ -1054,15 +1054,17 @@ function outboxHasWake(root, recordId, idempotencyKey) {
 // Idempotent by (recordId, idempotencyKey): the door that commits a decision
 // transition writes the line, so a caller that also writes one (the watcher,
 // for its observe wakes) finds it and appends nothing. Returns whether a line
-// was written, which is the caller's cue to launch the page.
-function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, now } = {}) {
+// was written, which is the caller's cue to launch the page. `actor` is the
+// writer's provenance (fleet#141): the watchdog's frontier wake does not wake a
+// lead for a decision-needed line that lead wrote itself.
+function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, now } = {}) {
   if (outboxHasWake(root, recordId, idempotencyKey)) return false;
   const file = wakeOutboxFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
-  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, evidence: text };
+  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), evidence: text };
   fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
   return true;
 }
@@ -1456,7 +1458,10 @@ function cli(argv) {
     throw new WorkStateError('USAGE', `unknown command '${command}'; commands: ${Object.keys(FLAGS).join(', ')}`);
   }
   const args = parseArgs(rest, FLAGS[command]);
-  const common = { root: args.root, now: args.now, actor: args.actor, evidence: args.evidence, idempotencyKey: args['idempotency-key'] };
+  // --actor defaults to FLEET_NAME, which is in every fleet session's environment
+  // (fleet#141, as review-policy.js does since fleet#46): a lead's escalation that
+  // omitted it was recorded as "unknown" and read as someone else's wake.
+  const common = { root: args.root, now: args.now, actor: args.actor || process.env.FLEET_NAME || undefined, evidence: args.evidence, idempotencyKey: args['idempotency-key'] };
   if (command === 'create') return createRecord({ ...common, id: args.id, tenant: args.tenant, issue: Number(args.issue), state: args.state || 'assigned', github: args['pr-number'] ? { issueNumber: Number(args.issue), prNumber: Number(args['pr-number']) } : undefined });
   if (command === 'reserve') return reserveRecord({
     ...common, id: args.id, tenant: args.tenant, issue: Number(args.issue), manifestPath: args.manifest,

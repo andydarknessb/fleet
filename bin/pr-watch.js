@@ -505,7 +505,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
           // nothing. Observe wakes (checks-settled, checks-failed) are written here.
           workState.appendWakeOutbox({
             root: base, recordId: record.id, revision: acted.revision, eventSequence: acted.eventSequence,
-            wake: action.wake, idempotencyKey: key, evidence: action.evidence,
+            wake: action.wake, idempotencyKey: key, evidence: action.evidence, actor,
           });
           if (action.wake === 'decision-needed' && notifier) {
             try { notifier({ root: base, recordId: record.id, sequence: acted.eventSequence }); } catch (error) { health.actions.push(`${record.id}: notifier launch failed (${String(error.message || error).slice(0, 120)})`); }
