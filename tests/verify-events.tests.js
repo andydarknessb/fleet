@@ -344,3 +344,60 @@ test('#114 review: the head reconciled at the merge wins over an older observati
   fs.writeFileSync(file, JSON.stringify(active));
   assert.equal(verifyLedger({ root }).findingsByKind['merged-without-review'], 1, 'the review was of an older head than the one that merged');
 });
+
+// --- #129: each verification verdict is kept, not only the last ---------------------
+// Red-tell: before the change only state/verify/last.json is written, so a failing
+// verdict overwritten by a passing one leaves no trace.
+function historyLines(root) {
+  const file = path.join(root, 'state', 'verify', 'history.jsonl');
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+}
+
+test('#129: a failing then a passing run leave two history lines; last.json holds the pass', () => {
+  const root = rootDir();
+  const id = unit(root, 3, ['pr-open', 'review']);
+  const good = fs.readFileSync(eventFile(root), 'utf8');
+  rewriteEvents(root, (lines) => lines.filter((l) => !(l.recordId === id && l.sequence === 2)));
+  const failing = verifyLedger({ root, now: '2026-09-20T00:00:00.000Z' });
+  assert.equal(failing.pass, false);
+  fs.writeFileSync(eventFile(root), good);
+  const passing = verifyLedger({ root, now: '2026-09-21T00:00:00.000Z' });
+  assert.equal(passing.pass, true);
+  const lines = historyLines(root);
+  assert.deepEqual(lines.map((l) => [l.at, l.pass]), [['2026-09-20T00:00:00.000Z', false], ['2026-09-21T00:00:00.000Z', true]]);
+  const last = JSON.parse(fs.readFileSync(path.join(root, 'state', 'verify', 'last.json'), 'utf8'));
+  assert.equal(last.pass, true);
+  assert.equal(last.at, '2026-09-21T00:00:00.000Z');
+});
+
+test('#129: a history line carries totals, findingsByKind and the acknowledged count, no per-record detail', () => {
+  const root = rootDir();
+  const id = unit(root, 3, ['pr-open', 'review']);
+  rewriteEvents(root, (lines) => lines.filter((l) => !(l.recordId === id && l.sequence === 2)));
+  verifyLedger({ root, now: '2026-09-20T00:00:00.000Z' });
+  const [line] = historyLines(root);
+  assert.deepEqual(line.findingsByKind, { 'sequence-gap': 1 });
+  assert.equal(line.acknowledged, 0);
+  assert.equal(line.totals.records, 1);
+  assert.equal(line.records, undefined, 'no per-record detail');
+  assert.equal(line.globalFindings, undefined);
+
+  const root2 = rootDir();
+  const merged = unit(root2, 1241, ['pr-open', 'review', 'merged'], { formalAt: null });
+  fs.mkdirSync(path.join(root2, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root2, 'config', 'review-exceptions.json'), JSON.stringify({ exceptions: [{ recordId: merged, head: HEAD, ruling: 'test ruling' }] }));
+  verifyLedger({ root: root2, now: '2026-09-20T00:00:00.000Z' });
+  assert.equal(historyLines(root2)[0].acknowledged, 1);
+});
+
+test('#129: a history line older than 90 days is trimmed on the next write', () => {
+  const root = rootDir();
+  unit(root, 3, ['pr-open']);
+  const dir = path.join(root, 'state', 'verify');
+  fs.mkdirSync(dir, { recursive: true });
+  const old = { at: '2026-06-01T00:00:00.000Z', pass: true, totals: {}, findingsByKind: {}, acknowledged: 0 };
+  const recent = { at: '2026-08-01T00:00:00.000Z', pass: false, totals: {}, findingsByKind: { x: 1 }, acknowledged: 0 };
+  fs.writeFileSync(path.join(dir, 'history.jsonl'), `${JSON.stringify(old)}\nnot json\n${JSON.stringify(recent)}\n`);
+  verifyLedger({ root, now: '2026-09-20T00:00:00.000Z' });
+  assert.deepEqual(historyLines(root).map((l) => l.at), ['2026-08-01T00:00:00.000Z', '2026-09-20T00:00:00.000Z']);
+});
