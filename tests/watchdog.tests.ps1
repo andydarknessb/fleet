@@ -253,6 +253,35 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((Get-Content "$testRoot\state\watchdog\paged.json" -Raw) -eq $pagedBefore) '-Verify must not touch paged state'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\banner.txt")) '-Verify must not write the banner'
 
+  # Case 8b (fleet #100): the -Verify report path is per run, so two ticks started
+  # together both exit 0 and neither leaves its report behind. Against the old
+  # shared $env:TEMP path one run could delete the other's report mid-read. That
+  # window is too narrow to hit on demand, so the deterministic half: a wrapping
+  # check logs the -ReportPath each tick hands it, and every path is distinct.
+  $origCheck8b = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check-real.ps1" $origCheck8b
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply, [string]$ReportPath = "", [string]$Actor = "sentinel", [string]$HealRespawn = "")' + "`r`n" + '[IO.File]::WriteAllText("' + $testRoot.Replace('\', '\\') + '\verify-report-path-$PID.txt", $ReportPath)' + "`r`n" + '& "$PSScriptRoot\sentinel-check-real.ps1" -ReportPath $ReportPath' + "`r`n" + 'exit $LASTEXITCODE' + "`r`n")
+  $verifyRuns = @(1..4 | ForEach-Object {
+    $o = Join-Path $testRoot "verify-$_.out"; $e = Join-Path $testRoot "verify-$_.err"
+    Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$testRoot\bin\watchdog.ps1`" -NoToast -Verify" -NoNewWindow -PassThru -RedirectStandardOutput $o -RedirectStandardError $e
+  })
+  foreach ($vr in $verifyRuns) { $null = $vr.Handle }
+  foreach ($vr in $verifyRuns) { $vr.WaitForExit() }
+  foreach ($i in 0..($verifyRuns.Count - 1)) {
+    $vr = $verifyRuns[$i]
+    Assert-True ($vr.ExitCode -eq 0) "concurrent -Verify tick $($i + 1) must exit 0 (exit $($vr.ExitCode)): $(Get-Content (Join-Path $testRoot "verify-$($i + 1).err") -Raw)"
+    $vrLine = ((Get-Content (Join-Path $testRoot "verify-$($i + 1).out") -Raw).Trim() -split "`n")[-1] | ConvertFrom-Json
+    Assert-True (-not $vrLine.checkError) "concurrent -Verify tick $($i + 1) must read its own report (checkError: $($vrLine.checkError))"
+  }
+  $verifyPathFiles = @(Get-ChildItem $testRoot -Filter 'verify-report-path-*.txt')
+  $verifyPaths = @($verifyPathFiles | ForEach-Object { (Get-Content $_.FullName -Raw).Trim() } | Where-Object { $_ })
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheck8b
+  Remove-Item "$testRoot\bin\sentinel-check-real.ps1"; $verifyPathFiles | Remove-Item
+  Assert-True ($verifyPaths.Count -eq 4) "each -Verify tick must run the check once (got $($verifyPaths.Count))"
+  Assert-True (@($verifyPaths | Sort-Object -Unique).Count -eq 4) "each -Verify tick must hand the check its own report path (got: $($verifyPaths -join ', '))"
+  foreach ($vp in $verifyPaths) { Assert-True (-not (Test-Path $vp)) "a -Verify tick must remove its report after reading it ($vp)" }
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
   # ===== Ticket 08b: live supervision under state/flags/sentinel-off =====
   # A mock launch door records every call and answers like launch.ps1.
   Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")

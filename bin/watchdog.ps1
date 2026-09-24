@@ -404,7 +404,10 @@ try {
   # --- source: stdout/stderr may carry warnings and must not fail a healthy run or cost
   # --- 08b its parity data. Deleting the file first makes its existence proof of a
   # --- fresh, completed check.
-  $reportPath = if ($Verify) { Join-Path $env:TEMP 'fleet-watchdog-verify-check.json' } elseif ($mode -eq 'live') { "$FleetHome\state\sentinel\last-check.json" } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
+  # fleet #100: -Verify writes nothing under state/, so its report goes to a
+  # per-run temp file (removed once read); a fixed name let two concurrent
+  # -Verify ticks delete or overwrite each other's report.
+  $reportPath = if ($Verify) { Join-Path $env:TEMP "fleet-watchdog-verify-check-$PID-$([guid]::NewGuid().ToString('N')).json" } elseif ($mode -eq 'live') { "$FleetHome\state\sentinel\last-check.json" } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
   if (-not $Verify) { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; [IO.Directory]::CreateDirectory("$FleetHome\state\sentinel") | Out-Null }
   Remove-Item $reportPath -ErrorAction SilentlyContinue
   $check = $null; $checkError = ''; $checkExit = $null
@@ -426,6 +429,7 @@ try {
     }
   }
   Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue
+  if ($Verify) { Remove-Item $reportPath -ErrorAction SilentlyContinue }
   # A live check just respawned or retired sessions; the staleness grace below must read
   # the rows as they are now, not the pre-action snapshot, or the curing tick pages.
   if ($mode -eq 'live') { try { $daemon = Get-DaemonSessions -All -Strict } catch {} }
