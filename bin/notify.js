@@ -34,13 +34,12 @@ const WITHHELD_QUESTION = 'see the record';
 // (first-clause) question rule.
 const WATCHER_MARK = '[pr-watch]';
 
-// The exact sentence pr-watch.js's `mergedChain` (ticket 05 lower bound) and
-// review-policy.js's equivalent append to a merge's evidence when no formal
-// review was recorded. Both files are outside ticket 79's scope, so this is a
-// second copy of the literal text, not an import; a test below reads
-// pr-watch.js's source and fails the suite if the wording ever moves, since a
-// silent drift here would silently downgrade every such page to normal.
-const MERGE_REVIEW_SENTENCE = 'merged without a recorded formal review';
+// The exact sentence pr-watch.js's `mergedChain` (ticket 05 lower bound)
+// appends to a merge's evidence when no formal review was recorded. fleet#99:
+// it lives in work-state.js now, beside the door that accepts that event; a
+// test below still reads pr-watch.js's source and fails the suite if the
+// wording ever moves, since a silent drift would silently lose every such page.
+const { MERGE_REVIEW_SENTENCE } = workState;
 
 function evidenceCarriesMergeReviewSentence(evidence) {
   return String(evidence || '').includes(MERGE_REVIEW_SENTENCE);
@@ -332,43 +331,14 @@ function withinMergeReviewWindow(eventAt, now) {
   return Number.isFinite(at) && Number.isFinite(reference) && (reference - at) <= MERGE_REVIEW_WINDOW_HOURS * 60 * 60 * 1000;
 }
 
-// Delivery/dedupe for this source, full stop - not a rare-case fallback.
-// workState.notifyRecord's claim phase requires the referenced event's type to
-// be one of its own DECISION_EVENT_TYPES (`state-escalated`/`state-hold`
-// only); a `state-merged` event throws NOT_A_DECISION_EVENT there EVERY time,
-// whether or not the record is still active and literally `merged`, and a
-// record that has since moved on entirely (retiring/retired/released/
-// abandoned) separately throws DECISION_RESOLVED or NOT_FOUND. Widening
-// DECISION_EVENT_TYPES is a work-state.js change and out of ticket 79's scope,
-// so this source never touches the ledger's own notification door at all -
-// this file is the whole of its delivery record. Same shape as a ledger
-// notification entry (status, attempt, detail) so the same failed/
-// retryAuthorized rule applies uninterrupted; there is no CLI door to set
-// retryAuthorized here, so a failed delivery needs a hand edit to this file to
-// retry (a work-state.js change to accept `merged` as a decision type would be
-// the real fix, and is out of ticket 79's scope).
-function mergeFallbackFile(base) { return path.join(base, 'state', 'notify', 'merge-review-fallback.jsonl'); }
-
-function readMergeFallback(base) {
-  const file = mergeFallbackFile(base);
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean)
-    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
-    .filter(Boolean);
-}
-
-function latestFallbackEntry(entries, recordId, sequence) {
-  const matches = entries.filter((entry) => entry.recordId === recordId && Number(entry.sequence) === Number(sequence));
-  return matches.length ? matches[matches.length - 1] : null;
-}
-
-function appendMergeFallback(base, entry) { appendLine(mergeFallbackFile(base), entry); }
-
+// fleet#99: this source records through the work-state door like a decision
+// (`workState.notifyRecord` accepts a merge-review `state-merged` event on an
+// active or archived record), so its dedupe is the record's own notifications
+// entry. It used to live in state/notify/merge-review-fallback.jsonl.
 function findPendingMergedWithoutReview({ root, tenant, recordId, sequence, now } = {}) {
   const base = baseOf(root);
-  const fallback = readMergeFallback(base);
   const events = workState.readEvents(base)
-    .filter((event) => event.type === 'state-merged' && evidenceCarriesMergeReviewSentence(event.evidence))
+    .filter((event) => workState.isMergeReviewEvent(event))
     .filter((event) => !recordId || event.recordId === recordId)
     .filter((event) => sequence === undefined || Number(event.sequence) === Number(sequence))
     .filter((event) => withinMergeReviewWindow(event.at, now));
@@ -377,12 +347,13 @@ function findPendingMergedWithoutReview({ root, tenant, recordId, sequence, now 
     let record;
     try { record = workState.getRecord({ root: base, id: event.recordId }); } catch { continue; }
     if (tenant && record.tenant !== tenant) continue;
-    const ledgerEntry = record.notifications?.[String(event.sequence)] || null;
-    if (ledgerEntry && !(ledgerEntry.status === 'failed' && ledgerEntry.retryAuthorized)) continue;
-    const fallbackEntry = latestFallbackEntry(fallback, event.recordId, event.sequence);
-    if (fallbackEntry && !(fallbackEntry.status === 'failed' && fallbackEntry.retryAuthorized)) continue;
-    const attempt = Math.max(ledgerEntry?.attempt || 0, fallbackEntry?.attempt || 0);
-    const entry = (ledgerEntry || fallbackEntry) ? { ...(ledgerEntry || fallbackEntry), attempt } : null;
+    // The door settles active and retired (archived) records only. A merged record
+    // later escalated and abandoned lives in state/abandons, where a notification
+    // event would break reusableAbandonedRecord; skip it rather than refuse it
+    // (skipped:not_found) on every sweep for 48h.
+    if (['released', 'abandoned'].includes(record.state)) continue;
+    const entry = record.notifications?.[String(event.sequence)] || null;
+    if (entry && !(entry.status === 'failed' && entry.retryAuthorized)) continue;
     pending.push({ record, event, entry });
   }
   return pending.sort((a, b) => String(a.record.tenant).localeCompare(String(b.record.tenant)) || a.record.issue - b.record.issue);
@@ -465,15 +436,13 @@ function runNotifier(options = {}) {
   const result = { at: new Date(now || Date.now()).toISOString(), live, handled: [] };
   const touchedTenants = new Set();
 
-  const pendingDecisions = findPendingDecisions({ root: base, tenant: options.tenant, recordId: options.recordId, sequence: options.sequence })
-    .map((item) => ({ ...item, source: 'decision' }));
+  const pendingDecisions = findPendingDecisions({ root: base, tenant: options.tenant, recordId: options.recordId, sequence: options.sequence });
   // fleet#79 QA round 1 (blocker): the merge-without-review wake's own pending
   // source - `merged` is not a DECISION_STATE, so findPendingDecisions alone
-  // never sees it.
-  const pendingMergeReviews = findPendingMergedWithoutReview({ root: base, tenant: options.tenant, recordId: options.recordId, sequence: options.sequence, now })
-    .map((item) => ({ ...item, source: 'merge-review' }));
+  // never sees it. fleet#99: both then go through the same door.
+  const pendingMergeReviews = findPendingMergedWithoutReview({ root: base, tenant: options.tenant, recordId: options.recordId, sequence: options.sequence, now });
 
-  for (const { record, event, entry, source } of [...pendingDecisions, ...pendingMergeReviews]) {
+  for (const { record, event, entry } of [...pendingDecisions, ...pendingMergeReviews]) {
     const tenantConfig = configs[record.tenant] || {};
     const handled = { recordId: record.id, sequence: event.sequence, decisionType: event.type, outcome: null };
     result.handled.push(handled);
@@ -487,29 +456,14 @@ function runNotifier(options = {}) {
       continue;
     }
     let claimed;
-    let viaFallback = false;
     try {
       claimed = workState.notifyRecord({ root: base, id: record.id, phase: 'claim', expectedRevision: record.revision, decisionSequence: event.sequence, idempotencyKey: `notify:${record.id}:s${event.sequence}:a${attempt}:claim`, actor, channel, now });
     } catch (error) {
-      // The real ledger door refuses EVERY merge-review claim, always:
-      // workState.notifyRecord's own DECISION_EVENT_TYPES is exactly
-      // ['state-escalated', 'state-hold'] (work-state.js is out of #79's
-      // scope to widen), so a `state-merged` event throws NOT_A_DECISION_EVENT
-      // there even while the record is still active and literally `merged`.
-      // A record that has since moved past `merged` entirely (retiring,
-      // retired, released, abandoned) would separately throw DECISION_RESOLVED
-      // or NOT_FOUND. The fact still stands and Cory still needs it either
-      // way, so this source always falls back to its own file.
-      if (source === 'merge-review' && ['NOT_A_DECISION_EVENT', 'DECISION_RESOLVED', 'NOT_FOUND'].includes(error.code)) {
-        viaFallback = true;
-        claimed = { record, revision: record.revision };
-      } else {
-        // STALE_REVISION means another actor moved first; every other refusal
-        // names the standing delivery state. Neither is ours to force.
-        handled.outcome = `skipped:${error.code === 'NOTIFICATION_ALREADY_CLAIMED' || error.code === 'STALE_REVISION' ? 'claimed' : String(error.code || 'error').toLowerCase()}`;
-        handled.detail = error.message;
-        continue;
-      }
+      // STALE_REVISION means another actor moved first; every other refusal
+      // names the standing delivery state. Neither is ours to force.
+      handled.outcome = `skipped:${error.code === 'NOTIFICATION_ALREADY_CLAIMED' || error.code === 'STALE_REVISION' ? 'claimed' : String(error.code || 'error').toLowerCase()}`;
+      handled.detail = error.message;
+      continue;
     }
     touchedTenants.add(record.tenant);
     const message = compose({ root: base, record: claimed.record, event, tenantConfig });
@@ -521,20 +475,14 @@ function runNotifier(options = {}) {
       if (!delivery || typeof delivery !== 'object') delivery = { ok: false, detail: 'channel returned no result' };
     }
     const phase = delivery.ok ? 'sent' : 'failed';
-    if (viaFallback) {
-      appendMergeFallback(base, { at: result.at, recordId: record.id, sequence: event.sequence, attempt, status: phase, detail: delivery.detail || null });
+    try {
+      workState.notifyRecord({ root: base, id: record.id, phase, expectedRevision: claimed.revision, decisionSequence: event.sequence, idempotencyKey: `notify:${record.id}:s${event.sequence}:a${attempt}:${phase}`, actor, channel, detail: delivery.detail || null, now });
       handled.outcome = phase;
-      handled.via = 'fallback';
-    } else {
-      try {
-        workState.notifyRecord({ root: base, id: record.id, phase, expectedRevision: claimed.revision, decisionSequence: event.sequence, idempotencyKey: `notify:${record.id}:s${event.sequence}:a${attempt}:${phase}`, actor, channel, detail: delivery.detail || null, now });
-        handled.outcome = phase;
-      } catch (error) {
-        // The claim stands (visible as in-flight) and the page, if it went out, went
-        // out once. Recording the settle again would be a second write, not a fix.
-        handled.outcome = `unsettled:${String(error.code || 'error').toLowerCase()}`;
-        handled.detail = error.message;
-      }
+    } catch (error) {
+      // The claim stands (visible as in-flight) and the page, if it went out, went
+      // out once. Recording the settle again would be a second write, not a fix.
+      handled.outcome = `unsettled:${String(error.code || 'error').toLowerCase()}`;
+      handled.detail = error.message;
     }
     if (message.questionWithheld) { handled.questionWithheld = true; handled.questionWithheldReason = message.questionWithheldReason; }
     handled.detail = handled.detail || delivery.detail || null;
