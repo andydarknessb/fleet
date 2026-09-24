@@ -789,8 +789,10 @@ test('fleet#99: the merge-review fact stays claimable after the record retires a
   assert.equal(stored.state, 'retired');
   assert.equal(stored.notifications['6'].status, 'claimed');
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-42'], undefined);
+  // The fixture really merged without a formal review, so #114's merged-without-review
+  // is expected; everything else (sequence, state, archive evidence index) is clean.
   const verified = require('../bin/verify-events').verifyLedger({ root });
-  assert.deepEqual(verified.records.flatMap((record) => record.findings), []);
+  assert.deepEqual(verified.records.flatMap((record) => record.findings).map((f) => f.kind), ['merged-without-review']);
 });
 
 test('fleet#99: a claim on an archived record recovers from every kill point to exactly one event', () => {
@@ -805,7 +807,7 @@ test('fleet#99: a claim on an archived record recovers from every kill point to 
     assert.equal(stored.notifications['6'].status, 'claimed', killPoint);
     assert.equal(readEvents(root).filter((event) => event.type === 'notification-attempted').length, 1, killPoint);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-42'], undefined, killPoint);
-    assert.deepEqual(require('../bin/verify-events').verifyLedger({ root }).records.flatMap((record) => record.findings), [], killPoint);
+    assert.deepEqual(require('../bin/verify-events').verifyLedger({ root }).records.flatMap((record) => record.findings).map((f) => f.kind), ['merged-without-review'], killPoint);
   }
 });
 
