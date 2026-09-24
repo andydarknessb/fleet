@@ -277,7 +277,28 @@ function writeArtifactExclusive(root, recordId, kind, buildContent) {
 // by the review that verified the close, through --resolutions (ADR 0009, 5).
 const RESOLUTION_LIKE_FIELDS = Object.freeze(['outcome', 'resolution']);
 
+// #117: the audit counted 485 findings with 12+ severity spellings and 41 blank,
+// so nothing downstream (the fleet-review status, the repeat escalation) could
+// read a severity. Every supplied finding names one from the enum and a
+// kebab-case category; carried findings are history and keep what they say.
+const SEVERITIES = Object.freeze(['blocker', 'major', 'minor', 'nit']);
+const CATEGORY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+function validateSuppliedFinding(finding, index) {
+  const name = finding && finding.id ? `${finding.id} (#${index + 1})` : `#${index + 1}`;
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} is not an object`, { finding: index + 1 });
+  }
+  if (!SEVERITIES.includes(finding.severity)) {
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has severity ${finding.severity === undefined ? '(none)' : `'${finding.severity}'`}; severity is one of ${SEVERITIES.join(', ')} (#117)`, { finding: finding.id || index + 1, field: 'severity', allowed: SEVERITIES });
+  }
+  if (typeof finding.category !== 'string' || !CATEGORY_PATTERN.test(finding.category)) {
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has category ${finding.category === undefined ? '(none)' : `'${finding.category}'`}; category is a non-empty kebab-case string such as correctness, test-coverage or docs-drift (#117)`, { finding: finding.id || index + 1, field: 'category' });
+  }
+}
+
 function buildFindings(stamp, suppliedFindings, priors, resolutions) {
+  (suppliedFindings || []).forEach(validateSuppliedFinding);
   // Caller fields never override the forced-open status: openFindings gates the
   // unresolved-findings guard on it.
   const findings = (suppliedFindings || []).map((finding, index) => {
@@ -791,7 +812,8 @@ if (require.main === module) {
     // invocations too: nothing was recorded, and the message names the door.
     // UNKNOWN_COMMIT and TENANT_REPO_UNKNOWN (fleet#67) likewise: nothing was
     // recorded, and the message names the repo and the SHA.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN'].includes(error.code) ? 2 : 1;
+    // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING'].includes(error.code) ? 2 : 1;
   }
 }
 
@@ -799,6 +821,7 @@ module.exports = {
   CLASSIFY_FLAGS,
   COMMAND_FLAGS,
   ReviewPolicyError,
+  SEVERITIES,
   classifyChange,
   cli,
   classifyFromGit,
