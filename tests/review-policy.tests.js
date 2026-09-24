@@ -1363,7 +1363,7 @@ test('fleet#103: a third formal link does not re-walk a risk artifact an earlier
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
     kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
     resolutions: { 'risk-001-f1': 'resolved', 'risk-001-f2': 'resolved', 'risk-001-f3': 'still-open' },
-    findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit' }],
+    findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit', category: 'correctness' }],
     idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
   });
   const second = recordReviewArtifact({
