@@ -391,13 +391,14 @@ test('buildReport computes per-unit ratios, the IC median, and budget verdicts',
   assert.equal(u.controlPlaneFreshReductionVsBaseline, 0.85);
   assert.equal(u.budgets.controlPlaneFreshReduction.pass, true);
   assert.equal(u.budgets.projectLeadFreshPerMergedPr.pass, true);
-  assert.equal(u.budgets.icJobTokensMedian.pass, true);
+  assert.equal(u.budgets.icJobTokensMedian.pass, null, '#128: the IC median is reported, not judged');
+  assert.equal(u.budgets.icJobTokensMedian.reference, 60000);
   assert.deepEqual(report.sample.excludedByReason, { abandoned: 2, 'no-pr': 1 });
   const empty = buildReport([], [], { sessionMetrics: sessions, budgets: { icJobTokensMedian: 60000 } });
   assert.equal(empty.unitMetrics.controlPlaneFreshPerCompletedUnit, null, 'no units: no ratio, no verdict');
   assert.equal(empty.unitMetrics.budgets.icJobTokensMedian.pass, null);
   const text = renderSummary(report);
-  assert.match(text, /IC job tokens median: 55000 \(p90 70000; limit 60000\) PASS/);
+  assert.match(text, /^IC job tokens median: 55000 \(p90 70000; reference 60000, not a verdict\)$/m);
   assert.match(text, /project-lead fresh per merged PR: 20000 over 3 merged PR\(s\) \(limit 25000; per completed unit 20000\) PASS/);
   assert.match(text, /reduction vs baseline 85%, target 70%/);
   // Merged PRs are counted from merge events, and the median is a true median on an even count.
@@ -446,7 +447,7 @@ test('the seven-day report names its own window and is persisted as JSON', () =>
   assert.equal(path.basename(result.summaryJsonArtifact), 'seven-day-2026-09-02.json');
   const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
   assert.equal(json.unitMetrics.completedUnits, 1);
-  assert.equal(json.unitMetrics.budgets.icJobTokensMedian.limit, 60000);
+  assert.equal(json.unitMetrics.budgets.icJobTokensMedian.reference, 60000);
 });
 
 // --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
@@ -751,4 +752,60 @@ test('#126: with an empty roster, subagent transcripts are still not read as ses
   });
   assert.equal(result.dailyReport.sessions.length, 1);
   assert.equal(result.dailyReport.roles['project-lead'].metrics.jobTokens, 15, 'the lead carries its researcher');
+});
+
+// --- #128: the IC token median is reported, not judged ------------------------------
+// Red-tell: before the change the median carries PASS/FAIL against 60000 and there is
+// no per-family figure.
+const familyUnit = (issue, model, job) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', model, merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: job, jobTokens: job, cacheReadInputTokens: 0 } });
+const familyUnits = [familyUnit(1, 'sonnet', 100000), familyUnit(2, 'sonnet', 140000), familyUnit(3, 'sonnet', 300000), familyUnit(4, 'haiku', 20000), familyUnit(5, 'haiku', 40000)];
+const nullTargets = { haiku: null, sonnet: null, opus: null, fable: null };
+
+test('#128: with every per-model target null, the median and p90 print per family with no verdict', () => {
+  const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedianReference: 60000, icJobTokensTargets: nullTargets } });
+  const byModel = report.unitMetrics.icByModel;
+  assert.deepEqual(byModel.sonnet, { units: 3, jobTokensMedian: 140000, jobTokensP90: 300000, target: null, pass: null });
+  assert.deepEqual(byModel.haiku, { units: 2, jobTokensMedian: 30000, jobTokensP90: 40000, target: null, pass: null });
+  assert.equal(report.unitMetrics.budgets.icJobTokensMedian.pass, null);
+  const text = renderSummary(report);
+  assert.match(text, /^IC job tokens median: 100000 \(p90 300000; reference 60000, not a verdict\)$/m);
+  assert.match(text, /^- sonnet: median 140000, p90 300000 over 3 unit\(s\) \(no target\)$/m);
+  assert.match(text, /^- haiku: median 30000, p90 40000 over 2 unit\(s\) \(no target\)$/m);
+  const icLines = text.split('\n').filter((l) => /^IC job tokens median|^- (sonnet|haiku):/.test(l));
+  assert.ok(icLines.every((l) => !/PASS|FAIL/.test(l)), 'no verdict on any IC median line');
+});
+
+test('#128: setting one family target judges that family only', () => {
+  const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedianReference: 60000, icJobTokensTargets: { ...nullTargets, haiku: 35000 } } });
+  const byModel = report.unitMetrics.icByModel;
+  assert.equal(byModel.haiku.target, 35000);
+  assert.equal(byModel.haiku.pass, true);
+  assert.equal(byModel.sonnet.pass, null);
+  const text = renderSummary(report);
+  assert.match(text, /^- haiku: median 30000, p90 40000 over 2 unit\(s\) \(target 35000\) PASS$/m);
+  assert.match(text, /^- sonnet: .*\(no target\)$/m);
+  const failing = buildReport(familyUnits, [], { budgets: { icJobTokensTargets: { ...nullTargets, haiku: 25000 } } });
+  assert.equal(failing.unitMetrics.icByModel.haiku.pass, false);
+  assert.match(renderSummary(failing), /^- haiku: .*\(target 25000\) FAIL$/m);
+});
+
+test('#128: the legacy icJobTokensMedian key is read as the reference, never a verdict', () => {
+  const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedian: 60000 } });
+  assert.equal(report.unitMetrics.budgets.icJobTokensMedian.reference, 60000);
+  assert.equal(report.unitMetrics.budgets.icJobTokensMedian.pass, null);
+});
+
+test('#128: the seven-day JSON carries the per-family figures, and the shipped config has null targets', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  assert.deepEqual(shipped.budgets.icJobTokensTargets, nullTargets);
+  assert.equal(shipped.budgets.icJobTokensMedianReference, 60000);
+  assert.equal(shipped.budgets.icJobTokensMedian, undefined, 'the judged key is gone');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const transcripts = path.join(root, 'transcripts');
+  fs.mkdirSync(path.join(transcripts, 'p'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{ name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1' }] }));
+  fs.writeFileSync(path.join(transcripts, 'p', 'session-1.jsonl'), fixtureTranscript());
+  const result = collectFromFiles({ transcriptsDir: transcripts, rosterPath: path.join(root, 'roster.json'), outputDir: path.join(root, 'out'), since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', generatedAt: '2026-09-01T12:00:00.000Z', verifyGithub: false, configPath: path.join(__dirname, '..', 'config', 'cycle.json') });
+  const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
+  assert.deepEqual(json.unitMetrics.icByModel.sonnet, { units: 1, jobTokensMedian: 68, jobTokensP90: 68, target: null, pass: null });
 });

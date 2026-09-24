@@ -30,7 +30,8 @@
     "baselineControlPlaneFreshPerCompletedUnit": 201505,
     "controlPlaneFreshReduction": 0.7,
     "projectLeadFreshPerMergedPr": 25000,
-    "icJobTokensMedian": 60000
+    "icJobTokensMedianReference": 60000,
+    "icJobTokensTargets": { "haiku": null, "sonnet": null, "opus": null, "fable": null }
   },
   "review": {
     "trivialMaxChangedLines": 25,

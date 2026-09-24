@@ -620,6 +620,23 @@ function unitMetrics(units, roles, budgets) {
     icFreshTokensMedian: percentile(icFresh, 0.5),
   };
   const b = budgets || {};
+  // #128: the IC job-token median is reported, not judged. The 60k figure is a reference
+  // line (`icJobTokensMedianReference`; the pre-#128 `icJobTokensMedian` key is read as
+  // the same reference). A family is judged only once its `icJobTokensTargets` entry is
+  // set; per-model targets come after two clean weeks.
+  const reference = b.icJobTokensMedianReference ?? b.icJobTokensMedian ?? null;
+  const targets = b.icJobTokensTargets || {};
+  const byFamily = {};
+  for (const unit of units) {
+    const key = modelFamily(unit.model).key;
+    (byFamily[key] || (byFamily[key] = [])).push(asNumber(unit.metrics?.jobTokens));
+  }
+  for (const [key, target] of Object.entries(targets)) if (target !== null && target !== undefined && !byFamily[key]) byFamily[key] = [];
+  metrics.icByModel = Object.fromEntries(Object.entries(byFamily).sort(([x], [y]) => x.localeCompare(y)).map(([key, values]) => {
+    const target = Number.isFinite(Number(targets[key])) && targets[key] !== null ? Number(targets[key]) : null;
+    const median = percentile(values, 0.5);
+    return [key, { units: values.length, jobTokensMedian: median, jobTokensP90: percentile(values, 0.9), target, pass: target === null || median === null ? null : median < target }];
+  }));
   const verdict = (value, limit, kind) => (value === null || limit === undefined || limit === null ? null : (kind === 'max' ? value <= limit : value < limit));
   const baseline = Number(b.baselineControlPlaneFreshPerCompletedUnit);
   const reductionTarget = Number(b.controlPlaneFreshReduction);
@@ -628,7 +645,7 @@ function unitMetrics(units, roles, budgets) {
   metrics.budgets = {
     controlPlaneFreshReduction: { target: Number.isFinite(reductionTarget) ? reductionTarget : null, actual: metrics.controlPlaneFreshReductionVsBaseline, pass: reduction === null || !Number.isFinite(reductionTarget) ? null : reduction >= reductionTarget },
     projectLeadFreshPerMergedPr: { limit: b.projectLeadFreshPerMergedPr ?? null, actual: metrics.projectLeadFreshPerMergedPr, pass: verdict(metrics.projectLeadFreshPerMergedPr, b.projectLeadFreshPerMergedPr, 'lt') },
-    icJobTokensMedian: { limit: b.icJobTokensMedian ?? null, actual: metrics.icJobTokensMedian, pass: verdict(metrics.icJobTokensMedian, b.icJobTokensMedian, 'lt') },
+    icJobTokensMedian: { reference, actual: metrics.icJobTokensMedian, pass: null, judged: false },
   };
   return metrics;
 }
@@ -712,7 +729,8 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
       controlPlaneFreshTokens: 'fresh tokens from Dispatcher, project-lead, Principal, Sentinel, and notifier sessions, live and rotated out (#125)',
       controlPlaneFreshPerCompletedUnit: 'control-plane fresh tokens divided by completed units in the window',
       projectLeadFreshPerMergedPr: 'project-lead fresh tokens divided by merged pull requests (one per completed unit) in the window',
-      icJobTokensMedian: 'median over completed units of whole-life IC job tokens: every session that worked the issue plus their subagents (#125, #126). Not the budget.js figure, which measures one live session',
+      icByModel: 'the IC job-token median and p90 per model family; judged only against a set icJobTokensTargets entry (#128)',
+      icJobTokensMedian: 'reported, not judged (#128): median over completed units of whole-life IC job tokens: every session that worked the issue plus their subagents (#125, #126). Not the budget.js figure, which measures one live session',
     },
     sample: { sessionSources: sessionSources(sessionMetrics || []), completedUnits: units.length, excludedUnits: (excluded || []).length, excludedByReason: (excluded || []).reduce((acc, item) => { acc[item.reason] = (acc[item.reason] || 0) + 1; return acc; }, {}) },
     metrics,
@@ -793,7 +811,12 @@ function renderSummary(report) {
   const mark = (p) => (p === null || p === undefined ? '' : (p ? ' PASS' : ' FAIL'));
   lines.push(`control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (reduction vs baseline ${pct(u.controlPlaneFreshReductionVsBaseline)}, target ${pct(b.controlPlaneFreshReduction?.target)})${mark(b.controlPlaneFreshReduction?.pass)}`);
   lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (limit ${show(b.projectLeadFreshPerMergedPr?.limit)}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
-  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; limit ${show(u.budgets?.icJobTokensMedian?.limit)})${mark(u.budgets?.icJobTokensMedian?.pass)}`);
+  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; reference ${show(u.budgets?.icJobTokensMedian?.reference)}, not a verdict)`);
+  const icFamilies = Object.entries(u.icByModel || {});
+  if (icFamilies.length) {
+    lines.push('IC job tokens by model (judged only where a target is set):');
+    for (const [key, entry] of icFamilies) lines.push(`- ${key}: median ${show(entry.jobTokensMedian)}, p90 ${show(entry.jobTokensP90)} over ${entry.units} unit(s) (${entry.target === null ? 'no target' : `target ${entry.target}`})${mark(entry.pass)}`);
+  }
   lines.push(`IC fresh tokens median: ${show(u.icFreshTokensMedian)}`);
   const risk = report.riskReviewer || { runs: 0, jobTokens: 0, byModel: {} };
   const riskModels = Object.entries(risk.byModel || {}).map(([key, value]) => `${key} ${value.runs}`).join(', ');
