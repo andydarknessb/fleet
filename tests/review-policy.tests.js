@@ -1345,6 +1345,49 @@ test('fleet#43: the first formal review walks the risk chain: every open risk fi
   assert.equal(storedRereview.riskArtifact, null);
 });
 
+test('fleet#103: a third formal link does not re-walk a risk artifact an earlier link in the chain consumed', () => {
+  const root = rootDir();
+  const { revision } = seedRiskThenReview(root);
+  const cycle = (from, tag, hour) => {
+    let current = from;
+    ['revision', 'pr-open', 'ci-wait', 'review'].forEach((to, index) => {
+      current = workState.transitionRecord({
+        root, id: 'endzone:issue-42', to, expectedRevision: current, idempotencyKey: `${tag}-${to}`,
+        actor: 'test', evidence: 'revision cycle', now: `2026-09-12T${hour}:1${index}:00.000Z`,
+      }).revision;
+    });
+    return current;
+  };
+  // formal-001 consumes risk-001 and carries risk-001-f3 still-open (deploy ordering: only the Hold resolves it).
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+    resolutions: { 'risk-001-f1': 'resolved', 'risk-001-f2': 'resolved', 'risk-001-f3': 'still-open' },
+    findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit', category: 'correctness' }],
+    idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
+  });
+  const second = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: cycle(first.result.revision, 'c1', '12'),
+    kind: 'formal', headSha: '28ab0000', actor: 'project-lead', classification: RISK,
+    priorArtifact: first.artifact,
+    resolutions: { 'formal-001-f1': 'resolved', 'risk-001-f3': 'still-open' },
+    idempotencyKey: 'formal-2', now: '2026-09-12T13:00:00.000Z',
+  });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8')).riskArtifact, null);
+
+  // The third link binds to the formal chain alone: only formal-002's open findings need resolutions.
+  const third = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: cycle(second.result.revision, 'c2', '14'),
+    kind: 'formal', headSha: '39bc0000', actor: 'project-lead', classification: RISK,
+    priorArtifact: second.artifact,
+    resolutions: { 'risk-001-f3': 'still-open' },
+    idempotencyKey: 'formal-3', now: '2026-09-12T15:00:00.000Z',
+  });
+  const stored = JSON.parse(fs.readFileSync(path.join(root, third.artifact), 'utf8'));
+  assert.equal(stored.riskArtifact, null);
+  assert.deepEqual(stored.findings.map((finding) => [finding.id, finding.status]), [['risk-001-f3', 'open']]);
+});
+
 test('fleet#43: a formal no-findings statement beside a still-open risk finding is refused, and a resolved chain can say so', () => {
   const root = rootDir();
   const { risk, revision } = seedRiskThenReview(root, { findings: [RISK_FINDINGS[0]] });
