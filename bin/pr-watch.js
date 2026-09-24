@@ -406,7 +406,7 @@ function makeFetchers(repo, executable = 'gh') {
   };
 }
 
-function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true, notifier = null } = {}) {
+function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true, notifier = null, healthFile = 'health.json' } = {}) {
   const started = Date.now();
   const base = path.resolve(root || path.resolve(__dirname, '..'));
   const watchDir = path.join(base, 'state', 'watch');
@@ -423,9 +423,9 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     }
     if (health.failures > 0) { health.ok = false; if (!health.error) health.error = `${health.failures} record action(s) failed; see actions`; }
     health.durationMs = Date.now() - started;
-    if (!dryRun) {
+    if (!dryRun && healthFile) {
       fs.mkdirSync(watchDir, { recursive: true });
-      fs.writeFileSync(path.join(watchDir, 'health.json'), `${JSON.stringify(health, null, 2)}\n`, 'utf8');
+      fs.writeFileSync(path.join(watchDir, healthFile), `${JSON.stringify(health, null, 2)}\n`, 'utf8');
     }
     return health;
   };
@@ -565,19 +565,44 @@ function runWatchCommand(args) {
     return { ok: true, skipped: true, reason: 'state/flags/pr-watch-off stands: CI watching is disabled; remove the flag to resume' };
   }
   const tenantDir = path.join(base, 'tenants');
-  let tenantName = args.tenant || null;
-  if (!tenantName) {
-    const files = fs.readdirSync(tenantDir).filter((f) => f.endsWith('.json'));
-    if (files.length !== 1) throw new Error(`--tenant required (${files.length} tenants configured)`);
-    tenantName = path.basename(files[0], '.json');
+  const dryRun = args['dry-run'] === 'true';
+  const watchTenant = (tenantName, options = {}) => {
+    const tenantConfig = JSON.parse(fs.readFileSync(path.join(tenantDir, `${tenantName}.json`), 'utf8'));
+    return runWatch({
+      root: base, tenantName, tenantConfig,
+      fetchers: makeFetchers(tenantConfig.github, args.gh || 'gh'),
+      dryRun,
+      notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
+      ...options,
+    });
+  };
+  if (args.tenant) return watchTenant(args.tenant);
+  // No --tenant (the scheduled tick, bin/run-pr-watch.ps1) watches every tenant.
+  // This used to demand --tenant once a second tenant file existed, and every
+  // tick died from 2026-09-24 20:10Z (nidus) with no PR discovered and no wake
+  // sent. One tenant's failure is recorded and the rest still tick; the shadow
+  // projection runs once, after all of them (review F3: it must run last);
+  // health.json carries every tenant, not whichever ticked last.
+  const started = Date.now();
+  const tenants = {};
+  for (const name of fs.readdirSync(tenantDir).filter((f) => f.endsWith('.json')).map((f) => path.basename(f, '.json')).sort()) {
+    try {
+      tenants[name] = watchTenant(name, { shadow: false, healthFile: null });
+    } catch (error) {
+      tenants[name] = { ok: false, error: String(error.message || error), tenant: name };
+    }
   }
-  const tenantConfig = JSON.parse(fs.readFileSync(path.join(tenantDir, `${tenantName}.json`), 'utf8'));
-  return runWatch({
-    root: base, tenantName, tenantConfig,
-    fetchers: makeFetchers(tenantConfig.github, args.gh || 'gh'),
-    dryRun: args['dry-run'] === 'true',
-    notifier: args['no-notifier'] === 'true' ? null : require('./notify').spawnNotifier,
-  });
+  const failed = Object.keys(tenants).filter((name) => tenants[name].ok === false);
+  const health = { at: new Date().toISOString(), ok: failed.length === 0, error: failed.length ? `tenant(s) failed: ${failed.join(', ')}` : null, tenants, actions: [], dryRun };
+  if (!dryRun) {
+    try { workState.shadowProject({ root: base, actor: 'pr-watch' }); } catch (error) { health.actions.push(`shadow-project-failed: ${error.message}`); }
+  }
+  health.durationMs = Date.now() - started;
+  if (!dryRun) {
+    fs.mkdirSync(path.join(base, 'state', 'watch'), { recursive: true });
+    fs.writeFileSync(path.join(base, 'state', 'watch', 'health.json'), `${JSON.stringify(health, null, 2)}\n`, 'utf8');
+  }
+  return health;
 }
 
 // No caller ever passes a command word (every invocation is flags only), so a
