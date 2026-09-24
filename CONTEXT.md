@@ -165,6 +165,21 @@ under the flag is the double-actor condition, and the Watchdog stays in shadow
 until it is gone.
 _Avoid_: sentinel (a session), monitor, health checker
 
+**Live ref**:
+The `live` branch the running fleet's checkout sits on, and the only way code
+reaches it (ADR 0013). Each tick the Watchdog fast-forwards it to `master`
+when `master`'s CI is green; it never moves it any other way. Nobody commits
+on it. A red `master` stops deploys and nothing else: the fleet keeps running
+the last commit that passed. Rolling back is moving `live` back, together
+with a Deploy hold.
+_Avoid_: prod branch, release (the tenant's release branch is a different thing), deployed master
+
+**Deploy hold**:
+The flag `state/flags/deploy-hold`: while it stands the Watchdog does not
+advance the Live ref, however green `master` is. Set with every rollback, or
+the next green tick moves the fleet forward again.
+_Avoid_: freeze, pause (Pause stops launches, not deploys)
+
 ### Work
 
 **Fleet cycle**:
