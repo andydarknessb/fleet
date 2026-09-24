@@ -6,16 +6,32 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError } = require('../bin/verify-events');
-const { abandonRecord, createRecord, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
+const { abandonRecord, createRecord, observeRecord, recordReview, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
 
 function rootDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-verify-')); }
-function unit(root, issue, chain = []) {
+const HEAD = 'a'.repeat(40);
+// A unit that reaches `merged` is reviewed on the way, as the fleet requires (#114):
+// a formal review at `formalAt` (default: the merged head; null for none) and a PR
+// observation naming the head it merged at (`mergedHead`, default HEAD).
+function unit(root, issue, chain = [], { formalAt, mergedHead = HEAD } = {}) {
   const id = `endzone:issue-${issue}`;
   createRecord({ root, id, tenant: 'endzone', issue, state: 'implementing', idempotencyKey: `c-${issue}`, now: '2026-09-09T00:00:00.000Z' });
   let revision = 1;
+  const at = () => `2026-09-09T00:${String(revision).padStart(2, '0')}:00.000Z`;
+  const reviewHead = formalAt === undefined ? mergedHead : formalAt;
   for (const to of chain) {
-    transitionRecord({ root, id, expectedRevision: revision, to, idempotencyKey: `t-${issue}-${to}`, now: `2026-09-09T00:0${revision}:00.000Z`, prNumber: 500 + issue, githubState: 'MERGED', githubMergedAt: '2026-09-09T00:05:00.000Z', testOnly: true });
+    transitionRecord({ root, id, expectedRevision: revision, to, idempotencyKey: `t-${issue}-${to}`, now: at(), prNumber: 500 + issue, githubState: 'MERGED', githubMergedAt: '2026-09-09T00:05:00.000Z', testOnly: true });
     revision += 1;
+    if (to === 'review' && chain.includes('merged')) {
+      if (reviewHead) {
+        recordReview({ root, id, expectedRevision: revision, idempotencyKey: `r-${issue}`, now: at(), review: { kind: 'formal', headSha: reviewHead, artifact: `state/reviews/${issue}/formal-001.json` } });
+        revision += 1;
+      }
+      if (mergedHead) {
+        observeRecord({ root, id, expectedRevision: revision, idempotencyKey: `o-${issue}`, now: at(), observation: { digest: `d-${issue}`, headSha: mergedHead } });
+        revision += 1;
+      }
+    }
   }
   return id;
 }
@@ -178,6 +194,103 @@ test('the 30-day archival moves nothing until a fresh passing verdict exists', (
 // --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
 // Red-tell: with bin/verify-events.js reverted to its old hand-rolled parseArgs (no
 // schema), --samples is silently ignored instead of throwing.
+
+// --- #114: a merge with no formal review for the merged head fails verification ---
+// Red-tell: with bin/verify-events.js reverted, the unreviewed merge verifies clean.
+
+function writeExceptions(root, exceptions) {
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'review-exceptions.json'), JSON.stringify({ schemaVersion: 1, exceptions }));
+}
+
+test('#114: a record driven review -> merged with no formal review fails merged-without-review', () => {
+  const root = rootDir();
+  const id = unit(root, 30, ['pr-open', 'review', 'merged'], { formalAt: null });
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, false);
+  assert.equal(result.findingsByKind['merged-without-review'], 1);
+  const finding = result.records.find((r) => r.recordId === id).findings.find((f) => f.kind === 'merged-without-review');
+  assert.equal(finding.mergedHead, HEAD);
+  assert.deepEqual(finding.formalHeads, []);
+});
+
+test('#114: a formal review at a different head than the merged one still fails', () => {
+  const root = rootDir();
+  unit(root, 31, ['pr-open', 'review', 'merged', 'retiring', 'retired'], { formalAt: 'b'.repeat(40) });
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, false, 'archived records are held to the invariant too');
+  assert.equal(result.findingsByKind['merged-without-review'], 1);
+  assert.equal(result.records[0].where, 'archive');
+});
+
+test('#114: a formal review at the merged head is clean, including an abbreviated recorded SHA', () => {
+  const root = rootDir();
+  unit(root, 32, ['pr-open', 'review', 'merged']);
+  unit(root, 33, ['pr-open', 'review', 'merged'], { formalAt: HEAD.slice(0, 8) });
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, true, JSON.stringify(result.records));
+});
+
+test('#114: a record with no observed merged head still needs some formal review', () => {
+  const root = rootDir();
+  unit(root, 38, ['pr-open', 'review', 'merged'], { formalAt: null, mergedHead: null });
+  assert.equal(verifyLedger({ root }).findingsByKind['merged-without-review'], 1);
+  const root2 = rootDir();
+  unit(root2, 39, ['pr-open', 'review', 'merged'], { formalAt: HEAD, mergedHead: null });
+  assert.equal(verifyLedger({ root: root2 }).pass, true);
+});
+
+test('#114: a risk review is not a formal review', () => {
+  const root = rootDir();
+  const id = unit(root, 34, ['pr-open', 'review', 'merged'], { formalAt: 'b'.repeat(40) });
+  rewriteEvents(root, (lines) => lines.map((l) => (l.recordId === id && l.type === 'review-recorded'
+    ? { ...l, changes: { ...l.changes, kind: 'risk', headSha: HEAD } } : l)));
+  assert.equal(verifyLedger({ root }).findingsByKind['merged-without-review'], 1);
+});
+
+test('#114: a record listed in config/review-exceptions.json is reported acknowledged and exits 0', () => {
+  const root = rootDir();
+  const id = unit(root, 35, ['pr-open', 'review', 'merged', 'retiring', 'retired'], { formalAt: null });
+  writeExceptions(root, [{ recordId: id, head: HEAD, ruling: 'retro review endzone #1545/#1546' }]);
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, true, JSON.stringify(result));
+  assert.equal(result.findingsByKind['merged-without-review'], undefined);
+  assert.deepEqual(result.acknowledged.map((a) => [a.recordId, a.kind, a.ruling]), [[id, 'merged-without-review-acknowledged', 'retro review endzone #1545/#1546']]);
+  const { spawnSync } = require('node:child_process');
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'verify-events.js'), '--root', root], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 0, run.stdout + run.stderr);
+  assert.match(run.stdout, /acknowledged: endzone:issue-35 merged-without-review-acknowledged/);
+});
+
+test('#114: an exception for another head, or with no ruling, acknowledges nothing', () => {
+  const root = rootDir();
+  const id = unit(root, 36, ['pr-open', 'review', 'merged'], { formalAt: null });
+  writeExceptions(root, [{ recordId: id, head: 'c'.repeat(40), ruling: 'r' }]);
+  assert.equal(verifyLedger({ root }).findingsByKind['merged-without-review'], 1);
+  writeExceptions(root, [{ recordId: id, head: HEAD }]);
+  const noRuling = verifyLedger({ root });
+  assert.equal(noRuling.findingsByKind['merged-without-review'], 1);
+  assert.equal(noRuling.findingsByKind['review-exception-invalid'], 1);
+});
+
+test('#114: an unreadable review-exceptions file fails closed', () => {
+  const root = rootDir();
+  unit(root, 37, ['pr-open']);
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'review-exceptions.json'), '{ torn');
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, false);
+  assert.equal(result.findingsByKind['review-exceptions-unreadable'], 1);
+});
+
+test('#114: the shipped exceptions file names only endzone #1241 and #1263, each with a ruling', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'review-exceptions.json'), 'utf8'));
+  assert.deepEqual(shipped.exceptions.map((e) => e.recordId).sort(), ['endzone:issue-1241', 'endzone:issue-1263']);
+  for (const entry of shipped.exceptions) {
+    assert.match(entry.head, /^[0-9a-f]{40}$/);
+    assert.match(entry.ruling, /#1545/);
+  }
+});
 
 test('cli: refuses --samples (confusable with --sample) as an unknown flag, naming the accepted set', () => {
   const root = rootDir();

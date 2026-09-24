@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "_comment": "Acknowledged unreviewed merges (#114, ADR 0013). verify-events reports each as merged-without-review-acknowledged instead of failing. An entry needs the ruling that accepted it; nothing is added without one.",
+  "exceptions": [
+    {
+      "recordId": "endzone:issue-1241",
+      "head": "24be6e6f2023051c895efd12f3531ab17518ebe2",
+      "pr": 1287,
+      "ruling": "Merged 2026-09-12 with no review (ADR 0014). Retroactive review 2026-09-17: endzone #1545 and #1546 (spec #90, fleet audit 2026-09-17)."
+    },
+    {
+      "recordId": "endzone:issue-1263",
+      "head": "7c36a78425ba81e874fdc0844a6e017aa48fad0d",
+      "pr": 1288,
+      "ruling": "Merged 2026-09-12 with no review (ADR 0014). Retroactive review 2026-09-17: endzone #1545 and #1546 (spec #90, fleet audit 2026-09-17)."
+    }
+  ]
+}

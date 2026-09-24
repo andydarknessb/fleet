@@ -83,6 +83,59 @@ function verifyRecordEvents(recordId, events, claimedState) {
   return { recordId, events: sorted.length, reconstructedState: state, claimedState, findings };
 }
 
+// #114 (ADR 0013): a Work record that reached `merged` must carry a formal
+// `review-recorded` event for the head it merged at. Endzone #1241 and #1263
+// merged on 2026-09-12 with no review on the record; the watcher saw it and
+// the page reached nobody. The merged head is what pr-watch last observed on
+// the record's PR (`github.observation.headSha`); a record merged before any
+// observation carried a head has none, and then any formal review satisfies
+// the invariant (there is nothing to compare, and no review at all is still a
+// failure). Reviews recorded before fleet#67 sometimes named an abbreviated
+// SHA, so two SHAs agree when the shorter (7+ characters) prefixes the longer.
+function sameCommit(a, b) {
+  const left = String(a || '').toLowerCase();
+  const right = String(b || '').toLowerCase();
+  const length = Math.min(left.length, right.length);
+  return length >= 7 && left.slice(0, length) === right.slice(0, length);
+}
+
+function mergedHeadOf(record) {
+  return record?.github?.observation?.headSha || record?.github?.headSha || null;
+}
+
+// Acknowledged history (config/review-exceptions.json): `{recordId, head, ruling}`
+// entries, each naming the Ruling that accepted the unreviewed merge. A listed
+// record is reported as `merged-without-review-acknowledged` and does not fail
+// the verdict, which is what keeps it archivable under ADR 0007. An entry with
+// no ruling acknowledges nothing, and an unreadable file fails closed.
+function loadReviewExceptions(base) {
+  const read = readJsonStrict(path.join(base, 'config', 'review-exceptions.json'));
+  const findings = [];
+  if (read.error) return { entries: [], findings: [{ kind: 'review-exceptions-unreadable', detail: read.error }] };
+  const listed = read.value && Array.isArray(read.value.exceptions) ? read.value.exceptions : [];
+  const entries = [];
+  for (const entry of listed) {
+    const valid = entry && typeof entry.recordId === 'string' && typeof entry.head === 'string'
+      && typeof entry.ruling === 'string' && entry.ruling.trim().length > 0;
+    if (valid) entries.push(entry);
+    else findings.push({ kind: 'review-exception-invalid', entry, detail: 'an exception names recordId, head and the ruling that accepted it' });
+  }
+  return { entries, findings };
+}
+
+function reviewFinding(record, events, exceptions) {
+  if (!record || !events.some((event) => event.type === 'state-merged')) return null;
+  const mergedHead = mergedHeadOf(record);
+  const formalHeads = events
+    .filter((event) => event.type === 'review-recorded' && event.changes?.kind === 'formal' && event.changes?.headSha)
+    .map((event) => String(event.changes.headSha));
+  const reviewed = mergedHead ? formalHeads.some((head) => sameCommit(head, mergedHead)) : formalHeads.length > 0;
+  if (reviewed) return null;
+  const exception = mergedHead && exceptions.find((entry) => entry.recordId === record.id && sameCommit(entry.head, mergedHead));
+  if (exception) return { acknowledged: { kind: 'merged-without-review-acknowledged', recordId: record.id, mergedHead, ruling: exception.ruling } };
+  return { finding: { kind: 'merged-without-review', mergedHead, formalHeads } };
+}
+
 function verifyLedger({ root, now, sample } = {}) {
   const base = baseOf(root);
   const at = now || new Date().toISOString();
@@ -123,16 +176,26 @@ function verifyLedger({ root, now, sample } = {}) {
       abandoned.push({ file: path.join(abandonDir, name), ...read.value });
     }
   }
+  const exceptions = loadReviewExceptions(base);
+  globalFindings.push(...exceptions.findings);
+  const acknowledged = [];
+  const checkReview = (result, record) => {
+    const outcome = reviewFinding(record, byRecord.get(record.id) || [], exceptions.entries);
+    if (outcome?.finding) result.findings.push(outcome.finding);
+    if (outcome?.acknowledged) acknowledged.push({ ...outcome.acknowledged, where: result.where });
+  };
   const records = [];
   for (const record of Object.values(active)) {
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
     result.where = 'active';
+    checkReview(result, record);
     records.push(result);
   }
   for (const entry of archived) {
     const record = entry.record || {};
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
     result.where = 'archive';
+    checkReview(result, record);
     // The evidence index: every listed file must exist and contain this record's events.
     const listed = Array.isArray(entry.eventFiles) ? entry.eventFiles : [];
     if (listed.length === 0) result.findings.push({ kind: 'evidence-index-empty' });
@@ -147,6 +210,7 @@ function verifyLedger({ root, now, sample } = {}) {
     const record = entry.record || {};
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
     result.where = 'release';
+    checkReview(result, record);
     const listed = Array.isArray(entry.eventFiles) ? entry.eventFiles : [];
     if (listed.length === 0) result.findings.push({ kind: 'evidence-index-empty' });
     const present = listed.map((relative) => path.join(base, relative)).filter((file) => fs.existsSync(file));
@@ -160,6 +224,7 @@ function verifyLedger({ root, now, sample } = {}) {
     const record = entry.record || {};
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
     result.where = 'abandonment';
+    checkReview(result, record);
     const listed = Array.isArray(entry.eventFiles) ? entry.eventFiles : [];
     if (listed.length === 0) result.findings.push({ kind: 'evidence-index-empty' });
     const present = listed.map((relative) => path.join(base, relative)).filter((file) => fs.existsSync(file));
@@ -184,6 +249,8 @@ function verifyLedger({ root, now, sample } = {}) {
     findingsByKind: allFindings.reduce((acc, f) => { acc[f.kind] = (acc[f.kind] || 0) + 1; return acc; }, {}),
     globalFindings,
     orphanedRecordIds: orphaned,
+    // #114: reported, never failing: each names the ruling that accepted it.
+    acknowledged,
     records: withFindings,
   };
   const dir = path.join(base, 'state', 'verify');
@@ -211,6 +278,7 @@ if (require.main === module) {
     else {
       process.stdout.write(`EVENT VERIFICATION: ${result.pass ? 'PASS' : 'FAIL'}\n`);
       process.stdout.write(`events ${result.totals.events}, records ${result.totals.records} (active ${result.totals.active}, archived ${result.totals.archived}, released ${result.totals.released}, abandoned ${result.totals.abandoned}), orphaned record ids ${result.totals.orphanedRecordIds}\n`);
+      for (const entry of result.acknowledged || []) process.stdout.write(`acknowledged: ${entry.recordId} ${entry.kind} at ${String(entry.mergedHead).slice(0, 12)} (${entry.ruling})\n`);
       if (!result.pass) {
         process.stdout.write(`findings: ${Object.entries(result.findingsByKind).map(([k, n]) => `${k}=${n}`).join(', ')}\n`);
         for (const record of result.records.slice(0, 40)) process.stdout.write(`  ${record.recordId} (${record.where}): ${record.findings.map((f) => f.kind).join(', ')}\n`);
@@ -232,4 +300,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError };
+module.exports = { reviewFinding, sameCommit, verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError };
