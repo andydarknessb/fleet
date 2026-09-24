@@ -13,6 +13,7 @@ const path = require('node:path');
 const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
+const { headlineOf, latestScorecard } = require('./weekly-scorecard');
 
 const { DECISION_STATES } = workState;
 const MAX_ROWS = 10;
@@ -100,6 +101,11 @@ function buildSummary({ root, now } = {}) {
     ? `${row.tenant} #${row.issue} ${row.state} ${formatAge(row.ageMs)}`
     : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`));
   if (rows.length > MAX_ROWS) lines.push(`and ${rows.length - MAX_ROWS} more`);
+  // #131: the latest weekly scorecard's headline (the week and its weakest row) rides
+  // the page as its last line. No scorecard file, no line; and a scorecard alone never
+  // turns a quiet day into a page (the early return above stands).
+  const card = latestScorecard(root);
+  if (card && card.week) lines.push(headlineOf(card));
   return {
     title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length,
   };

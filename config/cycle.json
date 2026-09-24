@@ -38,6 +38,14 @@
     "label": "second-read",
     "minChangedLines": 150
   },
+  "scorecard": {
+    "cycleTimeMedianHours": { "watch": 2, "weak": 6 },
+    "tailHours": 12,
+    "sentBackRate": { "watch": 0.3, "weak": 0.45 },
+    "escapedRate": { "weak": 0.05 },
+    "fleetDeadRate": { "watch": 0.02, "weak": 0.1 },
+    "maxPrLookups": 50
+  },
   "review": {
     "trivialMaxChangedLines": 25,
     "trivialMaxFiles": 3,
