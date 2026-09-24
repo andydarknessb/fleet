@@ -10,6 +10,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
+const { modelFamily } = require('./measure-cycle');
 
 // fleet#4: refuse an unknown flag rather than silently ignore it.
 class BudgetReportError extends Error {
@@ -29,12 +30,10 @@ function readJson(file, fallback) {
   try { return JSON.parse(stripBom(fs.readFileSync(file, 'utf8'))); } catch { return fallback; }
 }
 
+// #124: the collector's fold, so this summary's by-model tables and the seven-day
+// report share one key per family; an unrecognized string is kept as written.
 function family(model) {
-  const m = String(model || '').toLowerCase();
-  if (m.includes('opus')) return 'opus';
-  if (m.includes('sonnet')) return 'sonnet';
-  if (m.includes('haiku')) return 'haiku';
-  return m ? 'other' : 'unknown';
+  return modelFamily(model).key;
 }
 
 function median(values) {
@@ -107,6 +106,10 @@ function buildSummary({ root, now } = {}) {
     bucket.jobTokens.push(Number(u.metrics?.jobTokens));
   }
   for (const b of Object.values(completed.byModel)) { b.medianJobTokens = median(b.jobTokens); b.p90JobTokens = (() => { const s = b.jobTokens.filter(Number.isFinite).sort((x, y) => x - y); return s.length ? s[Math.min(s.length - 1, Math.floor(s.length * 0.9))] : null; })(); delete b.jobTokens; }
+  const unrecognized = {};
+  for (const [key, bucket] of [...Object.entries(live.byModel).map(([k, b]) => [k, b.measured + b.unmeasured]), ...Object.entries(completed.byModel).map(([k, b]) => [k, b.units])]) {
+    if (key !== 'unknown' && !modelFamily(key).recognized) unrecognized[key] = (unrecognized[key] || 0) + bucket;
+  }
   const summary = {
     at,
     soak: last?.config ? { warnTokens: last.config.warnTokens, escalateTokens: last.config.escalateTokens, warningOnly: last.config.escalateTokens === null || last.config.escalateTokens === undefined } : null,
@@ -114,6 +117,7 @@ function buildSummary({ root, now } = {}) {
     byDay,
     live,
     completed,
+    unrecognizedModels: Object.entries(unrecognized).sort(([a], [b]) => a.localeCompare(b)).map(([model, units]) => ({ model, units })),
     crossings,
   };
   const dir = path.join(base, 'state', 'budget');
@@ -149,6 +153,7 @@ function render(s) {
     const b = s.completed.byModel[m];
     lines.push(`- ${m}: ${b.units} unit(s); median job tokens ${b.medianJobTokens ?? 'n/a'}, p90 ${b.p90JobTokens ?? 'n/a'}`);
   }
+  if ((s.unrecognizedModels || []).length) lines.push('', `unrecognized models: ${s.unrecognizedModels.map((entry) => `${entry.model} (${entry.units} unit${entry.units === 1 ? '' : 's'})`).join(', ')}`);
   lines.push('', '## Crossings', '');
   if (!s.crossings.length) lines.push('None.');
   for (const c of s.crossings.slice(-200)) lines.push(`- ${c.at} ${c.kind} ${c.recordId} [${c.model}]${c.tokens !== null ? ` ${c.tokens} tokens` : ''}${c.by ? ` by ${c.by}` : ''}`);

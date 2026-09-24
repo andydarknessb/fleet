@@ -488,3 +488,75 @@ test('cli: a correct invocation still works, matching the direct call', () => {
   assert.equal(path.basename(viaCli.dailyArtifact), 'daily-2026-09-02.json');
   assert.equal(path.basename(viaCli.summaryArtifact), 'seven-day-2026-09-02.md');
 });
+
+// --- WS5 (#91) fixtures: one transcript per session, parameterised -------------------
+// A session transcript named `name` with role `role`, one assistant turn at `at` on
+// `model` that merges `pr` (so an IC session reads as a merged unit).
+function sessionTranscript({ sessionId, name, role = 'ic', model = 'claude-sonnet-5', at = '2026-09-01T00:00:00.000Z', input = 100, output = 10, creation = 0, pr = null }) {
+  return [
+    { type: 'custom-title', customTitle: name, sessionId },
+    { type: 'agent-setting', agentSetting: role, sessionId },
+    { ...assistant({ uuid: `${sessionId}-a1`, timestamp: at, content: [{ type: 'text', text: pr ? `Standards and Spec review passed. PR #${pr} merged.` : 'Turn complete.' }], usage: { input, output, creation }, model }), sessionId },
+  ].map(line).join('\n');
+}
+
+function icRow(issue, sessionId, extra = {}) {
+  return { name: `ic-${issue}`, role: 'ic', tenant: 'endzone', issue, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId, ...extra };
+}
+
+// --- #124: one model key per model family --------------------------------------------
+// Red-tell: before the change a unit on `sonnet` and one on `claude-sonnet-5` report
+// two rows.
+const { modelFamily } = require('../bin/measure-cycle');
+
+test('#124: modelFamily folds aliases and full ids onto one family key and keeps unknowns as written', () => {
+  assert.deepEqual(modelFamily('sonnet'), { key: 'sonnet', recognized: true });
+  assert.deepEqual(modelFamily('claude-sonnet-5'), { key: 'sonnet', recognized: true });
+  assert.deepEqual(modelFamily('claude-opus-5-5[1m]'), { key: 'opus', recognized: true });
+  assert.deepEqual(modelFamily('Opus'), { key: 'opus', recognized: true });
+  assert.deepEqual(modelFamily('claude-haiku-4-5-20251001'), { key: 'haiku', recognized: true });
+  assert.deepEqual(modelFamily('fable'), { key: 'fable', recognized: true });
+  assert.deepEqual(modelFamily('claude-fable-5-1'), { key: 'fable', recognized: true });
+  assert.deepEqual(modelFamily('gpt-9-turbo'), { key: 'gpt-9-turbo', recognized: false });
+  assert.deepEqual(modelFamily(null), { key: 'unknown', recognized: false });
+  assert.deepEqual(modelFamily(''), { key: 'unknown', recognized: false });
+});
+
+test('#124: a unit on `sonnet` and one on `claude-sonnet-5` report one sonnet row carrying both', () => {
+  const a = parseTranscript(sessionTranscript({ sessionId: 's-a', name: 'ic-1', model: 'sonnet', pr: 101 }), 'fixture/s-a.jsonl');
+  const b = parseTranscript(sessionTranscript({ sessionId: 's-b', name: 'ic-2', model: 'claude-sonnet-5', pr: 102 }), 'fixture/s-b.jsonl');
+  const cycles = buildCycleRecords({
+    roster: { sessions: [icRow(1, 's-a'), icRow(2, 's-b')] },
+    transcripts: [a, b],
+    pullRequestStates: { 'endzone:101': { state: 'MERGED', mergedAt: '2026-09-01T00:00:30.000Z' }, 'endzone:102': { state: 'MERGED', mergedAt: '2026-09-01T00:00:30.000Z' } },
+  });
+  const report = buildReport(cycles.records, cycles.excluded, { sessionMetrics: cycles.sessionMetrics });
+  assert.deepEqual(Object.keys(report.byModel), ['sonnet']);
+  assert.equal(report.byModel.sonnet.units, 2);
+  assert.equal(report.byModel.sonnet.sessions, 2);
+  assert.deepEqual(report.units.map((u) => [u.model, u.modelRaw]), [['sonnet', 'sonnet'], ['sonnet', 'claude-sonnet-5']]);
+  assert.deepEqual(report.sessions.map((s) => s.model), ['sonnet', 'sonnet']);
+  assert.deepEqual(report.unrecognizedModels, []);
+});
+
+test('#124: an unknown model string is kept as written and listed under unrecognized with its unit count', () => {
+  const a = parseTranscript(sessionTranscript({ sessionId: 's-a', name: 'ic-1', model: 'gpt-9-turbo', pr: 101 }), 'fixture/s-a.jsonl');
+  const cycles = buildCycleRecords({
+    roster: { sessions: [icRow(1, 's-a')] },
+    transcripts: [a],
+    pullRequestStates: { 'endzone:101': { state: 'MERGED', mergedAt: '2026-09-01T00:00:30.000Z' } },
+  });
+  const report = buildReport(cycles.records, cycles.excluded, { sessionMetrics: cycles.sessionMetrics });
+  assert.equal(report.byModel['gpt-9-turbo'].units, 1);
+  assert.deepEqual(report.unrecognizedModels, [{ model: 'gpt-9-turbo', units: 1, sessions: 1 }]);
+  assert.match(renderSummary(report), /unrecognized models: gpt-9-turbo \(1 unit/);
+});
+
+test('#124: a synthetic assistant row does not name the session model', () => {
+  const parsed = parseTranscript([
+    { type: 'custom-title', customTitle: 'ic-1', sessionId: 's-1' },
+    assistant({ uuid: 'syn', timestamp: '2026-09-01T00:00:00.000Z', content: [{ type: 'text', text: 'No response requested.' }], usage: { input: 0, output: 0 }, model: '<synthetic>' }),
+    assistant({ uuid: 'real', timestamp: '2026-09-01T00:00:01.000Z', content: [{ type: 'text', text: 'ok' }], usage: { input: 1, output: 1 }, model: 'claude-sonnet-5' }),
+  ].map(line).join('\n'), 'fixture/s-1.jsonl');
+  assert.equal(parsed.model, 'claude-sonnet-5');
+});

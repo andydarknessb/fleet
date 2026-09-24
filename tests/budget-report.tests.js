@@ -102,3 +102,22 @@ test('cli: a correct invocation still works, matching the direct call', () => {
   const direct = buildSummary({ root, now });
   assert.deepEqual(viaCli, direct);
 });
+
+// --- #124: the budget summary uses the collector's family keys -----------------------
+test('#124: the budget summary by-model tables use the same folded keys as the seven-day report', () => {
+  const { modelFamily } = require('../bin/measure-cycle');
+  for (const m of ['sonnet', 'claude-opus-4-8', 'haiku', 'x']) assert.equal(family(m), modelFamily(m).key, 'one fold, shared');
+  assert.equal(family('claude-fable-5-1'), 'fable');
+  assert.equal(family('claude-sonnet-5'), 'sonnet');
+  assert.equal(family('gpt-9-turbo'), 'gpt-9-turbo', 'an unknown string is kept as written, not "other"');
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'state', 'metrics', 'seven-day-2026-09-09.json'), JSON.stringify({ period: { since: 's', until: 'u' }, units: [
+    { model: 'sonnet', metrics: { jobTokens: 40000 } }, { model: 'claude-sonnet-5', metrics: { jobTokens: 60000 } }, { model: 'gpt-9-turbo', metrics: { jobTokens: 1 } },
+  ] }));
+  const s = buildSummary({ root, now: '2026-09-09T04:00:00.000Z' });
+  assert.deepEqual(Object.keys(s.completed.byModel).sort(), ['gpt-9-turbo', 'sonnet']);
+  assert.equal(s.completed.byModel.sonnet.units, 2);
+  assert.deepEqual(s.unrecognizedModels, [{ model: 'gpt-9-turbo', units: 1 }]);
+  const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
+  assert.match(md, /unrecognized models: gpt-9-turbo \(1 unit\)/);
+});

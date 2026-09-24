@@ -11,6 +11,20 @@ const POLLING_COMMAND = /(?:\bgh\s+(?:pr\s+(?:view|checks|list)|issue\s+(?:view|
 const PR_REFERENCE = /\bPR\s*#?(\d+)\b|\bpull request\s*#?(\d+)\b/gi;
 const GH_PR_REFERENCE = /\bgh\s+pr\s+(?:view|checks|merge|create)\s+#?(\d+)\b/gi;
 
+// #124: every model string folds to one family key, so an alias (`sonnet`, from a roster
+// row or a subagent meta file) and a full id (`claude-sonnet-5`, from a transcript) land on
+// the same row. A string that matches no family is kept as written (never dropped or
+// lumped into "other") and reported under `unrecognizedModels`; no string at all is
+// `unknown`.
+const MODEL_FAMILIES = Object.freeze(['haiku', 'sonnet', 'opus', 'fable']);
+function modelFamily(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return { key: 'unknown', recognized: false };
+  const lower = raw.toLowerCase();
+  const key = MODEL_FAMILIES.find((family) => lower.includes(family));
+  return key ? { key, recognized: true } : { key: raw, recognized: false };
+}
+
 function asNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
@@ -175,7 +189,9 @@ function parseTranscript(contents, sourcePath) {
   for (const row of rows) {
     if (row.type !== 'assistant' || !row.message) continue;
     assistantMessages += 1;
-    model = model || row.message.model || row.model || null;
+    // A `<synthetic>` row is written by the client, not a model: it names none.
+    const rowModel = row.message.model || row.model || null;
+    if (!model && rowModel && rowModel !== '<synthetic>') model = rowModel;
     effort = effort || row.effort || null;
     const rowUsage = row.message.usage || {};
     const inputTokens = asNumber(rowUsage.input_tokens);
@@ -311,7 +327,8 @@ function sessionMetricForTranscript(transcript) {
     name: transcript.name,
     role: transcript.role,
     issue: transcript.issue,
-    model: transcript.model,
+    model: modelFamily(transcript.model).key,
+    modelRaw: transcript.model || null,
     effort: transcript.effort,
     firstTimestamp: transcript.firstTimestamp,
     lastTimestamp: transcript.lastTimestamp,
@@ -399,7 +416,8 @@ function buildCycleRecords({ roster, transcripts, pullRequestStates = null, allo
       session: row.name || transcript.name || null,
       sessionId: row.sessionId || transcript.sessionId || null,
       role: 'ic',
-      model: row.model || transcript.model || null,
+      model: modelFamily(row.model || transcript.model).key,
+      modelRaw: row.model || transcript.model || null,
       effort: row.effort || transcript.effort || null,
       pullRequests: transcript.pullRequests,
       merged: true,
@@ -469,6 +487,28 @@ function unitMetrics(units, roles, budgets) {
   return metrics;
 }
 
+// #124: units and sessions counted per folded family key. Unrecognized keys are the
+// raw strings, listed separately with their counts.
+function modelBreakdown(units, sessions) {
+  const byModel = {};
+  const bucket = (key) => byModel[key] || (byModel[key] = { units: 0, sessions: 0, unitJobTokens: 0, sessionFreshTokens: 0 });
+  for (const unit of units) {
+    const entry = bucket(modelFamily(unit.model).key);
+    entry.units += 1;
+    entry.unitJobTokens += asNumber(unit.metrics?.jobTokens);
+  }
+  for (const session of sessions) {
+    const entry = bucket(modelFamily(session.model).key);
+    entry.sessions += 1;
+    entry.sessionFreshTokens += asNumber(session.metrics?.freshTokens);
+  }
+  const sorted = Object.fromEntries(Object.entries(byModel).sort(([a], [b]) => a.localeCompare(b)));
+  const unrecognizedModels = Object.entries(sorted)
+    .filter(([key]) => key !== 'unknown' && !modelFamily(key).recognized)
+    .map(([model, entry]) => ({ model, units: entry.units, sessions: entry.sessions }));
+  return { byModel: sorted, unrecognizedModels };
+}
+
 function sum(records, selector) {
   return records.reduce((total, record) => total + asNumber(selector(record)), 0);
 }
@@ -531,6 +571,7 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
     sample: { completedUnits: units.length, excludedUnits: (excluded || []).length, excludedByReason: (excluded || []).reduce((acc, item) => { acc[item.reason] = (acc[item.reason] || 0) + 1; return acc; }, {}) },
     metrics,
     unitMetrics: unitMetrics(units, roles, budgets),
+    ...modelBreakdown(units, sessionMetrics || []),
     sessions: sessionMetrics || [],
     roles,
     units,
@@ -573,6 +614,11 @@ function renderSummary(report) {
   lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; limit ${show(u.budgets?.icJobTokensMedian?.limit)})${mark(u.budgets?.icJobTokensMedian?.pass)}`);
   lines.push(`IC fresh tokens median: ${show(u.icFreshTokensMedian)}`);
   lines.push(`exclusions by reason: ${JSON.stringify(report.sample.excludedByReason || {})}`);
+  const models = Object.entries(report.byModel || {});
+  lines.push(`models: ${models.length ? models.map(([key, entry]) => `${key} ${entry.units} unit(s)/${entry.sessions} session(s)`).join(', ') : 'none'}`);
+  if ((report.unrecognizedModels || []).length) {
+    lines.push(`unrecognized models: ${report.unrecognizedModels.map((entry) => `${entry.model} (${entry.units} unit(s), ${entry.sessions} session(s))`).join(', ')}`);
+  }
   lines.push('', '## Exclusions', '');
   if (report.excluded.length === 0) lines.push('None.');
   else for (const item of report.excluded) lines.push(`- ${item.tenant || 'unknown'} #${item.issue} — ${item.reason} (${item.evidence})`);
@@ -796,6 +842,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  MODEL_FAMILIES,
+  modelFamily,
   unitMetrics,
   percentile,
   buildCycleRecords,
