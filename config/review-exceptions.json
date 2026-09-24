@@ -1,0 +1,108 @@
+{
+  "schemaVersion": 1,
+  "_comment": "Acknowledged unreviewed merges (#114, ADR 0013). verify-events reports each as merged-without-review-acknowledged instead of failing. An entry needs the ruling that accepted it; nothing is added without one.",
+  "exceptions": [
+    {
+      "recordId": "endzone:issue-1241",
+      "head": "24be6e6f2023051c895efd12f3531ab17518ebe2",
+      "pr": 1287,
+      "ruling": "Merged 2026-09-12 with no review (ADR 0014). Retroactive review 2026-09-17: endzone #1545 and #1546 (spec #90, fleet audit 2026-09-17)."
+    },
+    {
+      "recordId": "endzone:issue-1263",
+      "head": "7c36a78425ba81e874fdc0844a6e017aa48fad0d",
+      "pr": 1288,
+      "ruling": "Merged 2026-09-12 with no review (ADR 0014). Retroactive review 2026-09-17: endzone #1545 and #1546 (spec #90, fleet audit 2026-09-17)."
+    },
+    {
+      "recordId": "endzone:issue-601",
+      "head": "unrecorded",
+      "pr": 613,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-602",
+      "head": "e97d7c619ab10f08b08325989cb7c39bf81df257",
+      "pr": 618,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-615",
+      "head": "41e7c868790dbea89a394abef8e01068c77f13e0",
+      "pr": 624,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-619",
+      "head": "7f90dba92e6f184f0e30a014381ab0bc8fbe2dd9",
+      "pr": 629,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-620",
+      "head": "788029c0e896860f4b6348155b2ef95737bc04bf",
+      "pr": 630,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-633",
+      "head": "24110153be45fc54bf0949ff6688fd68655d445d",
+      "pr": 646,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-636",
+      "head": "a6d9dd062e5d5e1da526e04fdab2e9016af7f06f",
+      "pr": 647,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged 2026-09-01 before the formal-review door recorded anything (first formal review-recorded 2026-09-01T21:12Z). Not a bypass of a rule in force; acknowledged as history."
+    },
+    {
+      "recordId": "endzone:issue-641",
+      "head": "1e45909c4ff87c89e6841f9b50d3fdf96b6d9039",
+      "pr": 668,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): a formal review was recorded; the merged head adds only commits fixing that review's findings, and the re-review was not recorded. Acknowledged; #115/#120 put the status on the merged head from now on."
+    },
+    {
+      "recordId": "endzone:issue-642",
+      "head": "d2a90c7685f9634a9d8f28ee49ac7b3ed5b352f5",
+      "pr": 667,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): a formal review was recorded; the merged head adds only commits fixing that review's findings, and the re-review was not recorded. Acknowledged; #115/#120 put the status on the merged head from now on."
+    },
+    {
+      "recordId": "endzone:issue-733",
+      "head": "67d208905e69a15b152ab299dce9713c1883566c",
+      "pr": 738,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): a formal review was recorded; the merged head adds only commits fixing that review's findings, and the re-review was not recorded. Acknowledged; #115/#120 put the status on the merged head from now on."
+    },
+    {
+      "recordId": "endzone:issue-1312",
+      "head": "54515e44c5fcfdf454d295a7c39df0035c05dd41",
+      "pr": 1371,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): a formal review was recorded; the merged head adds only commits fixing that review's findings, and the re-review was not recorded. Acknowledged; #115/#120 put the status on the merged head from now on."
+    },
+    {
+      "recordId": "endzone:issue-1578",
+      "head": "873e7204708b1d1de6b16d4a58f530b0974b6def",
+      "pr": 1588,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): a formal review was recorded; the merged head adds only commits fixing that review's findings, and the re-review was not recorded. Acknowledged; #115/#120 put the status on the merged head from now on. #1578: the round-3 review at 873e7204 was done and clean but could not be recorded (fleet#103, fixed by PR #109)."
+    },
+    {
+      "recordId": "endzone:issue-769",
+      "head": "1327fa532f6dd59fc595b2e13c6c808ea3a81b46",
+      "pr": 777,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged after the formal-review door existed with a risk review at most, no formal review. A real bypass like #1241/#1263; acknowledged so archival resumes, and a retro review is owed (see ruling on PR #122)."
+    },
+    {
+      "recordId": "endzone:issue-787",
+      "head": "67e6d47aca1edfdaf897f380bf0ac04c56d5417f",
+      "pr": 812,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged after the formal-review door existed with a risk review at most, no formal review. A real bypass like #1241/#1263; acknowledged so archival resumes, and a retro review is owed (see ruling on PR #122)."
+    },
+    {
+      "recordId": "endzone:issue-883",
+      "head": "de62d9277358f59cc84be55a5e09b54b506d0c2b",
+      "pr": 889,
+      "ruling": "Ruling 2026-09-24 (fleet PR #122): merged after the formal-review door existed with a risk review at most, no formal review. A real bypass like #1241/#1263; acknowledged so archival resumes, and a retro review is owed (see ruling on PR #122)."
+    }
+  ]
+}

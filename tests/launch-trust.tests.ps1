@@ -151,6 +151,20 @@ try {
   $r6 = Run-Launch @('-Manifest', $m, '-WorkRecordId', 'test:issue-10')
   Assert-True ($lastExit -eq 0 -and $r6.launched -eq $true) "the flag must skip the trust check: $lastOut"
 
+  # Case 7: the CLI writes keys that differ only in case ('C:/...' and 'c:/...'), which
+  # Windows PowerShell's ConvertFrom-Json rejects outright. The trusted ancestor must
+  # still be found, not the whole file read as untrusted.
+  # (The planner holds two live assignments already, so this calls the check directly.)
+  $fwd = $testRoot.Replace('\', '/')
+  $lowerDrive = $fwd.Substring(0, 1).ToLowerInvariant() + $fwd.Substring(1)
+  $upperDrive = $fwd.Substring(0, 1).ToUpperInvariant() + $fwd.Substring(1)
+  Write-Utf8 "$testRoot\profile\.claude.json" ('{"projects":{' + ($upperDrive | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true},' + ($lowerDrive | ConvertTo-Json) + ':{"hasTrustDialogAccepted":false},"C:/somewhere/else":{"hasTrustDialogAccepted":true}}}')
+  $check = { param($p) & powershell -NoProfile -ExecutionPolicy Bypass -Command ". '$testRoot\bin\_common.ps1'; Test-WorkspaceTrusted '$p'" 2>&1 | Out-String }
+  $t7 = (& $check "$repoPath\.claude\worktrees\ic-11-assignment").Trim()
+  Assert-True ($t7 -eq 'True') "case-duplicate keys in ~/.claude.json must not hide a trusted ancestor: $t7"
+  $t7b = (& $check 'D:\not\trusted').Trim()
+  Assert-True ($t7b -eq 'False') "an untrusted path stays untrusted when the file has case-duplicate keys: $t7b"
+
   Write-Output 'launch trust tests passed'
 } finally {
   $env:PATH = $oldPath

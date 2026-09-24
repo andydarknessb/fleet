@@ -647,3 +647,27 @@ test('a typo\'d flag on the command line exits 2 with an empty stdout and USAGE 
   assert.equal(err.code, 'USAGE');
   assert.match(err.message, /--dryrun/);
 });
+
+test('#118: a third return to draft escalates for a Ruling instead of failing every tick on SEND_BACK_LIMIT', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  let head = 'abc123';
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  for (const next of ['def456', 'fed789']) {
+    watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: head, statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+    assert.equal(record(root).state, 'revision');
+    head = next;
+    const readied = fetchers({ open: [pr({ headRefOid: head, statusCheckRollup: GREEN })], viewResult: view({ headRefOid: head, statusCheckRollup: GREEN, body: 'Closes #42' }) });
+    for (let tick = 0; tick < 3; tick += 1) watch(root, readied);
+    assert.equal(record(root).state, 'review');
+  }
+  const third = fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: head, statusCheckRollup: GREEN, body: 'Closes #42' }) });
+  const health = watch(root, third);
+  const rec = record(root);
+  assert.equal(rec.state, 'escalated', `the third send-back is a decision, not another round: ${JSON.stringify(health && health.actions)}`);
+  assert.equal(rec.prior_state, 'review');
+  assert.match(rec.decisionEvidence, /third send-back/);
+  assert.equal(outbox(root).filter((w) => w.wake === 'decision-needed').length, 1, 'one decision-needed wake');
+  watch(root, third);
+  assert.equal(record(root).state, 'escalated', 'the next tick does nothing more');
+});
