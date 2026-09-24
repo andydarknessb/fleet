@@ -1002,3 +1002,105 @@ test('fleet#56: the Principal sees a lead escalation on a PR-less record', () =>
   assert.equal(frontier.eligible[0].number, 1267);
   assert.equal(frontier.eligible[0].evidence, 'acceptance criteria wrong');
 });
+
+// --- #118: the third send-back stops ---------------------------------------------
+// On endzone #1240 one finding was re-raised five times at a cost of 569k tokens;
+// nothing counted send-backs. A send-back is a `review -> revision` transition; the
+// door refuses the third one with SEND_BACK_LIMIT and the lead escalates instead.
+// Red-tell: with bin/work-state.js reverted, the third send-back is accepted.
+
+function sendBackCycle(root, revision, round) {
+  for (const to of ['pr-open', 'ci-wait', 'review']) {
+    revision = transitionRecord({ root, id: 'endzone:issue-42', to, expectedRevision: revision, idempotencyKey: `r${round}-${to}`, actor: 'test', now: '2026-09-24T00:00:00.000Z' }).revision;
+  }
+  return revision;
+}
+
+function recordInReview(root) {
+  makeRecord(root, { state: 'implementing' });
+  return sendBackCycle(root, 1, 0);
+}
+
+test('#118: a record already sent back twice refuses a third review -> revision with SEND_BACK_LIMIT', () => {
+  const root = rootDir();
+  let revision = recordInReview(root);
+  for (const round of [1, 2]) {
+    revision = transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: `send-back-${round}`, actor: 'pl', evidence: `round ${round}`, now: '2026-09-24T00:00:00.000Z' }).revision;
+    revision = sendBackCycle(root, revision, round);
+  }
+  assert.throws(
+    () => transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: 'send-back-3', actor: 'pl', evidence: 'round 3', now: '2026-09-24T00:00:00.000Z' }),
+    (error) => error instanceof WorkStateError && error.code === 'SEND_BACK_LIMIT' && /escalat/.test(error.message) && error.sendBacks === 2,
+  );
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'review', 'nothing moved');
+  const escalated = transitionRecord({ root, id: 'endzone:issue-42', to: 'escalated', expectedRevision: revision, idempotencyKey: 'escalate-3', actor: 'pl', evidence: 'wake:decision-needed; criterion restated', now: '2026-09-24T00:00:00.000Z' });
+  assert.equal(escalated.record.state, 'escalated', 'escalation is unaffected');
+});
+
+test('#118: a replay of an accepted second send-back still replays; hold is unaffected', () => {
+  const root = rootDir();
+  let revision = recordInReview(root);
+  const first = transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: 'send-back-1', actor: 'pl', evidence: 'r1', now: '2026-09-24T00:00:00.000Z' });
+  const replay = transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: 'send-back-1', actor: 'pl', evidence: 'r1', now: '2026-09-24T00:00:00.000Z' });
+  assert.equal(replay.replayed, true);
+  revision = sendBackCycle(root, first.revision, 1);
+  revision = transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: 'send-back-2', actor: 'pl', evidence: 'r2', now: '2026-09-24T00:00:00.000Z' }).revision;
+  revision = sendBackCycle(root, revision, 2);
+  const held = transitionRecord({ root, id: 'endzone:issue-42', to: 'hold', expectedRevision: revision, idempotencyKey: 'hold', actor: 'pl', evidence: 'wake:decision-needed; carve-out', now: '2026-09-24T00:00:00.000Z' });
+  assert.equal(held.record.state, 'hold');
+});
+
+// Ruling 2026-09-24 (PR #122): a send-back through an escalation (review ->
+// escalated -> revision) is a send-back too; otherwise a lead can resolve its own
+// escalation back to revision and never meet the limit. At the limit the only
+// way back to revision is a Ruling named on the transition (`ruling`), which is
+// recorded on the event so a self-granted one is visible.
+function escalatedSendBack(root, revision, round, extra = {}) {
+  revision = transitionRecord({ root, id: 'endzone:issue-42', to: 'escalated', expectedRevision: revision, idempotencyKey: `esc-${round}`, actor: 'pl', evidence: `wake:decision-needed; round ${round}`, now: '2026-09-24T00:00:00.000Z' }).revision;
+  return transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: `esc-back-${round}`, actor: 'pl', evidence: `resolved: send back, round ${round}`, now: '2026-09-24T00:00:00.000Z', ...extra });
+}
+
+test('ruling 2026-09-24: review -> escalated -> revision counts toward SEND_BACK_LIMIT', () => {
+  const root = rootDir();
+  let revision = recordInReview(root);
+  revision = sendBackCycle(root, escalatedSendBack(root, revision, 1).revision, 1);
+  revision = sendBackCycle(root, escalatedSendBack(root, revision, 2).revision, 2);
+  assert.throws(
+    () => transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: 'send-back-3', actor: 'pl', evidence: 'round 3', now: '2026-09-24T00:00:00.000Z' }),
+    (error) => error.code === 'SEND_BACK_LIMIT' && error.sendBacks === 2,
+  );
+  assert.throws(() => escalatedSendBack(root, revision, 3), (error) => error.code === 'SEND_BACK_LIMIT' && /ruling/.test(error.message));
+});
+
+test('ruling 2026-09-24: at the limit a named Ruling sends back through the escalation, and the event carries it', () => {
+  const root = rootDir();
+  let revision = recordInReview(root);
+  for (const round of [1, 2]) {
+    revision = transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: `send-back-${round}`, actor: 'pl', evidence: `round ${round}`, now: '2026-09-24T00:00:00.000Z' }).revision;
+    revision = sendBackCycle(root, revision, round);
+  }
+  const back = escalatedSendBack(root, revision, 3, { ruling: 'https://github.com/andydarknessb/Endzone-Empire/issues/42#issuecomment-1' });
+  assert.equal(back.record.state, 'revision');
+  const event = readEvents(root).filter((e) => e.recordId === 'endzone:issue-42' && e.type === 'state-revision').pop();
+  assert.equal(event.changes.ruling, 'https://github.com/andydarknessb/Endzone-Empire/issues/42#issuecomment-1');
+  assert.equal(event.changes.sendBack, true);
+});
+
+test('ruling 2026-09-24: an escalation that began outside review (ci-wait) resolving to revision is not a send-back', () => {
+  const root = rootDir();
+  makeRecord(root, { state: 'implementing' });
+  let revision = 1;
+  for (const to of ['pr-open', 'ci-wait']) revision = transitionRecord({ root, id: 'endzone:issue-42', to, expectedRevision: revision, idempotencyKey: `c-${to}`, actor: 'test', now: '2026-09-24T00:00:00.000Z' }).revision;
+  revision = transitionRecord({ root, id: 'endzone:issue-42', to: 'escalated', expectedRevision: revision, idempotencyKey: 'c-esc', actor: 'pl', evidence: 'wake:decision-needed; ci', now: '2026-09-24T00:00:00.000Z' }).revision;
+  const back = transitionRecord({ root, id: 'endzone:issue-42', to: 'revision', expectedRevision: revision, idempotencyKey: 'c-back', actor: 'pl', evidence: 'fix ci', now: '2026-09-24T00:00:00.000Z' });
+  assert.equal(readEvents(root).filter((e) => e.type === 'state-revision').pop().changes.sendBack, false);
+  assert.ok(back.record);
+});
+
+test('#114 review: a merge reconciled with its head records github.mergedHeadSha', () => {
+  const root = rootDir();
+  let revision = recordInReview(root);
+  const merged = transitionRecord({ root, id: 'endzone:issue-42', to: 'merged', expectedRevision: revision, idempotencyKey: 'merge', actor: 'pr-watch', evidence: 'observed merged',
+    reconciledObservation: { state: 'MERGED', mergedAt: '2026-09-24T01:00:00Z', headRefOid: 'e'.repeat(40), evidence: 'gh pr view 77' }, now: '2026-09-24T01:00:00.000Z' });
+  assert.equal(merged.record.github.mergedHeadSha, 'e'.repeat(40));
+});

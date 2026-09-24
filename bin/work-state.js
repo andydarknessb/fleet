@@ -770,11 +770,43 @@ function createRecord(options = {}) {
   });
 }
 
+// #118 (ADR 0014 Consequences): a send-back is a `review -> revision` transition.
+// On endzone #1240 one finding was re-raised five times at a cost of 569k tokens,
+// and nothing counted. The count is derived from the record's own committed
+// transitions (its idempotency map), so it covers records created before this
+// rule and resets with a fresh reservation, which starts a new attempt. The
+// door refuses the third; `hold` and `escalated` are unaffected.
+const SEND_BACK_LIMIT = 3;
+
+// Ruling 2026-09-24 (PR #122): an escalation raised from `review` and resolved
+// back to `revision` is a send-back too, or a lead could resolve its own
+// escalation and never meet the limit. Those entries carry `sendBack: true`;
+// escalations raised elsewhere (ci-wait) are not review rounds.
+function isSendBack(record, to) {
+  return to === 'revision' && (record.state === 'review' || (record.state === 'escalated' && record.prior_state === 'review'));
+}
+
+function sendBackCount(record) {
+  return Object.values(record?.idempotency || {}).filter((entry) => entry && (entry.type === 'transition:review->revision' || entry.sendBack === true)).length;
+}
+
 function validateTransition(record, to, options) {
   if (!STATES.includes(to)) throw new WorkStateError('INVALID_STATE', `unknown state '${to}'`);
   const allowed = TRANSITIONS[record.state] || [];
   const fromEscalated = record.state === 'escalated';
   if (!allowed.includes(to)) throw new WorkStateError('INVALID_TRANSITION', `${record.state} -> ${to} is not allowed`);
+  if (isSendBack(record, to)) {
+    const sendBacks = sendBackCount(record);
+    if (sendBacks >= SEND_BACK_LIMIT - 1) {
+      if (record.state === 'review') {
+        throw new WorkStateError('SEND_BACK_LIMIT', `${record.id} has been sent back ${sendBacks} times; a third send-back is refused (#118). Escalate with the criterion restated (transition --to escalated) so the disagreement gets a Ruling instead of another round`, { sendBacks, limit: SEND_BACK_LIMIT });
+      }
+      // Past the limit only a Ruling sends work back, and it is named on the event.
+      if (!options.ruling || !String(options.ruling).trim()) {
+        throw new WorkStateError('SEND_BACK_LIMIT', `${record.id} has been sent back ${sendBacks} times; resolving this escalation to revision needs the Ruling that ordered it (--ruling "<link or reference>"), which is recorded on the event`, { sendBacks, limit: SEND_BACK_LIMIT });
+      }
+    }
+  }
   if (to === 'hold' && !record.github?.prNumber) throw new WorkStateError('MISSING_PR_EVIDENCE', 'hold requires github.prNumber');
   if (to === 'merged') {
     const observation = options.githubObservation;
@@ -846,7 +878,7 @@ function transitionRecord(options = {}) {
       idempotency: { ...record.idempotency },
     };
     if (prNumber) next.github = { ...record.github, prNumber };
-    if (githubObservation) next.github = { ...next.github, lastObservedState: githubObservation.state, mergedAt: githubObservation.mergedAt, evidence: githubObservation.evidence || options.evidence };
+    if (githubObservation) next.github = { ...next.github, lastObservedState: githubObservation.state, mergedAt: githubObservation.mergedAt, evidence: githubObservation.evidence || options.evidence, ...(githubObservation.headRefOid ? { mergedHeadSha: String(githubObservation.headRefOid) } : {}) };
     if (to === 'escalated') {
       next.prior_state = record.state;
       next.decisionEvidence = options.evidence;
@@ -859,14 +891,18 @@ function transitionRecord(options = {}) {
       next.resolvedDecisionEvidence = record.decisionEvidence || null;
       next.resolutionEvidence = options.evidence;
     }
-    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: `transition:${record.state}->${to}` };
+    const sendBack = isSendBack(record, to);
+    next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: `transition:${record.state}->${to}`, ...(sendBack ? { sendBack: true } : {}) };
     const event = eventFor(next, {
       type: `state-${to}`,
       actor: options.actor,
       at: now,
       idempotencyKey: key,
       evidence: options.evidence,
-      changes: { from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null },
+      changes: {
+        from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null,
+        ...(to === 'revision' ? { sendBack, ...(options.ruling ? { ruling: String(options.ruling) } : {}) } : {}),
+      },
     });
     const retiring = to === 'retired';
     const resultRecord = commitMutation(p, {
@@ -1387,7 +1423,7 @@ const FLAGS = Object.freeze({
   reserve: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'manifest', 'reservations', 'assignment', 'independence-proof', 'issue-url', 'body-hash'],
   release: [...COMMON_FLAGS, 'id', 'expected-revision'],
   abandon: [...COMMON_FLAGS, 'id', 'expected-revision', 'reason', 'kill-point'],
-  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'github-evidence', 'no-notifier'],
+  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'github-evidence', 'no-notifier', 'ruling'],
   reconcile: ['repo', 'pr-number'],
   observe: [...COMMON_FLAGS, 'id', 'expected-revision', 'pr-number', 'observation', 'changed', 'wake'],
   review: [...COMMON_FLAGS, 'id', 'expected-revision', 'kind', 'head-sha', 'artifact', 'tier', 'triggers', 'prior-artifact'],
@@ -1418,7 +1454,7 @@ function cli(argv) {
     const result = transitionRecord({
       ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
       prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined, githubRepo: args.repo,
-      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'],
+      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'], ruling: args.ruling,
     });
     // Ticket 07: a decision event launches its notifier from the door that wrote it
     // (the watcher does the same for its own). `paged` is true when this call
@@ -1500,6 +1536,8 @@ module.exports = {
   reserveRecord,
   shadowProject,
   transitionRecord,
+  sendBackCount,
+  SEND_BACK_LIMIT,
 };
 
 // The CLI runs after the exports are set: bin/notify.js is required lazily from

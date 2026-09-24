@@ -8,6 +8,20 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-page-test-" + [guid]::N
 $oldPushoverUrl = $env:FLEET_PUSHOVER_URL
 $mockJob = $null
 
+# #112 (CI): a fixed 400 ms sleep let the first POST reach a port whose listener
+# job had not bound yet on a slow runner; the refused connection is a retryable
+# failure, so "exactly one attempt" read 2. Wait until the port accepts a TCP
+# connection instead (http.sys refuses the port until the prefix is registered).
+function Wait-MockListener {
+  param([int]$Port, [int]$TimeoutSec = 30)
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  while ((Get-Date) -lt $deadline) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try { $client.Connect('127.0.0.1', $Port); return } catch { Start-Sleep -Milliseconds 100 } finally { $client.Close() }
+  }
+  throw "mock listener on port $Port did not start within $TimeoutSec s"
+}
+
 function Start-MockPushover {
   # A tiny local HTTP server standing in for Pushover, run in a background job (a
   # separate process, so it can block on GetContext() while this script posts to
@@ -34,7 +48,7 @@ function Start-MockPushover {
     }
     $listener.Stop()
   } -ArgumentList $prefix, $LogPath, $Count
-  Start-Sleep -Milliseconds 400   # let the listener bind before the first post
+  Wait-MockListener -Port $port
   return [pscustomobject]@{ Job = $job; Prefix = $prefix }
 }
 
@@ -178,7 +192,7 @@ try {
       $context.Response.OutputStream.Close()
       $listener.Stop()
     } -ArgumentList $prefix, $StatusCode
-    Start-Sleep -Milliseconds 400
+    Wait-MockListener -Port $port
     return [pscustomobject]@{ Job = $job; Prefix = $prefix }
   }
   function Start-MockPushoverSequence {
@@ -208,7 +222,7 @@ try {
       }
       $listener.Stop()
     } -ArgumentList $prefix, $LogPath, $StatusCodes
-    Start-Sleep -Milliseconds 400
+    Wait-MockListener -Port $port
     return [pscustomobject]@{ Job = $job; Prefix = $prefix }
   }
 

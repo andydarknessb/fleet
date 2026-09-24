@@ -165,6 +165,21 @@ under the flag is the double-actor condition, and the Watchdog stays in shadow
 until it is gone.
 _Avoid_: sentinel (a session), monitor, health checker
 
+**Live ref**:
+The `live` branch the running fleet's checkout sits on, and the only way code
+reaches it (ADR 0013). Each tick the Watchdog fast-forwards it to `master`
+when `master`'s CI is green; it never moves it any other way. Nobody commits
+on it. A red `master` stops deploys and nothing else: the fleet keeps running
+the last commit that passed. Rolling back is moving `live` back, together
+with a Deploy hold.
+_Avoid_: prod branch, release (the tenant's release branch is a different thing), deployed master
+
+**Deploy hold**:
+The flag `state/flags/deploy-hold`: while it stands the Watchdog does not
+advance the Live ref, however green `master` is. Set with every rollback, or
+the next green tick moves the fleet forward again.
+_Avoid_: freeze, pause (Pause stops launches, not deploys)
+
 ### Work
 
 **Fleet cycle**:
@@ -229,6 +244,18 @@ resolves each of them on record. Every PR still gets the project lead's
 one formal Standards and Spec review; a diff without a trigger never gets a
 risk reviewer.
 _Avoid_: second reviewer, QA pass, extra review angle
+
+**Review gate**:
+The `fleet-review` commit status (the tenant file's `reviewStatus`) that a pull
+request into the tenant's default branch must carry green on its head before
+GitHub lets it merge (ADR 0014). Recording a formal review posts it for the
+head that was reviewed: green when no open finding is a blocker or major, red
+otherwise. A pull request with no Work record gets it from an attestation. A
+new push moves the head, so the new head needs its own review. The status says
+a review was recorded for that commit, not that the review was good. It is
+never one of the CI gates: review waits for the gates, so a gate that waited
+for the review would deadlock.
+_Avoid_: approval, review check, merge check
 
 **Researcher**:
 A Worker spawned to find facts and report them: documentation, how a thing
