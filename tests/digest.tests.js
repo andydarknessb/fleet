@@ -229,3 +229,17 @@ test('cli: a correct invocation still works, matching the direct call byte-for-b
   assert.equal(viaCli.content, direct.content);
   assert.deepEqual(viaCli.offset, direct.offset);
 });
+
+// Spec fleet #92 / #143: one line per tenant counting the open ready tickets with
+// no `## Premises`, read from the watchdog's triage shadow (stamped with its time).
+test('#143: the Triage section counts open ready tickets without a Premises section', () => {
+  const root = rootDir();
+  const missingLine = (content) => section(content, 'Triage (advisory Principal, ADR 0011)').split('\n').find((line) => /Premises/.test(line));
+  assert.match(missingLine(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content), /endzone: `## Premises` census not recorded yet/);
+  fs.mkdirSync(path.join(root, 'state', 'watchdog'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'watchdog', 'triage-frontier.json'), JSON.stringify({
+    at: '2026-09-24T07:45:00.000Z', tenants: [{ tenant: 'endzone', premises: { readyLabel: 'ready-for-agent', ready: 10, missing: [1440, 1441], malformed: [1609] } }],
+  }));
+  const line = missingLine(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content);
+  assert.equal(line, '- endzone: 2 of 10 open ready-for-agent ticket(s) without `## Premises` (#1440, #1441); malformed: #1609 (census 2026-09-24T07:45:00.000Z).');
+});

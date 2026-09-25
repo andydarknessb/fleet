@@ -18,6 +18,7 @@ const {
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
+const { readPremises } = require('./premises');
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
@@ -69,10 +70,17 @@ const ALLOWLIST = /\b(?:lists?|touch(?:es)?|edits?|changes?|modif(?:y|ies)|write
 const EDIT_VERB = /\b(?:add|adds|added|amend|amends|amended|append|appends|appended|write|writes|written|edit|edits|edited|update|updates|updated|change|changes|changed|create|creates|created|rewrite|rewrites|rewritten|extend|extends|extended|revise|revises|revised|own|owns|touch|touches|move|moves|delete|deletes|remove|removes|rename|renames|new)\b/i;
 const NEGATED_HEADING = /^\s{0,3}#{1,6}\s+.*\b(?:out of scope|non-goals?|not in scope|do not touch|must not touch)\b|^\s*\*\*(?:out of scope|non-goals?)\.?\*\*/i;
 
+// Spec fleet #92: a `## Premises` section cites the code a ticket depends on; its
+// paths are read, never written, so the section contributes no sentence at all.
+const PREMISES_HEADING = /^\s{0,3}##\s+premises\s*#*\s*$/i;
+
 function criteriaSentences(text) {
   const sentences = [];
   let negatedSection = false;
+  let premisesSection = false;
   for (const line of String(text || '').split(/\r?\n/)) {
+    if (/^\s{0,3}#{1,2}\s/.test(line)) premisesSection = PREMISES_HEADING.test(line);
+    if (premisesSection) continue;
     if (/^\s{0,3}#{1,6}\s/.test(line) || /^\s*\*\*[^*]+\*\*/.test(line)) negatedSection = NEGATED_HEADING.test(line);
     // An abbreviation's period ends no sentence: "cf. `path`" and "e.g. `path`"
     // keep their cue beside the path they cite (fleet#52).
@@ -197,6 +205,9 @@ function normalizeIssue(issue) {
     comments,
     commentsTruncated: Boolean(issue.commentsTruncated || issue.comments?.pageInfo?.hasNextPage),
     ...normalizeReservations({ ...issue, comments }),
+    // Spec fleet #92: from the body only; a malformed section is carried, not thrown,
+    // so the frontier still reads every other ticket and assign refuses this one.
+    ...readPremises(issue.body),
     createdAt: issue.createdAt || '9999-12-31T23:59:59.999Z',
   };
 }
@@ -433,7 +444,13 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
     ciGates: [...ciGates],
     reservations: normalized.reservations,
     independenceProof: independenceProof || null,
+    // Spec fleet #92: null while the ticket has no section (the backfill window), [] for `none`.
+    premises: pinnedPremises(normalized.premises),
   };
+}
+
+function pinnedPremises(premises) {
+  return Array.isArray(premises) ? premises.map(({ path: premisePath, claim, sha }) => ({ path: premisePath, claim, sha })) : null;
 }
 
 // fleet#33: lead-supplied reservations replace the derived set. The shape is the
@@ -454,6 +471,12 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
   const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
+  // Spec fleet #92: a section that exists and does not parse is refused before
+  // anything is written, quoting the line, so a half-written premise never
+  // reaches an IC. An absent section is still assignable during the backfill.
+  if (normalized.premisesError) {
+    throw new WorkStateError(normalized.premisesError.code, `issue #${normalized.number}: ${normalized.premisesError.message}`, { issue: normalized.number, line: normalized.premisesError.line });
+  }
   // fleet#33: an assignment with no reservation at all is a derivation failure far
   // more often than a file-less ticket, and it is invisible until the next third
   // assignment fails closed on `missingReservations`. Refuse it here, where the
@@ -477,7 +500,7 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
   const manifestPath = writeManifest(root, manifest);
   try {
     const reserved = reserveRecord({
-      root, id: workRecordId, tenant, issue: normalized.number, manifestPath, assignment: { manifestId: manifest.id, branch: manifest.branch, baseSha: manifest.base.sha, independenceProof: proof || null },
+      root, id: workRecordId, tenant, issue: normalized.number, manifestPath, assignment: { manifestId: manifest.id, branch: manifest.branch, baseSha: manifest.base.sha, independenceProof: proof || null, premises: manifest.premises },
       github: { issueNumber: normalized.number, issueUrl: normalized.url, bodyHash: normalized.bodyHash, criteriaHash: normalized.criteriaHash, commentCount: normalized.comments.length }, reservations: normalized.reservations, proofRecords: activeAssignments, independenceProof: proof,
       evidence: { github: `gh issue view ${normalized.number}`, manifest: path.relative(path.resolve(root), manifestPath) },
       idempotencyKey: `assignment-reserved:${manifest.id}`, actor, now,

@@ -103,6 +103,21 @@ function readSupplement(base) {
   return supplement;
 }
 
+// Spec fleet #92 (#143): the watchdog writes each tenant's triage frontier, census
+// included, to state/watchdog/triage-frontier.json every tick. A missing or torn
+// file only costs the census line.
+function readPremisesCensus(base) {
+  try {
+    const shadow = JSON.parse(fs.readFileSync(path.join(base, 'state', 'watchdog', 'triage-frontier.json'), 'utf8').replace(/^﻿/, ''));
+    const byTenant = {};
+    for (const entry of shadow.tenants || []) {
+      const census = entry?.premises;
+      if (entry?.tenant && census && Array.isArray(census.missing)) byTenant[entry.tenant] = { readyLabel: census.readyLabel || 'ready-for-agent', ready: Number(census.ready) || 0, missing: census.missing, malformed: Array.isArray(census.malformed) ? census.malformed : [] };
+    }
+    return { at: shadow.at || 'unknown', byTenant };
+  } catch { return null; }
+}
+
 function deliveryLine(entry) {
   if (!entry) return 'notification: not yet sent';
   if (entry.status === 'claimed') return `notification: claimed ${entry.at} (attempt ${entry.attempt}, in flight or stale - the ledger shows no settle)`;
@@ -122,7 +137,7 @@ function renderRow(row) {
   return `${row.tenant} #${row.issue}`;
 }
 
-function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, offset, configs }) {
+function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus, offset, configs }) {
   const lastEvent = events[events.length - 1] || null;
   const lines = [];
   lines.push(scope === 'fleet' ? '# Fleet digest' : `# ${scope} status`);
@@ -191,6 +206,14 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageBy
     // fleet#49: Principal docs PRs have no lead and no Work record; Cory merges them from here.
     for (const row of fold.docsPrs || []) lines.push(`  - #${row.issue} docs PR ${row.prUrl} opened ${row.since}; the merge is Cory's`);
   }
+  // Spec fleet #92 (#143): the Premises backfill census, from the watchdog's triage
+  // shadow and stamped with its own time (it is a GitHub read, not a ledger fold).
+  for (const tenant of tenantNames) {
+    const census = premisesCensus?.byTenant?.[tenant];
+    if (!census) { lines.push(`- ${tenant}: \`## Premises\` census not recorded yet (state/watchdog/triage-frontier.json).`); continue; }
+    const list = (numbers) => numbers.map((number) => `#${number}`).join(', ');
+    lines.push(`- ${tenant}: ${census.missing.length} of ${census.ready} open ${census.readyLabel} ticket(s) without \`## Premises\`${census.missing.length ? ` (${list(census.missing)})` : ''}${census.malformed.length ? `; malformed: ${list(census.malformed)}` : ''} (census ${premisesCensus.at}).`);
+  }
 
   lines.push('', "## Cory's authority", '');
   for (const tenant of tenantNames) {
@@ -239,7 +262,7 @@ function projectDigest(options = {}) {
   for (const tenant of tenantNames) {
     triageByTenant[tenant] = projectTriage({ entries: readTriageLedger(base, tenant), now: options.now, windowDays: triageConfig.windowDays, graduation: triageConfig.graduation });
   }
-  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, offset, configs });
+  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus: readPremisesCensus(base), offset, configs });
   const output = options.output ? path.resolve(options.output) : path.join(base, 'state', 'status', options.tenant ? `${options.tenant}-status.md` : 'DIGEST.md');
   if (!options.dryRun) writeAtomic(output, content);
   return { output, content, offset };

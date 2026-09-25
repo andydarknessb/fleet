@@ -356,7 +356,15 @@ _Avoid_: decision (unqualified), verdict, call
 **Premise**:
 A fact about the tenant's code that a ticket's criteria depend on, stated with
 the commit it was read at. A false premise was never true and needs a Ruling
-to restate the ticket.
+to restate the ticket. A ticket states its premises in the issue body (never a
+comment) under the heading `## Premises`: one line per premise,
+`<path>: <claim> @<sha>`, where the sha is the full 40 hex or a prefix of 7 or
+more, or the single word `none` when no criterion depends on the code. A line
+may be a `- ` list item and its path may be fenced in backticks; a line suffix
+(`path.js:53`) belongs to the path. Nothing else goes in the section. `assign`
+pins the parsed list in the manifest and refuses a section that does not parse
+(`PREMISES_MALFORMED`, quoting the line); a ticket with no section is still
+assignable until the backfill (fleet #146) and pins `premises: null`.
 _Avoid_: assumption, precondition, "mis-specified ticket"
 
 **Stale premise**:

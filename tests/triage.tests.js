@@ -271,3 +271,18 @@ function writeFixture(root, issues) {
   fs.writeFileSync(file, JSON.stringify(issues));
   return file;
 }
+
+// Spec fleet #92 / #143: the frontier counts the open ready tickets whose body
+// carries no `## Premises` section (and names malformed ones); the watchdog's
+// shadow file carries the census to the digest.
+test('#143: the frontier carries a premises census of the open ready tickets', () => {
+  const sha = 'abcdef0123456789abcdef0123456789abcdef01';
+  const result = frontier([
+    issue(21, { labels: ['ready-for-agent'], body: 'No section here.' }),
+    issue(22, { labels: ['ready-for-agent'], body: `## Premises\n\nsrc/a.js: exports a @${sha}\n` }),
+    issue(23, { labels: ['ready-for-agent'], body: '## Premises\n\nnone\n' }),
+    issue(24, { labels: ['ready-for-agent'], body: '## Premises\n\nhalf a premise\n' }),
+    issue(25, { labels: ['needs-triage'], body: 'Not ready, not counted.' }),
+  ]);
+  assert.deepEqual(result.premises, { readyLabel: 'ready-for-agent', ready: 4, missing: [21], malformed: [24] });
+});

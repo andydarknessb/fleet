@@ -17,6 +17,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { WorkStateError, parseArgs } = require('./work-state');
 const { sha256 } = require('./assignment');
+const { readPremises } = require('./premises');
 
 const DEFAULT_CONFIG = Object.freeze({
   markerLabel: 'triage-proposed',
@@ -406,6 +407,17 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
   }
 
+  // Spec fleet #92 (#143): the backfill census. Open tickets carrying the ready
+  // label whose body has no `## Premises`, and those whose section does not parse.
+  const premises = { readyLabel, ready: 0, missing: [], malformed: [] };
+  for (const issue of normalized) {
+    if (!issue.labels.includes(readyLabel)) continue;
+    premises.ready += 1;
+    const read = readPremises(issue.body);
+    if (read.premisesError) premises.malformed.push(issue.number);
+    else if (read.premises === null) premises.missing.push(issue.number);
+  }
+
   approvals.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
@@ -414,6 +426,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     eligible: [...approvals, ...escalationList, ...tickets],
     proposeNow,
     skipped,
+    premises,
     counts: { issues: issues.length, eligible: approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length },
   };
 }
