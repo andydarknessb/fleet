@@ -443,7 +443,7 @@ function replayIfKnown(record, key) {
 
 function sanitizeGithub(github, issue) {
   const source = github || {};
-  const allowed = ['issueNumber', 'prNumber', 'issueUrl', 'prUrl', 'baseSha', 'bodyHash', 'criteriaHash', 'commentCount', 'headSha', 'lastObservedState', 'mergedAt', 'evidence'];
+  const allowed = ['issueNumber', 'prNumber', 'issueUrl', 'prUrl', 'baseSha', 'bodyHash', 'criteriaHash', 'commentCount', 'headSha', 'lastObservedState', 'mergedAt', 'mergedBy', 'evidence'];
   return Object.fromEntries(allowed.filter((key) => source[key] !== undefined).map((key) => [key, source[key]]).concat(source.issueNumber === undefined ? [['issueNumber', Number(issue)]] : []));
 }
 
@@ -854,11 +854,12 @@ function reconcilePullRequest({ repo, prNumber, executable = 'gh' }) {
     throw new WorkStateError('INVALID_GITHUB_QUERY', 'repo and positive prNumber are required');
   }
   try {
-    const raw = execFileSync(executable, ['pr', 'view', String(prNumber), '-R', String(repo), '--json', 'state,mergedAt,url,headRefOid'], {
+    const raw = execFileSync(executable, ['pr', 'view', String(prNumber), '-R', String(repo), '--json', 'state,mergedAt,mergedBy,url,headRefOid'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000,
     });
     const result = JSON.parse(raw);
-    return { ...result, evidence: `gh pr view ${prNumber} -R ${repo}` };
+    const mergedBy = result.mergedBy && typeof result.mergedBy === 'object' ? result.mergedBy.login || null : result.mergedBy || null;
+    return { ...result, mergedBy, evidence: `gh pr view ${prNumber} -R ${repo}` };
   } catch (error) {
     throw new WorkStateError('GITHUB_RECONCILIATION_FAILED', String(error.stderr || error.message || error));
   }
@@ -891,7 +892,7 @@ function transitionRecord(options = {}) {
     const githubObservation = to === 'merged'
       ? (options.githubRepo ? reconcilePullRequest({ repo: options.githubRepo, prNumber, executable: options.githubExecutable })
         : (options.reconciledObservation && options.reconciledObservation.evidence ? options.reconciledObservation
-          : (options.testOnly ? (options.githubObservation || (options.githubState ? { state: options.githubState, mergedAt: options.githubMergedAt, evidence: options.githubEvidence } : null)) : null)))
+          : (options.testOnly ? (options.githubObservation || (options.githubState ? { state: options.githubState, mergedAt: options.githubMergedAt, mergedBy: options.githubMergedBy, evidence: options.githubEvidence } : null)) : null)))
       : null;
     validateTransition(record, to, { ...options, githubObservation });
     const now = isoNow(options.now);
@@ -904,7 +905,7 @@ function transitionRecord(options = {}) {
       idempotency: { ...record.idempotency },
     };
     if (prNumber) next.github = { ...record.github, prNumber };
-    if (githubObservation) next.github = { ...next.github, lastObservedState: githubObservation.state, mergedAt: githubObservation.mergedAt, evidence: githubObservation.evidence || options.evidence, ...(githubObservation.headRefOid ? { mergedHeadSha: String(githubObservation.headRefOid) } : {}) };
+    if (githubObservation) next.github = { ...next.github, lastObservedState: githubObservation.state, mergedAt: githubObservation.mergedAt, evidence: githubObservation.evidence || options.evidence, ...(githubObservation.headRefOid ? { mergedHeadSha: String(githubObservation.headRefOid) } : {}), ...(githubObservation.mergedBy ? { mergedBy: String(githubObservation.mergedBy) } : {}) };
     if (to === 'escalated') {
       next.prior_state = record.state;
       next.decisionEvidence = options.evidence;
@@ -928,6 +929,8 @@ function transitionRecord(options = {}) {
       changes: {
         from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null,
         ...(options.reason ? { reason: options.reason, premise: String(options.premise) } : {}),
+        // #155: who merged, from GitHub's mergedBy; null when the observation did not say.
+        ...(to === 'merged' ? { mergedBy: githubObservation?.mergedBy ? String(githubObservation.mergedBy) : null } : {}),
         ...(to === 'revision' ? { sendBack, ...(options.ruling ? { ruling: String(options.ruling) } : {}) } : {}),
       },
     });
@@ -1460,7 +1463,7 @@ const FLAGS = Object.freeze({
   reserve: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'manifest', 'reservations', 'assignment', 'independence-proof', 'issue-url', 'body-hash'],
   release: [...COMMON_FLAGS, 'id', 'expected-revision'],
   abandon: [...COMMON_FLAGS, 'id', 'expected-revision', 'reason', 'kill-point'],
-  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'github-evidence', 'no-notifier', 'ruling', 'reason', 'premise'],
+  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'merged-by', 'github-evidence', 'no-notifier', 'ruling', 'reason', 'premise'],
   reconcile: ['repo', 'pr-number'],
   observe: [...COMMON_FLAGS, 'id', 'expected-revision', 'pr-number', 'observation', 'changed', 'wake'],
   review: [...COMMON_FLAGS, 'id', 'expected-revision', 'kind', 'head-sha', 'artifact', 'tier', 'triggers', 'prior-artifact'],
@@ -1494,7 +1497,7 @@ function cli(argv) {
     const result = transitionRecord({
       ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
       prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined, githubRepo: args.repo,
-      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'], ruling: args.ruling, reason: args.reason, premise: args.premise,
+      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubMergedBy: args['merged-by'], githubEvidence: args['github-evidence'], ruling: args.ruling, reason: args.reason, premise: args.premise,
     });
     // Ticket 07: a decision event launches its notifier from the door that wrote it
     // (the watcher does the same for its own). `paged` is true when this call

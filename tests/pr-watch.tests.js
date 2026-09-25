@@ -707,3 +707,34 @@ test('one tenant\'s failure does not blind the watcher to the others', () => {
   assert.match(result.tenants['aaa-broken'].error, /JSON/);
   assert.equal(result.tenants.endzone.records, 1, 'endzone is still watched after the broken tenant');
 });
+
+// Spec fleet #93 / #155: the merge names who merged. GitHub's mergedBy rides the
+// reconciled observation onto the Work record (github.mergedBy) and the
+// state-merged event (changes.mergedBy), for a fleet merge and an owner merge alike.
+for (const [who, login] of [['a fleet merge', 'fleet-bot'], ['an owner merge', 'cory-owner']]) {
+  test(`#155: ${who} records mergedBy on the Work record and on its merge event`, () => {
+    const root = rootDir();
+    seed(root, { id: 'endzone:issue-70', issue: 70, state: 'review', prNumber: 170 });
+    watch(root, fetchers({ open: [], viewResult: view({ number: 170, state: 'MERGED', mergedAt: '2026-09-25T10:00:00Z', mergedBy: { login } }) }));
+    const rec = record(root, 'endzone:issue-70');
+    assert.equal(rec.state, 'merged');
+    assert.equal(rec.github.mergedBy, login);
+    const merge = events(root).filter((event) => event.type === 'state-merged').pop();
+    assert.equal(merge.changes.mergedBy, login);
+    assert.match(merge.evidence, new RegExp(`by ${login}; merged without a recorded formal review`), 'the unreviewed-merge evidence names the merger');
+  });
+}
+
+test('#155: a view with no mergedBy records null rather than guessing a login', () => {
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-71', issue: 71, state: 'review', prNumber: 171 });
+  watch(root, fetchers({ open: [], viewResult: view({ number: 171, state: 'MERGED', mergedAt: '2026-09-25T10:00:00Z' }) }));
+  const merge = events(root).filter((event) => event.type === 'state-merged').pop();
+  assert.equal(merge.changes.mergedBy, null);
+  assert.equal(record(root, 'endzone:issue-71').github.mergedBy, undefined);
+});
+
+test('#155: the gh adapter asks GitHub for mergedBy', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'bin', 'pr-watch.js'), 'utf8');
+  assert.match(source, /'--json', 'number,state,isDraft,mergedAt,mergedBy,/);
+});

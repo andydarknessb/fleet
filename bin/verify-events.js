@@ -195,11 +195,27 @@ function verifyLedger({ root, now, sample } = {}) {
     if (outcome?.finding) result.findings.push(outcome.finding);
     if (outcome?.acknowledged) acknowledged.push({ ...outcome.acknowledged, where: result.where });
   };
+  // Spec fleet #93 / #155: once the ledger carries a merge event that names its
+  // merger (mergedBy), every later merge event must name one too. The first such
+  // event is the moment #155 went live; merges before it stand as they were.
+  const merges = events.filter((event) => event.type === 'state-merged')
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || String(a.recordId).localeCompare(String(b.recordId)) || a.sequence - b.sequence);
+  const liveFrom = merges.findIndex((event) => event.changes && typeof event.changes.mergedBy === 'string' && event.changes.mergedBy.trim());
+  const unattributed = new Map();
+  if (liveFrom >= 0) {
+    for (const event of merges.slice(liveFrom + 1)) {
+      if (event.changes && typeof event.changes.mergedBy === 'string' && event.changes.mergedBy.trim()) continue;
+      if (!unattributed.has(event.recordId)) unattributed.set(event.recordId, []);
+      unattributed.get(event.recordId).push({ kind: 'merge-without-merged-by', sequence: event.sequence, at: event.at, since: merges[liveFrom].at });
+    }
+  }
   const records = [];
+  const checkMerger = (result) => { for (const finding of unattributed.get(result.recordId) || []) result.findings.push(finding); };
   for (const record of Object.values(active)) {
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
     result.where = 'active';
     checkReview(result, record);
+    checkMerger(result);
     records.push(result);
   }
   for (const entry of archived) {
@@ -207,6 +223,7 @@ function verifyLedger({ root, now, sample } = {}) {
     const result = verifyRecordEvents(record.id, byRecord.get(record.id) || [], record.state);
     result.where = 'archive';
     checkReview(result, record);
+    checkMerger(result);
     // The evidence index: every listed file must exist and contain this record's events.
     const listed = Array.isArray(entry.eventFiles) ? entry.eventFiles : [];
     if (listed.length === 0) result.findings.push({ kind: 'evidence-index-empty' });

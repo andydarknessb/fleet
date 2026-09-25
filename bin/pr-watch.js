@@ -178,12 +178,21 @@ function escalatedHopsTo(priorState, target) {
 // completes as a fact (GitHub is authoritative) and carries a decision-needed wake, so it
 // pages once and stands in the digest instead of passing silently.
 // state/flags/merge-review-wake-off is its rollback: the merge still completes, silently.
+// Spec fleet #93 / #155: GitHub's own `mergedBy` rides the merge, so the record,
+// its event and the merge-without-review page all name the login that merged
+// (with the Fleet identity split from the owner's, ADR 0015, that is an answer).
+function mergerLogin(viewPr) {
+  const login = viewPr?.mergedBy && typeof viewPr.mergedBy === 'object' ? viewPr.mergedBy.login : viewPr?.mergedBy;
+  return typeof login === 'string' && login.trim() ? login.trim() : null;
+}
+
 function mergedChain(hops, viewPr, prNumber, evidencePrefix, { formalReviewMissing = false } = {}) {
+  const mergedBy = mergerLogin(viewPr);
   return (hops || []).map((to, index) => ({
     kind: 'transition', to,
-    evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})${to === 'merged' && formalReviewMissing ? '; merged without a recorded formal review (ticket 05 lower bound)' : ''}`,
+    evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})${to === 'merged' && mergedBy ? ` by ${mergedBy}` : ''}${to === 'merged' && formalReviewMissing ? '; merged without a recorded formal review (ticket 05 lower bound)' : ''}`,
     wake: to === 'merged' && formalReviewMissing ? 'decision-needed' : null,
-    reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, headRefOid: viewPr.headRefOid || undefined, evidence: `gh pr view ${prNumber}` } : null,
+    reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, mergedBy, headRefOid: viewPr.headRefOid || undefined, evidence: `gh pr view ${prNumber}` } : null,
     observe: index === hops.length - 1 ? { pr: viewPr, evaluation: evaluateChecks({ ciGates: [], watchedChecks: [], ignoredChecks: [] }, viewPr.statusCheckRollup), closing: null } : null,
   }));
 }
@@ -402,7 +411,7 @@ function ghJson(executable, args) {
 function makeFetchers(repo, executable = 'gh') {
   return {
     listOpenPrs: () => ghJson(executable, ['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', 'number,isDraft,headRefName,headRefOid,statusCheckRollup']),
-    viewPr: (n) => ghJson(executable, ['pr', 'view', String(n), '-R', repo, '--json', 'number,state,isDraft,mergedAt,headRefOid,statusCheckRollup,closingIssuesReferences,headRefName,body']),
+    viewPr: (n) => ghJson(executable, ['pr', 'view', String(n), '-R', repo, '--json', 'number,state,isDraft,mergedAt,mergedBy,headRefOid,statusCheckRollup,closingIssuesReferences,headRefName,body']),
   };
 }
 
@@ -645,6 +654,6 @@ if (require.main === module) {
 
 module.exports = {
   evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
-  stableStringify, closingLinked, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain,
+  stableStringify, closingLinked, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
   cli, FLAGS, PrWatchError,
 };

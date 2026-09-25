@@ -454,16 +454,50 @@ function fullSha(sha, repoPath, git) {
   }
 }
 
-function postReviewStatus({ tenant, headSha, artifact, artifactPath, gh }) {
+// Spec fleet #93 / #155: the status API answers with the status it created,
+// whose `creator.login` is the login that posted it (the Fleet identity from a
+// fleet session, Cory from his shell, ADR 0015). It is written beside the head
+// it vouches for in <artifact>.status.json, a receipt next to the artifact, so
+// a later reader can say who stamped which commit. A post whose answer names no
+// creator records null rather than a guess.
+function statusReceiptPath(artifactPath) {
+  return String(artifactPath).replace(/\.json$/, '') + '.status.json';
+}
+
+function writeStatusReceipt(root, artifactPath, status, now) {
+  if (!root || !artifactPath) return null;
+  const relative = statusReceiptPath(artifactPath);
+  const receipt = { schemaVersion: 1, artifact: artifactPath, context: status.context, state: status.state, headSha: status.sha, postedBy: status.postedBy, postedAt: now ? new Date(now).toISOString() : new Date().toISOString() };
+  try {
+    fs.writeFileSync(path.join(path.resolve(root), relative), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8');
+    return relative;
+  } catch {
+    return null;
+  }
+}
+
+function creatorOf(output) {
+  try {
+    const parsed = JSON.parse(String(output || ''));
+    const login = parsed && parsed.creator && parsed.creator.login;
+    return typeof login === 'string' && login ? login : null;
+  } catch {
+    return null;
+  }
+}
+
+function postReviewStatus({ root, tenant, headSha, artifact, artifactPath, gh, now }) {
   if (!tenant || typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) return null;
   const context = tenant.reviewStatus.trim();
   const { state, description } = reviewStatusFor(artifact, artifactPath);
   const status = { context, state, sha: String(headSha), description };
   if (!tenant.github) return { statusPosted: false, status, statusError: `tenant ${tenant.name || ''} has no "github" slug to post ${context} to` };
   try {
-    (gh || defaultGh)(['api', '--method', 'POST', `repos/${tenant.github}/statuses/${headSha}`,
+    const output = (gh || defaultGh)(['api', '--method', 'POST', `repos/${tenant.github}/statuses/${headSha}`,
       '-f', `state=${state}`, '-f', `context=${context}`, '-f', `description=${description}`]);
-    return { statusPosted: true, status };
+    status.postedBy = creatorOf(output);
+    const receipt = writeStatusReceipt(root, artifactPath, status, now);
+    return { statusPosted: true, status, ...(receipt ? { statusReceipt: receipt } : {}) };
   } catch (error) {
     const detail = String(error.stderr || error.message || error).trim().slice(0, 500);
     return { statusPosted: false, status, statusError: detail || 'gh exited nonzero' };
@@ -482,7 +516,7 @@ function repostReviewStatus(options = {}) {
   const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
   let repoPath = options.repoPath || null;
   if (!repoPath) { try { repoPath = tenantRepoPath({ root, recordId, record }); } catch { repoPath = null; } }
-  const posted = postReviewStatus({ tenant, headSha: fullSha(formal.headSha, repoPath, options.git), artifact, artifactPath: formal.artifact, gh: options.gh });
+  const posted = postReviewStatus({ root, tenant, headSha: fullSha(formal.headSha, repoPath, options.git), artifact, artifactPath: formal.artifact, gh: options.gh, now: options.now });
   if (!posted) throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenant?.name || record.tenant} names no reviewStatus; nothing is posted`);
   return { artifact: formal.artifact, ...posted };
 }
@@ -591,7 +625,7 @@ function attestPullRequest(options = {}) {
     noFindings: supplied.noFindings,
     findings: buildFindings(stamp, supplied.findings, [], null),
   }));
-  const posted = postReviewStatus({ tenant, headSha: head, artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh });
+  const posted = postReviewStatus({ root, tenant, headSha: head, artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh, now: options.now });
   return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
 }
 
@@ -647,8 +681,8 @@ function afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, wr
   try {
     const tenant = options.tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
     const posted = postReviewStatus({
-      tenant, headSha: fullSha(headSha, verifiedRepo, options.git),
-      artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh: options.gh,
+      root, tenant, headSha: fullSha(headSha, verifiedRepo, options.git),
+      artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh: options.gh, now: options.now,
     });
     if (posted) Object.assign(out, posted);
   } catch (error) {

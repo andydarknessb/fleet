@@ -51,7 +51,7 @@ function seed(root, { issue = 42, prNumber = 77, to = 'escalated', evidence } = 
 // review-missing evidence tail by default (fleet#79 QA round 1, blocker).
 // `testOnly: true` + an explicit githubState/githubMergedAt is the same shape
 // tests/work-state.tests.js uses to reach `merged` without a real `gh` call.
-function seedMerged(root, { issue, prNumber, evidence, mergedAt, tenant = 'endzone' } = {}) {
+function seedMerged(root, { issue, prNumber, evidence, mergedAt, mergedBy, tenant = 'endzone' } = {}) {
   const id = `${tenant}:issue-${issue}`;
   workState.createRecord({ root, id, tenant, issue, state: 'implementing', github: { issueNumber: issue, prNumber }, actor: 'test', idempotencyKey: `c-${issue}`, now: at() });
   let revision = 1;
@@ -65,7 +65,7 @@ function seedMerged(root, { issue, prNumber, evidence, mergedAt, tenant = 'endzo
     : evidence;
   const merged = workState.transitionRecord({
     root, id, to: 'merged', expectedRevision: revision, idempotencyKey: `t-${issue}-merged`, actor: 'pr-watch',
-    evidence: finalEvidence, now: mergedTimestamp, prNumber, githubState: 'MERGED', githubMergedAt: mergedTimestamp, testOnly: true,
+    evidence: finalEvidence, now: mergedTimestamp, prNumber, githubState: 'MERGED', githubMergedAt: mergedTimestamp, githubMergedBy: mergedBy, testOnly: true,
   });
   return { id, revision: merged.revision, sequence: merged.eventSequence, at: mergedTimestamp };
 }
@@ -683,4 +683,16 @@ test('notify: the process exits 2 on a refusal and writes the refusal to stderr,
   assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'shadow.jsonl')), false);
   const ok = execFileSync(process.execPath, [bin, '--root', root], { encoding: 'utf8', windowsHide: true });
   assert.deepEqual(JSON.parse(ok).handled.map((h) => [h.recordId, h.sequence, h.outcome]), [[id, sequence, 'shadow']]);
+});
+
+// Spec fleet #93 / #155: the merge-without-review page names the merger.
+test('#155: the merge-review page names the login that merged', () => {
+  const root = rootDir();
+  const merged = seedMerged(root, { issue: 81, prNumber: 181, mergedBy: 'fleet-bot' });
+  const send = sender();
+  runNotifier({ root, live: true, send, now: at() });
+  assert.equal(send.calls.length, 1);
+  assert.equal(send.calls[0].question, 'PR #181 merged by fleet-bot without a recorded formal review');
+  assert.equal(send.calls[0].priority, 'high');
+  assert.ok(merged.sequence > 0);
 });

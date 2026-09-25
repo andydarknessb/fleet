@@ -2180,3 +2180,50 @@ test('#118 review: a repeats finding blocks the review status whatever its sever
   });
   assert.equal(statusField(calls[0], 'state'), 'failure', 'a record escalated for a Ruling must not carry a green status');
 });
+
+// Spec fleet #93 / #155: record and attest write the login that posted the
+// fleet-review status next to the head sha it vouches for.
+function creatorGh(login, calls = []) {
+  const gh = (args) => {
+    calls.push(args);
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: gh.head });
+    if (args[0] === 'api') return JSON.stringify({ id: 1, state: 'success', creator: { login } });
+    return '{}';
+  };
+  gh.calls = calls;
+  return gh;
+}
+
+test('#155: record writes the posting login next to the reviewed head', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const recorded = formalRecord(root, revision, creatorGh('fleet-bot'), { noFindings: 'read the whole diff; nothing wrong' });
+  assert.equal(recorded.status.postedBy, 'fleet-bot');
+  const receipt = JSON.parse(fs.readFileSync(path.join(root, recorded.statusReceipt), 'utf8'));
+  assert.equal(receipt.postedBy, 'fleet-bot');
+  assert.equal(receipt.headSha, FULL_HEAD);
+  assert.equal(receipt.artifact, recorded.artifact);
+  assert.equal(recorded.statusReceipt, recorded.artifact.replace(/\.json$/, '.status.json'));
+});
+
+test('#155: attest writes the posting login next to the attested head', () => {
+  const { root, head, gh: fixtureGh, artifact } = attestFixture();
+  const gh = creatorGh('cory-owner');
+  gh.head = head;
+  const attested = attestPullRequest({ root, tenantName: 'endzone', prNumber: 1602, headSha: head, artifactPath: artifact({ noFindings: 'read it all' }), actor: 'cory', gh });
+  assert.ok(fixtureGh);
+  assert.equal(attested.status.postedBy, 'cory-owner');
+  const receipt = JSON.parse(fs.readFileSync(path.join(root, attested.statusReceipt), 'utf8'));
+  assert.deepEqual([receipt.postedBy, receipt.headSha, receipt.context], ['cory-owner', head, 'fleet-review']);
+});
+
+test('#155: a status answer with no creator records postedBy null, never a guess', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const { gh } = stubGh();
+  const recorded = formalRecord(root, revision, gh, { noFindings: 'read the whole diff; nothing wrong' });
+  assert.equal(recorded.status.postedBy, null);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.statusReceipt), 'utf8')).postedBy, null);
+});

@@ -167,6 +167,7 @@ function mergedUnits(events, week) {
       issue: issueOf(recordId),
       events: list,
       mergeAt: merge.at,
+      mergedBy: merge.changes?.mergedBy || null,
       cycleMs: mergeMs - Date.parse(reserved.at),
       endToEndMs: mergeMs - Date.parse(before[0].at),
       decisionMs,
@@ -332,6 +333,46 @@ function verifyWeek(base, week) {
   return { runs: runs.length, pass: runs.filter((line) => line.pass === true).length, fail: runs.filter((line) => line.pass === false).length };
 }
 
+// Spec fleet #93 / #155: who merged into the default branch this week, the owner
+// or the fleet (ADR 0015). A merge whose login is both (a tenant that still names
+// the owner as its fleetIdentity) is counted as shared, since it cannot say which;
+// a merge event with no mergedBy (recorded before #155) is unrecorded.
+function tenantLogins(base) {
+  const logins = {};
+  let names = [];
+  try { names = fs.readdirSync(path.join(base, 'tenants')).filter((name) => name.endsWith('.json')); } catch { names = []; }
+  for (const name of names) {
+    const config = readJson(path.join(base, 'tenants', name), {}) || {};
+    logins[path.basename(name, '.json')] = { owner: String(config.ownerLogin || '').toLowerCase(), fleet: String(config.fleetIdentity || '').toLowerCase() };
+  }
+  return logins;
+}
+
+function mergesBy(base, units) {
+  const logins = tenantLogins(base);
+  const counts = { owner: 0, fleet: 0, shared: 0, other: 0, unrecorded: 0 };
+  const others = [];
+  for (const unit of units) {
+    const login = String(unit.mergedBy || '').toLowerCase();
+    const tenant = logins[String(unit.recordId).split(':')[0]] || { owner: '', fleet: '' };
+    if (!login) counts.unrecorded += 1;
+    else if (login === tenant.owner && login === tenant.fleet) counts.shared += 1;
+    else if (login === tenant.owner) counts.owner += 1;
+    else if (login === tenant.fleet) counts.fleet += 1;
+    else { counts.other += 1; others.push(unit.mergedBy); }
+  }
+  return { ...counts, merged: units.length, otherLogins: [...new Set(others)] };
+}
+
+function mergesByLine(figures) {
+  if (!figures) return null;
+  const parts = [`${figures.owner} by the owner`, `${figures.fleet} by the fleet`];
+  if (figures.shared) parts.push(`${figures.shared} by a login the owner and the fleet share`);
+  if (figures.other) parts.push(`${figures.other} by another login (${figures.otherLogins.join(', ')})`);
+  if (figures.unrecorded) parts.push(`${figures.unrecorded} with no merger recorded`);
+  return `Merges into the default branch this week: ${parts.join(', ')}.`;
+}
+
 function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, dryRun = false } = {}) {
   const base = baseOf(root);
   const at = now || new Date().toISOString();
@@ -353,6 +394,7 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     week,
     rows,
     verifyHistory: verifyWeek(base, week),
+    mergesBy: mergesBy(base, mergedUnits(events, week)),
     headline: SEVERITY[weakest.status] > SEVERITY.good ? { key: weakest.key, area: weakest.area, status: weakest.status, result: weakest.result } : null,
   };
 }
@@ -390,6 +432,7 @@ function renderScorecard(card) {
     '',
     `Ledger verification this week: ${card.verifyHistory.runs} run(s), ${card.verifyHistory.pass} pass, ${card.verifyHistory.fail} fail.`,
     '',
+    ...(card.mergesBy ? [mergesByLine(card.mergesBy), ''] : []),
     '## IC cost (two measures)',
     '',
     ...icCostLines(card.rows.find((row) => row.key === 'icCost')),
