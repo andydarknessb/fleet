@@ -40,7 +40,7 @@ try {
   $builder = "$sourceRoot\bin\scratch-root.ps1"
 
   # Refusals: inside the live root, inside the source tree, inside a tenant repo.
-  foreach ($bad in @("$liveRoot\scratch", "$sourceRoot\.scratch-root-test", (Join-Path $sourceTenant.repo 'scratch-fleet'))) {
+  foreach ($bad in @("$liveRoot\scratch", "$sourceRoot\.scratch-root-test", "$($sourceTenant.repo.TrimEnd('\'))\scratch-fleet")) {
     $r = Run-Script $builder @('-Path', $bad, '-LiveRoot', $liveRoot)
     Assert-True ($script:lastExit -ne 0 -and "$($r.reason)" -match 'inside') "a scratch root at '$bad' must be refused (exit $script:lastExit): $script:lastOut"
     Assert-True (-not (Test-Path -LiteralPath $bad)) "a refused path must not be created: $bad"
