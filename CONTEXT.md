@@ -84,6 +84,15 @@ a fault: the fleet is dead only when every static heartbeat is stale and work
 is waiting. Stale with nothing waiting is idle, recorded and never paged.
 _Avoid_: ping, keepalive, health check
 
+**Turn boundary**:
+The point between two turns of a session, where it can be woken, rotated or
+respawned without losing work. The daemon's `idle` is one. So is `busy` when
+everything in flight is a background task the session started (a shell loop,
+a Monitor) and the job has reported nothing for a while: the turn is over,
+and a leaked task would otherwise hold the session busy forever. A busy
+session with a subagent in flight, or one that reported recently, is mid-turn.
+_Avoid_: idle (for the busy-between-turns case), safe point
+
 **Page**:
 One off-host push to Cory. In-fleet condition pages come from a decision event
 (through the Notifier) or a Watchdog condition and share one delivery function;

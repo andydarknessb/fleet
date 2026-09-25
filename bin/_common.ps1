@@ -190,6 +190,43 @@ function Get-DaemonSessions {
   return @($obj)
 }
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
+# fleet #149: the daemon's `busy` covers two standings. Mid-turn: the model is working.
+# Between turns: the model ended its turn, but a background task it started (a shell
+# loop, a Monitor) is still in flight, and a leaked one never ends (pe-endzone,
+# 2026-09-24: two `until` loops kept it busy for 8h, and every wake and respawn skipped
+# it). The signal is the job's state.json: inFlight.kinds is only background kinds, and
+# updatedAt, which the daemon moves with every state report and timeline line, is at
+# least QuietMinutes old. Neither the state label nor the timeline's last entry marks a
+# turn boundary: a lead routinely ends its turn on a `working` report. A subagent
+# (local_agent) or any kind not listed ends in a turn of the model's own and stays busy.
+# Standing: idle | background (busy, but between turns) | turn (busy, mid-turn) |
+# unreadable (busy, job state missing or unparseable) | the raw status otherwise.
+$script:BackgroundTaskKinds = @('local_bash', 'monitor', 'monitor_ws', 'session_cron')
+function Get-BusyQuietMinutes {
+  $q = 60
+  try { $wd = (Read-Json "$FleetHome\config\cycle.json").watchdog; if ($wd -and $wd.PSObject.Properties['busyQuietMinutes']) { $q = [double]$wd.busyQuietMinutes } } catch {}
+  return $q
+}
+function Get-BusyStanding {
+  param($Row, [double]$QuietMinutes = 60, $Now = $null)
+  if ($null -eq $Now) { $Now = (Get-Date).ToUniversalTime() }
+  $status = "$($Row.status)"
+  if ($status -ne 'busy') { return [pscustomobject]@{ standing = $status; reason = "status $status"; quietMin = $null } }
+  $js = $null
+  try { $js = Get-JobState $Row.id } catch { return [pscustomobject]@{ standing = 'unreadable'; reason = "busy; job state unreadable ($(("$($_.Exception.Message)" -replace '\s+', ' ').Trim()))"; quietMin = $null } }
+  if (-not $js) { return [pscustomobject]@{ standing = 'unreadable'; reason = 'busy; job state missing'; quietMin = $null } }
+  $quiet = $null
+  $updated = $null; if ($js.PSObject.Properties['updatedAt']) { $updated = ConvertTo-UtcDateTime $js.updatedAt }
+  if ($updated) { $quiet = [int][Math]::Floor(($Now - $updated).TotalMinutes) }
+  $tasks = 0; $kinds = @()
+  if ($js.PSObject.Properties['inFlight'] -and $js.inFlight) { try { $tasks = [int]$js.inFlight.tasks } catch {}; $kinds = @($js.inFlight.kinds | Where-Object { $_ } | ForEach-Object { "$_" }) }
+  if ($tasks -lt 1 -or $kinds.Count -eq 0) { return [pscustomobject]@{ standing = 'turn'; reason = 'busy, nothing in flight: mid-turn'; quietMin = $quiet } }
+  $foreground = @($kinds | Where-Object { $script:BackgroundTaskKinds -notcontains $_ } | Select-Object -Unique)
+  if ($foreground.Count -gt 0) { return [pscustomobject]@{ standing = 'turn'; reason = "busy, $($foreground -join '+') in flight"; quietMin = $quiet } }
+  if ($null -eq $quiet) { return [pscustomobject]@{ standing = 'unreadable'; reason = 'busy; job state has no readable updatedAt'; quietMin = $null } }
+  if ($quiet -lt $QuietMinutes) { return [pscustomobject]@{ standing = 'turn'; reason = "busy, job reported $quiet min ago"; quietMin = $quiet } }
+  return [pscustomobject]@{ standing = 'background'; reason = "busy only with background $(@($kinds | Select-Object -Unique) -join '+') x$tasks; job quiet $quiet min (threshold $QuietMinutes)"; quietMin = $quiet }
+}
 # Claude Code 2.1.281 refuses `claude --bg` in a workspace whose trust dialog was never
 # accepted ("Workspace not trusted. Run `claude` in <dir> once and accept the trust
 # prompt, then retry.") and creates no session; earlier builds skipped the dialog for

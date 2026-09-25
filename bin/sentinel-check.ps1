@@ -250,7 +250,10 @@ foreach ($x in $expected) {
   }
   if ($state -eq 'working') {
     $age = Heartbeat-Age $x.name
-    if ($null -ne $age -and $age -gt 120 -and "$($row.status)" -ne 'busy') {
+    # fleet #149: a busy row is skipped only mid-turn. Busy with nothing but a (leaked)
+    # background task in flight is between turns (Get-BusyStanding), and respawns like
+    # any stale row; an unreadable job state stays skipped, and the watchdog pages it busy-stale.
+    if ($null -ne $age -and $age -gt 120 -and ("$($row.status)" -ne 'busy' -or (Get-BusyStanding $row -QuietMinutes (Get-BusyQuietMinutes)).standing -eq 'background')) {
       if ($x.role -eq 'ic' -and $x.tenant) {
         $t = Read-Json "$FleetHome\tenants\$($x.tenant).json"
         $skip = Read-Json "$FleetHome\state\skip\$($x.tenant).json"

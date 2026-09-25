@@ -537,6 +537,15 @@ function overlapFields(overlaps) {
   return [...new Set(overlaps.flatMap((overlap) => [overlap.leftField, overlap.rightField]))].sort();
 }
 
+// One Work record ledger serves every tenant, but a reservation, an issue
+// number and the three-assignment count only mean anything inside one repo:
+// unscoped, endzone's three ICs refused every nidus assignment (2026-09-24).
+// A record naming no tenant cannot be shown foreign, so it stays in scope;
+// dropping it would fail open.
+function isForeignRecord(record, tenant) {
+  return Boolean(tenant && record.tenant && record.tenant !== String(tenant));
+}
+
 function reservationConflicts(records, reservations, ignoreRecordId = null) {
   const requested = reservations || {};
   const conflicts = [];
@@ -640,7 +649,7 @@ function reserveRecord(options = {}) {
     if (fs.existsSync(archiveFile(p, id)) && !reusable) throw new WorkStateError('RECORD_ARCHIVED', `record '${id}' is terminally archived and cannot be reused`);
     if (fs.existsSync(releaseFile(p, id)) && !reusable) throw new WorkStateError('RELEASE_NOT_REUSABLE', `released record '${id}' does not prove an untouched reservation`);
     if (fs.existsSync(abandonFile(p, id)) && !reusable) throw new WorkStateError('ABANDON_NOT_REUSABLE', `abandoned record '${id}' does not have a valid audited abandonment`);
-    const activeRecords = Object.values(active.records);
+    const activeRecords = Object.values(active.records).filter((record) => !isForeignRecord(record, options.tenant));
     const activeAssignments = activeRecords.filter((record) => record.manifestPath && record.state !== 'retired');
     const suppliedSubjects = new Map((Array.isArray(options.proofRecords) ? options.proofRecords : []).map((record) => [String(record.id), record]));
     const reservationSubjects = activeRecords.map((record) => {
@@ -1548,6 +1557,7 @@ module.exports = {
   enteringEvent,
   getRecord,
   hasReservationEvidence,
+  isForeignRecord,
   notifyRecord,
   observeRecord,
   outboxHasWake,
