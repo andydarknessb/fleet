@@ -8,6 +8,8 @@
 param(
   [string]$Role, [string]$Name, [string]$Tenant, [string]$Parent, [string]$Prompt, [int]$Issue,
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
+  [ValidateSet('', 'auto', 'allowlist')]
+  [string]$Permissions, # the permission profile (ADR 0016); an assignment manifest's own `permissions` wins. Empty = auto.
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5 (the project-lead default), see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
@@ -49,6 +51,8 @@ if ($Manifest) {
   $Parent = $assignment.parent
   $Issue = [int]$assignment.issue.number
   $Model = [string]$assignment.model
+  # A manifest written before spec #94 has no `permissions`; it launches auto as it always did.
+  $Permissions = [string]$assignment.permissions
   # A slash command at the head of a launch prompt is a user invocation in the new
   # session, so the IC runs the real /implement (the same convention as a legacy brief).
   # Forward slashes on purpose: the IC pastes this into the Bash tool (Git Bash), where an unquoted
@@ -126,17 +130,29 @@ function Invalidate-Manifest {
   Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = $assignment.id; invalidatedAt = (Now-Iso); reason = $Reason })
 }
 # Fleet #28 (2026-09-11): the installed Claude Code CLI keeps a per-model auto-mode
-# list and claude-haiku-4-5 is not on it (verified on 2.1.267 and both 2.1.268 builds;
-# an explicit --permission-mode auto is downgraded the same way). A haiku --bg session
-# therefore runs in permission-mode default and blocks on its first out-of-cwd Read
-# with nobody to approve it. Refused here even under -Force (the CLI cannot be forced)
-# and even for a dry run, so a rehearsal reports the truth. assignment.js refuses the
-# same model at reservation time; lift both together when the CLI list changes.
-if ($Model -eq 'haiku') {
+# list and claude-haiku-4-5 is not on it (verified on 2.1.267, both 2.1.268 builds and
+# 2.1.282; an explicit --permission-mode auto is downgraded the same way). A haiku --bg
+# session under auto therefore runs in permission-mode default and blocks on its first
+# out-of-cwd Read with nobody to approve it. Spec #94 (#162, ADR 0016): the permission
+# mode is a launch-door profile per model, so haiku launches only under the allowlist
+# profile (acceptEdits plus config/permissions-allowlist.json, applied below) and haiku
+# under auto is still refused here, even under -Force (the CLI cannot be forced) and even
+# for a dry run, so a rehearsal reports the truth. assignment.js refuses the same pair at
+# reservation time.
+if (-not $Permissions) { $Permissions = 'auto' }
+if ($Model -eq 'haiku' -and $Permissions -ne 'allowlist') {
   $haikuReason = "the installed Claude Code CLI ($(try { (& claude --version 2>$null | Out-String).Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
   $released = $false
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $haikuReason; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $haikuReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+}
+# The allowlist profile is the haiku IC profile and nothing else: sonnet keeps auto, and a
+# control-plane role never trades its classifier for a fixed list.
+if ($Permissions -eq 'allowlist' -and ($Role -ne 'ic' -or $Model -ne 'haiku')) {
+  $profileReason = "the allowlist permission profile is the haiku IC profile (ADR 0016); a $Role on '$(if ($Model) { $Model } else { 'its role model' })' runs the auto profile"
+  $released = $false
+  if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $profileReason; $released = $true } catch {} }
+  Write-Output (@{ launched = $false; reason = $profileReason; model = $Model; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
 }
 
 if ($Manifest -and -not $DryRun) {
@@ -296,6 +312,40 @@ if ($denyRules.Count -gt 0) {
   $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $denyRules) | Select-Object -Unique)) -Force
 }
 
+# --- permission profile (spec #94, ADR 0016). auto is fleet-settings.json as written.
+# --- allowlist runs acceptEdits with the checked-in config/permissions-allowlist.json:
+# --- its allow rules verbatim (tokens resolved), the fleet root as an additional
+# --- directory, and its deny rules appended after the tool contract's (deny beats
+# --- allow, so the contract is unchanged). The mode lives in the settings only; no
+# --- --permission-mode goes on the command line.
+$allowRuleCount = 0
+if ($Permissions -eq 'allowlist') {
+  $profilePath = "$FleetHome\config\permissions-allowlist.json"
+  $permissionProfile = $null
+  try { $permissionProfile = Read-Json $profilePath } catch {}
+  if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable"; exit 4 }
+  $profileTokens = @{ '<fleet>' = $fleetFwd; '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
+  $resolveProfileRule = {
+    param([string]$Text)
+    foreach ($token in $profileTokens.Keys) { if ($profileTokens[$token]) { $Text = $Text.Replace($token, $profileTokens[$token]) } }
+    if ($Text -match '<[A-Za-z]+>') { throw "permission profile rule '$Text' names $($Matches[0]), which this launch cannot resolve (the tenant file lacks it)" }
+    return $Text
+  }
+  try {
+    $profileAllow = @($permissionProfile.allow | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
+    $profileDeny = @($permissionProfile.deny | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
+    $profileDirs = @($permissionProfile.additionalDirectories | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$_" })
+  } catch { Write-Error "$($_.Exception.Message)"; exit 4 }
+  if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
+  $existingDeny = @()
+  if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
+  $settings.permissions | Add-Member -NotePropertyName defaultMode -NotePropertyValue "$($permissionProfile.defaultMode)" -Force
+  $settings.permissions | Add-Member -NotePropertyName allow -NotePropertyValue $profileAllow -Force
+  $settings.permissions | Add-Member -NotePropertyName additionalDirectories -NotePropertyValue $profileDirs -Force
+  $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $profileDeny) | Select-Object -Unique)) -Force
+  $allowRuleCount = $profileAllow.Count
+}
+
 $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
 Write-Json $settingsPath $settings
 
@@ -376,7 +426,7 @@ if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-o
 }
 
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
+  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
   exit 0
 }
 
@@ -473,7 +523,7 @@ if (-not $row) {
 # --- record ---
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
-  model = $Model; effort = $effort
+  model = $Model; permissions = $Permissions; effort = $effort
   jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $Manifest; workRecordId = $WorkRecordId
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }
