@@ -23,7 +23,10 @@ function Run-Case {
 Set-Location '$testRoot'
 `$plan = Set-FleetIdentityProcessEnv
 `$paged = Send-FleetIdentityPageOnce -Plan `$plan -Source 'watchdog.ps1'
-`$cred = ("protocol=https``nhost=github.com``n``n" | & git credential fill 2>&1 | Out-String)
+[IO.File]::WriteAllText("$testRoot\cred-in.txt", "protocol=https``nhost=github.com``n``n", (New-Object Text.UTF8Encoding `$false))
+# stdin from a file through cmd: PowerShell piping to a native exe mangles it on the CI runner
+`$credProc = Start-Process -FilePath git -ArgumentList 'credential','fill' -RedirectStandardInput "$testRoot\cred-in.txt" -RedirectStandardOutput "$testRoot\cred-out.txt" -RedirectStandardError "$testRoot\cred-err.txt" -NoNewWindow -Wait -PassThru
+`$cred = (Get-Content "$testRoot\cred-out.txt" -Raw) + (Get-Content "$testRoot\cred-err.txt" -Raw)
 `$helpers = (& git config --show-origin --get-all credential.helper 2>&1 | Out-String)
 [pscustomobject]@{ refusal = if (`$plan.refusal) { "`$(`$plan.refusal.code)" } else { `$null }; paged = `$paged; ghConfigDir = `$env:GH_CONFIG_DIR; ghToken = `$env:GH_TOKEN; cred = `$cred; helpers = `$helpers; gitconfig = (Get-Content `$env:GIT_CONFIG_SYSTEM -Raw -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress
 "@
