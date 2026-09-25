@@ -43,6 +43,8 @@ try {
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['staleMinutes']) { $staleMinutes = [int]$watchdogConfig.staleMinutes }   # ticket 75: config/cycle.json watchdog.staleMinutes, default 45
   $healStaleMinutes = 60    # ticket 84: config/cycle.json watchdog.healStaleMinutes, default 60
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['healStaleMinutes']) { $healStaleMinutes = [int]$watchdogConfig.healStaleMinutes }
+  $busyQuietMinutes = Get-BusyQuietMinutes   # fleet #149: config/cycle.json watchdog.busyQuietMinutes, default 60 (Get-BusyStanding)
+  $busyStaleMinutes = 120   # fleet #149: sentinel-check's stale-heartbeat respawn threshold; past it a busy row no heal path can act on pages busy-stale
   $healCap = 2              # ticket 84: config/cycle.json watchdog.healCap, default 2 (per session, per 24h)
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['healCap']) { $healCap = [int]$watchdogConfig.healCap }
   $healWindowHours = 24
@@ -104,7 +106,8 @@ try {
   # fixture with no config/cycle.json pages.priority override must still route
   # a refused push to high, not fall through to 'normal'.
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal' }
+  # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -517,6 +520,28 @@ try {
     $permissionWaits += [pscustomobject]@{ name = "$($row.name)"; job = "$($row.id)"; parent = $parentName; waitMin = $waitMin; needs = (Get-OneLine "$($js.needs)" 200) }
   }
 
+  # --- busy-stale (fleet #149): the heal paths (the wakes, sentinel-check's stale-heartbeat
+  # --- respawn, rotate.ps1's boundary) act on a busy session only once Get-BusyStanding
+  # --- reads it as between turns. A busy session whose heartbeat is past the respawn
+  # --- threshold and that none of them can act on (job state unreadable, or the job
+  # --- itself silent that long mid-turn, e.g. a hung subagent) is visible nowhere but
+  # --- staleStatics, so it pages under its own name. A freshly (re)launched row with no
+  # --- heartbeat yet is not stale; PAUSE suppresses it as it does all staleness paging.
+  $busyStale = @()
+  if (-not $paused) {
+    foreach ($row in @($daemon | Where-Object { $_.pid -and "$($_.status)" -eq 'busy' -and "$($_.name)" -match '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$' })) {
+      $bsAge = Get-HeartbeatAgeMinutes "$($row.name)"
+      if ($null -ne $bsAge -and $bsAge -le $busyStaleMinutes) { continue }
+      $bsStart = ConvertTo-UtcDateTime $row.startedAt
+      if ($null -eq $bsAge -and $bsStart -and ((New-TimeSpan -Start $bsStart -End $now).TotalMinutes -le $busyStaleMinutes)) { continue }
+      $bs = Get-BusyStanding $row -QuietMinutes $busyQuietMinutes -Now $now
+      $silentMidTurn = ($bs.standing -eq 'turn' -and $null -ne $bs.quietMin -and $bs.quietMin -ge $busyStaleMinutes)
+      if ($bs.standing -ne 'unreadable' -and -not $silentMidTurn) { continue }
+      $bsShown = if ($null -eq $bsAge) { 'never recorded' } else { "$([int][Math]::Min($bsAge, 99999)) min old" }
+      $busyStale += [pscustomobject]@{ name = "$($row.name)"; job = "$($row.id)"; detail = "$($row.name) (job $($row.id)) is busy with its heartbeat $bsShown (threshold $busyStaleMinutes) and no heal path can act: $($bs.reason)" }
+    }
+  }
+
   # --- retry cap -> skip-hold for ICs (the third identical attempt never finds the cause).
   # --- Dispositions keep the page honest: our own launch-failed hold means handled (the
   # --- condition clears; a lifted hold whose failures recur inside the window re-pages);
@@ -872,7 +897,13 @@ try {
       $wake = [ordered]@{ tenant = $tenantName; lead = $leadName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null }
       $leadRow = $daemon | Where-Object { "$($_.name)" -eq $leadName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
       if (-not $leadRow) { $wake.reason = 'no running lead session (launchNeeded covers a missing one)'; $frontierWakes += [pscustomobject]$wake; continue }
-      if ("$($leadRow.status)" -ne 'idle') { $wake.reason = "lead is $($leadRow.status), not idle"; $frontierWakes += [pscustomobject]$wake; continue }
+      # fleet #149: busy with only a background task in flight, and quiet, is a turn boundary.
+      $leadStanding = Get-BusyStanding $leadRow -QuietMinutes $busyQuietMinutes -Now $now
+      if (@('idle', 'background') -notcontains $leadStanding.standing) {
+        $wake.reason = "lead is $($leadRow.status), not idle"; if ("$($leadRow.status)" -eq 'busy') { $wake.reason += " ($($leadStanding.reason))" }
+        $frontierWakes += [pscustomobject]$wake; continue
+      }
+      if ($leadStanding.standing -eq 'background') { $wake.boundary = $leadStanding.reason }
       # fleet #141: the outbox bound is the door launch (live roster launchedAt), never the
       # daemon row's startedAt. A `claude respawn` keeps the job but refreshes startedAt,
       # and a respawned idle session does not re-run its role prompt, so a wake recorded
@@ -977,7 +1008,12 @@ try {
       if ($twake.evidence.Count -eq 0) { $twake.reason = 'nothing to wake for'; $triageWakes += [pscustomobject]$twake; continue }
       $principalRow = $daemon | Where-Object { "$($_.name)" -eq $principalName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
       if (-not $principalRow) { $twake.reason = 'no running principal session (launchNeeded covers a missing one)'; $triageWakes += [pscustomobject]$twake; continue }
-      if ("$($principalRow.status)" -ne 'idle') { $twake.reason = "principal is $($principalRow.status), not idle"; $triageWakes += [pscustomobject]$twake; continue }
+      $principalStanding = Get-BusyStanding $principalRow -QuietMinutes $busyQuietMinutes -Now $now   # fleet #149, as the lead wake above
+      if (@('idle', 'background') -notcontains $principalStanding.standing) {
+        $twake.reason = "principal is $($principalRow.status), not idle"; if ("$($principalRow.status)" -eq 'busy') { $twake.reason += " ($($principalStanding.reason))" }
+        $triageWakes += [pscustomobject]$twake; continue
+      }
+      if ($principalStanding.standing -eq 'background') { $twake.boundary = $principalStanding.reason }
       $tdigest = ($twake.evidence -join '; ')
       $tState = $null; if ($triageState.tenants.PSObject.Properties[$tenantName]) { $tState = $triageState.tenants.$tenantName }
       if ($tState -and "$($tState.digest)" -eq $tdigest -and $tState.lastAt) {
@@ -1031,6 +1067,9 @@ try {
   # standing ask clears the moment `needs` clears, whichever job answers it.
   foreach ($hw in $humanWaits) {
     $conditions += [pscustomobject]@{ key = "human-wait:$($hw.name)"; kind = 'human-wait'; detail = $hw.needs; url = $null }
+  }
+  foreach ($bst in $busyStale) {
+    $conditions += [pscustomobject]@{ key = "busy-stale:$($bst.name)"; kind = 'busy-stale'; detail = $bst.detail; url = $null }
   }
   $escCount = @(Get-ChildItem "$FleetHome\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count
   $checkEsc = 0; if ($check) { $checkEsc = @($check.escalate).Count }

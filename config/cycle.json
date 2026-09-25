@@ -60,7 +60,8 @@
   "watchdog": {
     "staleMinutes": 45,
     "healStaleMinutes": 60,
-    "healCap": 2
+    "healCap": 2,
+    "busyQuietMinutes": 60
   },
   "pages": {
     "priority": {

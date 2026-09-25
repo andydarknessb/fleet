@@ -52,7 +52,13 @@ function Test-SafeBoundary {
   $row = $null
   try { $row = Get-DaemonSessions -Strict | Where-Object { $_.name -eq $SessionName } | Select-Object -First 1 }
   catch { return [pscustomobject]@{ safe = $false; reason = "daemon session list unreadable ($($_.Exception.Message)); deferring" } }
-  if ($row -and "$($row.status)" -eq 'busy') { return [pscustomobject]@{ safe = $false; reason = 'session is mid-turn (status busy)' } }
+  # fleet #149: busy with only a background task in flight, quiet past watchdog.busyQuietMinutes,
+  # is a turn boundary (Get-BusyStanding): stopping the session there ends the leaked task
+  # too. Without this every wake of such a session deferred here forever.
+  if ($row -and "$($row.status)" -eq 'busy') {
+    $standing = Get-BusyStanding $row -QuietMinutes (Get-BusyQuietMinutes)
+    if ($standing.standing -ne 'background') { return [pscustomobject]@{ safe = $false; reason = "session is mid-turn (status busy: $($standing.reason))" } }
+  }
   # A pending permission prompt (fleet #28's `needs`, e.g. "approve Read: ...") is the
   # same standing as busy: the session is stopped mid-wait, not idle, and -Force does
   # not override it (observed 2026-09-06: age-based rotation retired a blocked
