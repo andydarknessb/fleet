@@ -397,10 +397,36 @@ function Send-FleetToast {
 # bin/identity.js is the one reader of the secret gh config directory; these wrap
 # it for the PowerShell doors (launch.ps1, watchdog.ps1). A plan that cannot be
 # read at all is a refusal (FLEET_IDENTITY_UNREADABLE), never a silent keyring login.
+# The node call is bounded (-TimeoutSec). -Cached (the Watchdog, every tick) first
+# reuses state/identity/plan-cache.json while its key still matches: the identity
+# overrides, each tenant file's and hosts.yml's write time. A normal tick then spawns
+# no node at all, and a wedged node cannot wedge the tick (watchdog FD10).
+function Get-FleetIdentityCacheKey {
+  $dir = if ($env:FLEET_IDENTITY_DIR) { "$env:FLEET_IDENTITY_DIR" } else { Join-Path "$env:USERPROFILE" '.fleet-identity\gh' }
+  $parts = @("dir=$dir")
+  foreach ($f in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue | Sort-Object Name)) { $parts += "$($f.Name)=$($f.LastWriteTimeUtc.Ticks)" }
+  foreach ($name in 'hosts.yml', 'gitconfig') { $p = Join-Path $dir $name; $parts += "$name=$(if (Test-Path -LiteralPath $p) { (Get-Item -LiteralPath $p).LastWriteTimeUtc.Ticks } else { 'absent' })" }
+  return ($parts -join ';')
+}
 function Get-FleetIdentityPlan {
+  param([switch]$Cached, [int]$TimeoutSec = 15)
+  $cacheFile = "$FleetHome\state\identity\plan-cache.json"
+  $key = $null
+  if ($Cached) {
+    $key = Get-FleetIdentityCacheKey
+    $hit = $null; try { $hit = Read-Json $cacheFile } catch {}
+    if ($hit -and "$($hit.key)" -eq $key -and $hit.plan) { return $hit.plan }
+  }
   $out = $null
-  try { $out = & (Get-NodeExe) "$FleetHome\bin\identity.js" plan --root $FleetHome 2>&1 | Out-String } catch { $out = "$($_.Exception.Message)" }
+  try {
+    $bounded = Invoke-BoundedExe -FilePath (Get-NodeExe) -ArgumentList @("$FleetHome\bin\identity.js", 'plan', '--root', "$FleetHome") -TimeoutSec $TimeoutSec -Name 'identity.js plan'
+    $out = if ($bounded.timedOut) { "timed out after $TimeoutSec s" } elseif ($bounded.startError) { $bounded.startError } else { "$($bounded.stdout)$($bounded.stderr)" }
+  } catch { $out = "$($_.Exception.Message)" }
   $plan = ConvertFrom-LastJsonLine $out
+  if ($plan -and $plan.PSObject.Properties['required'] -and $Cached -and -not $plan.refusal) {
+    # Key recomputed after the call: identity.js may have (re)written gitconfig.
+    try { [IO.Directory]::CreateDirectory("$FleetHome\state\identity") | Out-Null; Write-Json $cacheFile ([pscustomobject]@{ key = (Get-FleetIdentityCacheKey); at = (Now-Iso); plan = $plan }) } catch {}
+  }
   if (-not $plan -or -not $plan.PSObject.Properties['required']) {
     $why = ("$out" -replace '\s+', ' ').Trim(); if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
     return [pscustomobject]@{ required = $true; present = $false; login = $null; env = [pscustomobject]@{}; refusal = [pscustomobject]@{ code = 'FLEET_IDENTITY_UNREADABLE'; message = "bin\identity.js plan did not answer: $why" } }
@@ -429,7 +455,7 @@ function Send-FleetIdentityPageOnce {
 # so a push or PR from this process fails instead of going out under the task's
 # own (Cory's) login. Local supervision still runs (ADR 0015, spec review 09-25).
 function Set-FleetIdentityProcessEnv {
-  $plan = Get-FleetIdentityPlan
+  $plan = Get-FleetIdentityPlan -Cached
   if (-not $plan.refusal -and $plan.env) {
     foreach ($p in $plan.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, "$($p.Value)", 'Process') }
   } elseif ($plan.refusal) {
