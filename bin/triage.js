@@ -84,6 +84,11 @@ function readTenantConfig(root, tenant, file) {
   const tenantFile = file ? path.resolve(file) : path.join(baseOf(root), 'tenants', `${tenant}.json`);
   const config = readJsonFile(tenantFile, null);
   if (!config) throw new WorkStateError('TENANT_NOT_FOUND', `no tenant file at ${tenantFile}`);
+  // #154 (ADR 0015): the owner-comment rule below rests on authorship, which a
+  // tenant sharing one login between owner and fleet cannot supply.
+  try { require('./identity').assertDistinctIdentity(config, tenant); } catch (error) {
+    throw new WorkStateError(error.code, error.message);
+  }
   return config;
 }
 
@@ -446,9 +451,11 @@ function readHeldIssues(root, tenant, now) {
 
 // ------------------------------------------------------------- frontier ----
 
-function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for-agent', config = DEFAULT_CONFIG, entries = [], outbox = [], held = new Map(), tenant, now } = {}) {
+function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, readyLabel = 'ready-for-agent', config = DEFAULT_CONFIG, entries = [], outbox = [], held = new Map(), tenant, now } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const owner = requireText(ownerLogin, 'ownerLogin');
+  // #154: authorship decides only when the owner and the fleet are two logins.
+  const authorshipDecides = Boolean(fleetIdentity) && String(fleetIdentity).toLowerCase() !== owner.toLowerCase();
   const routing = new Set([readyLabel, ...config.routingLabels]);
   const triageLabels = new Set(config.triageLabels);
   const marker = config.markerLabel;
@@ -494,12 +501,18 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     if (issue.openSubIssues > 0) { skipped.push({ number: issue.number, reason: 'spec parent (open sub-issues); cutting is the owner\'s' }); continue; }
     if (issue.assignees.includes(owner)) { skipped.push({ number: issue.number, reason: 'assigned to the owner' }); continue; }
     if (held.has(issue.number)) { skipped.push({ number: issue.number, reason: `held (${held.get(issue.number)})` }); continue; }
-    // fleet#55: there is no "owner has the newest comment" rule. Every fleet
+    // #154 (ADR 0015): with the Fleet identity split from the owner's, the owner
+    // having the newest comment means Cory is in conversation on it, and a fleet
+    // session's cross-link comment no longer looks like him. A tenant that still
+    // shares one login (refused by the loader since #154) never reaches this rule.
+    if (authorshipDecides && newest && newest.author === owner) { skipped.push({ number: issue.number, reason: 'owner has the newest comment; a conversation, not a triage item' }); continue; }
+    // fleet#55: before #154 there was no "owner has the newest comment" rule. Every fleet
     // session's comment carries the owner login, so that test dropped two
     // freshly filed companion tickets on the lead's own cross-links, with no
-    // event that could ever put them back. Nothing here infers the owner's
-    // involvement from authorship; an Approval and a re-proposal ask are
-    // recognised by a shape no fleet role may write.
+    // event that could ever put them back. With one login shared, nothing could
+    // infer the owner's involvement from authorship; since #154 the rule above
+    // does, and an Approval and a re-proposal ask still also carry a shape no
+    // fleet role may write (the guard hook), a second lock beside the login.
     tickets.push({ kind: 'ticket', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: hasTriageLabel ? `labelled ${[...labels].filter((label) => triageLabels.has(label)).join(', ')}` : 'unrouted' });
   }
 
@@ -551,7 +564,7 @@ function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, 
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
   const entries = readLedger(root, tenant);
   const held = readHeldIssues(root, tenant, at);
-  const frontier = selectTriageFrontier({ issues, ownerLogin, readyLabel: tenantConfig.readyLabel || 'ready-for-agent', config, entries, outbox, held, tenant, now: at });
+  const frontier = selectTriageFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, readyLabel: tenantConfig.readyLabel || 'ready-for-agent', config, entries, outbox, held, tenant, now: at });
   return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', ...frontier };
 }
 

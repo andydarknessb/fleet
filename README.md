@@ -181,7 +181,7 @@ node C:\Users\Cory\fleet\bin\identity.js check --tenant endzone
 node C:\Users\Cory\fleet\bin\identity.js plan
 ```
 
-A launch with no identity directory keeps the keyring login until a tenant names a `fleetIdentity` other than its `ownerLogin`; from then on it refuses with `FLEET_IDENTITY_MISSING` and pages once.
+Every tenant file names a `fleetIdentity` distinct from its `ownerLogin` (#154); the loaders and `launch.ps1` refuse a tenant that shares one login (`TENANT_IDENTITY_NOT_DISTINCT`). A launch with no identity directory refuses with `FLEET_IDENTITY_MISSING` and pages once.
 
 ### Tenant check policy
 

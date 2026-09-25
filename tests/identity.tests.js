@@ -131,13 +131,13 @@ test('ensureGitConfig is idempotent and launchPlan writes it when the identity i
   identity.ensureGitConfig(dir);
   assert.equal(fs.statSync(file).mtimeMs, mtime, 'unchanged content is not rewritten');
   const fresh = identityDir();
-  const root = fleetRoot({ endzone: { fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' } });
+  const root = fleetRoot({ endzone: {} });
   identity.launchPlan({ root, env: { ...process.env, FLEET_IDENTITY_DIR: fresh } });
   assert.ok(fs.existsSync(path.join(fresh, 'gitconfig')));
 });
 
-test('launchPlan: not required and absent keeps the keyring (pre-flip), no refusal', () => {
-  const root = fleetRoot({ endzone: { fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' } });
+test('launchPlan: a tenant naming no fleet identity, absent directory: keyring kept, no refusal', () => {
+  const root = fleetRoot({ endzone: {} });
   const plan = identity.launchPlan({ root, env: { FLEET_IDENTITY_DIR: path.join(root, 'nowhere') } });
   assert.equal(plan.required, false);
   assert.equal(plan.present, false);
@@ -147,7 +147,7 @@ test('launchPlan: not required and absent keeps the keyring (pre-flip), no refus
 
 test('launchPlan: present injects the environment whether or not it is yet required', () => {
   const dir = identityDir();
-  const root = fleetRoot({ endzone: { fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' } });
+  const root = fleetRoot({ endzone: {} });
   const plan = identity.launchPlan({ root, env: { FLEET_IDENTITY_DIR: dir } });
   assert.equal(plan.present, true);
   assert.equal(plan.login, 'endzone-fleet');
@@ -207,4 +207,26 @@ test('cli check: reads the session login through gh and exits nonzero only on re
   const failing = identity.cli(['check', '--root', root, '--tenant', 'endzone'], { ghUser: () => { throw new Error('gh: not logged in'); } });
   assert.equal(failing.status, 'red');
   assert.match(failing.detail, /not logged in/);
+});
+
+// #154: the tenant schema refuses a tenant whose fleetIdentity is its ownerLogin.
+test('#154: assertDistinctIdentity refuses fleetIdentity equal to ownerLogin, in any case', () => {
+  assert.throws(() => identity.assertDistinctIdentity({ name: 'endzone', fleetIdentity: 'AndyDarknessB', ownerLogin: 'andydarknessb' }), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
+  assert.doesNotThrow(() => identity.assertDistinctIdentity({ name: 'endzone', fleetIdentity: 'fleet-bot', ownerLogin: 'andydarknessb' }));
+  assert.doesNotThrow(() => identity.assertDistinctIdentity({ name: 'fixture' }), 'a tenant naming neither is not this rule\'s business');
+});
+
+test('#154: launchPlan refuses to launch while any tenant shares one login', () => {
+  const root = fleetRoot({ endzone: { fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' } });
+  const plan = identity.launchPlan({ root, env: { FLEET_IDENTITY_DIR: identityDir() } });
+  assert.equal(plan.refusal.code, 'TENANT_IDENTITY_NOT_DISTINCT');
+});
+
+test('#154: the shipped tenant files name a Fleet identity distinct from the owner', () => {
+  const tenantsDir = path.join(__dirname, '..', 'tenants');
+  for (const name of fs.readdirSync(tenantsDir).filter((file) => file.endsWith('.json'))) {
+    const config = JSON.parse(fs.readFileSync(path.join(tenantsDir, name), 'utf8'));
+    assert.doesNotThrow(() => identity.assertDistinctIdentity(config, name), name);
+    assert.ok(config.fleetIdentity && config.ownerLogin, `${name} names both logins`);
+  }
 });

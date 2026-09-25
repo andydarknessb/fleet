@@ -2227,3 +2227,10 @@ test('#155: a status answer with no creator records postedBy null, never a guess
   assert.equal(recorded.status.postedBy, null);
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.statusReceipt), 'utf8')).postedBy, null);
 });
+
+test('#154: the review-policy loader refuses a tenant whose fleetIdentity is its ownerLogin', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'shared.json'), JSON.stringify({ name: 'shared', github: 'owner/repo', reviewStatus: 'fleet-review', fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' }));
+  assert.throws(() => attestPullRequest({ root, tenantName: 'shared', prNumber: 1, headSha: 'a'.repeat(40), artifactPath: __filename, gh: () => '{}' }), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
+});

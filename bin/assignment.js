@@ -652,8 +652,13 @@ function readStateFixture(file, fallback, root, relative) {
 // The tenant file is the source of truth for readyLabel, repo and fleetIdentity; every door
 // that computes a frontier reads it so the rules cannot drift between them.
 function readTenantConfig(root, tenant, file) {
-  if (file) return readFixture(file, {});
-  return readStateFixture(null, {}, root, path.join('tenants', `${tenant || 'endzone'}.json`));
+  const config = file ? readFixture(file, {}) : readStateFixture(null, {}, root, path.join('tenants', `${tenant || 'endzone'}.json`));
+  // #154 (ADR 0015): a tenant whose fleetIdentity is its ownerLogin is refused,
+  // or the foreign-assignee rule below would silently mean nothing again.
+  try { require('./identity').assertDistinctIdentity(config, tenant); } catch (error) {
+    throw new WorkStateError(error.code, error.message);
+  }
+  return config;
 }
 
 function cli(argv) {
