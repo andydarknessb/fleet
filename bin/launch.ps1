@@ -154,6 +154,32 @@ if ($Permissions -eq 'allowlist' -and ($Role -ne 'ic' -or $Model -ne 'haiku')) {
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $profileReason; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $profileReason; model = $Model; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
 }
+# Spec #94 (#165): the haiku tier is open only on the CLI the rehearsal passed on. The
+# profile records that version; any other `claude --version` refuses a haiku launch
+# (dry runs included) until the rehearsal passes again and bumps the field. No recorded
+# version means no rehearsal has passed yet, which refuses too: the tier opens only when a
+# clean verdict writes the field. A scratch root (bin\scratch-root.ps1) marks its copy
+# `rehearsalRoot: true`, the one place a haiku launch runs on an unverified CLI, because
+# that launch IS the rehearsal. Sonnet never reads the field.
+if ($Model -eq 'haiku' -and $Permissions -eq 'allowlist') {
+  $haikuProfile = $null
+  try { $haikuProfile = Read-Json "$FleetHome\config\permissions-allowlist.json" } catch {}
+  if (-not ($haikuProfile -and $haikuProfile.rehearsalRoot -eq $true)) {
+    $verifiedCli = if ($haikuProfile) { "$($haikuProfile.verifiedCliVersion)".Trim() } else { '' }
+    $installedCli = ''
+    try { $installedCli = "$((& claude --version 2>$null | Out-String))".Trim() } catch {}
+    $installedVersion = if ($installedCli -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { $installedCli }
+    $rehearsalHow = "(bin\scratch-root.ps1 -Path <dir> -Issue <n>, then its printed assign and launch); a clean verdict writes verifiedCliVersion in config\permissions-allowlist.json. Launch this ticket on sonnet meanwhile"
+    $versionReason = $null
+    if (-not $verifiedCli) { $versionReason = "no haiku rehearsal has passed yet (config\permissions-allowlist.json records no verifiedCliVersion; spec #94, ADR 0016): run the rehearsal first $rehearsalHow" }
+    elseif ($installedVersion -ne $verifiedCli) { $versionReason = "the haiku tier was verified on Claude Code $verifiedCli, but the installed CLI is $(if ($installedVersion) { $installedVersion } else { 'unknown' }) (spec #94, ADR 0016): re-run the rehearsal before a haiku launch $rehearsalHow" }
+    if ($versionReason) {
+      $released = $false
+      if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $versionReason; $released = $true } catch {} }
+      Write-Output (@{ launched = $false; reason = $versionReason; model = $Model; permissions = $Permissions; verifiedCliVersion = $verifiedCli; installedCliVersion = $installedVersion; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+    }
+  }
+}
 
 if ($Manifest -and -not $DryRun) {
   $previousOutputEncoding = [Console]::OutputEncoding

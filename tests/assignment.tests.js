@@ -551,8 +551,8 @@ test('assign pins the permission profile: haiku only under allowlist, sonnet und
   for (const [number, extra, label] of [[81, { model: 'haiku' }, 'no flag'], [82, { model: 'haiku', permissions: 'auto' }, '--permissions auto']]) {
     assert.throws(
       () => reserve(number, extra),
-      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message),
-      `haiku with ${label} is refused with the fleet #28 cause`,
+      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message) && /--permissions allowlist/.test(error.message),
+      `haiku with ${label} is refused with the fleet #28 cause and the flag to pass`,
     );
   }
 
