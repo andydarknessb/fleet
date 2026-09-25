@@ -392,3 +392,104 @@ function Send-FleetToast {
     return $true
   } catch { return $false }
 }
+
+# Spec fleet #93 / #153 (ADR 0015): the fleet acts on GitHub as its own login.
+# bin/identity.js is the one reader of the secret gh config directory; these wrap
+# it for the PowerShell doors (launch.ps1, watchdog.ps1). A plan that cannot be
+# read at all is a refusal (FLEET_IDENTITY_UNREADABLE), never a silent keyring login.
+# The node call is bounded (-TimeoutSec). -Cached (the Watchdog, every tick) first
+# reuses state/identity/plan-cache.json while its key still matches: the identity
+# overrides, each tenant file's and hosts.yml's write time. A normal tick then spawns
+# no node at all, and a wedged node cannot wedge the tick (watchdog FD10).
+function Get-FleetIdentityCacheKey {
+  $dir = if ($env:FLEET_IDENTITY_DIR) { "$env:FLEET_IDENTITY_DIR" } else { Join-Path "$env:USERPROFILE" '.fleet-identity\gh' }
+  $parts = @("dir=$dir")
+  foreach ($f in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue | Sort-Object Name)) { $parts += "$($f.Name)=$($f.LastWriteTimeUtc.Ticks)" }
+  foreach ($name in 'hosts.yml', 'gitconfig') { $p = Join-Path $dir $name; $parts += "$name=$(if (Test-Path -LiteralPath $p) { (Get-Item -LiteralPath $p).LastWriteTimeUtc.Ticks } else { 'absent' })" }
+  return ($parts -join ';')
+}
+function Get-FleetIdentityPlan {
+  param([switch]$Cached, [int]$TimeoutSec = 15)
+  $cacheFile = "$FleetHome\state\identity\plan-cache.json"
+  $key = $null
+  if ($Cached) {
+    $key = Get-FleetIdentityCacheKey
+    $hit = $null; try { $hit = Read-Json $cacheFile } catch {}
+    if ($hit -and "$($hit.key)" -eq $key -and $hit.plan) { return $hit.plan }
+  }
+  $out = $null
+  try {
+    $bounded = Invoke-BoundedExe -FilePath (Get-NodeExe) -ArgumentList @("$FleetHome\bin\identity.js", 'plan', '--root', "$FleetHome") -TimeoutSec $TimeoutSec -Name 'identity.js plan'
+    $out = if ($bounded.timedOut) { "timed out after $TimeoutSec s" } elseif ($bounded.startError) { $bounded.startError } else { "$($bounded.stdout)$($bounded.stderr)" }
+  } catch { $out = "$($_.Exception.Message)" }
+  $plan = ConvertFrom-LastJsonLine $out
+  if ($plan -and $plan.PSObject.Properties['required'] -and $Cached -and -not $plan.refusal) {
+    # Key recomputed after the call: identity.js may have (re)written gitconfig.
+    try { [IO.Directory]::CreateDirectory("$FleetHome\state\identity") | Out-Null; Write-Json $cacheFile ([pscustomobject]@{ key = (Get-FleetIdentityCacheKey); at = (Now-Iso); plan = $plan }) } catch {}
+  }
+  if (-not $plan -or -not $plan.PSObject.Properties['required']) {
+    $why = ("$out" -replace '\s+', ' ').Trim(); if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
+    return [pscustomobject]@{ required = $true; present = $false; login = $null; env = [pscustomobject]@{}; refusal = [pscustomobject]@{ code = 'FLEET_IDENTITY_UNREADABLE'; message = "bin\identity.js plan did not answer: $why" } }
+  }
+  return $plan
+}
+# One high-priority page per distinct refusal code; cleared once a plan has no
+# refusal, so the next failure pages again. state/identity/paged.json is the marker.
+function Send-FleetIdentityPageOnce {
+  param($Plan, [string]$Source, [switch]$NoToast)
+  if ($env:FLEET_NO_TOAST -eq '1') { $NoToast = [switch]::Present }   # tests: the audit line and Pushover, no desktop toast
+  $markerDir = "$FleetHome\state\identity"
+  $marker = "$markerDir\paged.json"
+  if (-not $Plan.refusal) { Remove-Item -LiteralPath $marker -ErrorAction SilentlyContinue; return $false }
+  $prior = $null; try { $prior = Read-Json $marker } catch {}
+  if ($prior -and "$($prior.code)" -eq "$($Plan.refusal.code)") { return $false }
+  [IO.Directory]::CreateDirectory($markerDir) | Out-Null
+  Write-Json $marker ([pscustomobject]@{ code = "$($Plan.refusal.code)"; at = (Now-Iso); source = $Source })
+  try { Send-FleetPage -Kind 'fleet-identity' -Title "Fleet identity: $($Plan.refusal.code)" -Body "$Source refused: $($Plan.refusal.message)" -Priority high -NoToast:$NoToast | Out-Null } catch {}
+  return $true
+}
+# The Watchdog's own process (and every git/gh/node child it starts) carries the
+# same environment a launched session does. Returns the plan so the caller can
+# report a refusal. A refusal fails CLOSED for GitHub: gh gets a token that
+# authenticates as nobody and git a system gitconfig whose helper list is empty,
+# so a push or PR from this process fails instead of going out under the task's
+# own (Cory's) login. Local supervision still runs (ADR 0015, spec review 09-25).
+function Set-FleetIdentityProcessEnv {
+  $plan = Get-FleetIdentityPlan -Cached
+  if (-not $plan.refusal -and $plan.env) {
+    foreach ($p in $plan.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, "$($p.Value)", 'Process') }
+    # gh prefers GH_TOKEN / GITHUB_TOKEN over GH_CONFIG_DIR; an inherited one would
+    # silently act as whoever minted it.
+    foreach ($k in 'GH_TOKEN', 'GITHUB_TOKEN') { [Environment]::SetEnvironmentVariable($k, $null, 'Process') }
+  } elseif ($plan.refusal) {
+    $closedDir = "$FleetHome\state\identity"
+    [IO.Directory]::CreateDirectory($closedDir) | Out-Null
+    $closed = "$closedDir\refused.gitconfig"
+    [IO.File]::WriteAllText($closed, "# fleet identity refused ($($plan.refusal.code)): no git credentials in this process`n[credential]`n`thelper =`n", $script:Utf8)
+    [Environment]::SetEnvironmentVariable('GIT_CONFIG_SYSTEM', $closed, 'Process')
+    [Environment]::SetEnvironmentVariable('GH_TOKEN', "fleet-identity-refused-$($plan.refusal.code)", 'Process')
+    [Environment]::SetEnvironmentVariable('GIT_TERMINAL_PROMPT', '0', 'Process')
+    [Environment]::SetEnvironmentVariable('GCM_INTERACTIVE', 'never', 'Process')
+    [Environment]::SetEnvironmentVariable('GIT_ASKPASS', 'echo', 'Process')   # an inherited askpass (VS Code) would answer as Cory
+  }
+  return $plan
+}
+# #153 spec review: a present hosts.yml can hold an expired or revoked token. The
+# launch asks GitHub once, with the fleet's own config, which login it is; a failure
+# or another login is FLEET_IDENTITY_INVALID. Returns $null when the token is good.
+function Test-FleetIdentityLive {
+  param($Plan)
+  if (-not $Plan.present -or $Plan.refusal) { return $null }
+  $saved = @{}; foreach ($k in 'GH_CONFIG_DIR','GH_TOKEN','GITHUB_TOKEN','GH_PROMPT_DISABLED') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+  try {
+    [Environment]::SetEnvironmentVariable('GH_TOKEN', $null, 'Process'); [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('GH_CONFIG_DIR', "$($Plan.dir)", 'Process'); [Environment]::SetEnvironmentVariable('GH_PROMPT_DISABLED', '1', 'Process')
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = (& gh api user --jq .login 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE
+    $ErrorActionPreference = $eap
+  } catch { $out = "$($_.Exception.Message)"; $code = 1 }
+  finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
+  if ($code -eq 0 -and "$out".ToLowerInvariant() -eq "$($Plan.login)".ToLowerInvariant()) { return $null }
+  $why = ("$out" -replace '\s+', ' '); if ($why.Length -gt 200) { $why = $why.Substring(0, 200) }
+  return [pscustomobject]@{ code = 'FLEET_IDENTITY_INVALID'; message = "the token in $($Plan.dir) did not answer as $($Plan.login) (gh api user: $why); it may be expired or revoked: re-run bin/wizard-fleet-identity.sh (ADR 0015)" }
+}

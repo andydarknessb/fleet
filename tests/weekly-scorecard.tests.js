@@ -233,3 +233,32 @@ test('#131 review: the IC cost table cell carries the per-family medians', () =>
   assert.match(row.result, /whole-life: haiku median 30000 \(1 unit\), sonnet median 60000 \(3 units\)/);
   assert.match(row.result, /budget\.js 1 warning\(s\), 1 escalation\(s\)/);
 });
+
+// Spec fleet #93 / #155: the scorecard says who merged into the default branch.
+test('#155: the scorecard prints merges by the owner and by the fleet for the week', () => {
+  const root = fixtureWeek();
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'andydarknessb/Endzone-Empire', branchPrefix: 'fleet/', ownerLogin: 'cory-owner', fleetIdentity: 'fleet-bot' }));
+  const merger = { 'endzone:issue-11': 'fleet-bot', 'endzone:issue-12': 'fleet-bot', 'endzone:issue-13': 'Cory-Owner' };
+  const dir = path.join(root, 'state', 'events');
+  for (const file of fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl'))) {
+    const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    for (const event of lines) if (event.type === 'state-merged' && merger[event.recordId]) event.changes.mergedBy = merger[event.recordId];
+    fs.writeFileSync(path.join(dir, file), `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  }
+  const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
+  assert.deepEqual(card.mergesBy, { owner: 1, fleet: 2, shared: 0, other: 0, unrecorded: 1, merged: 4, otherLogins: [] });
+  const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
+  assert.match(md, /^Merges into the default branch this week: 1 by the owner, 2 by the fleet, 1 with no merger recorded\.$/m);
+});
+
+test('#155: a tenant whose owner and fleet share a login counts its merges as shared', () => {
+  const root = fixtureWeek();
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', ownerLogin: 'andydarknessb', fleetIdentity: 'andydarknessb' }));
+  const dir = path.join(root, 'state', 'events');
+  for (const file of fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl'))) {
+    const lines = fs.readFileSync(path.join(dir, file), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    for (const event of lines) if (event.type === 'state-merged') event.changes.mergedBy = 'andydarknessb';
+    fs.writeFileSync(path.join(dir, file), `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
+  }
+  assert.equal(build(root).mergesBy.shared, 4);
+});

@@ -27,7 +27,7 @@ try {
   foreach ($dir in 'bin','hooks','tenants','config','state','state/heartbeats','state/continue','state/skip','state/escalations','state/work','state/events','state/flags','state/triage','state/watch','state/exclusions') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','check-policy.ps1','triage.js','assignment.js','premises.js','work-state.js','exclusions.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','identity.js','check-policy.ps1','triage.js','assignment.js','premises.js','work-state.js','exclusions.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\stop.ps1", "$testRoot\hooks\stop.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'

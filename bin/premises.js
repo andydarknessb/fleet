@@ -131,4 +131,11 @@ function checkPremises({ premises, repoPath, baseSha, runner = execFileSync } = 
   return { head: baseSha, changed };
 }
 
-module.exports = { PREMISES_HEADING, PremisesError, checkPremises, fencedLines, parsePremises, readPremises };
+// #153 (ADR 0015): premises a SESSION asserts about itself, run from inside a
+// fleet session rather than read from an issue body. Each takes facts and returns
+// { check, status: green | expected-until-154 | red, detail }.
+const SESSION_CHECKS = Object.freeze({
+  'fleet-identity-matches-session': (facts) => require('./identity').checkSessionIdentity(facts),
+});
+
+module.exports = { PREMISES_HEADING, SESSION_CHECKS, PremisesError, checkPremises, fencedLines, parsePremises, readPremises };

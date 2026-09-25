@@ -53,7 +53,7 @@ try {
   foreach ($dir in 'bin','hooks','agents','tenants','config','state','state/sessions','state/notices','state/work','state/events','state/rotation','state/flags','state/heartbeats','state/manifests','state/exclusions','mock-bin','repo') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','launch.ps1','recover.ps1','cutover-assignment.ps1','assignment.js','premises.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','launch.ps1','identity.js','recover.ps1','cutover-assignment.ps1','assignment.js','premises.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body for ic."

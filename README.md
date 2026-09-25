@@ -161,6 +161,28 @@ powershell -File C:\Users\Cory\fleet\bin\deploy-live.ps1
 
 `state/` is gitignored and no ref move touches it. A change that needs a state migration ships the migration as a script Cory runs, never as a side effect of the advance. Role-file changes still take effect at a session's next launch or Rotation.
 
+### Who acts as whom on GitHub (ADR 0015)
+
+| Shell | Acts as | Why |
+|---|---|---|
+| Cory's own terminal, including `!` commands in an interactive Claude Code session | `andydarknessb` (keyring) | nothing in Cory's environment changes |
+| Every session `launch.ps1` or `rotate.ps1` starts | the Fleet identity | `GH_CONFIG_DIR` and `GIT_CONFIG_SYSTEM` in the session's settings `env` |
+| The Watchdog task, and everything it runs (`deploy-live.ps1`, `sync-integration.ps1`) | the Fleet identity | `watchdog.ps1` sets the same variables in its own process each tick |
+
+The token lives in `%USERPROFILE%\.fleet-identity\gh\hosts.yml`, never in `state/` or the repo. Commits keep Cory as author; the Fleet identity is only the pusher, PR opener, status poster and merger.
+
+```powershell
+# provision or rotate the account's token (run from Git Bash in Cory's shell, not a fleet session)
+bash C:/Users/Cory/fleet/bin/wizard-fleet-identity.sh
+
+# which login does a fleet session act as? (inside the session, or with FLEET_TENANT set)
+node C:\Users\Cory\fleet\bin\identity.js check --tenant endzone
+# what the next launch would do: required? present? refused?
+node C:\Users\Cory\fleet\bin\identity.js plan
+```
+
+A launch with no identity directory keeps the keyring login until a tenant names a `fleetIdentity` other than its `ownerLogin`; from then on it refuses with `FLEET_IDENTITY_MISSING` and pages once.
+
 ### Tenant check policy
 
 Each tenant classifies known CI checks in exactly one list:

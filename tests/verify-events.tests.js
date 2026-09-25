@@ -401,3 +401,41 @@ test('#129: a history line older than 90 days is trimmed on the next write', () 
   verifyLedger({ root, now: '2026-09-20T00:00:00.000Z' });
   assert.deepEqual(historyLines(root).map((l) => l.at), ['2026-08-01T00:00:00.000Z', '2026-09-20T00:00:00.000Z']);
 });
+
+// Spec fleet #93 / #155: verify-events accepts mergedBy and, once the first merge
+// event carrying one exists, refuses a later merge event without it.
+function setMergers(root, byIssue) {
+  rewriteEvents(root, (lines) => lines.map((line) => (line.type === 'state-merged' && byIssue[line.recordId] !== undefined
+    ? { ...line, changes: { ...line.changes, mergedBy: byIssue[line.recordId] } } : line)));
+}
+
+test('#155: merge events that all name their merger pass', () => {
+  const root = rootDir();
+  unit(root, 40, ['pr-open', 'review', 'merged']);
+  unit(root, 41, ['pr-open', 'review', 'merged']);
+  setMergers(root, { 'endzone:issue-40': 'fleet-bot', 'endzone:issue-41': 'cory-owner' });
+  const result = verifyLedger({ root });
+  assert.equal(result.findingsByKind['merge-without-merged-by'], undefined);
+  assert.equal(result.pass, true);
+});
+
+test('#155: after the first attributed merge, a merge event with no mergedBy fails', () => {
+  const root = rootDir();
+  unit(root, 42, ['pr-open', 'review', 'merged']);
+  unit(root, 43, ['pr-open', 'review', 'merged']);
+  // #42 merged first (earlier issue, same clock) and names its merger; #43 does not.
+  setMergers(root, { 'endzone:issue-42': 'fleet-bot', 'endzone:issue-43': null });
+  const result = verifyLedger({ root });
+  assert.equal(result.pass, false);
+  assert.equal(result.findingsByKind['merge-without-merged-by'], 1);
+  const finding = result.records.find((r) => r.recordId === 'endzone:issue-43').findings.find((f) => f.kind === 'merge-without-merged-by');
+  assert.ok(finding.sequence > 0);
+});
+
+test('#155: merges from before the first attributed one stand as they were', () => {
+  const root = rootDir();
+  unit(root, 44, ['pr-open', 'review', 'merged']);
+  unit(root, 45, ['pr-open', 'review', 'merged']);
+  setMergers(root, { 'endzone:issue-45': 'fleet-bot' });
+  assert.equal(verifyLedger({ root }).findingsByKind['merge-without-merged-by'], undefined);
+});

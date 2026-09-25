@@ -26,7 +26,7 @@ try {
   foreach ($dir in 'bin','agents','tenants','config','state','state/sessions','state/work','state/events','state/flags','state/manifests','mock-bin','repo') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($file in '_common.ps1','launch.ps1','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$file", "$testRoot\bin\$file") }
+  foreach ($file in '_common.ps1','launch.ps1','identity.js','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$file", "$testRoot\bin\$file") }
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{}'

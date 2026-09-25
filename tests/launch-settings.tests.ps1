@@ -23,7 +23,7 @@ try {
   foreach ($dir in 'bin','hooks','agents','tenants','config','state','state/sessions','state/notices','state/work','state/rotation','state/flags','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','launch.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','launch.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   foreach ($roleName in 'dispatcher','project-lead','ic') {

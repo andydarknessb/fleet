@@ -233,7 +233,7 @@ function buildPointerMessage({ root, record, event, tenantConfig = {} } = {}) {
   // pointing at pr-watch.js's own "observed merged at <ts> (gh pr view N)"
   // prose, which names how the watcher knows, not what Cory needs to act on.
   const rawQuestion = (kind === 'merge-review-wake' && prNumber)
-    ? `PR #${prNumber} merged without a recorded formal review`
+    ? `PR #${prNumber} merged${event.changes?.mergedBy ? ` by ${event.changes.mergedBy}` : ''} without a recorded formal review`
     : pickClause(event.evidence);
   const candidateQuestion = truncateQuestion(collapseWhitespace(rawQuestion));
   let question = candidateQuestion;

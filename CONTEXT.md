@@ -393,3 +393,17 @@ The tenant owner's comment adopting a Triage proposal, with or without edits,
 which turns it into a Ruling. Only the tenant owner's login approves; the same
 word from anyone else, including the fleet's own identity, is not one.
 _Avoid_: sign-off, LGTM, ack
+
+**Tenant owner**:
+The person a tenant's work is for, named by the tenant file's `ownerLogin`.
+Only this login approves, assigns work away from the fleet, or asks for a
+re-proposal. For both tenants it is Cory (`andydarknessb`).
+_Avoid_: admin, maintainer, user
+
+**Fleet identity**:
+The GitHub login the fleet itself acts as, named by the tenant file's
+`fleetIdentity` and distinct from the Tenant owner's. Every fleet session
+and the Watchdog push, open pull requests, post the review status, comment
+and merge under it; Cory's own shell never does (ADR 0015). A comment,
+assignment or merge by this login is the fleet's, never the owner's.
+_Avoid_: bot, service account, the fleet's token
