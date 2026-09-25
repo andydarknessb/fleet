@@ -63,6 +63,11 @@ try {
   Assert-True ($stateFiles.Count -eq 0) "the scratch state holds no files beyond an empty live roster (got $(@($stateFiles | ForEach-Object { $_.FullName }) -join ', '))"
   foreach ($dir in 'sessions', 'work', 'events', 'manifests', 'flags', 'watch') { Assert-True (Test-Path -LiteralPath "$scratch\state\$dir" -PathType Container) "the scratch state has state\$dir" }
   Assert-True (-not (Test-Path -LiteralPath "$scratch\.scratch")) 'the source .scratch notes are not copied'
+  # Spec #94 (#165): a scratch root is where a CLI re-test runs, so its profile carries no
+  # recorded version and the launch door does not refuse the installed CLI there.
+  $scratchProfile = Get-Content "$scratch\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  Assert-True ($scratchProfile.PSObject.Properties['verifiedCliVersion'] -and $null -eq $scratchProfile.verifiedCliVersion) 'the scratch profile clears verifiedCliVersion so a rehearsal runs on the installed CLI'
+  Assert-True ([bool](Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json).verifiedCliVersion) 'the source profile keeps its recorded version'
   $scratchFwd = $scratch.Replace('\', '/')
   $settingsText = Get-Content "$scratch\fleet-settings.json" -Raw
   $hookCommands = @(($settingsText | ConvertFrom-Json).hooks.PSObject.Properties | ForEach-Object { $_.Value } | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })

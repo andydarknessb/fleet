@@ -78,3 +78,23 @@ the settings carry the mode for both profiles.
   the live roster row records the profile.
 - A manifest written before this ADR has no `permissions` field and launches
   under auto, as it always did.
+
+## Amendment: the tier reopens on the rehearsed CLI (#165)
+
+Rehearsal (#164): PENDING. Fill in the date, the `claude --version` and the
+verdict line from `.scratch/haiku-rehearsal-<date>/` before this amendment
+merges. A not-clean verdict means this amendment does not merge at all.
+
+- The haiku tier is open again for the ticket types the project-lead role
+  file already names (copy changes, single-file fixes, test flakes, verbatim
+  moves, exact-file tickets), and only under the allowlist profile.
+- `config/permissions-allowlist.json` records `verifiedCliVersion`, the CLI
+  the rehearsal passed on. `launch.ps1` refuses a haiku launch on any other
+  `claude --version`, dry runs included, naming both versions and the
+  rehearsal command. Sonnet launches never read the field.
+- The re-test on a CLI update is the rehearsal again: `bin/scratch-root.ps1`
+  clears the field in its copy, so the scratch launch runs on the new CLI. A
+  clean verdict bumps the field; that is the whole re-test.
+- `budgets.icJobTokensTargets.haiku` in `config/cycle.json` stays null. One
+  rehearsal unit is not a median; the target is set from the weekly
+  scorecards once haiku units accumulate (fleet #139's method).

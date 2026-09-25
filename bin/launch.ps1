@@ -154,6 +154,26 @@ if ($Permissions -eq 'allowlist' -and ($Role -ne 'ic' -or $Model -ne 'haiku')) {
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $profileReason; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $profileReason; model = $Model; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
 }
+# Spec #94 (#165): the haiku tier is open only on the CLI the rehearsal passed on. The
+# profile records that version; any other `claude --version` refuses a haiku launch
+# (dry runs included) until the rehearsal passes again and bumps the field. A profile
+# with no recorded version (a scratch root, bin\scratch-root.ps1) is where that re-test
+# runs, so it is not refused. Sonnet never reads the field.
+if ($Model -eq 'haiku' -and $Permissions -eq 'allowlist') {
+  $verifiedCli = $null
+  try { $verifiedCli = "$((Read-Json "$FleetHome\config\permissions-allowlist.json").verifiedCliVersion)".Trim() } catch {}
+  if ($verifiedCli) {
+    $installedCli = ''
+    try { $installedCli = "$((& claude --version 2>$null | Out-String))".Trim() } catch {}
+    $installedVersion = if ($installedCli -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { $installedCli }
+    if ($installedVersion -ne $verifiedCli) {
+      $versionReason = "the haiku tier was verified on Claude Code $verifiedCli, but the installed CLI is $(if ($installedVersion) { $installedVersion } else { 'unknown' }) (spec #94, ADR 0016): re-run the rehearsal before a haiku launch (bin\scratch-root.ps1 -Path <dir> -Issue <n>, then its printed assign and launch); a clean verdict bumps verifiedCliVersion in config\permissions-allowlist.json. Launch this ticket on sonnet meanwhile"
+      $released = $false
+      if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $versionReason; $released = $true } catch {} }
+      Write-Output (@{ launched = $false; reason = $versionReason; model = $Model; permissions = $Permissions; verifiedCliVersion = $verifiedCli; installedCliVersion = $installedVersion; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+    }
+  }
+}
 
 if ($Manifest -and -not $DryRun) {
   $previousOutputEncoding = [Console]::OutputEncoding

@@ -411,7 +411,7 @@ function writeManifest(root, manifest) {
 const IC_MODELS = Object.freeze(['sonnet', 'haiku']);
 const IC_PERMISSION_PROFILES = Object.freeze({ sonnet: Object.freeze(['auto']), haiku: Object.freeze(['allowlist']) });
 const PERMISSION_PROFILES = Object.freeze(['auto', 'allowlist']);
-const HAIKU_REFUSAL = "the installed Claude Code CLI has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet";
+const HAIKU_REFUSAL = "the installed Claude Code CLI has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; pass --permissions allowlist to run it under the allowlist profile (ADR 0016), or launch it on sonnet";
 
 function icModel(model) {
   const value = String(model === undefined || model === null || model === '' ? 'sonnet' : model).toLowerCase();

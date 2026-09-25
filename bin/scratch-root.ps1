@@ -82,6 +82,14 @@ foreach ($dir in 'sessions', 'work', 'events', 'archive', 'exclusions', 'status'
   [IO.Directory]::CreateDirectory("$root\state\$dir") | Out-Null
 }
 Write-Utf8 "$root\state\roster.json" "{`"sessions`":[]}`n"
+# A scratch root is where the haiku rehearsal runs, on whatever CLI is installed now: its
+# profile carries no recorded version, so launch.ps1's version guard (#165) stands aside.
+$profileFile = "$root\config\permissions-allowlist.json"
+if (Test-Path -LiteralPath $profileFile) {
+  $scratchProfile = Get-Content -LiteralPath $profileFile -Raw | ConvertFrom-Json
+  $scratchProfile | Add-Member -NotePropertyName verifiedCliVersion -NotePropertyValue $null -Force
+  Write-Utf8 $profileFile (($scratchProfile | ConvertTo-Json -Depth 10) + "`n")
+}
 
 # --- settings: the scratch root's own hooks, and a fence around the live root ---
 $rootFwd = $root.Replace('\', '/')

@@ -36,7 +36,7 @@ try {
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   $repoPath = "$testRoot\repo"
   Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,"defaultBranch":"integration","releaseBranch":"main","repo":' + ($repoPath | ConvertTo-Json) + '}')
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'if "%1"=="--version" echo %MOCK_CLAUDE_VERSION% (Claude Code)' + "`r`n" + 'exit /b 0' + "`r`n")
   [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-disp") | Out-Null
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
@@ -157,9 +157,10 @@ exit $LASTEXITCODE
   $manifestPath = "$testRoot\state\manifests\assignment-test-issue-77.json"
   Write-Utf8 $manifestPath ('{"schemaVersion":1,"id":"assignment-test-issue-77","status":"pending-ack","workRecordId":"test:issue-77","workRecordRevision":1,"issue":{"number":77,"bodyHash":"x","criteriaHash":"y"},"base":{"remote":"origin","ref":"integration","sha":"' + ('a' * 40) + '"},"branch":"fleet/77-x","tenant":"test","parent":"pl-test","model":"haiku","permissions":"allowlist"}')
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-77":{"id":"test:issue-77","state":"assigned","issue":77,"manifestPath":"m77"}}}'
-  $rm = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs (got: $rm)"
   $profile = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $env:MOCK_CLAUDE_VERSION = "$($profile.verifiedCliVersion)"
+  $rm = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs on the verified CLI (got: $rm)"
   Assert-True ($rm.permissions -eq 'allowlist' -and $rm.allowRules -eq @($profile.allow).Count) "the dry run names the profile and its allow rule count (got $($rm.permissions)/$($rm.allowRules))"
   Assert-True (-not ("$($rm.command)" -match '--permission-mode')) 'the permission mode is never passed on the command line'
   $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
@@ -174,6 +175,22 @@ exit $LASTEXITCODE
   Assert-True ($haikuDeny -contains "Edit($rootFwd/**)") 'the profile denies edits across the fleet root it adds as a directory'
   Assert-True ($haikuDeny -contains 'Bash(git push origin integration:*)') 'the profile deny resolves <defaultBranch> from the tenant file'
   Assert-True (-not (@(@($haikuSettings.permissions.allow) + $haikuDeny) | Where-Object { "$_" -match '<[a-zA-Z]+>' })) 'no unresolved token reaches the settings'
+  # Spec #94 (#165): the profile records the CLI version the rehearsal passed on; a haiku
+  # launch on any other `claude --version` is refused, naming both and the rehearsal.
+  Assert-True ("$($profile.verifiedCliVersion)" -match '^\d+\.\d+\.\d+$') 'the checked-in profile records the rehearsal CLI version'
+  $env:MOCK_CLAUDE_VERSION = '9.9.999'
+  $rmv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and $rmv.launched -eq $false) "a haiku launch on an unverified CLI must refuse with exit 3 (got $script:lastExit): $rmv"
+  Assert-True ("$($rmv.reason)" -match '9\.9\.999' -and "$($rmv.reason)" -match [regex]::Escape("$($profile.verifiedCliVersion)") -and "$($rmv.reason)" -match 'scratch-root\.ps1') "the version refusal names both versions and the rehearsal command: $($rmv.reason)"
+  $rsv = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
+  Assert-True ($rsv.dryRun -eq $true) 'a sonnet launch is unaffected by the recorded CLI version'
+  $unverified = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $unverified.verifiedCliVersion = $null
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($unverified | ConvertTo-Json -Depth 6)
+  $rmn = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rmn.dryRun -eq $true) "a profile with no recorded version (a scratch rehearsal root) launches on any CLI: $rmn"
+  [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
+  Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
   # A sonnet manifest pinning allowlist is refused at the door too (the planner refuses it first).
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
   $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
