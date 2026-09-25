@@ -518,7 +518,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
   }
 
-  // Spec fleet #92 (#143): the backfill census. Open tickets carrying the ready
+  // Spec fleet #92 (#143): the backfill census. Open issues carrying the ready
   // label whose body has no `## Premises`, and those whose section does not parse.
   const premises = { readyLabel, ready: 0, missing: [], malformed: [] };
   for (const issue of normalized) {

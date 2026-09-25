@@ -18,7 +18,7 @@ const {
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
-const { PremisesError, checkPremises, readPremises } = require('./premises');
+const { PREMISES_HEADING, PremisesError, checkPremises, fencedLines, readPremises } = require('./premises');
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
@@ -70,16 +70,15 @@ const ALLOWLIST = /\b(?:lists?|touch(?:es)?|edits?|changes?|modif(?:y|ies)|write
 const EDIT_VERB = /\b(?:add|adds|added|amend|amends|amended|append|appends|appended|write|writes|written|edit|edits|edited|update|updates|updated|change|changes|changed|create|creates|created|rewrite|rewrites|rewritten|extend|extends|extended|revise|revises|revised|own|owns|touch|touches|move|moves|delete|deletes|remove|removes|rename|renames|new)\b/i;
 const NEGATED_HEADING = /^\s{0,3}#{1,6}\s+.*\b(?:out of scope|non-goals?|not in scope|do not touch|must not touch)\b|^\s*\*\*(?:out of scope|non-goals?)\.?\*\*/i;
 
-// Spec fleet #92: a `## Premises` section cites the code a ticket depends on; its
+// Spec fleet #92: a `## Premises` section cites the code an issue depends on; its
 // paths are read, never written, so the section contributes no sentence at all.
-const PREMISES_HEADING = /^\s{0,3}##\s+premises\s*#*\s*$/i;
 
 function criteriaSentences(text) {
   const sentences = [];
   let negatedSection = false;
   let premisesSection = false;
-  for (const line of String(text || '').split(/\r?\n/)) {
-    if (/^\s{0,3}#{1,2}\s/.test(line)) premisesSection = PREMISES_HEADING.test(line);
+  for (const { line, fenced } of fencedLines(text)) {
+    if (!fenced && /^\s{0,3}#{1,2}\s/.test(line)) premisesSection = PREMISES_HEADING.test(line);
     if (premisesSection) continue;
     if (/^\s{0,3}#{1,6}\s/.test(line) || /^\s*\*\*[^*]+\*\*/.test(line)) negatedSection = NEGATED_HEADING.test(line);
     // An abbreviation's period ends no sentence: "cf. `path`" and "e.g. `path`"
@@ -444,7 +443,7 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
     ciGates: [...ciGates],
     reservations: normalized.reservations,
     independenceProof: independenceProof || null,
-    // Spec fleet #92: null while the ticket has no section (the backfill window), [] for `none`.
+    // Spec fleet #92: null while the issue has no section (the backfill window), [] for `none`.
     premises: pinnedPremises(normalized.premises),
     premiseCheck,
   };

@@ -67,6 +67,14 @@ test('#143: the section ends at the next level-one or level-two heading; a deepe
   assert.throws(() => parsePremises(`## Premises\nnone\n### Notes\n`), (error) => error.code === 'PREMISES_MALFORMED' && error.line === '### Notes');
 });
 
+test('#143: a `## Premises` heading inside a fenced block (a quoted template) is not a section', () => {
+  const quoted = ['Template:', '', '```markdown', '## Premises', '', '<path>: <claim> @<sha>', '```', ''].join('\n');
+  assert.equal(parsePremises(quoted), null);
+  assert.deepEqual(parsePremises(`${quoted}\n${bodyWith(['none'])}`), []);
+  // A fence inside the section is something else in it: malformed, quoting the fence line.
+  assert.throws(() => parsePremises(['## Premises', '', `src/a.js: exports a @${SHA}`, '```', '## Not a heading', '```'].join('\n')), (error) => error.code === 'PREMISES_MALFORMED' && error.line === '```');
+});
+
 test('#143: a premise path is a citation, never a reservation', () => {
   const derived = deriveReservations({ body: bodyWith([`server/modules/lock.js: the lock is taken first @${SHA}`]), comments: [] });
   assert.deepEqual(derived.reservations.components, ['src/feature.js']);
@@ -204,6 +212,16 @@ test('#144: a premise sha the tenant checkout never saw refuses with its own cod
   const { repo, head } = tenantRepo();
   assert.throws(() => assignAt(root, repo, head, ['src/a.js: exports 1 @deadbeefdeadbeef']), (error) => error.code === 'PREMISE_SHA_UNKNOWN' && /deadbeefdeadbeef/.test(error.message));
   assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+});
+
+test('#144: a short sha that names several commits refuses PREMISE_SHA_AMBIGUOUS, not UNKNOWN', () => {
+  const runner = (exe, args) => {
+    if (args.includes('rev-parse') && args.includes('--verify')) { const error = new Error('ambiguous'); error.status = 1; throw error; }
+    if (args.some((arg) => arg.startsWith('--disambiguate='))) return `${'a'.repeat(40)}\n${'a'.repeat(7)}${'b'.repeat(33)}\n`;
+    throw new Error(`unexpected git ${args.join(' ')}`);
+  };
+  const premises = parsePremises(bodyWith(['src/a.js: exports 1 @aaaaaaa']));
+  assert.throws(() => checkPremises({ premises, repoPath: 'repo', baseSha: 'c'.repeat(40), runner }), (error) => error.code === 'PREMISE_SHA_AMBIGUOUS' && /longer prefix/.test(error.message));
 });
 
 test('#144: premises to check with no tenant checkout refuse instead of passing unchecked', () => {
