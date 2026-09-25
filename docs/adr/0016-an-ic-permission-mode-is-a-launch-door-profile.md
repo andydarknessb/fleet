@@ -143,3 +143,23 @@ outside the allowed directories.
   A PR the IC opens without its risk review therefore fails its own pre-ready check.
 
 Verification is the next rehearsal, a re-run of #164's procedure.
+
+## Amendment 3: the tier reopens on the rehearsed CLI (#165)
+
+Rehearsal (#164): PENDING. Fill in the date, the `claude --version` and the
+verdict line from `.scratch/haiku-rehearsal-<date>/` before this amendment
+merges. A not-clean verdict means this amendment does not merge at all.
+
+- The haiku tier is open again for the ticket types the project-lead role
+  file already names (copy changes, single-file fixes, test flakes, verbatim
+  moves, exact-file tickets), and only under the allowlist profile.
+- `config/permissions-allowlist.json` records `verifiedCliVersion`, the CLI
+  the rehearsal passed on. `launch.ps1` refuses a haiku launch on any other
+  `claude --version`, dry runs included, naming both versions and the
+  rehearsal command. Sonnet launches never read the field.
+- The re-test on a CLI update is the rehearsal again: `bin/scratch-root.ps1`
+  clears the field in its copy, so the scratch launch runs on the new CLI. A
+  clean verdict bumps the field; that is the whole re-test.
+- `budgets.icJobTokensTargets.haiku` in `config/cycle.json` stays null. One
+  rehearsal unit is not a median; the target is set from the weekly
+  scorecards once haiku units accumulate (fleet #139's method).
