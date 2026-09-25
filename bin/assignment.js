@@ -645,7 +645,7 @@ const FLAGS = Object.freeze({
   frontier: FRONTIER_FLAGS,
   proof: [...FRONTIER_FLAGS, 'issue', 'reservations'],
   assign: [
-    ...FRONTIER_FLAGS, 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'permissions', 'risk', 'token-budget',
+    ...FRONTIER_FLAGS, 'issue', 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'permissions', 'risk', 'token-budget',
     'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof', 'reservations', 'premises-rechecked',
   ],
   validate: ['manifest', 'issue', 'base-sha'],
@@ -736,7 +736,10 @@ function cli(argv) {
     for (const key of ['test-plan', 'ci-gates', 'context-headings', 'adr-paths']) { if (args[key] === 'true') throw new WorkStateError('USAGE', `--${key} needs a comma-separated value`); }
     const testPlan = given('test-plan') ? list('test-plan') : Object.entries(config.checks || {}).map(([name, command]) => `${name}: ${command}`);
     const ciGates = given('ci-gates') ? list('ci-gates') : [...(config.ciGates || [])];
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, permissions: args.permissions, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, premisesRechecked: args['premises-rechecked'], now: args.now });
+    // Spec #94: --issue reserves that frontier issue (a rehearsal's chosen ticket), not the head.
+    const chosen = args.issue ? frontier.eligible.find((entry) => entry.number === Number(args.issue)) : frontier.eligible[0];
+    if (!chosen) throw new WorkStateError('NO_FRONTIER', `issue #${args.issue} is not on the frontier`, { excluded: frontier.excluded });
+    return reserveAssignment({ root: args.root, issue: chosen, issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, permissions: args.permissions, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, premisesRechecked: args['premises-rechecked'], now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });

@@ -582,6 +582,22 @@ test('assign CLI takes --permissions and the written manifest pins it', () => {
   assert.equal(written.permissions, 'allowlist');
 });
 
+// Spec #94 (#163/#164): a rehearsal reserves one chosen ticket, not the frontier head.
+test('assign --issue reserves that frontier issue, and refuses one that is not eligible', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', readyLabel: 'ready-for-agent', maxIcs: 3, defaultBranch: 'integration' }));
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(91), issue(92), issue(93, { labels: [] })]));
+  const common = ['assign', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--base-sha', 'f'.repeat(40)];
+  assert.equal(cli([...common, '--issue', '92']).manifest.issue.number, 92, 'the named issue is reserved, not the head (#91)');
+  assert.throws(
+    () => cli([...common, '--issue', '93']),
+    (error) => error.code === 'NO_FRONTIER' && /#93/.test(error.message),
+    'an issue off the frontier is refused by number',
+  );
+});
+
 // --- fleet#4: assignment.js adopts the parseArgs flag schema -----------------
 // Before this, `cli()` used its own permissive parser: a typo'd flag fell into a
 // bucket nothing read and the command answered as if it had not been given.
