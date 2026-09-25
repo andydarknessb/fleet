@@ -3,7 +3,7 @@
   "profile": "allowlist",
   "models": ["haiku"],
   "defaultMode": "acceptEdits",
-  "verifiedCliVersion": "2.1.282",
+  "verifiedCliVersion": null,
   "additionalDirectories": [
     { "dir": "<fleet>", "for": "ic.md steps 1, 4, 5 and 6: the tenant file, CONTEXT.md, the assignment manifest and the fleet bin commands" },
     { "dir": "<repo>", "for": "ic.md steps 1 and 3: the IC reads the issue's paths in the main checkout, and a prefix rule such as Bash(ls:*) does not cover a path outside the allowed directories (fleet #171, rehearsal wait 2)" }
