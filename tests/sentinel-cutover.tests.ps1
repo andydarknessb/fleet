@@ -55,7 +55,7 @@ try {
   foreach ($dir in 'bin','agents','tenants','state','state/heartbeats','state/sentinel','state/sentinel/shadow','state/sentinel/applied','state/skip','state/watchdog','state/escalations','state/events','state/sessions','state/flags','profile/.claude/jobs/job-s','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','cutover-sentinel.ps1','retire.ps1','launch.ps1','parity.js','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','cutover-sentinel.ps1','retire.ps1','launch.ps1','identity.js','parity.js','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   Write-Utf8 "$testRoot\agents\sentinel.md" "---`nname: sentinel`nmodel: sonnet`neffort: low`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","tenant":null,"parent":"cory","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"d"},{"name":"sentinel","role":"sentinel","tenant":null,"parent":"dispatcher","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"You are the Sentinel."}]}')

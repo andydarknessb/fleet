@@ -221,10 +221,31 @@ if ($Role -eq 'ic') {
   }
 }
 
+# --- fleet identity (#153, ADR 0015): every session acts on GitHub as the fleet's
+# --- own login. bin/identity.js reads the secret gh config directory; its env keys
+# --- (GH_CONFIG_DIR plus git's credential reset) go into the settings env block below,
+# --- which every Bash call, hook and child binary inherits. No token lands in state/.
+# --- Once any tenant names a fleetIdentity distinct from its ownerLogin the directory
+# --- is required: missing or naming another login refuses the launch (exit 3, one
+# --- high page per code), writes no settings and no session, never falls back to
+# --- Cory's keyring login. A dry run reports the refusal but never pages.
+$identityPlan = Get-FleetIdentityPlan
+if ($identityPlan.refusal) {
+  $identityReason = "$($identityPlan.refusal.code): $($identityPlan.refusal.message)"
+  $released = $false; $paged = $false
+  if (-not $DryRun) {
+    if ($Manifest) { try { Invalidate-Manifest "launch refused: $identityReason"; $released = $true } catch {} }
+    $paged = Send-FleetIdentityPageOnce -Plan $identityPlan -Source "launch.ps1 ($Name)"
+  }
+  Write-Output (@{ launched = $false; code = "$($identityPlan.refusal.code)"; reason = $identityReason; reservationReleased = $released; paged = $paged; dryRun = [bool]$DryRun } | ConvertTo-Json -Compress); exit 3
+}
+if (-not $DryRun) { [void](Send-FleetIdentityPageOnce -Plan $identityPlan -Source 'launch.ps1') }
+
 # --- per-session settings: fleet-settings + env identity ---
 $settings = Read-Json "$FleetHome\fleet-settings.json"
 $envBlock = [ordered]@{ FLEET_HOME = $FleetHome; FLEET_NAME = $Name; FLEET_ROLE = $Role; FLEET_TENANT = "$Tenant"; FLEET_PARENT = $Parent }
 if ($Issue) { $envBlock.FLEET_ISSUE = "$Issue" }
+if ($identityPlan.env) { foreach ($identityVar in $identityPlan.env.PSObject.Properties) { $envBlock[$identityVar.Name] = "$($identityVar.Value)" } }
 if ($Manifest) {
   $envBlock.FLEET_ASSIGNMENT_MANIFEST = (Resolve-Path -LiteralPath $Manifest).Path
   $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId

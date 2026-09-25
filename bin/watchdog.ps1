@@ -37,6 +37,14 @@ try {
   # Entry point: never inherit a caller's Stop preference - PS 5.1 wraps native stderr
   # in ErrorRecords, and under Stop a mere gh/git stderr line would terminate the run.
   $ErrorActionPreference = 'Continue'
+  # Spec fleet #93 / #153 (ADR 0015): the Watchdog pushes `live` and opens
+  # branch-diverged pull requests, so its process (and every gh/git/node child it
+  # starts) acts as the fleet's own login, exactly as a launched session does. A
+  # required identity that is missing or wrong pages once at high priority and the
+  # tick goes on supervising under the task's own login: supervision is not
+  # suspended for an identity fault, and the page makes it loud, not silent.
+  $identityPlan = Set-FleetIdentityProcessEnv
+  if (-not $Verify) { [void](Send-FleetIdentityPageOnce -Plan $identityPlan -Source 'watchdog.ps1' -NoToast:$NoToast) }
   $now = (Get-Date).ToUniversalTime()
   $staleMinutes = 45        # three missed 15-min Sentinel crons; the dispatcher uses the same threshold
   $watchdogConfig = $null; try { $watchdogConfig = (Read-Json "$FleetHome\config\cycle.json").watchdog } catch {}

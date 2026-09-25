@@ -392,3 +392,43 @@ function Send-FleetToast {
     return $true
   } catch { return $false }
 }
+
+# Spec fleet #93 / #153 (ADR 0015): the fleet acts on GitHub as its own login.
+# bin/identity.js is the one reader of the secret gh config directory; these wrap
+# it for the PowerShell doors (launch.ps1, watchdog.ps1). A plan that cannot be
+# read at all is a refusal (FLEET_IDENTITY_UNREADABLE), never a silent keyring login.
+function Get-FleetIdentityPlan {
+  $out = $null
+  try { $out = & (Get-NodeExe) "$FleetHome\bin\identity.js" plan --root $FleetHome 2>&1 | Out-String } catch { $out = "$($_.Exception.Message)" }
+  $plan = ConvertFrom-LastJsonLine $out
+  if (-not $plan -or -not $plan.PSObject.Properties['required']) {
+    $why = ("$out" -replace '\s+', ' ').Trim(); if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
+    return [pscustomobject]@{ required = $true; present = $false; login = $null; env = [pscustomobject]@{}; refusal = [pscustomobject]@{ code = 'FLEET_IDENTITY_UNREADABLE'; message = "bin\identity.js plan did not answer: $why" } }
+  }
+  return $plan
+}
+# One high-priority page per distinct refusal code; cleared once a plan has no
+# refusal, so the next failure pages again. state/identity/paged.json is the marker.
+function Send-FleetIdentityPageOnce {
+  param($Plan, [string]$Source, [switch]$NoToast)
+  if ($env:FLEET_NO_TOAST -eq '1') { $NoToast = [switch]::Present }   # tests: the audit line and Pushover, no desktop toast
+  $markerDir = "$FleetHome\state\identity"
+  $marker = "$markerDir\paged.json"
+  if (-not $Plan.refusal) { Remove-Item -LiteralPath $marker -ErrorAction SilentlyContinue; return $false }
+  $prior = $null; try { $prior = Read-Json $marker } catch {}
+  if ($prior -and "$($prior.code)" -eq "$($Plan.refusal.code)") { return $false }
+  [IO.Directory]::CreateDirectory($markerDir) | Out-Null
+  Write-Json $marker ([pscustomobject]@{ code = "$($Plan.refusal.code)"; at = (Now-Iso); source = $Source })
+  try { Send-FleetPage -Kind 'fleet-identity' -Title "Fleet identity: $($Plan.refusal.code)" -Body "$Source refused: $($Plan.refusal.message)" -Priority high -NoToast:$NoToast | Out-Null } catch {}
+  return $true
+}
+# The Watchdog's own process (and every git/gh/node child it starts) carries the
+# same environment a launched session does. Returns the plan so the caller can
+# report a refusal; with a refusal nothing is set (the caller decides).
+function Set-FleetIdentityProcessEnv {
+  $plan = Get-FleetIdentityPlan
+  if (-not $plan.refusal -and $plan.env) {
+    foreach ($p in $plan.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, "$($p.Value)", 'Process') }
+  }
+  return $plan
+}
