@@ -211,7 +211,11 @@ if [[ -n "${GH_CONFIG_DIR:-}" || -n "${FLEET_NAME:-}" ]]; then
   exit 1
 fi
 command -v gh >/dev/null 2>&1 || { printf 'gh is not on PATH\n'; exit 1; }
-CORY_LOGIN="$(as_cory gh api user --jq .login 2>/dev/null || true)"
+# clean VALUE: strip carriage returns and surrounding whitespace. Some Windows
+# terminals send CR with Enter, so `read` returns "login\r" (seen 2026-09-25:
+# the own-login guard missed and users/<login> answered 404).
+clean() { local v="${1//$'\r'/}"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
+CORY_LOGIN="$(clean "$(as_cory gh api user --jq .login 2>/dev/null || true)")"
 [[ -n "$CORY_LOGIN" ]] || { printf 'gh in this shell is not logged in (run gh auth status)\n'; exit 1; }
 
 banner "Fleet identity: the fleet's own GitHub login (fleet #152, ADR 0015)"
@@ -226,7 +230,8 @@ step "Turn on two-factor authentication for it (Settings, Password and authentic
 open_url "https://github.com/signup"
 pause "Press Enter once the account exists and you are signed in to it in the private window"
 while :; do
-  ask FLEET_LOGIN "The machine user's login:"
+  ask FLEET_LOGIN "The NEW machine user's login (not ${CORY_LOGIN}):"
+  FLEET_LOGIN="$(clean "$FLEET_LOGIN")"
   if [[ -z "$FLEET_LOGIN" ]]; then warn "a login is required"; continue; fi
   if [[ "${FLEET_LOGIN,,}" == "${CORY_LOGIN,,}" ]]; then warn "that is your own login; the whole point is a second one"; continue; fi
   if as_cory gh api "users/$FLEET_LOGIN" --jq .login >/dev/null 2>&1; then ok "github.com/$FLEET_LOGIN exists"; break; fi
@@ -246,6 +251,7 @@ open_url "https://github.com/settings/tokens/new?description=fleet-identity&scop
 FLEET_TOKEN=""
 while [[ -z "$FLEET_TOKEN" ]]; do
   printf '  %sPaste the token (hidden):%s ' "$BOLD" "$RESET"; read -rs FLEET_TOKEN || true; printf '\n'
+  FLEET_TOKEN="$(clean "$FLEET_TOKEN")"
   if [[ "$FLEET_TOKEN" == github_pat_* ]]; then warn "that is a fine-grained token; mint a classic one (tokens/new)"; FLEET_TOKEN=""; continue; fi
   if [[ "$FLEET_TOKEN" != ghp_* ]]; then warn "that does not look like a classic token"; FLEET_TOKEN=""; fi
 done
