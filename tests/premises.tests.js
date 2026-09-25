@@ -112,3 +112,120 @@ test('#143: a changed Premises section invalidates the manifest at launch like a
   assert.equal(validation.valid, false);
   assert.ok(validation.mismatches.some((mismatch) => mismatch.field === 'issue.bodyHash'));
 });
+
+// ------------------------------------------------ #144 assign-time check ----
+
+const { execFileSync } = require('node:child_process');
+const workState = require('../bin/work-state');
+const { checkPremises } = require('../bin/premises');
+const { selectTriageFrontier, DEFAULT_CONFIG } = require('../bin/triage');
+
+function git(repo, ...args) {
+  return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true }).trim();
+}
+
+// A tenant checkout with two commits: `first` writes src/a.js and src/lib/b.js,
+// `head` changes only src/lib/b.js. `head` is the fetched base.
+function tenantRepo() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-premises-repo-'));
+  git(repo, 'init', '-q');
+  git(repo, 'config', 'user.email', 'test@example.com');
+  git(repo, 'config', 'user.name', 'test');
+  git(repo, 'config', 'commit.gpgsign', 'false');
+  fs.mkdirSync(path.join(repo, 'src', 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'src', 'a.js'), 'module.exports = 1;\n');
+  fs.writeFileSync(path.join(repo, 'src', 'lib', 'b.js'), 'module.exports = 2;\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'first');
+  const first = git(repo, 'rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'src', 'lib', 'b.js'), 'module.exports = 3;\n');
+  git(repo, 'commit', '-q', '-am', 'second');
+  return { repo, first, head: git(repo, 'rev-parse', 'HEAD') };
+}
+
+function assignAt(root, repo, head, premiseLines, extra = {}) {
+  return reserveAssignment({
+    root, issue: issue(90, bodyWith(premiseLines)), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    repoPath: repo, base: { remote: 'origin', ref: 'integration', sha: head }, now: '2026-09-24T00:00:00.000Z', ...extra,
+  });
+}
+
+test('#144: checkPremises diffs each premise sha against the base with --name-only and matches files and directories', () => {
+  const { repo, first, head } = tenantRepo();
+  const premises = parsePremises(bodyWith([`src/a.js:1: exports 1 @${first}`, `src/lib: holds b @${first.slice(0, 7)}`, `src/lib/b.js: exports 2 @${first}`, `src/lib/b.js: exports 3 @${head}`]));
+  const check = checkPremises({ premises, repoPath: repo, baseSha: head });
+  assert.equal(check.head, head);
+  assert.deepEqual(check.changed.map((entry) => entry.line), [`src/lib: holds b @${first.slice(0, 7)}`, `src/lib/b.js: exports 2 @${first}`]);
+  assert.deepEqual(check.changed[1].changedFiles, ['src/lib/b.js']);
+});
+
+test('#144: nothing changed under any premise path: assignment proceeds and pins the check', () => {
+  const root = rootDir();
+  const { repo, first, head } = tenantRepo();
+  const reserved = assignAt(root, repo, head, [`src/a.js: exports 1 @${first}`]);
+  assert.deepEqual(reserved.manifest.premiseCheck, { head, changed: [] });
+  assert.deepEqual(getRecord({ root, id: 'endzone:issue-90' }).assignment.premiseCheck, { head, changed: [] });
+});
+
+test('#144: a changed premise path refuses PREMISE_PATH_CHANGED naming each changed premise, and writes nothing', () => {
+  const root = rootDir();
+  const { repo, first, head } = tenantRepo();
+  const line = `src/lib/b.js: exports 2 @${first}`;
+  assert.throws(() => assignAt(root, repo, head, [`src/a.js: exports 1 @${first}`, line]), (error) => {
+    assert.equal(error.code, 'PREMISE_PATH_CHANGED');
+    assert.deepEqual(error.changed.map((entry) => ({ path: entry.path, claim: entry.claim, sha: entry.sha, head: entry.head, line: entry.line })), [{ path: 'src/lib/b.js', claim: 'exports 2', sha: first, head, line }]);
+    assert.match(error.message, /--premises-rechecked/);
+    return true;
+  });
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+  const manifests = path.join(root, 'state', 'manifests');
+  assert.equal(fs.existsSync(manifests) ? fs.readdirSync(manifests).length : 0, 0);
+});
+
+test('#144: re-run with the attestation at the manifest base succeeds and records which premises were re-checked', () => {
+  const root = rootDir();
+  const { repo, first, head } = tenantRepo();
+  const line = `src/lib/b.js: exports 2 @${first}`;
+  const reserved = assignAt(root, repo, head, [`src/a.js: exports 1 @${first}`, line], { premisesRechecked: head });
+  assert.deepEqual(reserved.manifest.premiseCheck.changed.map((entry) => entry.line), [line]);
+  assert.deepEqual(reserved.manifest.premiseCheck.attestation, { head, rechecked: [line] });
+  assert.deepEqual(getRecord({ root, id: 'endzone:issue-90' }).assignment.premiseCheck.attestation, { head, rechecked: [line] });
+});
+
+test('#144: an attestation at any other head than the manifest base is refused', () => {
+  const root = rootDir();
+  const { repo, first, head } = tenantRepo();
+  assert.throws(() => assignAt(root, repo, head, [`src/lib/b.js: exports 2 @${first}`], { premisesRechecked: first }), (error) => error.code === 'PREMISE_ATTESTATION_STALE' && error.base === head);
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+});
+
+test('#144: a premise sha the tenant checkout never saw refuses with its own code', () => {
+  const root = rootDir();
+  const { repo, head } = tenantRepo();
+  assert.throws(() => assignAt(root, repo, head, ['src/a.js: exports 1 @deadbeefdeadbeef']), (error) => error.code === 'PREMISE_SHA_UNKNOWN' && /deadbeefdeadbeef/.test(error.message));
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+});
+
+test('#144: premises to check with no tenant checkout refuse instead of passing unchecked', () => {
+  const root = rootDir();
+  assert.throws(() => assignAt(root, undefined, 'b'.repeat(40), [`src/a.js: exports 1 @${SHA}`]), (error) => error.code === 'PREMISE_CHECK_UNAVAILABLE');
+});
+
+test('#144: escalating a stale premise puts reason stale-premise and the premise line on the decision-needed wake, and the Principal frontier carries both', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-91';
+  const line = 'src/lib/b.js: exports 2 @0123456';
+  workState.createRecord({ root, id, tenant: 'endzone', issue: 91, state: 'assigned', idempotencyKey: 'create-91', now: '2026-09-24T00:00:00.000Z' });
+  assert.throws(() => workState.transitionRecord({ root, id, to: 'escalated', expectedRevision: 1, evidence: 'moved', reason: 'drift', premise: line, idempotencyKey: 'esc-x' }), (error) => error.code === 'USAGE');
+  assert.throws(() => workState.transitionRecord({ root, id, to: 'escalated', expectedRevision: 1, evidence: 'moved', reason: 'stale-premise', idempotencyKey: 'esc-y' }), (error) => error.code === 'USAGE' && /--premise/.test(error.message));
+  workState.transitionRecord({ root, id, to: 'escalated', expectedRevision: 1, evidence: 'stale premise: b.js now exports 3', reason: 'stale-premise', premise: line, idempotencyKey: 'esc-91', now: '2026-09-24T00:01:00.000Z' });
+  const outbox = fs.readFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').trim().split('\n').map((raw) => JSON.parse(raw));
+  const wake = outbox.find((entry) => entry.recordId === id);
+  assert.equal(wake.wake, 'decision-needed');
+  assert.equal(wake.reason, 'stale-premise');
+  assert.equal(wake.premise, line);
+  const frontier = selectTriageFrontier({ issues: [], ownerLogin: 'cory', config: DEFAULT_CONFIG, outbox, tenant: 'endzone', now: '2026-09-24T01:00:00.000Z' });
+  const escalation = frontier.eligible.find((entry) => entry.kind === 'escalation');
+  assert.equal(escalation.escalationReason, 'stale-premise');
+  assert.equal(escalation.premise, line);
+});

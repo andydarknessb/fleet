@@ -18,7 +18,7 @@ const {
   reserveRecord,
   transitionRecord,
 } = require('./work-state');
-const { readPremises } = require('./premises');
+const { PremisesError, checkPremises, readPremises } = require('./premises');
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
@@ -414,7 +414,7 @@ function icModel(model) {
   return value;
 }
 
-function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, now, workRecordId, workRecordRevision = 1 } = {}) {
+function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, premiseCheck = null, now, workRecordId, workRecordRevision = 1 } = {}) {
   model = icModel(model);
   const normalized = normalizeIssue(issue);
   if (normalized.commentsTruncated) throw new WorkStateError('INCOMPLETE_ISSUE_CRITERIA', `issue #${normalized.number} has more comments than the assignment query can pin`);
@@ -446,6 +446,7 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
     independenceProof: independenceProof || null,
     // Spec fleet #92: null while the ticket has no section (the backfill window), [] for `none`.
     premises: pinnedPremises(normalized.premises),
+    premiseCheck,
   };
 }
 
@@ -465,7 +466,34 @@ function explicitReservations(value) {
   return Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((parsed[field] || []).map(String))].sort()]));
 }
 
-function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, now, actor = 'assignment-planner', runner } = {}) {
+// Spec fleet #92 (#144): the lead re-reads only the premises whose paths moved.
+// A changed path refuses PREMISE_PATH_CHANGED and writes nothing; the lead
+// re-reads those lines and re-runs with --premises-rechecked <head> (the base it
+// re-checked at, which must be this manifest's base), or escalates a premise that
+// is now false with reason stale-premise. No section (the backfill window) is
+// not checked; `none` checks nothing and pins an empty check.
+function assignPremiseCheck({ issue, repoPath, base, premisesRechecked, runner }) {
+  if (!Array.isArray(issue.premises)) return null;
+  let check;
+  try { check = checkPremises({ premises: issue.premises, repoPath, baseSha: base.sha, ...(runner ? { runner } : {}) }); } catch (error) {
+    if (error instanceof PremisesError) throw new WorkStateError(error.code, `issue #${issue.number}: ${error.message}`, { issue: issue.number, sha: error.sha });
+    throw error;
+  }
+  if (premisesRechecked !== undefined && premisesRechecked !== null) {
+    const attested = String(premisesRechecked).trim().toLowerCase();
+    if (!/^[0-9a-f]{7,40}$/.test(attested) || !String(base.sha).toLowerCase().startsWith(attested)) {
+      throw new WorkStateError('PREMISE_ATTESTATION_STALE', `--premises-rechecked ${premisesRechecked} is not this assignment's base ${base.sha}; re-read the changed premises at ${base.sha} and attest that head`, { issue: issue.number, base: base.sha, attested: premisesRechecked });
+    }
+    return { ...check, attestation: { head: base.sha, rechecked: check.changed.map((entry) => entry.line) } };
+  }
+  if (check.changed.length) {
+    const list = check.changed.map((entry) => `"${entry.line}" (${entry.changedFiles.join(', ')} changed since ${entry.sha})`).join('; ');
+    throw new WorkStateError('PREMISE_PATH_CHANGED', `issue #${issue.number}: ${check.changed.length} premise path(s) changed between the premise sha and the base ${base.sha}: ${list}. Re-read each at ${base.sha}; if it still holds, re-run assign with --premises-rechecked ${base.sha}; if it is now false, escalate the Work record with --reason stale-premise --premise "<line>"`, { issue: issue.number, base: base.sha, changed: check.changed });
+  }
+  return check;
+}
+
+function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, premisesRechecked, now, actor = 'assignment-planner', runner } = {}) {
   const proofRecords = hydrateActiveReservations(active, issues);
   const explicit = explicitReservations(reservations);
   const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, now });
@@ -491,16 +519,17 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
     throw new WorkStateError('PARTIAL_RESERVATIONS', `issue #${normalized.number} lists ${normalized.unrecognizedPaths.map((item) => `\`${item}\``).join(', ')} in an allowlist criterion that the reservation builder could not place, so the derived set is short; pass --reservations '{"components":[...],"testResources":[...]}' naming the whole set`, { issue: normalized.number, criteriaHash: normalized.criteriaHash, reservations: normalized.reservations, unrecognizedPaths: normalized.unrecognizedPaths });
   }
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
+  const premiseCheck = assignPremiseCheck({ issue: normalized, repoPath, base: resolvedBase, premisesRechecked, runner });
   const workRecordId = `${tenant}:issue-${normalized.number}`;
   const baseline = reservationBaseline({ root, id: workRecordId });
   const activeAssignments = proofRecords.filter((record) => record.manifestPath && record.state !== 'retired');
   const expectedProof = independenceProof([...activeAssignments, normalized]);
   if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, proof))) throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires a verified independent machine-readable proof');
-  const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, now, workRecordId, workRecordRevision: baseline.revision });
+  const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, premiseCheck, now, workRecordId, workRecordRevision: baseline.revision });
   const manifestPath = writeManifest(root, manifest);
   try {
     const reserved = reserveRecord({
-      root, id: workRecordId, tenant, issue: normalized.number, manifestPath, assignment: { manifestId: manifest.id, branch: manifest.branch, baseSha: manifest.base.sha, independenceProof: proof || null, premises: manifest.premises },
+      root, id: workRecordId, tenant, issue: normalized.number, manifestPath, assignment: { manifestId: manifest.id, branch: manifest.branch, baseSha: manifest.base.sha, independenceProof: proof || null, premises: manifest.premises, premiseCheck: manifest.premiseCheck },
       github: { issueNumber: normalized.number, issueUrl: normalized.url, bodyHash: normalized.bodyHash, criteriaHash: normalized.criteriaHash, commentCount: normalized.comments.length }, reservations: normalized.reservations, proofRecords: activeAssignments, independenceProof: proof,
       evidence: { github: `gh issue view ${normalized.number}`, manifest: path.relative(path.resolve(root), manifestPath) },
       idempotencyKey: `assignment-reserved:${manifest.id}`, actor, now,
@@ -598,7 +627,7 @@ const FLAGS = Object.freeze({
   proof: [...FRONTIER_FLAGS, 'issue', 'reservations'],
   assign: [
     ...FRONTIER_FLAGS, 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'risk', 'token-budget',
-    'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof', 'reservations',
+    'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof', 'reservations', 'premises-rechecked',
   ],
   validate: ['manifest', 'issue', 'base-sha'],
   launch: ['root', 'manifest', 'work-record-id', 'launch-script', 'repo-path', 'github-repo', 'dry-run'],
@@ -682,7 +711,7 @@ function cli(argv) {
     for (const key of ['test-plan', 'ci-gates', 'context-headings', 'adr-paths']) { if (args[key] === 'true') throw new WorkStateError('USAGE', `--${key} needs a comma-separated value`); }
     const testPlan = given('test-plan') ? list('test-plan') : Object.entries(config.checks || {}).map(([name, command]) => `${name}: ${command}`);
     const ciGates = given('ci-gates') ? list('ci-gates') : [...(config.ciGates || [])];
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, now: args.now });
+    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, premisesRechecked: args['premises-rechecked'], now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });

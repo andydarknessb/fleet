@@ -404,7 +404,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, readyLabel = 'ready-for
     // the issue is closed or absent) so the Principal copies the hash into
     // `record --kind proposed` instead of hashing the body by hand and mismatching.
     const issue = issueByNumber.get(Number(parsed.issue)) || null;
-    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
+    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
   }
 
   // Spec fleet #92 (#143): the backfill census. Open tickets carrying the ready

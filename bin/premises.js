@@ -69,4 +69,45 @@ function readPremises(body) {
   }
 }
 
-module.exports = { PremisesError, parsePremises, readPremises };
+function gitRead(runner, repoPath, args) {
+  return String(runner('git', ['-C', repoPath, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 })).trim();
+}
+
+// The file or directory a premise names, without a line suffix (`a.js:53-60`).
+function premisePathOf(premise) {
+  return String(premise.path).replace(/:\d+(?:-\d+)?$/, '').replace(/\/+$/, '');
+}
+
+// #144: for each premise, did any file under its path change between the sha it
+// was read at and the fetched base? The sha must be a commit in the base's own
+// history; one the checkout never saw was never a real reading of this code.
+function checkPremises({ premises, repoPath, baseSha, runner = execFileSync } = {}) {
+  if (!Array.isArray(premises) || !premises.length) return { head: baseSha, changed: [] };
+  if (!repoPath) throw new PremisesError('PREMISE_CHECK_UNAVAILABLE', 'the ticket states premises but no tenant checkout (--repo-path) was given to check them against');
+  const diffBySha = new Map();
+  const changedFilesSince = (sha) => {
+    if (diffBySha.has(sha)) return diffBySha.get(sha);
+    let full;
+    try { full = gitRead(runner, repoPath, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]); } catch { full = ''; }
+    if (!/^[0-9a-f]{40}$/i.test(full)) throw new PremisesError('PREMISE_SHA_UNKNOWN', `premise sha ${sha} is not a commit in the tenant checkout ${repoPath}; the premise was never read at real code`, { sha });
+    try { gitRead(runner, repoPath, ['merge-base', '--is-ancestor', full, baseSha]); } catch (error) {
+      if (error.status === 1) throw new PremisesError('PREMISE_SHA_UNKNOWN', `premise sha ${sha} is not in the history of the base ${baseSha}; the premise was never read at this branch's code`, { sha });
+      throw new PremisesError('PREMISE_CHECK_FAILED', `git merge-base failed for premise sha ${sha}: ${String(error.stderr || error.message || error).trim()}`, { sha });
+    }
+    let files;
+    try { files = gitRead(runner, repoPath, ['diff', '--name-only', full, baseSha]).split(/\r?\n/).map((file) => file.trim()).filter(Boolean); } catch (error) {
+      throw new PremisesError('PREMISE_CHECK_FAILED', `git diff --name-only ${full} ${baseSha} failed: ${String(error.stderr || error.message || error).trim()}`, { sha });
+    }
+    diffBySha.set(sha, files);
+    return files;
+  };
+  const changed = [];
+  for (const premise of premises) {
+    const target = premisePathOf(premise);
+    const files = changedFilesSince(premise.sha).filter((file) => file === target || file.startsWith(`${target}/`));
+    if (files.length) changed.push({ path: premise.path, claim: premise.claim, sha: premise.sha, line: premise.line, head: baseSha, changedFiles: files });
+  }
+  return { head: baseSha, changed };
+}
+
+module.exports = { PremisesError, checkPremises, parsePremises, readPremises };

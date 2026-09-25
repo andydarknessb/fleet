@@ -798,6 +798,8 @@ function sendBackCount(record) {
   return Object.values(record?.idempotency || {}).filter((entry) => entry && (entry.type === 'transition:review->revision' || entry.sendBack === true)).length;
 }
 
+const ESCALATION_REASONS = Object.freeze(['stale-premise']);
+
 function validateTransition(record, to, options) {
   if (!STATES.includes(to)) throw new WorkStateError('INVALID_STATE', `unknown state '${to}'`);
   const allowed = TRANSITIONS[record.state] || [];
@@ -823,6 +825,13 @@ function validateTransition(record, to, options) {
     }
   }
   if (to === 'escalated' && !options.evidence) throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'escalated requires decision evidence');
+  // Spec fleet #92 (#144): an escalation may name its reason; the one reason so far
+  // is a stale premise, and it carries the premise line verbatim to the Principal.
+  if (options.reason !== undefined || options.premise !== undefined) {
+    if (to !== 'escalated') throw new WorkStateError('USAGE', '--reason and --premise belong to an escalation (--to escalated)');
+    if (!ESCALATION_REASONS.includes(options.reason)) throw new WorkStateError('USAGE', `--reason must be one of ${ESCALATION_REASONS.join(', ')}`);
+    if (!options.premise || !String(options.premise).trim()) throw new WorkStateError('USAGE', '--reason stale-premise needs --premise "<the premise line verbatim>"');
+  }
   if (fromEscalated && (!options.evidence || !record.prior_state)) {
     throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'escalation resolution requires prior_state and decision evidence');
   }
@@ -861,7 +870,7 @@ function transitionRecord(options = {}) {
     // PR-less record used to reach every ledger but that one. A replay repairs
     // a missing line (a crash between commit and append) and never duplicates.
     const pageDecision = (result) => (DECISION_STATES.includes(to)
-      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, now: options.now }) }
+      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
       : result);
     const replay = replayIfKnown(record, key);
     if (replay) return pageDecision(replay);
@@ -909,6 +918,7 @@ function transitionRecord(options = {}) {
       evidence: options.evidence,
       changes: {
         from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null,
+        ...(options.reason ? { reason: options.reason, premise: String(options.premise) } : {}),
         ...(to === 'revision' ? { sendBack, ...(options.ruling ? { ruling: String(options.ruling) } : {}) } : {}),
       },
     });
@@ -1057,14 +1067,14 @@ function outboxHasWake(root, recordId, idempotencyKey) {
 // was written, which is the caller's cue to launch the page. `actor` is the
 // writer's provenance (fleet#141): the watchdog's frontier wake does not wake a
 // lead for a decision-needed line that lead wrote itself.
-function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, now } = {}) {
+function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, now } = {}) {
   if (outboxHasWake(root, recordId, idempotencyKey)) return false;
   const file = wakeOutboxFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
-  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), evidence: text };
+  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), evidence: text };
   fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
   return true;
 }
@@ -1441,7 +1451,7 @@ const FLAGS = Object.freeze({
   reserve: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'manifest', 'reservations', 'assignment', 'independence-proof', 'issue-url', 'body-hash'],
   release: [...COMMON_FLAGS, 'id', 'expected-revision'],
   abandon: [...COMMON_FLAGS, 'id', 'expected-revision', 'reason', 'kill-point'],
-  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'github-evidence', 'no-notifier', 'ruling'],
+  transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'github-evidence', 'no-notifier', 'ruling', 'reason', 'premise'],
   reconcile: ['repo', 'pr-number'],
   observe: [...COMMON_FLAGS, 'id', 'expected-revision', 'pr-number', 'observation', 'changed', 'wake'],
   review: [...COMMON_FLAGS, 'id', 'expected-revision', 'kind', 'head-sha', 'artifact', 'tier', 'triggers', 'prior-artifact'],
@@ -1475,7 +1485,7 @@ function cli(argv) {
     const result = transitionRecord({
       ...common, id: args.id, to: args.to, expectedRevision: Number(args['expected-revision']), killPoint: args['kill-point'],
       prNumber: args['pr-number'] ? Number(args['pr-number']) : undefined, githubRepo: args.repo,
-      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'], ruling: args.ruling,
+      githubState: args['github-state'], githubMergedAt: args['merged-at'], githubEvidence: args['github-evidence'], ruling: args.ruling, reason: args.reason, premise: args.premise,
     });
     // Ticket 07: a decision event launches its notifier from the door that wrote it
     // (the watcher does the same for its own). `paged` is true when this call
