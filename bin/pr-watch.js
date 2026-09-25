@@ -415,6 +415,28 @@ function makeFetchers(repo, executable = 'gh') {
   };
 }
 
+// fleet #136: the watchdog samples health.json every 15 minutes while the watcher ticks
+// every 5, so the watcher counts its own consecutive failed ticks. A tick carries the
+// previous file's count forward (overall and per tenant) and a healthy tick resets it.
+// Both shapes are read: the aggregate { tenants: { <name>: health } } and a --tenant
+// run's single { tenant, ... }. A file without a count that failed counts as one.
+function readPreviousHealth(base) {
+  try { return JSON.parse(fs.readFileSync(path.join(base, 'state', 'watch', 'health.json'), 'utf8')); } catch { return null; }
+}
+function priorFailureStreak(entry) {
+  if (!entry || entry.ok !== false) return 0;
+  const count = Number(entry.consecutiveFailures);
+  return Number.isFinite(count) && count > 0 ? count : 1;
+}
+function previousTenantHealth(previous, name) {
+  if (!previous) return null;
+  if (previous.tenants && typeof previous.tenants === 'object') return previous.tenants[name] || null;
+  return previous.tenant === name ? previous : null;
+}
+function failureStreak(ok, previousEntry) {
+  return ok === false ? priorFailureStreak(previousEntry) + 1 : 0;
+}
+
 function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true, notifier = null, healthFile = 'health.json' } = {}) {
   const started = Date.now();
   const base = path.resolve(root || path.resolve(__dirname, '..'));
@@ -433,6 +455,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     if (health.failures > 0) { health.ok = false; if (!health.error) health.error = `${health.failures} record action(s) failed; see actions`; }
     health.durationMs = Date.now() - started;
     if (!dryRun && healthFile) {
+      health.consecutiveFailures = failureStreak(health.ok, previousTenantHealth(readPreviousHealth(base), tenantName));
       fs.mkdirSync(watchDir, { recursive: true });
       fs.writeFileSync(path.join(watchDir, healthFile), `${JSON.stringify(health, null, 2)}\n`, 'utf8');
     }
@@ -593,6 +616,7 @@ function runWatchCommand(args) {
   // projection runs once, after all of them (review F3: it must run last);
   // health.json carries every tenant, not whichever ticked last.
   const started = Date.now();
+  const previous = readPreviousHealth(base);
   const tenants = {};
   for (const name of fs.readdirSync(tenantDir).filter((f) => f.endsWith('.json')).map((f) => path.basename(f, '.json')).sort()) {
     try {
@@ -602,7 +626,9 @@ function runWatchCommand(args) {
     }
   }
   const failed = Object.keys(tenants).filter((name) => tenants[name].ok === false);
+  for (const name of Object.keys(tenants)) tenants[name].consecutiveFailures = failureStreak(tenants[name].ok, previousTenantHealth(previous, name));
   const health = { at: new Date().toISOString(), ok: failed.length === 0, error: failed.length ? `tenant(s) failed: ${failed.join(', ')}` : null, tenants, actions: [], dryRun };
+  health.consecutiveFailures = failureStreak(health.ok, previous);
   if (!dryRun) {
     try { workState.shadowProject({ root: base, actor: 'pr-watch' }); } catch (error) { health.actions.push(`shadow-project-failed: ${error.message}`); }
   }

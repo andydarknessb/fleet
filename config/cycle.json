@@ -61,7 +61,9 @@
     "staleMinutes": 45,
     "healStaleMinutes": 60,
     "healCap": 2,
-    "busyQuietMinutes": 60
+    "busyQuietMinutes": 60,
+    "watchStaleMinutes": 20,
+    "watchFailTicks": 3
   },
   "pages": {
     "priority": {
@@ -72,6 +74,7 @@
       "merge-review-wake": "high",
       "branch-diverged": "high",
       "sync-refused": "high",
+      "watcher-stale": "high",
       "state-escalated": "normal",
       "state-hold": "normal",
       "dated": "normal",

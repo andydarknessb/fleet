@@ -708,6 +708,37 @@ test('one tenant\'s failure does not blind the watcher to the others', () => {
   assert.equal(result.tenants.endzone.records, 1, 'endzone is still watched after the broken tenant');
 });
 
+// fleet #136: the watchdog samples health.json every 15 min but the watcher ticks every 5,
+// so the watcher itself counts its consecutive failed ticks, overall and per tenant, and a
+// healthy tick resets the count. A single-tenant (--tenant) run carries the same count.
+test('health.json counts consecutive failed ticks, per tenant too, and a healthy tick resets it', () => {
+  const root = twoTenantRoot();
+  fs.rmSync(path.join(root, 'tenants', 'endzone.json'));   // its record needs gh; a tenant with no records ticks healthy offline
+  fs.writeFileSync(path.join(root, 'tenants', 'zeta.json'), JSON.stringify({ name: 'zeta', github: 'owner/zeta', branchPrefix: 'fleet/', ciGates: [] }));
+  const tick = () => { cli(['--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true']); return JSON.parse(fs.readFileSync(path.join(root, 'state', 'watch', 'health.json'), 'utf8')); };
+  const healthy = tick();
+  assert.equal(healthy.consecutiveFailures, 0, 'a healthy tick reports no streak');
+  fs.writeFileSync(path.join(root, 'tenants', 'aaa-broken.json'), '{ not json');
+  assert.equal(tick().consecutiveFailures, 1);
+  assert.equal(tick().consecutiveFailures, 2);
+  const third = tick();
+  assert.equal(third.consecutiveFailures, 3, 'three failed ticks in a row read 3');
+  assert.equal(third.tenants['aaa-broken'].consecutiveFailures, 3, 'the failing tenant carries its own streak');
+  assert.equal(third.tenants.zeta.consecutiveFailures, 0, 'a healthy tenant carries none');
+  fs.rmSync(path.join(root, 'tenants', 'aaa-broken.json'));
+  assert.equal(tick().consecutiveFailures, 0, 'a healthy tick resets the streak');
+});
+
+test('a single-tenant run continues the tenant streak from the aggregate health.json', () => {
+  const root = rootDir();
+  seed(root);
+  fs.mkdirSync(path.join(root, 'state', 'watch'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'watch', 'health.json'), JSON.stringify({ ok: false, consecutiveFailures: 2, tenants: { endzone: { ok: false, consecutiveFailures: 2 } } }));
+  const failed = watch(root, fetchers({ failList: true }));
+  assert.equal(failed.consecutiveFailures, 3, 'the endzone streak carries across the shape change');
+  assert.equal(watch(root, fetchers()).consecutiveFailures, 0);
+});
+
 // Spec fleet #93 / #155: the merge names who merged. GitHub's mergedBy rides the
 // reconciled observation onto the Work record (github.mergedBy) and the
 // state-merged event (changes.mergedBy), for a fleet merge and an owner merge alike.
