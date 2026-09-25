@@ -1003,7 +1003,7 @@ try {
       if ($frontier) {
         $twake.counts = $frontier.counts
         foreach ($item in @($frontier.eligible)) { $twake.evidence += "$($item.kind) #$($item.number)" }
-        $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; counts = $frontier.counts; proposeNow = @($frontier.proposeNow); consumedThrough = $frontier.consumedThrough; eligible = @($frontier.eligible | ForEach-Object { [pscustomobject]@{ kind = "$($_.kind)"; number = $_.number; reason = "$($_.reason)" } }); skipped = @($frontier.skipped) }
+        $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; counts = $frontier.counts; proposeNow = @($frontier.proposeNow); consumedThrough = $frontier.consumedThrough; eligible = @($frontier.eligible | ForEach-Object { [pscustomobject]@{ kind = "$($_.kind)"; number = $_.number; reason = "$($_.reason)" } }); skipped = @($frontier.skipped); premises = $frontier.premises }
       } else { $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; error = $twake.frontierError } }
       if (-not $principalLive) { $twake.decision = 'shadow'; $twake.reason = 'state/flags/principal-live absent: frontier recorded, nothing launched'; $triageWakes += [pscustomobject]$twake; continue }
       if ($mode -ne 'live') { $twake.reason = "supervision mode is $mode, not live"; $triageWakes += [pscustomobject]$twake; continue }

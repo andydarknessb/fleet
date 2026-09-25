@@ -50,7 +50,7 @@ try {
   foreach ($dir in 'bin','tenants','config','state','state/heartbeats','state/sentinel','state/skip','state/watchdog','state/work','state/watch','state/flags','repo','mock-bin','profile','profile/.claude/jobs') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','sentinel-check.ps1','watchdog.ps1','assignment.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js','rotation-policy.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','sentinel-check.ps1','watchdog.ps1','assignment.js','premises.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js','rotation-policy.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   # The real rotate.ps1 under another name, for its boundary check alone (-DryRun);
   # bin/rotate.ps1 below is the mock the watchdog's wakes call.
   [IO.File]::Copy("$sourceRoot\bin\rotate.ps1", "$testRoot\bin\rotate-real.ps1")

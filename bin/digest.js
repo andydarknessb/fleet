@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 const { readExclusions, projectExclusions } = require('./exclusions');
-const { readLedger: readTriageLedger, projectTriage, readTriageConfig } = require('./triage');
+const { readLedger: readTriageLedger, projectTriage, readTriageConfig, staleNoticePath } = require('./triage');
 
 const CREATION_TYPES = Object.freeze(['assignment-reserved', 'work-created', 'shadow-projected']);
 const RETIRED_TYPES = Object.freeze(['assignment-released', 'assignment-retired', 'shadow-retired']);
@@ -103,6 +103,25 @@ function readSupplement(base) {
   return supplement;
 }
 
+// Spec fleet #92 (#143): the watchdog writes each tenant's triage frontier, census
+// included, to state/watchdog/triage-frontier.json every tick. A missing or torn
+// file only costs the census line.
+function readPremisesCensus(base) {
+  try {
+    const shadow = JSON.parse(fs.readFileSync(path.join(base, 'state', 'watchdog', 'triage-frontier.json'), 'utf8').replace(/^﻿/, ''));
+    const byTenant = {};
+    for (const entry of shadow.tenants || []) {
+      const census = entry?.premises;
+      if (entry?.tenant && census && Array.isArray(census.missing)) byTenant[entry.tenant] = { readyLabel: census.readyLabel || 'ready-for-agent', ready: Number(census.ready) || 0, missing: census.missing, malformed: Array.isArray(census.malformed) ? census.malformed : [] };
+    }
+    return { at: shadow.at || 'unknown', byTenant };
+  } catch { return null; }
+}
+
+function readStaleNotice(base) {
+  try { return JSON.parse(fs.readFileSync(staleNoticePath(base), 'utf8').replace(/^﻿/, '')); } catch { return null; }
+}
+
 function deliveryLine(entry) {
   if (!entry) return 'notification: not yet sent';
   if (entry.status === 'claimed') return `notification: claimed ${entry.at} (attempt ${entry.attempt}, in flight or stale - the ledger shows no settle)`;
@@ -122,7 +141,13 @@ function renderRow(row) {
   return `${row.tenant} #${row.issue}`;
 }
 
-function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, offset, configs }) {
+function staleHeadline(stale) {
+  if (!stale) return '';
+  const counts = stale.counts;
+  return `; stale-premise restatements (last ${stale.days} days): ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}`;
+}
+
+function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus, staleNotice, offset, configs }) {
   const lastEvent = events[events.length - 1] || null;
   const lines = [];
   lines.push(scope === 'fleet' ? '# Fleet digest' : `# ${scope} status`);
@@ -185,12 +210,29 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageBy
     if (!fold) { lines.push(`- ${tenant}: no triage ledger.`); continue; }
     const ratio = (value) => (value === null || value === undefined ? 'n/a' : `${Math.round(value * 100)}%`);
     const gate = fold.graduation;
-    lines.push(`- ${tenant}: ${fold.pending.length} proposal(s) awaiting approval, ${fold.awaitingFinalize.length} approved awaiting finalizing, ${fold.proposalsTotal} proposed in all; last ${fold.windowDays} days: ${fold.window.decided} decided, ${fold.window.unchanged} approved unchanged (${ratio(fold.window.unchangedRatio)}), ${fold.window.withEdits} with edits, ${fold.window.rejected} rejected; graduation ${gate.met ? 'MET' : 'not met'} (${gate.decided}/${gate.minProposals} decided over ${gate.spanDays}/${gate.minDays} days at ${ratio(gate.unchangedRatio)} of ${ratio(gate.minUnchangedRatio)}); decision-needed wakes consumed through ${fold.consumedThrough || 'never'}.`);
+    lines.push(`- ${tenant}: ${fold.pending.length} proposal(s) awaiting approval, ${fold.awaitingFinalize.length} approved awaiting finalizing, ${fold.proposalsTotal} proposed in all; last ${fold.windowDays} days: ${fold.window.decided} decided, ${fold.window.unchanged} approved unchanged (${ratio(fold.window.unchangedRatio)}), ${fold.window.withEdits} with edits, ${fold.window.rejected} rejected; graduation ${gate.met ? 'MET' : 'not met'} (${gate.decided}/${gate.minProposals} decided over ${gate.spanDays}/${gate.minDays} days at ${ratio(gate.unchangedRatio)} of ${ratio(gate.minUnchangedRatio)}); decision-needed wakes consumed through ${fold.consumedThrough || 'never'}${staleHeadline(fold.stalePremise)}.`);
     for (const row of fold.pending) lines.push(`  - #${row.issue} proposed ${row.since}${row.commentUrl ? ` - ${row.commentUrl}` : ''}`);
     for (const row of fold.awaitingFinalize) lines.push(`  - #${row.issue} ${row.outcome} ${row.since}, not yet finalized`);
     // fleet#49: Principal docs PRs have no lead and no Work record; Cory merges them from here.
     for (const row of fold.docsPrs || []) lines.push(`  - #${row.issue} docs PR ${row.prUrl} opened ${row.since}; the merge is Cory's`);
   }
+  // Spec fleet #92 (#143): the Premises backfill census, from the watchdog's triage
+  // shadow and stamped with its own time (it is a GitHub read, not a ledger fold).
+  for (const tenant of tenantNames) {
+    const census = premisesCensus?.byTenant?.[tenant];
+    if (!census) { lines.push(`- ${tenant}: \`## Premises\` census not recorded yet (state/watchdog/triage-frontier.json).`); continue; }
+    const list = (numbers) => numbers.map((number) => `#${number}`).join(', ');
+    lines.push(`- ${tenant}: ${census.missing.length} of ${census.ready} open ${census.readyLabel} ticket(s) without \`## Premises\`${census.missing.length ? ` (${list(census.missing)})` : ''}${census.malformed.length ? `; malformed: ${list(census.malformed)}` : ''} (census ${premisesCensus.at}).`);
+  }
+  // Spec fleet #92 (#148): every stale-premise restatement of the trailing 30 days,
+  // with Cory's verdict and its age, the evidence the revisit of ADR 0011 rules on.
+  const staleRows = tenantNames.flatMap((tenant) => ((triageByTenant || {})[tenant]?.stalePremise?.rows || []).map((row) => ({ tenant, ...row })));
+  if (staleRows.length) {
+    lines.push('', '| Tenant | Issue | Premise | Proposed at | Verdict | Age |', '| --- | --- | --- | --- | --- | --- |');
+    for (const row of staleRows) lines.push(`| ${row.tenant} | #${row.issue} | \`${String(row.premise).replaceAll('|', '\\|')}\` | ${row.proposedAt} | ${row.verdict} | ${row.ageDays}d |`);
+    lines.push('');
+  }
+  if (staleNotice) lines.push(`Stale-premise revisit notice: armed ${staleNotice.armedAt}, pages ${staleNotice.dueAt}${staleNotice.firedAt ? `, paged ${staleNotice.firedAt}` : ''}.`);
 
   lines.push('', "## Cory's authority", '');
   for (const tenant of tenantNames) {
@@ -239,7 +281,7 @@ function projectDigest(options = {}) {
   for (const tenant of tenantNames) {
     triageByTenant[tenant] = projectTriage({ entries: readTriageLedger(base, tenant), now: options.now, windowDays: triageConfig.windowDays, graduation: triageConfig.graduation });
   }
-  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, offset, configs });
+  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus: readPremisesCensus(base), staleNotice: readStaleNotice(base), offset, configs });
   const output = options.output ? path.resolve(options.output) : path.join(base, 'state', 'status', options.tenant ? `${options.tenant}-status.md` : 'DIGEST.md');
   if (!options.dryRun) writeAtomic(output, content);
   return { output, content, offset };

@@ -229,3 +229,33 @@ test('cli: a correct invocation still works, matching the direct call byte-for-b
   assert.equal(viaCli.content, direct.content);
   assert.deepEqual(viaCli.offset, direct.offset);
 });
+
+// Spec fleet #92 / #143: one line per tenant counting the open ready tickets with
+// no `## Premises`, read from the watchdog's triage shadow (stamped with its time).
+test('#143: the Triage section counts open ready tickets without a Premises section', () => {
+  const root = rootDir();
+  const missingLine = (content) => section(content, 'Triage (advisory Principal, ADR 0011)').split('\n').find((line) => /Premises/.test(line));
+  assert.match(missingLine(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content), /endzone: `## Premises` census not recorded yet/);
+  fs.mkdirSync(path.join(root, 'state', 'watchdog'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'watchdog', 'triage-frontier.json'), JSON.stringify({
+    at: '2026-09-24T07:45:00.000Z', tenants: [{ tenant: 'endzone', premises: { readyLabel: 'ready-for-agent', ready: 10, missing: [1440, 1441], malformed: [1609] } }],
+  }));
+  const line = missingLine(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content);
+  assert.equal(line, '- endzone: 2 of 10 open ready-for-agent ticket(s) without `## Premises` (#1440, #1441); malformed: #1609 (census 2026-09-24T07:45:00.000Z).');
+});
+
+// Spec fleet #92 / #148: 30 days of stale-premise restatements, counted by verdict
+// on the tenant's Triage line and listed in a table; the revisit notice's state.
+test('#148: the Triage section tables stale-premise restatements and counts them by verdict', () => {
+  const root = rootDir();
+  const { recordEntry } = require('../bin/triage');
+  const line = 'src/lib/b.js: exports 2 @0123456';
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 12, bodyHash: 'h', commentUrl: 'https://x/12', model: 'fable', reason: 'stale-premise', premise: line, now: '2026-09-20T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 12, by: 'cory', edits: 'narrower', now: '2026-09-21T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 13, bodyHash: 'h', commentUrl: 'https://x/13', model: 'fable', reason: 'stale-premise', premise: 'src/c.js: exports c @abcdef1', now: '2026-09-23T12:00:00.000Z' });
+  const triageSection = section(projectDigest({ root, now: '2026-09-24T00:00:00.000Z', dryRun: true }).content, 'Triage (advisory Principal, ADR 0011)');
+  assert.match(triageSection, /stale-premise restatements \(last 30 days\): 0 approved, 1 approved with edits, 0 rejected, 1 pending/);
+  assert.ok(triageSection.includes('| endzone | #12 | \`src/lib/b.js: exports 2 @0123456\` | 2026-09-20T00:00:00.000Z | approved-with-edits | 4d |'), triageSection);
+  assert.ok(triageSection.includes('| endzone | #13 | \`src/c.js: exports c @abcdef1\` | 2026-09-23T12:00:00.000Z | pending | 0.5d |'), triageSection);
+  assert.match(triageSection, /Stale-premise revisit notice: armed 2026-09-20T00:00:00.000Z, pages 2026-10-20T00:00:00.000Z/);
+});

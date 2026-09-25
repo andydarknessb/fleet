@@ -419,7 +419,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   # ===== Ticket 09 ruling 2: the frontier wake =====
   # A mock rotate.ps1 records every -Wake call and answers like the real one; the planner
   # runs for real against a fixture issue file (FLEET_GITHUB_ISSUES_FIXTURE).
-  foreach ($f in 'assignment.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
+  foreach ($f in 'assignment.js','premises.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
   [IO.Directory]::CreateDirectory("$testRoot\state\work") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\state\watch") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null

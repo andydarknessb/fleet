@@ -38,6 +38,9 @@ Ruling: <the decision the work depends on, or "none needed">
 Red-tell: <the test or observation that is red today and green when done>
 Repro: <steps beyond the red-tell, or "none">
 Scope: lists exactly <path A> and <path B>
+Premises:
+  <path>: <claim> @<sha> verified @<sha you re-read it at>
+  <path>: <claim> @<sha> false: <what the code says instead>
 Blocked_by: #N | none
 Tier: haiku | sonnet
 Precedent: <link to Cory's prior ruling comment on this question, or "none">
@@ -48,17 +51,22 @@ Open for Cory: <questions only the owner can answer, or "none">
 
 When you record a proposal, copy `bodyHash` from the frontier output (`triage.js frontier`) into `record --kind proposed --body-hash`; never compute it yourself, a hand-made hash differs by a newline and reads later as "body changed since the proposal" (fleet #48). Every frontier item carries it, escalations included.
 
+**Premises (spec fleet #92).** Triage is where re-reading a cited line is cheapest, so you verify the ticket's `## Premises` here (format: `CONTEXT.md` **Premise**). Take the tenant default branch's head sha, re-read every cited path at that sha (through the researcher when the read is a lookup rather than the lines themselves), and copy each premise line into the `Premises:` block ending `verified @<that sha>` or `false: <why>` when the claim was never true. Never stamp a sha you did not read at. A ticket with no section gets `Premises: none stated`, and `Open for Cory` says whether it needs one (a ticket whose criteria depend on code does). Record the stamp: `record --kind proposed --premises-sha <that sha>` (7 to 40 hex; anything else is refused).
+
+**Stale-premise restatements (#148).** When a ticket comes back because a premise went stale (a lead's `decision-needed` escalation whose frontier item carries `escalationReason: stale-premise` and the `premise` line, or your own re-proposal after the lead's `PREMISE_PATH_CHANGED`), the proposal's `Ruling:` says which premise moved and what is now true, and its `Premises:` block carries the restated line. Record it with `record --kind proposed ... --reason stale-premise --premise "<the stale line verbatim>"` (any other `--reason` is refused). It still needs Cory's Approval (ADR 0011): every such restatement and its verdict is tabled in the digest's Triage section for 30 days, and the first one arms a dated page, 30 days on, asking Cory to rule whether they may skip Approval.
+
 When the ticket came from a lead's `decision-needed` escalation, post the proposal on the issue first, then one line by SendMessage to `pl-<tenant>` naming the issue and the `Ruling:` line. The issue is the record; the message is the wake. Never rule only in a message. The lead waits for Cory's approval regardless.
 
 ## Approval and finalizing
 
 An Approval is a comment on the proposal's issue from the tenant owner's GitHub login (`ownerLogin` in the tenant file; never `fleetIdentity`, never a lead, never an IC) reading `Approved` or `Approved with: <edits>`. On approval:
 
-1. Post `## Ruling` restating the proposal with the edits folded in.
-2. Apply `ready-for-agent`, `ready-for-human` or `needs-info` as ruled, and remove `triage-proposed`.
-3. Record it (`triage.js record --kind finalized`; if the ruling opened a docs PR, add `--pr-url <url>` so the digest lists it) and message `pl-<tenant>` if a lead was waiting.
+1. Post `## Ruling` restating the proposal with the edits folded in. A premise marked `false` is restated there first, as the corrected `<path>: <claim> @<sha>` line.
+2. When any premise was `false`, edit the issue body's `## Premises` to the restated lines (`gh issue edit <n> --body-file <file>`) before any label, so the body the lead assigns is the one the Ruling verified. Then read the new hash with `node C:/Users/Cory/fleet/bin/triage.js hash --tenant <tenant> --issue <n>`; never hash it yourself.
+3. Apply `ready-for-agent`, `ready-for-human` or `needs-info` as ruled, and remove `triage-proposed`.
+4. Record it (`triage.js record --kind finalized`; add `--body-hash <hash from step 2>` when the body was edited, and `--pr-url <url>` if the ruling opened a docs PR so the digest lists it) and message `pl-<tenant>` if a lead was waiting. A body edited by the finalize reads in `triage.js state` under `restated` (proposed at one hash, finalized at another), never as "body changed since the proposal".
 
-Closing an issue, `wontfix` and `duplicate` are Cory's hands in every mode: for those classifications step 2 is the `## Ruling` comment only. Any other reply from Cory is a conversation: answer it, do not re-propose. Re-propose a ticket only when its body changed after your proposal or Cory asks you to in a comment.
+Closing an issue, `wontfix` and `duplicate` are Cory's hands in every mode: for those classifications you post the `## Ruling` comment and skip steps 2 and 3. Any other reply from Cory is a conversation: answer it, do not re-propose. Re-propose a ticket only when its body changed after your proposal or Cory asks you to in a comment.
 
 ## Boundaries
 

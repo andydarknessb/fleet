@@ -261,3 +261,29 @@ test('#131: a scorecard alone never turns a quiet day into a page', () => {
   writeCard(root, '2026-09-14', { area: 'Review gate', status: 'weak', result: 'x' });
   assert.equal(buildSummary({ root, now: NOW }), null);
 });
+
+// Spec fleet #92 / #148: the daily run fires the stale-premise revisit notice once
+// it is due, through the same sender, even on a quiet day; a failed send exits non-zero.
+test('#148: the daily run pages the due stale-premise notice once, quiet day or not', () => {
+  const root = rootDir();
+  const { recordEntry } = require('../bin/triage');
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 12, bodyHash: 'h', commentUrl: 'https://x/12', model: 'fable', reason: 'stale-premise', premise: 'src/b.js: b @0123456', now: '2026-09-01T00:00:00.000Z' });
+  const sent = [];
+  const send = (message) => { sent.push(message); return { ok: true }; };
+  const early = runDailySummary({ root, now: '2026-09-30T08:00:00.000Z', send });
+  assert.equal(early.staleNotice.due, false);
+  assert.equal(sent.length, 0);
+  const due = runDailySummary({ root, now: '2026-10-01T08:00:00.000Z', send });
+  assert.equal(due.attempted, false, 'nothing waiting: no summary page');
+  assert.equal(due.staleNotice.sent, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, 'dated');
+  runDailySummary({ root, now: '2026-10-02T08:00:00.000Z', send });
+  assert.equal(sent.length, 1, 'never twice');
+  const failingRoot = rootDir();
+  recordEntry({ root: failingRoot, tenant: 'endzone', kind: 'proposed', issue: 12, bodyHash: 'h', commentUrl: 'https://x/12', model: 'fable', reason: 'stale-premise', premise: 'src/b.js: b @0123456', now: '2026-09-01T00:00:00.000Z' });
+  const failed = runDailySummary({ root: failingRoot, now: '2026-10-01T08:00:00.000Z', send: () => ({ ok: false, detail: 'down' }) });
+  assert.equal(exitCodeFor(failed), 1);
+  const dry = cli(['--root', failingRoot, '--now', '2026-10-01T08:00:00.000Z', '--dry-run']);
+  assert.equal(dry.staleNotice.dryRun, true);
+});
