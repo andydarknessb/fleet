@@ -1219,3 +1219,18 @@ test('#114 review: a merge reconciled with its head records github.mergedHeadSha
     reconciledObservation: { state: 'MERGED', mergedAt: '2026-09-24T01:00:00Z', headRefOid: 'e'.repeat(40), evidence: 'gh pr view 77' }, now: '2026-09-24T01:00:00.000Z' });
   assert.equal(merged.record.github.mergedHeadSha, 'e'.repeat(40));
 });
+
+test('reserve scopes the conflict set and the third-assignment count to the record\'s tenant', () => {
+  const root = rootDir();
+  const endzone = [40, 41, 42].map((issue) => ({ issue, reservations: { components: [`src/e${issue}.js`] } }));
+  for (const [index, record] of endzone.entries()) {
+    reserveRecord({ root, id: `endzone:issue-${record.issue}`, tenant: 'endzone', issue: record.issue, manifestPath: `m${record.issue}`, reservations: record.reservations, independenceProof: index === 2 ? proofFor(endzone) : undefined, idempotencyKey: `reserve-${record.issue}`, now: '2026-09-24T00:00:00.000Z' });
+  }
+  const nidus = reserveRecord({ root, id: 'nidus:issue-2', tenant: 'nidus', issue: 2, manifestPath: 'n2', reservations: { components: ['src/e40.js'] }, idempotencyKey: 'reserve-n2', now: '2026-09-24T00:00:01.000Z' });
+  assert.equal(nidus.record.tenant, 'nidus', 'endzone\'s three and its src/e40.js do not bind another repo');
+  assert.throws(
+    () => reserveRecord({ root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43, manifestPath: 'm43', reservations: { components: ['src/e43.js'] }, idempotencyKey: 'reserve-43', now: '2026-09-24T00:00:02.000Z' }),
+    (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF',
+    'endzone\'s own count is unchanged by nidus joining',
+  );
+});

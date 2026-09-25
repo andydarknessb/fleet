@@ -308,6 +308,7 @@ function cli(argv) {
         // The observer must apply exactly the rules the planner will apply when it is
         // authoritative, or the ledger records a difference the live path would not make.
         fleetIdentity: assignment.readTenantConfig(args.root, tenant).fleetIdentity,
+        tenant,
         now: args.now,
       });
     } catch (error) {
