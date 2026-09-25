@@ -19,6 +19,7 @@ function Run-Case {
   Write-Utf8 "$testRoot\tenants\t.json" $Tenant
   $script = @"
 . '$testRoot\bin\_common.ps1'
+`$OutputEncoding = New-Object Text.UTF8Encoding `$false   # a BOM on stdin reads as a missing protocol field (CI runner)
 Set-Location '$testRoot'
 `$plan = Set-FleetIdentityProcessEnv
 `$paged = Send-FleetIdentityPageOnce -Plan `$plan -Source 'watchdog.ps1'
