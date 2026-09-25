@@ -13,10 +13,11 @@
 #        docs/. One named test file passes.
 #      - No Supabase or Netlify-writing MCP tool.
 #   2. every fleet role: no comment whose body begins "Approved" or "Re-propose" on any
-#      issue. The machine's gh login is the tenant owner's login (fleetIdentity ==
-#      ownerLogin), so the owner-login gate in bin/triage.js cannot tell Cory's Approved
-#      from one a session posts; this rule is what makes an Approval, and (fleet#55) a
-#      re-proposal ask, Cory's alone. The rule reads the command being invoked, not
+#      issue. Until #154 the fleet's gh login was the tenant owner's (fleetIdentity ==
+#      ownerLogin) and this rule alone made an Approval, and (fleet#55) a re-proposal
+#      ask, Cory's. Since #154 the fleet acts as its own login (ADR 0015) and the
+#      owner-login gate in bin/triage.js does that; this rule stays as the second
+#      lock (ADR 0011 amendment). The rule reads the command being invoked, not
 #      prose or heredoc text that quotes one, and a body it cannot inspect (stdin,
 #      --body-file -) is refused on its own terms with the fix named (fleet #70).
 #
