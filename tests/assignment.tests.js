@@ -18,6 +18,7 @@ const {
   normalizeIssue,
   queryGithubIssues,
   resolveRemoteBase,
+  readTenantConfig,
   reserveAssignment,
   selectFrontier,
   sha256,
@@ -765,4 +766,27 @@ test('an active record naming no tenant still conflicts, so scoping cannot fail 
   const active = [{ id: 'legacy:issue-8', issue: 8, state: 'implementing', reservations: { components: ['src/shared'] } }];
   const frontier = selectFrontier({ issues: [issue(3, { body: 'Change `src/shared/x.js`.' })], readyLabel: 'ready-for-agent', active, tenant: 'nidus', now: '2026-09-24T00:00:00.000Z' });
   assert.equal(frontier.excluded[0].reasons[0].code, 'reservation-conflict');
+});
+
+// #154 (ADR 0015): with the Fleet identity distinct from the owner's, an issue
+// assigned to the owner is foreign and stays off the frontier; one assigned to the
+// fleet is the fleet's own; an unassigned one is unchanged.
+test('#154: assigned-to-owner is foreign, assigned-to-fleet is kept, unassigned unchanged', () => {
+  const ownerHas = issue(70, { assignees: [{ login: 'cory-owner' }] });
+  const fleetHas = issue(71, { assignees: [{ login: 'fleet-bot' }] });
+  const nobody = issue(72);
+  const result = selectFrontier({ issues: [ownerHas, fleetHas, nobody], readyLabel: 'ready-for-agent', fleetIdentity: 'fleet-bot' });
+  assert.deepEqual(result.eligible.map((entry) => entry.number), [71, 72]);
+  const excluded = result.excluded.find((entry) => entry.issue === 70);
+  assert.deepEqual(excluded.reasons.map((reason) => reason.code), ['assigned']);
+  assert.match(excluded.reasons[0].detail, /cory-owner/);
+});
+
+test('#154: the assignment loader refuses a tenant whose fleetIdentity is its ownerLogin', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-154-'));
+  fs.mkdirSync(path.join(root, 'tenants'));
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' }));
+  assert.throws(() => readTenantConfig(root, 'endzone'), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', fleetIdentity: 'fleet-bot', ownerLogin: 'andydarknessb' }));
+  assert.equal(readTenantConfig(root, 'endzone').fleetIdentity, 'fleet-bot');
 });

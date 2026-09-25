@@ -25,7 +25,8 @@ function Run-Launch {
   $script:lastOut = $out
   try { return ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
 }
-function Set-Tenant { param([string]$FleetIdentity) Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,"fleetIdentity":"' + $FleetIdentity + '","ownerLogin":"cory-owner","repo":' + ("$testRoot\repo" | ConvertTo-Json) + '}') }
+# An empty -FleetIdentity writes a tenant naming neither login (a fixture tenant).
+function Set-Tenant { param([string]$FleetIdentity) $logins = if ($FleetIdentity) { '"fleetIdentity":"' + $FleetIdentity + '","ownerLogin":"cory-owner",' } else { '' }; Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,' + $logins + '"repo":' + ("$testRoot\repo" | ConvertTo-Json) + '}') }
 function Set-Identity {
   param([string]$Login)
   if (-not $Login) { Remove-Item -Recurse -Force "$testRoot\identity" -ErrorAction SilentlyContinue; return }
@@ -60,7 +61,11 @@ try {
 
   # Case 1 (today, before #152 is run): the tenant still names the owner as the fleet and
   # no identity directory exists. The launch keeps the keyring: no GH_CONFIG_DIR, no refusal.
+  # #154: a tenant naming its owner as the fleet is refused outright.
   Set-Tenant 'cory-owner'; Set-Identity $null
+  $r0 = Run-Launch ($dispatch + '-DryRun')
+  Assert-True ($lastExit -eq 3 -and $r0.code -eq 'TENANT_IDENTITY_NOT_DISTINCT') "a tenant sharing one login must refuse the launch: $lastOut"
+  Set-Tenant ''
   $r1 = Run-Launch ($dispatch + '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r1.dryRun -eq $true) "pre-flip with no identity must launch as before: $lastOut"
   $env1 = (Get-Content $settingsFile -Raw | ConvertFrom-Json).env

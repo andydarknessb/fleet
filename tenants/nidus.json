@@ -5,7 +5,7 @@
   "defaultBranch": "master",
   "releaseBranch": "master",
   "readyLabel": "ready-for-agent",
-  "fleetIdentity": "andydarknessb",
+  "fleetIdentity": "andydarknessb-fleet",
   "ownerLogin": "andydarknessb",
   "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",

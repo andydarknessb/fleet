@@ -400,3 +400,28 @@ test('#148: the dated notice arms on the first stale-premise entry, pages once a
   assert.equal(replay.firedAt, '2026-10-26T08:00:00.000Z');
   assert.equal(sent.length, 1, 'a replay never pages twice');
 });
+
+// #154 (ADR 0015): with distinct logins the owner-comment rules rest on authorship.
+test('#154: a newest comment by the fleet does not skip the issue; one by the owner does', () => {
+  const byFleet = frontier([issue(1400, { labels: ['needs-triage'], comments: [comment(FLEET, 'Companion: #1401.', '2026-09-12T10:00:00.000Z')] })], { fleetIdentity: FLEET });
+  assert.equal(byFleet.eligible.length, 1, 'a fleet cross-link must not drop a freshly filed issue (fleet #55 root cause)');
+  const byOwner = frontier([issue(1402, { labels: ['needs-triage'], comments: [comment(FLEET, 'Companion: #1403.', '2026-09-12T09:00:00.000Z'), comment(OWNER, 'I will take this one.', '2026-09-12T10:00:00.000Z')] })], { fleetIdentity: FLEET });
+  assert.equal(byOwner.eligible.length, 0);
+  assert.match(byOwner.skipped[0].reason, /owner has the newest comment/);
+});
+
+test('#154: a fleet comment matching the re-propose pattern is not the owner asking again', () => {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 1404, bodyHash: triage.normalizeIssue(issue(1404)).bodyHash, commentUrl: 'https://github.com/owner/repo/issues/1404#issuecomment-1', model: 'fable', now: '2026-09-10T00:00:00.000Z' });
+  const entries = readLedger(root, 'endzone');
+  const fleetAsk = frontier([issue(1404, { labels: ['needs-triage', 'triage-proposed'], comments: [comment(FLEET, 'Re-propose: scope moved.', '2026-09-11T00:00:00.000Z')] })], { entries, fleetIdentity: FLEET });
+  assert.equal(fleetAsk.eligible.length, 0);
+  assert.match(fleetAsk.skipped[0].reason, /awaiting approval/);
+  const ownerAsk = frontier([issue(1404, { labels: ['needs-triage', 'triage-proposed'], comments: [comment(OWNER, 'Re-propose: scope moved.', '2026-09-11T00:00:00.000Z')] })], { entries, fleetIdentity: FLEET });
+  assert.equal(ownerAsk.eligible[0].kind, 'reproposal');
+});
+
+test('#154: the triage loader refuses a tenant whose fleetIdentity is its ownerLogin', () => {
+  const root = rootDir({ ownerLogin: FLEET });
+  assert.throws(() => triage.computeFrontier({ root, tenant: 'endzone', fixture: writeFixture(root, []), now: NOW }), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
+});

@@ -1019,7 +1019,15 @@ function loadTenant(root, name) {
   const file = path.join(path.resolve(root || DEFAULT_ROOT), 'tenants', `${name}.json`);
   let text = fs.readFileSync(file, 'utf8');
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-  return JSON.parse(text);
+  const config = JSON.parse(text);
+  // #154 (ADR 0015): the door that posts the review status refuses a tenant
+  // whose Fleet identity is its owner's login, as the assignment and triage
+  // loaders do. (work-state's readTenantConfigs feeds read-only reporters,
+  // the digest and the notifier among them, and stays tolerant on purpose.)
+  try { require('./identity').assertDistinctIdentity(config, name); } catch (error) {
+    throw new ReviewPolicyError(error.code, error.message);
+  }
+  return config;
 }
 
 function loadConfig(root) {

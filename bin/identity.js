@@ -86,6 +86,19 @@ function readTenants(root) {
   });
 }
 
+// #154: a tenant file must name a Fleet identity distinct from its owner. The
+// 09-12 configuration (both andydarknessb) made Approval rest on a hook, made
+// merges unattributable and made the foreign-assignee and owner-comment rules
+// inert (fleet #55); the loaders refuse it so it can never come back silently.
+function assertDistinctIdentity(config, tenantName) {
+  const name = tenantName || config?.name || '?';
+  if (config && config.fleetIdentity && config.ownerLogin && sameLogin(config.fleetIdentity, config.ownerLogin)) {
+    const error = new IdentityError('TENANT_IDENTITY_NOT_DISTINCT', `tenant ${name} names ${config.fleetIdentity} as both fleetIdentity and ownerLogin; the fleet acts under its own login (ADR 0015), so fleetIdentity must be the machine user`);
+    throw error;
+  }
+  return config;
+}
+
 function identityRequired(tenants) {
   return (tenants || []).some((tenant) => tenant && tenant.fleetIdentity && tenant.ownerLogin && !sameLogin(tenant.fleetIdentity, tenant.ownerLogin));
 }
@@ -161,6 +174,10 @@ function ensureGitConfig(dir, { env = process.env, runner } = {}) {
 function launchPlan({ root, env = process.env } = {}) {
   const base = path.resolve(root || path.resolve(__dirname, '..'));
   const tenants = readTenants(base);
+  const shared = tenants.find((tenant) => tenant.fleetIdentity && tenant.ownerLogin && sameLogin(tenant.fleetIdentity, tenant.ownerLogin));
+  if (shared) {
+    return { required: true, present: false, login: null, dir: identityDir(env), problem: null, env: {}, refusal: { code: 'TENANT_IDENTITY_NOT_DISTINCT', message: `tenant ${shared.name} names ${shared.fleetIdentity} as both fleetIdentity and ownerLogin; set fleetIdentity to the machine user (ADR 0015)` } };
+  }
   const required = identityRequired(tenants);
   const dir = identityDir(env);
   const read = readIdentity(dir);
@@ -244,5 +261,5 @@ if (require.main === module) {
 }
 
 module.exports = {
-  CHECK_NAME, IdentityError, identityDir, ensureGitConfig, gitConfigText, systemGitConfigPath, readIdentity, readTenants, identityRequired, sessionEnv, launchPlan, checkSessionIdentity, sameLogin, cli,
+  CHECK_NAME, IdentityError, assertDistinctIdentity, identityDir, ensureGitConfig, gitConfigText, systemGitConfigPath, readIdentity, readTenants, identityRequired, sessionEnv, launchPlan, checkSessionIdentity, sameLogin, cli,
 };
