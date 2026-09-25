@@ -73,6 +73,9 @@ $root = Split-Path -Parent $PSScriptRoot
 $forceMark = if ($Force) { '|force' } else { '' }
 Add-Content "$root\launch-calls.log" "$FromRoster$forceMark"
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"cap reached (6/6)"}'; exit 3 }
+# fleet #121: the first launch meets a session already running under the name (the
+# stale revival, or a hand relaunch), the next one goes through.
+if ($env:MOCK_LAUNCH_RUNNING -eq '1' -and -not (Test-Path "$root\launch-running.marker")) { Set-Content "$root\launch-running.marker" 'x'; Write-Output ('{"launched":false,"reason":"a session named ''' + $FromRoster + ''' is already running; use claude respawn"}'); exit 3 }
 Write-Output ('{"launched":true,"name":"' + $FromRoster + '","jobId":"job-new","sessionId":"sess-new"}')
 exit 0
 '@
@@ -81,7 +84,7 @@ const fs = require('node:fs'), path = require('node:path');
 fs.appendFileSync(path.join(__dirname, '..', 'reconcile-calls.log'), process.argv.slice(2).join(' ') + '\n');
 console.log(JSON.stringify({ ok: true }));
 '@
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'if "%1"=="stop" echo stop %2>>"' + $testRoot + '\claude-calls.log"' + "`r`n" + 'exit /b 0' + "`r`n")
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
 
@@ -193,6 +196,37 @@ console.log(JSON.stringify({ ok: true }));
   $r6b = Run-Rotate @('-Resume')
   Assert-True (@($r6b.rotated) -contains 'dispatcher') 'a stopping intent must resume to launched'
   Assert-True ((Get-Content "$testRoot\retire-calls.log" -Raw) -match 'resumed') 'resume must finish retiring the live predecessor'
+
+  # Case 6c (fleet #121): between stop and launch a job created BEFORE the rotation began
+  # comes back under the name (sentinel-check once revived an Aug-25 job this way). That
+  # is a stale revival, not a hand relaunch: stop it and launch the replacement.
+  Set-LiveRoster $old 'retired'; Reset-Markers
+  Remove-Item "$testRoot\launch-running.marker", "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  Set-AgentsRows '[{"id":"job-stale","name":"dispatcher","state":"working","status":"idle","pid":21,"sessionId":"sess-stale","startedAt":1786115823884}]'
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-stale") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-stale\state.json" '{"createdAt":"2026-08-25T00:00:00Z","respawnFlags":["--model","claude-opus-5"]}'
+  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  $env:MOCK_LAUNCH_RUNNING = '1'
+  $r6c = Run-Rotate @('-Resume')
+  $intent6c = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($intent6c.launchedBy)" -ne 'external') 'a stale revival must not be recorded as an external relaunch'
+  Assert-True ((Test-Path "$testRoot\claude-calls.log") -and (Get-Content "$testRoot\claude-calls.log" -Raw) -match 'stop job-stale') 'the revived stale job must be stopped'
+  Assert-True (@(Get-Content "$testRoot\launch-calls.log").Count -eq 2 -and $intent6c.phase -eq 'launched' -and "$($intent6c.newJobId)" -eq 'job-new') "the replacement must launch through launch.ps1 after the stop (intent: $($intent6c | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True ("$($intent6c.staleRevival.jobId)" -eq 'job-stale') 'the intent records the stale revival it replaced'
+  Assert-True (@($r6c.rotated) -contains 'dispatcher') 'the rotation completes'
+
+  # Case 6d (control): a session started AFTER the rotation began is a genuine hand relaunch.
+  Set-LiveRoster $old 'retired'; Reset-Markers
+  Remove-Item "$testRoot\launch-running.marker", "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  Set-AgentsRows '[{"id":"job-hand","name":"dispatcher","state":"working","status":"idle","pid":22,"sessionId":"sess-hand","startedAt":1786115823884}]'
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-hand") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-hand\state.json" ('{"createdAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o') + '"}')
+  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  $r6d = Run-Rotate @('-Resume')
+  $intent6d = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($intent6d.launchedBy)" -eq 'external' -and -not (Test-Path "$testRoot\claude-calls.log")) 'a session launched after the rotation began stays an external relaunch, untouched'
+  Remove-Item Env:MOCK_LAUNCH_RUNNING
+  Remove-Item "$testRoot\launch-running.marker" -ErrorAction SilentlyContinue
 
   # Case 7: launch failure keeps the intent recoverable; the next run completes it.
   Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
