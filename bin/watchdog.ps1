@@ -525,8 +525,12 @@ try {
   # --- reads it as between turns. A busy session whose heartbeat is past the respawn
   # --- threshold and that none of them can act on (job state unreadable, or the job
   # --- itself silent that long mid-turn, e.g. a hung subagent) is visible nowhere but
-  # --- staleStatics, so it pages under its own name. A freshly (re)launched row with no
-  # --- heartbeat yet is not stale; PAUSE suppresses it as it does all staleness paging.
+  # --- staleStatics, so it pages under its own name. Between turns is a candidate too:
+  # --- not every such row has a heal path (an IC waiting on its open PR, a static whose
+  # --- daemon state is not `working`, the dispatcher), so it pages unless a wake, a
+  # --- respawn or a heal acted on that name this tick (filtered where conditions are
+  # --- built, after those run). A freshly (re)launched row with no heartbeat yet is not
+  # --- stale; PAUSE suppresses it as it does all staleness paging.
   $busyStale = @()
   if (-not $paused) {
     foreach ($row in @($daemon | Where-Object { $_.pid -and "$($_.status)" -eq 'busy' -and "$($_.name)" -match '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$' })) {
@@ -536,9 +540,9 @@ try {
       if ($null -eq $bsAge -and $bsStart -and ((New-TimeSpan -Start $bsStart -End $now).TotalMinutes -le $busyStaleMinutes)) { continue }
       $bs = Get-BusyStanding $row -QuietMinutes $busyQuietMinutes -Now $now
       $silentMidTurn = ($bs.standing -eq 'turn' -and $null -ne $bs.quietMin -and $bs.quietMin -ge $busyStaleMinutes)
-      if ($bs.standing -ne 'unreadable' -and -not $silentMidTurn) { continue }
+      if (@('unreadable', 'background') -notcontains $bs.standing -and -not $silentMidTurn) { continue }
       $bsShown = if ($null -eq $bsAge) { 'never recorded' } else { "$([int][Math]::Min($bsAge, 99999)) min old" }
-      $busyStale += [pscustomobject]@{ name = "$($row.name)"; job = "$($row.id)"; detail = "$($row.name) (job $($row.id)) is busy with its heartbeat $bsShown (threshold $busyStaleMinutes) and no heal path can act: $($bs.reason)" }
+      $busyStale += [pscustomobject]@{ name = "$($row.name)"; job = "$($row.id)"; standing = $bs.standing; detail = "$($row.name) (job $($row.id)) is busy with its heartbeat $bsShown (threshold $busyStaleMinutes) and no heal path acted: $($bs.reason)" }
     }
   }
 
@@ -1068,7 +1072,15 @@ try {
   foreach ($hw in $humanWaits) {
     $conditions += [pscustomobject]@{ key = "human-wait:$($hw.name)"; kind = 'human-wait'; detail = $hw.needs; url = $null }
   }
+  # fleet #149: a between-turns busy-stale row that a wake, a respawn or a heal acted on
+  # this tick is being healed, not silent; the next tick re-judges it.
+  $actedOn = @()
+  $actedOn += @($frontierWakes | Where-Object { $_.decision -eq 'woken' } | ForEach-Object { "$($_.lead)" })
+  $actedOn += @($triageWakes | Where-Object { $_.decision -eq 'woken' } | ForEach-Object { "$($_.principal)" })
+  if ($check) { $actedOn += @($check.respawned | ForEach-Object { "$($_.name)" }) }
+  $actedOn += @($healed | Where-Object { $_.ok -eq $true } | ForEach-Object { "$($_.name)" })
   foreach ($bst in $busyStale) {
+    if ($bst.standing -eq 'background' -and $actedOn -contains $bst.name) { continue }
     $conditions += [pscustomobject]@{ key = "busy-stale:$($bst.name)"; kind = 'busy-stale'; detail = $bst.detail; url = $null }
   }
   $escCount = @(Get-ChildItem "$FleetHome\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count

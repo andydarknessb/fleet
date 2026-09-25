@@ -41,8 +41,8 @@ function New-Job { param([string]$Id, [string]$State, [double]$QuietMinutes, [in
   Write-Utf8 "$dir\state.json" ($js | ConvertTo-Json -Depth 5 -Compress)
   Write-Utf8 "$dir\timeline.jsonl" ((([ordered]@{ at = $at; state = $State; detail = 'fixture'; text = '' }) | ConvertTo-Json -Compress) + "`n")
 }
-function New-Row { param([string]$Id, [string]$Name, [string]$Status, [int]$ProcessId)
-  '{"id":"' + $Id + '","name":"' + $Name + '","state":"working","status":"' + $Status + '","pid":' + $ProcessId + ',"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-10)) + '}'
+function New-Row { param([string]$Id, [string]$Name, [string]$Status, [int]$ProcessId, [string]$State = 'working')
+  '{"id":"' + $Id + '","name":"' + $Name + '","state":"' + $State + '","status":"' + $Status + '","pid":' + $ProcessId + ',"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-10)) + '}'
 }
 function Get-TenantEntry { param($List) @($List | Where-Object { $_.tenant -eq 'test' })[0] }
 
@@ -97,6 +97,7 @@ try {
   Assert-True ($t1.decision -eq 'woken') "B1: a principal busy only with background tasks must get the triage wake (got $($t1.decision): $($t1.reason); frontierError=$($t1.frontierError))"
   Assert-True ($f1.decision -eq 'woken') "B1: a lead busy only with background tasks must get the frontier wake (got $($f1.decision): $($f1.reason))"
   Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pe-test|*' }).Count -eq 1 -and @(Get-RotateCalls | Where-Object { $_ -like 'pl-test|*' }).Count -eq 1) "B1: one rotate.ps1 -Wake each (got $(@(Get-RotateCalls) -join '; '))"
+  Assert-True (@($b1.conditions | Where-Object { "$_" -like 'busy-stale:*' }).Count -eq 0) "B1: a session woken this tick is being healed, not busy-stale (got $(@($b1.conditions) -join ','))"
 
   # Case B2: the stale-heartbeat respawn must not skip that row as busy either.
   $c2 = Run-Check
@@ -121,7 +122,7 @@ try {
   $c4 = Run-Check
   Assert-True (@($c4.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0) 'B4: sentinel-check must not respawn a lead mid-turn'
   $r4 = Run-RotateDry
-  Assert-True ($r4.status -eq 'deferred') "B4: rotate.ps1 must defer a session mid-turn (got $($r4.status): $($r4.reason))"
+  Assert-True ($r4.status -eq 'deferred' -and "$($r4.reason)" -match 'mid-turn') "B4: rotate.ps1 must defer a session mid-turn (got $($r4.status): $($r4.reason))"
 
   # Case B5 (control, a subagent in flight): a task kind that ends in a turn of its
   # own is not a leak by this rule, however quiet. Still busy.
@@ -131,6 +132,10 @@ try {
   $b5 = Run-Watchdog
   Assert-True ((Get-TenantEntry $b5.triageWakes).decision -eq 'none') "B5: a principal with a subagent in flight is still busy (got $((Get-TenantEntry $b5.triageWakes).decision))"
   Assert-True ((Get-TenantEntry $b5.frontierWakes).decision -eq 'none') "B5: a lead with a subagent in flight is still busy (got $((Get-TenantEntry $b5.frontierWakes).decision))"
+  # ... but silent 8h mid-turn with a stale heartbeat, nothing can act on it: it pages.
+  Assert-True ((@($b5.conditions) -contains 'busy-stale:pe-test') -and (@($b5.conditions) -contains 'busy-stale:pl-test')) "B5: a session silent 8h mid-turn must raise busy-stale (got $(@($b5.conditions) -join ','))"
+  $c5 = Run-Check
+  Assert-True (@($c5.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0) 'B5: sentinel-check must not respawn a lead with a subagent in flight'
 
   # Case B6 (control, unreadable job state): nothing wakes, but once the heartbeat
   # is stale past the respawn threshold a named condition says so.
@@ -139,7 +144,7 @@ try {
   New-Job 'job-p' 'working' 1 1 @('local_bash')
   $b6 = Run-Watchdog
   $t6 = Get-TenantEntry $b6.triageWakes
-  Assert-True ($t6.decision -eq 'none') "B6: an unreadable job state must not wake (got $($t6.decision): $($t6.reason))"
+  Assert-True ($t6.decision -eq 'none' -and "$($t6.reason)" -match 'busy; job state') "B6: an unreadable job state must not wake (got $($t6.decision): $($t6.reason))"
   Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pe-test|*' }).Count -eq 0) 'B6: no rotate.ps1 call off an unreadable job state'
   Assert-True (@($b6.conditions) -contains 'busy-stale:pe-test') "B6: a stale busy session whose job state is unreadable must raise busy-stale:pe-test (got $(@($b6.conditions) -join ','))"
   Assert-True (@($b6.conditions) -notcontains 'busy-stale:pl-test') 'B6: a mid-turn session raises no busy-stale'
@@ -147,6 +152,18 @@ try {
   Set-Heartbeat 'pe-test' 30
   $b6b = Run-Watchdog
   Assert-True (@($b6b.conditions) -notcontains 'busy-stale:pe-test') "B6: busy-stale waits for the stale threshold (got $(@($b6b.conditions) -join ','))"
+
+  # Case B7 (review of #149): between turns, but no heal path reaches it. The principal's
+  # daemon row is `done` (sentinel-check only respawns `working`) and its frontier is
+  # empty (no triage wake). A leaked loop there must not be silent either.
+  Reset-Wake
+  Write-Utf8 $env:FLEET_TRIAGE_ISSUES_FIXTURE '[]'
+  New-Job 'job-pe' 'done' 480 1 @('local_bash')
+  Set-Heartbeat 'pe-test' 480
+  Set-AgentsRows ('[' + $dispRow + ',' + (New-Row 'job-p' 'pl-test' 'busy' 13) + ',' + (New-Row 'job-pe' 'pe-test' 'busy' 14 'done') + ']')
+  $b7 = Run-Watchdog
+  Assert-True ((Get-TenantEntry $b7.triageWakes).decision -eq 'none') "B7: nothing to wake the principal for (got $((Get-TenantEntry $b7.triageWakes).decision))"
+  Assert-True (@($b7.conditions) -contains 'busy-stale:pe-test') "B7: a stale session between turns that nothing acted on must raise busy-stale (got $(@($b7.conditions) -join ','))"
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) busy-background assertion(s) failed" }
   Write-Output 'busy-background tests passed'
