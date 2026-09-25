@@ -537,6 +537,51 @@ test('assignment refuses an IC model outside sonnet, refuses haiku by name, and 
   assert.equal(reserveAssignment({ root: rootDir(), issue: issue(73), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'Sonnet' }).manifest.model, 'sonnet', 'case is not a distinction');
 });
 
+// Spec #94 (#162): the permission profile is a launch-door choice per model. The
+// planner pins it in the manifest beside the model so launch.ps1 writes the matching
+// settings; haiku is reservable only under the allowlist profile (auto is fleet #28).
+test('assign pins the permission profile: haiku only under allowlist, sonnet under auto', () => {
+  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
+  const reserve = (number, extra) => reserveAssignment({ root: rootDir(), issue: issue(number), tenant: 'endzone', readyLabel: 'ready-for-agent', base, ...extra });
+
+  const haiku = reserve(80, { model: 'haiku', permissions: 'allowlist' });
+  assert.equal(haiku.manifest.model, 'haiku');
+  assert.equal(haiku.manifest.permissions, 'allowlist', 'the manifest pins the profile beside the model');
+
+  for (const [number, extra, label] of [[81, { model: 'haiku' }, 'no flag'], [82, { model: 'haiku', permissions: 'auto' }, '--permissions auto']]) {
+    assert.throws(
+      () => reserve(number, extra),
+      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message),
+      `haiku with ${label} is refused with the fleet #28 cause`,
+    );
+  }
+
+  assert.equal(reserve(83, { model: 'sonnet' }).manifest.permissions, 'auto', 'sonnet with no flag pins the auto profile');
+  assert.equal(reserve(84, {}).manifest.permissions, 'auto', 'the default model pins auto too');
+  assert.throws(
+    () => reserve(85, { model: 'sonnet', permissions: 'allowlist' }),
+    (error) => error.code === 'INVALID_PERMISSION_PROFILE' && /sonnet/.test(error.message),
+    'sonnet stays on auto: the allowlist profile is the haiku profile',
+  );
+  assert.throws(
+    () => reserve(86, { model: 'haiku', permissions: 'bypass' }),
+    (error) => error.code === 'INVALID_PERMISSION_PROFILE' && /allowlist/.test(error.message),
+    'an unknown profile is refused, naming the known ones',
+  );
+});
+
+test('assign CLI takes --permissions and the written manifest pins it', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', readyLabel: 'ready-for-agent', maxIcs: 3, defaultBranch: 'integration' }));
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(90)]));
+  const result = cli(['assign', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--base-sha', 'f'.repeat(40), '--model', 'haiku', '--permissions', 'allowlist']);
+  const written = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'));
+  assert.equal(written.model, 'haiku');
+  assert.equal(written.permissions, 'allowlist');
+});
+
 // --- fleet#4: assignment.js adopts the parseArgs flag schema -----------------
 // Before this, `cli()` used its own permissive parser: a typo'd flag fell into a
 // bucket nothing read and the command answered as if it had not been given.
