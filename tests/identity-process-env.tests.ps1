@@ -19,10 +19,12 @@ function Run-Case {
   Write-Utf8 "$testRoot\tenants\t.json" $Tenant
   $script = @"
 . '$testRoot\bin\_common.ps1'
+Set-Location '$testRoot'
 `$plan = Set-FleetIdentityProcessEnv
 `$paged = Send-FleetIdentityPageOnce -Plan `$plan -Source 'watchdog.ps1'
-`$cred = ("protocol=https``nhost=github.com``n``n" | & git credential fill 2>`$null | Out-String)
-[pscustomobject]@{ refusal = if (`$plan.refusal) { "`$(`$plan.refusal.code)" } else { `$null }; paged = `$paged; ghConfigDir = `$env:GH_CONFIG_DIR; ghToken = `$env:GH_TOKEN; cred = `$cred } | ConvertTo-Json -Compress
+`$cred = ("protocol=https``nhost=github.com``n``n" | & git credential fill 2>&1 | Out-String)
+`$helpers = (& git config --show-origin --get-all credential.helper 2>&1 | Out-String)
+[pscustomobject]@{ refusal = if (`$plan.refusal) { "`$(`$plan.refusal.code)" } else { `$null }; paged = `$paged; ghConfigDir = `$env:GH_CONFIG_DIR; ghToken = `$env:GH_TOKEN; cred = `$cred; helpers = `$helpers; gitconfig = (Get-Content `$env:GIT_CONFIG_SYSTEM -Raw -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress
 "@
   Write-Utf8 "$testRoot\case.ps1" $script
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -42,7 +44,7 @@ try {
   # Present: the process env routes git through gh, which answers with the fleet token.
   $r1 = Run-Case '{"name":"t","fleetIdentity":"fleet-bot","ownerLogin":"cory-owner"}'
   Assert-True (-not $r1.refusal -and $r1.ghConfigDir -eq "$testRoot\identity") "the watchdog process must carry GH_CONFIG_DIR: $($r1 | ConvertTo-Json -Compress)"
-  Assert-True ("$($r1.cred)" -match 'username=fleet-bot' -and "$($r1.cred)" -match 'password=ghp_watchdog_probe') 'a git push from the watchdog must authenticate as the fleet (credential not printed)'
+  Assert-True ("$($r1.cred)" -match 'username=fleet-bot' -and "$($r1.cred)" -match 'password=ghp_watchdog_probe') ("a git push from the watchdog must authenticate as the fleet; credential (password redacted): " + (("$($r1.cred)") -replace 'password=\S+', 'password=REDACTED') + " helpers: $($r1.helpers) gitconfig: $($r1.gitconfig)")
   Assert-True ($r1.paged -eq $false) 'a clean plan pages nothing'
 
   # Required but missing: nothing is set, one high page, and a second tick does not page again.

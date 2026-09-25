@@ -458,6 +458,9 @@ function Set-FleetIdentityProcessEnv {
   $plan = Get-FleetIdentityPlan -Cached
   if (-not $plan.refusal -and $plan.env) {
     foreach ($p in $plan.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, "$($p.Value)", 'Process') }
+    # gh prefers GH_TOKEN / GITHUB_TOKEN over GH_CONFIG_DIR; an inherited one would
+    # silently act as whoever minted it.
+    foreach ($k in 'GH_TOKEN', 'GITHUB_TOKEN') { [Environment]::SetEnvironmentVariable($k, $null, 'Process') }
   } elseif ($plan.refusal) {
     $closedDir = "$FleetHome\state\identity"
     [IO.Directory]::CreateDirectory($closedDir) | Out-Null
