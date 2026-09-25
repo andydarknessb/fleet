@@ -126,7 +126,7 @@ function appendEntry(root, tenant, entry) {
   return entry;
 }
 
-function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, now } = {}) {
+function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, now } = {}) {
   if (!LEDGER_KINDS.includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `kind must be one of ${LEDGER_KINDS.join(', ')}`);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : 'principal' };
@@ -141,6 +141,12 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     entry.commentUrl = requireText(commentUrl, 'comment-url');
     entry.model = requireText(model, 'model');
     if (recordId) entry.recordId = String(recordId);
+    // Spec fleet #92 (#145): the sha the Principal re-read every cited premise at.
+    if (premisesSha !== undefined && premisesSha !== null) {
+      const sha = String(premisesSha).trim().toLowerCase();
+      if (!/^[0-9a-f]{7,40}$/.test(sha)) throw new WorkStateError('TRIAGE_INVALID', `--premises-sha must be 7 to 40 hex characters, got "${premisesSha}"`);
+      entry.premisesSha = sha;
+    }
   }
   if (kind === 'approved' || kind === 'approved-with-edits' || kind === 'rejected') {
     entry.by = requireText(by, 'by');
@@ -155,6 +161,9 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     // lead reviews only branchPrefix PRs and pr-watch tracks only Work records, so the
     // digest is where the PR stays visible until Cory merges it (the merge is Cory's).
     if (prUrl) entry.prUrl = String(prUrl);
+    // Spec fleet #92 (#145): a finalize that restated a false premise edited the
+    // body; the restated body's hash is what the lead's manifest will pin.
+    if (bodyHash) entry.bodyHash = String(bodyHash);
   }
   if (evidence) entry.evidence = String(evidence);
   const entries = readLedger(root, tenant);
@@ -197,6 +206,9 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
   const rows = Object.values(byIssue).sort((left, right) => left.issue - right.issue);
   const pending = rows.filter((row) => row.proposed && !row.outcome).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model }));
   const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits'].includes(row.outcome.kind) && !row.finalized).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
+  // Spec fleet #92 (#145): proposed at one hash, finalized at another. The finalize
+  // edit is expected (a restated premise), not "body changed since the proposal".
+  const restated = rows.filter((row) => row.finalized && row.finalized.bodyHash && row.proposed && row.finalized.bodyHash !== row.proposed.bodyHash).map((row) => ({ issue: row.issue, proposedBodyHash: row.proposed.bodyHash, finalizedBodyHash: row.finalized.bodyHash, finalizedAt: row.finalized.at }));
   const cutoff = new Date(new Date(at).getTime() - window * 86400000).toISOString();
   // fleet#49: docs PRs the Principal opened while finalizing, within the window; Cory merges them.
   const docsPrs = rows.filter((row) => row.finalized && row.finalized.prUrl && String(row.finalized.at) >= cutoff).map((row) => ({ issue: row.issue, prUrl: row.finalized.prUrl, since: row.finalized.at }));
@@ -220,7 +232,7 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     decided: allTime.decided, spanDays: Number(spanDays.toFixed(1)), unchangedRatio: allTime.unchangedRatio,
     met: allTime.decided >= rule.minProposals && spanDays >= rule.minDays && allTime.unchangedRatio !== null && allTime.unchangedRatio >= rule.minUnchangedRatio,
   };
-  return { at, windowDays: window, byIssue, pending, awaitingFinalize, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
+  return { at, windowDays: window, byIssue, pending, awaitingFinalize, restated, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
 }
 
 // --------------------------------------------------------------- GitHub ----
@@ -444,14 +456,36 @@ function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, 
   return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', ...frontier };
 }
 
+// Spec fleet #92 (#145): the live body hash of one issue, hashed exactly as the
+// frontier and the assignment manifest hash it, for `record --kind finalized
+// --body-hash` after a finalize edited the body. Never hash a body by hand (fleet#48).
+function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner = execFileSync } = {}) {
+  const number = requireIssue(issue);
+  let body;
+  if (fixture) {
+    const found = readFixtureIssues(fixture).find((entry) => entry.number === number);
+    if (!found) throw new WorkStateError('TRIAGE_INVALID', `issue #${number} is not in the fixture ${fixture}`);
+    body = found.body;
+  } else {
+    const repo = readTenantConfig(root, tenant, tenantConfigPath).github;
+    try {
+      body = JSON.parse(runner('gh', ['issue', 'view', String(number), '-R', String(repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 })).body;
+    } catch (error) {
+      throw new WorkStateError('GITHUB_QUERY_FAILED', String(error.stderr || error.message || error));
+    }
+  }
+  return { tenant: String(tenant), issue: number, bodyHash: sha256(body || '') };
+}
+
 // ------------------------------------------------------------------ CLI ----
 
 const TRIAGE_FLAGS = Object.freeze({
   frontier: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
-  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'now'],
+  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'now'],
   state: ['root', 'tenant', 'now', 'days'],
+  hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -463,9 +497,10 @@ function cli(argv) {
   if (command === 'record') {
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
-      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], now: args.now,
+      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], now: args.now,
     });
   }
+  if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
   const config = readTriageConfig(args.root);
   const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation });
   const { byIssue, ...summary } = projection;
@@ -490,6 +525,7 @@ module.exports = {
   TRIAGE_FLAGS,
   cli,
   computeFrontier,
+  issueBodyHash,
   ledgerPath,
   normalizeIssue,
   projectTriage,

@@ -262,7 +262,7 @@ test('the CLI refuses an unknown flag with exit 2 and a missing tenant as usage;
   const state = JSON.parse(run(['state', '--root', root, '--tenant', 'endzone', '--now', NOW]).stdout.trim());
   assert.deepEqual(state.pending.map((row) => row.issue), [1]);
   assert.equal('byIssue' in state, false, 'the state command prints the summary, not the per-issue fold');
-  assert.deepEqual(Object.keys(TRIAGE_FLAGS), ['frontier', 'record', 'state']);
+  assert.deepEqual(Object.keys(TRIAGE_FLAGS), ['frontier', 'record', 'state', 'hash']);
   assert.equal(typeof cli, 'function');
 });
 
@@ -285,4 +285,53 @@ test('#143: the frontier carries a premises census of the open ready tickets', (
     issue(25, { labels: ['needs-triage'], body: 'Not ready, not counted.' }),
   ]);
   assert.deepEqual(result.premises, { readyLabel: 'ready-for-agent', ready: 4, missing: [21], malformed: [24] });
+});
+
+// Spec fleet #92 / #145: the Principal stamps the sha it verified the premises at;
+// a finalize that restates a false premise edits the body, and the ledger records
+// the restated body's hash beside the proposal's.
+test('#145: record --kind proposed --premises-sha stores premisesSha and refuses a malformed sha', () => {
+  const root = rootDir();
+  const sha = 'abcdef0123456789abcdef0123456789abcdef01';
+  const base = { root, tenant: 'endzone', kind: 'proposed', bodyHash: 'hash-a', commentUrl: 'https://x/1', model: 'fable', now: '2026-09-24T00:00:00.000Z' };
+  assert.throws(() => recordEntry({ ...base, issue: 1, premisesSha: 'abc12' }), (error) => error.code === 'TRIAGE_INVALID' && /premises-sha/.test(error.message));
+  assert.throws(() => recordEntry({ ...base, issue: 1, premisesSha: 'not-a-sha' }), { code: 'TRIAGE_INVALID' });
+  assert.equal(recordEntry({ ...base, issue: 1, premisesSha: sha.toUpperCase() }).premisesSha, sha);
+  assert.equal(recordEntry({ ...base, issue: 2 }).premisesSha, undefined);
+  assert.ok(TRIAGE_FLAGS.record.includes('premises-sha'));
+  const viaCli = cli(['record', '--root', root, '--tenant', 'endzone', '--kind', 'proposed', '--issue', '3', '--body-hash', 'hash-c', '--comment-url', 'https://x/3', '--model', 'fable', '--premises-sha', sha.slice(0, 7), '--now', '2026-09-24T00:00:00.000Z']);
+  assert.equal(viaCli.premisesSha, sha.slice(0, 7));
+});
+
+test('#145: a finalize that edits the body records the new hash; state shows both hashes and nothing is re-proposed', () => {
+  const root = rootDir();
+  const proposedBody = '## Premises\n\nsrc/a.js: exports a @abcdef1\n';
+  const restatedBody = '## Premises\n\nsrc/a.js: exports b @1234567\n';
+  const proposedHash = triage.normalizeIssue(issue(5, { body: proposedBody })).bodyHash;
+  const restatedHash = triage.normalizeIssue(issue(5, { body: restatedBody })).bodyHash;
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 5, bodyHash: proposedHash, commentUrl: 'https://x/5', model: 'fable', premisesSha: '1234567', now: '2026-09-24T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 5, by: OWNER, now: '2026-09-24T01:00:00.000Z' });
+  const finalized = cli(['record', '--root', root, '--tenant', 'endzone', '--kind', 'finalized', '--issue', '5', '--labels', 'ready-for-agent', '--body-hash', restatedHash, '--now', '2026-09-24T02:00:00.000Z']);
+  assert.equal(finalized.bodyHash, restatedHash);
+  const state = cli(['state', '--root', root, '--tenant', 'endzone', '--now', '2026-09-24T03:00:00.000Z']);
+  assert.deepEqual(state.pending, []);
+  assert.deepEqual(state.awaitingFinalize, []);
+  assert.deepEqual(state.restated, [{ issue: 5, proposedBodyHash: proposedHash, finalizedBodyHash: restatedHash, finalizedAt: '2026-09-24T02:00:00.000Z' }]);
+  const entries = readLedger(root, 'endzone');
+  // Marker not yet removed, and after the ready label lands: neither is a re-proposal.
+  for (const labels of [['triage-proposed'], ['ready-for-agent']]) {
+    const result = frontier([issue(5, { body: restatedBody, labels })], { entries, now: '2026-09-24T03:00:00.000Z' });
+    assert.deepEqual(result.eligible, [], `labels ${labels}`);
+  }
+});
+
+test('#145: hash prints the live body hash exactly as the frontier computes it', () => {
+  const root = rootDir();
+  const fixture = path.join(root, 'issues.json');
+  const body = '## Premises' + String.fromCharCode(10) + 'none';
+  fs.writeFileSync(fixture, JSON.stringify([issue(5, { body })]));
+  const hashed = cli(['hash', '--root', root, '--tenant', 'endzone', '--issue', '5', '--fixture', fixture]);
+  assert.equal(hashed.bodyHash, triage.normalizeIssue(issue(5, { body })).bodyHash);
+  const viaGh = triage.issueBodyHash({ root, tenant: 'endzone', issue: 5, runner: (exe, args) => { assert.deepEqual(args.slice(0, 5), ['issue', 'view', '5', '-R', 'owner/repo']); return JSON.stringify({ body }); } });
+  assert.equal(viaGh.bodyHash, hashed.bodyHash);
 });
