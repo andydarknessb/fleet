@@ -11,7 +11,7 @@ function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllTex
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-identity-env-test-" + [guid]::NewGuid().ToString('N'))
 $saved = @{}
-foreach ($k in 'FLEET_IDENTITY_DIR','FLEET_NO_TOAST','GH_CONFIG_DIR','GIT_CONFIG_SYSTEM','GH_PROMPT_DISABLED','GIT_TERMINAL_PROMPT') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+foreach ($k in 'FLEET_IDENTITY_DIR','FLEET_NO_TOAST','GH_CONFIG_DIR','GIT_CONFIG_SYSTEM','GH_TOKEN','GCM_INTERACTIVE','GIT_ASKPASS','GH_PROMPT_DISABLED','GIT_TERMINAL_PROMPT') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
 
 # One child process per case: the env it ends with, and the credential git would send.
 function Run-Case {
@@ -22,7 +22,7 @@ function Run-Case {
 `$plan = Set-FleetIdentityProcessEnv
 `$paged = Send-FleetIdentityPageOnce -Plan `$plan -Source 'watchdog.ps1'
 `$cred = ("protocol=https``nhost=github.com``n``n" | & git credential fill 2>`$null | Out-String)
-[pscustomobject]@{ refusal = if (`$plan.refusal) { "`$(`$plan.refusal.code)" } else { `$null }; paged = `$paged; ghConfigDir = `$env:GH_CONFIG_DIR; cred = `$cred } | ConvertTo-Json -Compress
+[pscustomobject]@{ refusal = if (`$plan.refusal) { "`$(`$plan.refusal.code)" } else { `$null }; paged = `$paged; ghConfigDir = `$env:GH_CONFIG_DIR; ghToken = `$env:GH_TOKEN; cred = `$cred } | ConvertTo-Json -Compress
 "@
   Write-Utf8 "$testRoot\case.ps1" $script
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
@@ -42,13 +42,15 @@ try {
   # Present: the process env routes git through gh, which answers with the fleet token.
   $r1 = Run-Case '{"name":"t","fleetIdentity":"fleet-bot","ownerLogin":"cory-owner"}'
   Assert-True (-not $r1.refusal -and $r1.ghConfigDir -eq "$testRoot\identity") "the watchdog process must carry GH_CONFIG_DIR: $($r1 | ConvertTo-Json -Compress)"
-  Assert-True ("$($r1.cred)" -match 'username=fleet-bot' -and "$($r1.cred)" -match 'password=ghp_watchdog_probe') "a git push from the watchdog must authenticate as the fleet: $($r1.cred)"
+  Assert-True ("$($r1.cred)" -match 'username=fleet-bot' -and "$($r1.cred)" -match 'password=ghp_watchdog_probe') 'a git push from the watchdog must authenticate as the fleet (credential not printed)'
   Assert-True ($r1.paged -eq $false) 'a clean plan pages nothing'
 
   # Required but missing: nothing is set, one high page, and a second tick does not page again.
   Remove-Item -Recurse -Force "$testRoot\identity"
   $r2 = Run-Case '{"name":"t","fleetIdentity":"fleet-bot","ownerLogin":"cory-owner"}'
   Assert-True ($r2.refusal -eq 'FLEET_IDENTITY_MISSING' -and -not $r2.ghConfigDir) "a refused plan must set no identity env: $($r2 | ConvertTo-Json -Compress)"
+  Assert-True ("$($r2.cred)" -notmatch 'password=(gh[opsu]_|github_pat_)') 'a refused plan must leave git with no credentials, not the owner''s (credential not printed)'
+  Assert-True ("$($r2.ghToken)" -like 'fleet-identity-refused-*') 'a refused plan must give gh a token that authenticates as nobody'
   Assert-True ($r2.paged -eq $true) 'a refused plan must page'
   $r3 = Run-Case '{"name":"t","fleetIdentity":"fleet-bot","ownerLogin":"cory-owner"}'
   Assert-True ($r3.paged -eq $false) 'the same refusal on the next tick must not page again'

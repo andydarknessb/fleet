@@ -103,6 +103,10 @@ function sessionEnv(dir) {
     GH_PROMPT_DISABLED: '1',
     GIT_TERMINAL_PROMPT: '0',
     GIT_CONFIG_SYSTEM: path.join(dir, 'gitconfig'),
+    // An inherited GIT_ASKPASS (VS Code sets one) answers with the owner's credential
+    // whenever no helper does, e.g. a revoked fleet token. 'echo' answers garbage, so
+    // the push fails instead of going out as Cory. Settings env cannot unset a variable.
+    GIT_ASKPASS: 'echo',
   };
 }
 

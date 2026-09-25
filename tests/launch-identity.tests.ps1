@@ -48,6 +48,8 @@ try {
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   # The mock CLI lists no sessions and creates none: a launch that passes every gate ends at exit 5.
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  # The mock gh answers `api user` with MOCK_GH_LOGIN, or fails like an expired token when it is unset.
+  Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_GH_LOGIN%"=="" (echo HTTP 401: Bad credentials 1>&2 & exit /b 1)' + "`r`n" + 'echo %MOCK_GH_LOGIN%' + "`r`n" + 'exit /b 0' + "`r`n")
   [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
   Write-Utf8 "$testRoot\profile\.claude.json" ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}')
   $env:PATH = "$testRoot\mock-bin;$oldPath"
@@ -99,6 +101,12 @@ try {
   Assert-True ($lastExit -eq 3 -and $r4.code -eq 'FLEET_IDENTITY_MISMATCH' -and "$($r4.reason)" -match 'someone-else') "a directory for the wrong login must refuse: $lastOut"
   Assert-True (@(Get-PageLines).Count -eq 2) 'a different refusal code pages once more'
 
+  # Case 4b: the right login on disk, but GitHub refuses the token (expired or revoked).
+  Set-Identity 'fleet-bot'; $env:MOCK_GH_LOGIN = ''
+  $r4b = Run-Launch $dispatch
+  Assert-True ($lastExit -eq 3 -and $r4b.code -eq 'FLEET_IDENTITY_INVALID' -and "$($r4b.reason)" -match 'expired or revoked') "a token GitHub refuses must refuse the launch: $lastOut"
+  $env:MOCK_GH_LOGIN = 'fleet-bot'
+
   # Case 5: the right login: the launch passes the identity gate (and reaches the mock CLI,
   # which makes no session: exit 5), the settings carry the env, and the page marker clears.
   Set-Identity 'fleet-bot'
@@ -113,5 +121,6 @@ try {
   $env:USERPROFILE = $oldProfile
   $env:FLEET_IDENTITY_DIR = $oldIdentity
   $env:FLEET_NO_TOAST = $oldNoToast
+  $env:MOCK_GH_LOGIN = $null
   Remove-Item -Recurse -Force $testRoot -ErrorAction SilentlyContinue
 }

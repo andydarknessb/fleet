@@ -76,6 +76,10 @@ at the top of each tick. The variables are:
   git's reset is an empty value.
 - `GH_PROMPT_DISABLED` and `GIT_TERMINAL_PROMPT`, so a missing credential
   fails instead of waiting for an answer nobody will give.
+- `GIT_ASKPASS=echo`. A session started from a VS Code terminal inherits
+  VS Code's askpass, which answers with Cory's credential whenever no
+  helper does (a revoked fleet token, say). `echo` answers with the prompt
+  text, so such a push fails instead of going out as Cory.
 
 No token is ever written to `state/`, and no binary names a token or a
 login. The user's global gitconfig is untouched.
@@ -97,11 +101,17 @@ launch with it already acts as the machine user, and the premise check
 tenant names a `fleetIdentity` distinct from its `ownerLogin`, the directory
 is required. A launch without it refuses with `FLEET_IDENTITY_MISSING`, and a
 launch whose directory names another login refuses with
-`FLEET_IDENTITY_MISMATCH`. Either refusal writes no session, releases a
+`FLEET_IDENTITY_MISMATCH`. A launch whose token GitHub no longer accepts
+(expired or revoked; one `gh api user` call per launch) refuses with
+`FLEET_IDENTITY_INVALID`. Each refusal writes no session, releases a
 manifest's reservation, and pages once at high priority. There is no
 fallback to the keyring login. The Watchdog pages the same refusal once and
-keeps supervising under the task's own login, because a tick that stopped
-supervising over an identity fault would hide every other fault.
+keeps supervising locally, because a tick that stopped supervising over an
+identity fault would hide every other fault; its GitHub access fails closed
+(a `gh` token that authenticates as nobody, a system gitconfig with no
+credential helper, `GIT_ASKPASS=echo`), so it pushes and opens nothing as
+Cory. Sessions already running when the identity changes keep the settings
+they launched with until their next launch or Rotation.
 
 ## Consequences
 

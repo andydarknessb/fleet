@@ -230,6 +230,13 @@ if ($Role -eq 'ic') {
 # --- high page per code), writes no settings and no session, never falls back to
 # --- Cory's keyring login. A dry run reports the refusal but never pages.
 $identityPlan = Get-FleetIdentityPlan
+# A present token is asked of GitHub once (not in a dry run, which stays offline):
+# an expired or revoked one refuses as FLEET_IDENTITY_INVALID instead of launching a
+# session whose every gh call would fail unpaged.
+if (-not $identityPlan.refusal -and -not $DryRun) {
+  $liveRefusal = Test-FleetIdentityLive $identityPlan
+  if ($liveRefusal) { $identityPlan | Add-Member -NotePropertyName refusal -NotePropertyValue $liveRefusal -Force }
+}
 if ($identityPlan.refusal) {
   $identityReason = "$($identityPlan.refusal.code): $($identityPlan.refusal.message)"
   $released = $false; $paged = $false

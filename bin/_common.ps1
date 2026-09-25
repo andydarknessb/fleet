@@ -424,11 +424,43 @@ function Send-FleetIdentityPageOnce {
 }
 # The Watchdog's own process (and every git/gh/node child it starts) carries the
 # same environment a launched session does. Returns the plan so the caller can
-# report a refusal; with a refusal nothing is set (the caller decides).
+# report a refusal. A refusal fails CLOSED for GitHub: gh gets a token that
+# authenticates as nobody and git a system gitconfig whose helper list is empty,
+# so a push or PR from this process fails instead of going out under the task's
+# own (Cory's) login. Local supervision still runs (ADR 0015, spec review 09-25).
 function Set-FleetIdentityProcessEnv {
   $plan = Get-FleetIdentityPlan
   if (-not $plan.refusal -and $plan.env) {
     foreach ($p in $plan.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, "$($p.Value)", 'Process') }
+  } elseif ($plan.refusal) {
+    $closedDir = "$FleetHome\state\identity"
+    [IO.Directory]::CreateDirectory($closedDir) | Out-Null
+    $closed = "$closedDir\refused.gitconfig"
+    [IO.File]::WriteAllText($closed, "# fleet identity refused ($($plan.refusal.code)): no git credentials in this process`n[credential]`n`thelper =`n", $script:Utf8)
+    [Environment]::SetEnvironmentVariable('GIT_CONFIG_SYSTEM', $closed, 'Process')
+    [Environment]::SetEnvironmentVariable('GH_TOKEN', "fleet-identity-refused-$($plan.refusal.code)", 'Process')
+    [Environment]::SetEnvironmentVariable('GIT_TERMINAL_PROMPT', '0', 'Process')
+    [Environment]::SetEnvironmentVariable('GCM_INTERACTIVE', 'never', 'Process')
+    [Environment]::SetEnvironmentVariable('GIT_ASKPASS', 'echo', 'Process')   # an inherited askpass (VS Code) would answer as Cory
   }
   return $plan
+}
+# #153 spec review: a present hosts.yml can hold an expired or revoked token. The
+# launch asks GitHub once, with the fleet's own config, which login it is; a failure
+# or another login is FLEET_IDENTITY_INVALID. Returns $null when the token is good.
+function Test-FleetIdentityLive {
+  param($Plan)
+  if (-not $Plan.present -or $Plan.refusal) { return $null }
+  $saved = @{}; foreach ($k in 'GH_CONFIG_DIR','GH_TOKEN','GITHUB_TOKEN','GH_PROMPT_DISABLED') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+  try {
+    [Environment]::SetEnvironmentVariable('GH_TOKEN', $null, 'Process'); [Environment]::SetEnvironmentVariable('GITHUB_TOKEN', $null, 'Process')
+    [Environment]::SetEnvironmentVariable('GH_CONFIG_DIR', "$($Plan.dir)", 'Process'); [Environment]::SetEnvironmentVariable('GH_PROMPT_DISABLED', '1', 'Process')
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    $out = (& gh api user --jq .login 2>&1 | Out-String).Trim(); $code = $LASTEXITCODE
+    $ErrorActionPreference = $eap
+  } catch { $out = "$($_.Exception.Message)"; $code = 1 }
+  finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
+  if ($code -eq 0 -and "$out".ToLowerInvariant() -eq "$($Plan.login)".ToLowerInvariant()) { return $null }
+  $why = ("$out" -replace '\s+', ' '); if ($why.Length -gt 200) { $why = $why.Substring(0, 200) }
+  return [pscustomobject]@{ code = 'FLEET_IDENTITY_INVALID'; message = "the token in $($Plan.dir) did not answer as $($Plan.login) (gh api user: $why); it may be expired or revoked: re-run bin/wizard-fleet-identity.sh (ADR 0015)" }
 }

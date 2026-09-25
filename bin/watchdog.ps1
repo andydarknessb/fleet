@@ -40,9 +40,9 @@ try {
   # Spec fleet #93 / #153 (ADR 0015): the Watchdog pushes `live` and opens
   # branch-diverged pull requests, so its process (and every gh/git/node child it
   # starts) acts as the fleet's own login, exactly as a launched session does. A
-  # required identity that is missing or wrong pages once at high priority and the
-  # tick goes on supervising under the task's own login: supervision is not
-  # suspended for an identity fault, and the page makes it loud, not silent.
+  # required identity that is missing or wrong pages once at high priority; the
+  # tick keeps supervising locally while its GitHub access fails closed (no
+  # fallback to the task's own login: Set-FleetIdentityProcessEnv).
   $identityPlan = Set-FleetIdentityProcessEnv
   if (-not $Verify) { [void](Send-FleetIdentityPageOnce -Plan $identityPlan -Source 'watchdog.ps1' -NoToast:$NoToast) }
   $now = (Get-Date).ToUniversalTime()
