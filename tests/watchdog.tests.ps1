@@ -41,6 +41,11 @@ try {
   foreach ($dir in 'bin','tenants','state','state/heartbeats','state/sentinel','state/skip','state/watchdog','state/escalations','state/work','state/watch','profile/.claude/jobs/job-ic-901-2','repo','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
+  # fleet #136: these cases carry active Work records and no PR watcher, which the
+  # watchdog now pages as watcher-stale; the watcher's own rollback flag keeps that
+  # check out of every case here (tests/watcher-stale.tests.ps1 covers it).
+  [IO.Directory]::CreateDirectory("$testRoot\state\flags") | Out-Null
+  Write-Utf8 "$testRoot\state\flags\pr-watch-off" 'fleet #136: no PR watcher in this fixture'
   foreach ($f in '_common.ps1','sentinel-check.ps1','watchdog.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
 
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
