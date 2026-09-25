@@ -67,7 +67,8 @@ try {
   # recorded version and the launch door does not refuse the installed CLI there.
   $scratchProfile = Get-Content "$scratch\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
   Assert-True ($scratchProfile.PSObject.Properties['verifiedCliVersion'] -and $null -eq $scratchProfile.verifiedCliVersion) 'the scratch profile clears verifiedCliVersion so a rehearsal runs on the installed CLI'
-  Assert-True ([bool](Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json).verifiedCliVersion) 'the source profile keeps its recorded version'
+  Assert-True ($scratchProfile.rehearsalRoot -eq $true) 'the scratch profile is marked as a rehearsal root'
+  Assert-True (-not (Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json).PSObject.Properties['rehearsalRoot']) 'the source profile is never a rehearsal root'
   $scratchFwd = $scratch.Replace('\', '/')
   $settingsText = Get-Content "$scratch\fleet-settings.json" -Raw
   $hookCommands = @(($settingsText | ConvertFrom-Json).hooks.PSObject.Properties | ForEach-Object { $_.Value } | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })

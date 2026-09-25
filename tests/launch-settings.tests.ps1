@@ -158,7 +158,12 @@ exit $LASTEXITCODE
   Write-Utf8 $manifestPath ('{"schemaVersion":1,"id":"assignment-test-issue-77","status":"pending-ack","workRecordId":"test:issue-77","workRecordRevision":1,"issue":{"number":77,"bodyHash":"x","criteriaHash":"y"},"base":{"remote":"origin","ref":"integration","sha":"' + ('a' * 40) + '"},"branch":"fleet/77-x","tenant":"test","parent":"pl-test","model":"haiku","permissions":"allowlist"}')
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-77":{"id":"test:issue-77","state":"assigned","issue":77,"manifestPath":"m77"}}}'
   $profile = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
-  $env:MOCK_CLAUDE_VERSION = "$($profile.verifiedCliVersion)"
+  # #165: the checked-in profile records no version until a rehearsal passes; this root
+  # stands in for the fleet after a clean verdict on 2.1.282.
+  $verifiedProfile = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $verifiedProfile.verifiedCliVersion = '2.1.282'
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($verifiedProfile | ConvertTo-Json -Depth 6)
+  $env:MOCK_CLAUDE_VERSION = '2.1.282'
   $rm = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs on the verified CLI (got: $rm)"
   Assert-True ($rm.permissions -eq 'allowlist' -and $rm.allowRules -eq @($profile.allow).Count) "the dry run names the profile and its allow rule count (got $($rm.permissions)/$($rm.allowRules))"
@@ -177,18 +182,25 @@ exit $LASTEXITCODE
   Assert-True (-not (@(@($haikuSettings.permissions.allow) + $haikuDeny) | Where-Object { "$_" -match '<[a-zA-Z]+>' })) 'no unresolved token reaches the settings'
   # Spec #94 (#165): the profile records the CLI version the rehearsal passed on; a haiku
   # launch on any other `claude --version` is refused, naming both and the rehearsal.
-  Assert-True ("$($profile.verifiedCliVersion)" -match '^\d+\.\d+\.\d+$') 'the checked-in profile records the rehearsal CLI version'
   $env:MOCK_CLAUDE_VERSION = '9.9.999'
   $rmv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and $rmv.launched -eq $false) "a haiku launch on an unverified CLI must refuse with exit 3 (got $script:lastExit): $rmv"
-  Assert-True ("$($rmv.reason)" -match '9\.9\.999' -and "$($rmv.reason)" -match [regex]::Escape("$($profile.verifiedCliVersion)") -and "$($rmv.reason)" -match 'scratch-root\.ps1') "the version refusal names both versions and the rehearsal command: $($rmv.reason)"
+  Assert-True ("$($rmv.reason)" -match '9\.9\.999' -and "$($rmv.reason)" -match '2\.1\.282' -and "$($rmv.reason)" -match 'scratch-root\.ps1') "the version refusal names both versions and the rehearsal command: $($rmv.reason)"
   $rsv = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
   Assert-True ($rsv.dryRun -eq $true) 'a sonnet launch is unaffected by the recorded CLI version'
-  $unverified = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
-  $unverified.verifiedCliVersion = $null
-  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($unverified | ConvertTo-Json -Depth 6)
+  # The checked-in profile (no version: no rehearsal has passed) keeps the tier closed, so
+  # merging before a clean verdict opens nothing.
+  Assert-True ($null -eq $profile.verifiedCliVersion) 'the checked-in profile records no version until a rehearsal passes'
+  [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
+  $env:MOCK_CLAUDE_VERSION = '2.1.282'
   $rmn = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($rmn.dryRun -eq $true) "a profile with no recorded version (a scratch rehearsal root) launches on any CLI: $rmn"
+  Assert-True ($script:lastExit -eq 3 -and "$($rmn.reason)" -match 'no haiku rehearsal has passed') "no recorded version refuses a haiku launch: $rmn"
+  # A scratch root marks its copy rehearsalRoot: the rehearsal launch itself runs there.
+  $rehearsal = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $rehearsal | Add-Member -NotePropertyName rehearsalRoot -NotePropertyValue $true -Force
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($rehearsal | ConvertTo-Json -Depth 6)
+  $rmr = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rmr.dryRun -eq $true) "a rehearsal root launches haiku on the installed CLI: $rmr"
   [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
   Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
   # A sonnet manifest pinning allowlist is refused at the door too (the planner refuses it first).

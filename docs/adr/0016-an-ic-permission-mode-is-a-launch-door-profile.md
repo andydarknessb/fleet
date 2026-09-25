@@ -89,11 +89,13 @@ merges. A not-clean verdict means this amendment does not merge at all.
   file already names (copy changes, single-file fixes, test flakes, verbatim
   moves, exact-file tickets), and only under the allowlist profile.
 - `config/permissions-allowlist.json` records `verifiedCliVersion`, the CLI
-  the rehearsal passed on. `launch.ps1` refuses a haiku launch on any other
-  `claude --version`, dry runs included, naming both versions and the
-  rehearsal command. Sonnet launches never read the field.
+  the rehearsal passed on, and stays null until one passes. `launch.ps1`
+  refuses a haiku launch while it is null and on any other `claude --version`,
+  dry runs included, naming both versions and the rehearsal command, so this
+  amendment merging early opens nothing. Sonnet launches never read the field.
 - The re-test on a CLI update is the rehearsal again: `bin/scratch-root.ps1`
-  clears the field in its copy, so the scratch launch runs on the new CLI. A
+  marks its copy `rehearsalRoot: true`, the one place the guard stands aside,
+  so the scratch launch runs on the new CLI. A
   clean verdict bumps the field; that is the whole re-test.
 - `budgets.icJobTokensTargets.haiku` in `config/cycle.json` stays null. One
   rehearsal unit is not a median; the target is set from the weekly
