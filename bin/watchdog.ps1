@@ -115,7 +115,8 @@ try {
   # a refused push to high, not fall through to 'normal'.
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
+  # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -1139,6 +1140,60 @@ try {
     $reason = "$($lastDeploy.outcome)".Substring('refused:'.Length)
     $deployDetail = "the live checkout did not advance ($reason): $(Get-OneLine "$($lastDeploy.detail)" 250)"
     $conditions += [pscustomobject]@{ key = "deploy-refused:$reason"; kind = 'deploy-refused'; detail = $deployDetail; url = $null }
+  }
+  # fleet #136: the PR watcher is the only thing that advances a Work record past
+  # `implementing` and the only thing that wakes a lead for review; when it dies the fleet
+  # looks idle, not broken (2026-09-24: 2h20m of failed ticks, no page). Two conditions,
+  # both kind watcher-stale (high): `watcher-stale` when state/watch/health.json is older
+  # than watchdog.watchStaleMinutes (default 20, four missed 5-minute ticks), unparseable,
+  # or missing while any Work record is active; `watcher-stale:failing` when the file
+  # reports ok:false for watchdog.watchFailTicks consecutive ticks (default 3; pr-watch.js
+  # counts them in consecutiveFailures), naming the failing tenant(s). Both health shapes
+  # are read (the aggregate `tenants` map and a --tenant run's single `tenant`).
+  # state/flags/pr-watch-off stands down the watcher by design, so it stands down this
+  # check. PAUSE does not stop the PR watcher, so it does not suppress this check.
+  if (-not (Test-Path "$FleetHome\state\flags\pr-watch-off")) {
+    $watchStaleMinutes = 20
+    if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['watchStaleMinutes']) { $watchStaleMinutes = [int]$watchdogConfig.watchStaleMinutes }
+    $watchFailTicks = 3
+    if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['watchFailTicks']) { $watchFailTicks = [int]$watchdogConfig.watchFailTicks }
+    $watchHealthPath = "$FleetHome\state\watch\health.json"
+    $watchHealth = $null
+    $watchHealthPresent = Test-Path -LiteralPath $watchHealthPath
+    if ($watchHealthPresent) { try { $watchHealth = Read-Json $watchHealthPath } catch { $watchHealth = $null } }
+    $watchAt = if ($watchHealth) { ConvertTo-UtcDateTime $watchHealth.at } else { $null }
+    $watchLook = 'check state/watch/watch.log and the Fleet PR watch scheduled task; until it ticks no Work record advances and no lead is woken for review'
+    $watchStaleDetail = $null
+    if ($watchHealthPresent -and $null -eq $watchAt) {
+      $watchStaleDetail = "state/watch/health.json is unreadable or carries no readable 'at'; $watchLook"
+    } elseif ($null -ne $watchAt) {
+      $watchAge = (New-TimeSpan -Start $watchAt -End $now).TotalMinutes
+      if ($watchAge -gt $watchStaleMinutes -or $watchAge -lt -5) { $watchStaleDetail = "the PR watcher last wrote state/watch/health.json $([int][Math]::Floor($watchAge)) min ago (threshold $watchStaleMinutes min); $watchLook" }
+    } else {
+      $watchActive = 0
+      $watchActiveStates = @('assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision', 'hold')
+      try {
+        $watchActiveFile = Read-Json "$FleetHome\state\work\active.json"
+        if ($watchActiveFile -and $watchActiveFile.records) { $watchActive = @($watchActiveFile.records.PSObject.Properties | Where-Object { $watchActiveStates -contains "$($_.Value.state)" }).Count }
+      } catch { $watchActive = 1 }   # unreadable: fail toward paging
+      if ($watchActive -gt 0) { $watchStaleDetail = "no state/watch/health.json while $watchActive Work record(s) are active; $watchLook" }
+    }
+    if ($watchStaleDetail) {
+      $conditions += [pscustomobject]@{ key = 'watcher-stale'; kind = 'watcher-stale'; detail = $watchStaleDetail; url = $null }
+    } elseif ($watchHealth -and $watchHealth.ok -eq $false) {
+      $watchStreak = 1
+      try { if ([int]$watchHealth.consecutiveFailures -gt 0) { $watchStreak = [int]$watchHealth.consecutiveFailures } } catch {}
+      if ($watchStreak -ge $watchFailTicks) {
+        $watchFailing = @()
+        if ($watchHealth.PSObject.Properties['tenants'] -and $watchHealth.tenants) {
+          $watchFailing = @($watchHealth.tenants.PSObject.Properties | Where-Object { $_.Value.ok -eq $false } | ForEach-Object { "$($_.Name): $(Get-OneLine "$($_.Value.error)" 120)" })
+        } elseif ($watchHealth.PSObject.Properties['tenant']) {
+          $watchFailing = @("$($watchHealth.tenant): $(Get-OneLine "$($watchHealth.error)" 120)")
+        }
+        $watchWhich = if ($watchFailing.Count) { $watchFailing -join '; ' } else { Get-OneLine "$($watchHealth.error)" 200 }
+        $conditions += [pscustomobject]@{ key = 'watcher-stale:failing'; kind = 'watcher-stale'; detail = "the PR watcher failed $watchStreak consecutive ticks (threshold $watchFailTicks): $watchWhich; see state/watch/watch.log"; url = $null }
+      }
+    }
   }
   # 2026-09-18 QA (review 2, NIT): one name can raise launch-retry:<name> twice in
   # a tick (the daemon-row storm scan and the respawn-failed trip both key on the

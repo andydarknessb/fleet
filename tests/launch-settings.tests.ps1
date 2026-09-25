@@ -26,6 +26,7 @@ try {
   foreach ($f in '_common.ps1','launch.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
+  [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json")
   foreach ($roleName in 'dispatcher','project-lead','ic') {
     Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
   }
@@ -34,7 +35,7 @@ try {
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   $repoPath = "$testRoot\repo"
-  Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,"repo":' + ($repoPath | ConvertTo-Json) + '}')
+  Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,"defaultBranch":"integration","releaseBranch":"main","repo":' + ($repoPath | ConvertTo-Json) + '}')
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
   [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-disp") | Out-Null
   $env:PATH = "$testRoot\mock-bin;$oldPath"
@@ -142,6 +143,43 @@ exit $LASTEXITCODE
   Assert-True ("$($rh.reason)" -match 'auto mode' -and "$($rh.reason)" -match 'fleet #28') 'the haiku refusal must name the CLI auto-mode cause'
   $rs = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
   Assert-True ($rs.dryRun -eq $true -and $rs.model -eq 'sonnet') 'a sonnet launch still dry-runs'
+  Assert-True ($rs.permissions -eq 'auto' -and $rs.allowRules -eq 0) "a sonnet launch reports the auto profile with no allow rules (got $($rs.permissions)/$($rs.allowRules))"
+  $sonnetSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.json" -Raw | ConvertFrom-Json
+  Assert-True ($sonnetSettings.permissions.defaultMode -eq 'auto') 'the sonnet settings keep defaultMode auto'
+  Assert-True (-not $sonnetSettings.permissions.PSObject.Properties['allow'] -and -not $sonnetSettings.permissions.PSObject.Properties['additionalDirectories']) 'the sonnet settings carry no allow list and no additional directories'
+  $rha = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'haiku', '-Permissions', 'auto', '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rha.reason)" -match 'fleet #28') 'haiku under an explicit auto profile is still the fleet #28 refusal'
+
+  # Spec #94 (#162, ADR 0016): an allowlist manifest launches haiku under acceptEdits with
+  # the checked-in profile as its allow list, the fleet root as an additional directory,
+  # and every tool-contract deny rule still written. No --permission-mode on the command.
+  [IO.Directory]::CreateDirectory("$testRoot\state\manifests") | Out-Null
+  $manifestPath = "$testRoot\state\manifests\assignment-test-issue-77.json"
+  Write-Utf8 $manifestPath ('{"schemaVersion":1,"id":"assignment-test-issue-77","status":"pending-ack","workRecordId":"test:issue-77","workRecordRevision":1,"issue":{"number":77,"bodyHash":"x","criteriaHash":"y"},"base":{"remote":"origin","ref":"integration","sha":"' + ('a' * 40) + '"},"branch":"fleet/77-x","tenant":"test","parent":"pl-test","model":"haiku","permissions":"allowlist"}')
+  Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-77":{"id":"test:issue-77","state":"assigned","issue":77,"manifestPath":"m77"}}}'
+  $rm = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs (got: $rm)"
+  $profile = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  Assert-True ($rm.permissions -eq 'allowlist' -and $rm.allowRules -eq @($profile.allow).Count) "the dry run names the profile and its allow rule count (got $($rm.permissions)/$($rm.allowRules))"
+  Assert-True (-not ("$($rm.command)" -match '--permission-mode')) 'the permission mode is never passed on the command line'
+  $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
+  Assert-True ($haikuSettings.permissions.defaultMode -eq 'acceptEdits') 'the allowlist settings run acceptEdits'
+  $expectedAllow = @($profile.allow | ForEach-Object { "$($_.rule)".Replace('<fleet>', $rootFwd) })
+  Assert-True ((@($haikuSettings.permissions.allow) -join "`n") -eq ($expectedAllow -join "`n")) 'permissions.allow is the checked-in profile verbatim, <fleet> resolved to this root'
+  Assert-True (@($haikuSettings.permissions.additionalDirectories) -contains $rootFwd) 'additionalDirectories names the fleet root'
+  $haikuDeny = @($haikuSettings.permissions.deny)
+  foreach ($contractRule in @($deny2 | Where-Object { $_ -like "*$rootFwd/state*" })) {
+    Assert-True ($haikuDeny -contains $contractRule) "the allowlist settings keep the tool-contract deny rule $contractRule"
+  }
+  Assert-True ($haikuDeny -contains "Edit($rootFwd/**)") 'the profile denies edits across the fleet root it adds as a directory'
+  Assert-True ($haikuDeny -contains 'Bash(git push origin integration:*)') 'the profile deny resolves <defaultBranch> from the tenant file'
+  Assert-True (-not (@(@($haikuSettings.permissions.allow) + $haikuDeny) | Where-Object { "$_" -match '<[a-zA-Z]+>' })) 'no unresolved token reaches the settings'
+  # A sonnet manifest pinning allowlist is refused at the door too (the planner refuses it first).
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
+  $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rms.reason)" -match 'allowlist') "a sonnet allowlist manifest is refused (got: $rms)"
+  Remove-Item $manifestPath
+  Write-Utf8 "$testRoot\state\work\active.json" '{"records":{}}'
 
   # ADR 0011 (fleet #37): the Principal comes through the door as pe-<tenant>, on the
   # pinned Fable id at effort high, with the control-plane tenant-repo denial and its

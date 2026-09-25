@@ -403,20 +403,37 @@ function writeManifest(root, manifest) {
 // claude-haiku-4-5 is not on it (2.1.267 and 2.1.268 verified; an explicit
 // --permission-mode auto is downgraded too). A haiku --bg session therefore runs in
 // permission-mode default and blocks on its first out-of-cwd Read with nobody to
-// approve it. Amendment 14's haiku tier is suspended until the CLI list changes:
-// put 'haiku' back here AND in launch.ps1's refusal when it does.
-const IC_MODELS = Object.freeze(['sonnet']);
+// approve it. Spec #94 (#162, ADR 0016) goes around the CLI list instead of waiting
+// for it: the permission mode is a launch-door profile chosen per model. Sonnet runs
+// the auto profile; haiku runs only the allowlist profile (acceptEdits plus the
+// checked-in config/permissions-allowlist.json), and haiku under auto is still the
+// fleet #28 refusal. The manifest pins the profile beside the model.
+const IC_MODELS = Object.freeze(['sonnet', 'haiku']);
+const IC_PERMISSION_PROFILES = Object.freeze({ sonnet: Object.freeze(['auto']), haiku: Object.freeze(['allowlist']) });
+const PERMISSION_PROFILES = Object.freeze(['auto', 'allowlist']);
 const HAIKU_REFUSAL = "the installed Claude Code CLI has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet";
 
 function icModel(model) {
   const value = String(model === undefined || model === null || model === '' ? 'sonnet' : model).toLowerCase();
-  if (value === 'haiku') throw new WorkStateError('INVALID_IC_MODEL', HAIKU_REFUSAL);
-  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as sonnet, not '${model}' (amendment 14 with the haiku tier suspended by fleet #28; the risk reviewer is the only opus worker)`);
+  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as sonnet or haiku, not '${model}' (amendment 14; haiku only under the allowlist profile, fleet #28; the risk reviewer is the only opus worker)`);
   return value;
 }
 
-function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, premiseCheck = null, now, workRecordId, workRecordRevision = 1 } = {}) {
+// An absent profile is the model's first (sonnet: auto). Haiku under auto, asked for
+// or defaulted, is the fleet #28 refusal: the CLI would downgrade it to default mode.
+function icPermissions(model, permissions) {
+  const given = permissions === undefined || permissions === null || permissions === '' ? null : String(permissions).toLowerCase();
+  if (given !== null && !PERMISSION_PROFILES.includes(given)) throw new WorkStateError('INVALID_PERMISSION_PROFILE', `unknown permission profile '${permissions}'; known: ${PERMISSION_PROFILES.join(', ')} (ADR 0016)`);
+  if (model === 'haiku' && given !== 'allowlist') throw new WorkStateError('INVALID_IC_MODEL', HAIKU_REFUSAL);
+  const allowed = IC_PERMISSION_PROFILES[model];
+  const value = given === null ? allowed[0] : given;
+  if (!allowed.includes(value)) throw new WorkStateError('INVALID_PERMISSION_PROFILE', `a ${model} IC runs the ${allowed.join(' or ')} profile, not '${value}' (ADR 0016: the allowlist profile is the haiku profile)`);
+  return value;
+}
+
+function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 'pl-endzone', model = 'sonnet', permissions, risk = 'standard', tokenBudget = 25000, base, contextHeadings = [], adrPaths = [], testPlan = [], ciGates = [], independenceProof, premiseCheck = null, now, workRecordId, workRecordRevision = 1 } = {}) {
   model = icModel(model);
+  permissions = icPermissions(model, permissions);
   const normalized = normalizeIssue(issue);
   if (normalized.commentsTruncated) throw new WorkStateError('INCOMPLETE_ISSUE_CRITERIA', `issue #${normalized.number} has more comments than the assignment query can pin`);
   const createdAt = now || new Date().toISOString();
@@ -437,6 +454,7 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
     tenant,
     parent,
     model,
+    permissions,
     risk,
     tokenBudget,
     contextHeadings: [...contextHeadings],
@@ -494,7 +512,7 @@ function assignPremiseCheck({ issue, repoPath, base, premisesRechecked, runner }
   return check;
 }
 
-function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, premisesRechecked, now, actor = 'assignment-planner', runner } = {}) {
+function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, permissions, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, premisesRechecked, now, actor = 'assignment-planner', runner } = {}) {
   const proofRecords = hydrateActiveReservations(active, issues, tenant);
   const explicit = explicitReservations(reservations);
   const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, tenant, now });
@@ -526,7 +544,7 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
   const activeAssignments = proofRecords.filter((record) => record.manifestPath && record.state !== 'retired');
   const expectedProof = independenceProof([...activeAssignments, normalized]);
   if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, proof))) throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires a verified independent machine-readable proof');
-  const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, premiseCheck, now, workRecordId, workRecordRevision: baseline.revision });
+  const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, permissions, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, premiseCheck, now, workRecordId, workRecordRevision: baseline.revision });
   const manifestPath = writeManifest(root, manifest);
   try {
     const reserved = reserveRecord({
@@ -627,7 +645,7 @@ const FLAGS = Object.freeze({
   frontier: FRONTIER_FLAGS,
   proof: [...FRONTIER_FLAGS, 'issue', 'reservations'],
   assign: [
-    ...FRONTIER_FLAGS, 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'risk', 'token-budget',
+    ...FRONTIER_FLAGS, 'issue', 'base-sha', 'remote', 'ref', 'repo-path', 'parent', 'model', 'permissions', 'risk', 'token-budget',
     'test-plan', 'ci-gates', 'context-headings', 'adr-paths', 'independence-proof', 'reservations', 'premises-rechecked',
   ],
   validate: ['manifest', 'issue', 'base-sha'],
@@ -718,7 +736,10 @@ function cli(argv) {
     for (const key of ['test-plan', 'ci-gates', 'context-headings', 'adr-paths']) { if (args[key] === 'true') throw new WorkStateError('USAGE', `--${key} needs a comma-separated value`); }
     const testPlan = given('test-plan') ? list('test-plan') : Object.entries(config.checks || {}).map(([name, command]) => `${name}: ${command}`);
     const ciGates = given('ci-gates') ? list('ci-gates') : [...(config.ciGates || [])];
-    return reserveAssignment({ root: args.root, issue: frontier.eligible[0], issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, premisesRechecked: args['premises-rechecked'], now: args.now });
+    // Spec #94: --issue reserves that frontier issue (a rehearsal's chosen ticket), not the head.
+    const chosen = args.issue ? frontier.eligible.find((entry) => entry.number === Number(args.issue)) : frontier.eligible[0];
+    if (!chosen) throw new WorkStateError('NO_FRONTIER', `issue #${args.issue} is not on the frontier`, { excluded: frontier.excluded });
+    return reserveAssignment({ root: args.root, issue: chosen, issues, tenant, tenantConfig: config, readyLabel, active, skipIssues, exclusions, repoPath: args['repo-path'], base, ref: args.ref, parent: args.parent, model: args.model, permissions: args.permissions, risk: args.risk, tokenBudget: args['token-budget'] ? Number(args['token-budget']) : undefined, contextHeadings: list('context-headings'), adrPaths: list('adr-paths'), testPlan, ciGates, independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined, reservations: args.reservations, premisesRechecked: args['premises-rechecked'], now: args.now });
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });
@@ -742,6 +763,7 @@ if (require.main === module) {
 module.exports = {
   FLAGS,
   IC_MODELS,
+  IC_PERMISSION_PROFILES,
   acknowledgeAssignment,
   buildManifest,
   buildLaunchPlan,
