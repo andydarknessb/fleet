@@ -133,8 +133,15 @@ function Complete-Rotation {
     # while it ran 16h on frozen flags with no roster row. A job this rotation stopped,
     # or one created before the rotation began, is a stale revival: stop it and launch
     # the replacement through the door.
-    $runningRow = @(Get-DaemonSessions | Where-Object { "$($_.name)" -eq "$($Intent.name)" }) | Select-Object -First 1
-    $staleWhy = Get-StaleRevival -Intent $Intent -Row $runningRow
+    # A strict read: a glitched daemon list must not read as "nothing stale is running",
+    # which would close the intent as an external relaunch (review of #121).
+    $daemonReadError = $null
+    $runningRow = $null
+    try { $runningRow = @(Get-DaemonSessions -Strict | Where-Object { "$($_.name)" -eq "$($Intent.name)" }) | Select-Object -First 1 } catch { $daemonReadError = "$($_.Exception.Message)" }
+    if ($daemonReadError) {
+      $launch = [pscustomobject]@{ launched = $false; reason = "a session named '$($Intent.name)' is running, and the daemon list could not be read to tell a hand relaunch from a stale revival ($daemonReadError); the intent stays open for the next run" }
+    }
+    $staleWhy = if ($daemonReadError) { $null } else { Get-StaleRevival -Intent $Intent -Row $runningRow }
     if ($staleWhy) {
       & claude stop $runningRow.id 2>&1 | Out-Null
       $Intent | Add-Member -NotePropertyName staleRevival -NotePropertyValue ([pscustomobject]@{ at = (Now-Iso); jobId = "$($runningRow.id)"; why = $staleWhy }) -Force
@@ -142,6 +149,11 @@ function Complete-Rotation {
       $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
       $launchExit = $LASTEXITCODE
       $launch = ConvertFrom-LastJsonLine $out
+      # Still "already running" after the stop: the stale job did not go down (a failed or
+      # late stop). That is not a hand relaunch either; fail and keep the intent resumable.
+      if ($launch -and "$($launch.reason)" -match 'already running') {
+        $launch = [pscustomobject]@{ launched = $false; reason = "the stale revival of job $($runningRow.id) was still running after claude stop ($staleWhy); the intent stays open for the next run" }
+      }
     }
   }
   if ($launch -and $launch.launched) {

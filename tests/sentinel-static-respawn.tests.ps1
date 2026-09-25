@@ -33,7 +33,10 @@ try {
   }
   foreach ($f in '_common.ps1', 'sentinel-check.ps1', 'pause.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   Write-Utf8 "$testRoot\agents\project-lead.md" "---`nname: project-lead`nmodel: opus`neffort: high`n---`nLead."
-  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"lead"}]}'
+  Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":' + ("$testRoot\repo" | ConvertTo-Json) + ',"prompt":"lead"}]}')
+  # The relaunch pre-flight asks the same trust question launch.ps1 does (fleet #104).
+  [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
+  [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))
   Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","defaultBranch":"master","branchPrefix":"fleet/","repo":' + ("$testRoot\repo" | ConvertTo-Json) + '}')
   Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{},"prs":{}}'
   Write-Utf8 "$testRoot\state\heartbeats\pl-test.json" (ConvertTo-Json @{ at = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o') } -Compress)
@@ -59,8 +62,9 @@ exit 0
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'echo []' + "`r`n" + 'exit /b 0' + "`r`n")
   # launch.ps1 is the door the relaunch must go through; the mock logs the call.
   $mockLaunch = @'
-param([string]$FromRoster, [switch]$Force)
-[IO.File]::AppendAllText('TESTROOT\calls.txt', "launch $FromRoster`r`n")
+param([string]$FromRoster, [string]$Model, [switch]$Force)
+$modelMark = if ($Model) { "|$Model" } else { '' }
+[IO.File]::AppendAllText('TESTROOT\calls.txt', "launch $FromRoster$modelMark`r`n")
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"workspace not trusted"}'; exit 7 }
 Write-Output ('{"launched":true,"name":"' + $FromRoster + '","jobId":"job-new","sessionId":"sess-new"}')
 exit 0
@@ -138,7 +142,7 @@ exit 0
   # sonnet` alias). The CLI still records the resolved id in respawnFlags, so a frozen
   # claude-sonnet-5 is the role's own model and respawns; a frozen other family relaunches.
   Write-Utf8 "$testRoot\agents\dispatcher.md" "---`nname: dispatcher`nmodel: sonnet`neffort: low`n---`nDispatcher."
-  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory","cwd":"x","prompt":"d"}]}'
+  Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory","cwd":' + ("$testRoot\repo" | ConvertTo-Json) + ',"prompt":"d"}]}')
   Write-Utf8 "$testRoot\state\heartbeats\dispatcher.json" (ConvertTo-Json @{ at = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o') } -Compress)
   Set-LiveRoster '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-d","model":""}]}'
   $env:MOCK_ROW_NAME = 'dispatcher'
@@ -150,6 +154,39 @@ exit 0
   Set-Job 'job-d' @('--name', 'dispatcher', '--agent', 'dispatcher', '--settings', 'x', '--model', 'claude-haiku-4-5', '--effort', 'low')
   $s8b = Run-Check
   Assert-True ("$(@($s8b.respawned | Where-Object { $_.name -eq 'dispatcher' })[0].via)" -eq 'launch') 'S8: an unpinned role frozen on another model family relaunches'
+
+  # S9 (review): a hand-set model alias on the roster row (launch.ps1 -Model sonnet) froze
+  # as claude-sonnet-5: that is the roster's own choice and respawns. When a relaunch is
+  # needed, it carries the roster's -Model so the hand choice is not reverted.
+  Set-LiveRoster '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-d","model":"haiku"}]}'
+  Set-Job 'job-d' @('--name', 'dispatcher', '--agent', 'dispatcher', '--settings', 'x', '--model', 'claude-haiku-4-5', '--effort', 'low')
+  $s9 = Run-Check
+  Assert-True ("$(@($s9.respawned | Where-Object { $_.name -eq 'dispatcher' })[0].via)" -ne 'launch') 'S9: a roster alias that froze as its family id respawns'
+  Set-Job 'job-d' @('--name', 'dispatcher', '--agent', 'dispatcher', '--settings', 'x', '--model', 'claude-haiku-4-5', '--effort', 'xhigh')
+  Reset-Calls
+  $s9b = Run-Check -Apply
+  Assert-True (@(Get-Calls) -contains 'launch dispatcher|haiku') "S9: the relaunch keeps the roster's -Model (calls: $(@(Get-Calls) -join '; '))"
+
+  # S10 (review): a roster row with no jobId cannot prove the job is its own: relaunch.
+  Set-LiveRoster '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","model":""}]}'
+  Set-Job 'job-d' @('--name', 'dispatcher', '--agent', 'dispatcher', '--settings', 'x', '--model', 'claude-sonnet-5', '--effort', 'low')
+  $s10 = Run-Check
+  Assert-True ("$(@($s10.respawned | Where-Object { $_.name -eq 'dispatcher' })[0].via)" -eq 'launch') 'S10: a roster row without a jobId relaunches'
+
+  # S11 (review): the relaunch never stops a running session the door would then refuse.
+  # Under PAUSE (or an untrusted workspace) it is deferred with the reason, nothing stopped.
+  Set-LiveRoster '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-d","model":""}]}'
+  Set-Job 'job-d' @('--name', 'dispatcher', '--agent', 'dispatcher', '--settings', 'x', '--model', 'claude-haiku-4-5', '--effort', 'low')
+  Write-Utf8 "$testRoot\state\PAUSE" 'rate limit'
+  Reset-Calls
+  $s11 = Run-Check -Apply
+  Assert-True (@(Get-Calls).Count -eq 0) "S11: nothing is stopped or launched under PAUSE (calls: $(@(Get-Calls) -join '; '))"
+  Assert-True (@($s11.respawnDeferred | Where-Object { $_.name -eq 'dispatcher' -and "$($_.reason)" -match 'PAUSE' }).Count -eq 1) "S11: the relaunch is deferred naming PAUSE (got $($s11.respawnDeferred | ConvertTo-Json -Compress))"
+  Remove-Item "$testRoot\state\PAUSE"
+  Write-Utf8 "$testRoot\profile\.claude.json" '{"projects":{}}'
+  Reset-Calls
+  $s11b = Run-Check -Apply
+  Assert-True (@(Get-Calls).Count -eq 0 -and @($s11b.respawnDeferred | Where-Object { "$($_.reason)" -match 'trust' }).Count -eq 1) "S11: an untrusted workspace defers the relaunch before any stop (calls: $(@(Get-Calls) -join '; '))"
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) static-respawn assertion(s) failed" }
   Write-Output 'sentinel static respawn tests passed'

@@ -370,6 +370,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
 
   # Case 10g: a respawn files an escalation naming the parent (the re-send nudge the Sentinel used to message).
   $stoppedPl = $plRow.Replace('"state":"working"', '"state":"stopped"')
+  # fleet #121: a static is respawned (not relaunched through launch.ps1) only when its job
+  # is the live roster's own and its frozen flags match what launch.ps1 passes today.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","jobId":"job-p","model":"opus-5.5"}]}'
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-p") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-p\state.json" '{"state":"stopped","respawnFlags":["--name","pl-test","--agent","project-lead","--model","claude-opus-5-5"]}'
   Set-AgentsRows "[$dispRow,$stoppedPl]"
   $r10g = Run-Watchdog
   Assert-True (@($r10g.proposed.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'a stopped static session is respawned by the applied check'
@@ -390,6 +395,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $r10g3 = Run-Watchdog
   Assert-True (@($r10g3.notified | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'a respawn after a clean tick is a new event and notifies again'
   Set-AgentsRows $noSentinelRows
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item "$testRoot\profile\.claude\jobs\job-p\state.json" -ErrorAction SilentlyContinue
 
   # Case 10g-strict: an unreadable daemon list under the flag must not read as "no Sentinel running".
   $env:MOCK_CLAUDE_FAIL = '1'

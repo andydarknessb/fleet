@@ -75,7 +75,7 @@ Add-Content "$root\launch-calls.log" "$FromRoster$forceMark"
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"cap reached (6/6)"}'; exit 3 }
 # fleet #121: the first launch meets a session already running under the name (the
 # stale revival, or a hand relaunch), the next one goes through.
-if ($env:MOCK_LAUNCH_RUNNING -eq '1' -and -not (Test-Path "$root\launch-running.marker")) { Set-Content "$root\launch-running.marker" 'x'; Write-Output ('{"launched":false,"reason":"a session named ''' + $FromRoster + ''' is already running; use claude respawn"}'); exit 3 }
+if ($env:MOCK_LAUNCH_RUNNING -eq 'always' -or ($env:MOCK_LAUNCH_RUNNING -eq '1' -and -not (Test-Path "$root\launch-running.marker"))) { Set-Content "$root\launch-running.marker" 'x'; Write-Output ('{"launched":false,"reason":"a session named ''' + $FromRoster + ''' is already running; use claude respawn"}'); exit 3 }
 Write-Output ('{"launched":true,"name":"' + $FromRoster + '","jobId":"job-new","sessionId":"sess-new"}')
 exit 0
 '@
@@ -225,6 +225,19 @@ console.log(JSON.stringify({ ok: true }));
   $r6d = Run-Rotate @('-Resume')
   $intent6d = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
   Assert-True ("$($intent6d.launchedBy)" -eq 'external' -and -not (Test-Path "$testRoot\claude-calls.log")) 'a session launched after the rotation began stays an external relaunch, untouched'
+
+  # Case 6e (review of #121): the stale job survives its stop (the name still reads
+  # "already running"). That is a failure that keeps the intent open, never external.
+  Set-LiveRoster $old 'retired'; Reset-Markers
+  Remove-Item "$testRoot\launch-running.marker", "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  Set-AgentsRows '[{"id":"job-stale","name":"dispatcher","state":"working","status":"idle","pid":21,"sessionId":"sess-stale","startedAt":1786115823884}]'
+  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  $env:MOCK_LAUNCH_RUNNING = 'always'
+  $r6e = Run-Rotate @('-Resume')
+  $intent6e = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($intent6e.launchedBy)" -ne 'external' -and $intent6e.phase -ne 'launched') "a stale revival that survives its stop must not close the intent (intent: $($intent6e | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True ("$($intent6e.launchError.reason)" -match 'still running after claude stop') 'the launch error says the stale job survived its stop'
+  Assert-True (@($r6e.outcomes | Where-Object { $_.status -eq 'failed' }).Count -eq 1) 'the rotation reports failed'
   Remove-Item Env:MOCK_LAUNCH_RUNNING
   Remove-Item "$testRoot\launch-running.marker" -ErrorAction SilentlyContinue
 
