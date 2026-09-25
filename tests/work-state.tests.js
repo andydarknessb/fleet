@@ -1105,7 +1105,7 @@ test('fleet#141: a CLI decision transition stamps its actor on the outbox line, 
 test('fleet#56: the Principal sees a lead escalation on a PR-less record', () => {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', ownerLogin: 'cory', fleetIdentity: 'cory' }));
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', ownerLogin: 'cory', fleetIdentity: 'fleet-bot' }));
   const fixture = path.join(root, 'issues.json');
   fs.writeFileSync(fixture, JSON.stringify([{ number: 1267, title: 'Ticket', url: 'https://github.com/owner/repo/issues/1267', body: 'x', createdAt: '2026-09-11T00:00:00.000Z', labels: ['ready-for-agent'], assignees: [], comments: [] }]));
   makeRecord(root, { id: 'endzone:issue-1267', issue: 1267, github: { issueNumber: 1267 }, idempotencyKey: 'create-1267' });
