@@ -335,3 +335,68 @@ test('#145: hash prints the live body hash exactly as the frontier computes it',
   const viaGh = triage.issueBodyHash({ root, tenant: 'endzone', issue: 5, runner: (exe, args) => { assert.deepEqual(args.slice(0, 5), ['issue', 'view', '5', '-R', 'owner/repo']); return JSON.stringify({ body }); } });
   assert.equal(viaGh.bodyHash, hashed.bodyHash);
 });
+
+// Spec fleet #92 / #148: a stale-premise restatement is logged with Cory's verdict
+// for a month, and a dated notice asks for the ruling on evidence.
+const STALE_LINE = 'src/lib/b.js: exports 2 @0123456';
+
+test('#148: record --kind proposed --reason stale-premise --premise stores both; any other reason is refused', () => {
+  const root = rootDir();
+  const base = { root, tenant: 'endzone', kind: 'proposed', bodyHash: 'hash-a', commentUrl: 'https://x/1', model: 'fable', now: '2026-09-24T00:00:00.000Z' };
+  assert.throws(() => recordEntry({ ...base, issue: 1, reason: 'drift', premise: STALE_LINE }), (error) => error.code === 'TRIAGE_INVALID' && /stale-premise/.test(error.message));
+  assert.throws(() => recordEntry({ ...base, issue: 1, reason: 'stale-premise' }), (error) => error.code === 'TRIAGE_INVALID' && /--premise/.test(error.message));
+  assert.throws(() => recordEntry({ ...base, issue: 1, premise: STALE_LINE }), (error) => error.code === 'TRIAGE_INVALID' && /--reason/.test(error.message));
+  const entry = cli(['record', '--root', root, '--tenant', 'endzone', '--kind', 'proposed', '--issue', '1', '--body-hash', 'hash-a', '--comment-url', 'https://x/1', '--model', 'fable', '--reason', 'stale-premise', '--premise', STALE_LINE, '--now', '2026-09-24T00:00:00.000Z']);
+  assert.equal(entry.reason, 'stale-premise');
+  assert.equal(entry.premise, STALE_LINE);
+  assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 1, by: OWNER, reason: 'stale-premise', premise: STALE_LINE }), { code: 'TRIAGE_INVALID' });
+});
+
+test('#148: the projection lists 30 days of stale-premise restatements with verdict and age, counted by verdict', () => {
+  const root = rootDir();
+  const propose = (issue, at, extra = {}) => recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue, bodyHash: `h${issue}`, commentUrl: `https://x/${issue}`, model: 'fable', reason: 'stale-premise', premise: `${STALE_LINE} #${issue}`, now: at, ...extra });
+  propose(1, '2026-08-01T00:00:00.000Z');   // outside the window
+  propose(2, '2026-09-20T00:00:00.000Z');
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 2, by: OWNER, now: '2026-09-21T00:00:00.000Z' });
+  propose(3, '2026-09-22T00:00:00.000Z');
+  recordEntry({ root, tenant: 'endzone', kind: 'rejected', issue: 3, by: OWNER, now: '2026-09-22T12:00:00.000Z' });
+  propose(4, '2026-09-23T12:00:00.000Z');
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 5, bodyHash: 'h5', commentUrl: 'https://x/5', model: 'fable', now: '2026-09-23T00:00:00.000Z' });   // not stale-premise
+  const fold = projectTriage({ entries: readLedger(root, 'endzone'), now: '2026-09-24T00:00:00.000Z' });
+  assert.deepEqual(fold.stalePremise.rows, [
+    { issue: 2, premise: `${STALE_LINE} #2`, proposedAt: '2026-09-20T00:00:00.000Z', verdict: 'approved', ageDays: 4 },
+    { issue: 3, premise: `${STALE_LINE} #3`, proposedAt: '2026-09-22T00:00:00.000Z', verdict: 'rejected', ageDays: 2 },
+    { issue: 4, premise: `${STALE_LINE} #4`, proposedAt: '2026-09-23T12:00:00.000Z', verdict: 'pending', ageDays: 0.5 },
+  ]);
+  assert.deepEqual(fold.stalePremise.counts, { approved: 1, 'approved-with-edits': 0, rejected: 1, superseded: 0, pending: 1 });
+});
+
+test('#148: the dated notice arms on the first stale-premise entry, pages once at 30 days with the tally, and never twice', () => {
+  const root = rootDir();
+  const noticeFile = path.join(root, 'state', 'triage', 'stale-premise-notice.json');
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: 'h7', commentUrl: 'https://x/7', model: 'fable', now: '2026-09-24T00:00:00.000Z' });
+  assert.equal(fs.existsSync(noticeFile), false, 'an ordinary proposal arms nothing');
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 8, bodyHash: 'h8', commentUrl: 'https://x/8', model: 'fable', reason: 'stale-premise', premise: STALE_LINE, now: '2026-09-25T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 8, by: OWNER, now: '2026-09-25T02:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 9, bodyHash: 'h9', commentUrl: 'https://x/9', model: 'fable', reason: 'stale-premise', premise: STALE_LINE, now: '2026-10-01T00:00:00.000Z' });
+  const armed = JSON.parse(fs.readFileSync(noticeFile, 'utf8'));
+  assert.equal(armed.armedAt, '2026-09-25T00:00:00.000Z', 'armed by the first stale-premise entry, not re-armed by the second');
+  assert.equal(armed.dueAt, '2026-10-25T00:00:00.000Z');
+
+  const sent = [];
+  const send = (message) => { sent.push(message); return { ok: true }; };
+  assert.deepEqual(triage.runStalePremiseNotice({ root, now: '2026-10-24T23:59:00.000Z', send }).due, false);
+  const failing = triage.runStalePremiseNotice({ root, now: '2026-10-25T08:00:00.000Z', send: () => ({ ok: false, detail: 'down' }) });
+  assert.equal(failing.sent, false, 'a failed send is not a page: it stays armed');
+  const fired = triage.runStalePremiseNotice({ root, now: '2026-10-26T08:00:00.000Z', send });
+  assert.equal(fired.sent, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, 'dated');
+  assert.equal(sent[0].priority, 'normal');
+  assert.match(sent[0].body, /rule whether stale-premise restatements may skip Approval/);
+  assert.match(sent[0].body, /2 stale-premise restatement\(s\) since 2026-09-25: 1 approved, 0 approved with edits, 0 rejected, 1 pending/);
+  const replay = triage.runStalePremiseNotice({ root, now: '2026-10-27T08:00:00.000Z', send });
+  assert.equal(replay.sent, false);
+  assert.equal(replay.firedAt, '2026-10-26T08:00:00.000Z');
+  assert.equal(sent.length, 1, 'a replay never pages twice');
+});

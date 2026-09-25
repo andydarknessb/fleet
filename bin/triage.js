@@ -126,7 +126,7 @@ function appendEntry(root, tenant, entry) {
   return entry;
 }
 
-function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, now } = {}) {
+function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, now } = {}) {
   if (!LEDGER_KINDS.includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `kind must be one of ${LEDGER_KINDS.join(', ')}`);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : 'principal' };
@@ -165,6 +165,14 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     // body; the restated body's hash is what the lead's manifest will pin.
     if (bodyHash) entry.bodyHash = String(bodyHash);
   }
+  // Spec fleet #92 (#148): a proposal caused by a stale premise says so, with the
+  // premise line, so its verdict can be counted before ADR 0011 is revisited.
+  if (reason !== undefined || premise !== undefined) {
+    if (kind !== 'proposed') throw new WorkStateError('TRIAGE_INVALID', '--reason and --premise belong to a proposal (--kind proposed)');
+    if (!PROPOSAL_REASONS.includes(reason)) throw new WorkStateError('TRIAGE_INVALID', `--reason must be one of ${PROPOSAL_REASONS.join(', ')}${reason === undefined ? ' (--premise needs --reason stale-premise)' : ''}`);
+    entry.reason = reason;
+    entry.premise = requireText(premise, '--premise');
+  }
   if (evidence) entry.evidence = String(evidence);
   const entries = readLedger(root, tenant);
   if (kind === 'proposed') {
@@ -176,7 +184,91 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     if (OUTCOME_KINDS.includes(kind) && open.outcome) throw new WorkStateError('TRIAGE_OUTCOME_RECORDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at}`);
     if (kind === 'finalized' && !open.outcome) throw new WorkStateError('TRIAGE_NOT_APPROVED', `issue #${entry.issue} has no approval to finalize`);
   }
-  return appendEntry(root, tenant, entry);
+  appendEntry(root, tenant, entry);
+  if (entry.reason === 'stale-premise') armStalePremiseNotice(root, entry);
+  return entry;
+}
+
+// ------------------------------------------------ stale-premise notice ----
+// Spec fleet #92 (#148): the first stale-premise restatement arms a dated notice
+// that pages once, 30 days later, asking Cory to rule whether such restatements
+// may skip Approval (ADR 0011), with the tally so far. The file is created once
+// (wx) and marked fired only on a delivered page, so a replay never pages twice.
+
+const STALE_NOTICE_DAYS = 30;
+const PROPOSAL_REASONS = Object.freeze(['stale-premise']);
+
+function staleNoticePath(root) {
+  return path.join(baseOf(root), 'state', 'triage', 'stale-premise-notice.json');
+}
+
+function armStalePremiseNotice(root, entry) {
+  const file = staleNoticePath(root);
+  if (fs.existsSync(file)) return false;
+  const dueAt = new Date(new Date(entry.at).getTime() + STALE_NOTICE_DAYS * 86400000).toISOString();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try {
+    fs.writeFileSync(file, `${JSON.stringify({ schemaVersion: 1, armedAt: entry.at, dueAt, tenant: entry.tenant, issue: entry.issue, firedAt: null }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+  } catch (error) {
+    if (error.code === 'EEXIST') return false;
+    throw error;
+  }
+  return true;
+}
+
+function stalePremiseTally(root, since) {
+  const dir = path.join(baseOf(root), 'state', 'triage');
+  const counts = { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, pending: 0 };
+  const tenants = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -6)).sort() : [];
+  for (const tenant of tenants) {
+    for (const row of staleRows(readLedger(root, tenant))) {
+      if (String(row.proposedAt) >= String(since)) counts[row.verdict] += 1;
+    }
+  }
+  return counts;
+}
+
+function runStalePremiseNotice({ root, now, send, dryRun = false } = {}) {
+  const file = staleNoticePath(root);
+  const notice = readJsonFile(file, null);
+  if (!notice) return { armed: false, due: false, sent: false };
+  if (notice.firedAt) return { armed: true, due: true, sent: false, firedAt: notice.firedAt };
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  if (at < notice.dueAt) return { armed: true, due: false, sent: false, dueAt: notice.dueAt };
+  const counts = stalePremiseTally(root, notice.armedAt);
+  const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const message = {
+    kind: 'dated', priority: 'normal', title: 'Fleet: rule on stale-premise restatements',
+    body: `${STALE_NOTICE_DAYS} days are up: rule whether stale-premise restatements may skip Approval (ADR 0011, spec fleet #92). ${total} stale-premise restatement(s) since ${String(notice.armedAt).slice(0, 10)}: ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}. The rows are in the digest's Triage section.`,
+  };
+  if (dryRun) return { armed: true, due: true, sent: false, dryRun: true, message };
+  let result;
+  try { result = send(message); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
+  if (!result || !result.ok) return { armed: true, due: true, sent: false, attempted: true, detail: (result && result.detail) || null };
+  const fired = { ...notice, firedAt: at, tally: counts };
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(fired, null, 2)}\n`, 'utf8');
+  fs.renameSync(temporary, file);
+  return { armed: true, due: true, sent: true, attempted: true, firedAt: at, tally: counts };
+}
+
+// One row per stale-premise proposal: the premise, when it was proposed, and
+// the verdict it got (the outcome that followed it, or pending).
+function staleRows(entries) {
+  const sorted = [...entries].filter((entry) => entry && entry.kind && entry.kind !== 'consumed').sort((left, right) => String(left.at).localeCompare(String(right.at)));
+  const rows = [];
+  const open = new Map();
+  for (const entry of sorted) {
+    const issue = Number(entry.issue);
+    if (entry.kind === 'proposed') {
+      open.delete(issue);
+      if (entry.reason === 'stale-premise') { const row = { issue, premise: entry.premise, proposedAt: entry.at, verdict: 'pending' }; rows.push(row); open.set(issue, row); }
+    } else if (OUTCOME_KINDS.includes(entry.kind) && open.has(issue)) {
+      open.get(issue).verdict = entry.kind;
+      open.delete(issue);
+    }
+  }
+  return rows;
 }
 
 // ------------------------------------------------------------ projection ----
@@ -225,6 +317,13 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     return counts;
   };
   const windowStats = tally(outcomes.filter((entry) => String(entry.at) >= cutoff));
+  // Spec fleet #92 (#148): the stale-premise restatements of the trailing 30 days.
+  const staleCutoff = new Date(new Date(at).getTime() - STALE_NOTICE_DAYS * 86400000).toISOString();
+  const staleCounts = { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, pending: 0 };
+  const staleWindow = staleRows(sorted).filter((row) => String(row.proposedAt) >= staleCutoff).map((row) => {
+    staleCounts[row.verdict] += 1;
+    return { ...row, ageDays: Number(((new Date(at).getTime() - new Date(row.proposedAt).getTime()) / 86400000).toFixed(1)) };
+  });
   const allTime = tally(outcomes);
   const spanDays = firstProposedAt ? (new Date(at).getTime() - new Date(firstProposedAt).getTime()) / 86400000 : 0;
   const graduationState = {
@@ -232,7 +331,7 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     decided: allTime.decided, spanDays: Number(spanDays.toFixed(1)), unchangedRatio: allTime.unchangedRatio,
     met: allTime.decided >= rule.minProposals && spanDays >= rule.minDays && allTime.unchangedRatio !== null && allTime.unchangedRatio >= rule.minUnchangedRatio,
   };
-  return { at, windowDays: window, byIssue, pending, awaitingFinalize, restated, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
+  return { at, windowDays: window, byIssue, pending, awaitingFinalize, restated, stalePremise: { days: STALE_NOTICE_DAYS, rows: staleWindow, counts: staleCounts }, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
 }
 
 // --------------------------------------------------------------- GitHub ----
@@ -481,7 +580,7 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
 
 const TRIAGE_FLAGS = Object.freeze({
   frontier: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
-  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'now'],
+  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'reason', 'premise', 'now'],
   state: ['root', 'tenant', 'now', 'days'],
   hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
 });
@@ -497,7 +596,7 @@ function cli(argv) {
   if (command === 'record') {
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
-      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], now: args.now,
+      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
     });
   }
   if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
@@ -533,5 +632,7 @@ module.exports = {
   readLedger,
   readTriageConfig,
   recordEntry,
+  runStalePremiseNotice,
+  staleNoticePath,
   selectTriageFrontier,
 };

@@ -14,6 +14,7 @@ const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
+const { runStalePremiseNotice } = require('./triage');
 
 const { DECISION_STATES } = workState;
 const MAX_ROWS = 10;
@@ -119,16 +120,21 @@ function buildSummary({ root, now } = {}) {
 // the send itself failed" (the only case `cli`/`main` below turn into a
 // non-zero exit, so the wrapper's existing exit-code-based grading catches it
 // exactly like every other bin/run-*.ps1 wrapper already does).
+// Spec fleet #92 (#148): the daily run is also the clock for the stale-premise
+// revisit notice (bin/triage.js), a page of its own that fires once when due,
+// quiet day or not; once armed it reports under `staleNotice` beside the summary's result.
 function runDailySummary(options = {}) {
   const base = baseOf(options.root);
-  const summary = buildSummary({ root: base, now: options.now });
-  if (!summary) return { sent: false, attempted: false, count: 0 };
-  if (options.dryRun) return { sent: false, attempted: false, count: summary.count, dryRun: true, summary };
   const send = options.send || pageSender({ root: base });
+  const notice = runStalePremiseNotice({ root: base, now: options.now, send, dryRun: Boolean(options.dryRun) });
+  const staleNotice = notice.armed ? { staleNotice: notice } : {};
+  const summary = buildSummary({ root: base, now: options.now });
+  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice };
+  if (options.dryRun) return { sent: false, attempted: false, count: summary.count, dryRun: true, summary, ...staleNotice };
   let result;
   try { result = send(summary); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
   const ok = Boolean(result && result.ok);
-  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null };
+  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice };
 }
 
 function cli(argv) {
@@ -150,7 +156,8 @@ function cli(argv) {
 // fake one, and shelling out for real in a test is exactly what this suite
 // must never do).
 function exitCodeFor(result) {
-  return (result.attempted && !result.sent) ? 1 : 0;
+  const failedNotice = Boolean(result.staleNotice && result.staleNotice.attempted && !result.staleNotice.sent);
+  return ((result.attempted && !result.sent) || failedNotice) ? 1 : 0;
 }
 
 function main(argv) {
