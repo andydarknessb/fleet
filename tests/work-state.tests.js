@@ -1077,6 +1077,31 @@ test('fleet#56: a CLI transition to escalated appends a decision-needed wake onc
   assert.equal(lines().length, 1);
 });
 
+// fleet#141: the watchdog's frontier wake woke and rotated pl-endzone for two
+// decision-needed lines pl-endzone had just raised for Cory. The outbox line
+// carried no provenance, and the lead's CLI escalation omitted --actor, so even
+// the ledger said "unknown". The line now carries the transition's actor, and
+// the CLI takes it from FLEET_NAME when --actor is omitted (as review-policy.js
+// already does, fleet#46).
+test('fleet#141: a CLI decision transition stamps its actor on the outbox line, from FLEET_NAME when --actor is omitted', () => {
+  const root = rootDir();
+  makeRecord(root, { github: { issueNumber: 42 } });
+  const bin = path.join(__dirname, '..', 'bin', 'work-state.js');
+  const env = { ...process.env, FLEET_NAME: 'pl-endzone' };
+  execFileSync(process.execPath, [bin, 'transition', '--root', root, '--id', 'endzone:issue-42', '--to', 'escalated', '--expected-revision', '1', '--idempotency-key', 'esc-141', '--evidence', 'needs a Ruling', '--no-notifier'], { encoding: 'utf8', env });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const [line] = fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(line.actor, 'pl-endzone');
+  const event = readEvents(root).find((e) => e.recordId === 'endzone:issue-42' && e.type === 'state-escalated');
+  assert.equal(event.actor, 'pl-endzone');
+
+  const root2 = rootDir();
+  makeRecord(root2, { github: { issueNumber: 42 } });
+  execFileSync(process.execPath, [bin, 'transition', '--root', root2, '--id', 'endzone:issue-42', '--to', 'escalated', '--expected-revision', '1', '--idempotency-key', 'esc-141', '--actor', 'cory', '--evidence', 'x', '--no-notifier'], { encoding: 'utf8', env });
+  const [explicit] = fs.readFileSync(path.join(root2, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(explicit.actor, 'cory', '--actor still wins over FLEET_NAME');
+});
+
 test('fleet#56: the Principal sees a lead escalation on a PR-less record', () => {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });

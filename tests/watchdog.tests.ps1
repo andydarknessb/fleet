@@ -484,7 +484,9 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # Case W6: an empty frontier but an undelivered outbox wake newer than the lead's session -> wake on the outbox.
+  # fleet #141: "the lead's session" is its door launch (live roster launchedAt), which a respawn never moves.
   Write-Utf8 $wakeFixture '[]'
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","launchedAt":"' + (Get-Date).ToUniversalTime().AddHours(-2).ToString('o') + '"}]}')
   Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ('{"at":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '","recordId":"test:issue-7","wake":"checks-settled"}' + "`n" + '{"at":"' + (Get-Date).ToUniversalTime().AddHours(-5).ToString('o') + '","recordId":"test:issue-8","wake":"checks-settled"}' + "`n")
   Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
   $w6 = Run-Watchdog
@@ -493,6 +495,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $w6b = Run-Watchdog
   $wake6b = @($w6b.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($wake6b.decision -eq 'none') 'a consumed outbox wake must not wake again'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # Case W7: state/flags/frontier-wake-off disables the wake entirely.
   Write-Utf8 $wakeFixture '[{"number":502,"title":"Ready","url":"https://github.com/owner/repo/issues/502","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'

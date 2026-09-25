@@ -150,3 +150,18 @@ units. The escalation threshold is a runaway guard: 350,000 escalates 11 of
 134. What a unit is expected to cost stays a reported median, per model, and
 escalates nothing; its targets are set after the collector counts rotated
 sessions and the risk reviewer.
+
+## Status note - 2026-09-24 (fleet #141)
+
+"Since the lead's session started" now means since the lead was launched
+through the door (its live roster `launchedAt`), not the daemon row's
+`startedAt`. A `claude respawn` keeps the job but refreshes `startedAt`, and a
+respawned idle session does not re-run its role prompt. On 2026-09-24 the
+22:32Z tick respawned pl-endzone, and the three outbox wakes written at 22:27Z
+fell before the refreshed `startedAt` and were silently treated as delivered.
+When the lead has no roster row, only the delivery watermark bounds the outbox.
+A `decision-needed` line the lead wrote itself (a hold or a Ruling ask for Cory)
+no longer wakes that lead or counts as fleet-dead work waiting. Outbox lines
+now carry the writer's `actor`, which the work-state CLI takes from
+`FLEET_NAME` when `--actor` is omitted. A line with no actor, written before
+this change, still wakes.

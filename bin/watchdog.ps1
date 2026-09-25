@@ -257,12 +257,15 @@ try {
   }
 
   function Get-UnconsumedWakes {
-    # $Since bounds "before this lead's current session started" (the frontier
+    # $Since bounds "before this lead was launched through the door" (the frontier
     # wake's own use); fleet-dead has no lead session to bound by and passes
     # $null. $ConsumedThrough is the frontier wake's delivery watermark for the
     # tenant, shared so a wake that already woke the lead is not double-counted
-    # as fresh work waiting.
-    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null)
+    # as fresh work waiting. $SelfActor (fleet #141) drops the decision-needed
+    # lines that session wrote itself: a hold or Ruling ask the lead raised is
+    # addressed to Cory, and waking the lead for it rotates away the session
+    # that asked. A line with no actor (written before #141) still counts.
+    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '')
     $kinds = @{}
     $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
     if (-not (Test-Path $outboxPath)) { return $kinds }
@@ -275,6 +278,7 @@ try {
       if ($Since -and $atUtc -le $Since) { continue }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
       if (@('checks-settled', 'checks-failed', 'decision-needed') -notcontains "$($o.wake)") { continue }
+      if ($SelfActor -and "$($o.wake)" -eq 'decision-needed' -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
     }
     return $kinds
@@ -336,7 +340,8 @@ try {
     if ($fw.evidence.Count -gt 0) { return $true }
     $tenantState = $null; if ($WakeState -and $WakeState.PSObject.Properties['tenants'] -and $WakeState.tenants.PSObject.Properties[$TenantName]) { $tenantState = $WakeState.tenants.$TenantName }
     $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
-    $kinds = Get-UnconsumedWakes -TenantName $TenantName -ConsumedThrough $consumedThrough
+    # fleet #141: the lead's own decision-needed lines are Cory's to act on, like the hold and escalated records they come from.
+    $kinds = Get-UnconsumedWakes -TenantName $TenantName -ConsumedThrough $consumedThrough -SelfActor "pl-$TenantName"
     return ($kinds.Count -gt 0)
   }
 
@@ -837,7 +842,7 @@ try {
   # --- session, so the only wake a script can deliver is a relaunch: when a tenant's lead
   # --- is idle at a turn boundary and there is work it cannot see (the planner's frontier
   # --- is non-empty with a free IC slot, or the PR watcher recorded a checks-settled /
-  # --- checks-failed / decision-needed wake since the lead's current session started), the
+  # --- checks-failed / decision-needed wake since the lead was launched through the door), the
   # --- lead is rotated NOW through rotate.ps1 -Wake: stop at the boundary, reconcile,
   # --- relaunch through the one door, so the replacement reconstructs from state exactly as
   # --- a rotated lead does. This retires the lead's hourly polling cron. Loop guards: one
@@ -868,17 +873,24 @@ try {
       $leadRow = $daemon | Where-Object { "$($_.name)" -eq $leadName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
       if (-not $leadRow) { $wake.reason = 'no running lead session (launchNeeded covers a missing one)'; $frontierWakes += [pscustomobject]$wake; continue }
       if ("$($leadRow.status)" -ne 'idle') { $wake.reason = "lead is $($leadRow.status), not idle"; $frontierWakes += [pscustomobject]$wake; continue }
-      $leadStartedAt = ConvertTo-UtcDateTime $leadRow.startedAt
+      # fleet #141: the outbox bound is the door launch (live roster launchedAt), never the
+      # daemon row's startedAt. A `claude respawn` keeps the job but refreshes startedAt,
+      # and a respawned idle session does not re-run its role prompt, so a wake recorded
+      # before the respawn is still undelivered. With no roster row the watermark alone
+      # bounds the outbox (fail toward delivering).
+      $leadLaunchedAt = $null
+      $leadRosterRow = $null; if ($liveRoster) { $leadRosterRow = @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $leadName -and $_.status -eq 'active' -and $_.launchedAt } | Sort-Object { ConvertTo-UtcDateTime $_.launchedAt } -Descending)[0] }
+      if ($leadRosterRow) { $leadLaunchedAt = ConvertTo-UtcDateTime $leadRosterRow.launchedAt }
       # Source 1: the planner's frontier, with an IC slot and a cap slot to launch into.
       if ($wakeSources -contains 'frontier' -and $nodeExe) {
         $fw = Test-FrontierWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap
         if ($fw.evidence.Count -gt 0) { $wake.evidence += $fw.evidence } elseif ($fw.reason) { $wake.reason = $fw.reason }
       }
-      # Source 2: PR-watcher wakes recorded since this lead session started and not yet delivered.
+      # Source 2: PR-watcher wakes recorded since this lead was launched and not yet delivered.
       if ($wakeSources -contains 'outbox') {
         $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
         $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
-        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadStartedAt -ConsumedThrough $consumedThrough
+        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName
         if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
       }
       if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
