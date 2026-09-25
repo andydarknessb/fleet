@@ -101,6 +101,87 @@ function Test-RespawnVerified {
   } while ((Get-Date) -lt $deadline)
   return $false
 }
+# fleet #121 (2026-09-23/24): the daemon respawn command replays the job's respawnFlags as they were
+# frozen when the job was created, bypassing launch.ps1 (the pin map, the role file's
+# effort, the trust gate, the roster row). Latest-Row picked a 2026-08-25 pl-endzone
+# job with no roster row behind it and ran it on --model claude-opus-5 --effort xhigh
+# for 16h. A static session is respawned only when the daemon row is the live
+# roster's own active job AND its frozen --model/--effort equal what launch.ps1 passes
+# today (_common.ps1 Resolve-LaunchModel / Get-RoleEffort). Otherwise this returns why,
+# and Do-Respawn stops the job and relaunches through launch.ps1 -FromRoster instead.
+# ICs keep the daemon respawn: their flags are per-assignment and short-lived.
+function Get-StaticRespawnRefusal {
+  param($row, $entry)
+  $rosterRow = (Get-LiveRoster).sessions | Where-Object { $_.name -eq $entry.name -and "$($_.status)" -eq 'active' } | Select-Object -Last 1
+  if (-not $rosterRow) { return "no active live-roster row names $($entry.name), so job $($row.id) is not a session launch.ps1 started" }
+  if (-not $rosterRow.jobId) { return "the live-roster row for $($entry.name) records no jobId, so job $($row.id) cannot be shown to be the session launch.ps1 started" }
+  if ("$($rosterRow.jobId)" -ne "$($row.id)") { return "job $($row.id) is not the live roster's job $($rosterRow.jobId)" }
+  $js = $null; try { $js = Get-JobState $row.id } catch {}
+  if (-not $js -or -not $js.PSObject.Properties['respawnFlags']) { return "job $($row.id) has no readable respawnFlags to compare" }
+  $flags = @($js.respawnFlags | ForEach-Object { "$_" })
+  $frozen = @{}
+  foreach ($flag in '--model', '--effort') {
+    $at = [array]::IndexOf($flags, $flag)
+    $frozen[$flag] = if ($at -ge 0 -and $at + 1 -lt $flags.Count) { $flags[$at + 1] } else { '' }
+  }
+  $expectedModel = (Resolve-LaunchModel -Role "$($entry.role)" -Model "$($rosterRow.model)").id
+  $roleEffort = Get-RoleEffort "$($entry.role)"
+  $expectedEffort = if (Test-LaunchEffort $roleEffort) { $roleEffort } else { '' }
+  # A pinned model (a claude-* id) must match exactly. An alias (a roster -Model such as
+  # sonnet or haiku, or, with no model at all, the role file's `model:`) is resolved by
+  # the CLI, which records the id it chose (the dispatcher's sonnet froze as
+  # claude-sonnet-5): there the frozen id must belong to the alias's family.
+  $alias = if ($expectedModel -and $expectedModel -notmatch '^claude-') { $expectedModel } elseif (-not $expectedModel) { Get-RoleModel "$($entry.role)" } else { $null }
+  $modelMatches = if ($null -eq $alias) { $frozen['--model'] -eq $expectedModel } else {
+    (-not $alias) -or (-not $frozen['--model']) -or ($frozen['--model'] -eq $alias) -or ($frozen['--model'] -match "(^|-)$([regex]::Escape($alias))(-|$)")
+  }
+  $effortMatches = (-not $expectedEffort) -or $frozen['--effort'] -eq $expectedEffort
+  if (-not $modelMatches -or -not $effortMatches) {
+    if (-not $expectedModel) { $expectedModel = "the role alias $(Get-RoleModel "$($entry.role)")" }
+    return "job $($row.id) would replay --model '$($frozen['--model'])' --effort '$($frozen['--effort'])', but launch.ps1 passes --model '$expectedModel' --effort '$expectedEffort' today"
+  }
+  return $null
+}
+function Do-Relaunch {
+  param($row, $entry, $reason)
+  if (-not $Apply) {
+    $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
+    return
+  }
+  if ($script:RespawnVerifyCount -ge $script:RespawnVerifyCap) {
+    $script:report.respawnDeferred += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "verify cap ($($script:RespawnVerifyCap)) reached this tick; deferred to the next tick: $reason"; via = 'launch' }
+    return
+  }
+  # Never stop a running session the door is about to refuse (review of #121): PAUSE and
+  # an untrusted workspace refuse a launch, and the stopped session would stay down.
+  $refuseWhy = $null
+  if (Test-Paused) { $refuseWhy = 'PAUSE is set, and launch.ps1 would refuse the relaunch' }
+  else {
+    $staticEntry = @($static.sessions | Where-Object { "$($_.name)" -eq "$($entry.name)" })[0]
+    $launchCwd = if ($staticEntry -and $staticEntry.cwd) { "$($staticEntry.cwd)" } elseif ($entry.tenant) { "$((Read-Json "$FleetHome\tenants\$($entry.tenant).json").repo)" } else { $FleetHome }
+    if (-not (Test-Path "$FleetHome\state\flags\launch-trust-check-off") -and -not (Test-WorkspaceTrusted $launchCwd)) { $refuseWhy = "workspace '$launchCwd' is not trusted, and launch.ps1 would refuse the relaunch" }
+  }
+  if ($refuseWhy) {
+    $script:report.respawnDeferred += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "relaunch deferred, nothing stopped: $refuseWhy; $reason"; via = 'launch' }
+    return
+  }
+  $script:RespawnVerifyCount++
+  if ($row.pid) { & claude stop $row.id 2>&1 | Out-Null }
+  # Hashtable splat (rotate.ps1's lesson: PS 5.1 array splatting passes '-FromRoster' as a value).
+  $launchArgs = @{ FromRoster = "$($entry.name)" }
+  # A hand-set -Model on the roster row survives the relaunch (launch.ps1's ValidateSet tokens only).
+  $rosterModel = "$(@((Get-LiveRoster).sessions | Where-Object { $_.name -eq $entry.name -and "$($_.status)" -eq 'active' } | Select-Object -Last 1).model)"
+  if ($rosterModel -in @('sonnet', 'opus', 'haiku', 'fable', 'opus-5.5') -and $rosterModel -ne (Resolve-LaunchModel -Role "$($entry.role)" -Model '').token) { $launchArgs.Model = $rosterModel }
+  $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
+  $launch = ConvertFrom-LastJsonLine $out
+  if ($launch -and $launch.launched) {
+    $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = "$($launch.jobId)"; previousJobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
+  } else {
+    $why = if ($launch -and $launch.reason) { "$($launch.reason)" } else { Get-OneLineText $out }
+    $script:report.respawnFailed += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "relaunch through launch.ps1 -FromRoster failed ($why): $reason"; via = 'launch' }
+  }
+}
+function Get-OneLineText { param([string]$Text) $t = ("$Text" -replace '\s+', ' ').Trim(); if ($t.Length -gt 200) { $t = $t.Substring(0, 200) }; return $t }
 function Do-Respawn {
   param($row, $entry, $reason)
   if (-not $entry.static) {
@@ -111,6 +192,9 @@ function Do-Respawn {
       $script:report.ok += [pscustomobject]@{ name = $row.name; detail = "respawn cancelled: live roster status is $currentStatus" }
       return
     }
+  } else {
+    $refusal = Get-StaticRespawnRefusal $row $entry
+    if ($refusal) { Do-Relaunch $row $entry "$reason; not respawned because $refusal"; return }
   }
   if (-not $Apply) {
     # Shadow: nothing to verify against, since nothing was run.

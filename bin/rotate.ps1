@@ -98,6 +98,19 @@ function Invoke-Reconcile {
   return [pscustomobject]@{ at = (Now-Iso); tenants = $results; ok = (@($results | Where-Object { -not $_.ok }).Count -eq 0) }
 }
 
+function Get-StaleRevival {
+  # fleet #121: why the session running under the intent's name is NOT a relaunch made
+  # after this rotation began, or $null when it plausibly is one.
+  param($Intent, $Row)
+  if (-not $Row -or -not $Row.id) { return $null }
+  if ($Intent.oldJobId -and "$($Row.id)" -eq "$($Intent.oldJobId)") { return "job $($Row.id) is the job this rotation stopped" }
+  $savedAt = ConvertTo-UtcDateTime $Intent.savedAt
+  $js = $null; try { $js = Get-JobState $Row.id } catch {}
+  $createdAt = if ($js) { ConvertTo-UtcDateTime $js.createdAt } else { $null }
+  if ($savedAt -and $createdAt -and $createdAt -lt $savedAt) { return "job $($Row.id) was created $($js.createdAt), before this rotation began at $($Intent.savedAt): a revived stale job, not a hand relaunch" }
+  return $null
+}
+
 function Complete-Rotation {
   # From a written intent whose session is already stopped: reconcile, then relaunch.
   param([pscustomobject]$Intent)
@@ -113,6 +126,36 @@ function Complete-Rotation {
   $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
   $launchExit = $LASTEXITCODE
   $launch = ConvertFrom-LastJsonLine $out
+  if ($launch -and "$($launch.reason)" -match 'already running') {
+    # fleet #121: a session under the name is not always a hand relaunch. On 2026-09-23
+    # sentinel-check revived an Aug-25 pl-endzone job with `claude respawn` after this
+    # rotation's launch failed, and it was recorded as `launchedBy: external` twice
+    # while it ran 16h on frozen flags with no roster row. A job this rotation stopped,
+    # or one created before the rotation began, is a stale revival: stop it and launch
+    # the replacement through the door.
+    # A strict read: a glitched daemon list must not read as "nothing stale is running",
+    # which would close the intent as an external relaunch (review of #121).
+    $daemonReadError = $null
+    $runningRow = $null
+    try { $runningRow = @(Get-DaemonSessions -Strict | Where-Object { "$($_.name)" -eq "$($Intent.name)" }) | Select-Object -First 1 } catch { $daemonReadError = "$($_.Exception.Message)" }
+    if ($daemonReadError) {
+      $launch = [pscustomobject]@{ launched = $false; reason = "a session named '$($Intent.name)' is running, and the daemon list could not be read to tell a hand relaunch from a stale revival ($daemonReadError); the intent stays open for the next run" }
+    }
+    $staleWhy = if ($daemonReadError) { $null } else { Get-StaleRevival -Intent $Intent -Row $runningRow }
+    if ($staleWhy) {
+      & claude stop $runningRow.id 2>&1 | Out-Null
+      $Intent | Add-Member -NotePropertyName staleRevival -NotePropertyValue ([pscustomobject]@{ at = (Now-Iso); jobId = "$($runningRow.id)"; why = $staleWhy }) -Force
+      Write-Json $intentPath $Intent
+      $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
+      $launchExit = $LASTEXITCODE
+      $launch = ConvertFrom-LastJsonLine $out
+      # Still "already running" after the stop: the stale job did not go down (a failed or
+      # late stop). That is not a hand relaunch either; fail and keep the intent resumable.
+      if ($launch -and "$($launch.reason)" -match 'already running') {
+        $launch = [pscustomobject]@{ launched = $false; reason = "the stale revival of job $($runningRow.id) was still running after claude stop ($staleWhy); the intent stays open for the next run" }
+      }
+    }
+  }
   if ($launch -and $launch.launched) {
     $Intent.phase = 'launched'
     $Intent | Add-Member -NotePropertyName newSessionId -NotePropertyValue $launch.sessionId -Force

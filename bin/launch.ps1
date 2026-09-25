@@ -359,27 +359,21 @@ Write-Json $settingsPath $settings
 # pin that path too so the two spellings resolve to the same id.
 # A project lead launched with no -Model runs Opus 5.5 (owner ruling 2026-09-23),
 # pinned for the same reason; CLI 2.1.280 admits claude-opus-5-5 to auto mode.
-$modelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5' }
-if (-not $Model -and $Role -eq 'principal') { $Model = 'fable' }
-if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
+# The pins and role defaults live in _common.ps1 (Resolve-LaunchModel) since fleet
+# #121: sentinel-check compares a daemon job's frozen respawnFlags against them.
+$launchModel = Resolve-LaunchModel -Role $Role -Model $Model
+$Model = $launchModel.token
 $modelArgs = @()
-if ($Model) {
-  $resolvedModel = if ($modelPins.ContainsKey($Model)) { $modelPins[$Model] } else { $Model }
-  $modelArgs = @('--model', $resolvedModel)
-}
+if ($launchModel.id) { $modelArgs = @('--model', $launchModel.id) }
 
 # The role file frontmatter declares `effort:`, but `claude --agent` does NOT read
 # it for a top-level background session (it defaults every such session to high;
 # e.g. sentinel.md says low yet ran at high). So parse the role file ourselves and
 # pass the declared effort with --effort, the only lever that sticks for --bg.
-$effort = ''
 $roleFile = "$FleetHome\agents\$Role.md"
-if (Test-Path $roleFile) {
-  $m = Select-String -Path $roleFile -Pattern '^\s*effort:\s*(\S+)' | Select-Object -First 1
-  if ($m) { $effort = $m.Matches[0].Groups[1].Value }
-}
+$effort = Get-RoleEffort $Role
 $effortArgs = @()
-if ($effort -in @('low','medium','high','xhigh','max')) { $effortArgs = @('--effort', $effort) }
+if (Test-LaunchEffort $effort) { $effortArgs = @('--effort', $effort) }
 
 # --- first-turn ceiling (ticket 06): a launch that would start over its role's
 # --- config/cycle.json budget fails before assignment and reports the token

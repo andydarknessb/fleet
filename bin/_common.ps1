@@ -190,6 +190,37 @@ function Get-DaemonSessions {
   return @($obj)
 }
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
+# The --model and --effort a launch passes today, in one place (fleet #121): launch.ps1
+# builds its command from these, and sentinel-check.ps1 compares a daemon job's frozen
+# respawnFlags against them before `claude respawn` replays that job. 'opus' pins Opus
+# 4.8 for ICs, 'fable' the Principal's seat (ADR 0011), 'opus-5.5' the project-lead
+# default (owner ruling 2026-09-23); a principal or lead with no -Model gets its pin.
+$script:LaunchModelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5' }
+function Resolve-LaunchModel {
+  param([string]$Role, [string]$Model)
+  if (-not $Model -and $Role -eq 'principal') { $Model = 'fable' }
+  if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
+  $id = if (-not $Model) { '' } elseif ($script:LaunchModelPins.ContainsKey($Model)) { $script:LaunchModelPins[$Model] } else { $Model }
+  return [pscustomobject]@{ token = "$Model"; id = "$id" }
+}
+function Get-RoleEffort {
+  param([string]$Role)
+  $roleFile = "$FleetHome\agents\$Role.md"
+  if (-not (Test-Path -LiteralPath $roleFile)) { return '' }
+  $m = Select-String -LiteralPath $roleFile -Pattern '^\s*effort:\s*(\S+)' | Select-Object -First 1
+  if ($m) { return $m.Matches[0].Groups[1].Value }
+  return ''
+}
+function Test-LaunchEffort { param([string]$Effort) return $Effort -in @('low', 'medium', 'high', 'xhigh', 'max') }
+function Get-RoleModel {
+  # The role file's `model:` alias (e.g. sonnet), or '' when it declares none.
+  param([string]$Role)
+  $roleFile = "$FleetHome\agents\$Role.md"
+  if (-not (Test-Path -LiteralPath $roleFile)) { return '' }
+  $m = Select-String -LiteralPath $roleFile -Pattern '^\s*model:\s*(\S+)' | Select-Object -First 1
+  if ($m) { return $m.Matches[0].Groups[1].Value }
+  return ''
+}
 # fleet #149: the daemon's `busy` covers two standings. Mid-turn: the model is working.
 # Between turns: the model ended its turn, but a background task it started (a shell
 # loop, a Monitor) is still in flight, and a leaked one never ends (pe-endzone,
