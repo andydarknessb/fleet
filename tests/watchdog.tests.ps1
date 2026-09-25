@@ -989,6 +989,19 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
 
   # ===== 2026-09-17 QA (fleet #85 review BLOCKER): a no-op respawn must feed =====
   # ===== the launch-retry cap exactly as a genuinely failed launch does =====
+  # fleet #121: the respawn path is for a static whose job is the live roster's own and
+  # whose frozen flags are current; give these statics that standing (restored after h14).
+  $savedLiveRoster121 = Get-Content "$testRoot\state\roster.json" -Raw
+  $savedJobStates121 = @{}
+  foreach ($pair in @(@('job-d', 'dispatcher', 'dispatcher', @()), @('job-p', 'pl-test', 'project-lead', @('--model', 'claude-opus-5-5')), @('job-pe2', 'pl-extra', 'project-lead', @('--model', 'claude-opus-5-5')))) {
+    $jobDir = "$testRoot\profile\.claude\jobs\$($pair[0])"
+    [IO.Directory]::CreateDirectory($jobDir) | Out-Null
+    $savedJobStates121[$pair[0]] = if (Test-Path "$jobDir\state.json") { Get-Content "$jobDir\state.json" -Raw } else { $null }
+    $jobState = if ($savedJobStates121[$pair[0]]) { $savedJobStates121[$pair[0]] | ConvertFrom-Json } else { [pscustomobject]@{} }
+    $jobState | Add-Member -NotePropertyName respawnFlags -NotePropertyValue (@('--name', $pair[1], '--agent', $pair[2]) + $pair[3]) -Force
+    Write-Utf8 "$jobDir\state.json" ($jobState | ConvertTo-Json -Depth 6 -Compress)
+  }
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-d"},{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","jobId":"job-p"},{"name":"pl-extra","role":"project-lead","tenant":"test","status":"active","jobId":"job-pe2"}]}'
   Set-AgentsRows $noSentinelRows
   foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
   $null = Run-Watchdog
@@ -1045,6 +1058,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   foreach ($n in 'dispatcher','sentinel','pl-test') { Set-Heartbeat $n 5 }
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" $savedLiveRoster121
+  foreach ($jobId in $savedJobStates121.Keys) {
+    $jobFile = "$testRoot\profile\.claude\jobs\$jobId\state.json"
+    if ($null -eq $savedJobStates121[$jobId]) { Remove-Item $jobFile -ErrorAction SilentlyContinue } else { Write-Utf8 $jobFile $savedJobStates121[$jobId] }
+  }
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
 
   # ===== ADR 0011 (fleet #38): the triage wake =====
@@ -1835,9 +1853,15 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   # Red-tell: the mock's respawn leaves mock-agents.json unchanged (the wedge
   # persists). Today this is logged "respawned"; after the fix it is
   # "respawn-failed" and the applied ledger never claims a success that did not happen.
+  # fleet #121: the respawn path is for a static whose job is the live roster's own with
+  # current flags; the wedged dispatcher gets that standing for this block.
+  $savedLiveRoster85 = Get-Content "$testRoot\state\roster.json" -Raw
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-d-wedge") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-d-wedge\state.json" '{"state":"failed","respawnFlags":["--name","dispatcher","--agent","dispatcher"]}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-d-wedge"}]}'
   Set-AgentsRows "[$wedgedDispRow]"
   $env:MOCK_RESPAWN_NOOP = '1'
-  $noOp = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog -ReportPath $ticket85ReportPath | Out-String) | ConvertFrom-Json
+  $noOp =(& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog -ReportPath $ticket85ReportPath | Out-String) | ConvertFrom-Json
   Remove-Item Env:MOCK_RESPAWN_NOOP
   Assert-True (@($noOp.respawned | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 0) 'a no-op respawn must not be reported as respawned'
   Assert-True (@($noOp.respawnFailed | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'a no-op respawn must be classified respawn-failed'
@@ -1859,6 +1883,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\sentinel\applied" -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item $ticket85ReportPath -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\mock-respawn-counter.txt" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" $savedLiveRoster85
+  Remove-Item "$testRoot\profile\.claude\jobs\job-d-wedge" -Recurse -ErrorAction SilentlyContinue
   Set-AgentsRows $noSentinelRows
 
   Write-Output 'watchdog tests passed'
