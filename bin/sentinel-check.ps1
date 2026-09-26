@@ -382,7 +382,41 @@ foreach ($x in $expected) {
 # --- strays and cap ---
 $fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$'
 $known = @($expected | ForEach-Object { $_.name })
+# `claude agents --all` lists every job on the machine, not only this root's. A scratch
+# root (bin/scratch-root.ps1) launches through its own doors under the same fleet names,
+# so its IC read here as a stray (ic-1686, job cf1d0d8e, 2026-09-26 03:46:57Z). A job's
+# frozen --settings is <root>\state\sessions\<name>.settings.json; when that names
+# another root whose live roster holds this very job, the session is that root's. Anything
+# short of that proof (no settings, this root's settings, a root that does not roster
+# the job) stays a stray.
+function Get-ForeignRosterRoot {
+  param($row)
+  $js = $null; try { $js = Get-JobState $row.id } catch {}
+  if (-not $js -or -not $js.PSObject.Properties['respawnFlags']) { return $null }
+  $flags = @($js.respawnFlags | ForEach-Object { "$_" })
+  $i = [array]::IndexOf($flags, '--settings')
+  if ($i -lt 0 -or ($i + 1) -ge $flags.Count) { return $null }
+  try {
+    $sessionsDir = Split-Path -Parent $flags[$i + 1]
+    $stateDir = Split-Path -Parent $sessionsDir
+    if ((Split-Path -Leaf $sessionsDir) -ne 'sessions' -or (Split-Path -Leaf $stateDir) -ne 'state') { return $null }
+    $root = [IO.Path]::GetFullPath((Split-Path -Parent $stateDir)).TrimEnd('\', '/')
+    $own = [IO.Path]::GetFullPath($FleetHome).TrimEnd('\', '/')
+  } catch { return $null }
+  if ($root.Equals($own, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  # Another root's roster is not this root's to trust: unreadable means not proven.
+  $roster = $null; try { $roster = Read-Json "$root\state\roster.json" } catch {}
+  if (-not $roster) { return $null }
+  $held = @($roster.sessions | Where-Object { $_.name -eq $row.name -and "$($_.jobId)" -eq "$($row.id)" -and "$($_.status)" -eq 'active' })
+  if ($held.Count -eq 0) { return $null }
+  return $root
+}
 foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fleetPattern) -and ($known -notcontains $_.name) })) {
+  $foreign = Get-ForeignRosterRoot $row
+  if ($foreign) {
+    $report.ok += [pscustomobject]@{ name = $row.name; detail = "another fleet root's session (job $($row.id), rostered by $foreign); not this root's to supervise" }
+    continue
+  }
   $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'stray'; detail = "fleet-named session not on the roster (job $($row.id)); cause not measured: launched outside launch.ps1, or its roster entry was lost or retired while the process lived" }
 }
 $liveFleet = @($daemon | Where-Object { $_.pid -and ($known -contains $_.name) })
