@@ -106,7 +106,10 @@ if ($Manifest) {
   $activeState = Read-Json "$FleetHome\state\work\active.json"
   $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
   if (-not $recordProperty -or $recordProperty.Value.state -ne 'assigned') { Write-Error "Work record '$WorkRecordId' is not assigned"; exit 4 }
-  $activeAssignments = @($activeState.records.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.manifestPath -and $_.state -ne 'retired' -and $_.id -ne $WorkRecordId })
+  # Per tenant, the way work-state.js's isForeignRecord scopes it: another tenant's ICs are
+  # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
+  # A record with no tenant is legacy and still counts, matching isForeignRecord.
+  $activeAssignments = @($activeState.records.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.manifestPath -and $_.state -ne 'retired' -and $_.id -ne $WorkRecordId -and (-not $_.tenant -or [string]$_.tenant -eq [string]$Tenant) })
   if ($activeAssignments.Count -ge 3) { Write-Error 'a fourth assignment is not permitted'; exit 4 }
   if ($activeAssignments.Count -ge 2) {
     $proof = $assignment.independenceProof
