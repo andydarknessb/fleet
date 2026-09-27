@@ -2,6 +2,10 @@
   "crossSessionInbound": "accept",
   "permissions": { "defaultMode": "auto" },
   "autoMode": {
+    "allow": [
+      "$defaults",
+      "gh pr merge by the fleet project lead (FLEET_ROLE=project-lead) of a fleet/* PR into its tenant's defaultBranch (integration), after that session recorded a formal review at the PR's current head with bin/review-policy.js (fleet-review status success). Cory, the repo owner, delegated this reviewed merge to the project lead, so it is not Merge Without Review. It never covers the releaseBranch (main), a carve-out path (migrations, deploy hooks, .env*, CI secrets), or a PR with no formal review recorded at its head"
+    ],
     "soft_deny": [
       "$defaults",
       "Bash(git push:* --force*) on andydarknessb/Endzone-Empire — public repo, main has no branch protection/rulesets listed",
