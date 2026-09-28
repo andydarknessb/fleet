@@ -321,13 +321,36 @@ if ($denyRules.Count -gt 0) {
 # --- directory, and its deny rules appended after the tool contract's (deny beats
 # --- allow, so the contract is unchanged). The mode lives in the settings only; no
 # --- --permission-mode goes on the command line.
+# The profile adds the tenant repo as a directory (fleet #171: a haiku IC reads the
+# ticket's paths in the main checkout), which acceptEdits then makes editable. A deny
+# list cannot say "everything but .claude/worktrees", so the rules are generated here
+# from the checkout as it stands: every entry beside each segment of the kept path is
+# denied, the kept path itself is not. An entry created after launch is not covered.
+function Get-RepoDenyRules {
+  param([string]$Repo, [string]$Keep, [string[]]$Tools)
+  if (-not $Repo -or -not (Test-Path -LiteralPath $Repo -PathType Container)) { throw "the allowlist profile denies edits across the tenant repo '$Repo', which does not exist; refusing a launch that would leave it editable" }
+  $prefix = $Repo.Replace('\', '/').TrimEnd('/')
+  $dir = $Repo
+  $rules = @()
+  foreach ($segment in @($Keep.Replace('\', '/').Split('/') | Where-Object { $_ })) {
+    foreach ($entry in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)) {
+      if ($entry.Name -eq $segment) { continue }
+      $target = if ($entry.PSIsContainer) { "$prefix/$($entry.Name)/**" } else { "$prefix/$($entry.Name)" }
+      foreach ($tool in $Tools) { $rules += "$tool($target)" }
+    }
+    $dir = Join-Path $dir $segment
+    $prefix = "$prefix/$segment"
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { break }
+  }
+  return $rules
+}
 $allowRuleCount = 0
 if ($Permissions -eq 'allowlist') {
   $profilePath = "$FleetHome\config\permissions-allowlist.json"
   $permissionProfile = $null
   try { $permissionProfile = Read-Json $profilePath } catch {}
   if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable"; exit 4 }
-  $profileTokens = @{ '<fleet>' = $fleetFwd; '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
+  $profileTokens = @{ '<fleet>' = $fleetFwd; '<repo>' = "$($t.repo)".Replace('\', '/').TrimEnd('/'); '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
   $resolveProfileRule = {
     param([string]$Text)
     foreach ($token in $profileTokens.Keys) { if ($profileTokens[$token]) { $Text = $Text.Replace($token, $profileTokens[$token]) } }
@@ -337,7 +360,10 @@ if ($Permissions -eq 'allowlist') {
   try {
     $profileAllow = @($permissionProfile.allow | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
     $profileDeny = @($permissionProfile.deny | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
-    $profileDirs = @($permissionProfile.additionalDirectories | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$_" })
+    $profileDirs = @($permissionProfile.additionalDirectories | Where-Object { $_ } | ForEach-Object { if ($_ -is [string]) { & $resolveProfileRule $_ } else { & $resolveProfileRule "$($_.dir)" } })
+    if ($permissionProfile.PSObject.Properties['repoDeny'] -and $permissionProfile.repoDeny) {
+      $profileDeny += @(Get-RepoDenyRules -Repo "$($t.repo)" -Keep "$($permissionProfile.repoDeny.keep)" -Tools @($permissionProfile.repoDeny.tools))
+    }
   } catch { Write-Error "$($_.Exception.Message)"; exit 4 }
   if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
   $existingDeny = @()
@@ -470,6 +496,22 @@ if ($Manifest) {
   New-Item -ItemType Directory -Force $worktreeParent | Out-Null
   & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { Remove-FailedAssignmentWorktree; try { Invalidate-Manifest "launch failed: could not create the assignment worktree from $expectedBase" } catch {}; Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
+  # ic.md step 6: the PR body file is .fleet-pr-body.md in the worktree root, written with
+  # the Write tool, not a heredoc into a temp directory outside the allowed directories
+  # (fleet #171, rehearsal wait 4). The repo's info/exclude, shared by every worktree,
+  # keeps it out of every commit. Best effort: a missing line only risks a stray file.
+  $commonDir = (& git -C $worktreePath rev-parse --path-format=absolute --git-common-dir 2>$null | Out-String).Trim()
+  if ($commonDir) {
+    try {
+      $excludePath = Join-Path $commonDir 'info\exclude'
+      $excludeLines = @()
+      if (Test-Path -LiteralPath $excludePath) { $excludeLines = @(Get-Content -LiteralPath $excludePath) }
+      if ($excludeLines -notcontains '/.fleet-pr-body.md') {
+        [IO.Directory]::CreateDirectory((Split-Path -Parent $excludePath)) | Out-Null
+        [IO.File]::AppendAllText($excludePath, "`n/.fleet-pr-body.md`n")
+      }
+    } catch { Write-Warning "could not add the PR body file to $excludePath ($_)" }
+  }
   $cwd = $worktreePath
 }
 

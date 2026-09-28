@@ -100,6 +100,25 @@ try {
   Assert-TrueB ($resultB2.worktreeCleanup -eq 'remaining') 'the JSON must report worktreeCleanup remaining when the daemon list could not be read'
   Assert-TrueB ($resultB2.jobRemoval -eq 'unknown') 'the JSON must report jobRemoval unknown, never guess removed or still-present'
 
+  # Case (fleet #171): git no longer lists the assignment worktree but its directory
+  # survived empty, which made launch.ps1 refuse a relaunch of the same issue. Retire
+  # removes it once the job is gone; a non-empty leftover is reported, never deleted, and
+  # another unit's directory (ic-9020 is not ic-902) is left alone.
+  $staleDir = "$hub\.claude\worktrees\ic-902-assignment"
+  $fullDir = "$hub\.claude\worktrees\ic-902-scratch"
+  $otherDir = "$hub\.claude\worktrees\ic-9020-assignment"
+  foreach ($d in $staleDir, $fullDir, $otherDir) { [IO.Directory]::CreateDirectory($d) | Out-Null }
+  Write-Utf8B "$fullDir\left.txt" 'x'
+  Write-Utf8B "$retireTestRoot\state\roster.json" (@{ sessions = @(@{ name = 'ic-902'; role = 'ic'; tenant = 'test'; issue = 902; cwd = "$hub\.claude\worktrees\ic-902-assignment"; status = 'active'; jobId = 'job-902' }) } | ConvertTo-Json -Depth 6)
+  $eapB3 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  $outB3 = & powershell -NoProfile -ExecutionPolicy Bypass -File "$retireTestRoot\bin\retire.ps1" -Name 'ic-902' -Reason 'done' 2>&1 | Out-String
+  $ErrorActionPreference = $eapB3
+  $resultB3 = ($outB3.Trim() -split "`n")[-1] | ConvertFrom-Json
+  Assert-TrueB (-not (Test-Path $staleDir)) "retire must remove the empty assignment directory git no longer lists (got: $outB3)"
+  Assert-TrueB (@($resultB3.worktreeDirsRemoved).Count -eq 1 -and "$(@($resultB3.worktreeDirsRemoved)[0])" -like '*ic-902-assignment') 'the JSON must name the removed directory'
+  Assert-TrueB ((Test-Path "$fullDir\left.txt") -and "$(@($resultB3.worktreeDirsRemaining))" -like '*ic-902-scratch*') 'a non-empty leftover must survive and be reported remaining'
+  Assert-TrueB (Test-Path $otherDir) "another unit's directory must be left alone"
+
   $env:PATH = $oldPathB
 } finally {
   $resolvedB = [IO.Path]::GetFullPath($retireTestRoot)
