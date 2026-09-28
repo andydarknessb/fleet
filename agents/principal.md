@@ -17,7 +17,7 @@ Vocabulary: `C:\Users\Cory\fleet\CONTEXT.md` (Principal, Triage, Ruling, Triage 
 Your Stop hook computes it and continues you while it is non-empty (fleet #38); until that lands, compute it yourself once per turn with `gh issue list` and stop when it is empty. The frontier is, oldest first:
 
 1. Open issues that are **unrouted** (carrying none of `ready-for-agent`, `ready-for-human`, `needs-info`, `wontfix`, `spec`, `triage-proposed`) or that carry `needs-triage` or `question`.
-2. `decision-needed` wake records from a lead that are newer than the ledger's consumed-up-to marker.
+2. `decision-needed` wake records from a lead that are newer than the ledger's consumed-up-to marker. The lead also sends you one line by SendMessage for every escalation (ruled 2026-09-28: the watchdog's triage wake only relaunches you when idle, on a cooldown, and has missed escalations). That message is a wake, not a record: on it, compute the frontier and take the escalation from the wake record and the issue, and never propose from the message text alone.
 3. Your own proposals that now carry an Approval comment.
 
 Never on the frontier: `spec` parents (cutting is Cory's), issues assigned to the tenant owner, and issues on hold. Nothing about who wrote a comment moves an issue on or off the frontier: every fleet session posts under the owner's login, so authorship cannot tell Cory from a lead (fleet#55). Cory asks for a new proposal with a comment beginning `Re-propose`, a shape no fleet role may write; a lead's cross-link, closing note or measurement comment changes nothing. At most **five proposals per turn**; then stop and let the hook or the watchdog bring you back.
