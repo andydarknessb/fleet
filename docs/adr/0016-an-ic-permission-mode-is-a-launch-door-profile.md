@@ -78,3 +78,35 @@ the settings carry the mode for both profiles.
   the live roster row records the profile.
 - A manifest written before this ADR has no `permissions` field and launches
   under auto, as it always did.
+
+## Main-checkout amendment (2026-09-28, fleet#171)
+
+The rehearsal (#164, CLI 2.1.283) waited four times. The fixes stay inside
+this ADR's shape: a missing line, or an `agents/ic.md` rule where no line can
+cover the need.
+
+- **`<repo>` is a fourth token**, the tenant file's `repo`. A haiku IC
+  resolves a ticket's paths against the main checkout, not its worktree, so
+  the profile allows `Read(<repo>/**)` and names `<repo>` in
+  `additionalDirectories` (a Bash prefix rule does not cover a path outside
+  the allowed directories).
+- **The main checkout stays uneditable.** The additional directory makes it
+  editable under `acceptEdits`, and a deny list cannot say "everything but
+  `.claude/worktrees`". The profile's `mainCheckoutDeny` has `launch.ps1`
+  walk the path to `.claude/worktrees` and deny Edit, Write and NotebookEdit
+  on every other entry at each level as it stands at launch: a file by its
+  path, a directory with `/**`. A top-level entry created after launch is not
+  covered. A main checkout the launch cannot list refuses the launch.
+- **The PR body file lives beside the worktree**, at
+  `.claude/worktrees/ic-<n>-pr-body.md`, written with the Write tool. A temp
+  directory is outside the allowed directories, and a file inside the
+  worktree would reach the IC's commits. The retire door removes it with
+  the assignment directory, which it now removes even when git's record of
+  the worktree is already gone.
+- **One command per Bash call** is an `ic.md` rule, not a profile line. A
+  `cd <worktree> && ... 2>/dev/null || ...` call waited with every command in
+  it allowed, and no rule was probed that covers it.
+
+The open premise is settled for 2.1.283: every Edit in the worktree went
+through without a prompt, so the settings' `acceptEdits` wins over the role
+file's `permissionMode: auto`.

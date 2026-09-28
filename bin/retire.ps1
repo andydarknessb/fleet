@@ -77,6 +77,26 @@ $removedWorktrees = @($ownedBefore | Where-Object { $afterPaths -notcontains $_.
 $remainingWorktrees = @($ownedAfter | ForEach-Object { $_.path })
 $worktreeCleanup = if ($ownedBefore.Count -eq 0 -and $ownedAfter.Count -eq 0) { 'none-owned' } elseif ($ownedAfter.Count -eq 0) { 'removed' } else { 'remaining' }
 $jobRemoval = if (-not $e.jobId) { 'no-job-recorded' } elseif (-not $daemonListOk) { 'unknown' } elseif ($stillThere) { 'still-present' } else { 'removed' }
+# git's record going is not the directory going: `worktree remove` has left the emptied
+# assignment directory behind, and a relaunch of the same issue then refuses "assignment
+# worktree already exists" (#171). Once the job is gone, every owned directory git no longer
+# registers goes too (the ones unregistered above, and the row's own assignment cwd left by
+# an earlier retire), with the PR body file the IC wrote beside it (ic.md step 6).
+$leftoverDirs = @()
+if ($jobRemoval -in @('removed', 'no-job-recorded')) {
+  $registeredPaths = @($afterPaths | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') })
+  $leftoverCandidates = @($removedWorktrees)
+  if ("$($e.cwd)" -match "[\\/]\.claude[\\/]worktrees[\\/]$([regex]::Escape($Name))-assignment[\\/]?$") { $leftoverCandidates += "$($e.cwd)" }
+  foreach ($candidate in $leftoverCandidates) {
+    $candidatePath = [IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
+    if ($registeredPaths -contains $candidatePath) { continue }
+    Remove-Item -LiteralPath (Join-Path (Split-Path -Parent $candidatePath) "$Name-pr-body.md") -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $candidatePath) {
+      Remove-Item -LiteralPath $candidatePath -Recurse -Force -ErrorAction SilentlyContinue
+      if (Test-Path -LiteralPath $candidatePath) { $leftoverDirs += $candidatePath }
+    }
+  }
+}
 Write-Output (@{
   retired = $Name
   reason = $Reason
@@ -84,6 +104,7 @@ Write-Output (@{
   worktreeCleanup = $worktreeCleanup
   worktreesRemoved = $removedWorktrees
   worktreesRemaining = $remainingWorktrees
+  worktreeDirsLeft = $leftoverDirs
 } | ConvertTo-Json -Compress)
 # claude/git above leave their last exit code in $LASTEXITCODE, and a nonzero code on
 # a successful retire is expected (claude rm refuses dirty worktrees). Exit 0 so

@@ -317,17 +317,17 @@ if ($denyRules.Count -gt 0) {
 
 # --- permission profile (spec #94, ADR 0016). auto is fleet-settings.json as written.
 # --- allowlist runs acceptEdits with the checked-in config/permissions-allowlist.json:
-# --- its allow rules verbatim (tokens resolved), the fleet root as an additional
-# --- directory, and its deny rules appended after the tool contract's (deny beats
-# --- allow, so the contract is unchanged). The mode lives in the settings only; no
-# --- --permission-mode goes on the command line.
+# --- its allow rules verbatim (tokens resolved), the fleet root and the tenant's main
+# --- checkout as additional directories, and its deny rules appended after the tool
+# --- contract's (deny beats allow, so the contract is unchanged). The mode lives in the
+# --- settings only; no --permission-mode goes on the command line.
 $allowRuleCount = 0
 if ($Permissions -eq 'allowlist') {
   $profilePath = "$FleetHome\config\permissions-allowlist.json"
   $permissionProfile = $null
   try { $permissionProfile = Read-Json $profilePath } catch {}
   if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable"; exit 4 }
-  $profileTokens = @{ '<fleet>' = $fleetFwd; '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
+  $profileTokens = @{ '<fleet>' = $fleetFwd; '<repo>' = "$($t.repo)".Replace('\', '/').TrimEnd('/'); '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
   $resolveProfileRule = {
     param([string]$Text)
     foreach ($token in $profileTokens.Keys) { if ($profileTokens[$token]) { $Text = $Text.Replace($token, $profileTokens[$token]) } }
@@ -338,6 +338,25 @@ if ($Permissions -eq 'allowlist') {
     $profileAllow = @($permissionProfile.allow | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
     $profileDeny = @($permissionProfile.deny | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
     $profileDirs = @($permissionProfile.additionalDirectories | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$_" })
+    # #171: the main checkout is an additional directory, which acceptEdits makes editable,
+    # and a deny list cannot say "everything but .claude/worktrees". So the path down to
+    # `keep` is walked and every other entry at each level is denied as it stands at
+    # launch: a file by its path, a directory with /**. The keep path itself is never
+    # denied, whether or not it exists yet. An unlistable root refuses the launch.
+    $mainCheckout = $permissionProfile.mainCheckoutDeny
+    if ($mainCheckout) {
+      $level = (& $resolveProfileRule "$($mainCheckout.root)").TrimEnd('/')
+      if (-not (Test-Path -LiteralPath $level -PathType Container)) { throw "the main checkout '$level' the allowlist profile denies is not a directory this launch can list" }
+      foreach ($keepSegment in @("$($mainCheckout.keep)" -split '/' | Where-Object { $_ })) {
+        if (-not (Test-Path -LiteralPath $level -PathType Container)) { break }
+        foreach ($entry in @(Get-ChildItem -LiteralPath $level -Force)) {
+          if ($entry.Name -eq $keepSegment) { continue }
+          $entryPattern = if ($entry.PSIsContainer) { "$level/$($entry.Name)/**" } else { "$level/$($entry.Name)" }
+          foreach ($deniedTool in @($mainCheckout.tools)) { $profileDeny += "$deniedTool($entryPattern)" }
+        }
+        $level = "$level/$keepSegment"
+      }
+    }
   } catch { Write-Error "$($_.Exception.Message)"; exit 4 }
   if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
   $existingDeny = @()

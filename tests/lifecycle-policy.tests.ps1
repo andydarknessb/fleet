@@ -32,6 +32,7 @@ $stop = $retire.IndexOf('claude stop')
 Assert-True ($retiring -ge 0 -and $stop -gt $retiring) 'Retirement must publish the retiring marker before stopping the job'
 Assert-Match $retire 'worktreesRemaining' 'Retirement output must report still-registered owned worktrees'
 Assert-Match $retire "worktreeCleanup = if .*'none-owned'.*'removed'.*'remaining'" 'Retirement output must distinguish no worktree, removed worktree, and remaining worktree'
+Assert-Match $retire 'worktreeDirsLeft' 'Retirement output must report an assignment directory it could not remove (#171)'
 Assert-Match $retire 'Get-DaemonSessions -All -Strict' 'Owned-worktree removal must depend on a daemon read that fails CLOSED (-Strict), never a tolerant read that reads a failure as "the job is gone"'
 
 # --- behavioral case (review finding 11/12): a real retire.ps1 run, not just source text.
@@ -99,6 +100,24 @@ try {
   Assert-TrueB (Test-Path $ownedWt2) 'an unreadable daemon list must leave the owned worktree untouched, not force-remove it'
   Assert-TrueB ($resultB2.worktreeCleanup -eq 'remaining') 'the JSON must report worktreeCleanup remaining when the daemon list could not be read'
   Assert-TrueB ($resultB2.jobRemoval -eq 'unknown') 'the JSON must report jobRemoval unknown, never guess removed or still-present'
+
+  # Case (#171): git no longer registers the assignment worktree but its directory is still
+  # there (the relaunch refused "assignment worktree already exists"). Once the job is gone,
+  # retire removes the directory and the PR body file beside it, and nothing of ic-9020's.
+  $leftoverWt = "$hub\.claude\worktrees\ic-902-assignment"
+  [IO.Directory]::CreateDirectory($leftoverWt) | Out-Null
+  Write-Utf8B "$hub\.claude\worktrees\ic-902-pr-body.md" 'body'
+  [IO.Directory]::CreateDirectory("$hub\.claude\worktrees\ic-9020-assignment") | Out-Null
+  Write-Utf8B "$hub\.claude\worktrees\ic-9020-pr-body.md" 'body'
+  Write-Utf8B "$retireTestRoot\state\roster.json" (@{ sessions = @(@{ name = 'ic-902'; role = 'ic'; tenant = 'test'; issue = 902; cwd = $leftoverWt; status = 'active'; jobId = 'job-902' }) } | ConvertTo-Json -Depth 6)
+  $eapB3 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  $outB3 = & powershell -NoProfile -ExecutionPolicy Bypass -File "$retireTestRoot\bin\retire.ps1" -Name 'ic-902' -Reason 'done' 2>&1 | Out-String
+  $ErrorActionPreference = $eapB3
+  $resultB3 = ($outB3.Trim() -split "`n")[-1] | ConvertFrom-Json
+  Assert-TrueB (-not (Test-Path $leftoverWt)) "retire must remove an assignment directory git no longer registers (got: $outB3)"
+  Assert-TrueB (-not (Test-Path "$hub\.claude\worktrees\ic-902-pr-body.md")) 'retire must remove the PR body file beside the assignment worktree'
+  Assert-TrueB (@($resultB3.worktreeDirsLeft).Count -eq 0) 'the JSON must report no directory left behind'
+  Assert-TrueB ((Test-Path "$hub\.claude\worktrees\ic-9020-assignment") -and (Test-Path "$hub\.claude\worktrees\ic-9020-pr-body.md")) 'retire must not touch another IC whose name only starts with this one'
 
   $env:PATH = $oldPathB
 } finally {

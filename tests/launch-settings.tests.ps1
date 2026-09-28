@@ -43,6 +43,10 @@ try {
   # Claude Code 2.1.281 trust pre-flight (launch.ps1 Test-WorkspaceTrusted): trust the test root so every path under it launches.
   [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
   [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))
+  # The tenant's main checkout, for the allowlist profile's main-checkout denies (#171).
+  foreach ($repoDir in 'src', '.git', '.claude\agents', '.claude\worktrees') { [IO.Directory]::CreateDirectory((Join-Path $repoPath $repoDir)) | Out-Null }
+  Write-Utf8 "$repoPath\package.json" '{}'
+  Write-Utf8 "$repoPath\.claude\settings.json" '{}'
   $repoFwd = $repoPath.Replace('\', '/')
   $rootFwd = $testRoot.Replace('\', '/')
 
@@ -164,16 +168,44 @@ exit $LASTEXITCODE
   Assert-True (-not ("$($rm.command)" -match '--permission-mode')) 'the permission mode is never passed on the command line'
   $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
   Assert-True ($haikuSettings.permissions.defaultMode -eq 'acceptEdits') 'the allowlist settings run acceptEdits'
-  $expectedAllow = @($profile.allow | ForEach-Object { "$($_.rule)".Replace('<fleet>', $rootFwd) })
-  Assert-True ((@($haikuSettings.permissions.allow) -join "`n") -eq ($expectedAllow -join "`n")) 'permissions.allow is the checked-in profile verbatim, <fleet> resolved to this root'
+  $expectedAllow = @($profile.allow | ForEach-Object { "$($_.rule)".Replace('<fleet>', $rootFwd).Replace('<repo>', $repoFwd) })
+  Assert-True ((@($haikuSettings.permissions.allow) -join "`n") -eq ($expectedAllow -join "`n")) 'permissions.allow is the checked-in profile verbatim, <fleet> and <repo> resolved'
   Assert-True (@($haikuSettings.permissions.additionalDirectories) -contains $rootFwd) 'additionalDirectories names the fleet root'
+  # #171: <repo> is the tenant file's repo, in allow, additionalDirectories and deny.
+  Assert-True (@($haikuSettings.permissions.allow) -contains "Read($repoFwd/**)") 'the allowlist settings allow Read across the tenant main checkout (rehearsal wait 1)'
+  Assert-True (@($haikuSettings.permissions.additionalDirectories) -contains $repoFwd) 'additionalDirectories names the tenant main checkout (rehearsal wait 2)'
+  foreach ($rule in @($profile.allow)) { Assert-True ("$($rule.for)" -match 'ic\.md') "the allow rule $($rule.rule) carries a for note naming its ic.md step" }
+  foreach ($rule in @($profile.deny)) { Assert-True ("$($rule.for)".Trim().Length -gt 0) "the deny rule $($rule.rule) carries a for note" }
+  Assert-True ("$($profile.mainCheckoutDeny.for)" -match 'ic\.md') 'the main-checkout deny carries a for note naming its ic.md step'
   $haikuDeny = @($haikuSettings.permissions.deny)
   foreach ($contractRule in @($deny2 | Where-Object { $_ -like "*$rootFwd/state*" })) {
     Assert-True ($haikuDeny -contains $contractRule) "the allowlist settings keep the tool-contract deny rule $contractRule"
   }
   Assert-True ($haikuDeny -contains "Edit($rootFwd/**)") 'the profile denies edits across the fleet root it adds as a directory'
   Assert-True ($haikuDeny -contains 'Bash(git push origin integration:*)') 'the profile deny resolves <defaultBranch> from the tenant file'
-  Assert-True (-not (@(@($haikuSettings.permissions.allow) + $haikuDeny) | Where-Object { "$_" -match '<[a-zA-Z]+>' })) 'no unresolved token reaches the settings'
+  Assert-True (-not (@(@($haikuSettings.permissions.allow) + $haikuDeny + @($haikuSettings.permissions.additionalDirectories)) | Where-Object { "$_" -match '<[a-zA-Z]+>' })) 'no unresolved token reaches the settings'
+  # The main checkout's entries as they stand at launch are uneditable, a file by its path
+  # and a directory with /**, down through .claude to (not including) .claude/worktrees.
+  foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') {
+    foreach ($entryRule in "$repoFwd/src/**", "$repoFwd/.git/**", "$repoFwd/package.json", "$repoFwd/.claude/settings.json", "$repoFwd/.claude/agents/**") {
+      Assert-True ($haikuDeny -contains "$deniedTool($entryRule)") "the allowlist settings deny $deniedTool($entryRule) in the main checkout"
+    }
+  }
+  # ...and no Edit, Write or NotebookEdit deny reaches the assignment worktree, any
+  # directory above it, or the PR body file beside it (ic.md steps 2 and 6). The fleet-root
+  # deny is skipped: this fixture's repo sits under its fleet root, a live tenant repo never does.
+  $mustStayEditable = @("$repoFwd/.claude", "$repoFwd/.claude/worktrees", "$repoFwd/.claude/worktrees/ic-77-assignment", "$repoFwd/.claude/worktrees/ic-77-assignment/src/app.js", "$repoFwd/.claude/worktrees/ic-77-pr-body.md")
+  foreach ($denyRule in $haikuDeny) {
+    if ("$denyRule" -notmatch '^(Edit|Write|NotebookEdit)\((.*)\)$' -or $Matches[2] -eq "$rootFwd/**") { continue }
+    $denyRegex = '^' + [regex]::Escape($Matches[2]).Replace('\*\*', '.*').Replace('\*', '[^/]*') + '$'
+    foreach ($editablePath in $mustStayEditable) {
+      Assert-True ($editablePath -notmatch $denyRegex) "the deny rule $denyRule must leave $editablePath editable"
+    }
+  }
+  # A main checkout the launch cannot list refuses the launch rather than leaving it editable.
+  Rename-Item -LiteralPath $repoPath -NewName 'repo-away'
+  try { $rmr = Run-Launch @('-Manifest', $manifestPath, '-DryRun') } finally { Rename-Item -LiteralPath "$testRoot\repo-away" -NewName 'repo' }
+  Assert-True ($script:lastExit -eq 4) "an unlistable main checkout refuses the allowlist launch (exit $script:lastExit, got: $rmr)"
   # A sonnet manifest pinning allowlist is refused at the door too (the planner refuses it first).
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
   $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')

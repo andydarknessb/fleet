@@ -1,11 +1,12 @@
 {
-  "$comment": "The allowlist permission profile (ADR 0016, spec #94). launch.ps1 writes it into an IC's per-session settings when the manifest pins permissions: allowlist, which assignment.js allows only for haiku. The session runs permission mode acceptEdits: Edit and Write inside the assignment worktree need no rule, everything else the IC role touches is pre-approved below. Tokens: <fleet> is the fleet root the launch runs from (forward slashes); <defaultBranch> and <releaseBranch> come from the tenant file. A permission wait in a rehearsal is a missing line here: add the rule with the ic.md step that needs it. The tool-contract deny rules launch.ps1 injects for every IC are still written and deny beats allow; the deny list below stands in for the autoMode soft_deny lines, which acceptEdits never consults.",
+  "$comment": "The allowlist permission profile (ADR 0016, spec #94). launch.ps1 writes it into an IC's per-session settings when the manifest pins permissions: allowlist, which assignment.js allows only for haiku. The session runs permission mode acceptEdits: Edit and Write inside the assignment worktree need no rule, everything else the IC role touches is pre-approved below. Tokens: <fleet> is the fleet root the launch runs from (forward slashes); <repo> is the tenant file's repo, its main checkout (forward slashes); <defaultBranch> and <releaseBranch> come from the tenant file. The main checkout is an additional directory, which acceptEdits makes editable, so mainCheckoutDeny has launch.ps1 deny every entry of it at launch except the path down to .claude/worktrees (a deny list cannot say \"everything but\"). A permission wait in a rehearsal is a missing line here: add the rule with the ic.md step that needs it. The tool-contract deny rules launch.ps1 injects for every IC are still written and deny beats allow; the deny list below stands in for the autoMode soft_deny lines, which acceptEdits never consults.",
   "profile": "allowlist",
   "models": ["haiku"],
   "defaultMode": "acceptEdits",
-  "additionalDirectories": ["<fleet>"],
+  "additionalDirectories": ["<fleet>", "<repo>"],
   "allow": [
     { "rule": "Read(<fleet>/**)", "for": "ic.md step 1: the tenant file, CONTEXT.md, the assignment manifest under state/manifests, bin and hooks" },
+    { "rule": "Read(<repo>/**)", "for": "ic.md step 1 and Boundaries: the tenant's CLAUDE.md and CONTEXT.md and the files a ticket names, which the IC resolves against the tenant's main checkout, not its worktree (#171, rehearsal wait 1)" },
     { "rule": "Read(~/.claude/plugins/**)", "for": "ic.md step 3: /implement and /tdd read their sibling files from the plugin cache" },
     { "rule": "Skill", "for": "ic.md steps 3 and 7: /implement, /tdd, /diagnosing-bugs, /resolving-merge-conflicts" },
     { "rule": "Bash(node <fleet>/bin/assignment.js ack:*)", "for": "ic.md step 1: the assignment-started acknowledgment" },
@@ -42,5 +43,11 @@
     { "rule": "Bash(git worktree remove:*)", "for": "soft_deny: removing a worktree is the retire door's job, not an IC's" },
     { "rule": "Bash(gh pr merge:*)", "for": "ic.md step 8 and Boundaries: an IC never merges; done is the project lead saying so" },
     { "rule": "Bash(claude:*)", "for": "soft_deny: claude stop, rm and respawn are the supervisor's" }
-  ]
+  ],
+  "mainCheckoutDeny": {
+    "root": "<repo>",
+    "keep": ".claude/worktrees",
+    "tools": ["Edit", "Write", "NotebookEdit"],
+    "for": "ic.md Boundaries: the tenant's main checkout keeps its branch. <repo> in additionalDirectories (#171, rehearsal wait 2: a Bash prefix rule does not cover a path outside the allowed directories) makes it editable under acceptEdits, so every entry is denied except the path to .claude/worktrees, where the assignment worktree (ic.md step 2) and the PR body file (ic.md step 6) live"
+  }
 }
