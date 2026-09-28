@@ -43,7 +43,7 @@
   },
   "heavySuites": {},
   "reviewStatus": "fleet-review",
-  "ciGates": [],
+  "ciGates": ["ci"],
   "watchedChecks": [],
   "ignoredChecks": ["Supabase Preview"],
   "notes": [
