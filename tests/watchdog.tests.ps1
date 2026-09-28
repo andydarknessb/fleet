@@ -752,10 +752,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $healState1 = (Get-Content "$testRoot\state\watchdog\heal.json" -Raw) | ConvertFrom-Json
   Assert-True (@($healState1.'pl-test'.attempts).Count -eq 1) 'the heal attempt must be counted for the session'
 
-  # Case H2 (control): needs "approve Bash" (a real permission prompt) must never heal.
+  # Case H2 (control): needs "approve Bash: ..." (a real permission prompt, in the CLI's
+  # own "approve <Tool>: <input>" form) must never heal.
   Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
-  Write-Utf8 $jobPStatePath '{"needs":"approve Bash","updatedAt":"2026-01-01T00:00:00Z"}'
+  Write-Utf8 $jobPStatePath '{"needs":"approve Bash: npm test","updatedAt":"2026-01-01T00:00:00Z"}'
   $rotateCountBeforeH2 = @(Get-RotateCalls).Count
   $h2 = Run-Watchdog
   Assert-True (@(Get-RotateCalls).Count -eq $rotateCountBeforeH2) 'a permission prompt must never be healed'
@@ -769,6 +770,14 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   # only raises permission-wait (unchanged, tested in the paging section below)
   # and must never also raise human-wait - a permission prompt is never doubled.
   Assert-True (-not (@($h2.conditions) -contains 'human-wait:pl-test')) 'a permission prompt must never raise human-wait'
+  # Case H2c (2026-09-28): a session's own ask that merely starts with "approve"/"Approve"
+  # (pe-nidus: "approve decisions on #4, ...") is a human-wait, never a permission-wait.
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $jobPStatePath '{"needs":"Approve PR #26 amendment and ticket #4 proposal","updatedAt":"2026-01-01T00:00:00Z"}'
+  $h2c = Run-Watchdog
+  Assert-True (@($h2c.conditions) -contains 'human-wait:pl-test') "a written ask starting with Approve must raise human-wait (conditions: $(@($h2c.conditions) -join ', '))"
+  Assert-True (@(@($h2c.conditions) | Where-Object { "$_" -like 'permission-wait:pl-test*' }).Count -eq 0) 'a written ask starting with Approve must never raise permission-wait'
+  Write-Utf8 $jobPStatePath '{"needs":"approve Bash: npm test","updatedAt":"2026-01-01T00:00:00Z"}'
 
   # Case H3 (control): heartbeat 59 min (under the 60-min threshold) must not heal.
   Write-Utf8 $jobPStatePath '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
