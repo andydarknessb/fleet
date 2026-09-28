@@ -271,6 +271,8 @@ if (-not $DryRun) { [void](Send-FleetIdentityPageOnce -Plan $identityPlan -Sourc
 $settings = Read-Json "$FleetHome\fleet-settings.json"
 $envBlock = [ordered]@{ FLEET_HOME = $FleetHome; FLEET_NAME = $Name; FLEET_ROLE = $Role; FLEET_TENANT = "$Tenant"; FLEET_PARENT = $Parent }
 if ($Issue) { $envBlock.FLEET_ISSUE = "$Issue" }
+# fleet #181: hooks/allowlist-gate.js gates only the sessions launched under the allowlist profile.
+if ($Permissions) { $envBlock.FLEET_PERMISSIONS = "$Permissions" }
 if ($identityPlan.env) { foreach ($identityVar in $identityPlan.env.PSObject.Properties) { $envBlock[$identityVar.Name] = "$($identityVar.Value)" } }
 if ($Manifest) {
   $envBlock.FLEET_ASSIGNMENT_MANIFEST = (Resolve-Path -LiteralPath $Manifest).Path

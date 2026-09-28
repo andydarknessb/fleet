@@ -26,6 +26,7 @@
     ],
     "PreToolUse": [
       { "matcher": "Bash|PowerShell|WebFetch|WebSearch", "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/research-gate.ps1", "timeout": 15 } ] },
+      { "matcher": "Bash|PowerShell", "hooks": [ { "type": "command", "command": "node C:/Users/Cory/fleet/hooks/allowlist-gate.js", "timeout": 15 } ] },
       { "hooks": [ { "type": "command", "command": "powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/Cory/fleet/hooks/principal-guard.ps1", "timeout": 15 } ] }
     ],
     "Stop": [

@@ -146,6 +146,7 @@ exit $LASTEXITCODE
   Assert-True ($rs.permissions -eq 'auto' -and $rs.allowRules -eq 0) "a sonnet launch reports the auto profile with no allow rules (got $($rs.permissions)/$($rs.allowRules))"
   $sonnetSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.json" -Raw | ConvertFrom-Json
   Assert-True ($sonnetSettings.permissions.defaultMode -eq 'auto') 'the sonnet settings keep defaultMode auto'
+  Assert-True ($sonnetSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a sonnet session is marked auto, so the allowlist gate passes it (fleet #181)'
   Assert-True (-not $sonnetSettings.permissions.PSObject.Properties['allow'] -and -not $sonnetSettings.permissions.PSObject.Properties['additionalDirectories']) 'the sonnet settings carry no allow list and no additional directories'
   $rha = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'haiku', '-Permissions', 'auto', '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and "$($rha.reason)" -match 'fleet #28') 'haiku under an explicit auto profile is still the fleet #28 refusal'
@@ -170,6 +171,7 @@ exit $LASTEXITCODE
   Assert-True (-not ("$($rm.command)" -match '--permission-mode')) 'the permission mode is never passed on the command line'
   $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
   Assert-True ($haikuSettings.permissions.defaultMode -eq 'acceptEdits') 'the allowlist settings run acceptEdits'
+  Assert-True ($haikuSettings.env.FLEET_PERMISSIONS -eq 'allowlist') 'the env names the profile, which hooks/allowlist-gate.js keys on (fleet #181)'
   $expectedAllow = @($profile.allow | ForEach-Object { "$($_.rule)".Replace('<fleet>', $rootFwd).Replace('<repo>', $repoFwd) })
   Assert-True ((@($haikuSettings.permissions.allow) -join "`n") -eq ($expectedAllow -join "`n")) 'permissions.allow is the checked-in profile verbatim, <fleet> and <repo> resolved'
   Assert-True (@($haikuSettings.permissions.additionalDirectories) -contains $rootFwd) 'additionalDirectories names the fleet root'

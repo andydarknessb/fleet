@@ -180,3 +180,39 @@ test('#119 review: a removed common-word local, or a name code still uses, is no
   const grep = (name) => (name === 'keepMe' ? 'src/y.js:4:  keepMe(); // keepMe is still called here\nREADME.md:2:keepMe docs' : 'README.md:9:the result is fine');
   assert.deepEqual(checkPullRequest({ repo: '.', base: 'x', issue: 11, bodyText: CLEAN_BODY, issueBody: ISSUE, diffText: diff, grep }).defects, []);
 });
+
+// --- #181: ic.md step 5 is mechanical ------------------------------------------------
+// The 2026-09-28 haiku rehearsal's IC skipped step 5 on a diff that tripped the
+// concurrency trigger, and this check exited 0. Red-tell: before #181 there is no
+// risk-review defect, so the first case below is clean.
+
+test('#181: a triggered diff with no risk review recorded at the head is a risk-review defect', () => {
+  const { riskDefects } = require('../bin/pr-ready-check');
+  const head = 'a'.repeat(40);
+  const classify = () => ({ headSha: head, classification: { riskReview: true, triggers: [{ class: 'concurrency' }] } });
+  const tenant = { name: 'endzone', riskTriggers: { concurrency: { patterns: ['advisory'] } } };
+  const missing = riskDefects({ repo: '.', base: 'b', head: 'HEAD', issue: 1730, tenant, classify, getRecord: () => ({ review: {} }) });
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0].kind, 'risk-review');
+  assert.match(missing[0].detail, /concurrency/);
+  assert.match(missing[0].detail, /ic\.md step 5/);
+  assert.match(missing[0].detail, /endzone:issue-1730 records no risk review/);
+
+  const stale = riskDefects({ repo: '.', base: 'b', head: 'HEAD', issue: 1730, tenant, classify, getRecord: () => ({ review: { risk: { artifact: 'state/reviews/x/risk-001.json', headSha: 'b'.repeat(40) } } }) });
+  assert.equal(stale.length, 1, 'a risk review at an older head does not cover this one');
+  assert.match(stale[0].detail, /not this head/);
+
+  const notFound = () => { const error = new Error('no record'); error.code = 'NOT_FOUND'; throw error; };
+  assert.equal(riskDefects({ repo: '.', base: 'b', head: 'HEAD', issue: 1730, tenant, classify, getRecord: notFound }).length, 1, 'a missing Work record is the same defect');
+});
+
+test('#181: a recorded risk review at the head, an untriggered diff, or no tenant is clean', () => {
+  const { riskDefects } = require('../bin/pr-ready-check');
+  const head = 'a'.repeat(40);
+  const tenant = { name: 'endzone' };
+  const triggered = () => ({ headSha: head, classification: { riskReview: true, triggers: [{ class: 'concurrency' }] } });
+  assert.deepEqual(riskDefects({ repo: '.', base: 'b', issue: 1730, tenant, classify: triggered, getRecord: () => ({ review: { risk: { artifact: 'r', headSha: head } } }) }), []);
+  const quiet = () => ({ headSha: head, classification: { riskReview: false, triggers: [] } });
+  assert.deepEqual(riskDefects({ repo: '.', base: 'b', issue: 1730, tenant, classify: quiet, getRecord: () => { throw new Error('must not read'); } }), []);
+  assert.deepEqual(riskDefects({ repo: '.', base: 'b', issue: 1730, tenant: null, classify: () => { throw new Error('must not classify'); } }), []);
+});
