@@ -273,10 +273,12 @@ foreach ($x in $expected) {
   if ($js) { $detail = "$($js.detail) $($js.waitingFor)" }
   # Wordings seen live: "rate limit", "usage limit", "You've hit your session limit · resets 5:50pm"
   # (2026-09-01: the last one matched nothing, so no PAUSE was set and the watchdog paged
-  # fleet-dead during a plain Max-plan window). "session limit" is anchored to the CLI's
-  # "hit your ... limit": the detail is the session's own free-text summary, and on
-  # 2026-09-28 pl-endzone wrote its IC cap as "session limit 6/6", which paused the fleet.
-  if ($detail -match 'rate.?limit|usage limit|hit your \w+ limit|limit reached|resets? (at|\d)') {
+  # fleet-dead during a plain Max-plan window). The detail is the session's own free-text
+  # summary, so a bare keyword is work being described, not a limit: on 2026-09-28 "session
+  # limit 6/6" (pl-endzone's IC cap) and "pairing rate limit" (pe-nidus naming Nidus #21)
+  # each paused the fleet for an hour. Match only the CLI's limit sentence: "hit your ...
+  # limit", "limit will reset", or a reset clock time.
+  if ($detail -match 'hit your \w+ limit|limit will reset|resets?( at)? \d{1,2}(:\d{2})?\s?(am|pm)') {
     if (-not (Test-Paused)) {
       # The detail line is a LEVEL, not an event: it is the session's own last status summary and
       # stands long after the limit it names has reset (live 2026-09-10: "resets 1:20am" still stood

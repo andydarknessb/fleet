@@ -82,6 +82,18 @@ exit /b 0
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"2 PRs in CI; #1723 queued (session limit 6/6); awaiting watchdog","waitingFor":""}'
   $icCap = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
   Assert-True ($null -eq $icCap.pause) "an IC-cap count in a status line must not propose the rate-limit PAUSE (got '$($icCap.pause)')"
+  # 2026-09-28 16:01Z, the same day: pe-nidus summarised Nidus issue #21 ("pairing rate limit")
+  # and `rate.?limit` paused the fleet again. Any keyword can be work the session is describing;
+  # only the CLI's own limit sentence (with its reset time) is a limit.
+  foreach ($workText in @(
+      'frontier: #21 proposed as feature (pairing rate limit); no approvals/escalations',
+      'gh: API rate limit exceeded on pr list; retrying next tick',
+      'PR #30 adds a usage limit column to profiles',
+      'IC cap limit reached (6/6); #1730 queued')) {
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" (ConvertTo-Json @{ detail = $workText; waitingFor = '' } -Compress)
+    $workLine = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+    Assert-True ($null -eq $workLine.pause) "a status line describing work must not propose the rate-limit PAUSE: '$workText' (got '$($workLine.pause)')"
+  }
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"","waitingFor":""}'
 
   Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"900":"held"},"prs":{}}'
