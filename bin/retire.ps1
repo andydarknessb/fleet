@@ -28,6 +28,33 @@ $e | Add-Member -NotePropertyName retiringAt -NotePropertyValue (Now-Iso) -Force
 $e | Add-Member -NotePropertyName retiredBecause -NotePropertyValue $Reason -Force
 Save-LiveRoster $live
 
+# git's record of a removed worktree goes, but on Windows its directory can survive
+# empty (a handle the stopped job still held), and launch.ps1 then refuses a relaunch of
+# the same issue: "assignment worktree already exists" (fleet #171). The main checkout
+# is where .claude/worktrees lives; a manifest IC's cwd is the worktree under it.
+$repoRoot = $null
+if ($e.cwd) { $repoRoot = if ("$($e.cwd)" -match '^(.+?)[\\/]\.claude[\\/]worktrees[\\/]') { $Matches[1] } else { "$($e.cwd)" } }
+function Remove-EmptyOwnedWorktreeDirs {
+  param([string[]]$RegisteredPaths)
+  $result = [pscustomobject]@{ removed = @(); remaining = @() }
+  if (-not $repoRoot) { return $result }
+  $worktreesDir = Join-Path $repoRoot '.claude\worktrees'
+  if (-not (Test-Path -LiteralPath $worktreesDir -PathType Container)) { return $result }
+  $registered = @($RegisteredPaths | ForEach-Object { "$_".Replace('\', '/').TrimEnd('/').ToLowerInvariant() })
+  foreach ($dir in @(Get-ChildItem -LiteralPath $worktreesDir -Directory -Force -ErrorAction SilentlyContinue)) {
+    if ($dir.Name -notmatch "^$([regex]::Escape($Name))(-|$)") { continue }
+    if ($registered -contains $dir.FullName.Replace('\', '/').TrimEnd('/').ToLowerInvariant()) { continue }
+    # Empty only: a directory with content git no longer tracks is reported, never deleted.
+    $gone = $false
+    for ($attempt = 0; $attempt -lt 5 -and -not $gone; $attempt++) {
+      if (@(Get-ChildItem -LiteralPath $dir.FullName -Force -ErrorAction SilentlyContinue).Count -gt 0) { break }
+      try { [IO.Directory]::Delete($dir.FullName, $false); $gone = $true } catch { Start-Sleep -Milliseconds 500 }
+    }
+    if ($gone) { $result.removed += $dir.FullName } else { $result.remaining += $dir.FullName }
+  }
+  return $result
+}
+
 $ownedBefore = @(Get-OwnedWorktrees)
 $stillThere = $false
 $daemonListOk = $true
@@ -76,6 +103,9 @@ $afterPaths = @($ownedAfter | ForEach-Object { $_.path })
 $removedWorktrees = @($ownedBefore | Where-Object { $afterPaths -notcontains $_.path } | ForEach-Object { $_.path })
 $remainingWorktrees = @($ownedAfter | ForEach-Object { $_.path })
 $worktreeCleanup = if ($ownedBefore.Count -eq 0 -and $ownedAfter.Count -eq 0) { 'none-owned' } elseif ($ownedAfter.Count -eq 0) { 'removed' } else { 'remaining' }
+# Only once the job is confirmed gone (or none was recorded): a live job may still be in the directory.
+$dirSweep = [pscustomobject]@{ removed = @(); remaining = @() }
+if (-not $e.jobId -or ($daemonListOk -and -not $stillThere)) { $dirSweep = Remove-EmptyOwnedWorktreeDirs -RegisteredPaths $remainingWorktrees }
 $jobRemoval = if (-not $e.jobId) { 'no-job-recorded' } elseif (-not $daemonListOk) { 'unknown' } elseif ($stillThere) { 'still-present' } else { 'removed' }
 Write-Output (@{
   retired = $Name
@@ -84,6 +114,8 @@ Write-Output (@{
   worktreeCleanup = $worktreeCleanup
   worktreesRemoved = $removedWorktrees
   worktreesRemaining = $remainingWorktrees
+  worktreeDirsRemoved = @($dirSweep.removed)
+  worktreeDirsRemaining = @($dirSweep.remaining)
 } | ConvertTo-Json -Compress)
 # claude/git above leave their last exit code in $LASTEXITCODE, and a nonzero code on
 # a successful retire is expected (claude rm refuses dirty worktrees). Exit 0 so

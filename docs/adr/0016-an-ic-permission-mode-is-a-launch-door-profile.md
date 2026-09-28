@@ -78,3 +78,35 @@ the settings carry the mode for both profiles.
   the live roster row records the profile.
 - A manifest written before this ADR has no `permissions` field and launches
   under auto, as it always did.
+
+## Amendment 1 (2026-09-28, fleet #171): the tenant repo, the PR body file, one command per call
+
+The rehearsal (#164, CLI 2.1.283, report in `.scratch/haiku-rehearsal-2026-09-26/`)
+was not clean. It stopped on four permission waits, and it settled the open
+premise: the settings' `acceptEdits` was in effect, so `permissionMode: auto` in
+the `agents/ic.md` frontmatter does not override it.
+
+- **`<repo>` is a token.** It resolves to the tenant file's `repo`, the main
+  checkout. The profile allows `Read(<repo>/**)` and lists `<repo>` as an
+  additional directory, because a haiku IC reads the issue's paths in the main
+  checkout rather than its worktree, and a prefix rule such as `Bash(ls:*)`
+  does not cover a path outside the allowed directories.
+- **The main checkout stays unwritable.** An additional directory is editable
+  under `acceptEdits`, and a deny list cannot say "everything but
+  `.claude/worktrees`". So the profile's `repoDeny` names the tools and the
+  kept path, and `launch.ps1` generates one deny rule per tool for every entry
+  of the checkout beside each segment of that path. An entry created after the
+  launch is not covered. A launch whose tenant repo does not exist is refused
+  rather than written with no denies.
+- **The PR body file is `.fleet-pr-body.md` in the worktree root**, written with
+  the Write tool (`ic.md` step 6) instead of a heredoc into a temp directory
+  outside the allowed directories. The launch adds it to the repo's
+  `info/exclude` so it is never committed.
+- **One command per Bash call** under this profile (`ic.md` Boundaries). A
+  compound with `2>/dev/null` and `||` prompted although every command in it
+  was allowed. No rule was probed to cover it; the role file rule avoids it.
+- Every `additionalDirectories` entry is now `{ dir, for }`, like a rule.
+
+Verification is the next rehearsal, a re-run of #164's procedure against this
+profile. The fourth ticket's reopen and its `verifiedCliVersion` wait on its
+verdict.

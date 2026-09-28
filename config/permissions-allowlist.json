@@ -1,11 +1,15 @@
 {
-  "$comment": "The allowlist permission profile (ADR 0016, spec #94). launch.ps1 writes it into an IC's per-session settings when the manifest pins permissions: allowlist, which assignment.js allows only for haiku. The session runs permission mode acceptEdits: Edit and Write inside the assignment worktree need no rule, everything else the IC role touches is pre-approved below. Tokens: <fleet> is the fleet root the launch runs from (forward slashes); <defaultBranch> and <releaseBranch> come from the tenant file. A permission wait in a rehearsal is a missing line here: add the rule with the ic.md step that needs it. The tool-contract deny rules launch.ps1 injects for every IC are still written and deny beats allow; the deny list below stands in for the autoMode soft_deny lines, which acceptEdits never consults.",
+  "$comment": "The allowlist permission profile (ADR 0016, spec #94). launch.ps1 writes it into an IC's per-session settings when the manifest pins permissions: allowlist, which assignment.js allows only for haiku. The session runs permission mode acceptEdits: Edit and Write inside the assignment worktree need no rule, everything else the IC role touches is pre-approved below. Tokens: <fleet> is the fleet root the launch runs from (forward slashes); <repo> is the tenant file's repo, the main checkout (forward slashes); <defaultBranch> and <releaseBranch> come from the tenant file. A permission wait in a rehearsal is a missing line here: add the rule with the ic.md step that needs it. The tool-contract deny rules launch.ps1 injects for every IC are still written and deny beats allow; the deny list below stands in for the autoMode soft_deny lines, which acceptEdits never consults. An additionalDirectories entry is { dir, for }. repoDeny is not a rule list: launch.ps1 generates one deny rule per tool for every entry of the main checkout beside each segment of `keep`, so the assignment worktrees under it stay editable.",
   "profile": "allowlist",
   "models": ["haiku"],
   "defaultMode": "acceptEdits",
-  "additionalDirectories": ["<fleet>"],
+  "additionalDirectories": [
+    { "dir": "<fleet>", "for": "ic.md steps 1, 4, 5 and 6: the tenant file, CONTEXT.md, the assignment manifest and the fleet bin commands" },
+    { "dir": "<repo>", "for": "ic.md steps 1 and 3: the IC reads the issue's paths in the main checkout, and a prefix rule such as Bash(ls:*) does not cover a path outside the allowed directories (fleet #171, rehearsal wait 2)" }
+  ],
   "allow": [
     { "rule": "Read(<fleet>/**)", "for": "ic.md step 1: the tenant file, CONTEXT.md, the assignment manifest under state/manifests, bin and hooks" },
+    { "rule": "Read(<repo>/**)", "for": "ic.md steps 1 and 3: the files the issue names, which a haiku IC reads in the tenant's main checkout rather than its worktree (fleet #171, rehearsal wait 1)" },
     { "rule": "Read(~/.claude/plugins/**)", "for": "ic.md step 3: /implement and /tdd read their sibling files from the plugin cache" },
     { "rule": "Skill", "for": "ic.md steps 3 and 7: /implement, /tdd, /diagnosing-bugs, /resolving-merge-conflicts" },
     { "rule": "Bash(node <fleet>/bin/assignment.js ack:*)", "for": "ic.md step 1: the assignment-started acknowledgment" },
@@ -30,6 +34,7 @@
     { "rule": "WebFetch", "for": "ic.md Boundaries: the researcher worker's documentation lookups (ADR 0010)" },
     { "rule": "SendMessage", "for": "ic.md steps 6 and 7 and Stop conditions: messaging the project lead" }
   ],
+  "repoDeny": { "tools": ["Edit", "Write", "NotebookEdit"], "keep": ".claude/worktrees", "for": "ic.md step 2: the IC writes only in its assignment worktree under .claude/worktrees; <repo> as an additional directory makes the main checkout editable under acceptEdits, so launch.ps1 denies every other entry of the checkout as it stands at launch (fleet #171)" },
   "deny": [
     { "rule": "Edit(<fleet>/**)", "for": "additionalDirectories makes the fleet root editable under acceptEdits; an IC never edits the fleet tree (soft_deny: roster.json, fleet-settings.json, agents/)" },
     { "rule": "Write(<fleet>/**)", "for": "additionalDirectories makes the fleet root writable under acceptEdits; an IC never writes the fleet tree" },
