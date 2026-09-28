@@ -76,6 +76,12 @@ exit /b 0
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"You''ve hit your session limit · resets 5:50pm (America/Chicago)","waitingFor":""}'
   $limited = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
   Assert-True ("$($limited.pause)" -match 'rate-limit signal on ic-900') 'a session-limit detail must propose the rate-limit PAUSE'
+  # 2026-09-28 14:31Z: pl-endzone's own status line named the fleet IC cap "session limit 6/6"
+  # and the bare `session limit` alternative paused the whole fleet for 59 minutes. The
+  # CLI's wording is "You've hit your session limit"; a PL counting ICs is not a limit.
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"2 PRs in CI; #1723 queued (session limit 6/6); awaiting watchdog","waitingFor":""}'
+  $icCap = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ($null -eq $icCap.pause) "an IC-cap count in a status line must not propose the rate-limit PAUSE (got '$($icCap.pause)')"
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-900\state.json" '{"detail":"","waitingFor":""}'
 
   Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"900":"held"},"prs":{}}'
