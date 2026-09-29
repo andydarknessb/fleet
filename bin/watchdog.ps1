@@ -994,8 +994,10 @@ try {
       # the Principal is never woken for it: the Ruling comment, the ready label, the marker gone, the
       # ledger. It writes to GitHub, so it runs only where a wake would (principal-live, live mode,
       # no PAUSE) and inside this block's triage-wake-off rollback. A failed or timed-out finalize
-      # is recorded and changes nothing else: the approval stays on the frontier, so the Principal
-      # is woken for it exactly as before (the retry is the next tick; finalize is idempotent).
+      # is recorded and changes nothing else. A finalize that failed BEFORE its claim leaves the
+      # approval on the frontier, so the Principal is woken for it as before. One that failed AFTER
+      # its claim is off the frontier for 30 minutes (the next tick finishes it; finalize is
+      # idempotent) and returns to the Principal as an expiry item if it is still unfinished.
       if ($triageNode -and $principalLive -and $mode -eq 'live' -and -not $paused) {
         $finArgs = @('finalize', '--root', $FleetHome, '--tenant', $tenantName)
         if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $finArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }

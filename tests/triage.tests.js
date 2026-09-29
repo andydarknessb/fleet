@@ -21,7 +21,7 @@ function rootDir({ ownerLogin = OWNER } = {}) {
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'watch'), { recursive: true });
-  const tenant = { name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', fleetIdentity: FLEET };
+  const tenant = { name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', fleetIdentity: FLEET, escalationLabel: 'fleet-escalation' };
   if (ownerLogin) tenant.ownerLogin = ownerLogin;
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify(tenant));
   fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ triage: { maxProposalsPerTurn: 2 } }));
@@ -458,7 +458,7 @@ function thread(number, { approval = 'Approved', proposal = PROPOSAL, proposalEd
 }
 
 // Open proposals on issues `numbers` (default #40); per-issue options via `each(number)`.
-function finalizeWorld({ numbers = [40], each = () => ({}), history, outbox, recordId } = {}) {
+function finalizeWorld({ numbers = [40], each = () => ({}), history, afterPropose, outbox, recordId } = {}) {
   const root = rootDir();
   if (history) history(root);
   const issues = numbers.map((number) => {
@@ -467,6 +467,7 @@ function finalizeWorld({ numbers = [40], each = () => ({}), history, outbox, rec
     recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: number, bodyHash: triage.normalizeIssue(issue(number, { body: options.proposedBody || body })).bodyHash, commentUrl: proposalUrl(number), model: 'fable', recordId: options.recordId || recordId, now: PROPOSED_AT });
     return issue(number, { body, labels: options.labels || ['needs-triage', 'triage-proposed'], comments: options.comments || thread(number, options.thread) });
   });
+  if (afterPropose) afterPropose(root);
   const fixture = writeFixture(root, issues);
   if (outbox) fs.writeFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), `${outbox.map((row) => JSON.stringify(row)).join('\n')}\n`);
   const read = () => JSON.parse(fs.readFileSync(fixture, 'utf8'));
@@ -562,11 +563,25 @@ test('#207: each clause that fails leaves the issue to the Principal, named in l
     ['a false premise', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('verified @abcdef2', 'false: the slice is already correct') } })],
     ['Premises: none stated', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('Premises:\n  src/list.js: slices one short @abcdef1 verified @abcdef2', 'Premises: none stated') } })],
     ['an empty Premises block', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('  src/list.js: slices one short @abcdef1 verified @abcdef2\n', '') } })],
+    // clause 8, whole FIELD: a continuation line under an exact-valued field fails it
+    ['Open for Cory: none with an indented question under it', 'open-for-cory', () => ({ thread: { proposal: PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none\n  Is the caption in scope?') } })],
+    ['Tier: sonnet with a continuation', 'tier', () => ({ thread: { proposal: PROPOSAL.replace('Tier: sonnet', 'Tier: sonnet\n  (opus if the migration is needed)') } })],
+    ['Blocked_by: none with a continuation', 'blocked-by', () => ({ thread: { proposal: PROPOSAL.replace('Blocked_by: none', 'Blocked_by: none\n  once #12 lands') } })],
+    ['Classification: bug with a continuation', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: bug\n  (ready-for-human: run the migration)') } })],
+    ['a duplicated Tier line', 'tier', () => ({ thread: { proposal: PROPOSAL.replace('Tier: sonnet', 'Tier: sonnet\nTier: opus') } })],
+    // clause 8, premises: every line, no false, not stopped by a blank line
+    ['a false premise that also says verified', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('slices one short @abcdef1 verified @abcdef2', 'slices one short @abcdef1 false: not so, verified @abcdef2') } })],
+    ['two premises, one unverified', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('  src/list.js: slices one short @abcdef1 verified @abcdef2', '  src/list.js: slices one short @abcdef1 verified @abcdef2\n  src/util.js: exports pad @abcdef1') } })],
+    ['an unverified premise after a blank line', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('  src/list.js: slices one short @abcdef1 verified @abcdef2', '  src/list.js: slices one short @abcdef1 verified @abcdef2\n\n  src/util.js: exports pad @abcdef1') } })],
+    ['a premise with a trailing note after verified', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('verified @abcdef2', 'verified @abcdef2 (re-read at head)') } })],
+    // clause 6: the heading must be a heading on its own line
+    ['a Premises heading split across lines', 'no-premises-heading', () => ({ body: 'Body of #40 ##\nPremises\n' })],
     // clause 9
     ['held', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'held'] })],
     ['haiku-rehearsal', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'haiku-rehearsal'] })],
     ['already routed', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'ready-for-human'] })],
     ['the marker gone', 'labels', () => ({ labels: ['needs-triage'] })],
+    ['the tenant escalation label', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'fleet-escalation'] })],
   ];
   for (const [name, reason, options] of cases) {
     const world = finalizeWorld({ each: options });
@@ -724,4 +739,80 @@ test('#207: the finalize CLI runs against a fixture and prints what it finalized
   assert.deepEqual(out.left, [{ issue: 41, reason: 'not-exact-approval' }]);
   assert.ok(TRIAGE_FLAGS.finalize.includes('fixture'));
   assert.throws(() => cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixtrue', 'x']), (error) => /unknown flag/.test(error.message));
+});
+
+test('#207: a trailing full stop is allowed on an exact field, and a Premises heading may carry a parenthesis and a blank-separated verified block', () => {
+  const dotted = PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none.').replace('Blocked_by: none', 'Blocked_by: none.').replace('Tier: sonnet', 'Tier: sonnet.').replace('Classification: bug', 'Classification: bug.')
+    .replace('  src/list.js: slices one short @abcdef1 verified @abcdef2', '  src/list.js: slices one short @abcdef1 verified @abcdef2\n\n  src/util.js: exports pad @abcdef1 verified @abcdef2');
+  const world = finalizeWorld({ each: () => ({ body: 'Body of #40\n\n## Premises (re-read 2026-09-25)\n\nsrc/list.js: slices one short @abcdef1\n', thread: { proposal: dotted } }) });
+  assert.deepEqual(world.finalize().finalized.map((row) => row.issue), [40]);
+});
+
+test('#207: escalation window: a wake, proposal A with a record id, consumed, A superseded, B without one: B is still an escalation', () => {
+  const world = finalizeWorld({
+    outbox: [{ at: '2026-09-01T00:00:00.000Z', recordId: 'endzone:issue-40', wake: 'decision-needed', evidence: 'stuck' }],
+    history: (root) => {
+      recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: 'a', commentUrl: 'https://x/a', model: 'fable', recordId: 'endzone:issue-40', now: '2026-09-02T00:00:00.000Z' });
+      recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-02T01:00:00.000Z', now: '2026-09-02T01:00:01.000Z' });
+      recordEntry({ root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: 'b', now: '2026-09-03T00:00:00.000Z' });
+    },
+  });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'escalation', 'a superseded proposal is not a decision that answers the wake');
+});
+
+test('#207: a standing bounded-ready row is not finalized by script (clause 1)', () => {
+  const world = finalizeWorld({ afterPropose: (root) => fs.appendFileSync(triage.ledgerPath(root, 'endzone'), JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', at: '2026-09-10T06:00:00.000Z', actor: 'principal', issue: 40 }) + '\n') });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'no-open-proposal');
+});
+
+test('#207: recovery of a claim with no comment url does not render an empty approval link', () => {
+  const world = finalizeWorld();
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, actor: 'finalize-script', now: '2026-09-11T00:00:30.000Z' });
+  assert.equal(world.finalize().finalized.length, 1);
+  const ruling = rulingsOn(world.fixtureIssue())[0].body;
+  assert.match(ruling, /^## Ruling\nApproved without edits\. Finalized by script \(fleet #207\)\.\n/);
+});
+
+test('#207: proposalGate is one pure predicate over clauses 1 and 4 to 9 and parseProposal is the one proposal parser', () => {
+  const eligible = () => {
+    const body = BODY;
+    const proposed = { kind: 'proposed', at: PROPOSED_AT, commentUrl: proposalUrl(40), bodyHash: triage.normalizeIssue(issue(40, { body })).bodyHash };
+    const normalized = triage.normalizeIssue(issue(40, { body, labels: ['needs-triage', 'triage-proposed'], comments: thread(40) }));
+    return { issue: normalized, row: { proposed, outcome: null, history: [proposed] }, proposal: normalized.comments[0], approval: normalized.comments[1], config: DEFAULT_CONFIG, tenantConfig: { readyLabel: 'ready-for-agent', escalationLabel: 'fleet-escalation' }, outbox: [], consumedThrough: null, tenant: 'endzone' };
+  };
+  assert.equal(typeof triage.proposalGate, 'function');
+  assert.deepEqual(triage.proposalGate(eligible()), []);
+  const held = triage.proposalGate({ ...eligible(), holds: new Map([[40, 'skip file: parked']]) });
+  assert.deepEqual(held.map((failure) => failure.code), ['held']);
+  const noHold = triage.proposalGate({ ...eligible(), holds: new Map([[41, 'x']]) });
+  assert.deepEqual(noHold, []);
+  const failing = eligible();
+  failing.proposal = { ...failing.proposal, body: PROPOSAL.replace('Tier: sonnet', 'Tier: opus').replace('Blocked_by: none', 'Blocked_by: #3') };
+  assert.deepEqual(triage.proposalGate(failing).map((failure) => failure.code), ['blocked-by', 'tier']);
+  const parsed = triage.parseProposal(PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none\n  and a second thought\n\n  after a blank'));
+  assert.equal(parsed.fields['Open for Cory'], 'none\nand a second thought\nafter a blank');
+  assert.equal(parsed.fields.Classification, 'bug');
+  assert.equal(parsed.fields.Tier, 'sonnet');
+  assert.deepEqual(parsed.premises, ['src/list.js: slices one short @abcdef1 verified @abcdef2']);
+  assert.equal(triage.parseProposal('## Triage proposal (advisory)\nPremises: none stated\n').premises, null);
+});
+
+// A principal or script claim with no finalized row comes back on the frontier after 30 minutes.
+test('#207: the frontier lists any actor\'s unfinished claim older than 30 minutes, carrying withEdits and edits, while the marker stands', () => {
+  const root = rootDir();
+  for (const number of [70, 71, 72, 73]) recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: number, bodyHash: triage.normalizeIssue(issue(number)).bodyHash, commentUrl: proposalUrl(number), model: 'fable', now: '2026-09-12T10:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 70, by: OWNER, edits: 'tier sonnet', commentUrl: approvalUrl(70), now: '2026-09-12T11:00:00.000Z' });   // 60 minutes old
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 71, by: OWNER, commentUrl: approvalUrl(71), now: '2026-09-12T11:10:00.000Z' });   // 50 minutes old
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 72, by: OWNER, now: '2026-09-12T11:50:00.000Z' });   // 10 minutes old
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 73, by: OWNER, now: '2026-09-12T11:00:00.000Z' });   // old, but ruled by hand: marker gone
+  const entries = readLedger(root, 'endzone');
+  const result = frontier([issue(70, { labels: ['triage-proposed'] }), issue(71, { labels: ['triage-proposed'] }), issue(72, { labels: ['triage-proposed'] }), issue(73, { labels: ['ready-for-agent'] })], { entries });
+  assert.deepEqual(result.eligible.map((item) => [item.kind, item.number, item.withEdits]), [['approval', 70, true], ['approval', 71, false]]);
+  assert.equal(result.eligible[0].edits, 'tier sonnet');
+  assert.match(result.eligible[0].reason, /claim older than 30 minutes without a finalized row/);
+  assert.equal(result.eligible[0].commentUrl, approvalUrl(70));
 });
