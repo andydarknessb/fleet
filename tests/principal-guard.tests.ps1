@@ -2,7 +2,7 @@
 # docs/adr, CONTEXT.md, its status file, the triage ledger and its memory; refuses the
 # bare suite, sync-* scripts, closes, merges, wontfix/duplicate, non-docs pushes and the
 # production MCP tools; and refuses EVERY fleet role an issue comment beginning
-# "Approved" (the fleet shares the owner's GitHub login). Never exits nonzero.
+# "Approved", "Re-propose" or "Veto" (shapes only the owner may write). Never exits nonzero.
 $ErrorActionPreference = 'Stop'
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
