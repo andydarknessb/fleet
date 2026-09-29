@@ -144,24 +144,29 @@ outside the allowed directories.
 
 Verification is the next rehearsal, a re-run of #164's procedure.
 
-## Amendment 3: the tier reopens on the rehearsed CLI (#165)
+## Amendment 3 (2026-09-29, fleet #165): the tier reopens on the rehearsed CLI
 
-Rehearsal (#164): PENDING. Fill in the date, the `claude --version` and the
-verdict line from `.scratch/haiku-rehearsal-<date>/` before this amendment
-merges. A not-clean verdict means this amendment does not merge at all.
+Rehearsal (#164): 2026-09-29, Claude Code 2.1.284, Endzone #1773 -> PR #1801,
+report in `.scratch/haiku-rehearsal-2026-09-29/`. **Clean.** There were zero
+permission waits. Off-list calls came back as refusals from the Amendment 2
+gate, and the IC rewrote them. The Amendment 2 `risk-review` DEFECT made the
+IC run step 5. The PR went through the review gate (formal-001, docs nits
+only, no send-back). Job tokens: 61,218, against a haiku median of 37,724 and
+a sonnet median of 133,209.
 
 - The haiku tier is open again for the ticket types the project-lead role
   file already names (copy changes, single-file fixes, test flakes, verbatim
   moves, exact-file tickets), and only under the allowlist profile.
 - `config/permissions-allowlist.json` records `verifiedCliVersion`, the CLI
-  the rehearsal passed on, and stays null until one passes. `launch.ps1`
-  refuses a haiku launch while it is null and on any other `claude --version`,
-  dry runs included, naming both versions and the rehearsal command, so this
-  amendment merging early opens nothing. Sonnet launches never read the field.
+  the rehearsal passed on (2.1.284); it is null until a rehearsal passes.
+  `launch.ps1` refuses a haiku launch while it is null and on any other
+  `claude --version`, dry runs included, naming both versions and the
+  rehearsal command. Sonnet launches never read the field.
 - The re-test on a CLI update is the rehearsal again: `bin/scratch-root.ps1`
   marks its copy `rehearsalRoot: true`, the one place the guard stands aside,
-  so the scratch launch runs on the new CLI. A
-  clean verdict bumps the field; that is the whole re-test.
+  so the scratch launch runs on the new CLI. A clean verdict bumps the field;
+  that is the whole re-test. Until then every haiku launch on the new CLI is
+  refused, and the ticket launches on sonnet.
 - `budgets.icJobTokensTargets.haiku` in `config/cycle.json` stays null. One
   rehearsal unit is not a median; the target is set from the weekly
   scorecards once haiku units accumulate (fleet #139's method).
