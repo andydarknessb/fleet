@@ -390,6 +390,8 @@ Write-Json $settingsPath $settings
 # pin that path too so the two spellings resolve to the same id.
 # A project lead launched with no -Model runs Opus 5.5 (owner ruling 2026-09-23),
 # pinned for the same reason; CLI 2.1.280 admits claude-opus-5-5 to auto mode.
+# An IC on sonnet runs pinned Sonnet 5.5 (owner ruling 2026-09-28): CLI 2.1.284's
+# sonnet alias already resolves to claude-sonnet-5-5; the pin stops a silent bump.
 # The pins and role defaults live in _common.ps1 (Resolve-LaunchModel) since fleet
 # #121: sentinel-check compares a daemon job's frozen respawnFlags against them.
 $launchModel = Resolve-LaunchModel -Role $Role -Model $Model
