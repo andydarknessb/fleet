@@ -5,8 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { evaluateChecks, planRecord, runWatch, closingLinked, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
+const { evaluateChecks, planRecord, runWatch, closingLinked, closingLinkage, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
 const workState = require('../bin/work-state');
+const { CASES: CLOSING_CASES, ISSUE: CLOSING_ISSUE, REPO: CLOSING_REPO } = require('./closing-link.cases');
 
 function rootDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-pr-watch-'));
@@ -102,6 +103,20 @@ test('closingLinked follows the #330 grammar: colon and URL forms link, code spa
   assert.equal(closingLinked(view({ body: 'Closes #421' }), 42, 'owner/repo'), false);
   assert.equal(closingLinked(view({ closingIssuesReferences: [{ number: 42 }], body: '' }), 42, 'owner/repo'), true);
 });
+
+// #202: the shared parser cases (tests/closing-link.cases.js), the same table
+// pr-ready-check.tests.js runs. Here: the watcher's verdict, and what a settled
+// ci-wait tick then does with it (only `none` escalates).
+for (const c of CLOSING_CASES) {
+  test(`#202 shared closing-link case: ${c.name} is ${c.expect}`, () => {
+    const viewPr = view({ body: c.body });
+    assert.equal(closingLinkage(viewPr, CLOSING_ISSUE, CLOSING_REPO), c.expect);
+    const rec = { id: 'endzone:issue-42', tenant: 'endzone', issue: CLOSING_ISSUE, state: 'ci-wait', revision: 3, github: { prNumber: 77 } };
+    const plan = planRecord({ record: rec, openPr: pr({ statusCheckRollup: GREEN }), viewPr, policy: { ciGates: ['g1', 'g2'], watchedChecks: [], ignoredChecks: [] }, repo: CLOSING_REPO });
+    assert.equal(plan.actions.length, 1);
+    assert.equal(plan.actions[0].to, c.expect === 'none' ? 'escalated' : 'review');
+  });
+}
 
 test('hop paths come from the store transitions, including escalated resolutions from any prior state', () => {
   assert.deepEqual(hopsTo('implementing', 'merged'), ['pr-open', 'review', 'merged']);
@@ -343,7 +358,9 @@ function resolveAsLead(root, to, evidence = 'Refs is deliberate: AC1 is escalate
     idempotencyKey: `pl-resolve-${record(root).revision}`, actor: 'pl-endzone', evidence, now: now(),
   });
 }
-const REFS_BODY = 'Refs #42 (deliberate; AC1 ruling open)';
+// #202: an explained Refs is deliberate at the watcher, so the fleet#44 memory is for the
+// bodies with neither a closing keyword nor an explained Refs (here a bare Refs line).
+const REFS_BODY = 'Refs #42';
 
 test('fleet#44: a lead-resolved closing-linkage escalation is not re-raised while the body is unchanged', () => {
   const root = rootDir();
@@ -387,12 +404,39 @@ test('fleet#44: an edited body is a new fact and escalates again; a closing keyw
   seed(root, { state: 'review' });
   watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: REFS_BODY }) }));
   resolveAsLead(root, 'review');
-  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42 and the ruling paragraph was rewritten' }) }));
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'See #42 for the rest' }) }));
   assert.equal(record(root).state, 'escalated', 'a different body was never ruled on');
   assert.equal(record(root).prior_state, 'review');
   assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'decision-needed']);
   watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
   assert.equal(record(root).state, 'review', 'linkage appearing still self-resolves the watcher own escalation');
+});
+
+test('#202: an explained Refs is deliberate: settled gates go to review with checks-settled and no escalation, and later ticks stay silent', () => {
+  const root = rootDir();
+  seed(root);
+  const f = fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42 (deliberate; AC1 ruling open)' }) });
+  watch(root, f);
+  const rec = record(root);
+  assert.equal(rec.state, 'review');
+  assert.equal(rec.github.observation.closingVerified, false, 'the observation still says the body carries no closing keyword');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
+  assert.match(String(events(root).filter((e) => e.type === 'state-review').pop().evidence), /explained Refs for #42 on PR #77, deliberate/);
+  assert.equal(events(root).filter((e) => e.type === 'state-escalated').length, 0);
+  for (let tick = 0; tick < 3; tick += 1) assert.deepEqual(watch(root, f).actions, [], `tick ${tick}: steady state is silent`);
+});
+
+test('#202: an explained Refs in review stays put; the next-line explanation counts, and a bare Refs line still escalates', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  const green = [pr({ statusCheckRollup: GREEN })];
+  watch(root, fetchers({ open: green, viewResult: view({ body: 'Refs #42\r\nThe migration stays with Cory.' }) }));
+  assert.equal(record(root).state, 'review', 'no closing-linkage escalation for an explained Refs');
+  watch(root, fetchers({ open: green, viewResult: view({ body: 'Refs #42' }) }));
+  assert.equal(record(root).state, 'escalated', 'neither a keyword nor an explanation is still a defect');
+  assert.match(String(record(root).decisionEvidence), /no closing linkage|disappeared/);
+  watch(root, fetchers({ open: green, viewResult: view({ body: 'Refs #42: the migration stays with Cory' }) }));
+  assert.equal(record(root).state, 'review', 'the body edited to an explained Refs resolves the watcher escalation');
 });
 
 test('fleet#34: a re-readied PR whose record sits in review re-enters ci-wait on the new head, then wakes checks-settled when it settles', () => {

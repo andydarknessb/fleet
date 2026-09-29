@@ -10,7 +10,8 @@
 // stays authoritative; this maintains the shadow records and parity evidence. Zero
 // model turns. Two deliberate spec-over-legacy choices: a required gate MISSING from
 // the rollup is incomplete (never settled), and closure linkage counts a body
-// closing keyword because this tenant closes issues through the #330 workflow.
+// closing keyword because this tenant closes issues through the #330 workflow, and an
+// explained `Refs` is deliberate (#202, bin/closing-link.js).
 //
 // Design rules from the 2026-09-01 review: idempotency keys are retry-dedupe only,
 // so every key is scoped to the record revision it acts on (novelty detection is
@@ -23,6 +24,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
+const closingLink = require('./closing-link');
 
 const WATCH_STATES = Object.freeze(['implementing', 'revision', 'pr-open', 'ci-wait', 'review', 'hold', 'escalated']);
 const WATCHER_MARK = '[pr-watch]';
@@ -70,25 +72,19 @@ function evaluateChecks(policy, rollup) {
   };
 }
 
-// Closure linkage, ported from the tenant's close-merged-issues.js (#330) grammar:
-// strip code fences and spans first; keyword with optional colon, same-line
-// whitespace, then #n, owner/repo#n, or the full issue URL. Native
-// closingIssuesReferences also counts (it under-reports on this tenant, never over).
-function stripCode(text) {
-  return String(text).replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
+// Closure linkage (#202): bin/closing-link.js is the one parser, shared with
+// bin/pr-ready-check.js: a closing keyword (the tenant's close-merged-issues.js #330
+// grammar), an explained `Refs #n` (deliberate, closure is the lead's at the merge),
+// or neither. Native closingIssuesReferences also counts as a closing keyword (it
+// under-reports on this tenant, never over).
+function closingLinkage(viewPr, issue, repo) {
+  const refs = viewPr?.closingIssuesReferences || [];
+  if (refs.some((ref) => Number(ref.number) === Number(issue))) return 'closing';
+  return closingLink.classify(viewPr?.body || '', issue, repo);
 }
 
 function closingLinked(viewPr, issue, repo) {
-  const refs = viewPr?.closingIssuesReferences || [];
-  if (refs.some((ref) => Number(ref.number) === Number(issue))) return true;
-  const body = stripCode(viewPr?.body || '');
-  const n = Number(issue);
-  const forms = [`#${n}\\b`];
-  if (repo) {
-    const repoPattern = String(repo).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    forms.push(`${repoPattern}#${n}\\b`, `https://github\\.com/${repoPattern}/issues/${n}\\b`);
-  }
-  return new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?[^\\S\\n]+(?:${forms.join('|')})`, 'i').test(body);
+  return closingLinkage(viewPr, issue, repo) === 'closing';
 }
 
 // fleet#44: the closing-linkage rule re-derives "no closing keyword" from GitHub on
@@ -218,7 +214,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
     if (!openPr && String(viewPr.state).toUpperCase() === 'MERGED') {
       return { actions: mergedChain(escalatedHopsTo(record.prior_state, 'merged'), viewPr, prNumber, 'escalation resolved by an observed merge', { formalReviewMissing: reviewMissing }) };
     }
-    if (livePr && closingLinked(viewPr, record.issue, repo)) {
+    if (livePr && closingLinkage(viewPr, record.issue, repo) !== 'none') {
       const back = record.prior_state && record.prior_state !== 'escalated' ? record.prior_state : 'ci-wait';
       return {
         actions: [{
@@ -316,8 +312,9 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   if (state === 'ci-wait') {
     if (evaluation.settled) {
       if (!viewPr) return { actions: [], ghNeeds: 'view' };   // linkage needs the body
-      const linked = closingLinked(viewPr, record.issue, repo);
-      if (!linked && !closingLinkageRuled(record, viewPr)) {
+      const linkage = closingLinkage(viewPr, record.issue, repo);
+      const linked = linkage === 'closing';
+      if (linkage === 'none' && !closingLinkageRuled(record, viewPr)) {
         return {
           actions: [{
             kind: 'transition', to: 'escalated', observe: { pr: livePr, evaluation, closing: false },
@@ -329,7 +326,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
       return {
         actions: [{
           kind: 'transition', to: 'review', observe: { pr: livePr, evaluation, closing: linked },
-          evidence: `every gate green on PR #${prNumber}; ${linkagePhrase(linked, record.issue, prNumber)}`,
+          evidence: `every gate green on PR #${prNumber}; ${linkagePhrase(linkage, record.issue, prNumber)}`,
           wake: 'checks-settled',
         }],
       };
@@ -350,8 +347,9 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   // review/hold: the lead owns the outcome, but linkage is re-verified every tick -
   // a body edit that drops the closing keyword must escalate before the merge.
   if (!viewPr) return { actions: [], ghNeeds: 'view' };
-  const linked = closingLinked(viewPr, record.issue, repo);
-  if (!linked && !closingLinkageRuled(record, viewPr)) {
+  const linkage = closingLinkage(viewPr, record.issue, repo);
+  const linked = linkage === 'closing';
+  if (linkage === 'none' && !closingLinkageRuled(record, viewPr)) {
     return {
       actions: [{
         kind: 'transition', to: 'escalated', observe: { pr: livePr, evaluation, closing: false },
@@ -383,7 +381,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
           kind: 'transition', to,
           observe: index === chain.length - 1 ? { pr: livePr, evaluation, closing: settled ? linked : null } : null,
           evidence: index === chain.length - 1
-            ? `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review (was ${String(prevHead).slice(0, 12)}); ${settled ? `every gate green; ${linkagePhrase(linked, record.issue, prNumber)}` : `gates ${evaluation.failed ? `failed: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}` : `pending: ${evaluation.gatePending.join(', ') || 'none observed'}`}`}`
+            ? `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review (was ${String(prevHead).slice(0, 12)}); ${settled ? `every gate green; ${linkagePhrase(linkage, record.issue, prNumber)}` : `gates ${evaluation.failed ? `failed: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}` : `pending: ${evaluation.gatePending.join(', ') || 'none observed'}`}`}`
             : `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review; walking back to ci-wait`,
           wake: index === chain.length - 1 ? wake : null,
         })),
@@ -395,10 +393,10 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   return { actions: [{ kind: 'observe', observation, evidence: `PR #${prNumber} changed while ${state}`, wake: null }] };
 }
 
-function linkagePhrase(linked, issue, prNumber) {
-  return linked
-    ? `closing linkage verified for #${issue}`
-    : `closing linkage absent on PR #${prNumber} for #${issue}, ruled deliberate by the lead (fleet#44); issue closure is the lead's at the merge`;
+function linkagePhrase(linkage, issue, prNumber) {
+  if (linkage === 'closing') return `closing linkage verified for #${issue}`;
+  if (linkage === 'refs') return `explained Refs for #${issue} on PR #${prNumber}, deliberate (#202); issue closure is the lead's at the merge`;
+  return `closing linkage absent on PR #${prNumber} for #${issue}, ruled deliberate by the lead (fleet#44); issue closure is the lead's at the merge`;
 }
 
 function ghJson(executable, args) {
@@ -680,6 +678,6 @@ if (require.main === module) {
 
 module.exports = {
   evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
-  stableStringify, closingLinked, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
+  stableStringify, closingLinked, closingLinkage, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
   cli, FLAGS, PrWatchError,
 };
