@@ -133,7 +133,7 @@ test('#131: the review gate counts formal and risk reviews and separates acknowl
 test('#131: the escaped-defects row prints the classified and the unclassified count', () => {
   const card = build();
   const row = card.rows.find((r) => r.key === 'escapedDefects');
-  assert.deepEqual(row.figures, { bugs: 4, escapedFromFleet: [{ issue: 900, pr: 112 }], namedNonFleet: [{ issue: 903, pr: 77 }], unclassified: 2, merged: 4, rate: 0.25 });
+  assert.deepEqual(row.figures, { bugs: 4, escapedFromFleet: [{ issue: 900, pr: 112 }], namedNonFleet: [{ issue: 903, pr: 77 }], none: [], unknown: 0, fromProposal: 0, unclassified: 2, merged: 4, rate: 0.25 });
   assert.match(row.result, /1 escaped from a fleet PR/);
   assert.match(row.result, /2 unclassified/);
 });
@@ -261,4 +261,69 @@ test('#155: a tenant whose owner and fleet share a login counts its merges as sh
     fs.writeFileSync(path.join(dir, file), `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
   }
   assert.equal(build(root).mergesBy.shared, 4);
+});
+
+// #213 (spec #193): a bug's Triage proposal carries `Escaped from: #<PR> | none | unknown`.
+// The collector reads it for bugs whose issue form field is empty (every Nidus bug has no form).
+const proposalComment = (escaped, createdAt = '2026-09-25T00:00:00Z') => ({ createdAt, body: `## Triage proposal (advisory)\nClassification: bug\nRoot cause: x\n${escaped === null ? '' : `Escaped from: ${escaped}\n`}Ruling: none needed` });
+const chatter = (body, createdAt = '2026-09-25T01:00:00Z') => ({ createdAt, body });
+
+function proposalGhStub() {
+  const calls = [];
+  const gh = (args) => {
+    calls.push(args);
+    if (args[0] === 'issue' && args[1] === 'list') {
+      return JSON.stringify([
+        { number: 910, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [proposalComment('#112')] },
+        { number: 911, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [proposalComment('none')] },
+        { number: 912, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [proposalComment('unknown')] },
+        { number: 913, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [chatter('looking at this')] },
+        { number: 914, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [proposalComment('#77', '2026-09-24T01:00:00Z'), proposalComment('none', '2026-09-25T01:00:00Z')] },
+        { number: 915, createdAt: '2026-09-24T00:00:00Z', body: '### Escaped from PR #\n\n77\n', comments: [proposalComment('none')] },
+        { number: 916, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [proposalComment('maybe #12')] },
+        { number: 917, createdAt: '2026-09-24T00:00:00Z', body: 'no form', comments: [chatter('Escaped from: #112')] },
+        { number: 918, createdAt: '2026-09-24T00:00:00Z', body: 'no form' },
+      ]);
+    }
+    if (args[0] === 'pr' && args[1] === 'view') {
+      const heads = { 112: 'fleet/12-thing', 77: 'feature/by-hand' };
+      return JSON.stringify({ number: Number(args[2]), headRefName: heads[Number(args[2])] });
+    }
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  return { gh, calls };
+}
+
+test('#213: the escaped row counts the proposal\'s Escaped from line for bugs with no form value, and says how many stay unclassified', () => {
+  const stub = proposalGhStub();
+  const card = build(fixtureWeek(), stub);
+  const row = card.rows.find((r) => r.key === 'escapedDefects');
+  assert.deepEqual(row.figures.escapedFromFleet, [{ issue: 910, pr: 112 }]);
+  assert.deepEqual(row.figures.namedNonFleet, [{ issue: 915, pr: 77 }], 'the form field wins over the proposal');
+  assert.deepEqual(row.figures.none, [911, 914], 'the newest proposal wins, and none is a classification');
+  assert.equal(row.figures.unknown, 1);
+  assert.equal(row.figures.fromProposal, 3, 'bugs 910, 911 and 914 were classified from their proposals');
+  // 912 unknown, 913 no proposal, 916 malformed value, 917 not a proposal comment, 918 no comments at all.
+  assert.equal(row.figures.unclassified, 5);
+  assert.equal(row.figures.bugs, 9);
+  assert.match(row.result, /1 escaped from a fleet PR \(#910 from PR #112\)/);
+  assert.match(row.result, /2 traced to no PR/);
+  assert.match(row.result, /5 unclassified \(1 marked unknown\)/);
+  assert.equal(row.status, 'weak', 'an escape from a fleet PR is still counted against the merged units');
+  const list = stub.calls.find((args) => args[0] === 'issue' && args[1] === 'list');
+  assert.match(list[list.indexOf('--json') + 1], /comments/, 'the collector asks GitHub for the comments');
+});
+
+test('#213: parseProposalEscapedFrom reads only the newest Triage proposal and only an exact value', () => {
+  const { parseProposalEscapedFrom } = require('../bin/weekly-scorecard');
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('#1545')]), { kind: 'pr', pr: 1545 });
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('none')]), { kind: 'none' });
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('  UNKNOWN  ')]), { kind: 'unknown' });
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('#5', '2026-09-01T00:00:00Z'), proposalComment('none', '2026-09-02T00:00:00Z')]), { kind: 'none' });
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('none', '2026-09-01T00:00:00Z'), proposalComment(null, '2026-09-02T00:00:00Z')]), null, 'a newer proposal without the line is not silently the older one');
+  assert.equal(parseProposalEscapedFrom([proposalComment('#5 (probably)')]), null);
+  assert.equal(parseProposalEscapedFrom([proposalComment('5')]), null);
+  assert.equal(parseProposalEscapedFrom([chatter('Escaped from: #5')]), null);
+  assert.equal(parseProposalEscapedFrom([]), null);
+  assert.equal(parseProposalEscapedFrom(undefined), null);
 });

@@ -10,8 +10,10 @@
 //     ones from config/review-exceptions.json counted separately);
 //   - GitHub: each tenant's `bug` issues opened that week, read for the bug form's
 //     "### Escaped from PR #" heading (endzone, fleet #130), and the named PR's head branch
-//     (a fleet PR's starts with the tenant's branchPrefix). A bug with no number there is
-//     unclassified; before the form lands the row reads 0 classified with N unclassified,
+//     (a fleet PR's starts with the tenant's branchPrefix). A bug whose form field is empty
+//     (every Nidus bug) is read from its newest Triage proposal's `Escaped from:` line (#213:
+//     `#<PR>`, `none` or `unknown`). A bug with neither, or marked unknown, is
+//     unclassified, and the row says how many; before the form lands the row reads 0 classified with N unclassified,
 //     which is a true reading. A GitHub failure makes the row `unknown`, never a zero;
 //   - the watchdog shadow log (state/sentinel/shadow/*.jsonl): `fleet-dead` ticks over
 //     total ticks;
@@ -247,13 +249,41 @@ function parseEscapedFrom(body) {
   return number ? Number(number[1]) : null;
 }
 
+// #213 (spec #193): a bug's Triage proposal (agents/principal.md) carries an `Escaped from:`
+// line whose value is exactly `#<PR number>`, `none` or `unknown`. It is read for bugs whose
+// form field is empty, which is every Nidus bug (no form). Only the newest Triage proposal
+// counts, and only an exact value: a proposal without the line, or with anything after the
+// value, classifies nothing. #211 parses the same `Escaped from: #<n>` shape.
+const PROPOSAL_HEADING_RE = /^\s*##\s*Triage proposal\b/i;
+const PROPOSAL_ESCAPED_RE = /^Escaped from:[ \t]*(?:#(\d+)|(none|unknown))[ \t]*\r?$/im;
+function parseProposalEscapedFrom(comments) {
+  const proposals = (Array.isArray(comments) ? comments : [])
+    .filter((comment) => comment && PROPOSAL_HEADING_RE.test(String(comment.body || '')))
+    .sort((left, right) => String(left.createdAt || '').localeCompare(String(right.createdAt || '')));
+  const newest = proposals[proposals.length - 1];
+  if (!newest) return null;
+  const match = String(newest.body).match(PROPOSAL_ESCAPED_RE);
+  if (!match) return null;
+  return match[1] ? { kind: 'pr', pr: Number(match[1]) } : { kind: match[2].toLowerCase() };
+}
+
+// The form's number wins; with none, the proposal's line. { pr, kind, source } where kind is
+// 'none' or 'unknown' when there is no PR to name and null when nothing classifies the bug.
+function classifyEscape(issue) {
+  const form = parseEscapedFrom(issue.body);
+  if (form !== null) return { pr: form, kind: null, source: 'form' };
+  const proposal = parseProposalEscapedFrom(issue.comments);
+  if (!proposal) return { pr: null, kind: null, source: null };
+  return { pr: proposal.kind === 'pr' ? proposal.pr : null, kind: proposal.kind === 'pr' ? null : proposal.kind, source: 'proposal' };
+}
+
 function escapedRow(base, week, merged, settings, gh) {
   const tenants = Object.entries(workState.readTenantConfigs(base)).filter(([, config]) => config && config.github);
   const bugs = [];
   try {
     for (const [name, config] of tenants) {
-      const listed = JSON.parse(gh(['issue', 'list', '-R', config.github, '--label', 'bug', '--state', 'all', '--search', `created:${week.monday}..${week.sunday}`, '--json', 'number,createdAt,body', '--limit', '200']));
-      for (const issue of listed) bugs.push({ tenant: name, repo: config.github, prefix: config.branchPrefix || 'fleet/', number: issue.number, pr: parseEscapedFrom(issue.body) });
+      const listed = JSON.parse(gh(['issue', 'list', '-R', config.github, '--label', 'bug', '--state', 'all', '--search', `created:${week.monday}..${week.sunday}`, '--json', 'number,createdAt,body,comments', '--limit', '200']));
+      for (const issue of listed) bugs.push({ tenant: name, repo: config.github, prefix: config.branchPrefix || 'fleet/', number: issue.number, ...classifyEscape(issue) });
     }
   } catch (error) {
     return { figures: { error: String(error.message || error).split('\n')[0] }, result: `unavailable: ${String(error.message || error).split('\n')[0]}`, status: 'unknown' };
@@ -270,14 +300,18 @@ function escapedRow(base, week, merged, settings, gh) {
     if (head && head.startsWith(bug.prefix)) escapedFromFleet.push({ issue: bug.number, pr: bug.pr });
     else namedNonFleet.push(head ? { issue: bug.number, pr: bug.pr } : { issue: bug.number, pr: bug.pr, unverified: true });
   }
-  const unclassified = bugs.filter((entry) => entry.pr === null).length;
+  // #213: `none` is a classification (no PR introduced the bug); `unknown` and a bug nothing classifies are not.
+  const none = bugs.filter((entry) => entry.kind === 'none').map((entry) => entry.number);
+  const unknown = bugs.filter((entry) => entry.kind === 'unknown').length;
+  const unclassified = bugs.filter((entry) => entry.pr === null && entry.kind !== 'none').length;
+  const fromProposal = bugs.filter((entry) => entry.source === 'proposal' && (entry.pr !== null || entry.kind === 'none')).length;
   const rate = merged ? Math.round((escapedFromFleet.length / merged) * 1000) / 1000 : null;
   let status = 'good';
   if (escapedFromFleet.length && (rate === null || rate > settings.escapedRate.weak)) status = 'weak';
   else if (escapedFromFleet.length) status = 'watch';
   return {
-    figures: { bugs: bugs.length, escapedFromFleet, namedNonFleet, unclassified, merged, rate },
-    result: `${escapedFromFleet.length} escaped from a fleet PR${escapedFromFleet.length ? ` (${escapedFromFleet.map((e) => `#${e.issue} from PR #${e.pr}`).join(', ')})` : ''}, ${namedNonFleet.length} named another PR, ${unclassified} unclassified, of ${plural(bugs.length, 'bug')} opened${rate !== null ? `; ${pct(rate)} of ${merged} merged` : ''}`,
+    figures: { bugs: bugs.length, escapedFromFleet, namedNonFleet, none, unknown, fromProposal, unclassified, merged, rate },
+    result: `${escapedFromFleet.length} escaped from a fleet PR${escapedFromFleet.length ? ` (${escapedFromFleet.map((e) => `#${e.issue} from PR #${e.pr}`).join(', ')})` : ''}, ${namedNonFleet.length} named another PR, ${none.length} traced to no PR, ${unclassified} unclassified${unknown ? ` (${unknown} marked unknown)` : ''}, of ${plural(bugs.length, 'bug')} opened${rate !== null ? `; ${pct(rate)} of ${merged} merged` : ''}`,
     status,
   };
 }
@@ -487,4 +521,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { DEFAULTS, ROWS, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError, buildScorecard, cli, headlineOf, latestScorecard, parseEscapedFrom, renderScorecard, writeScorecard };
+module.exports = { DEFAULTS, ROWS, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError, buildScorecard, cli, headlineOf, latestScorecard, parseEscapedFrom, parseProposalEscapedFrom, renderScorecard, writeScorecard };

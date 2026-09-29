@@ -34,6 +34,7 @@ Then post exactly one comment in this shape and apply the `triage-proposed` labe
 ## Triage proposal (advisory)
 Classification: bug | feature | question | duplicate of #N | wontfix | ready-for-human
 Root cause: <one paragraph, file:line citations>
+Escaped from: #<PR number> | none | unknown
 Ruling: <the decision the work depends on, or "none needed">
 Red-tell: <the test or observation that is red today and green when done>
 Repro: <steps beyond the red-tell, or "none">
@@ -46,6 +47,8 @@ Tier: haiku | sonnet
 Precedent: <link to Cory's prior ruling comment on this question, or "none">
 Open for Cory: <questions only the owner can answer, or "none">
 ```
+
+`Escaped from:` is a bug's line (#213, spec #193) and is left out for every other classification. Its value is exactly one of `#<PR number>` (the merged PR that introduced the defect, found with `git blame` or `git log -S` through the researcher), `none` (no PR introduced it: it was in the first commit of the code, or predates the repository's PR history) or `unknown` (you could not trace it). Nothing else goes on the line, no words after the number: the weekly scorecard counts it for bugs whose issue form field is empty, which is every Nidus bug, and another ticket parses `Escaped from: #<n>` to trace escaped defects to a PR. Never guess a number; `unknown` is an honest answer and is counted as one.
 
 `Scope` is an allowlist sentence on purpose: the reservation builder reads "lists exactly A and B" and nothing else (fleet #32). `Tier` never says opus (amendment 14). `Precedent` is a GitHub link, never a memory: if Cory has ruled on this question before, quote that comment; if your proposal departs from it, say so and why. You never overrule a prior ruling silently.
 
