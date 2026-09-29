@@ -11,7 +11,7 @@
 //   - GitHub: each tenant's `bug` issues opened that week, read for the bug form's
 //     "### Escaped from PR #" heading (endzone, fleet #130), and the named PR's head branch
 //     (a fleet PR's starts with the tenant's branchPrefix). A bug whose form field is empty
-//     (every Nidus bug) is read from its newest Triage proposal's `Escaped from:` line (#213:
+//     (every Nidus bug) is read from its newest `## Ruling` or `## Triage proposal` comment's `Escaped from:` line (#213:
 //     `#<PR>`, `none` or `unknown`). A bug with neither, or marked unknown, is
 //     unclassified, and the row says how many; before the form lands the row reads 0 classified with N unclassified,
 //     which is a true reading. A GitHub failure makes the row `unknown`, never a zero;
@@ -251,10 +251,11 @@ function parseEscapedFrom(body) {
 
 // #213 (spec #193): a bug's Triage proposal (agents/principal.md) carries an `Escaped from:`
 // line whose value is exactly `#<PR number>`, `none` or `unknown`. It is read for bugs whose
-// form field is empty, which is every Nidus bug (no form). Only the newest Triage proposal
-// counts, and only an exact value: a proposal without the line, or with anything after the
-// value, classifies nothing. #211 parses the same `Escaped from: #<n>` shape.
-const PROPOSAL_HEADING_RE = /^\s*##\s*Triage proposal\b/i;
+// form field is empty, which is every Nidus bug (no form). Only the newest comment headed
+// `## Ruling` or `## Triage proposal` counts (a Ruling restates the proposal, and a later
+// one is the last word), and only an exact value: a comment without the line, or with
+// anything after the value, classifies nothing. #211 parses the same `Escaped from: #<n>` shape.
+const PROPOSAL_HEADING_RE = /^\s*##\s*(?:Triage proposal|Ruling)\b/i;
 const PROPOSAL_ESCAPED_RE = /^Escaped from:[ \t]*(?:#(\d+)|(none|unknown))[ \t]*\r?$/im;
 function parseProposalEscapedFrom(comments) {
   const proposals = (Array.isArray(comments) ? comments : [])

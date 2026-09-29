@@ -327,3 +327,11 @@ test('#213: parseProposalEscapedFrom reads only the newest Triage proposal and o
   assert.equal(parseProposalEscapedFrom([]), null);
   assert.equal(parseProposalEscapedFrom(undefined), null);
 });
+
+test('#213: the newest comment headed Ruling or Triage proposal decides: a later Ruling overrides the proposal, and a later proposal overrides the Ruling', () => {
+  const { parseProposalEscapedFrom } = require('../bin/weekly-scorecard');
+  const ruling = (escaped, createdAt) => ({ createdAt, body: `## Ruling\nApproved without edits: https://x/1. Finalized by script (fleet #207).\n\nClassification: bug\nEscaped from: ${escaped}\nRuling: none needed\n\nLabels: ready-for-agent, bug; triage-proposed removed.` });
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('unknown', '2026-09-24T00:00:00Z'), ruling('#12', '2026-09-25T00:00:00Z')]), { kind: 'pr', pr: 12 });
+  assert.deepEqual(parseProposalEscapedFrom([ruling('#12', '2026-09-25T00:00:00Z'), proposalComment('none', '2026-09-26T00:00:00Z')]), { kind: 'none' });
+  assert.deepEqual(parseProposalEscapedFrom([proposalComment('#5', '2026-09-24T00:00:00Z'), { createdAt: '2026-09-25T00:00:00Z', body: '## Ruling\nrestated without the line' }]), null);
+});
