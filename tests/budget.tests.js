@@ -59,7 +59,7 @@ test('budgetConfig reads the ic block with defaults and isLive reads the flag', 
   assert.equal(isLive({ root }), true);
   assert.deepEqual(BUDGET_STATES, ['implementing', 'revision', 'pr-open', 'ci-wait', 'review']);
   fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ ic: {} }));
-  assert.deepEqual(budgetConfig(root), { warnTokens: 50000, escalateTokens: 350000 });
+  assert.deepEqual(budgetConfig(root), { warnTokens: 25000, escalateTokens: 175000 });
 });
 
 test('below the warning threshold nothing is recorded, but the measurement is projected', async () => {
@@ -308,4 +308,38 @@ test('warning-only: escalateTokens null warns, never escalates, and reports the 
   assert.equal(record.budget.cumulativeTokens, 250000);
   assert.equal(readEvents(root).filter((e) => e.type === 'state-escalated').length, 0);
   assert.equal(readEvents(root).filter((e) => e.type === 'budget-warning').length, 1);
+});
+
+// --- #201 (spec #191): count each model response once ---------------------------------
+test('#201: one response written as three rows plus a second response is measured as two responses', async () => {
+  const root = rootDir();
+  rosterIc(root, 70, 's70');
+  const row = (id, input, output) => JSON.stringify({ type: 'assistant', message: { id, usage: { input_tokens: input, output_tokens: output, cache_read_input_tokens: 5000000 } } });
+  const rows = [row('msg_A', 40000, 20000), row('msg_A', 40000, 20000), row('msg_A', 40000, 20000), row('msg_B', 3000, 1000)];
+  fs.writeFileSync(path.join(claudeHome(root), 'projects', 'p', 's70.jsonl'), `${rows.join('\n')}\n`);
+  unit(root, 70, 'review');
+  const result = await run(root);
+  assert.equal(result.records[0].jobTokens, 64000, 'two responses: 60000 + 4000, not the 184000 the four rows sum to');
+  assert.equal(result.records[0].decision, 'warn', 'over the 50000 warning line, under the 75000 escalation line');
+});
+
+test('#201: the shipped config halves the triggers the doubled meter was tuned on', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  assert.equal(shipped.ic.warnTokens, 25000);
+  assert.equal(shipped.ic.escalateTokens, 175000);
+  const rotation = require('../bin/rotation-policy').rotationConfig(path.join(__dirname, '..'));
+  assert.equal(rotation['project-lead'].maxJobTokens, 125000);
+  assert.equal(rotation.principal.maxJobTokens, 125000);
+  const budget = require('../bin/budget').budgetConfig(path.join(__dirname, '..'));
+  assert.deepEqual(budget, { warnTokens: 25000, escalateTokens: 175000 });
+});
+
+test('#201: last.json carries usageRowsWithoutId for each measured record', async () => {
+  const root = rootDir();
+  rosterIc(root, 71, 's71'); transcript(root, 's71', [[10000, 5000], [20000, 5000]]);
+  unit(root, 71, 'review');
+  const result = await run(root);
+  assert.equal(result.records[0].usageRowsWithoutId, 2, 'the two id-less rows are flagged');
+  const last = JSON.parse(fs.readFileSync(path.join(root, 'state', 'budget', 'last.json'), 'utf8'));
+  assert.equal(last.records[0].usageRowsWithoutId, 2);
 });

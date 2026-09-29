@@ -190,3 +190,58 @@ wrote the line (`paged`). Not chosen: a second frontier
 source reading decision events from the ledger. The outbox is also what the
 watchdog's frontier wake and the digest read; a second definition of
 "decision-needed" in one reader would let the readers disagree.
+
+## Amendment 2026-09-29 - bounded authority for Endzone bugs
+
+Decision 3's bar is met on Endzone. As of 2026-09-29, the triage ledger holds
+133 proposals over 17 days on 117 issues. 120 of the 124 decided proposals were
+approved unchanged (96.8%), 4 with edits; 5 pending and 4 superseded ones are
+not decided and do not count. Nidus has 8 proposals over 3.3 days and stays on
+Approval until it meets the bar on its own.
+
+Endzone's Principal now has Bounded authority. It applies `ready-for-agent`
+itself, with no Approval, to a ticket only when all of these hold:
+
+- its proposal classifies the ticket as a bug with a reproducible `Red-tell`;
+- it says `Ruling: none needed` and `Open for Cory: none`;
+- it names a `Scope` outside every carve-out path and every risk-trigger path
+  (for this door, a file whose current content matches a risk-trigger pattern
+  is a risk-trigger path);
+- it sets `Tier` to haiku or sonnet;
+- every premise on the ticket was verified at the proposal's sha.
+
+Any other proposal waits for an Approval exactly as before. Full authority is
+still not on the table, and the Principal stays the fleet's one Fable seat
+(decision 4).
+
+- **Veto window.** A bounded ready pages Cory once at normal priority, with the
+  link. Nothing assigns the ticket for 2 hours. A ready whose 2-hour window
+  would touch 22:00 to 07:00 Central keeps it open until 09:00 Central, after
+  the 8am daily Page has listed it, so the whole window is waking hours.
+- **Veto.** A comment from `ownerLogin` that begins `Veto` withdraws the ready,
+  and the proposal returns to awaiting Approval. It is recognised by shape,
+  like `Approved` and `Re-propose`: the guard hook refuses a comment beginning
+  `Veto` to every fleet role and its workers, and the author test is the
+  second lock. A Veto withdraws one ticket and suspends nothing, because a veto
+  can be about timing rather than quality. The door readies a ticket under
+  Bounded authority once: after a bounded ready or a Veto, the issue is Cory's.
+- **Cap and suspension.** At most 5 bounded readies per tenant per day. The
+  authority suspends itself when either of these happens:
+  - an escalation or a send-back on a bounded ticket whose finding says the
+    criteria were wrong or ambiguous;
+  - a defect that escaped from a bounded ticket.
+
+  Suspension is a flag that only Cory removes.
+- **Ledger.** A bounded ready records its own kind and never counts toward the
+  unchanged ratio that earned the authority. The weekly scorecard reports how
+  many readies were bounded, vetoed and suspended.
+
+Not chosen:
+
+- **Any veto suspends.** A veto can mean "not now" as easily as "wrong".
+- **A plain 2-hour window.** A window that opens at 2am is no veto at all.
+- **Batching every bounded ready into the 8am Page.** That adds up to a day of
+  latency to the class that most needs none.
+- **Features in the class.** Decision 3 names bugs only.
+
+Source: the 2026-09-29 fleet audit (ruling R5) and its grill (Q5 to Q7).

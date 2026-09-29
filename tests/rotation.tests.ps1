@@ -41,6 +41,8 @@ try {
   # parseArgs); without this copy the whole suite died at module load with "Cannot
   # find module './work-state'" before a single case ran (review finding 6).
   [IO.File]::Copy("$sourceRoot\bin\work-state.js", "$testRoot\bin\work-state.js")
+  # #201: rotation-policy.js reads transcripts through the shared usage reader.
+  [IO.File]::Copy("$sourceRoot\bin\transcript-usage.js", "$testRoot\bin\transcript-usage.js")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
 
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"}]}'
