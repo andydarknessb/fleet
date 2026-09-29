@@ -20,6 +20,9 @@
 //     the dispatcher's relays left out); the roster and its retired-row archive for "IC idle
 //     share" (no IC running, fleet-wide and per tenant, and at the IC cap). Both are reported,
 //     not judged, until a threshold is ruled: their status is n/a;
+//   - #215: the event ledger again, for "Review pickup latency" (per unit, the record
+//     entering review to the first formal review recorded, median and p90 for the week the
+//     review landed in; reported, not judged);
 //   - the cycle collector (bin/measure-cycle.js run for exactly this week): whole-life IC
 //     job tokens per model family and the risk reviewer, printed beside bin/budget.js's
 //     warnings and escalations for the week as a separate measure (#127).
@@ -67,6 +70,7 @@ const ROWS = [
   ['availability', 'Availability'],
   ['waitingOnCory', 'Waiting on Cory'],
   ['icIdleShare', 'IC idle share'],
+  ['reviewPickup', 'Review pickup latency'],
   ['icCost', 'IC cost'],
 ];
 const SEVERITY = { weak: 4, unknown: 3, watch: 2, good: 1, 'n/a': 0 };
@@ -513,6 +517,70 @@ function icIdleRow(base, week, settings) {
   };
 }
 
+// #215 (spec #195): review pickup latency, per unit: from the Work record entering `review`
+// to the first formal review recorded in that stay, the wait for a lead to pick a settled PR
+// up. Both come from the ledger (a `state-review` event, then a `review-recorded` formal;
+// the door records a formal review only while the record is in review). A stay that ends in
+// a send-back or a merge with no formal review is not a sample; a unit's sample is its first
+// stay that got one. The week is the week the formal review landed in, so a unit that
+// entered review on a Sunday night is measured in the week its review came. The wake outbox
+// line for the settled PR is written in the same pr-watch pass as the `state-review` event,
+// so the entry time here is also the wake line's time; the one-time split between that line
+// and the Watchdog tick that delivered it (#215's note) is a measurement, not a row.
+function reviewPickups(events) {
+  const byRecord = new Map();
+  for (const event of events) {
+    if (!byRecord.has(event.recordId)) byRecord.set(event.recordId, []);
+    byRecord.get(event.recordId).push(event);
+  }
+  const samples = [];
+  const enteredReview = [];
+  for (const [recordId, list] of byRecord) {
+    list.sort((a, b) => a.sequence - b.sequence);
+    let stayStart = null;
+    let answered = false;
+    let sample = null;
+    for (const event of list) {
+      const next = stateAfter(event);
+      if (event.type === 'review-recorded' && event.changes?.kind === 'formal' && stayStart !== null && !answered) {
+        answered = true;
+        if (!sample) sample = { recordId, issue: issueOf(recordId), enteredAt: stayStart, reviewedAt: event.at, ms: Date.parse(event.at) - Date.parse(stayStart) };
+      }
+      if (!next) continue;
+      if (next === 'review') { if (stayStart === null) { stayStart = event.at; answered = false; enteredReview.push({ recordId, at: event.at }); } } else { stayStart = null; answered = false; }
+    }
+    if (sample) samples.push(sample);
+  }
+  return { samples, enteredReview };
+}
+
+function reviewPickupRow(events, week) {
+  const { samples, enteredReview } = reviewPickups(events);
+  const answeredRecords = new Set(samples.map((sample) => sample.recordId));
+  const inWeekSamples = samples.filter((sample) => inWeek(week, sample.reviewedAt)).sort((a, b) => a.issue - b.issue);
+  const noFormal = new Set(enteredReview.filter((entry) => inWeek(week, entry.at) && !answeredRecords.has(entry.recordId)).map((entry) => entry.recordId)).size;
+  const minutes = inWeekSamples.map((sample) => Math.round((sample.ms / 60000) * 10) / 10);
+  const median = percentile(minutes, 0.5);
+  const p90 = percentile(minutes, 0.9);
+  const slowest = inWeekSamples.slice().sort((a, b) => b.ms - a.ms || a.issue - b.issue)[0] || null;
+  const figures = {
+    units: inWeekSamples.length,
+    medianMinutes: median === null ? null : Math.round(median * 10) / 10,
+    p90Minutes: p90,
+    maxMinutes: slowest ? Math.round((slowest.ms / 60000) * 10) / 10 : null,
+    maxIssue: slowest ? slowest.issue : null,
+    noFormal,
+    samples: inWeekSamples.map((sample, index) => ({ issue: sample.issue, minutes: minutes[index] })),
+  };
+  return {
+    figures,
+    result: inWeekSamples.length
+      ? `n=${inWeekSamples.length} units with a formal review in the week: median ${figures.medianMinutes} min, p90 ${p90} min, max ${figures.maxMinutes} min (#${slowest.issue}); ${plural(noFormal, 'unit')} entered review and got none`
+      : `no formal review recorded in the week; ${plural(noFormal, 'unit')} entered review and got none`,
+    status: 'n/a',
+  };
+}
+
 function icCostRow(base, events, week, collect, dryRun) {
   const budget = {
     warnings: events.filter((event) => event.type === 'budget-warning' && inWeek(week, event.at)).length,
@@ -592,6 +660,7 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     availability: availabilityRow(base, week, settings),
     waitingOnCory: waitingOnCoryRow(base, week, settings),
     icIdleShare: icIdleRow(base, week, settings),
+    reviewPickup: reviewPickupRow(events, week),
     icCost: icCostRow(base, events, week, collect, dryRun),
   };
   const rows = ROWS.map(([key, area]) => ({ key, area, ...computed[key] }));

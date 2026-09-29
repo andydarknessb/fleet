@@ -103,9 +103,9 @@ test('#131: a fixture week produces every row in markdown and JSON', () => {
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
   assert.equal(card.week.label, '2026-09-21..2026-09-27');
   const json = JSON.parse(fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.json'), 'utf8'));
-  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'icCost']);
+  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'reviewPickup', 'icCost']);
   const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
-  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'IC cost']) {
+  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'Review pickup latency', 'IC cost']) {
     assert.match(md, new RegExp(`^\\| ${area.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|`, 'm'), area);
   }
 });
@@ -403,4 +403,52 @@ test('#214: an ask that changes inside a tick is two episodes that never overlap
   fs.writeFileSync(path.join(root, 'state', 'sentinel', 'shadow', '20260922.jsonl'), `${ticks('2026-09-22T12:00:00Z', 4).map((at) => shadowTick(at, ['human-wait:pe-endzone'])).join('\n')}\n`);
   const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
   assert.deepEqual(row.figures.bySession, { 'pe-endzone': { role: 'principal', hours: 1, episodes: 2 } });
+});
+
+// #215 (spec #195): review pickup latency per unit, from the record entering review to the
+// first formal review recorded, as median and p90 for the week the review landed in.
+test('#215: review pickup latency is the median and p90 from entering review to the first formal review, per unit', () => {
+  const row = build().rows.find((r) => r.key === 'reviewPickup');
+  assert.equal(row.area, 'Review pickup latency');
+  // #11: review 00:40, formal 01:00 (20 min). #12: its first stay ended in a send-back with no formal review,
+  // its second stay opened at 02:30 and the formal review came at 03:00 (30 min). #13 and #14 merged with none.
+  assert.deepEqual(row.figures, { units: 2, medianMinutes: 25, p90Minutes: 30, maxMinutes: 30, maxIssue: 12, noFormal: 2, samples: [{ issue: 11, minutes: 20 }, { issue: 12, minutes: 30 }] });
+  assert.equal(row.status, 'n/a');
+  assert.match(row.result, /^n=2 units with a formal review in the week: median 25 min, p90 30 min, max 30 min \(#12\); 2 units entered review and got none$/);
+});
+
+test('#215: a unit counts in the week its formal review landed', () => {
+  const root = fixtureWeek();
+  // #15: in review 00:30, formal review 00:50 (20 min), in the week.
+  unit(root, 15, '2026-09-26T00:00:00.000Z', [['implementing', '2026-09-26T00:10:00.000Z'], ['pr-open', '2026-09-26T00:20:00.000Z'], ['review', '2026-09-26T00:30:00.000Z'], ['merged', '2026-09-26T02:00:00.000Z']], { formal: '2026-09-26T00:50:00.000Z' });
+  // #16: entered review the week before, its formal review landed in this week (20 min).
+  unit(root, 16, '2026-09-20T22:00:00.000Z', [['implementing', '2026-09-20T22:10:00.000Z'], ['pr-open', '2026-09-20T23:40:00.000Z'], ['review', '2026-09-20T23:50:00.000Z'], ['merged', '2026-09-21T00:30:00.000Z']], { formal: '2026-09-21T00:10:00.000Z' });
+  const row = build(root).rows.find((r) => r.key === 'reviewPickup');
+  assert.deepEqual(row.figures.samples, [{ issue: 11, minutes: 20 }, { issue: 12, minutes: 30 }, { issue: 15, minutes: 20 }, { issue: 16, minutes: 20 }]);
+  assert.equal(row.figures.units, 4);
+  assert.equal(row.figures.noFormal, 2, '#16 entered review before the week and is not one of the units that got none');
+});
+
+test('#215: the first of two formal reviews in a stay is the pickup', () => {
+  const root = fixtureWeek();
+  const { id, revision } = unit(root, 17, '2026-09-26T00:00:00.000Z', [['implementing', '2026-09-26T00:10:00.000Z'], ['pr-open', '2026-09-26T00:20:00.000Z'], ['review', '2026-09-26T00:30:00.000Z']], { formal: '2026-09-26T00:50:00.000Z' });
+  workState.recordReview({ root, id, expectedRevision: revision, actor: 'pl-endzone', idempotencyKey: 'formal-17-again', now: '2026-09-26T01:30:00.000Z', review: { kind: 'formal', headSha: H(7), artifact: 'state/reviews/endzone_issue-17/formal-002.json' } });
+  assert.equal(workState.readEvents(root).filter((event) => event.recordId === id && event.type === 'review-recorded').length, 2);
+  const row = build(root).rows.find((r) => r.key === 'reviewPickup');
+  assert.deepEqual(row.figures.samples.filter((sample) => sample.issue === 17), [{ issue: 17, minutes: 20 }]);
+});
+
+test('#215: a week with no formal review reads n/a, not a zero', () => {
+  const root = rootDir();
+  const row = build(root).rows.find((r) => r.key === 'reviewPickup');
+  assert.equal(row.status, 'n/a');
+  assert.equal(row.figures.units, 0);
+  assert.equal(row.figures.medianMinutes, null);
+  assert.match(row.result, /^no formal review recorded in the week/);
+});
+
+test('#215: the markdown carries the Review pickup latency row', () => {
+  const root = fixtureWeek();
+  writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
+  assert.match(fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8'), /^\| Review pickup latency \| n=2 units with a formal review in the week: median 25 min/m);
 });
