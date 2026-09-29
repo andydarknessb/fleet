@@ -10,7 +10,8 @@
 // stays authoritative; this maintains the shadow records and parity evidence. Zero
 // model turns. Two deliberate spec-over-legacy choices: a required gate MISSING from
 // the rollup is incomplete (never settled), and closure linkage counts a body
-// closing keyword because this tenant closes issues through the #330 workflow.
+// closing keyword because this tenant closes issues through the #330 workflow, and an
+// explained `Refs` is deliberate (#202, bin/closing-link.js).
 //
 // Design rules from the 2026-09-01 review: idempotency keys are retry-dedupe only,
 // so every key is scoped to the record revision it acts on (novelty detection is
@@ -23,6 +24,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
+const closingLink = require('./closing-link');
+const exclusions = require('./exclusions');
 
 const WATCH_STATES = Object.freeze(['implementing', 'revision', 'pr-open', 'ci-wait', 'review', 'hold', 'escalated']);
 const WATCHER_MARK = '[pr-watch]';
@@ -70,25 +73,19 @@ function evaluateChecks(policy, rollup) {
   };
 }
 
-// Closure linkage, ported from the tenant's close-merged-issues.js (#330) grammar:
-// strip code fences and spans first; keyword with optional colon, same-line
-// whitespace, then #n, owner/repo#n, or the full issue URL. Native
-// closingIssuesReferences also counts (it under-reports on this tenant, never over).
-function stripCode(text) {
-  return String(text).replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]*`/g, ' ');
+// Closure linkage (#202): bin/closing-link.js is the one parser, shared with
+// bin/pr-ready-check.js: a closing keyword (the tenant's close-merged-issues.js #330
+// grammar), an explained `Refs #n` (deliberate, closure is the lead's at the merge),
+// or neither. Native closingIssuesReferences also counts as a closing keyword (it
+// under-reports on this tenant, never over).
+function closingLinkage(viewPr, issue, repo) {
+  const refs = viewPr?.closingIssuesReferences || [];
+  if (refs.some((ref) => Number(ref.number) === Number(issue))) return 'closing';
+  return closingLink.classify(viewPr?.body || '', issue, repo);
 }
 
 function closingLinked(viewPr, issue, repo) {
-  const refs = viewPr?.closingIssuesReferences || [];
-  if (refs.some((ref) => Number(ref.number) === Number(issue))) return true;
-  const body = stripCode(viewPr?.body || '');
-  const n = Number(issue);
-  const forms = [`#${n}\\b`];
-  if (repo) {
-    const repoPattern = String(repo).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    forms.push(`${repoPattern}#${n}\\b`, `https://github\\.com/${repoPattern}/issues/${n}\\b`);
-  }
-  return new RegExp(`\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?[^\\S\\n]+(?:${forms.join('|')})`, 'i').test(body);
+  return closingLinkage(viewPr, issue, repo) === 'closing';
 }
 
 // fleet#44: the closing-linkage rule re-derives "no closing keyword" from GitHub on
@@ -186,10 +183,15 @@ function mergerLogin(viewPr) {
   return typeof login === 'string' && login.trim() ? login.trim() : null;
 }
 
-function mergedChain(hops, viewPr, prNumber, evidencePrefix, { formalReviewMissing = false } = {}) {
+// #203: a merged PR whose linkage is an explained Refs leaves its issue open on purpose,
+// so the merged hop carries an exclusion request: the planner must not reassign
+// delivered work, and the issue closing releases it (releaseClosedIssueExclusions).
+function mergedChain(hops, viewPr, prNumber, evidencePrefix, { formalReviewMissing = false, issue = null, repo = null } = {}) {
   const mergedBy = mergerLogin(viewPr);
+  const explainedRefs = issue !== null && closingLinkage(viewPr, issue, repo) === 'refs';
   return (hops || []).map((to, index) => ({
     kind: 'transition', to,
+    excludeIssue: to === 'merged' && explainedRefs ? { issue: Number(issue), prNumber: Number(prNumber), mergedAt: viewPr.mergedAt } : null,
     evidence: `${evidencePrefix} at ${viewPr.mergedAt} (gh pr view ${prNumber})${to === 'merged' && mergedBy ? ` by ${mergedBy}` : ''}${to === 'merged' && formalReviewMissing ? '; merged without a recorded formal review (ticket 05 lower bound)' : ''}`,
     wake: to === 'merged' && formalReviewMissing ? 'decision-needed' : null,
     reconciled: to === 'merged' ? { state: viewPr.state, mergedAt: viewPr.mergedAt, mergedBy, headRefOid: viewPr.headRefOid || undefined, evidence: `gh pr view ${prNumber}` } : null,
@@ -216,9 +218,9 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
     if (!prNumber) return { actions: [] };
     if (!viewPr) return { actions: [], ghNeeds: 'view' };
     if (!openPr && String(viewPr.state).toUpperCase() === 'MERGED') {
-      return { actions: mergedChain(escalatedHopsTo(record.prior_state, 'merged'), viewPr, prNumber, 'escalation resolved by an observed merge', { formalReviewMissing: reviewMissing }) };
+      return { actions: mergedChain(escalatedHopsTo(record.prior_state, 'merged'), viewPr, prNumber, 'escalation resolved by an observed merge', { formalReviewMissing: reviewMissing, issue: record.issue, repo }) };
     }
-    if (livePr && closingLinked(viewPr, record.issue, repo)) {
+    if (livePr && closingLinkage(viewPr, record.issue, repo) !== 'none') {
       const back = record.prior_state && record.prior_state !== 'escalated' ? record.prior_state : 'ci-wait';
       return {
         actions: [{
@@ -247,7 +249,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
     if (!prNumber) return { actions: [] };
     if (!viewPr) return { actions: [], ghNeeds: 'view' };
     if (String(viewPr.state).toUpperCase() === 'MERGED') {
-      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing }) };
+      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing, issue: record.issue, repo }) };
     }
     return { actions: [] };   // closed (await a replacement PR) or draft (paused work)
   }
@@ -257,7 +259,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   if (!livePr) {
     if (!viewPr) return { actions: [], ghNeeds: 'view' };
     if (String(viewPr.state).toUpperCase() === 'MERGED') {
-      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing }) };
+      return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing, issue: record.issue, repo }) };
     }
     if (viewIsOpen && viewPr.isDraft) {
       // fleet#63: a lead returns a PR to its IC with `gh pr ready --undo` and the
@@ -316,8 +318,9 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   if (state === 'ci-wait') {
     if (evaluation.settled) {
       if (!viewPr) return { actions: [], ghNeeds: 'view' };   // linkage needs the body
-      const linked = closingLinked(viewPr, record.issue, repo);
-      if (!linked && !closingLinkageRuled(record, viewPr)) {
+      const linkage = closingLinkage(viewPr, record.issue, repo);
+      const linked = linkage === 'closing';
+      if (linkage === 'none' && !closingLinkageRuled(record, viewPr)) {
         return {
           actions: [{
             kind: 'transition', to: 'escalated', observe: { pr: livePr, evaluation, closing: false },
@@ -329,7 +332,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
       return {
         actions: [{
           kind: 'transition', to: 'review', observe: { pr: livePr, evaluation, closing: linked },
-          evidence: `every gate green on PR #${prNumber}; ${linkagePhrase(linked, record.issue, prNumber)}`,
+          evidence: `every gate green on PR #${prNumber}; ${linkagePhrase(linkage, record.issue, prNumber)}`,
           wake: 'checks-settled',
         }],
       };
@@ -350,8 +353,9 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   // review/hold: the lead owns the outcome, but linkage is re-verified every tick -
   // a body edit that drops the closing keyword must escalate before the merge.
   if (!viewPr) return { actions: [], ghNeeds: 'view' };
-  const linked = closingLinked(viewPr, record.issue, repo);
-  if (!linked && !closingLinkageRuled(record, viewPr)) {
+  const linkage = closingLinkage(viewPr, record.issue, repo);
+  const linked = linkage === 'closing';
+  if (linkage === 'none' && !closingLinkageRuled(record, viewPr)) {
     return {
       actions: [{
         kind: 'transition', to: 'escalated', observe: { pr: livePr, evaluation, closing: false },
@@ -383,7 +387,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
           kind: 'transition', to,
           observe: index === chain.length - 1 ? { pr: livePr, evaluation, closing: settled ? linked : null } : null,
           evidence: index === chain.length - 1
-            ? `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review (was ${String(prevHead).slice(0, 12)}); ${settled ? `every gate green; ${linkagePhrase(linked, record.issue, prNumber)}` : `gates ${evaluation.failed ? `failed: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}` : `pending: ${evaluation.gatePending.join(', ') || 'none observed'}`}`}`
+            ? `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review (was ${String(prevHead).slice(0, 12)}); ${settled ? `every gate green; ${linkagePhrase(linkage, record.issue, prNumber)}` : `gates ${evaluation.failed ? `failed: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}` : `pending: ${evaluation.gatePending.join(', ') || 'none observed'}`}`}`
             : `PR #${prNumber} re-readied at ${String(livePr.headRefOid).slice(0, 12)} while review; walking back to ci-wait`,
           wake: index === chain.length - 1 ? wake : null,
         })),
@@ -395,10 +399,10 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   return { actions: [{ kind: 'observe', observation, evidence: `PR #${prNumber} changed while ${state}`, wake: null }] };
 }
 
-function linkagePhrase(linked, issue, prNumber) {
-  return linked
-    ? `closing linkage verified for #${issue}`
-    : `closing linkage absent on PR #${prNumber} for #${issue}, ruled deliberate by the lead (fleet#44); issue closure is the lead's at the merge`;
+function linkagePhrase(linkage, issue, prNumber) {
+  if (linkage === 'closing') return `closing linkage verified for #${issue}`;
+  if (linkage === 'refs') return `explained Refs for #${issue} on PR #${prNumber}, deliberate (#202); issue closure is the lead's at the merge`;
+  return `closing linkage absent on PR #${prNumber} for #${issue}, ruled deliberate by the lead (fleet#44); issue closure is the lead's at the merge`;
 }
 
 function ghJson(executable, args) {
@@ -411,6 +415,7 @@ function ghJson(executable, args) {
 function makeFetchers(repo, executable = 'gh') {
   return {
     listOpenPrs: () => ghJson(executable, ['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', 'number,isDraft,headRefName,headRefOid,statusCheckRollup']),
+    issueState: (n) => String(ghJson(executable, ['issue', 'view', String(n), '-R', repo, '--json', 'state']).state || ''),
     viewPr: (n) => ghJson(executable, ['pr', 'view', String(n), '-R', repo, '--json', 'number,state,isDraft,mergedAt,mergedBy,headRefOid,statusCheckRollup,closingIssuesReferences,headRefName,body']),
   };
 }
@@ -445,7 +450,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     ciGates: tenantConfig.ciGates || [], watchedChecks: tenantConfig.watchedChecks || [],
     ignoredChecks: tenantConfig.ignoredChecks || [],
   };
-  const health = { at: new Date().toISOString(), ok: true, error: null, tenant: tenantName, records: 0, ghCalls: 0, failures: 0, actions: [], dryRun };
+  const health = { at: new Date().toISOString(), ok: true, error: null, tenant: tenantName, records: 0, ghCalls: 0, failures: 0, releaseFailures: 0, actions: [], dryRun };
   const finish = () => {
     // The shadow projection runs LAST: retiring a roster-dropped IC before its
     // record was advanced would archive an in-flight PR unwatched (review F3).
@@ -469,7 +474,8 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     .filter((r) => r.tenant === tenantName && WATCH_STATES.includes(r.state))
     .sort((a, b) => a.issue - b.issue);
   health.records = records.length;
-  if (records.length === 0) return finish();
+  const repo = tenantConfig.github || null;
+  if (records.length === 0) { releaseClosedIssueExclusions({ root: base, tenantName, fetchers, actor, dryRun, health }); return finish(); }
 
   let openPrs;
   try {
@@ -483,7 +489,6 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
   }
   const byNumber = new Map(openPrs.filter((pr) => !pr.isDraft).map((pr) => [Number(pr.number), pr]));
   const prefix = tenantConfig.branchPrefix || '';
-  const repo = tenantConfig.github || null;
 
   for (const record of records) {
     const prNumber = record.github?.prNumber || null;
@@ -514,8 +519,12 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
       // recurrence of the same digest after ANY intervening change gets a fresh key.
       const key = action.kind === 'observe' ? `watch:${record.id}:r${revision}:${suffix}` : `watch:${record.id}:r${revision}:${suffix}:${action.to}`;
       const summary = `${record.id}: ${action.kind === 'observe' ? 'observe' : `-> ${action.to}`}${action.wake ? ` wake=${action.wake}` : ''}`;
-      if (dryRun) { health.actions.push(`DRY ${summary}`); continue; }
+      if (dryRun) { health.actions.push(`DRY ${summary}${action.excludeIssue ? ' + exclusion' : ''}`); continue; }
       try {
+        // #203: the exclusion is recorded BEFORE the merged transition commits, so a tick
+        // that dies between the two is retried by the next one (the record is still
+        // unmerged and watched); its id is fixed per PR, so the retry adds nothing twice.
+        if (action.excludeIssue) recordMergedRefsExclusion({ root: base, tenantName, actor, exclusion: action.excludeIssue, health });
         let acted;
         if (action.kind === 'observe') {
           acted = workState.observeRecord({
@@ -560,7 +569,86 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
       }
     }
   }
+  releaseClosedIssueExclusions({ root: base, tenantName, fetchers, actor, dryRun, health });
   return finish();
+}
+
+// #203: one Frontier exclusion per merged explained-Refs PR, owned by the fleet, its
+// recheck event the issue closing. The id is fixed per (issue, PR), so a replay finds it
+// and records nothing (EXCLUSION_EXISTS); a different exclusion already standing for the
+// issue (a lead's hand exclusion) means the issue is already refused, so nothing is added.
+function recordMergedRefsExclusion({ root, tenantName, actor, exclusion, health }) {
+  const fixedId = `${tenantName}:excl-${exclusion.issue}-pr-${exclusion.prNumber}`;
+  try {
+    const added = exclusions.addExclusion({
+      root, tenant: tenantName, issue: exclusion.issue, owner: 'fleet', actor,
+      id: fixedId,
+      reason: `PR #${exclusion.prNumber} merged with an explained Refs for #${exclusion.issue}; the issue stays open until it closes, and its work is delivered`,
+      evidence: `gh pr view ${exclusion.prNumber} (merged at ${exclusion.mergedAt})`,
+      recheck: { event: { type: 'issue-closed', issue: exclusion.issue } },
+    });
+    health.actions.push(`${tenantName}:issue-${exclusion.issue}: excluded ${added.id} (PR #${exclusion.prNumber} merged with an explained Refs)`);
+  } catch (error) {
+    if (error.code !== 'EXCLUSION_EXISTS') throw error;
+    // The fleet's own fixed id means this is a replay: silent. Any other id is a different
+    // exclusion (a lead's hand exclusion) that already refuses the issue; say so once, since
+    // the fleet does not retry and a lapse before its issue is closed would put it back.
+    if (error.id !== fixedId) {
+      health.actions.push(`${tenantName}:issue-${exclusion.issue}: fleet exclusion for PR #${exclusion.prNumber} not recorded; ${error.id} already stands and the fleet does not retry (if it lapses before #${exclusion.issue} closes, exclude by hand)`);
+    }
+  }
+}
+
+// #203: the issue closing releases the exclusion. GitHub owns that event, so each tick
+// reads the issue of every standing issue-closed exclusion of this tenant and lifts it
+// once CLOSED. An unreadable issue is retained, never read as closed.
+function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRun, health }) {
+  let standing;
+  try {
+    standing = exclusions.activeExclusions({ root, tenant: tenantName }).filter((entry) => entry.recheck?.event?.type === 'issue-closed');
+  } catch (error) {
+    health.failures += 1;
+    health.actions.push(`${tenantName}: exclusion ledger unreadable, releases skipped (${String(error.message || error).slice(0, 120)})`);
+    return;
+  }
+  for (const entry of standing) {
+    let state;
+    try {
+      state = String(fetchers.issueState(entry.issue) || '').toUpperCase();
+      health.ghCalls += 1;
+    } catch (error) {
+      const message = String(error.message || error);
+      if (/could not resolve to an issue/i.test(message)) {
+        // Deleted or transferred: the issue can never close here, so nothing else would
+        // ever release the exclusion. Lift it, say why, and count no failure.
+        if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${entry.issue} no longer resolves)`); continue; }
+        try {
+          exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${entry.issue} no longer resolves (gh issue view: ${message.slice(0, 120)})` });
+          health.actions.push(`${entry.id}: lifted, issue #${entry.issue} no longer resolves`);
+        } catch (liftError) {
+          if (liftError.code === 'EXCLUSION_NOT_ACTIVE') continue;
+          health.failures += 1;
+          health.actions.push(`${entry.id}: lift failed (${liftError.code || ''} ${String(liftError.message).slice(0, 120)})`);
+        }
+        continue;
+      }
+      // A transient read error retains the exclusion and is counted apart from record
+      // action failures: it is not a failed tick, and the next tick reads again.
+      health.releaseFailures += 1;
+      health.actions.push(`${entry.id}: issue view failed, retained (${message.slice(0, 120)})`);
+      continue;
+    }
+    if (state !== 'CLOSED') continue;
+    if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${entry.issue} is CLOSED)`); continue; }
+    try {
+      exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${entry.issue} is CLOSED (gh issue view)` });
+      health.actions.push(`${entry.id}: lifted, issue #${entry.issue} closed`);
+    } catch (error) {
+      if (error.code === 'EXCLUSION_NOT_ACTIVE') continue;   // released meanwhile
+      health.failures += 1;
+      health.actions.push(`${entry.id}: lift failed (${error.code || ''} ${String(error.message).slice(0, 120)})`);
+    }
+  }
 }
 
 // Ticket 09: CI watching has its own rollback flag. With state/flags/pr-watch-off the tick
@@ -680,6 +768,6 @@ if (require.main === module) {
 
 module.exports = {
   evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
-  stableStringify, closingLinked, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
+  stableStringify, closingLinked, closingLinkage, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
   cli, FLAGS, PrWatchError,
 };
