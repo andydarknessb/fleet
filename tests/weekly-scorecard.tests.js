@@ -262,3 +262,19 @@ test('#155: a tenant whose owner and fleet share a login counts its merges as sh
   }
   assert.equal(build(root).mergesBy.shared, 4);
 });
+
+// --- #201 (spec #191): the meter changed on 2026-09-30 ---------------------------------
+test('#201: the scorecard says token figures before the meter change date read about 2x', () => {
+  const card = build();
+  assert.equal(card.meterChange.date, '2026-09-30');
+  const md = renderScorecard(card);
+  assert.match(md, /Token figures before 2026-09-30 read about 2x/);
+  assert.equal(md.split('\n').filter((l) => /read about 2x/.test(l)).length, 1, 'one line');
+  assert.match(md, /## IC cost \(two measures\)\n\n[^\n]*read about 2x/, 'the note sits with the token figures');
+});
+
+test('#201: the scorecard reads the meter change date from config/cycle.json', () => {
+  const root = fixtureWeek();
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ meterChange: { date: '2026-10-05' } }));
+  assert.match(renderScorecard(build(root)), /Token figures before 2026-10-05 read about 2x/);
+});
