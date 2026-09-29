@@ -41,6 +41,8 @@ tickets still go to Cory's sessions.
   last commit that passed.
 - The known contention flake (the work-state mutex test under a parallel run)
   means the aggregate runner runs suites one at a time.
+  Status note: #234 found the flake is a Windows lock race (EPERM on a delete-pending
+  lock file), not a load effect, and the work-state lock now waits it out.
 - `state/` stays outside all of this: it is not in the repository and no ref
   move touches it. A change that needs a state migration ships the migration
   as a script Cory runs, never as a side effect of the advance.

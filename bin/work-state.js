@@ -44,6 +44,12 @@ function isMergeReviewEvent(event) {
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
 const LOCK_STALE_MS = 60 * 1000;
+// #234: Windows answers EPERM/EACCES/EBUSY for a lock or rename target that is delete-pending.
+// The lock treats them as contended for about LOCK_STALE_MS of waits, then throws, so a genuine
+// ACL failure cannot spin forever.
+const TRANSIENT_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const LOCK_TRANSIENT_MAX_WAITS = Math.ceil(LOCK_STALE_MS / LOCK_WAIT_MS);
+const RENAME_RETRIES = 5;
 
 class WorkStateError extends Error {
   constructor(code, message, details = {}) {
@@ -99,14 +105,27 @@ function writeAtomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(temporary, file);
+  renameWithRetry(temporary, file);
 }
 
 function writeAtomicText(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, value, 'utf8');
-  fs.renameSync(temporary, file);
+  renameWithRetry(temporary, file);
+}
+
+// #234: a rename onto a file another process just opened or replaced can report EPERM/EBUSY on Windows.
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (!['EPERM', 'EBUSY'].includes(error.code) || attempt >= RENAME_RETRIES) throw error;
+      sleepBriefly();
+    }
+  }
 }
 
 function sleepBriefly() {
@@ -117,13 +136,16 @@ function sleepBriefly() {
 function withLock(root, callback) {
   const p = ensureLayout(root);
   let handle;
+  let transientWaits = 0;
   for (;;) {
     try {
       handle = fs.openSync(p.lock, 'wx');
       fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
       break;
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      const transient = TRANSIENT_FS_CODES.has(error.code);
+      if (error.code !== 'EEXIST' && !transient) throw error;
+      if (transient && (transientWaits += 1) > LOCK_TRANSIENT_MAX_WAITS) throw error;
       try {
         const stat = fs.statSync(p.lock);
         if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
@@ -133,7 +155,7 @@ function withLock(root, callback) {
           if (!owner.pid || !alive) fs.rmSync(p.lock, { force: true });
         }
       } catch (statError) {
-        if (statError.code !== 'ENOENT') throw statError;
+        if (!['ENOENT', 'EPERM', 'EBUSY'].includes(statError.code)) throw statError;
       }
       sleepBriefly();
     }

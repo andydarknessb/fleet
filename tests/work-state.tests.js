@@ -418,19 +418,106 @@ test('cross-process mutex serializes concurrent compare-and-swap attempts', asyn
   const root = rootDir();
   makeRecord(root);
   const modulePath = path.resolve(__dirname, '..', 'bin', 'work-state.js');
-  const script = (index) => `const m=require(${JSON.stringify(modulePath)});try{m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'proc-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'});process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error')}`;
-  const results = await Promise.all(Array.from({ length: 20 }, (_, index) => new Promise((resolve) => {
+  const script = (index) => `const m=require(${JSON.stringify(modulePath)});try{m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'proc-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'});process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error');process.stderr.write(String(e.stack||e))}`;
+  const runs = await Promise.all(Array.from({ length: 20 }, (_, index) => new Promise((resolve) => {
     setTimeout(() => {
-      const child = spawn(process.execPath, ['-e', script(index)], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const child = spawn(process.execPath, ['-e', script(index)], { stdio: ['ignore', 'pipe', 'pipe'] });
       let output = '';
+      let stderr = '';
       child.stdout.on('data', (chunk) => { output += chunk; });
-      child.on('close', () => resolve(output));
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('close', () => resolve({ output, stderr }));
     }, index * 2);
   })));
+  const results = runs.map((run) => run.output);
+  // #234: a contender that dies on a Windows EPERM shows its code and stack here, not just a count mismatch.
+  assert.deepEqual(runs.filter((run) => run.output !== 'ok' && run.output !== 'STALE_REVISION'), []);
   assert.equal(results.filter((result) => result === 'ok').length, 1);
   assert.equal(results.filter((result) => result === 'STALE_REVISION').length, 19);
   const events = fs.readFileSync(path.join(root, 'state', 'events', '2026-09-01.jsonl'), 'utf8').trim().split(/\r?\n/);
   assert.equal(events.length, 2);
+});
+
+// #234: Windows reports a delete-pending lock or a replaced target as EPERM/EBUSY. The state door
+// waits those out like a held lock and never spins forever on a genuine permission failure.
+// These run in-process: fs methods and Atomics.wait are swapped for the body, so no real waiting.
+function withFsFault(method, faultFor, body) {
+  const original = fs[method];
+  const originalWait = Atomics.wait;
+  const probe = { failures: 0, waits: 0 };
+  fs[method] = function faulty(target, ...rest) {
+    const code = faultFor(String(target), probe);
+    if (code) {
+      probe.failures += 1;
+      throw Object.assign(new Error(`${code}: simulated`), { code });
+    }
+    return original.call(this, target, ...rest);
+  };
+  Atomics.wait = (...args) => {
+    probe.waits += 1;
+    return probe.onWait ? probe.onWait() : 'timed-out';
+  };
+  try {
+    return body(probe);
+  } finally {
+    fs[method] = original;
+    Atomics.wait = originalWait;
+  }
+}
+
+const isLock = (target) => path.basename(target) === '.lock';
+
+test('lock open retries EPERM, EACCES and EBUSY like a held lock', () => {
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    const root = rootDir();
+    withFsFault('openSync', (target, probe) => (isLock(target) && probe.failures < 5 ? code : null), (probe) => {
+      makeRecord(root);
+      assert.equal(probe.failures, 5);
+      assert.ok(probe.waits >= 5);
+    });
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+  }
+});
+
+test('lock open throws a genuine permission failure after a bounded wait', () => {
+  const root = rootDir();
+  withFsFault('openSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
+    assert.throws(() => makeRecord(root), (error) => error.code === 'EPERM');
+    assert.ok(probe.failures > 1 && probe.failures <= 100000);
+  });
+});
+
+test('lock probe forgives a delete-pending lock that stats as EPERM', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = path.join(root, 'state', 'work', '.lock');
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  withFsFault('statSync', (target, probe) => (isLock(target) && probe.failures < 3 ? 'EBUSY' : null), (probe) => {
+    probe.onWait = () => {
+      if (probe.failures >= 3) fs.rmSync(lock, { force: true });
+      return 'timed-out';
+    };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.failures, 3);
+  });
+});
+
+test('atomic write retries a rename that reports EPERM or EBUSY', () => {
+  for (const code of ['EPERM', 'EBUSY']) {
+    const root = rootDir();
+    withFsFault('renameSync', (target, probe) => (probe.failures < 2 ? code : null), (probe) => {
+      makeRecord(root);
+      assert.equal(probe.failures, 2);
+    });
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+  }
+});
+
+test('atomic write throws when a rename keeps failing', () => {
+  const root = rootDir();
+  withFsFault('renameSync', () => 'EPERM', () => {
+    assert.throws(() => makeRecord(root), (error) => error.code === 'EPERM');
+  });
 });
 
 test('pending journals recover kill points between replacement and append', () => {
