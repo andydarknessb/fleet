@@ -727,11 +727,14 @@ function abandonRecord(options = {}) {
     if (!record) {
       const abandoned = readJson(abandonFile(p, options.id))?.record;
       const replay = abandoned && replayIfKnown(abandoned, key);
-      if (replay) return replay;
+      if (replay) return pageAbandon(p, root, abandoned, key, options, abandoned.abandonment?.from, replay);
       throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
     }
     const replay = replayIfKnown(record, key);
-    if (replay) return replay;
+    if (replay) {
+      const abandoned = readJson(abandonFile(p, options.id))?.record;
+      return pageAbandon(p, root, record, key, options, abandoned?.idempotency?.[key] ? abandoned.abandonment?.from : null, replay);
+    }
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
@@ -757,8 +760,16 @@ function abandonRecord(options = {}) {
       evidence: options.evidence, changes: { from: record.state, to: 'abandoned', reason },
     });
     const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, abandonedRecord: next, event, killPoint: options.killPoint });
-    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+    return pageAbandon(p, root, record, key, options, record.state, { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord });
   });
+}
+
+// #204 (ruling): an abandon out of `escalated` or `hold` leaves a decision state, so
+// it appends the same resolution line a transition does; `to` is `abandoned`.
+function pageAbandon(p, root, record, key, options, from, result) {
+  return from && DECISION_STATES.includes(from)
+    ? { ...result, resolved: appendResolutionWake({ root, p, record, key, options, from, to: 'abandoned', result }) }
+    : result;
 }
 
 function createRecord(options = {}) {
@@ -889,17 +900,19 @@ function transitionRecord(options = {}) {
     // `resolution` line under `<key>:resolution` (the decision-needed line owns `key`,
     // and escalated -> hold writes both). `from` is the record's state before the
     // transition; a replay reads it back from the transition's own idempotency entry.
-    const pageDecision = (result, from) => {
+    // A replay takes both ends from the committed `transition:from->to`, never from the caller.
+    const pageDecision = (result, from, target = to) => {
       let out = result;
-      if (from && DECISION_STATES.includes(from)) {
-        out = { ...out, resolved: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now }) };
-      }
-      return DECISION_STATES.includes(to)
+      if (from && DECISION_STATES.includes(from)) out = { ...out, resolved: appendResolutionWake({ root, p, record, key, options, from, to: target, result }) };
+      return DECISION_STATES.includes(target)
         ? { ...out, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
         : out;
     };
     const replay = replayIfKnown(record, key);
-    if (replay) return pageDecision(replay, /^transition:([a-z-]+)->/.exec(record.idempotency[key].type || '')?.[1]);
+    if (replay) {
+      const committed = /^transition:([a-z-]+)->([a-z-]+)$/.exec(record.idempotency[key].type || '');
+      return pageDecision(replay, committed?.[1], committed?.[2] || to);
+    }
     if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
     if (Number(options.expectedRevision) !== record.revision) {
       throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
@@ -1101,6 +1114,12 @@ function decisionRaisedBy(p, recordId, from, beforeSequence) {
       .sort((a, b) => b.sequence - a.sequence)[0];
     return entering && entering.actor && entering.actor !== 'unknown' ? String(entering.actor) : null;
   } catch { return null; }
+}
+
+// The resolution line for a record leaving a decision state, by transition or by
+// abandon (#204): keyed `<key>:resolution`, so a replay repairs it and never doubles it.
+function appendResolutionWake({ root, p, record, key, options, from, to, result }) {
+  return appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
 }
 
 // Idempotent by (recordId, idempotencyKey): the door that commits a decision

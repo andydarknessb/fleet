@@ -280,7 +280,11 @@ try {
     # #204: a `resolution` line (a record left escalated or hold) is addressed to the
     # session that raised the decision: `raisedBy` names it. -Recipient lead (the
     # default) takes every line but the Principal's own (`raisedBy` starting `pe-`);
-    # -Recipient principal takes only the resolution lines its own escalations earned.
+    # -Recipient principal takes only the resolution lines its own escalations earned
+    # (the Principal has no escalation door today, its ask is the Triage proposal,
+    # ADR 0011, so that branch serves a future door).
+    # The lead skips a resolution INTO ci-wait: the PR watcher's checks-settled
+    # follows and is the actionable wake, so both would rotate the lead twice.
     # $SelfActor drops a resolution its own session performed. $Details, when
     # given, collects one "<record> <from> -> <to>" per counted resolution so the
     # wake reason can name them.
@@ -299,7 +303,7 @@ try {
       if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
       $raisedBy = ''; if ($o.PSObject.Properties['raisedBy']) { $raisedBy = "$($o.raisedBy)" }
       if ($Recipient -eq 'principal') { if ("$($o.wake)" -ne 'resolution' -or $raisedBy -notlike 'pe-*') { continue } }
-      elseif ("$($o.wake)" -eq 'resolution' -and $raisedBy -like 'pe-*') { continue }
+      elseif ("$($o.wake)" -eq 'resolution' -and ($raisedBy -like 'pe-*' -or ($o.PSObject.Properties['to'] -and "$($o.to)" -eq 'ci-wait'))) { continue }
       if ($SelfActor -and @('decision-needed', 'resolution') -contains "$($o.wake)" -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
       if ($null -ne $Details -and "$($o.wake)" -eq 'resolution') { [void]$Details.Add("$($o.recordId) $($o.from) -> $($o.to)") }

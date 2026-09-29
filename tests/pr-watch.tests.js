@@ -232,6 +232,11 @@ test('a watcher escalation self-resolves when linkage appears, then settles norm
   watch(root, fixed);
   assert.equal(record(root).state, 'review');
   assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'checks-settled']);
+  // #204: the watcher's own self-resolve line says it raised and resolved the decision (the lead is still woken for it).
+  const selfResolved = outbox(root).find((w) => w.wake === 'resolution');
+  assert.equal(selfResolved.raisedBy, selfResolved.actor);
+  assert.equal(selfResolved.from, 'escalated');
+  assert.equal(selfResolved.to, 'ci-wait');
 });
 
 test('close, reopen, close again escalates twice - no permanent replay wedge', () => {

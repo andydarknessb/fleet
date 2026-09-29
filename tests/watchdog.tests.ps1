@@ -515,28 +515,32 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     ([ordered]@{ at = (Get-Date).ToUniversalTime().AddMinutes(-$MinutesAgo).ToString('o'); recordId = "test:$Record"; revision = 6; eventSequence = 6; wake = 'resolution'; idempotencyKey = "k-$Record:resolution"; actor = $Actor; from = $From; to = $To; raisedBy = $RaisedBy; evidence = 'Cory ruled' } | ConvertTo-Json -Compress)
   }
   Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","launchedAt":"' + (Get-Date).ToUniversalTime().AddHours(-2).ToString('o') + '"}]}')
-  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((@((New-ResolutionLine 20 'issue-30' 'escalated' 'revision' 'pe-test' 'cory'), (New-ResolutionLine 15 'issue-31' 'hold' 'merged' 'pl-test' 'pl-test')) -join "`n") + "`n")
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((@((New-ResolutionLine 20 'issue-30' 'escalated' 'revision' 'pe-test' 'cory'), (New-ResolutionLine 15 'issue-31' 'hold' 'merged' 'pl-test' 'pl-test'), (New-ResolutionLine 14 'issue-35' 'escalated' 'ci-wait' 'pl-test' 'cory')) -join "`n") + "`n")
   Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
   $callsBeforeR = @(Get-RotateCalls).Count
   $w6r0 = Run-Watchdog
   $wake6r0 = @($w6r0.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
-  Assert-True ($wake6r0.decision -eq 'none' -and @(Get-RotateCalls).Count -eq $callsBeforeR) "a Principal's resolution and the lead's own must not wake the lead (got $($wake6r0.decision): $(@($wake6r0.evidence) -join ' '))"
-  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((@((New-ResolutionLine 10 'issue-32' 'escalated' 'ci-wait' 'pl-test' 'cory'), (New-ResolutionLine 9 'issue-33' 'hold' 'merged' 'pl-test' 'pr-watch')) -join "`n") + "`n")
+  Assert-True ($wake6r0.decision -eq 'none' -and @(Get-RotateCalls).Count -eq $callsBeforeR) "a Principal's resolution, the lead's own, and one into ci-wait (checks-settled follows) must not wake the lead (got $($wake6r0.decision): $(@($wake6r0.evidence) -join ' '))"
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((@((New-ResolutionLine 10 'issue-32' 'escalated' 'review' 'pl-test' 'cory'), (New-ResolutionLine 9 'issue-33' 'hold' 'merged' 'pl-test' 'pr-watch')) -join "`n") + "`n")
   $w6r = Run-Watchdog
   $wake6r = @($w6r.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
   $wake6rText = (@($wake6r.evidence) -join '; ')
   Assert-True ($wake6r.decision -eq 'woken' -and $wake6rText -match 'outbox resolution x2') "an idle lead must be woken by resolution wakes (got $($wake6r.decision): $wake6rText)"
-  Assert-True ($wake6rText -match 'resolved test:issue-32 escalated -> ci-wait' -and $wake6rText -match 'resolved test:issue-33 hold -> merged') "the wake reason must name each record and both states (got $wake6rText)"
+  Assert-True ($wake6rText -match 'resolved test:issue-32 escalated -> review' -and $wake6rText -match 'resolved test:issue-33 hold -> merged') "the wake reason must name each record and both states (got $wake6rText)"
   Assert-True (@(Get-RotateCalls) -contains "pl-test|$wake6rText") 'the resolution wake must go through rotate.ps1 -Wake carrying that reason'
   $w6rb = Run-Watchdog
   Assert-True (@($w6rb.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0].decision -eq 'none') 'a delivered resolution wake must not wake again'
-  # PAUSE still stops it: a fresh resolution under PAUSE rotates nothing.
-  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((New-ResolutionLine 1 'issue-34' 'escalated' 'implementing' 'pl-test' 'cory') + "`n")
+  # PAUSE still stops it. The line is stamped after any watermark and the wake state is reset, so only PAUSE can be why nothing rotates;
+  # the unpaused control run over the same line then wakes.
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((New-ResolutionLine 0 'issue-34' 'escalated' 'implementing' 'pl-test' 'cory') + "`n")
   Write-Utf8 "$testRoot\state\PAUSE" 'paused for the resolution wake case'
   $callsBeforeP = @(Get-RotateCalls).Count
   [void](Run-Watchdog)
   Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeP) 'PAUSE must stop a resolution wake'
   Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  $w6rc = Run-Watchdog
+  Assert-True (@($w6rc.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0].decision -eq 'woken' -and @(Get-RotateCalls).Count -eq $callsBeforeP + 1) 'without PAUSE the same resolution wakes the lead (control)'
   Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ''
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
@@ -1179,6 +1183,9 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ($tw5r.decision -eq 'woken' -and ((@($tw5r.evidence) -join '; ') -match 'resolved test:issue-41 escalated -> implementing')) "an idle principal must be woken for a resolved escalation it raised (got $($tw5r.decision): $($tw5r.reason); $(@($tw5r.evidence) -join '; '))"
   Assert-True (@(Get-TriageRotateCalls) -contains ('pe-test|' + (@($tw5r.evidence) -join '; '))) 'the Principal wake must carry the resolution as its reason'
   Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pl-test|*' }).Count -eq $leadCallsBeforeT5r) "the Principal's resolution must not wake the lead"
+  $t5rDelivered = @(Get-TriageRotateCalls).Count
+  [void](Run-Watchdog)
+  Assert-True (@(Get-TriageRotateCalls).Count -eq $t5rDelivered) 'a delivered Principal resolution must not wake again (watermark)'
   Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ''
 
   # Case T6: an unreadable frontier wakes nothing and says so (fail closed).
