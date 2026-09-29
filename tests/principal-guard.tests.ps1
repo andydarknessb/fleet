@@ -153,6 +153,28 @@ try {
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 
+  # --- spec fleet #193: the Bounded-authority flags and the triage ledger are not a session's to write (every role) ---
+  Assert-Denied (Run-Guard -Role principal -Tool Write -ToolInput (WriteTo "$testRoot\state\triage\test.jsonl")) 'a Principal Write of the triage ledger' 'bin/triage.js'
+  Assert-Denied (Run-Guard -Role principal -Tool Edit -ToolInput @{ file_path = "$testRoot\state\triage\test.jsonl"; old_string = 'a'; new_string = 'b' }) 'a Principal Edit of the triage ledger'
+  Assert-Denied (Run-Guard -Role ic -Tool Write -ToolInput (WriteTo "$testRoot\state\flags\bounded-authority-test")) 'an IC Write of the tenant flag' 'Cory'
+  Assert-Denied (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$testRoot\state\flags\bounded-authority-suspended-test")) 'a lead Write of the suspension flag'
+  Assert-Denied (Run-Guard -Role dispatcher -Tool NotebookEdit -ToolInput @{ notebook_path = "$testRoot\state\triage\x.ipynb" }) 'a NotebookEdit under state/triage'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'rm state/flags/bounded-authority-test')) 'an IC rm of the tenant flag' 'Cory'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'echo ''{"kind":"suspended"}'' >> state/triage/test.jsonl')) 'an IC echo appended to the ledger' 'bin/triage.js'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cat notes.txt > state/triage/test.jsonl')) 'a read-only command word redirected into the ledger'
+  Assert-Denied (Run-Guard -Role project-lead -Tool PowerShell -ToolInput (Bash "Remove-Item $testRoot\state\flags\bounded-authority-suspended-test")) 'a PowerShell Remove-Item of the suspension flag'
+  Assert-Denied (Run-Guard -Role project-lead -Tool PowerShell -ToolInput (Bash "Set-Content $testRoot\state\triage\test.jsonl 'x'")) 'a PowerShell Set-Content of the ledger'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'node -e "require(''fs'').writeFileSync(''state/flags/bounded-authority-test'','''')"')) 'node -e writing a flag'
+  Assert-Denied (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'touch state/flags/bounded-authority-test') -AgentId 'w9') 'a Principal worker touching the flag'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cat state/flags/bounded-authority-suspended-test')) 'reading the suspension flag'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'ls state/triage/')) 'listing the ledger directory'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'tail -n 5 state/triage/test.jsonl')) 'tailing the ledger'
+  Assert-Allowed (Run-Guard -Role dispatcher -Tool PowerShell -ToolInput (Bash "Get-Content $testRoot\state\triage\test.jsonl")) 'Get-Content of the ledger'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'node C:/Users/Cory/fleet/bin/triage.js bounded-scan --tenant test')) 'the scan door, which names neither the flag nor the ledger path'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'node C:/Users/Cory/fleet/bin/triage.js bounded-ready --tenant test --issue 7')) 'the bounded-ready door'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'New-Item state/flags/notifier-live')) 'another flag is not covered by this rule'
+  Assert-Allowed (Run-Guard -Role principal -Tool Write -ToolInput (WriteTo "$testRoot\state\status\pe-test.md")) 'the Principal''s own status file still writes'
+
   # --- no fleet identity, rollback flag ---
   $env:FLEET_HOME = ''; $env:FLEET_ROLE = ''
   $payload = @{ tool_name = 'Bash'; tool_input = @{ command = 'gh issue comment 1 -b "Approved"' } } | ConvertTo-Json -Compress

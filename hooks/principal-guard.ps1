@@ -5,8 +5,9 @@
 #      - Edit/Write/NotebookEdit/MultiEdit only under: the tenant repo's docs/adr/ and
 #        CONTEXT.md (also inside .claude/worktrees/<x>/ for a docs PR), the fleet's
 #        docs/adr/ and CONTEXT.md, its own status file state/status/pe-<tenant>.md,
-#        state/triage/ (bin/triage.js is the writer; the door's state denials still
-#        apply), the user's ~/.claude (memory, plans) and the temp directory.
+#        the user's ~/.claude (memory, plans) and the temp directory. The triage
+#        ledger is NOT writable here: it is written only through node bin/triage.js,
+#        whose doors check what they record (rule 2b below).
 #      - Bash/PowerShell: no bare test suite (npm test / npx jest / node --test with no
 #        file; test:server:all / :sweep ever), no sync-* script, no gh issue close,
 #        no gh pr merge, no wontfix/duplicate label, no git push to a branch outside
@@ -20,6 +21,16 @@
 #      lock (ADR 0011 amendment). The rule reads the command being invoked, not
 #      prose or heredoc text that quotes one, and a body it cannot inspect (stdin,
 #      --body-file -) is refused on its own terms with the fix named (fleet #70).
+#   2b. every fleet role (spec fleet #193, ruling on the QA of #209 to #211): the
+#      Bounded-authority flags are Cory's to create and remove, and the triage ledger is
+#      written by bin/triage.js, whose checks are the point. Edit/Write/NotebookEdit/
+#      MultiEdit on any path under state/flags/ or state/triage/ is refused, and so is a
+#      Bash/PowerShell segment that names a bounded-authority- flag or a state/triage/
+#      path unless its command word is read-only (cat, ls, dir, type, head, tail,
+#      Get-Content, Get-ChildItem, Test-Path, Get-Item, node), or that redirects into
+#      one, or that runs node -e/-p. Over-refusal is accepted; the refusal names the
+#      cause. node bin/triage.js bounded-scan (and the daily summary) never name the flag
+#      or the ledger path in their command line, so the scan's own write is unaffected.
 #
 # Rollback: state/flags/principal-guard-off. Output contract: a deny is JSON on stdout
 # with permissionDecision "deny"; anything else is silence + exit 0. Never exit nonzero.
@@ -107,6 +118,30 @@ if ($tool -in @('Bash', 'PowerShell')) {
   }
 }
 
+# --- rule 2b: the Bounded-authority flags and the triage ledger (every fleet role) ---
+$flagsCause = "the Bounded-authority flags (state/flags/bounded-authority-*) are Cory's to create and remove, and the triage ledger (state/triage/) is written by node bin/triage.js, whose doors check what they record; say what you found in your status file instead $cite"
+if (-not $reason -and $tool -in @('Edit', 'Write', 'NotebookEdit', 'MultiEdit')) {
+  $t2 = "$($inp.tool_input.file_path)"; if (-not $t2) { $t2 = "$($inp.tool_input.notebook_path)" }
+  $t2N = Normalize-Path $t2 "$($inp.cwd)"
+  $homeN2 = Normalize-Path $home_ ''
+  if ($t2N -match "^$(Escape-Rx $homeN2)/state/(flags|triage)/") { $reason = $flagsCause }
+}
+if (-not $reason -and $tool -in @('Bash', 'PowerShell')) {
+  $cmd2 = "$($inp.tool_input.command)"
+  # Heredoc bodies are dropped (text a ticket quotes is not a command); quotes are NOT masked,
+  # since the paths this rule looks for are usually quoted.
+  $stripped2 = [regex]::Replace($cmd2, '<<-?\s*(["'']?)(\w+)\1[^\r\n]*\r?\n[\s\S]*?\r?\n[ \t]*\2[ \t]*(?=\r?\n|$)', '#heredoc-stripped')
+  $stateRx = 'bounded-authority-|state[\\/]triage[\\/]'
+  $readOnlyWords = @('cat', 'ls', 'dir', 'type', 'head', 'tail', 'Get-Content', 'Get-ChildItem', 'Test-Path', 'Get-Item', 'node')
+  foreach ($seg in [regex]::Split($stripped2, '\r?\n|;|&&|\|\||\||&|\(|\)')) {
+    if ($seg -notmatch $stateRx) { continue }
+    $word = ''
+    if ($seg -match '^\s*(?:\w+=\S*\s+)*(?<w>\S+)') { $word = "$($Matches['w'])" -replace '^["'']|["'']$', ''; $word = ([IO.Path]::GetFileName(($word -replace '\\', '/'))) -replace '\.exe$', '' }
+    $writes = ($seg -match ('>\s*["'']?\S*(' + $stateRx + ')')) -or (($word -eq 'node') -and ($seg -match '\s(-e|--eval|-p|--print)\b'))
+    if ($writes -or ($readOnlyWords -notcontains $word)) { $reason = $flagsCause; break }
+  }
+}
+
 # --- rule set 1: the Principal's write and action boundary ---
 if (-not $reason -and $role -eq 'principal') {
   $repo = ''
@@ -126,7 +161,6 @@ if (-not $reason -and $role -eq 'principal') {
   $insideRules += "^$(Escape-Rx $homeN)/docs/adr/[^/]+\.md$"
   $insideRules += "^$(Escape-Rx $homeN)/context\.md$"
   if ($tenant) { $insideRules += "^$(Escape-Rx $homeN)/state/status/pe-$(Escape-Rx $tenant.ToLowerInvariant())\.md$" }
-  $insideRules += "^$(Escape-Rx $homeN)/state/triage/"
   $outsideRules = @()
   if ($profileN) { $outsideRules += "^$(Escape-Rx $profileN)/\.claude/" }
   if ($tempN) { $outsideRules += "^$(Escape-Rx $tempN)/" }
@@ -141,7 +175,7 @@ if (-not $reason -and $role -eq 'principal') {
     $allowed = if ($inside) { $insideRules } else { $outsideRules }
     foreach ($rx in $allowed) { if ($ok) { break }; if ($targetN -match $rx) { $ok = $true; break } }
     if (-not $ok) {
-      $reason = "the Principal writes only ADR and glossary proposals (docs/adr/*.md, CONTEXT.md in the tenant repo or the fleet), its own status file (state/status/pe-<tenant>.md), the triage ledger through bin/triage.js, and its own memory; '$target' is none of those. Product code is an IC's: put the change in the proposal's Scope and Red-tell for the IC $cite"
+      $reason = "the Principal writes only ADR and glossary proposals (docs/adr/*.md, CONTEXT.md in the tenant repo or the fleet), its own status file (state/status/pe-<tenant>.md) and its own memory (the triage ledger is written through bin/triage.js only); '$target' is none of those. Product code is an IC's: put the change in the proposal's Scope and Red-tell for the IC $cite"
     }
   } elseif ($tool -in @('Bash', 'PowerShell')) {
     $cmd = "$($inp.tool_input.command)"
