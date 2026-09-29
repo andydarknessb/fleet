@@ -128,6 +128,20 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True (@($r2c.outcomes | Where-Object { $_.status -eq 'deferred' }).Count -eq 1) '-Force still defers on a pending prompt, same standing as busy'
   Remove-Item "$testRoot\profile\.claude\jobs\job-old" -Recurse -Force
 
+  # Case 2d (2026-09-28): `needs` is also the session's own free text. pe-nidus wrote
+  # "approve decisions on #4, ..." and pl-nidus "Approve PR #26 amendment ...", both
+  # asking Cory for GitHub approvals he had already given; `^approve ` (case-blind)
+  # read each as a permission prompt and deferred every triage wake for hours. A real
+  # prompt is the CLI's "approve <Tool>: <input>"; anything else is not a prompt.
+  foreach ($askText in @('approve decisions on #4, #21, #23, #24, #25 to proceed with rulings', 'Approve PR #26 amendment (issuecomment-5875947580) and ticket #4 proposal; triage #23, #24, #25')) {
+    Set-LiveRoster $old; Set-AgentsRows $idleRow; Reset-Markers
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-old") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-old\state.json" (ConvertTo-Json @{ needs = $askText; updatedAt = '2026-09-06T12:00:00.000Z' } -Compress)
+    $r2d = Run-Rotate @('-Auto')
+    Assert-True (@($r2d.rotated).Count -eq 1) "a human ask in needs is not a permission prompt and must not defer: '$askText' (deferred: $($r2d.deferred))"
+    Remove-Item "$testRoot\profile\.claude\jobs\job-old" -Recurse -Force
+  }
+
   # Case 3: mid-turn session -> deferred, no intent, no stop.
   Set-LiveRoster $old; Set-AgentsRows $busyRow; Reset-Markers
   $r3 = Run-Rotate @('-Auto')

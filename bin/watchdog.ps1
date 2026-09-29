@@ -519,7 +519,7 @@ try {
   $permissionWaits = @()
   foreach ($row in @($daemon | Where-Object { "$($_.name)" -match $fleetPattern -and "$($_.state)" -notin @('stopped','failed','done') })) {
     $js = $null; try { $js = Get-JobState $row.id } catch {}
-    if (-not $js -or -not $js.PSObject.Properties['needs'] -or "$($js.needs)" -notmatch '^approve ') { continue }
+    if (-not $js -or -not $js.PSObject.Properties['needs'] -or -not (Test-PermissionPromptNeeds "$($js.needs)")) { continue }
     $since = $null; if ($js.PSObject.Properties['updatedAt']) { $since = ConvertTo-UtcDateTime $js.updatedAt }
     if (-not $since) { continue }
     $waitMin = [Math]::Floor((New-TimeSpan -Start $since -End $now).TotalMinutes)
@@ -750,8 +750,8 @@ try {
       # rule) never actually fired - 51 of 52 real job states, including a
       # working dispatcher, carry no `needs` key at all. Heal when the job state
       # read cleanly AND `needs` is absent or whitespace-only. Any non-empty
-      # `needs` is a session asking a human: `^approve ` alone is a permission
-      # prompt (paged already, below, at high priority - never doubled here);
+      # `needs` is a session asking a human: the CLI's "approve <Tool>: " alone is a
+      # permission prompt (Test-PermissionPromptNeeds; paged already, above, at high priority - never doubled here);
       # anything else is a plain ask (a question, "reply ...", an
       # AskUserQuestion) and raises its own `human-wait` page instead of
       # healing. An unreadable job state or no daemon row to read it from is
@@ -768,7 +768,7 @@ try {
       }
       if (-not $healNeedsOk) {
         $healed += [pscustomobject]@{ name = $healName; role = "$($e.role)"; tenant = "$($e.tenant)"; action = 'none'; ok = $false; proposed = ($mode -ne 'live'); reason = "not healed: $healNeedsReason" }
-        if ($healNeedsValue -and $healNeedsValue -notmatch '^approve ') {
+        if ($healNeedsValue -and -not (Test-PermissionPromptNeeds $healNeedsValue)) {
           $humanWaits += [pscustomobject]@{ name = $healName; needs = (Get-OneLine $healNeedsValue 200) }
         }
         continue

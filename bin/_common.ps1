@@ -190,6 +190,12 @@ function Get-DaemonSessions {
   return @($obj)
 }
 function Get-JobState { param($Id) Read-Json "$env:USERPROFILE\.claude\jobs\$Id\state.json" }
+# A job state's `needs` is a pending permission prompt only in the CLI's own form,
+# "approve <Tool>: <input>" (live: "approve Bash: node --test ..."). `needs` is also
+# where a session writes its own ask of a human, and on 2026-09-28 "approve decisions
+# on #4, ..." (pe-nidus) and "Approve PR #26 amendment ..." (pl-nidus) read as
+# prompts under a case-blind `^approve `, deferring every wake for hours.
+function Test-PermissionPromptNeeds { param([string]$Needs) return ("$Needs" -cmatch '^approve [A-Za-z][\w-]*(\([^)]*\))?: ') }
 # The --model and --effort a launch passes today, in one place (fleet #121): launch.ps1
 # builds its command from these, and sentinel-check.ps1 compares a daemon job's frozen
 # respawnFlags against them before `claude respawn` replays that job. 'opus' pins Opus

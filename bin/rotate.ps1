@@ -67,7 +67,7 @@ function Test-SafeBoundary {
   # _common.ps1, the same reader watchdog.ps1 and sentinel-check.ps1 use.
   if ($row) {
     $js = $null; try { $js = Get-JobState $row.id } catch {}
-    if ($js -and $js.PSObject.Properties['needs'] -and "$($js.needs)" -match '^approve ') {
+    if ($js -and $js.PSObject.Properties['needs'] -and (Test-PermissionPromptNeeds "$($js.needs)")) {
       return [pscustomobject]@{ safe = $false; reason = "session has a pending permission prompt ($($js.needs))" }
     }
   }
