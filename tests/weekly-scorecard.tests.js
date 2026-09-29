@@ -98,14 +98,14 @@ function build(root = fixtureWeek(), stub = ghStub()) {
   return buildScorecard({ root, now: NOW, gh: stub.gh, collect: () => collectorReport() });
 }
 
-test('#131: a fixture week produces all eight rows in markdown and JSON', () => {
+test('#131: a fixture week produces every row in markdown and JSON', () => {
   const root = fixtureWeek();
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
   assert.equal(card.week.label, '2026-09-21..2026-09-27');
   const json = JSON.parse(fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.json'), 'utf8'));
-  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'icCost']);
+  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'icCost']);
   const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
-  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'IC cost']) {
+  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'IC cost']) {
     assert.match(md, new RegExp(`^\\| ${area.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|`, 'm'), area);
   }
 });
@@ -261,4 +261,146 @@ test('#155: a tenant whose owner and fleet share a login counts its merges as sh
     fs.writeFileSync(path.join(dir, file), `${lines.map((line) => JSON.stringify(line)).join('\n')}\n`);
   }
   assert.equal(build(root).mergesBy.shared, 4);
+});
+
+// #214 (spec #195): the "Waiting on Cory" and "IC idle share" rows. Both are reported, not
+// judged: no threshold has been ruled for either, so their status stays n/a.
+const page = (at, name, body, extra = {}) => JSON.stringify({ at, kind: 'human-wait', title: 'Fleet watchdog', body, priority: 'normal', toast: true, pushover: 'unconfigured', pushoverError: null, attempts: 0, detail: { key: `human-wait:${name}` }, ...extra });
+const otherPage = (at) => JSON.stringify({ at, kind: 'dated', title: 'Fleet watchdog', body: 'x', priority: 'normal', pushover: 'unconfigured', attempts: 0, detail: { key: 'dated:x' } });
+const shadowTick = (at, conditions) => JSON.stringify({ at, mode: 'live', conditions });
+const ticks = (from, count, stepMinutes = 15) => Array.from({ length: count }, (_, i) => new Date(Date.parse(from) + i * stepMinutes * 60000).toISOString());
+
+function waitFixture() {
+  const root = fixtureWeek();
+  fs.mkdirSync(path.join(root, 'state', 'pages'), { recursive: true });
+  const rows = [otherPage('2026-09-20T00:00:00Z')];
+  // pl-endzone: one ask for 3 ticks (45 min), then a gap of over 35 minutes and a new ask for 2 ticks (30 min).
+  for (const at of ticks('2026-09-22T10:00:00Z', 3)) rows.push(page(at, 'pl-endzone', 'merge PR #1690 and #1691'));
+  for (const at of ticks('2026-09-22T14:00:00Z', 2)) rows.push(page(at, 'pl-endzone', 'squash-merge #1695'));
+  // The dispatcher relays asks upward: its rows are never counted, whether or not a lead asks the same.
+  for (const at of ticks('2026-09-22T10:15:00Z', 2)) rows.push(page(at, 'dispatcher', 'run `gh pr merge 1690` and 1691, then release'));
+  rows.push(page('2026-09-23T08:00:00Z', 'dispatcher', 'release integration to main'));
+  rows.push(page('2026-09-22T14:15:00Z', 'dispatcher', 'release integration to main'));
+  // A Principal's ask inside the lead's 14:00-14:30 wait: the session-hours add, the hours someone waits do not.
+  rows.push(page('2026-09-22T14:15:00Z', 'pe-endzone', 'approve #1695'));
+  // An IC's wait is never counted.
+  for (const at of ticks('2026-09-22T10:00:00Z', 4)) rows.push(page(at, 'ic-3', 'project lead to review'));
+  // A wait that opened before the week: only the part inside the week counts, and it is not an episode of this week.
+  for (const at of ticks('2026-09-20T23:45:00Z', 3)) rows.push(page(at, 'pl-nidus', 'merge PR #16'));
+  // After the week: never counted.
+  rows.push(page('2026-09-28T00:00:00Z', 'pl-endzone', 'later'));
+  // pe-nidus: one delivered page (a delivered page is never written again); the standing wait shows in the watchdog ticks.
+  rows.push(page('2026-09-24T12:00:00Z', 'pe-nidus', 'Approved on #17', { pushover: true, attempts: 1 }));
+  fs.writeFileSync(path.join(root, 'state', 'pages', 'pages.jsonl'), `${rows.join('\n')}\n`);
+  const shadowFile = path.join(root, 'state', 'sentinel', 'shadow', '20260924.jsonl');
+  fs.writeFileSync(shadowFile, `${ticks('2026-09-24T12:00:00Z', 4).map((at) => shadowTick(at, ['human-wait:pe-nidus'])).join('\n')}\n${shadowTick('2026-09-24T13:00:00Z', [])}\n`);
+  return root;
+}
+
+test('#214: Waiting on Cory counts project lead and Principal session-hours and episodes, without the dispatcher or ICs', () => {
+  const row = build(waitFixture()).rows.find((r) => r.key === 'waitingOnCory');
+  assert.equal(row.area, 'Waiting on Cory');
+  // pl-endzone 45 + 30 min, pe-endzone 15 min, pe-nidus 60 min (four watchdog ticks), pl-nidus 30 min inside the week.
+  assert.equal(row.figures.sessionHours, 3);
+  assert.equal(row.figures.episodes, 4, 'the pl-nidus wait opened before the week and is not an episode of it');
+  assert.deepEqual(row.figures.bySession, {
+    'pe-endzone': { role: 'principal', hours: 0.3, episodes: 1 },
+    'pe-nidus': { role: 'principal', hours: 1, episodes: 1 },
+    'pl-endzone': { role: 'project-lead', hours: 1.3, episodes: 2 },
+    'pl-nidus': { role: 'project-lead', hours: 0.5, episodes: 0 },
+  });
+  assert.deepEqual(row.figures.dispatcherRepeats, { episodes: 3, hours: 1 }, 'the dispatcher: 30 + 15 + 15 min, reported and left out');
+  assert.equal(row.status, 'n/a');
+  assert.match(row.result, /3 session-hours in 4 episodes/);
+  assert.match(row.result, /excluding the dispatcher's 3 episodes \(1 h\)/);
+});
+
+test('#214: Waiting on Cory reports the hours at least one project lead or Principal was waiting, counted once', () => {
+  const row = build(waitFixture()).rows.find((r) => r.key === 'waitingOnCory');
+  // 3 session-hours, 2.75 hours with someone waiting: pe-endzone's 14:15 ask sits inside pl-endzone's wait.
+  assert.equal(row.figures.anyWaitingHours, 2.8);
+  assert.equal(row.figures.weekHours, 168);
+  assert.equal(row.figures.anyWaitingShare, 0.016);
+});
+
+test('#214: Waiting on Cory is unknown when the page log is missing or does not reach the week', () => {
+  const root = waitFixture();
+  fs.writeFileSync(path.join(root, 'state', 'pages', 'pages.jsonl'), `${page('2026-09-30T00:00:00Z', 'pl-endzone', 'later')}\n`);
+  const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
+  assert.equal(row.status, 'unknown');
+  assert.match(row.result, /page log starts 2026-09-30/);
+  fs.rmSync(path.join(root, 'state', 'pages'), { recursive: true });
+  assert.equal(build(root).rows.find((r) => r.key === 'waitingOnCory').status, 'unknown');
+});
+
+test('#214: a week the page log only partly covers says so', () => {
+  const root = waitFixture();
+  const file = path.join(root, 'state', 'pages', 'pages.jsonl');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').split('\n').filter((line) => !line.includes('"dated:x"') && !line.includes('pl-nidus')).join('\n'));
+  const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
+  assert.match(row.result, /page log starts 2026-09-22T10:00/);
+});
+
+function icFixture() {
+  const root = fixtureWeek();
+  fs.writeFileSync(path.join(root, 'tenants', 'nidus.json'), JSON.stringify({ name: 'nidus', maxIcs: 2 }));
+  const ic = (name, tenant, launchedAt, retiredAt) => ({ name, role: 'ic', tenant, status: retiredAt ? 'retired' : 'active', launchedAt, ...(retiredAt ? { retiredAt } : {}) });
+  const rosterRows = [
+    ic('ic-1', 'endzone', '2026-09-20T22:00:00Z', '2026-09-21T02:00:00Z'), // launched the week before: 2 h are in the week
+    ic('ic-3', 'endzone', '2026-09-21T01:30:00Z', '2026-09-21T04:00:00Z'), // also archived: counted once
+    ic('ic-4', 'endzone', '2026-09-27T20:00:00Z', null), // still running at the week's end: 4 h
+    ic('ic-9', 'endzone', '2026-09-28T01:00:00Z', null), // launched after the week
+    { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', status: 'active', launchedAt: '2026-09-20T00:00:00Z' },
+  ];
+  fs.writeFileSync(path.join(root, 'state', 'roster.json'), JSON.stringify({ sessions: rosterRows }));
+  fs.mkdirSync(path.join(root, 'state', 'archive'), { recursive: true });
+  const archived = [
+    ic('ic-2', 'endzone', '2026-09-21T01:00:00Z', '2026-09-21T03:00:00Z'),
+    ic('ic-3', 'endzone', '2026-09-21T01:30:00Z', '2026-09-21T04:00:00Z'),
+    ic('ic-5', 'nidus', '2026-09-22T00:00:00Z', '2026-09-22T12:00:00Z'),
+    ic('ic-0', 'endzone', '2026-09-01T00:00:00Z', '2026-09-01T05:00:00Z'), // long before the week
+    { name: 'dispatcher', role: 'dispatcher', tenant: null, status: 'retired', launchedAt: '2026-09-21T00:00:00Z', retiredAt: '2026-09-27T00:00:00Z' },
+  ];
+  fs.writeFileSync(path.join(root, 'state', 'archive', 'roster-retired-full.jsonl'), `${archived.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  return root;
+}
+
+test('#214: IC idle share is the share of the week with no IC running, fleet-wide and per tenant, clipped to the week', () => {
+  const row = build(icFixture()).rows.find((r) => r.key === 'icIdleShare');
+  assert.equal(row.area, 'IC idle share');
+  // ICs run 09-21 00:00-04:00 (ic-1 clipped at the week start), 09-22 00:00-12:00 (nidus) and 09-27 20:00-24:00 (ic-4, open at the week's end): 20 of 168 h.
+  assert.equal(row.figures.weekHours, 168);
+  assert.equal(row.figures.noIcHours, 148);
+  assert.equal(row.figures.noIcShare, 0.881);
+  assert.deepEqual(row.figures.byTenant, { endzone: { noIcHours: 160, noIcShare: 0.952 }, nidus: { noIcHours: 156, noIcShare: 0.929 } });
+  assert.equal(row.status, 'n/a');
+});
+
+test('#214: IC idle share also reports the share of the week at the IC cap', () => {
+  const row = build(icFixture()).rows.find((r) => r.key === 'icIdleShare');
+  // ic-1, ic-2 and ic-3 overlap 01:30-02:00 on 09-21: three at once for half an hour.
+  assert.equal(row.figures.icCap, 3);
+  assert.equal(row.figures.atCapHours, 0.5);
+  assert.equal(row.figures.atCapShare, 0.003);
+  assert.match(row.result, /no IC running 88\.1% of the week/);
+  assert.match(row.result, /at the cap of 3 for 0\.3%/);
+  assert.match(row.result, /endzone 95\.2%, nidus 92\.9%/);
+});
+
+test('#214: IC idle share is unknown with no roster at all, and reads 100% for a week the roster covers with no IC', () => {
+  const root = fixtureWeek();
+  assert.equal(build(root).rows.find((r) => r.key === 'icIdleShare').status, 'unknown');
+  fs.writeFileSync(path.join(root, 'state', 'roster.json'), JSON.stringify({ sessions: [{ name: 'dispatcher', role: 'dispatcher', status: 'active', launchedAt: '2026-09-01T00:00:00Z' }] }));
+  const row = build(root).rows.find((r) => r.key === 'icIdleShare');
+  assert.equal(row.figures.noIcShare, 1);
+  assert.equal(row.figures.atCapShare, 0);
+});
+
+test('#214: an ask that changes inside a tick is two episodes that never overlap', () => {
+  const root = fixtureWeek();
+  fs.mkdirSync(path.join(root, 'state', 'pages'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'pages', 'pages.jsonl'), `${[otherPage('2026-09-20T00:00:00Z'), page('2026-09-22T12:00:05Z', 'pe-endzone', 'rule on #1'), page('2026-09-22T12:30:05Z', 'pe-endzone', 'rule on #2')].join('\n')}\n`);
+  fs.writeFileSync(path.join(root, 'state', 'sentinel', 'shadow', '20260922.jsonl'), `${ticks('2026-09-22T12:00:00Z', 4).map((at) => shadowTick(at, ['human-wait:pe-endzone'])).join('\n')}\n`);
+  const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
+  assert.deepEqual(row.figures.bySession, { 'pe-endzone': { role: 'principal', hours: 1, episodes: 2 } });
 });

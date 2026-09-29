@@ -1,6 +1,6 @@
 'use strict';
 // #131 (spec #91): the weekly scorecard. Each Monday (bin/install-weekly-scorecard-task.ps1
-// via bin/run-weekly-scorecard.ps1) it writes the audit's eight rows for the previous
+// via bin/run-weekly-scorecard.ps1) it writes the audit's rows for the previous
 // Monday-to-Sunday UTC week (bin/report-week.js) to state/metrics/scorecard-<monday>.md
 // and .json. Sources, each bounded:
 //   - the event ledger: throughput, cycle time (reserve to merge), the issue-to-merge tail
@@ -15,6 +15,11 @@
 //     which is a true reading. A GitHub failure makes the row `unknown`, never a zero;
 //   - the watchdog shadow log (state/sentinel/shadow/*.jsonl): `fleet-dead` ticks over
 //     total ticks;
+//   - #214: the page log's human-wait rows (state/pages/pages.jsonl) with the same watchdog
+//     ticks, for "Waiting on Cory" (project lead and Principal session-hours and episodes,
+//     the dispatcher's relays left out); the roster and its retired-row archive for "IC idle
+//     share" (no IC running, fleet-wide and per tenant, and at the IC cap). Both are reported,
+//     not judged, until a threshold is ruled: their status is n/a;
 //   - the cycle collector (bin/measure-cycle.js run for exactly this week): whole-life IC
 //     job tokens per model family and the risk reviewer, printed beside bin/budget.js's
 //     warnings and escalations for the week as a separate measure (#127).
@@ -44,6 +49,9 @@ const HOUR_MS = 60 * 60 * 1000;
 const DEFAULTS = Object.freeze({
   cycleTimeMedianHours: { watch: 2, weak: 6 },
   tailHours: 12,
+  waitTickMinutes: 15,
+  waitGapMinutes: 35,
+  icCap: 3,
   sentBackRate: { watch: 0.3, weak: 0.45 },
   escapedRate: { weak: 0.05 },
   fleetDeadRate: { watch: 0.02, weak: 0.1 },
@@ -57,6 +65,8 @@ const ROWS = [
   ['reviewGate', 'Review gate'],
   ['escapedDefects', 'Escaped defects'],
   ['availability', 'Availability'],
+  ['waitingOnCory', 'Waiting on Cory'],
+  ['icIdleShare', 'IC idle share'],
   ['icCost', 'IC cost'],
 ];
 const SEVERITY = { weak: 4, unknown: 3, watch: 2, good: 1, 'n/a': 0 };
@@ -307,6 +317,202 @@ function availabilityRow(base, week, settings) {
   };
 }
 
+// #214 (spec #195): how long the fleet waits on Cory. The source is the page log's
+// human-wait rows (state/pages/pages.jsonl), which the Watchdog writes once per tick
+// while a session's `needs` stands and Pushover is unconfigured or failing, and ONCE
+// when a page is delivered (a delivered page is deduped, so the row stops repeating and
+// the page log alone would read a delivered wait as one tick). So a wait's extent also
+// reads the Watchdog's own ticks (state/sentinel/shadow/*.jsonl), which list every
+// standing `human-wait:<session>` condition on every tick. An episode is a run of
+// ticks of one session with the same ask (a page row with another body opens a new one)
+// and no gap over waitGapMinutes; it runs from its first tick to its last tick plus one
+// tick, clipped to the week. A shadow-only tick inherits the ask of the page row before it.
+// The dispatcher relays the project leads' asks upward in its own words, so its rows repeat
+// theirs (audit F2). They are counted apart, in dispatcherRepeats, and left out of the row:
+// on the audit's window (2026-09-23T21:17Z to 09-29) leaving them out reads 57% of the time
+// with a project lead or Principal waiting, and counting them reads 71%, the audit's two
+// figures. Only project leads and Principals are counted.
+const WAITING_ROLES = ['project-lead', 'principal'];
+
+function readJsonl(file) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch { return null; }
+  const rows = [];
+  for (const line of text.replace(/^﻿/, '').split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try { rows.push(JSON.parse(line)); } catch { /* a torn line is skipped */ }
+  }
+  return rows;
+}
+
+function roleOfSession(name, rosterRoles) {
+  if (rosterRoles.has(name)) return rosterRoles.get(name);
+  if (name === 'dispatcher') return 'dispatcher';
+  if (name.startsWith('pl-')) return 'project-lead';
+  if (name.startsWith('pe-')) return 'principal';
+  if (name.startsWith('ic-')) return 'ic';
+  return null;
+}
+
+function waitEpisodes(observations, { tickMs, gapMs }) {
+  const episodes = [];
+  for (const [name, list] of observations) {
+    list.sort((a, b) => a.ms - b.ms);
+    let current = null;
+    for (const seen of list) {
+      const body = seen.body === null ? null : String(seen.body).trim();
+      const continues = current && seen.ms - current.last <= gapMs && (body === null || current.body === null || body === current.body);
+      if (!continues) { current = { name, start: seen.ms, last: seen.ms, body }; episodes.push(current); continue; }
+      current.last = Math.max(current.last, seen.ms);
+      if (current.body === null) current.body = body;
+    }
+  }
+  // An episode ends one tick after its last tick, or where the same session's next one starts
+  // (a new ask can open inside the last tick's span), so one session never overlaps itself.
+  return episodes.map((episode, index) => {
+    const next = episodes[index + 1];
+    const end = episode.last + tickMs;
+    return { name: episode.name, start: episode.start, end: next && next.name === episode.name ? Math.min(end, next.start) : end, body: episode.body || '' };
+  });
+}
+
+function unionMs(intervals) {
+  let total = 0;
+  let end = -Infinity;
+  for (const [from, to] of intervals.slice().sort((a, b) => a[0] - b[0])) {
+    if (to <= end) continue;
+    total += to - Math.max(from, end);
+    end = to;
+  }
+  return total;
+}
+
+function waitingOnCoryRow(base, week, settings) {
+  const pageRows = readJsonl(path.join(base, 'state', 'pages', 'pages.jsonl'));
+  const starts = (pageRows || []).map((row) => Date.parse(row?.at || '')).filter(Number.isFinite);
+  if (!starts.length) return { figures: { logStart: null }, result: 'no page log (state/pages/pages.jsonl) to read waits from', status: 'unknown' };
+  const logStart = Math.min(...starts);
+  const logStartText = (pageRows.find((row) => Date.parse(row?.at || '') === logStart) || {}).at;
+  if (logStart >= Date.parse(week.end)) return { figures: { logStart: logStartText }, result: `page log starts ${String(logStartText).slice(0, 16)}, after the week`, status: 'unknown' };
+  const observations = new Map();
+  const observe = (name, ms, body) => { if (!observations.has(name)) observations.set(name, []); observations.get(name).push({ ms, body }); };
+  for (const row of pageRows) {
+    const key = String(row?.detail?.key || '');
+    if (row?.kind === 'human-wait' && key.startsWith('human-wait:') && Number.isFinite(Date.parse(row.at))) observe(key.slice('human-wait:'.length), Date.parse(row.at), row.body ?? '');
+  }
+  const shadowDir = path.join(base, 'state', 'sentinel', 'shadow');
+  for (const name of fs.existsSync(shadowDir) ? fs.readdirSync(shadowDir).filter((entry) => entry.endsWith('.jsonl')).sort() : []) {
+    for (const tick of readJsonl(path.join(shadowDir, name)) || []) {
+      const ms = Date.parse(tick?.at || '');
+      if (!Number.isFinite(ms) || !Array.isArray(tick.conditions)) continue;
+      for (const condition of tick.conditions) if (String(condition).startsWith('human-wait:')) observe(String(condition).slice('human-wait:'.length), ms, null);
+    }
+  }
+  const rosterRoles = new Map();
+  for (const row of readJson(path.join(base, 'state', 'roster.json'), { sessions: [] }).sessions || []) if (row?.name && row.role) rosterRoles.set(row.name, String(row.role));
+  const tickMs = settings.waitTickMinutes * 60000;
+  const episodes = waitEpisodes(observations, { tickMs, gapMs: settings.waitGapMinutes * 60000 })
+    .map((episode) => ({ ...episode, role: roleOfSession(episode.name, rosterRoles) }));
+  const weekStart = Date.parse(week.start);
+  const weekEnd = Date.parse(week.end);
+  const clipped = (episode) => Math.max(0, Math.min(episode.end, weekEnd) - Math.max(episode.start, weekStart));
+  const counted = [];
+  const repeats = { episodes: 0, ms: 0 };
+  for (const episode of episodes.filter((entry) => clipped(entry) > 0)) {
+    if (episode.role === 'dispatcher') {
+      if (episode.start >= weekStart) repeats.episodes += 1;
+      repeats.ms += clipped(episode);
+    } else if (WAITING_ROLES.includes(episode.role)) counted.push(episode);
+  }
+  const bySession = {};
+  for (const episode of counted) {
+    const entry = bySession[episode.name] || (bySession[episode.name] = { role: episode.role, ms: 0, episodes: 0 });
+    entry.ms += clipped(episode);
+    if (episode.start >= weekStart) entry.episodes += 1;
+  }
+  const sessionMs = counted.reduce((sum, episode) => sum + clipped(episode), 0);
+  const anyMs = unionMs(counted.map((episode) => [Math.max(episode.start, weekStart), Math.min(episode.end, weekEnd)]));
+  const weekHours = (weekEnd - weekStart) / HOUR_MS;
+  const total = Object.values(bySession).reduce((sum, entry) => sum + entry.episodes, 0);
+  const share = Math.round((anyMs / HOUR_MS / weekHours) * 1000) / 1000;
+  const partial = logStart > weekStart ? `; page log starts ${String(logStartText).slice(0, 16)}, the hours before it are unrecorded` : '';
+  return {
+    figures: {
+      sessionHours: hours(sessionMs),
+      episodes: total,
+      bySession: Object.fromEntries(Object.entries(bySession).sort(([a], [b]) => a.localeCompare(b)).map(([name, entry]) => [name, { role: entry.role, hours: hours(entry.ms), episodes: entry.episodes }])),
+      dispatcherRepeats: { episodes: repeats.episodes, hours: hours(repeats.ms) },
+      anyWaitingHours: hours(anyMs),
+      anyWaitingShare: share,
+      weekHours,
+      logStart: logStartText,
+    },
+    result: `at least one project lead or Principal waiting ${hours(anyMs)} of ${weekHours} h (${pct(share)}); ${hours(sessionMs)} session-hours in ${plural(total, 'episode')}, excluding the dispatcher's ${plural(repeats.episodes, 'episode')} (${hours(repeats.ms)} h)${partial}`,
+    status: 'n/a',
+  };
+}
+
+// #214 (spec #195): how often ICs sit idle, from the roster and its retired-row archive
+// (the sessions a rotation or retirement replaced), the same merge the cycle collector
+// makes (measure-cycle.js mergeSessionRows: a session in both counts once, as its live
+// row). An IC runs from launchedAt to retiredAt, and to the week's end while its row is
+// still live. Everything is clipped to THIS week's window and measured against the whole
+// week (168 h), not against the span the archive happens to cover: the archive reaches
+// back to the first launch, so an unclipped run or a whole-history denominator reads a
+// week that opened with ICs already running, or one the archive barely covers, wrong.
+// The cap is `scorecard.icCap`: the global six-session cap less the dispatcher and the two
+// project leads, Principals being cap-exempt (config/cycle.json cap.exemptNamePrefixes).
+function icIdleRow(base, week, settings) {
+  const { loadRetiredRows, mergeSessionRows } = require('./measure-cycle');
+  const roster = readJson(path.join(base, 'state', 'roster.json'), null);
+  const retired = loadRetiredRows(path.join(base, 'state', 'archive', 'roster-retired-full.jsonl'));
+  if (!roster && retired.missing) return { figures: { sources: 0 }, result: 'no roster or roster archive to read IC runs from', status: 'unknown' };
+  const liveRows = Array.isArray(roster) ? roster : (roster?.sessions || []);
+  const weekStart = Date.parse(week.start);
+  const weekEnd = Date.parse(week.end);
+  const runs = [];
+  for (const row of mergeSessionRows(liveRows, retired.rows)) {
+    if (String(row.role || '').toLowerCase() !== 'ic') continue;
+    const from = Date.parse(row.launchedAt || row.startedAt || '');
+    const ended = Date.parse(row.retiredAt || '');
+    const to = Number.isFinite(ended) ? ended : (String(row.status || '').toLowerCase() === 'retired' ? NaN : weekEnd);
+    if (!Number.isFinite(from) || !Number.isFinite(to)) continue;
+    const clippedFrom = Math.max(from, weekStart);
+    const clippedTo = Math.min(to, weekEnd);
+    if (clippedTo > clippedFrom) runs.push({ tenant: row.tenant || null, from: clippedFrom, to: clippedTo });
+  }
+  const tenants = [...new Set([...Object.keys(workState.readTenantConfigs(base)), ...runs.map((run) => run.tenant).filter(Boolean)])].sort();
+  // Sweep the run edges: the time in the week with at least `atLeast` ICs running.
+  const sweep = (list, atLeast) => {
+    const edges = list.flatMap((run) => [[run.from, 1], [run.to, -1]]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    let running = 0;
+    let cursor = weekStart;
+    let ms = 0;
+    for (const [at, delta] of edges) {
+      if (running >= atLeast) ms += at - cursor;
+      cursor = at;
+      running += delta;
+    }
+    if (running >= atLeast) ms += weekEnd - cursor;
+    return ms;
+  };
+  const weekMs = weekEnd - weekStart;
+  const weekHours = weekMs / HOUR_MS;
+  const share = (ms) => Math.round((ms / weekMs) * 1000) / 1000;
+  const idleMs = weekMs - sweep(runs, 1);
+  const atCapMs = sweep(runs, settings.icCap);
+  const byTenant = {};
+  for (const tenant of tenants) {
+    const tenantIdle = weekMs - sweep(runs.filter((run) => run.tenant === tenant), 1);
+    byTenant[tenant] = { noIcHours: hours(tenantIdle), noIcShare: share(tenantIdle) };
+  }
+  return {
+    figures: { weekHours, noIcHours: hours(idleMs), noIcShare: share(idleMs), byTenant, icCap: settings.icCap, atCapHours: hours(atCapMs), atCapShare: share(atCapMs), runs: runs.length },
+    result: `no IC running ${pct(share(idleMs))} of the week${tenants.length ? ` (${tenants.map((tenant) => `${tenant} ${pct(byTenant[tenant].noIcShare)}`).join(', ')})` : ''}; at the cap of ${settings.icCap} for ${pct(share(atCapMs))}`,
+    status: 'n/a',
+  };
+}
+
 function icCostRow(base, events, week, collect, dryRun) {
   const budget = {
     warnings: events.filter((event) => event.type === 'budget-warning' && inWeek(week, event.at)).length,
@@ -384,6 +590,8 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     ...ledger,
     escapedDefects: escapedRow(base, week, merged, settings, gh),
     availability: availabilityRow(base, week, settings),
+    waitingOnCory: waitingOnCoryRow(base, week, settings),
+    icIdleShare: icIdleRow(base, week, settings),
     icCost: icCostRow(base, events, week, collect, dryRun),
   };
   const rows = ROWS.map(([key, area]) => ({ key, area, ...computed[key] }));
