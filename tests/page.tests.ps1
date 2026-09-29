@@ -123,7 +123,24 @@ try {
   Assert-True (@(Get-PostedBodies $logPath).Count -eq 3) 'an unconfigured channel must not attempt a POST'
   $pagesLines4 = @(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ })
   Assert-True ($pagesLines4.Count -eq 4) 'an unconfigured page still writes its audit line'
+
+  # Case 4b (fleet #74, red-tell): Cory wrote his credentials to
+  # state/secrets/pushover.json as {apiToken, userKey}; with no
+  # state/pages/pushover.json that file delivers. With both present, the ADR's
+  # state/pages path wins.
+  [IO.Directory]::CreateDirectory("$testRoot\state\secrets") | Out-Null
+  Write-Utf8 "$testRoot\state\secrets\pushover.json" '{"apiToken":"tok-sec","userKey":"usr-sec"}'
+  $r4b = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body 'secrets creds test' -Priority 'normal' -NoToast | ConvertFrom-Json
+  Assert-True ($r4b.pushover -eq $true) "state/secrets/pushover.json must deliver when state/pages/pushover.json is absent (got $($r4b.pushover))"
+  $form4b = ConvertFrom-FormBody (@(Get-PostedBodies $logPath) | Select-Object -Last 1)
+  Assert-True ($form4b.token -eq 'tok-sec' -and $form4b.user -eq 'usr-sec') 'apiToken/userKey from state/secrets must be sent as token/user'
   Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-123","user":"usr-456"}'
+  $null = & "$testRoot\bin\send-page.ps1" -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body 'both creds test' -Priority 'normal' -NoToast
+  $form4c = ConvertFrom-FormBody (@(Get-PostedBodies $logPath) | Select-Object -Last 1)
+  Assert-True ($form4c.token -eq 'tok-123') 'state/pages/pushover.json must win when both files exist'
+  Remove-Item "$testRoot\state\secrets\pushover.json"
+  $auditSoFar = Get-Content "$testRoot\state\pages\pages.jsonl" -Raw
+  Assert-True ($auditSoFar -notmatch 'tok-sec' -and $auditSoFar -notmatch 'usr-sec') 'secrets-file credentials must never appear in pages.jsonl'
 
   # Case 5: the toast is skipped under -NoToast, never attempted.
   Assert-True ($r1.toast -eq 'skipped') '-NoToast must skip the toast, never attempt it'
