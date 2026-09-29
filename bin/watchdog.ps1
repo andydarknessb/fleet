@@ -1012,7 +1012,35 @@ try {
       if (-not $tenant) { continue }
       $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
       $principalName = "pe-$tenantName"
-      $twake = [ordered]@{ tenant = $tenantName; principal = $principalName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null; frontierError = $null; counts = $null }
+      $twake = [ordered]@{ tenant = $tenantName; principal = $principalName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null; frontierError = $null; counts = $null; finalize = $null }
+      # #207 (spec #193): an exact `Approved` is finalized by script BEFORE the frontier is read, so
+      # the Principal is never woken for it: the Ruling comment, the ready label, the marker gone, the
+      # ledger. It writes to GitHub, so it runs only where a wake would (principal-live, live mode,
+      # no PAUSE) and inside this block's triage-wake-off rollback. A failed or timed-out finalize
+      # is recorded and changes nothing else. A finalize that failed BEFORE its claim leaves the
+      # approval on the frontier, so the Principal is woken for it as before. One that failed AFTER
+      # its claim is off the frontier for 30 minutes (the next tick finishes it; finalize is
+      # idempotent) and returns to the Principal as an expiry item if it is still unfinished.
+      if ($triageNode -and $principalLive -and $mode -eq 'live' -and -not $paused) {
+        $finArgs = @('finalize', '--root', $FleetHome, '--tenant', $tenantName)
+        if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $finArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
+        $finBounded = Invoke-BoundedExe -FilePath $triageNode -ArgumentList (@("$PSScriptRoot\triage.js") + $finArgs) -TimeoutSec ($frontierTimeoutSec * 3) -Name "node triage.js finalize $tenantName"
+        $finResult = $null
+        if ($finBounded.startError) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize could not start: $(Get-OneLine $finBounded.startError 200)" } }
+        elseif ($finBounded.timedOut) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize timed out and was killed" } }
+        elseif ($finBounded.exitCode -ne 0) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize exited $($finBounded.exitCode)`: $(Get-OneLine (($finBounded.stdout + ' ' + $finBounded.stderr)) 200)" } }
+        else {
+          $finResult = ConvertFrom-LastJsonLine $finBounded.stdout
+          if (-not $finResult) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize returned no JSON: $(Get-OneLine $finBounded.stdout 200)" } }
+          else {
+            $twake.finalize = [pscustomobject]@{ finalized = @($finResult.finalized | ForEach-Object { [pscustomobject]@{ issue = $_.issue; url = "$($_.url)" } }); left = @($finResult.left); errors = @($finResult.errors); error = $null }
+            if (@($finResult.finalized).Count -gt 0) {
+              $finNumbers = (@($finResult.finalized | ForEach-Object { "#$($_.issue)" }) -join ', ')
+              try { $null = Write-FleetWakeAudit -Kind 'triage-finalize' -Title 'Fleet watchdog: exact approval finalized' -Body "$tenantName finalized $finNumbers by script (exact Approved)" -Detail ([pscustomobject]@{ tenant = $tenantName; finalized = @($finResult.finalized) }) } catch {}
+            }
+          }
+        }
+      }
       $frontier = $null
       if (-not $triageNode) { $twake.frontierError = 'node not found (FLEET_NODE_PATH or PATH)' }
       else {

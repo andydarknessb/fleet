@@ -1169,6 +1169,39 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $tw5 = @($t5.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($tw5.decision -eq 'none' -and $tw5.reason -match 'nothing to wake for') "a routed-only board must not wake (got $($tw5.decision): $($tw5.reason))"
 
+  # Case T5b (#207): an exact `Approved` is finalized by the script before the frontier is read,
+  # so the principal is not woken for it; a qualified approval still wakes the principal.
+  $t5bHash = & node -e "process.stdout.write(require(process.argv[1]).normalizeIssue({ number: 1, body: 'Body of the ticket\n\n## Premises\n\na.js: x @abcdef1' }).bodyHash)" "$testRoot\bin\triage.js"
+  $t5bProposal = "## Triage proposal (advisory)`nClassification: bug`nRoot cause: x`nRuling: none needed`nScope: lists exactly a.js`nPremises:`n  a.js: x @abcdef1 verified @abcdef2`nBlocked_by: none`nTier: sonnet`nOpen for Cory: none"
+  $t5bIssue = { param($n, $approval) '{"number":' + $n + ',"title":"T","url":"https://github.com/owner/repo/issues/' + $n + '","body":"Body of the ticket\n\n## Premises\n\na.js: x @abcdef1","createdAt":"2026-09-02T00:00:00.000Z","labels":["triage-proposed"],"assignees":[],"comments":[{"id":"p' + $n + '","url":"https://x/p' + $n + '","author":"fleet-bot","body":"' + ($t5bProposal -replace "`n", '\n') + '","createdAt":"2026-09-10T00:00:00.000Z"},{"id":"a' + $n + '","url":"https://x/a' + $n + '","author":"cory-owner","body":"' + $approval + '","createdAt":"2026-09-11T00:00:00.000Z"}]}' }
+  Write-Utf8 $triageFixture ('[' + (& $t5bIssue 610 'Approved') + ',' + (& $t5bIssue 611 'Approved, but skip the second premise') + ']')
+  New-Item -ItemType Directory -Force "$testRoot\state\triage" | Out-Null
+  Write-Utf8 "$testRoot\state\triage\test.jsonl" (((@(610, 611) | ForEach-Object { '{"schemaVersion":1,"kind":"proposed","tenant":"test","at":"2026-09-10T00:00:00.000Z","actor":"principal","issue":' + $_ + ',"bodyHash":"' + $t5bHash + '","commentUrl":"https://x/p' + $_ + '","model":"fable"}' }) -join "`n") + "`n")
+  $callsBefore5b = @(Get-TriageRotateCalls).Count
+  $alertsBefore5b = @(Get-AlertLines).Count
+  $t5b = Run-Watchdog
+  $tw5b = @($t5b.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  $fixture5b = Get-Content $triageFixture -Raw | ConvertFrom-Json
+  $issue610 = @($fixture5b | Where-Object { $_.number -eq 610 })[0]
+  $issue611 = @($fixture5b | Where-Object { $_.number -eq 611 })[0]
+  Assert-True (@($issue610.labels) -contains 'ready-for-agent' -and @($issue610.labels) -notcontains 'triage-proposed') "an exact Approved must be finalized by the tick (labels: $(@($issue610.labels) -join ','); error=$($tw5b.frontierError) finalize=$(($tw5b.finalize | ConvertTo-Json -Compress -Depth 5)))"
+  Assert-True (@($issue610.comments).Count -eq 3 -and "$(@($issue610.comments)[2].body)".StartsWith('## Ruling')) 'the Ruling comment must be posted'
+  Assert-True (@($issue611.labels) -contains 'triage-proposed' -and @($issue611.comments).Count -eq 2) 'a qualified approval must be left untouched by the script'
+  Assert-True ((Get-Content "$testRoot\state\triage\test.jsonl" -Raw) -match '"kind":"finalized","tenant":"test","at":"[^"]+","actor":"finalize-script","issue":610') 'the finalize must be on the ledger'
+  Assert-True ((@($tw5b.finalize.finalized) | ForEach-Object { $_.issue }) -contains 610) 'the tick record must name what the script finalized'
+  Assert-True ($tw5b.decision -eq 'woken' -and @($tw5b.evidence).Count -eq 1 -and "$($tw5b.evidence[0])" -eq 'approval #611') "the principal must be woken only for the qualified approval (got $($tw5b.decision): $(@($tw5b.evidence) -join '; '))"
+  Assert-True (@(Get-TriageRotateCalls)[-1] -eq 'pe-test|approval #611') 'the wake digest must not name the finalized approval'
+  Assert-True (@(Get-AlertLines).Count -eq $alertsBefore5b + 2 -and (@(Get-AlertLines) | Where-Object { ($_ | ConvertFrom-Json).kind -eq 'triage-finalize' }).Count -eq 1) 'a finalize must leave one triage-finalize audit line (beside the wake alert)'
+  # A tick with the principal not live or PAUSE set finalizes nothing.
+  Write-Utf8 $triageFixture ('[' + (& $t5bIssue 612 'Approved') + ']')
+  Write-Utf8 "$testRoot\state\triage\test.jsonl" ('{"schemaVersion":1,"kind":"proposed","tenant":"test","at":"2026-09-10T00:00:00.000Z","actor":"principal","issue":612,"bodyHash":"' + $t5bHash + '","commentUrl":"https://x/p612","model":"fable"}' + "`n")
+  Write-Utf8 "$testRoot\state\PAUSE" 'reason=test; setAt=now; until='
+  $null = Run-Watchdog
+  Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  Assert-True (@((Get-Content $triageFixture -Raw | ConvertFrom-Json)[0].labels) -contains 'triage-proposed') 'PAUSE must stop the finalize (it writes to GitHub)'
+  Remove-Item "$testRoot\state\triage\test.jsonl" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $triageFixture '[{"number":602,"title":"Ready","url":"https://github.com/owner/repo/issues/602","body":"x","createdAt":"2026-09-02T00:00:00.000Z","labels":["ready-for-agent"],"assignees":[],"comments":[]}]'
   # Case T5r (#204): a record the Principal escalated that left escalated wakes the Principal, naming it; a lead's
   # escalation resolving does not, and the Principal's resolution does not wake the lead.
   Remove-Item "$testRoot\state\watchdog\triage-wake.json", "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
