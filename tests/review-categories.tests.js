@@ -159,3 +159,39 @@ test('#218: the cli takes its own flags and refuses others', () => {
   assert.equal(cli(['--root', root, '--now', NOW]).outcome, 'written');
   assert.throws(() => cli(['--root', root, '--top', '5']), (error) => error instanceof ReviewCategoriesError && error.code === 'USAGE');
 });
+
+test('#218: a finding carried from an IC risk review is counted once, in the first formal review that carries it', () => {
+  const root = rootDir();
+  const riskSource = 'state/reviews/endzone_issue-9/risk-001.json';
+  const formalSource = 'state/reviews/endzone_issue-9/formal-000.json';
+  // Two formal reviews in the week carry the same risk finding (same source, same id);
+  // the earlier one counts it, the later one does not.
+  reviewed(root, 1, [finding('security', { id: 'risk-f1', carriedFrom: riskSource }), finding('naming')], { at: '2026-09-22T10:00:00.000Z', prior: riskSource });
+  reviewed(root, 2, [finding('security', { id: 'risk-f1', carriedFrom: riskSource }), finding('naming')], { at: '2026-09-24T10:00:00.000Z', prior: riskSource });
+  // A different risk finding from the same source is a different finding.
+  reviewed(root, 3, [finding('security', { id: 'risk-f2', carriedFrom: riskSource })], { at: '2026-09-25T10:00:00.000Z', prior: riskSource });
+  // A finding carried from an earlier formal review was counted when first found.
+  reviewed(root, 4, [finding('correctness', { id: 'formal-f1', carriedFrom: formalSource })], { at: '2026-09-23T10:00:00.000Z', prior: formalSource });
+  const result = writeReviewCategoryNotice({ root, now: NOW });
+  assert.deepEqual(result.top, [{ category: 'naming', count: 2 }, { category: 'security', count: 2 }], 'risk-f1 once and risk-f2 once; the formal-carried finding not at all');
+});
+
+test('#218: a risk finding is counted in the first formal review by time, whatever order the events were written in', () => {
+  const root = rootDir();
+  const riskSource = 'state/reviews/endzone_issue-9/risk-001.json';
+  reviewed(root, 1, [finding('security', { id: 'risk-f1', carriedFrom: riskSource })], { at: '2026-09-25T10:00:00.000Z', prior: riskSource });
+  reviewed(root, 2, [finding('security', { id: 'risk-f1', carriedFrom: riskSource }), finding('naming')], { at: '2026-09-22T10:00:00.000Z', prior: riskSource });
+  const result = writeReviewCategoryNotice({ root, now: NOW });
+  assert.deepEqual(result.top, [{ category: 'naming', count: 1 }, { category: 'security', count: 1 }]);
+});
+
+test('#218: findings with no category are counted in `uncategorized`, in the result and the CLI line', () => {
+  const root = rootDir();
+  reviewed(root, 1, [finding('correctness'), { id: 'f-bad', severity: 'minor', summary: 'no category' }, { id: 'f-blank', severity: 'minor', category: '  ', summary: 'blank' }]);
+  const result = writeReviewCategoryNotice({ root, now: NOW });
+  assert.equal(result.uncategorized, 2);
+  assert.deepEqual(result.top, [{ category: 'correctness', count: 1 }]);
+  const cliOut = require('node:child_process').execFileSync(process.execPath, [path.join(__dirname, '..', 'bin', 'review-categories.js'), '--root', root, '--now', NOW, '--dry-run'], { encoding: 'utf8' });
+  assert.equal(JSON.parse(cliOut).uncategorized, 2);
+  assert.equal(writeReviewCategoryNotice({ root: rootDir(), now: NOW }).uncategorized, 0);
+});

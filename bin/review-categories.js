@@ -8,9 +8,14 @@
 // injects for an IC. The paragraph carries `[until YYYY-MM-DD]`, one week past the run,
 // the expiry session start already honours; a rerun or the next week's run replaces it.
 //
-// A finding a re-review carried forward (`carriedFrom`) was counted when it was first
-// found and is not counted again. Severity is not weighed: a category reviewers keep
-// flagging as a nit is still a self-check item. Ties in count break by category name,
+// Carried findings (`carriedFrom`, set when a later review carries a still-open finding
+// forward): one carried from an earlier FORMAL review was counted when that review found
+// it and is skipped; one carried from an IC RISK review (`risk-NNN.json`) is found by no
+// formal review in any window, so it is counted once, in the first formal review in the
+// window that carries it (deduped by its carriedFrom source and finding id). A finding
+// with no category is not counted; the result and the CLI line report how many
+// (`uncategorized`). Severity is not weighed: a category reviewers keep flagging as a
+// nit is still a self-check item. Ties in count break by category name,
 // alphabetically (plain code-unit order), so the same week always reads the same. A week
 // with no finding removes the paragraph and writes none. Paragraphs other than its own
 // (the ones starting with the marker below) are kept as they are. `--dry-run` computes
@@ -46,12 +51,21 @@ function readJson(file, fallback) {
 }
 
 // The findings of one week's formal reviews, as `{ category }` rows.
+const RISK_ARTIFACT = /(^|[\\/])risk-[^\\/]*$/;
+
 function weekFindings(base, week) {
   const findings = [];
   const errors = [];
   let reviews = 0;
+  let uncategorized = 0;
   const seen = new Set();
-  for (const event of workState.readEvents(base)) {
+  const carriedRisk = new Set();
+  // Time order (stable for equal times), so "the first formal review that carries it" is
+  // the earliest one whatever order the ledger holds the events in.
+  const events = workState.readEvents(base).map((event, index) => ({ event, index }))
+    .sort((a, b) => (Date.parse(a.event.at) - Date.parse(b.event.at)) || a.index - b.index)
+    .map(({ event }) => event);
+  for (const event of events) {
     if (event.type !== 'review-recorded' || event.changes?.kind !== 'formal' || !inWeek(week, event.at)) continue;
     const relative = String(event.changes.artifact || '');
     if (!relative || seen.has(relative)) continue;
@@ -60,12 +74,18 @@ function weekFindings(base, week) {
     if (!artifact || !Array.isArray(artifact.findings)) { errors.push(`${relative}: artifact unreadable or has no findings list`); continue; }
     reviews += 1;
     for (const finding of artifact.findings) {
-      if (finding && finding.carriedFrom) continue;
-      if (!finding || typeof finding.category !== 'string' || !finding.category.trim()) continue;
+      if (finding && finding.carriedFrom) {
+        const source = String(finding.carriedFrom);
+        if (!RISK_ARTIFACT.test(source)) continue;
+        const key = `${source}#${finding.id}`;
+        if (carriedRisk.has(key)) continue;
+        carriedRisk.add(key);
+      }
+      if (!finding || typeof finding.category !== 'string' || !finding.category.trim()) { uncategorized += 1; continue; }
       findings.push({ category: finding.category.trim() });
     }
   }
-  return { findings, reviews, errors };
+  return { findings, reviews, errors, uncategorized };
 }
 
 function topCategories(findings, top = TOP) {
@@ -105,18 +125,18 @@ function writeReviewCategoryNotice({ root, now, dryRun = false } = {}) {
   const base = baseOf(root);
   const at = now || new Date().toISOString();
   const week = previousWeek(at);
-  const { findings, reviews, errors } = weekFindings(base, week);
+  const { findings, reviews, errors, uncategorized } = weekFindings(base, week);
   const top = topCategories(findings);
   const board = noticePath(base);
   const existing = fs.existsSync(board) ? fs.readFileSync(board, 'utf8') : '';
   if (!top.length) {
     if (!dryRun) writeBoard(base, replaceOwnParagraph(existing, null));
-    return { outcome: 'no-findings', week, reviews, top, errors, message: `no findings in ${week.label} across ${reviews} formal reviews; no notice written` };
+    return { outcome: 'no-findings', week, reviews, top, errors, uncategorized, message: `no findings in ${week.label} across ${reviews} formal reviews; no notice written` };
   }
   const notice = renderNotice(week, top, at);
-  if (dryRun) return { outcome: 'would-write', week, reviews, top, errors, notice };
+  if (dryRun) return { outcome: 'would-write', week, reviews, top, errors, uncategorized, notice };
   writeBoard(base, replaceOwnParagraph(existing, notice));
-  return { outcome: 'written', week, reviews, top, errors, notice, file: board };
+  return { outcome: 'written', week, reviews, top, errors, uncategorized, notice, file: board };
 }
 
 function cli(argv) {
@@ -133,7 +153,7 @@ function cli(argv) {
 if (require.main === module) {
   try {
     const result = cli(process.argv.slice(2));
-    process.stdout.write(`${JSON.stringify({ outcome: result.outcome, week: result.week.label, reviews: result.reviews, top: result.top, errors: result.errors, message: result.message || null })}\n`);
+    process.stdout.write(`${JSON.stringify({ outcome: result.outcome, week: result.week.label, reviews: result.reviews, top: result.top, uncategorized: result.uncategorized, errors: result.errors, message: result.message || null })}\n`);
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ code: error.code || 'ERROR', message: String(error.message || error) })}\n`);
     process.exitCode = error.code === 'USAGE' ? 2 : 1;
