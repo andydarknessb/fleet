@@ -191,7 +191,8 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
   } else if (kind !== 'consumed') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
     if (!open || !open.proposed) throw new WorkStateError('TRIAGE_NO_PROPOSAL', `issue #${entry.issue} has no proposal to ${kind}`);
-    if (OUTCOME_KINDS.includes(kind) && open.outcome) throw new WorkStateError('TRIAGE_OUTCOME_RECORDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at}`);
+    // #207: the outcome row is a first-writer-wins claim (the finalize script and the Principal both take it before posting a Ruling).
+    if (OUTCOME_KINDS.includes(kind) && open.outcome) throw new WorkStateError('TRIAGE_ALREADY_DECIDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at} by ${open.outcome.actor || 'principal'}`, { decidedBy: open.outcome.actor || 'principal' });
     if (kind === 'finalized' && !open.outcome) throw new WorkStateError('TRIAGE_NOT_APPROVED', `issue #${entry.issue} has no approval to finalize`);
   }
   appendEntry(root, tenant, entry);
@@ -362,6 +363,7 @@ function normalizeComments(comments) {
     id: String(comment.id || ''),
     url: String(comment.url || ''),
     createdAt: String(comment.createdAt || ''),
+    lastEditedAt: String(comment.lastEditedAt || ''),
     author: String(typeof comment.author === 'string' ? comment.author : comment.author?.login || ''),
     body: String(comment.body || ''),
   })).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
@@ -387,7 +389,7 @@ function normalizeIssue(issue) {
   };
 }
 
-const ISSUE_QUERY = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,lastEditedAt,author{login},labels(first:20){nodes{name}},assignees(first:20){nodes{login}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(last:100){nodes{id,url,body,createdAt,author{login}} pageInfo{hasPreviousPage}}} pageInfo{hasNextPage,endCursor}}}}';
+const ISSUE_QUERY = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,lastEditedAt,author{login},labels(first:20){nodes{name}},assignees(first:20){nodes{login}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(last:100){nodes{id,url,body,createdAt,lastEditedAt,author{login}} pageInfo{hasPreviousPage}}} pageInfo{hasNextPage,endCursor}}}}';
 
 function queryGithubIssues({ repo, executable = 'gh', runner = execFileSync } = {}) {
   const [owner, name] = String(repo || '').split('/');
@@ -477,6 +479,15 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
     const ownerComments = issue.comments.filter((comment) => comment.author === owner);
     const newest = issue.comments[issue.comments.length - 1] || null;
+
+    // 0. #207: a claim of the finalize script that never reached its finalized row (a run cut
+    // short) is the script's to finish on its next run; past CLAIM_EXPIRY_MINUTES it is the
+    // Principal's, by hand (agents/principal.md, Approval and finalizing).
+    if (row && row.outcome && row.outcome.actor === FINALIZE_ACTOR && row.outcome.kind === 'approved' && !row.finalized
+      && new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000) {
+      approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: row.outcome.commentUrl || null, at: row.outcome.at, withEdits: false, by: row.outcome.by || owner, reason: `finalize-script claim older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row` });
+      continue;
+    }
 
     // 1. An open proposal with the owner's Approved comment after it: finalize first.
     if (proposed) {
@@ -595,45 +606,104 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
 }
 
 // ------------------------------------------------------------- finalize ----
-// #207 (spec #193): an exact `Approved` from the owner turns an open proposal into a
-// Ruling and a ready ticket within one tick, with no Principal session: the Ruling
-// comment (the proposal verbatim), the ready label, the marker removed, the ledger
-// recorded. Everything else is left where it was, for the Principal: a qualified
-// approval, a body edited since the proposal, an escalation ruling, and any proposal
-// the script cannot restate verbatim (a false premise wants the body edited first;
-// wontfix, duplicate and question are the owner's hands or a conversation).
+// #207 (spec #193, scope ruled 2026-09-29 after QA): an exact `Approved` from the owner
+// turns a SELF-CONTAINED proposal into a Ruling and a ready ticket within one tick, with
+// no Principal session. Self-contained means the proposal leaves the Principal nothing to
+// fold in, edit, link or route by judgment; every clause below must hold, and a failing
+// clause leaves the issue to the Principal with the clause name as its `reason` in `left`.
+// No prose regex: every check is on a structured line, an exact word, a label or a ledger row.
+//
+//   1  ledger: an open proposal (proposed, no outcome)
+//   2  approval: the owner's newest approval-shaped comment after it is exactly `Approved`
+//   3  no `## Ruling` and no owner comment newer than that approval
+//   4  the proposal comment is the ledger's and the newest `## Triage proposal` before the approval
+//   5  neither the proposal nor the approval comment was edited after the approval
+//   6  the issue body hash is unchanged and the body has a `## Premises` heading
+//   7  not an escalation ruling (fail closed, three independent checks)
+//   8  proposal lines: Classification bug|feature, Open for Cory none, Blocked_by none, Tier
+//      haiku|sonnet, a Ruling line, and every premise line verified (none false, none unstamped)
+//   9  labels: no routing label, `held` or `haiku-rehearsal`; the marker present
+//   10 cap: at most FINALIZE_CAP new finalizes per run
+//
+// A conversation between the proposal and the approval is ACCEPTED: the owner said
+// `Approved` last, and clause 3 refuses anything the owner said after it.
 
 const PROPOSAL_HEADING_RE = /^\s*##\s*Triage proposal\b/i;
 const RULING_HEADING_RE = /^\s*##\s*Ruling\b/i;
-const FALSE_PREMISE_RE = /@[0-9a-f]{7,40}\s+false:/i;
+const PREMISES_HEADING_RE = /^\s{0,3}##\s+premises\s*#*\s*$/im;
+// The verified-premise line as the Principal writes it (agents/principal.md, `Premises:`),
+// matched after trimming the block's indent: `<path>: <claim> @<sha> verified @<sha>`.
+const VERIFIED_PREMISE_RE = /^\S.*: .+ @[0-9a-f]{7,40} verified @[0-9a-f]{7,40}$/;
 const FINALIZE_ACTOR = 'finalize-script';
+const FINALIZE_CAP = 5;
+const CLAIM_EXPIRY_MINUTES = 30;
+const NEVER_FINALIZED_LABELS = Object.freeze(['held', 'haiku-rehearsal']);
 
-// The Ruling is the proposal restated under its own heading; nothing else is added.
-function rulingBodyFor(proposalBody) {
+// The Ruling: the proposal under its own heading (its first `## Triage proposal` line
+// removed, otherwise verbatim, CRLF normalised), with the approval named above and the
+// labels applied below.
+function rulingBodyFor({ proposalBody, approvalUrl, labels, marker }) {
   const lines = String(proposalBody || '').replace(/\r\n/g, '\n').split('\n');
   const first = lines.findIndex((line) => line.trim());
   if (first >= 0 && PROPOSAL_HEADING_RE.test(lines[first])) lines.splice(first, 1);
-  return `## Ruling\n${lines.join('\n').replace(/^\n+/, '')}`;
+  const proposal = lines.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
+  return `## Ruling\nApproved without edits: ${approvalUrl}. Finalized by script (fleet #207).\n\n${proposal}\n\nLabels: ${labels.join(', ')}; ${marker} removed.`;
 }
 
-function proposalClassification(proposalBody) {
-  const match = /^\s*Classification:\s*(\S+)/im.exec(String(proposalBody || ''));
-  return match ? match[1].toLowerCase().replace(/[.,;]+$/, '') : null;
+// A `Key: value` line of the proposal: the whole value after the key, trimmed, one trailing
+// full stop allowed. null when the key has no line.
+function proposalLine(text, key) {
+  const match = new RegExp(`^${key}:[ \\t]*(.*?)[ \\t]*\\r?$`, 'm').exec(String(text || ''));
+  return match ? match[1].replace(/\.$/, '') : null;
 }
 
-// An escalation ruling: the proposal answered a lead's decision-needed wake (its ledger
-// entry carries the wake's record id), or a wake for the issue is still past the
-// consumed-up-to marker. Fail closed: either one keeps the approval with the Principal.
-function escalationReason({ proposed, issueNumber, tenant, outbox, consumedThrough }) {
+// The indented lines under a bare `Premises:` line, trimmed; null when there is no such block.
+function premisesBlock(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const start = lines.findIndex((line) => /^Premises:[ \t]*$/.test(line));
+  if (start < 0) return null;
+  const block = [];
+  for (let index = start + 1; index < lines.length && /^[ \t]+\S/.test(lines[index]); index += 1) block.push(lines[index].trim());
+  return block;
+}
+
+// Clause 8: the reason name of the first proposal line that is not self-contained, or null.
+function proposalRefusal(text) {
+  const classification = proposalLine(text, 'Classification');
+  if (classification !== 'bug' && classification !== 'feature') return 'classification';
+  if (proposalLine(text, 'Open for Cory') !== 'none') return 'open-for-cory';
+  if (proposalLine(text, 'Blocked_by') !== 'none') return 'blocked-by';
+  const tier = proposalLine(text, 'Tier');
+  if (tier !== 'haiku' && tier !== 'sonnet') return 'tier';
+  if (proposalLine(text, 'Ruling') === null) return 'no-ruling-line';
+  const premises = premisesBlock(text);
+  if (!premises || !premises.length || !premises.every((line) => VERIFIED_PREMISE_RE.test(line))) return 'premises';
+  return null;
+}
+
+// Clause 7, fail closed. An escalation ruling is one whose proposal carries a wake record
+// id; or one a lead's `decision-needed` wake reached in the window before the proposal
+// (after the issue's previous decision, up to the proposal), consumed or not; or one whose
+// wake is still past the consumed-up-to marker. The Principal not recording `--record-id`
+// is why the second and third checks exist: the first is never the only one.
+function escalationReason({ proposed, issueNumber, tenant, outbox, consumedThrough, entries }) {
   if (proposed.recordId) return `proposal was recorded against wake ${proposed.recordId}`;
+  const previous = entries
+    .filter((entry) => Number(entry.issue) === issueNumber && (OUTCOME_KINDS.includes(entry.kind) || entry.kind === 'finalized') && String(entry.at) < String(proposed.at))
+    .reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
   for (const record of outbox) {
     if (!record || record.wake !== 'decision-needed' || !record.at) continue;
     const parsed = parseRecordIssue(record.recordId);
     if (parsed.tenant !== String(tenant) || parsed.issue !== issueNumber) continue;
-    if (consumedThrough && String(record.at) <= consumedThrough) continue;
-    return `decision-needed wake ${record.recordId} at ${record.at} is not consumed`;
+    const at = String(record.at);
+    if (at > previous && at <= String(proposed.at)) return `decision-needed wake ${record.recordId} at ${at} preceded the proposal`;
+    if (!consumedThrough || at > consumedThrough) return `decision-needed wake ${record.recordId} at ${at} is not consumed`;
   }
   return null;
+}
+
+function editedAfter(comment, moment) {
+  return Boolean(comment.lastEditedAt) && String(comment.lastEditedAt) > String(moment);
 }
 
 function ghIssueWriter({ repo, runner }) {
@@ -647,7 +717,8 @@ function ghIssueWriter({ repo, runner }) {
   return {
     comment(number, body) { run(['issue', 'comment', String(number), '-R', repo, '--body-file', '-'], body); },
     relabel(number, { add, remove }) {
-      const args = ['issue', 'edit', String(number), '-R', repo, '--add-label', add];
+      const args = ['issue', 'edit', String(number), '-R', repo];
+      for (const label of add) args.push('--add-label', label);
       if (remove) args.push('--remove-label', remove);
       run(args);
     },
@@ -676,7 +747,7 @@ function fixtureIssueWriter({ file, author, at }) {
     relabel(number, { add, remove }) {
       edit(number, (target) => {
         const labels = normalizeLabels(target.labels).filter((label) => label !== remove);
-        if (!labels.includes(add)) labels.push(add);
+        for (const label of add) if (!labels.includes(label)) labels.push(label);
         target.labels = labels;
       });
     },
@@ -688,53 +759,92 @@ function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath
   const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
   const owner = ownerLoginOf(tenantConfig);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  // The ledger is read before GitHub, so a claim recorded while the issues load is what the
+  // claim below collides with (TRIAGE_ALREADY_DECIDED), not something this run already saw.
+  const entries = readLedger(root, tenant);
+  const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
   const issues = fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner });
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
-  const projection = projectTriage({ entries: readLedger(root, tenant), now: at, windowDays: config.windowDays, graduation: config.graduation });
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
   const marker = config.markerLabel;
-  const routing = new Set([readyLabel, ...config.routingLabels]);
+  const blocking = new Set([readyLabel, ...config.routingLabels, ...NEVER_FINALIZED_LABELS]);
   const writer = fixture
     ? fixtureIssueWriter({ file: fixture, author: tenantConfig.fleetIdentity || 'fleet', at })
     : ghIssueWriter({ repo: tenantConfig.github, runner });
   const finalized = [];
   const left = [];
   const errors = [];
+  const sorted = [...issues].sort((a, b) => a.number - b.number);
 
-  for (const issue of [...issues].sort((a, b) => a.number - b.number)) {
+  // Steps b to d of the effect, all idempotent: the Ruling unless one newer than the approval
+  // stands, the labels, then the finalized row. The claim (step a) is what made this run the owner of it.
+  const complete = (issue, proposalComment, approvalUrl, approvalAt) => {
+    const classification = proposalLine(proposalComment.body, 'Classification');
+    const applied = classification === 'bug' ? [readyLabel, 'bug'] : [readyLabel];
+    const posted = issue.comments.some((comment) => comment.createdAt > approvalAt && RULING_HEADING_RE.test(comment.body));
+    if (!posted) writer.comment(issue.number, rulingBodyFor({ proposalBody: proposalComment.body, approvalUrl, labels: applied, marker }));
+    const have = new Set(issue.labels);
+    if (applied.some((label) => !have.has(label)) || have.has(marker)) writer.relabel(issue.number, { add: applied.filter((label) => !have.has(label)), remove: have.has(marker) ? marker : null });
+    recordEntry({ root, tenant, kind: 'finalized', issue: issue.number, labels: applied.join(','), actor: FINALIZE_ACTOR, now: at });
+    finalized.push({ issue: issue.number, url: issue.url, commentUrl: approvalUrl, labels: applied });
+  };
+
+  // Recovery (section 5): a claim of ours with no finalized row is a run cut short. Finish it.
+  for (const issue of sorted) {
     const row = projection.byIssue[issue.number] || null;
-    const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
+    if (!row || !row.proposed || !row.outcome || row.finalized) continue;
+    if (row.outcome.kind !== 'approved' || row.outcome.actor !== FINALIZE_ACTOR) continue;
+    try {
+      const proposalComment = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
+      if (!proposalComment) { left.push({ issue: issue.number, reason: 'stale-proposal', detail: 'recovery: proposal comment not found' }); continue; }
+      const approvalComment = issue.comments.find((comment) => comment.url && comment.url === row.outcome.commentUrl);
+      complete(issue, proposalComment, row.outcome.commentUrl || '', approvalComment ? approvalComment.createdAt : row.outcome.at);
+    } catch (error) {
+      errors.push({ issue: issue.number, message: String(error.message || error) });
+    }
+  }
+
+  let claims = 0;
+  for (const issue of sorted) {
+    const row = projection.byIssue[issue.number] || null;
+    const proposed = row && row.proposed && !row.outcome ? row.proposed : null;   // clause 1
     if (!proposed) continue;
     // The same rule the frontier uses for "an approval": the owner's newest approval-shaped comment after the proposal.
     const approval = issue.comments.filter((comment) => comment.author === owner && comment.createdAt > proposed.at && APPROVAL_RE.test(comment.body)).pop();
     if (!approval) continue;
-    const leave = (reason) => left.push({ issue: issue.number, reason });
+    const leave = (reason, detail) => left.push(detail ? { issue: issue.number, reason, detail } : { issue: issue.number, reason });
 
-    if (!isExactApproval(approval.body)) { leave('approval is not exactly "Approved"'); continue; }
-    if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > approval.createdAt)) { leave('owner commented after the approval'); continue; }
-    if (issue.bodyHash !== proposed.bodyHash) { leave('body changed since the proposal'); continue; }
-    const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant, outbox, consumedThrough: projection.consumedThrough });
-    if (escalation) { leave(`escalation ruling: ${escalation}`); continue; }
-    const labels = new Set(issue.labels);
-    const routed = [...labels].filter((label) => routing.has(label));
-    if (routed.length) { leave(`already routed (${routed.join(', ')})`); continue; }
-
-    const proposal = issue.comments.find((comment) => comment.url && comment.url === proposed.commentUrl)
-      || issue.comments.filter((comment) => comment.createdAt <= approval.createdAt && PROPOSAL_HEADING_RE.test(comment.body)).pop();
-    if (!proposal) { leave(`proposal comment not found in the ${issue.commentsTruncated ? 'truncated ' : ''}thread`); continue; }
-    const classification = proposalClassification(proposal.body);
-    if (classification !== 'bug' && classification !== 'feature') { leave(`classification ${classification || 'missing'} is not finalized by script`); continue; }
-    if (FALSE_PREMISE_RE.test(proposal.body)) { leave('a premise is marked false; the body must be restated first'); continue; }
+    if (!isExactApproval(approval.body)) { leave('not-exact-approval'); continue; }   // clause 2
+    if (issue.comments.some((comment) => comment.createdAt > approval.createdAt && RULING_HEADING_RE.test(comment.body))) { leave('ruling-already-posted'); continue; }   // clause 3
+    if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > approval.createdAt)) { leave('owner-commented-after-approval'); continue; }
+    const proposal = issue.comments.find((comment) => comment.url && comment.url === proposed.commentUrl);   // clause 4
+    const newestProposal = issue.comments.filter((comment) => comment.createdAt < approval.createdAt && PROPOSAL_HEADING_RE.test(comment.body)).pop();
+    if (!proposal || !PROPOSAL_HEADING_RE.test(proposal.body) || !newestProposal || newestProposal !== proposal) { leave('stale-proposal', issue.commentsTruncated ? 'thread truncated' : undefined); continue; }
+    if (editedAfter(proposal, approval.createdAt) || editedAfter(approval, approval.createdAt)) { leave('edited-after-approval'); continue; }   // clause 5
+    if (issue.bodyHash !== proposed.bodyHash) { leave('body-changed'); continue; }   // clause 6
+    if (!PREMISES_HEADING_RE.test(issue.body)) { leave('no-premises-heading'); continue; }
+    const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant, outbox, consumedThrough: projection.consumedThrough, entries });   // clause 7
+    if (escalation) { leave('escalation', escalation); continue; }
+    const refusal = proposalRefusal(proposal.body);   // clause 8
+    if (refusal) { leave(refusal); continue; }
+    const labels = new Set(issue.labels);   // clause 9
+    const blocked = [...labels].filter((label) => blocking.has(label));
+    if (blocked.length || !labels.has(marker)) { leave('labels', blocked.length ? `carries ${blocked.join(', ')}` : `no ${marker}`); continue; }
+    if (claims >= FINALIZE_CAP) { leave('cap'); continue; }   // clause 10
 
     try {
-      // A Ruling already posted after the approval (an earlier run cut short) is not posted twice.
-      const posted = issue.comments.some((comment) => comment.createdAt > approval.createdAt && RULING_HEADING_RE.test(comment.body));
-      if (!posted) writer.comment(issue.number, rulingBodyFor(proposal.body));
-      writer.relabel(issue.number, { add: readyLabel, remove: labels.has(marker) ? marker : null });
-      // Recorded last: nothing is on the ledger until every GitHub write landed, so a retry starts clean.
-      recordEntry({ root, tenant, kind: 'approved', issue: issue.number, by: owner, commentUrl: approval.url, actor: FINALIZE_ACTOR, now: at });
-      recordEntry({ root, tenant, kind: 'finalized', issue: issue.number, labels: readyLabel, actor: FINALIZE_ACTOR, now: at });
-      finalized.push({ issue: issue.number, url: issue.url, commentUrl: approval.url, labels: [readyLabel] });
+      // a. CLAIM. The ledger's outcome row is a first-writer-wins claim (TRIAGE_ALREADY_DECIDED
+      // for the second): the script claims before any GitHub write, and the Principal records its
+      // own outcome before posting a Ruling by hand, so at most one of them posts. What stays is a
+      // millisecond race between two reads of the ledger, accepted.
+      try {
+        recordEntry({ root, tenant, kind: 'approved', issue: issue.number, by: owner, commentUrl: approval.url, actor: FINALIZE_ACTOR, now: at });
+      } catch (error) {
+        if (error.code === 'TRIAGE_ALREADY_DECIDED') { leave(`claimed by ${error.decidedBy || 'another actor'}`); continue; }
+        throw error;
+      }
+      claims += 1;
+      complete(issue, proposal, approval.url, approval.createdAt);
     } catch (error) {
       errors.push({ issue: issue.number, message: String(error.message || error) });
     }

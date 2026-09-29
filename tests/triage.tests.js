@@ -177,7 +177,7 @@ test('the ledger is typed: proposals need hash, comment and model; outcomes need
   assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 1, labels: 'ready-for-agent', now: '2026-09-10T01:00:00.000Z' }), { code: 'TRIAGE_NOT_APPROVED' });
   assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 1, by: OWNER, now: '2026-09-10T02:00:00.000Z' }), { code: 'TRIAGE_INVALID' });
   recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 1, by: OWNER, edits: 'tier sonnet', now: '2026-09-10T02:00:00.000Z' });
-  assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'rejected', issue: 1, by: OWNER, now: '2026-09-10T03:00:00.000Z' }), { code: 'TRIAGE_OUTCOME_RECORDED' });
+  assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'rejected', issue: 1, by: OWNER, now: '2026-09-10T03:00:00.000Z' }), { code: "TRIAGE_ALREADY_DECIDED" });
   const finalized = recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 1, labels: 'ready-for-agent', prUrl: 'https://github.com/owner/repo/pull/9', now: '2026-09-10T04:00:00.000Z' });
   assert.deepEqual(finalized.labels, ['ready-for-agent']);
   // fleet#49: a finalize that opened a docs PR names it, and the projection lists it for Cory's merge.
@@ -426,8 +426,9 @@ test('#154: the triage loader refuses a tenant whose fleetIdentity is its ownerL
   assert.throws(() => triage.computeFrontier({ root, tenant: 'endzone', fixture: writeFixture(root, []), now: NOW }), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
 });
 
-// #207 (spec #193): an exact `Approved` from the owner finalizes by script. Anything
-// qualified is an approval WITH edits and stays the Principal's.
+// #207 (spec #193, scope ruled 2026-09-29 after QA): an exact `Approved` from the owner
+// finalizes by script ONLY a self-contained proposal. Every clause that fails leaves the
+// issue to the Principal, named in `left`. Anything qualified is an approval WITH edits.
 const PROPOSAL = [
   '## Triage proposal (advisory)',
   'Classification: bug',
@@ -443,146 +444,231 @@ const PROPOSAL = [
   'Precedent: none',
   'Open for Cory: none',
 ].join('\n');
+const BODY = 'Body of #40\n\n## Premises\n\nsrc/list.js: slices one short @abcdef1\n';
 const PROPOSED_AT = '2026-09-10T00:00:00.000Z';
 const APPROVED_AT = '2026-09-11T00:00:00.000Z';
-const PROPOSAL_URL = 'https://github.com/owner/repo/issues/40#issuecomment-proposal';
+const proposalUrl = (n) => `https://github.com/owner/repo/issues/${n}#issuecomment-proposal-${n}`;
+const approvalUrl = (n) => `https://github.com/owner/repo/issues/${n}#issuecomment-approval-${n}`;
 
-// One open proposal on #40 with the given comments after it; returns the root, fixture and readers.
-function finalizeWorld({ approval = 'Approved', proposal = PROPOSAL, body = 'Body of #40', proposedBody = body, labels = ['needs-triage', 'triage-proposed'], extraComments = [], recordId, outbox } = {}) {
-  const root = rootDir();
-  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: triage.normalizeIssue(issue(40, { body: proposedBody })).bodyHash, commentUrl: PROPOSAL_URL, model: 'fable', recordId, now: PROPOSED_AT });
-  const comments = [{ id: 'proposal', url: PROPOSAL_URL, author: FLEET, body: proposal, createdAt: PROPOSED_AT }];
-  if (approval !== null) comments.push(comment(OWNER, approval, APPROVED_AT, 'approval'));
-  comments.push(...extraComments);
-  const fixture = writeFixture(root, [issue(40, { body, labels, comments })]);
-  if (outbox) fs.writeFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), `${outbox.map((row) => JSON.stringify(row)).join('\n')}\n`);
-  const fixtureIssue = () => JSON.parse(fs.readFileSync(fixture, 'utf8'))[0];
-  const finalize = (extra = {}) => triage.finalizeApprovals({ root, tenant: 'endzone', fixture, now: NOW, ...extra });
-  return { root, fixture, fixtureIssue, finalize };
+// The proposal-and-approval thread of issue `number`, as GitHub would show it.
+function thread(number, { approval = 'Approved', proposal = PROPOSAL, proposalEditedAt, approvalEditedAt, extraComments = [] } = {}) {
+  const comments = [{ id: `proposal-${number}`, url: proposalUrl(number), author: FLEET, body: proposal, createdAt: PROPOSED_AT, lastEditedAt: proposalEditedAt }];
+  if (approval !== null) comments.push({ id: `approval-${number}`, url: approvalUrl(number), author: OWNER, body: approval, createdAt: APPROVED_AT, lastEditedAt: approvalEditedAt });
+  return [...comments, ...extraComments];
 }
 
-test('#207: an exact Approved is finalized: Ruling comment (the proposal verbatim), ready label, marker removed, ledger recorded', () => {
-  const world = finalizeWorld({ approval: '  Approved \n' });
+// Open proposals on issues `numbers` (default #40); per-issue options via `each(number)`.
+function finalizeWorld({ numbers = [40], each = () => ({}), history, outbox, recordId } = {}) {
+  const root = rootDir();
+  if (history) history(root);
+  const issues = numbers.map((number) => {
+    const options = each(number);
+    const body = options.body || BODY;
+    recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: number, bodyHash: triage.normalizeIssue(issue(number, { body: options.proposedBody || body })).bodyHash, commentUrl: proposalUrl(number), model: 'fable', recordId: options.recordId || recordId, now: PROPOSED_AT });
+    return issue(number, { body, labels: options.labels || ['needs-triage', 'triage-proposed'], comments: options.comments || thread(number, options.thread) });
+  });
+  const fixture = writeFixture(root, issues);
+  if (outbox) fs.writeFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), `${outbox.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  const read = () => JSON.parse(fs.readFileSync(fixture, 'utf8'));
+  const fixtureIssue = (number = numbers[0]) => read().find((entry) => entry.number === number);
+  const finalize = (extra = {}) => triage.finalizeApprovals({ root, tenant: 'endzone', fixture, now: NOW, ...extra });
+  return { root, fixture, fixtureIssue, finalize, ledger: () => readLedger(root, 'endzone') };
+}
+
+const rulingsOn = (fixtureIssue) => fixtureIssue.comments.filter((c) => /^## Ruling/.test(c.body));
+
+test('#207: an eligible exact Approved is claimed, ruled, labelled and finalized', () => {
+  const world = finalizeWorld({ each: () => ({ thread: { approval: '  Approved \n' } }) });
   const result = world.finalize();
   assert.deepEqual(result.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(result.left, []);
   const after = world.fixtureIssue();
-  const ruling = after.comments[after.comments.length - 1];
-  assert.match(ruling.body, /^## Ruling\n/);
-  assert.ok(ruling.body.includes(PROPOSAL.split('\n').slice(1).join('\n')), 'the proposal is restated verbatim under the Ruling heading');
-  assert.ok(!ruling.body.includes('## Triage proposal'), 'the proposal heading gives way to the Ruling heading');
-  assert.deepEqual([...after.labels].sort(), ['needs-triage', 'ready-for-agent']);
-  const ledger = readLedger(world.root, 'endzone');
-  assert.deepEqual(ledger.slice(1).map((row) => row.kind), ['approved', 'finalized']);
+  assert.equal(rulingsOn(after).length, 1);
+  const ruling = rulingsOn(after)[0].body;
+  assert.equal(ruling, `## Ruling\nApproved without edits: ${approvalUrl(40)}. Finalized by script (fleet #207).\n\n${PROPOSAL.split('\n').slice(1).join('\n')}\n\nLabels: ready-for-agent, bug; triage-proposed removed.`);
+  assert.deepEqual([...after.labels].sort(), ['bug', 'needs-triage', 'ready-for-agent']);
+  const ledger = world.ledger();
+  assert.deepEqual(ledger.slice(1).map((row) => [row.kind, row.actor]), [['approved', 'finalize-script'], ['finalized', 'finalize-script']]);
   assert.equal(ledger[1].by, OWNER);
-  assert.equal(ledger[1].commentUrl, 'https://github.com/owner/repo/issues/1#issuecomment-approval');
-  assert.deepEqual(ledger[2].labels, ['ready-for-agent']);
-  assert.equal(projectTriage({ entries: ledger, now: NOW }).allTime.unchanged, 1, 'an exact approval counts as approved unchanged');
-  // The frontier the watchdog computes next no longer holds the ticket, so no Principal is woken for it.
-  const next = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW });
-  assert.deepEqual(next.eligible, []);
+  assert.equal(ledger[1].commentUrl, approvalUrl(40));
+  assert.deepEqual(ledger[2].labels, ['ready-for-agent', 'bug']);
+  assert.equal(ledger[2].bodyHash, undefined, 'the script never edits a body, so it records no body hash');
+  assert.equal(projectTriage({ entries: ledger, now: NOW }).allTime.unchanged, 1);
+  assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible, [], 'no Principal is woken for it');
   // A replay changes nothing: no second Ruling, no second ledger row.
   assert.deepEqual(world.finalize().finalized, []);
-  assert.equal(world.fixtureIssue().comments.length, after.comments.length);
-  assert.equal(readLedger(world.root, 'endzone').length, 3);
+  assert.equal(rulingsOn(world.fixtureIssue()).length, 1);
+  assert.equal(world.ledger().length, 3);
+  // A feature is readied without the bug label.
+  const feature = finalizeWorld({ each: () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: feature') } }) });
+  feature.finalize();
+  assert.deepEqual([...feature.fixtureIssue().labels].sort(), ['needs-triage', 'ready-for-agent']);
+  assert.match(rulingsOn(feature.fixtureIssue())[0].body, /\nLabels: ready-for-agent; triage-proposed removed\.$/);
 });
 
 test('#207: a qualified approval is an approval with edits: the script leaves it and the frontier still shows it to the Principal', () => {
   for (const body of ['Approved with: tier sonnet', 'Approved, but skip the second premise', 'Approved. Also ping me first.', 'Approved!', 'Approved with']) {
-    const world = finalizeWorld({ approval: body });
+    const world = finalizeWorld({ each: () => ({ thread: { approval: body } }) });
     const result = world.finalize();
     assert.deepEqual(result.finalized, [], body);
-    assert.equal(result.left.find((row) => row.issue === 40).reason, 'approval is not exactly "Approved"', body);
+    assert.deepEqual(result.left, [{ issue: 40, reason: 'not-exact-approval' }], body);
     assert.equal(world.fixtureIssue().comments.length, 2, `${body}: nothing posted`);
-    assert.deepEqual(world.fixtureIssue().labels, ['needs-triage', 'triage-proposed'], `${body}: labels untouched`);
-    assert.equal(readLedger(world.root, 'endzone').length, 1, `${body}: nothing recorded`);
+    assert.equal(world.ledger().length, 1, `${body}: nothing recorded`);
     const item = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible[0];
     assert.equal(item.kind, 'approval', body);
     assert.equal(item.withEdits, true, `${body}: a qualified approval is with edits, never unchanged`);
   }
-  const exact = finalizeWorld({ approval: 'Approved' });
+  const exact = finalizeWorld();
   assert.equal(computeFrontier({ root: exact.root, tenant: 'endzone', fixture: exact.fixture, now: NOW }).eligible[0].withEdits, false);
   assert.equal(triage.isExactApproval('Approved'), true);
   assert.equal(triage.isExactApproval('\r\napproved\r\n'), true);
   assert.equal(triage.isExactApproval('Approved, but skip X'), false);
-  assert.equal(triage.isExactApproval('Approved with: edits'), false);
   assert.equal(triage.isExactApproval('Not approved'), false);
 });
 
-test('#207: only the owner login can approve, and only when the approval is the last thing the owner said', () => {
-  const byFleet = finalizeWorld({ approval: null, extraComments: [comment(FLEET, 'Approved', APPROVED_AT)] });
-  assert.deepEqual(byFleet.finalize().finalized, [], 'the fleet identity cannot approve');
-  const early = finalizeWorld({ approval: null, extraComments: [comment(OWNER, 'Approved', '2026-09-09T00:00:00.000Z')] });
-  assert.deepEqual(early.finalize().finalized, [], 'an approval older than the proposal does not count');
-  const talked = finalizeWorld({ extraComments: [comment(OWNER, 'Actually, hold on, what about the mobile view?', '2026-09-11T01:00:00.000Z')] });
-  const left = talked.finalize();
-  assert.deepEqual(left.finalized, []);
-  assert.match(left.left[0].reason, /owner commented after the approval/);
-});
-
-test('#207: a changed body hash leaves the approval to the Principal', () => {
-  const world = finalizeWorld({ body: 'Body of #40, edited after the proposal', proposedBody: 'Body of #40' });
-  const result = world.finalize();
-  assert.deepEqual(result.finalized, []);
-  assert.match(result.left[0].reason, /body changed since the proposal/);
-  assert.equal(world.fixtureIssue().comments.length, 2);
-  assert.equal(readLedger(world.root, 'endzone').length, 1);
-  assert.equal(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible[0].kind, 'approval', 'the Principal still sees it');
-});
-
-test('#207: an escalation ruling is left to the Principal, whether its proposal carried the record id or a decision-needed wake is still unconsumed', () => {
-  const recorded = finalizeWorld({ recordId: 'endzone:issue-40' });
-  const one = recorded.finalize();
-  assert.deepEqual(one.finalized, []);
-  assert.match(one.left[0].reason, /escalation ruling/);
-  const woken = finalizeWorld({ outbox: [{ at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-40', wake: 'decision-needed', evidence: 'stuck' }] });
-  const two = woken.finalize();
-  assert.deepEqual(two.finalized, []);
-  assert.match(two.left[0].reason, /escalation ruling/);
-  const consumed = finalizeWorld({ outbox: [{ at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-40', wake: 'decision-needed', evidence: 'stuck' }] });
-  recordEntry({ root: consumed.root, tenant: 'endzone', kind: 'consumed', through: '2026-09-09T12:00:00.000Z', now: '2026-09-09T12:00:01.000Z' });
-  assert.equal(consumed.finalize().finalized.length, 1, 'a consumed wake is not an open escalation');
-  const other = finalizeWorld({ outbox: [{ at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-41', wake: 'decision-needed', evidence: 'another issue' }] });
-  assert.equal(other.finalize().finalized.length, 1, 'a wake on another issue is not this one');
-});
-
-test('#207: the script finalizes only what it can finalize verbatim: bug or feature, with no false premise', () => {
-  for (const [why, proposal] of [
-    ['wontfix is the owner\'s hands', PROPOSAL.replace('Classification: bug', 'Classification: wontfix')],
-    ['a duplicate is the owner\'s hands', PROPOSAL.replace('Classification: bug', 'Classification: duplicate of #12')],
-    ['a question is a conversation', PROPOSAL.replace('Classification: bug', 'Classification: question')],
-    ['a false premise must be restated in the body first', PROPOSAL.replace('verified @abcdef2', 'false: the slice is already correct')],
-    ['no classification line', PROPOSAL.replace('Classification: bug\n', '')],
-  ]) {
-    const world = finalizeWorld({ proposal });
+test('#207: each clause that fails leaves the issue to the Principal, named in left, with nothing posted, labelled or recorded', () => {
+  const later = (createdAt, body = 'comment', author = OWNER) => ({ id: `x-${createdAt}`, url: 'https://x/x', author, body, createdAt });
+  const otherProposal = { id: 'other', url: 'https://github.com/owner/repo/issues/40#issuecomment-other', author: FLEET, body: PROPOSAL, createdAt: '2026-09-10T12:00:00.000Z' };
+  const cases = [
+    // clause 2
+    ['Approved with:', 'not-exact-approval', () => ({ thread: { approval: 'Approved with: tier haiku' } })],
+    ['Approved, but', 'not-exact-approval', () => ({ thread: { approval: 'Approved, but skip X' } })],
+    // clause 3
+    ['a Ruling already posted after the approval', 'ruling-already-posted', () => ({ thread: { extraComments: [later('2026-09-11T00:01:00.000Z', '## Ruling\nby hand', FLEET)] } })],
+    ['an owner comment after the approval', 'owner-commented-after-approval', () => ({ thread: { extraComments: [later('2026-09-11T01:00:00.000Z', 'Actually, hold on, what about the mobile view?')] } })],
+    // clause 4
+    ['a newer proposal than the ledger\'s', 'stale-proposal', () => ({ thread: { extraComments: [] }, comments: [thread(40)[0], otherProposal, thread(40)[1]] })],
+    // clause 5
+    ['a proposal edited after the approval', 'edited-after-approval', () => ({ thread: { proposalEditedAt: '2026-09-11T00:30:00.000Z' } })],
+    ['an approval edited after it was made', 'edited-after-approval', () => ({ thread: { approvalEditedAt: '2026-09-11T00:30:00.000Z' } })],
+    // clause 6
+    ['a body hash changed since the proposal', 'body-changed', () => ({ body: `${BODY}Edited later.\n`, proposedBody: BODY })],
+    ['a body lacking ## Premises', 'no-premises-heading', () => ({ body: 'Body of #40 with no section' })],
+    // clause 7
+    ['a proposal carrying a wake record id', 'escalation', () => ({ recordId: 'endzone:issue-40' })],
+    // clause 8
+    ['bug (ready-for-human: ...)', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: bug (ready-for-human: a human must run the migration)') } })],
+    ['ready-for-human', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: ready-for-human') } })],
+    ['question', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: question') } })],
+    ['duplicate', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: duplicate of #12') } })],
+    ['wontfix', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: wontfix') } })],
+    ['no classification line', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug\n', '') } })],
+    ['Open for Cory: none. On Approval ...', 'open-for-cory', () => ({ thread: { proposal: PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none. On Approval, please also decide the caption.') } })],
+    ['Open for Cory with a question', 'open-for-cory', () => ({ thread: { proposal: PROPOSAL.replace('Open for Cory: none', 'Open for Cory: is the caption in scope?') } })],
+    ['Blocked_by: #N', 'blocked-by', () => ({ thread: { proposal: PROPOSAL.replace('Blocked_by: none', 'Blocked_by: #12') } })],
+    ['a Tier of opus', 'tier', () => ({ thread: { proposal: PROPOSAL.replace('Tier: sonnet', 'Tier: opus') } })],
+    ['no Ruling line', 'no-ruling-line', () => ({ thread: { proposal: PROPOSAL.replace('Ruling: none needed\n', '') } })],
+    ['an unverified premise', 'premises', () => ({ thread: { proposal: PROPOSAL.replace(' verified @abcdef2', '') } })],
+    ['a false premise', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('verified @abcdef2', 'false: the slice is already correct') } })],
+    ['Premises: none stated', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('Premises:\n  src/list.js: slices one short @abcdef1 verified @abcdef2', 'Premises: none stated') } })],
+    ['an empty Premises block', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('  src/list.js: slices one short @abcdef1 verified @abcdef2\n', '') } })],
+    // clause 9
+    ['held', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'held'] })],
+    ['haiku-rehearsal', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'haiku-rehearsal'] })],
+    ['already routed', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'ready-for-human'] })],
+    ['the marker gone', 'labels', () => ({ labels: ['needs-triage'] })],
+  ];
+  for (const [name, reason, options] of cases) {
+    const world = finalizeWorld({ each: options });
+    const before = JSON.stringify(world.fixtureIssue());
     const result = world.finalize();
-    assert.deepEqual(result.finalized, [], why);
-    assert.equal(world.fixtureIssue().comments.length, 2, why);
+    assert.deepEqual(result.finalized, [], name);
+    assert.equal(result.left.length, 1, name);
+    assert.equal(result.left[0].reason, reason, name);
+    assert.equal(JSON.stringify(world.fixtureIssue()), before, `${name}: GitHub is untouched`);
+    assert.equal(world.ledger().length, 1, `${name}: nothing recorded`);
   }
-  const feature = finalizeWorld({ proposal: PROPOSAL.replace('Classification: bug', 'Classification: feature') });
-  assert.equal(feature.finalize().finalized.length, 1);
-  assert.ok(feature.fixtureIssue().labels.includes('ready-for-agent'));
 });
 
-test('#207: a proposal comment that cannot be found leaves the approval to the Principal', () => {
-  const world = finalizeWorld();
-  const fixture = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
-  fixture[0].comments[0].body = 'a comment that is not a proposal';
-  fixture[0].comments[0].url = 'https://github.com/owner/repo/issues/40#issuecomment-other';
-  fs.writeFileSync(world.fixture, JSON.stringify(fixture));
+test('#207: only the owner login can approve, and an approval older than the proposal does not count', () => {
+  const byFleet = finalizeWorld({ each: () => ({ comments: [thread(40, { approval: null })[0], { id: 'f', url: 'https://x/f', author: FLEET, body: 'Approved', createdAt: APPROVED_AT }] }) });
+  assert.deepEqual(byFleet.finalize().finalized, []);
+  const early = finalizeWorld({ each: () => ({ comments: [thread(40, { approval: null })[0], { id: 'e', url: 'https://x/e', author: OWNER, body: 'Approved', createdAt: '2026-09-09T00:00:00.000Z' }] }) });
+  assert.deepEqual(early.finalize().finalized, []);
+});
+
+test('#207: an escalation is never finalized: a wake before the proposal (consumed or not), or one still unconsumed; a wake before the previous decision is not this one', () => {
+  const wake = (issueNumber, at) => ({ at, recordId: `endzone:issue-${issueNumber}`, wake: 'decision-needed', evidence: 'stuck' });
+  const before = finalizeWorld({ outbox: [wake(40, '2026-09-09T00:00:00.000Z')] });
+  assert.equal(before.finalize().left[0].reason, 'escalation');
+  const consumed = finalizeWorld({ outbox: [wake(40, '2026-09-09T00:00:00.000Z')], history: (root) => recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-09T12:00:00.000Z', now: '2026-09-09T12:00:01.000Z' }) });
+  const two = consumed.finalize();
+  assert.deepEqual(two.finalized, [], 'a consumed wake in the window before the proposal is still an escalation');
+  assert.equal(two.left[0].reason, 'escalation');
+  const after = finalizeWorld({ outbox: [wake(40, '2026-09-10T06:00:00.000Z')] });
+  assert.equal(after.finalize().left[0].reason, 'escalation', 'a wake past the consumed marker is an open escalation');
+  const other = finalizeWorld({ outbox: [wake(41, '2026-09-09T00:00:00.000Z')] });
+  assert.equal(other.finalize().finalized.length, 1, 'a wake on another issue is not this one');
+  // #40 was decided once before (proposed, approved, finalized in early September) and its wake was consumed then.
+  const decidedBefore = finalizeWorld({
+    outbox: [wake(40, '2026-09-01T12:00:00.000Z')],
+    history: (root) => {
+      recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: 'old', commentUrl: 'https://x/old', model: 'fable', now: '2026-09-01T00:00:00.000Z' });
+      recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, now: '2026-09-02T00:00:00.000Z' });
+      recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 40, labels: 'ready-for-agent', now: '2026-09-03T00:00:00.000Z' });
+      recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-04T00:00:00.000Z', now: '2026-09-04T00:00:01.000Z' });
+    },
+  });
+  assert.equal(decidedBefore.finalize().finalized.length, 1, 'a wake that predates the previous decision was answered by it');
+});
+
+test('#207: at most five are finalized per run; the sixth is left with the reason cap', () => {
+  const world = finalizeWorld({ numbers: [51, 52, 53, 54, 55, 56] });
   const result = world.finalize();
-  assert.deepEqual(result.finalized, []);
-  assert.match(result.left[0].reason, /proposal comment not found/);
+  assert.deepEqual(result.finalized.map((row) => row.issue), [51, 52, 53, 54, 55]);
+  assert.deepEqual(result.left, [{ issue: 56, reason: 'cap' }]);
+  assert.equal(world.ledger().filter((row) => row.kind === 'finalized').length, 5);
+  assert.deepEqual(world.finalize().finalized.map((row) => row.issue), [56], 'the next run takes the rest');
 });
 
-// A runner that answers the issue query from `seed` and hands every other gh call to `write`.
-function ghRunner(seed, write) {
+test('#207: the claim is first-writer-wins: record --kind approved on a decided row throws, and finalize leaves an issue the Principal claimed meanwhile', () => {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 1, bodyHash: 'h', commentUrl: 'u', model: 'fable', now: PROPOSED_AT });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 1, by: OWNER, actor: 'finalize-script', now: APPROVED_AT });
+  assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'approved-with-edits', issue: 1, by: OWNER, edits: 'x', now: '2026-09-11T00:00:01.000Z' }), (error) => error.code === 'TRIAGE_ALREADY_DECIDED' && error.decidedBy === 'finalize-script');
+  assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 1, by: OWNER, now: '2026-09-11T00:00:01.000Z' }), { code: 'TRIAGE_ALREADY_DECIDED' });
+  assert.equal(readLedger(root, 'endzone').length, 2);
+  // The Principal claims #40 while the script is loading GitHub: the script's claim collides.
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const writes = [];
+  const result = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, (exe, args) => { writes.push(args); return ''; }, () => recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, now: '2026-09-11T00:00:02.000Z' })) });
+  assert.deepEqual(result.finalized, []);
+  assert.deepEqual(result.left, [{ issue: 40, reason: 'claimed by principal' }]);
+  assert.deepEqual(writes, [], 'not one GitHub write');
+});
+
+// A runner that answers the issue query from `seed`, calling `onQuery` first, and hands every other gh call to `write`.
+function ghRunner(seed, write, onQuery) {
   return (exe, args, options) => {
-    if (args[0] === 'api') return JSON.stringify({ data: { repository: { issues: { nodes: seed, pageInfo: { hasNextPage: false } } } } });
+    if (args[0] === 'api') {
+      if (onQuery) onQuery();
+      return JSON.stringify({ data: { repository: { issues: { nodes: seed, pageInfo: { hasNextPage: false } } } } });
+    }
     return write(exe, args, options);
   };
 }
 
-test('#207: a finalize interrupted after the Ruling posted does not post it twice; the next run completes the labels and the ledger', () => {
+test('#207: a run cut short is finished by the next run: one Ruling, the labels, one finalized row', () => {
+  const ruling = { id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: '## Ruling\nApproved without edits.', createdAt: '2026-09-11T00:01:00.000Z' };
+  for (const [name, extra, labels] of [
+    ['claim with no Ruling', [], ['needs-triage', 'triage-proposed']],
+    ['Ruling but no label', [ruling], ['needs-triage', 'triage-proposed']],
+    ['labels but no finalized row', [ruling], ['needs-triage', 'ready-for-agent', 'bug']],
+  ]) {
+    const world = finalizeWorld({ each: () => ({ labels, comments: thread(40, { extraComments: extra }) }) });
+    recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, commentUrl: approvalUrl(40), actor: 'finalize-script', now: '2026-09-11T00:00:30.000Z' });
+    const result = world.finalize();
+    assert.deepEqual(result.finalized.map((row) => row.issue), [40], name);
+    assert.equal(rulingsOn(world.fixtureIssue()).length, 1, `${name}: one Ruling`);
+    assert.deepEqual([...world.fixtureIssue().labels].sort(), ['bug', 'needs-triage', 'ready-for-agent'], name);
+    assert.deepEqual(world.ledger().slice(1).map((row) => [row.kind, row.actor]), [['approved', 'finalize-script'], ['finalized', 'finalize-script']], name);
+    assert.deepEqual(world.finalize().finalized, [], `${name}: and a rerun does nothing`);
+    assert.equal(world.ledger().length, 3, name);
+  }
+});
+
+test('#207: a failed GitHub write after the claim is retried by the next run without a second Ruling', () => {
   const world = finalizeWorld();
   const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
   const writes = [];
@@ -595,18 +681,17 @@ test('#207: a finalize interrupted after the Ruling posted does not post it twic
   const first = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, write) });
   assert.deepEqual(first.finalized, []);
   assert.match(first.errors[0].message, /502/);
-  assert.deepEqual(writes, ['issue comment', 'issue edit'], 'the Ruling was posted, then the label edit failed');
-  assert.equal(readLedger(world.root, 'endzone').length, 1, 'nothing is recorded until every GitHub write landed');
-  // Second run: GitHub now shows the Ruling comment already there.
-  seed[0].comments.push({ id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: '## Ruling\nClassification: bug', createdAt: '2026-09-11T00:01:00.000Z' });
+  assert.deepEqual(writes, ['issue comment', 'issue edit']);
+  assert.deepEqual(world.ledger().slice(1).map((row) => row.kind), ['approved'], 'the claim stands, so the Principal cannot also rule');
+  seed[0].comments.push({ id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: '## Ruling\nApproved without edits.', createdAt: '2026-09-11T00:01:00.000Z' });
   writes.length = 0;
   const second = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, write) });
   assert.deepEqual(second.finalized.map((row) => row.issue), [40]);
   assert.deepEqual(writes, ['issue edit'], 'no second Ruling comment');
-  assert.deepEqual(readLedger(world.root, 'endzone').slice(1).map((row) => row.kind), ['approved', 'finalized']);
+  assert.deepEqual(world.ledger().slice(1).map((row) => row.kind), ['approved', 'finalized']);
 });
 
-test('#207: against GitHub the writes are one gh comment (body on stdin) and one gh edit that adds the ready label and removes the marker', () => {
+test('#207: against GitHub the writes are one gh comment (body on stdin) and one gh edit that adds ready-for-agent and bug and removes the marker', () => {
   const world = finalizeWorld();
   const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
   const calls = [];
@@ -615,14 +700,28 @@ test('#207: against GitHub the writes are one gh comment (body on stdin) and one
   assert.equal(calls.length, 2);
   assert.deepEqual(calls[0].args, ['issue', 'comment', '40', '-R', 'owner/repo', '--body-file', '-']);
   assert.match(calls[0].input, /^## Ruling\n/);
-  assert.deepEqual(calls[1].args, ['issue', 'edit', '40', '-R', 'owner/repo', '--add-label', 'ready-for-agent', '--remove-label', 'triage-proposed']);
+  assert.doesNotMatch(calls[0].input, /^\s*veto/i);
+  assert.deepEqual(calls[1].args, ['issue', 'edit', '40', '-R', 'owner/repo', '--add-label', 'ready-for-agent', '--add-label', 'bug', '--remove-label', 'triage-proposed']);
+});
+
+test('#207: the frontier lists a finalize-script claim older than 30 minutes with no finalized row, and not a younger one', () => {
+  const root = rootDir();
+  for (const number of [60, 61]) recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: number, bodyHash: triage.normalizeIssue(issue(number)).bodyHash, commentUrl: proposalUrl(number), model: 'fable', now: '2026-09-12T10:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 60, by: OWNER, commentUrl: approvalUrl(60), actor: 'finalize-script', now: '2026-09-12T11:20:00.000Z' });   // 40 minutes before NOW
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 61, by: OWNER, commentUrl: approvalUrl(61), actor: 'finalize-script', now: '2026-09-12T11:50:00.000Z' });   // 10 minutes before NOW
+  const entries = readLedger(root, 'endzone');
+  const result = frontier([issue(60, { labels: ['triage-proposed'] }), issue(61, { labels: ['triage-proposed'] })], { entries });
+  assert.deepEqual(result.eligible.map((item) => [item.kind, item.number, item.reason]), [['approval', 60, 'finalize-script claim older than 30 minutes without a finalized row']]);
+  recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 60, labels: 'ready-for-agent', actor: 'finalize-script', now: '2026-09-12T11:55:00.000Z' });
+  assert.deepEqual(frontier([issue(60, { labels: ['ready-for-agent'] })], { entries: readLedger(root, 'endzone') }).eligible, [], 'a finalized row clears it');
 });
 
 test('#207: the finalize CLI runs against a fixture and prints what it finalized and what it left', () => {
-  const world = finalizeWorld();
+  const world = finalizeWorld({ numbers: [40, 41], each: (n) => (n === 41 ? { thread: { approval: 'Approved with: tier haiku' } } : {}) });
   const out = cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', NOW]);
   assert.deepEqual(out.finalized.map((row) => row.issue), [40]);
-  assert.deepEqual(out.finalized[0].labels, ['ready-for-agent']);
+  assert.deepEqual(out.finalized[0].labels, ['ready-for-agent', 'bug']);
+  assert.deepEqual(out.left, [{ issue: 41, reason: 'not-exact-approval' }]);
   assert.ok(TRIAGE_FLAGS.finalize.includes('fixture'));
   assert.throws(() => cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixtrue', 'x']), (error) => /unknown flag/.test(error.message));
 });
