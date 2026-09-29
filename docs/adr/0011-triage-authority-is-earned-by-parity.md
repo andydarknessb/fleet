@@ -204,7 +204,9 @@ itself, with no Approval, to a ticket only when all of these hold:
 
 - its proposal classifies the ticket as a bug with a reproducible `Red-tell`;
 - it says `Ruling: none needed` and `Open for Cory: none`;
-- it names a `Scope` outside every carve-out path and every risk-trigger path;
+- it names a `Scope` outside every carve-out path and every risk-trigger path
+  (for this door, a file whose current content matches a risk-trigger pattern
+  is a risk-trigger path);
 - it sets `Tier` to haiku or sonnet;
 - every premise on the ticket was verified at the proposal's sha.
 
@@ -213,15 +215,16 @@ still not on the table, and the Principal stays the fleet's one Fable seat
 (decision 4).
 
 - **Veto window.** A bounded ready pages Cory once at normal priority, with the
-  link. Nothing assigns the ticket for 2 hours. A ready made between 22:00 and
-  07:00 Central keeps its window open until 09:00, after the 8am daily Page has
-  listed it.
+  link. Nothing assigns the ticket for 2 hours. A ready whose 2-hour window
+  would touch 22:00 to 07:00 Central keeps it open until 09:00 Central, after
+  the 8am daily Page has listed it, so the whole window is waking hours.
 - **Veto.** A comment from `ownerLogin` that begins `Veto` withdraws the ready,
   and the proposal returns to awaiting Approval. It is recognised by shape,
   like `Approved` and `Re-propose`: the guard hook refuses a comment beginning
   `Veto` to every fleet role and its workers, and the author test is the
   second lock. A Veto withdraws one ticket and suspends nothing, because a veto
-  can be about timing rather than quality.
+  can be about timing rather than quality. The door readies a ticket under
+  Bounded authority once: after a bounded ready or a Veto, the issue is Cory's.
 - **Cap and suspension.** At most 5 bounded readies per tenant per day. The
   authority suspends itself when either of these happens:
   - an escalation or a send-back on a bounded ticket whose finding says the
