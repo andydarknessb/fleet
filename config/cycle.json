@@ -67,7 +67,7 @@
   },
   "pages": {
     "priority": {
-      "fleet-dead": "emergency",
+      "fleet-dead": "high",
       "dead-man-silence": "emergency",
       "permission-wait": "high",
       "launch-retry": "high",
@@ -82,6 +82,7 @@
     },
     "defaultPriority": "normal",
     "fleetDeadRepeatMinutes": 120,
+    "fleetDeadRepeatPriority": "high",
     "maxAttempts": 3,
     "retryAfterMinutes": 60
   },
