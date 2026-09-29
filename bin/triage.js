@@ -498,6 +498,12 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
 
     // 3. A fresh candidate: unrouted or carrying a triage label.
     if (!hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
+    // Finalized at this body: the triage is done, and a label the owner moves it to
+    // afterwards (a hold such as haiku-rehearsal, or none) is the owner's routing, not
+    // a new ask. A changed body, a triage label or a Re-propose still reopens it. Live
+    // 2026-09-29: Endzone #1773, served to the Principal 30 times.
+    const settledHash = row && row.finalized ? (row.finalized.bodyHash || row.proposed.bodyHash) : null;
+    if (!hasTriageLabel && settledHash && settledHash === issue.bodyHash && !ownerAsksAgain) { skipped.push({ number: issue.number, reason: `finalized ${row.finalized.at} at this body; a later label is the owner's routing` }); continue; }
     if (issue.openSubIssues > 0) { skipped.push({ number: issue.number, reason: 'spec parent (open sub-issues); cutting is the owner\'s' }); continue; }
     if (issue.assignees.includes(owner)) { skipped.push({ number: issue.number, reason: 'assigned to the owner' }); continue; }
     if (held.has(issue.number)) { skipped.push({ number: issue.number, reason: `held (${held.get(issue.number)})` }); continue; }

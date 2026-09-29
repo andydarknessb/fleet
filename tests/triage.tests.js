@@ -325,6 +325,33 @@ test('#145: a finalize that edits the body records the new hash; state shows bot
   }
 });
 
+test('a finalized issue whose body is unchanged is not re-proposed when the owner parks it under a label the frontier does not route', () => {
+  // Live 2026-09-29: Endzone #1773 was finalized as ready-for-agent, then Cory swapped
+  // that label for haiku-rehearsal to hold it for a rehearsal. The fresh-candidate
+  // step saw an unrouted label, ignored the finalized record, and the Stop hook served
+  // the Principal the same proposal 30 times.
+  const root = rootDir();
+  const body = '## What to build\n\nThe thing.\n';
+  const hash = triage.normalizeIssue(issue(7, { body })).bodyHash;
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/7', model: 'fable', now: '2026-09-24T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 7, by: OWNER, now: '2026-09-24T01:00:00.000Z' });
+  cli(['record', '--root', root, '--tenant', 'endzone', '--kind', 'finalized', '--issue', '7', '--labels', 'ready-for-agent', '--body-hash', hash, '--now', '2026-09-24T02:00:00.000Z']);
+  const entries = readLedger(root, 'endzone');
+  const at = { entries, now: '2026-09-24T03:00:00.000Z' };
+  for (const labels of [['haiku-rehearsal'], ['bug', 'haiku-rehearsal'], []]) {
+    const result = frontier([issue(7, { body, labels })], at);
+    assert.deepEqual(result.eligible, [], `labels [${labels}] must not be re-proposed`);
+    assert.match(result.skipped.find((row) => row.number === 7).reason, /finalized/, `labels [${labels}] must say why it was skipped`);
+  }
+  // What still re-opens it: a changed body, a triage label, or the owner asking again.
+  assert.deepEqual(frontier([issue(7, { body: `${body}More.\n`, labels: ['haiku-rehearsal'] })], at).eligible.map((row) => row.number), [7]);
+  assert.deepEqual(frontier([issue(7, { body, labels: ['needs-triage'] })], at).eligible.map((row) => row.number), [7]);
+  const ask = comment(OWNER, 'Re-propose: scope moved.', '2026-09-24T02:30:00.000Z');
+  assert.deepEqual(frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [ask] })], at).eligible.map((row) => row.number), [7]);
+  // Never triaged at all: an unrouted label is still a fresh candidate.
+  assert.deepEqual(frontier([issue(8, { labels: ['haiku-rehearsal'] })], at).eligible.map((row) => row.number), [8]);
+});
+
 test('#145: hash prints the live body hash exactly as the frontier computes it', () => {
   const root = rootDir();
   const fixture = path.join(root, 'issues.json');
