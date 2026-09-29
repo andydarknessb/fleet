@@ -175,7 +175,9 @@ function checkScope({ scope, tenantConfig, repo }) {
   if (!carveOuts.length && !Object.keys(riskTriggers).length) { fail('tenant-no-carve-outs', `tenant ${tenantConfig.name || '?'} declares no carveOuts and no riskTriggers, so no Scope can be shown to be outside them`); return { failures, files: [] }; }
   const branch = tenantConfig.defaultBranch || 'integration';
   const files = [];
-  for (const { raw, token } of scopeTokens(scope)) {
+  const tokens = scopeTokens(scope);
+  if (tokens.length > 25) { fail('scope-unresolved', `Scope names more than 25 paths (${tokens.length}); a bounded ticket is small`); return { failures, files: [] }; }
+  for (const { raw, token } of tokens) {
     const shown = raw;
     const bare = token.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/(?::L?\d+)+(?:-L?\d+)?$/i, '');
     if (bare.endsWith('/') || /[*?{}[\]]/.test(bare)) { fail('scope-unresolved', `${shown} is a directory or a pattern; name the files`); continue; }
@@ -241,15 +243,7 @@ function checkPremises({ proposal, issue, premisesSha }) {
 // --- the door's full predicate ---
 
 function hasWorkRecord(root, tenant, number) {
-  try {
-    const raw = fs.readFileSync(path.join(baseOf(root), 'state', 'work', 'active.json'), 'utf8');
-    const active = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-    const records = Array.isArray(active) ? active : Object.values((active && active.records) || active || {});
-    return records.some((record) => record && String(record.id) === `${tenant}:issue-${number}`);
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
-  }
+  return triage().activeWorkIssues(root, tenant).has(number);
 }
 
 function boundedFailures({ root, tenant, number, issue, row, open, entries, projection, config, tenantConfig, repo, at, outboxPath }) {
@@ -342,19 +336,10 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   const entries = readLedger(root, tenant);
   const standing = assignment.liveBoundedReadies(entries).get(number);
   if (standing) {
-    // A bounded ready is already recorded. Only its missing label is repaired, and only while the owner has said nothing since.
-    // The repair is of this ticket as it was when it was readied: a body changed since, or a newer proposal, is not it.
-    if (entries.some((entry) => entry.kind === 'proposed' && Number(entry.issue) === number && String(entry.at) > String(standing.at))) throw refused([{ code: 'bounded-once', detail: `a newer proposal than the bounded ready at ${standing.at} exists; an issue is readied under Bounded authority once` }]);
-    if (found.bodyHash !== standing.bodyHash) throw refused([{ code: 'body-changed', detail: `the issue body changed since the bounded ready at ${standing.at}` }]);
-    if (found.labels.includes(readyLabel)) throw refused([{ code: 'bounded-once', detail: `issue #${number} already has its bounded ready (${standing.at}) and carries ${readyLabel}` }]);
-    // Only a row that records Cory was paged is repaired: a row without that is not a ready he was told of.
-    if (standing.paged !== true) throw refused([{ code: 'unpaged-ready', detail: `the bounded-ready row at ${standing.at} does not record that Cory was paged, so it is not repaired into a ready label` }]);
-    if (found.comments.some((comment) => String(comment.author).toLowerCase() === owner.toLowerCase() && Date.parse(comment.createdAt) > Date.parse(standing.at))) throw refused([{ code: 'owner-spoke', detail: `${owner} commented after the bounded ready at ${standing.at}; the repair is left` }]);
-    const barred = found.labels.filter((label) => [...config.routingLabels, 'held', 'haiku-rehearsal', tenantConfig.escalationLabel].filter(Boolean).includes(label));
-    if (barred.length) throw refused([{ code: 'labels', detail: `issue #${number} carries ${barred.join(', ')}, so the ready label is not re-applied` }]);
-    const hold = triage().readHeldIssues(root, tenant, at).get(number);
-    if (hold) throw refused([{ code: 'held', detail: hold }]);
-    if (hasWorkRecord(root, tenant, number)) throw refused([{ code: 'live-work', detail: `a Work record ${tenant}:issue-${number} exists` }]);
+    // A bounded ready is already recorded. Only its missing label is repaired, by the one predicate the frontier's
+    // bounded-repair item also reads (triage.js repairBlockers), so the door refuses whatever the frontier would not offer.
+    const blockers = triage().repairBlockers({ standing, issue: found, entries, owner, readyLabel, config, escalationLabel: tenantConfig.escalationLabel || null, held: triage().readHeldIssues(root, tenant, at), workIssues: triage().activeWorkIssues(root, tenant) });
+    if (blockers.length) throw refused(blockers);
     const result = { tenant, issue: number, repaired: true, readied: false, at, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false };
     if (!effects) return result;
     try { ghEdit({ runner, tenantConfig, number, edits: [['--add-label', readyLabel], ...(found.labels.includes(config.markerLabel) ? [['--remove-label', config.markerLabel]] : [])] }); } catch (error) {

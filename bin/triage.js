@@ -482,7 +482,7 @@ function readHeldIssues(root, tenant, now) {
 
 // ------------------------------------------------------------- frontier ----
 
-function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, readyLabel = 'ready-for-agent', config = DEFAULT_CONFIG, entries = [], outbox = [], held = new Map(), tenant, now } = {}) {
+function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, readyLabel = 'ready-for-agent', config = DEFAULT_CONFIG, entries = [], outbox = [], held = new Map(), tenant, now, escalationLabel = null, workIssues = null } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const owner = requireText(ownerLogin, 'ownerLogin');
   // #154: authorship decides only when the owner and the fleet are two logins.
@@ -532,7 +532,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // 0b. (#210, ruling m2) A standing bounded ready whose ready label is missing and that the owner
     // has not spoken on since: the label edit after the ledger row failed. Re-running
     // `bounded-ready --issue <n>` re-applies the label, records nothing and pages nothing.
-    if (standing && standing.paged === true && !labels.has(readyLabel) && ![...labels].some((label) => config.routingLabels.includes(label) || ['held', 'haiku-rehearsal'].includes(label)) && !ownerComments.some((comment) => Date.parse(comment.createdAt) > Date.parse(standing.at))) {
+    if (standing && !repairBlockers({ standing, issue, entries, owner, readyLabel, config, escalationLabel, held, workIssues }).length) {
       repairs.push({ kind: 'bounded-repair', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, readyAt: standing.at, reason: `bounded ready recorded at ${standing.at}, but ${readyLabel} is not on the issue` });
       continue;
     }
@@ -629,7 +629,7 @@ function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, 
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
   const entries = readLedger(root, tenant);
   const held = readHeldIssues(root, tenant, at);
-  const frontier = selectTriageFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, readyLabel: tenantConfig.readyLabel || 'ready-for-agent', config, entries, outbox, held, tenant, now: at });
+  const frontier = selectTriageFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, readyLabel: tenantConfig.readyLabel || 'ready-for-agent', config, entries, outbox, held, tenant, now: at, escalationLabel: tenantConfig.escalationLabel || null, workIssues: activeWorkIssues(root, tenant) });
   return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', ...frontier };
 }
 
@@ -662,6 +662,43 @@ function approvalFloor(row) {
   const proposedAt = row && row.proposed ? String(row.proposed.at) : '';
   const veto = ((row && row.history) || []).filter((entry) => entry.kind === 'veto' && String(entry.at) >= proposedAt).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
   return veto > proposedAt ? veto : proposedAt;
+}
+
+// Spec fleet #193 (final QA, minor 6): ONE predicate for "this standing bounded ready may have its
+// ready label re-applied". The frontier's bounded-repair item (an item exists only when this returns
+// nothing) and the door's repair (bin/bounded-authority.js refuses on whatever it returns) both read it,
+// so they cannot disagree. [{ code, detail }] in the order the checks bind: a newer proposal, a changed
+// body, the ready label already on, a row that never paged Cory, an owner comment since (any case of
+// the login), a barred label, a hold, a Work record.
+function repairBlockers({ standing, issue, entries = [], owner, readyLabel, config = DEFAULT_CONFIG, escalationLabel = null, held = null, workIssues = null } = {}) {
+  const failures = [];
+  const fail = (code, detail) => failures.push({ code, detail });
+  if (entries.some((entry) => entry.kind === 'proposed' && Number(entry.issue) === issue.number && String(entry.at) > String(standing.at))) fail('bounded-once', `a newer proposal than the bounded ready at ${standing.at} exists; an issue is readied under Bounded authority once`);
+  if (issue.bodyHash !== standing.bodyHash) fail('body-changed', `the issue body changed since the bounded ready at ${standing.at}`);
+  if (issue.labels.includes(readyLabel)) fail('bounded-once', `issue #${issue.number} already has its bounded ready (${standing.at}) and carries ${readyLabel}`);
+  if (standing.paged !== true) fail('unpaged-ready', `the bounded-ready row at ${standing.at} does not record that Cory was paged, so it is not repaired into a ready label`);
+  const login = String(owner || '').toLowerCase();
+  if (issue.comments.some((comment) => String(comment.author).toLowerCase() === login && Date.parse(comment.createdAt) > Date.parse(standing.at))) fail('owner-spoke', `${owner} commented after the bounded ready at ${standing.at}; the repair is left`);
+  const barred = issue.labels.filter((label) => [...config.routingLabels, ...NEVER_FINALIZED_LABELS, escalationLabel].filter(Boolean).includes(label));
+  if (barred.length) fail('labels', `issue #${issue.number} carries ${barred.join(', ')}, so the ready label is not re-applied`);
+  const hold = heldIn(held, issue.number);
+  if (hold) fail('held', hold);
+  if (workIssues && workIssues.has(issue.number)) fail('live-work', `a Work record for issue #${issue.number} exists`);
+  return failures;
+}
+
+// The issue numbers of a tenant's Work records (state/work/active.json), any state: what a bounded ready must not be made over.
+function activeWorkIssues(root, tenant) {
+  const file = path.join(baseOf(root), 'state', 'work', 'active.json');
+  if (!fs.existsSync(file)) return new Set();
+  const active = readJsonFile(file, {});
+  const records = Array.isArray(active) ? active : Object.values((active && active.records) || active || {});
+  const numbers = new Set();
+  for (const record of records) {
+    const parsed = record && parseRecordIssue(record.id);
+    if (parsed && parsed.tenant === String(tenant)) numbers.add(parsed.issue);
+  }
+  return numbers;
 }
 
 // ------------------------------------------------------------- finalize ----
@@ -1050,6 +1087,8 @@ module.exports = {
   finalizeApprovals,
   parseProposal,
   proposalGate,
+  repairBlockers,
+  activeWorkIssues,
   isExactApproval,
   issueBodyHash,
   ledgerPath,

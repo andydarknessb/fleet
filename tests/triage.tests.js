@@ -1514,3 +1514,62 @@ test('#210 minors: a proposal recorded in the door\'s future refuses, the owner-
   const world = boundedRoot();
   assert.throws(() => cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', 'proposed', '--issue', '9', '--body-hash', 'h', '--comment-url', 'https://x/9', '--model', 'fable', '--now', '2099-01-01T00:00:00.000Z']), (error) => error.code === 'USAGE' && /future/.test(error.message));
 });
+
+// ---------------------------------------------------------------------------
+// Final QA pass: one repair predicate, the mutation survivors, the size cap.
+// ---------------------------------------------------------------------------
+
+test('#210 minor 6: the frontier\'s bounded-repair item and the door\'s repair are one predicate: whatever the door refuses, the frontier does not offer', () => {
+  const failLabel = () => { const world = boundedRoot(); assert.throws(() => world.door({ runner: () => { throw new Error('gh 502'); } }), (error) => error.code === 'GITHUB_WRITE_FAILED'); return world; };
+  const offered = (world) => computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T15:30:00.000Z' }).eligible.some((item) => item.kind === 'bounded-repair');
+  // Control: nothing wrong, so both agree the label may be re-applied.
+  const control = failLabel();
+  assert.equal(offered(control), true);
+  assert.equal(control.door({ now: '2026-09-29T15:31:00.000Z' }).repaired, true);
+  const variations = [
+    ['an owner comment in another case of the login', (world) => fs.writeFileSync(world.fixture, JSON.stringify([{ ...world.bug, comments: [...world.bug.comments, comment(OWNER.toUpperCase(), 'wait', '2026-09-29T15:10:00.000Z')] }])), 'owner-spoke'],
+    ['a changed body', (world) => fs.writeFileSync(world.fixture, JSON.stringify([{ ...world.bug, body: 'a different ticket now' }])), 'body-changed'],
+    ['a newer proposal', (world) => recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: world.bodyHash, commentUrl: PROPOSAL_URL, model: 'fable', now: '2026-09-29T16:00:00.000Z' }), 'bounded-once'],
+    ['a held label', (world) => fs.writeFileSync(world.fixture, JSON.stringify([{ ...world.bug, labels: ['bug', 'held'] }])), 'labels'],
+    ['a skip-file hold', (world) => SKIP(world.root), 'held'],
+    ['a Work record', (world) => { fs.mkdirSync(path.join(world.root, 'state', 'work'), { recursive: true }); fs.writeFileSync(path.join(world.root, 'state', 'work', 'active.json'), JSON.stringify({ records: { 'endzone:issue-7': { id: 'endzone:issue-7', state: 'implementing' } } })); }, 'live-work'],
+    ['the ready label already on', (world) => fs.writeFileSync(world.fixture, JSON.stringify([{ ...world.bug, labels: ['bug', 'ready-for-agent'] }])), 'bounded-once'],
+  ];
+  for (const [name, change, condition] of variations) {
+    const world = failLabel();
+    change(world);
+    assert.equal(offered(world), false, 'the frontier offers no repair after ' + name);
+    assert.throws(() => world.door({ now: '2026-09-29T15:31:00.000Z' }), (error) => error.condition === condition, 'the door refuses after ' + name);
+  }
+});
+
+test('#210 minor 7: a fixture run that finds suspension evidence still refuses (a dry run reports what it would suspend on)', () => {
+  const world = readiedUnit();
+  escalate(world, { reason: 'criteria-defect' });
+  // A second ticket's proposal, run as a dry fixture (effects off): no flag exists yet, the evidence alone refuses it.
+  const other = issue(8, { labels: ['bug', 'triage-proposed'], body: B_BODY, comments: [{ id: 'p8', url: 'https://github.com/owner/repo/issues/8#issuecomment-8001', author: FLEET, createdAt: '2026-09-29T09:30:00.000Z', body: proposalBody() }] });
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 8, bodyHash: triage.normalizeIssue(other).bodyHash, commentUrl: 'https://github.com/owner/repo/issues/8#issuecomment-8001', model: 'fable', premisesSha: PREMISE_SHA, now: '2026-09-29T09:30:01.000Z' });
+  fs.writeFileSync(world.fixture, JSON.stringify([world.bug, other]));
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(world.root)));
+  assert.throws(() => bounded.boundedReady({ root: world.root, tenant: 'endzone', issue: 8, fixture: world.fixture, now: '2026-09-29T18:30:00.000Z', effects: false, repo: world.repo }), (error) => error.condition === 'suspended');
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(world.root)), 'and the dry run wrote no flag');
+});
+
+test('#210 minor 7: a new file whose name differs only in case is judged against the carve-out and risk globs case-insensitively', () => {
+  for (const [scope, code] of [
+    ['lists exactly `server/modules/AUTH.js`', 'scope-risk-path'],
+    ['lists exactly `server/db/migrations/0099_FIX.SQL`', 'scope-carve-out'],
+    ['lists exactly `.GITHUB/workflows/ci.yml`', 'scope-unresolved'],
+    ['lists exactly `server/services/WAIVER.service.js`', 'scope-risk-path'],
+  ]) {
+    refusal(boundedRoot({ proposal: { Scope: scope } }), code);
+  }
+});
+
+test('#210 minor 8: a Scope of more than 25 paths refuses scope-unresolved, so a proposal cannot spend the door on git calls', () => {
+  const many = Array.from({ length: 26 }, (_, index) => 'server/services/f' + index + '.js');
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly ' + many.join(', ') } }), 'scope-unresolved', /more than 25/);
+  const ok = Array.from({ length: 25 }, (_, index) => 'server/services/f' + index + '.js');
+  const world = boundedRoot({ proposal: { Scope: 'lists exactly ' + ok.join(', ') } });
+  assert.equal(world.door().readied, true);
+});
