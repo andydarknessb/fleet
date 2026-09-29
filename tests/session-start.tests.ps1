@@ -90,6 +90,31 @@ try {
   $out5 = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement"}'
   Assert-True ($out5 -notmatch 'ROTATION:') 'an incomplete rotation must not claim a completed handoff'
 
+  # Case 6 (#218): the weekly review-category notice (bin/review-categories.js) is an
+  # ordinary IC-board paragraph. A newly launched IC sees it; a lead does not; and it
+  # drops out once the week it carries has passed. The notice is rendered by the script's
+  # own renderNotice at a run time N days ago, so its [until] is that run + 7 days.
+  $node = (Get-Command node -ErrorAction Stop).Source
+  function New-CategoryNotice {
+    param([int]$DaysAgo)
+    $script = "const { renderNotice } = require(process.argv[1]); const { previousWeek } = require(process.argv[2]); const now = new Date(Date.now() - $DaysAgo * 86400000).toISOString(); process.stdout.write(renderNotice(previousWeek(now), [{ category: 'zz-first-category', count: 4 }, { category: 'zz-second-category', count: 2 }], now));"
+    return (& $node -e $script "$sourceRoot/bin/review-categories.js" "$sourceRoot/bin/report-week.js" | Out-String).Trim()
+  }
+  $icBoard = "$testRoot\state\notices\ic.md"
+  Write-Utf8 $icBoard ("IC-BOARD-KEEPER stands.`n`n" + (New-CategoryNotice 0))
+  $out6 = Run-Hook 'ic-218' 'ic' 'endzone'
+  Assert-True ($out6 -match 'zz-first-category \(4\), zz-second-category \(2\)') 'a newly launched IC must see the week''s top categories'
+  Assert-True ($out6 -match 'IC-BOARD-KEEPER') 'the notice must not displace the rest of the IC board'
+  $out6lead = Run-Hook 'pl-endzone' 'project-lead' 'endzone'
+  Assert-True ($out6lead -notmatch 'zz-first-category') 'the categories notice is scoped to the IC role'
+  Write-Utf8 $icBoard ("IC-BOARD-KEEPER stands.`n`n" + (New-CategoryNotice 7))
+  $out6b = Run-Hook 'ic-218' 'ic' 'endzone'
+  Assert-True ($out6b -match 'zz-first-category') 'a notice written a week ago still shows on its last day'
+  Write-Utf8 $icBoard ("IC-BOARD-KEEPER stands.`n`n" + (New-CategoryNotice 8))
+  $out6c = Run-Hook 'ic-218' 'ic' 'endzone'
+  Assert-True ($out6c -notmatch 'zz-first-category') 'a notice older than a week must be gone at session start'
+  Assert-True ($out6c -match 'IC-BOARD-KEEPER') 'expiry drops only the categories paragraph'
+
   Write-Output 'session-start tests passed'
 } finally {
   foreach ($v in $saved.Keys) { [Environment]::SetEnvironmentVariable($v, $saved[$v]) }
