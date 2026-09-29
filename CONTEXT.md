@@ -112,7 +112,9 @@ _Avoid_: limit, quota, concurrency
 **Escalation**:
 A condition an IC or project lead may not resolve on its own, handed one level
 up the reporting line until it reaches Cory: a permission prompt, red CI twice
-on one PR, scope drift, or a day without a commit. Escalations are the only
+on one PR, scope drift, a day without a commit, or a question only Cory can
+answer. A session that needs Cory escalates and ends its turn idle; it never
+ends a turn waiting on him. Escalations are the only
 events that page Cory through the reporting line. While the rostered Sentinel
 is enabled the Watchdog's out-of-band page exists solely for when that line
 itself is down; after the 08b cutover the Watchdog is the top of the
@@ -231,9 +233,9 @@ the label.
 _Avoid_: task, ticket, job
 
 **Carve-out**:
-A change that may never merge without Cory, however green it is: migrations,
-deploy hooks, environment and secrets. The list lives in the project lead's
-role, not in its judgement.
+A change that alters production when it merges (migrations, deploy hooks,
+environment and secrets), and so never merges without Cory, however green it
+is. Each tenant lists its own; the list decides, never a session's judgement.
 _Avoid_: protected change, sensitive PR, exception
 
 **Watched check**:
@@ -278,7 +280,8 @@ _Avoid_: explorer, lookup agent, research sub-agent
 
 **Budget**:
 The token line a Unit of work is measured against: job tokens (input plus
-output, never cache fields) summed over the IC session's transcript. The
+output, never cache fields) over the IC session's transcript, counted once per
+model response however many transcript rows repeat it. The
 Work record gets one warning event at the warning threshold and is escalated
 at the escalation threshold unless an approved extension, granted by Cory
 through the state command with an amount and a reason, raises the line. The
@@ -391,8 +394,32 @@ _Avoid_: recommendation, draft ruling, suggestion
 **Approval**:
 The tenant owner's comment adopting a Triage proposal, with or without edits,
 which turns it into a Ruling. Only the tenant owner's login approves; the same
-word from anyone else, including the fleet's own identity, is not one.
+word from anyone else, including the fleet's own identity, is not one. A
+ticket the Principal routes itself under Bounded authority has no Approval.
 _Avoid_: sign-off, LGTM, ack
+
+**Bounded authority**:
+The Principal's standing permission, in a tenant whose proposals have earned it
+(ADR 0011), to route one narrow class of ticket to ready itself, with no
+Approval: a bug with a reproducible red-tell that needs no Ruling and touches
+no carve-out or risk-trigger path. It is capped per day, and it suspends itself
+on evidence that the class is failing: criteria that sent work back or
+escalated it, or a defect that escaped. Only Cory lifts a suspension.
+_Avoid_: auto-approval, self-approval, graduation (the event that grants it)
+
+**Veto window**:
+The time after a Bounded-authority ready during which no assignment may take
+the ticket, long enough for the Tenant owner to see it and Veto it. A ready
+made overnight keeps its window open until the morning's daily Page has listed
+it.
+_Avoid_: grace period, cooling-off, delay
+
+**Veto**:
+The Tenant owner's comment, beginning `Veto`, that withdraws a Bounded-authority
+ready inside its Veto window; the ticket goes back to awaiting Approval. Like
+an Approval, no fleet session may write one. A Veto withdraws one ticket and
+suspends nothing.
+_Avoid_: hold (a reviewed PR parked for Cory's merge), block, reject
 
 **Tenant owner**:
 The person a tenant's work is for, named by the tenant file's `ownerLogin`.
