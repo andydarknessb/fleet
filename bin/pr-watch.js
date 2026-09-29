@@ -1,7 +1,8 @@
 'use strict';
 // Ticket 04: deterministic PR watcher. Reconciles active Work records against GitHub,
 // writes a Fleet event ONLY when an observed value changes, and records an eligible
-// project-lead wake (checks-settled | checks-failed | decision-needed). The EVENT
+// project-lead wake (checks-settled | checks-failed | decision-needed; the state door adds
+// `resolution` when a record leaves escalated or hold, #204). The EVENT
 // LEDGER is the authoritative wake record (changes.wake on observations, a
 // `wake:<kind>; ` evidence prefix on transitions); state/watch/wake-outbox.jsonl is a
 // best-effort convenience cache written after commit. A decision-needed wake also

@@ -1099,9 +1099,72 @@ test('fleet#56: a CLI transition to escalated appends a decision-needed wake onc
   assert.equal(repaired.replayed, true);
   assert.equal(lines().length, 1, 'a replay that finds no line repairs the cache');
 
-  // A non-decision transition writes no line.
-  move(root, 'endzone:issue-42', repaired.revision, 'implementing', 'back', 'restated by Cory', '2026-09-12T18:00:00.000Z');
-  assert.equal(lines().length, 1);
+  // A transition between two non-decision states writes no line (leaving a decision state is #204's resolution wake).
+  const back = move(root, 'endzone:issue-42', repaired.revision, 'implementing', 'back', 'restated by Cory', '2026-09-12T18:00:00.000Z');
+  assert.deepEqual(lines().map((l) => l.wake), ['decision-needed', 'resolution']);
+  move(root, 'endzone:issue-42', back.revision, 'pr-open', 'pr-open', 'PR opened', '2026-09-12T19:00:00.000Z');
+  assert.equal(lines().length, 2);
+});
+
+// #204 (spec #192): a lead or Principal that asked Cory something ends its turn idle, so
+// the door that commits the answer wakes it. Any transition out of `escalated` or `hold`,
+// whoever calls it, appends one `resolution` line naming the record, the state left and
+// the state entered, and who raised the decision (the Watchdog routes on that).
+test('#204: leaving escalated or hold appends one resolution wake line; a replay appends none and repairs a missing one', () => {
+  const root = rootDir();
+  makeRecord(root, { github: { issueNumber: 42, prNumber: 77 } });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const lines = () => (fs.existsSync(outboxFile) ? fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : []);
+  const go = (revision, to, key, actor, evidence) => transitionRecord({ root, id: 'endzone:issue-42', expectedRevision: revision, to, idempotencyKey: key, actor, evidence, now: '2026-09-29T10:00:00.000Z', githubState: to === 'merged' ? 'MERGED' : undefined, githubMergedAt: to === 'merged' ? '2026-09-29T10:00:00.000Z' : undefined, testOnly: to === 'merged' });
+
+  // escalated -> ci-wait, raised by a lead, resolved by Cory.
+  let r = go(1, 'implementing', 'r-1', 'pl-endzone', 'launched');
+  r = go(r.revision, 'pr-open', 'r-2', 'pl-endzone', 'PR opened');
+  r = go(r.revision, 'ci-wait', 'r-3', 'pl-endzone', 'CI running');
+  const escalated = go(r.revision, 'escalated', 'r-4', 'pl-endzone', 'wake:decision-needed; needs a Ruling');
+  assert.deepEqual(lines().map((l) => l.wake), ['decision-needed']);
+  const resolved = go(escalated.revision, 'ci-wait', 'r-5', 'cory', 'Cory ruled: proceed');
+  const resolutions = lines().filter((l) => l.wake === 'resolution');
+  assert.equal(resolutions.length, 1);
+  assert.equal(resolutions[0].recordId, 'endzone:issue-42');
+  assert.equal(resolutions[0].from, 'escalated');
+  assert.equal(resolutions[0].to, 'ci-wait');
+  assert.equal(resolutions[0].raisedBy, 'pl-endzone');
+  assert.equal(resolutions[0].actor, 'cory');
+  assert.equal(resolutions[0].idempotencyKey, 'r-5:resolution');
+  assert.equal(resolutions[0].eventSequence, resolved.eventSequence);
+  assert.equal(resolutions[0].evidence, 'Cory ruled: proceed');
+
+  // A replay appends nothing; a replay that finds the line missing repairs it once.
+  assert.equal(go(escalated.revision, 'ci-wait', 'r-5', 'cory', 'Cory ruled: proceed').replayed, true);
+  assert.equal(lines().filter((l) => l.wake === 'resolution').length, 1);
+  const kept = lines().filter((l) => l.wake !== 'resolution');
+  fs.writeFileSync(outboxFile, `${kept.map((l) => JSON.stringify(l)).join('\n')}\n`);
+  assert.equal(go(escalated.revision, 'ci-wait', 'r-5', 'cory', 'Cory ruled: proceed').replayed, true);
+  assert.equal(lines().filter((l) => l.wake === 'resolution').length, 1);
+  assert.equal(lines().filter((l) => l.wake === 'resolution')[0].from, 'escalated');
+
+  // hold -> merged, by whoever merges; raised by the lead's hold.
+  r = go(resolved.revision, 'review', 'r-6', 'pl-endzone', 'checks settled');
+  const held = go(r.revision, 'hold', 'r-7', 'pl-endzone', 'wake:decision-needed; clean PR waits on Cory merge');
+  const merged = go(held.revision, 'merged', 'r-8', 'pr-watch', 'merged by Cory');
+  const holdResolution = lines().filter((l) => l.wake === 'resolution').pop();
+  assert.equal(holdResolution.from, 'hold');
+  assert.equal(holdResolution.to, 'merged');
+  assert.equal(holdResolution.raisedBy, 'pl-endzone');
+  assert.equal(holdResolution.actor, 'pr-watch');
+  assert.equal(holdResolution.eventSequence, merged.eventSequence);
+
+  // Leaving any other state writes no resolution line, and a Principal's escalation says who raised it.
+  assert.equal(lines().filter((l) => l.wake === 'resolution').length, 2);
+  const root2 = rootDir();
+  makeRecord(root2, { github: { issueNumber: 42 } });
+  const pe = transitionRecord({ root: root2, id: 'endzone:issue-42', expectedRevision: 1, to: 'escalated', idempotencyKey: 'pe-1', actor: 'pe-endzone', evidence: 'wake:decision-needed; proposal needs approval', now: '2026-09-29T10:00:00.000Z' });
+  transitionRecord({ root: root2, id: 'endzone:issue-42', expectedRevision: pe.revision, to: 'implementing', idempotencyKey: 'pe-2', actor: 'cory', evidence: 'approved', now: '2026-09-29T11:00:00.000Z' });
+  const [, peResolution] = fs.readFileSync(path.join(root2, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(peResolution.wake, 'resolution');
+  assert.equal(peResolution.raisedBy, 'pe-endzone');
+  assert.equal(peResolution.to, 'implementing');
 });
 
 // fleet#141: the watchdog's frontier wake woke and rotated pl-endzone for two
