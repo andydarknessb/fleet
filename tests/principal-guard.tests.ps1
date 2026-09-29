@@ -116,6 +116,39 @@ try {
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 1298 --body "repropose please"') -AgentId 'w3') 'a repropose comment from a sub-agent'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1298 -b "The lead will re-propose the scope once #3 lands"')) 'the word re-propose later in a body'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh pr review 42 --approve -b "LGTM"')) 'a PR review approval (not a comment body)'
+  # fleet#208: a Veto (CONTEXT.md **Veto**, the tenant owner's withdrawal of a Bounded-authority
+  # ready) is a shape only the owner may write, on every channel and role Approved is refused on.
+  Write-Utf8 "$testRoot\veto-body.md" "Veto: not this one`nSecond line."
+  foreach ($r in 'project-lead','ic','dispatcher','principal','sentinel') {
+    $vetoRefusal = Run-Guard -Role $r -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -R owner/repo -b "Veto"')
+    Assert-Denied $vetoRefusal "a Veto comment from $r" 'owner'
+    Assert-True ("$($vetoRefusal.permissionDecisionReason)" -match 'Bounded-authority') "the Veto refusal from $r must name it as the withdrawal of a Bounded-authority ready"
+    Assert-True ("$($vetoRefusal.permissionDecisionReason)" -match '\*\*Veto\*\*') "the Veto refusal from $r must cite CONTEXT.md **Veto**"
+    Assert-Denied (Run-Guard -Role $r -Tool Bash -ToolInput (Bash 'gh pr comment 42 -b "Veto: wrong tier"')) "a Veto PR comment from $r" 'owner'
+    Assert-Denied (Run-Guard -Role $r -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Veto"') -AgentId 'w5') "a Veto comment from a sub-agent of $r" 'owner'
+  }
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash "gh issue comment 1276 --body 'veto, not now'")) 'a lower-case veto comment' 'Veto'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 1276 --body "  VETO"')) 'a Veto with leading whitespace and upper case' 'Veto'
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash "gh issue comment 1276 --body-file $testRoot\veto-body.md")) 'a Veto body from a file' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 1276 --body-file `"$testRoot\veto-body.md`"")) 'a Veto body from a double-quoted file path' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1276/comments -f body="Veto."')) 'a Veto comment through gh api' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1276/comments --raw-field body="Veto this"')) 'a Veto comment through gh api --raw-field' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "\nVeto"')) 'a Veto behind a literal backslash-n prefix' 'owner'
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash "cat > $testRoot/x.md <<'EOF'`nsome prose`nEOF`ngh issue comment 1 -b `"Veto`"")) 'a Veto comment after a heredoc in the same call' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cd /e/repo && gh issue comment 1 -b "Veto"')) 'a Veto comment after cd &&' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'GH_PAGER= gh pr comment 2 --body "Veto, wrong scope"')) 'a Veto comment behind an env assignment' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 1276 --body-file $testRoot\veto-body.md; echo posted")) 'a Veto body file followed by another command' 'owner'
+  foreach ($body in @('Veto; not now', 'Veto | no', 'Veto && reopen', 'Veto (wrong tier)', "Veto`nsecond line")) {
+    Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 -b `"$body`"")) "a Veto-shaped body containing a metacharacter ($body)" 'owner'
+  }
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body 'Veto (see #3); thanks'")) 'a single-quoted Veto body with metacharacters' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/5/comments -f body="Veto; batch 41"')) 'a gh api Veto body with a semicolon' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash "gh issue comment 5 --body @'`nVeto: wrong tier`n'@")) 'a Veto here-string body from the PowerShell tool' 'owner'
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1474 --repo owner/repo --body-file -')) 'a stdin body, whose refusal now also names Veto' 'Veto'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "The owner may Veto this ready inside its window"')) 'the word Veto later in a body'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Vetoed by the owner at 10:04, back to awaiting Approval"')) 'a body beginning Vetoed (not the word Veto)'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash "cat > $testRoot/note.md <<'EOF'`nVeto: nothing, this is a note`nEOF`necho done")) 'a heredoc whose text begins Veto but which is not a comment'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue create --repo owner/repo --title x -b "Veto: a ticket about the guard"')) 'an issue body beginning Veto (not a comment)'
   # fleet#70 case 1: a body on stdin cannot be inspected. Still refused, but the refusal
   # says WHY and names the fix; it must not claim the body begins with "Approved".
   $stdinRefusal = Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1474 --repo owner/repo --body-file -')

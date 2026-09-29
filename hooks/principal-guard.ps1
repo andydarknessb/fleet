@@ -12,10 +12,11 @@
 #        no gh pr merge, no wontfix/duplicate label, no git push to a branch outside
 #        docs/. One named test file passes.
 #      - No Supabase or Netlify-writing MCP tool.
-#   2. every fleet role: no comment whose body begins "Approved" or "Re-propose" on any
-#      issue. Until #154 the fleet's gh login was the tenant owner's (fleetIdentity ==
+#   2. every fleet role: no comment whose body begins "Approved", "Re-propose" or "Veto"
+#      on any issue. Until #154 the fleet's gh login was the tenant owner's (fleetIdentity ==
 #      ownerLogin) and this rule alone made an Approval, and (fleet#55) a re-proposal
-#      ask, Cory's. Since #154 the fleet acts as its own login (ADR 0015) and the
+#      ask, Cory's; (fleet#208) a Veto, the owner's withdrawal of a Bounded-authority
+#      ready (CONTEXT.md **Veto**), is his alone the same way. Since #154 the fleet acts as its own login (ADR 0015) and the
 #      owner-login gate in bin/triage.js does that; this rule stays as the second
 #      lock (ADR 0011 amendment). The rule reads the command being invoked, not
 #      prose or heredoc text that quotes one, and a body it cannot inspect (stdin,
@@ -87,7 +88,7 @@ if ($tool -in @('Bash', 'PowerShell')) {
         # fleet#70 case 1: a body on stdin cannot be inspected, so it cannot be cleared.
         # Refused on its own terms: the message names the cause and the one-step fix
         # instead of asserting a first word this guard never saw.
-        $reason = "the comment body is passed on stdin (--body-file - / body=@-), which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**) or 'Re-propose', since the fleet acts under the owner's own GitHub login. Write the body to a file and pass --body-file <path>; the guard reads the file's first line $cite"
+        $reason = "the comment body is passed on stdin (--body-file - / body=@-), which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**), 'Re-propose' or 'Veto' (the tenant owner's withdrawal of a Bounded-authority ready, CONTEXT.md **Veto**), since the fleet acts under the owner's own GitHub login. Write the body to a file and pass --body-file <path>; the guard reads the file's first line $cite"
         break
       }
       $filePath = Normalize-Path $file "$($inp.cwd)"
@@ -101,6 +102,11 @@ if ($tool -in @('Bash', 'PowerShell')) {
       }
       if ("$body" -match '^\s*(\\n|\s)*re-?propose\b') {
         $reason = "a comment that begins 'Re-propose' is the tenant owner's ask for a new Triage proposal and no fleet session may post one under any role (fleet#55): the fleet acts under the owner's own GitHub login, so bin/triage.js reads the shape, not the author. Say what you mean in other words ('the scope changed; the Principal should look again') or leave the ask to Cory $cite"
+        break
+      }
+      # fleet#208: matched exactly like Approved (case-insensitive, leading whitespace or a literal \n skipped, first word only).
+      if ("$body" -match '^\s*(\\n|\s)*veto\b') {
+        $reason = "a comment that begins 'Veto' is the tenant owner's withdrawal of a Bounded-authority ready (CONTEXT.md **Veto**) and no fleet session may post one under any role: the fleet acts under the owner's own GitHub login, so bin/triage.js could not tell them apart. Say what you mean in other words ('the lead is holding this ticket', 'this ready is wrong because ...') or leave the Veto to Cory $cite"
         break
       }
     }
