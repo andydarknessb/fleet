@@ -34,6 +34,7 @@ const { execFileSync, execSync } = require('node:child_process');
 
 const workState = require('./work-state');
 const reviewPolicy = require('./review-policy');
+const closingLink = require('./closing-link');
 
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const FLAGS = ['repo', 'base', 'head', 'issue', 'body', 'tenant', 'root'];
@@ -161,18 +162,11 @@ function staleReferences({ repo, base, head, diffText, grep }) {
 
 // --- closing keywords ---------------------------------------------------------
 
-const CLOSING = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s+((?:[\w.-]+\/[\w.-]+)?#(\d+))/gi;
-
+// #202: the parser is bin/closing-link.js, the same one pr-watch reads a PR body with,
+// so a body this check passes cannot escalate at the watcher.
 function closingDefects(body, issue, repoSlug = null) {
   const defects = [];
-  const keywords = [];
-  CLOSING.lastIndex = 0;
-  for (let match = CLOSING.exec(body); match; match = CLOSING.exec(body)) {
-    const prefix = match[1].slice(0, match[1].indexOf('#'));
-    // `owner/repo#n` closes an issue in that repo: only the tenant's own slug is this issue.
-    const sameRepo = !prefix || (repoSlug && prefix.toLowerCase() === `${String(repoSlug).toLowerCase()}`);
-    keywords.push({ text: match[0].trim(), issue: Number(match[2]), sameRepo });
-  }
+  const keywords = closingLink.closingKeywords(body, repoSlug);
   for (const keyword of keywords.filter((entry) => !entry.sameRepo || entry.issue !== Number(issue))) {
     defects.push({ kind: 'closing-keyword', detail: keyword.sameRepo
       ? `"${keyword.text}" closes #${keyword.issue}, not #${issue}; a PR closes only its own issue`
@@ -180,15 +174,8 @@ function closingDefects(body, issue, repoSlug = null) {
   }
   const own = keywords.filter((entry) => entry.sameRepo && entry.issue === Number(issue));
   if (own.length > 1) defects.push({ kind: 'closing-keyword', detail: `the body closes #${issue} ${own.length} times; use exactly one closing keyword` });
-  if (!keywords.length) {
-    // `Refs #n` plus the explanation: words after it on the line, or the next line.
-    const lines = String(body || '').split(/\r?\n/);
-    const at = lines.findIndex((line) => new RegExp(`^\\s*(?:[-*]\\s*)?Refs?\\s+#${Number(issue)}\\b`, 'i').test(line));
-    const rest = at === -1 ? '' : lines[at].replace(new RegExp(`^.*?#${Number(issue)}\\b`), '');
-    const explained = at !== -1 && (/[A-Za-z]{3,}.*\s.*[A-Za-z]{3,}/.test(rest) || (lines.slice(at + 1).find((line) => line.trim()) || '').trim().length > 0);
-    if (!explained) {
-      defects.push({ kind: 'closing-keyword', detail: `no closing keyword: write "Closes #${issue}" when every criterion is met, or a "Refs #${issue}" line followed by what remains and why (ic.md step 6)` });
-    }
+  if (!keywords.length && closingLink.classify(body, issue, repoSlug) === 'none') {
+    defects.push({ kind: 'closing-keyword', detail: `no closing keyword: write "Closes #${issue}" when every criterion is met, or a "Refs #${issue}" line followed by what remains and why (ic.md step 6)` });
   }
   return defects;
 }

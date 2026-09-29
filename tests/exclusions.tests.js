@@ -219,3 +219,27 @@ test('cli: the process exits 2 on a refused flag, empty stdout, USAGE JSON on st
   const ok = execFileSync(process.execPath, [bin, 'project', '--root', root, '--tenant', 'endzone'], { encoding: 'utf8', windowsHide: true });
   assert.deepEqual(JSON.parse(ok), { active: [], discharged: [] });
 });
+
+// #203: "the issue closing" as a recheck event. GitHub, not the Fleet ledger, says when an
+// issue closes, so the event is observed and released by the fleet's own lift (pr-watch).
+test('#203: an issue-closed recheck is a valid event that no ledger event discharges; the fleet lift releases it and the issue is back on the frontier', () => {
+  const root = rootDir();
+  const added = addExclusion({ root, tenant: 'endzone', issue: 42, reason: 'PR #77 merged with an explained Refs', evidence: 'gh pr view 77', owner: 'fleet', actor: 'pr-watch', recheck: { event: { type: 'issue-closed', issue: 42 } }, now: '2026-09-29T10:00:00.000Z' });
+  assert.deepEqual(added.recheck, { event: { type: 'issue-closed', issue: 42 } });
+  const noise = [
+    { recordId: 'endzone:issue-42', type: 'state-merged', at: '2026-09-29T11:00:00.000Z', sequence: 1 },
+    { recordId: 'endzone:issue-42', type: 'state-retired', at: '2026-09-29T12:00:00.000Z', sequence: 2 },
+  ];
+  assert.equal(projectExclusions({ entries: readExclusions(root, 'endzone'), events: noise, now: '2026-09-30T00:00:00.000Z' }).active.length, 1, 'merging or retiring the record does not release it');
+  const issues = [{ number: 42, state: 'OPEN', labels: ['ready-for-agent'], createdAt: '2026-08-01T00:00:00.000Z' }];
+  assert.deepEqual(selectFrontier({ issues, readyLabel: 'ready-for-agent', exclusions: activeExclusions({ root, tenant: 'endzone' }) }).eligible, []);
+  liftExclusion({ root, tenant: 'endzone', id: added.id, actor: 'pr-watch', evidence: 'issue #42 is CLOSED', now: '2026-09-30T09:00:00.000Z' });
+  assert.deepEqual(selectFrontier({ issues, readyLabel: 'ready-for-agent', exclusions: activeExclusions({ root, tenant: 'endzone' }) }).eligible.map((i) => i.number), [42]);
+  assert.equal(projectExclusions({ entries: readExclusions(root, 'endzone'), events: noise, now: '2026-09-30T10:00:00.000Z' }).discharged[0].dischargedBy, 'lifted');
+});
+
+test('#203: the CLI adds an issue-closed exclusion', () => {
+  const root = rootDir();
+  const added = cli(['add', '--root', root, '--tenant', 'endzone', '--issue', '9', '--reason', 'r', '--evidence', 'e', '--owner', 'fleet', '--recheck-event', 'issue-closed', '--recheck-issue', '9']);
+  assert.deepEqual(added.recheck, { event: { type: 'issue-closed', issue: 9 } });
+});

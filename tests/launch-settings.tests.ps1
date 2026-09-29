@@ -36,7 +36,7 @@ try {
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   $repoPath = "$testRoot\repo"
   Write-Utf8 "$testRoot\tenants\test.json" ('{"name":"test","github":"owner/repo","maxIcs":2,"defaultBranch":"integration","releaseBranch":"main","repo":' + ($repoPath | ConvertTo-Json) + '}')
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'if "%1"=="--version" echo %MOCK_CLAUDE_VERSION% (Claude Code)' + "`r`n" + 'exit /b 0' + "`r`n")
   [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-disp") | Out-Null
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
@@ -77,6 +77,29 @@ try {
   Assert-True (-not $settings2b.permissions.PSObject.Properties['deny']) 'tool-contract-off must skip the deny injection'
   Assert-True ($null -ne $r2b.budget) 'tool-contract-off must not disable the ceiling estimate'
   Remove-Item "$testRoot\state\flags\tool-contract-off"
+
+  # #200 (spec #190): the real fleet-settings.json carries the auto-mode environment
+  # statement (Cory's merge authorization, Nidus migrations local-only), and every
+  # role's per-session settings carry it verbatim after "$defaults". (No sentinel case:
+  # the door copies the settings object the same way for every role.)
+  $srcEnv = @((Get-Content "$sourceRoot\fleet-settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
+  Assert-True ($srcEnv.Count -ge 3 -and $srcEnv[0] -eq '$defaults') 'fleet-settings.json autoMode.environment must inherit the built-in entries first'
+  Assert-True (@($srcEnv | Where-Object { $_ -match 'authorizes a fleet session' -and $_ -match 'not Merge Without Review' -and $_ -match 'fleet-review' -and $_ -match 'every required check' -and $_ -match 'Endzone-Empire main' -and $_ -match 'Carve-out paths:' }).Count -eq 1) 'the owner merge authorization must be stated once, with its conditions, its exclusions and the carve-out paths'
+  Assert-True (@($srcEnv | Where-Object { $_ -match 'Nidus #14' -and $_ -match 'local stack' -and $_ -match 'supabase db push' -and $_ -match 'Cory''s' }).Count -eq 1) 'Nidus migrations must be stated local-only, with the remote commands left to Cory, once'
+  [IO.File]::Copy("$sourceRoot\fleet-settings.json", "$testRoot\fleet-settings.json", $true)
+  $envCases = @(
+    @{ Name = 'dispatcher'; Args = @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun') },
+    @{ Name = 'pl-test'; Args = @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun') },
+    @{ Name = 'pe-test'; Args = @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun') },
+    @{ Name = 'ic-42'; Args = @('-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'Implement issue 42.', '-DryRun') }
+  )
+  foreach ($case in $envCases) {
+    $re = Run-Launch $case.Args
+    Assert-True ($re.dryRun -eq $true) "the $($case.Name) dry run under the real fleet settings must pass the gates (got: $re)"
+    $gotEnv = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
+    Assert-True (($gotEnv.Count -eq $srcEnv.Count) -and (@(for ($i = 0; $i -lt $srcEnv.Count; $i++) { $gotEnv[$i] -ceq $srcEnv[$i] }) -notcontains $false)) "$($case.Name) per-session settings must carry the environment statement verbatim"
+  }
+  Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
 
   # Case 3: an over-ceiling launch fails before assignment with a source breakdown.
   # A 60K-char prompt (~15K tokens; dispatcher ceiling is 12K) exceeds the Windows
@@ -159,6 +182,13 @@ exit $LASTEXITCODE
   $manifestPath = "$testRoot\state\manifests\assignment-test-issue-77.json"
   Write-Utf8 $manifestPath ('{"schemaVersion":1,"id":"assignment-test-issue-77","status":"pending-ack","workRecordId":"test:issue-77","workRecordRevision":1,"issue":{"number":77,"bodyHash":"x","criteriaHash":"y"},"base":{"remote":"origin","ref":"integration","sha":"' + ('a' * 40) + '"},"branch":"fleet/77-x","tenant":"test","parent":"pl-test","model":"haiku","permissions":"allowlist"}')
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-77":{"id":"test:issue-77","state":"assigned","issue":77,"manifestPath":"m77"}}}'
+  $profile = Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  # #165: this root stands in for the fleet after a clean verdict on 2.1.282, whatever
+  # version the checked-in profile records.
+  $verifiedProfile = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $verifiedProfile.verifiedCliVersion = '2.1.282'
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($verifiedProfile | ConvertTo-Json -Depth 6)
+  $env:MOCK_CLAUDE_VERSION = '2.1.282'
   # Fleet #171: the tenant repo's main checkout, whose entries the profile denies around .claude/worktrees.
   $rmMissing = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 4 -and ("$rmMissing" -replace '\s+', '') -match 'whichdoesnotexist')"an allowlist launch against a missing tenant repo must refuse rather than leave it editable (got: $rmMissing)"
@@ -166,8 +196,7 @@ exit $LASTEXITCODE
   Write-Utf8 "$repoPath\package.json" '{}'
   Write-Utf8 "$repoPath\.claude\settings.json" '{}'
   $rm = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs (got: $rm)"
-  $profile = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs on the verified CLI (got: $rm)"
   Assert-True ($rm.permissions -eq 'allowlist' -and $rm.allowRules -eq @($profile.allow).Count) "the dry run names the profile and its allow rule count (got $($rm.permissions)/$($rm.allowRules))"
   Assert-True (-not ("$($rm.command)" -match '--permission-mode')) 'the permission mode is never passed on the command line'
   $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
@@ -202,6 +231,32 @@ exit $LASTEXITCODE
     $glob = [regex]::Escape($Matches[2]).Replace('\*\*', '.*').Replace('\*', '[^/]*')
     Assert-True ($worktreeFile -notmatch "^$glob$") "deny rule $rule must leave the assignment worktree editable"
   }
+  # Spec #94 (#165): the profile records the CLI version the rehearsal passed on; a haiku
+  # launch on any other `claude --version` is refused, naming both and the rehearsal.
+  $env:MOCK_CLAUDE_VERSION = '9.9.999'
+  $rmv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and $rmv.launched -eq $false) "a haiku launch on an unverified CLI must refuse with exit 3 (got $script:lastExit): $rmv"
+  Assert-True ("$($rmv.reason)" -match '9\.9\.999' -and "$($rmv.reason)" -match '2\.1\.282' -and "$($rmv.reason)" -match 'scratch-root\.ps1') "the version refusal names both versions and the rehearsal command: $($rmv.reason)"
+  $rsv = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
+  Assert-True ($rsv.dryRun -eq $true) 'a sonnet launch is unaffected by the recorded CLI version'
+  # The checked-in profile records the CLI the clean rehearsal ran on (spec #94: 2026-09-29,
+  # Endzone #1773, .scratch/haiku-rehearsal-2026-09-29/).
+  Assert-True ("$($profile.verifiedCliVersion)" -match '^\d+\.\d+\.\d+$') "the checked-in profile records the rehearsed CLI version (got $($profile.verifiedCliVersion))"
+  # No recorded version (before any rehearsal passes) keeps the tier closed.
+  $unverified = Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $unverified.verifiedCliVersion = $null
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($unverified | ConvertTo-Json -Depth 6)
+  $env:MOCK_CLAUDE_VERSION = '2.1.282'
+  $rmn = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rmn.reason)" -match 'no haiku rehearsal has passed') "no recorded version refuses a haiku launch: $rmn"
+  # A scratch root marks its copy rehearsalRoot: the rehearsal launch itself runs there.
+  $rehearsal = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $rehearsal | Add-Member -NotePropertyName rehearsalRoot -NotePropertyValue $true -Force
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($rehearsal | ConvertTo-Json -Depth 6)
+  $rmr = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rmr.dryRun -eq $true) "a rehearsal root launches haiku on the installed CLI: $rmr"
+  [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
+  Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
   # A sonnet manifest pinning allowlist is refused at the door too (the planner refuses it first).
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
   $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')

@@ -44,6 +44,13 @@ function isMergeReviewEvent(event) {
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
 const LOCK_STALE_MS = 60 * 1000;
+// #234: Windows answers EPERM/EACCES/EBUSY for a lock or rename target that is delete-pending.
+// The lock treats them as contended, but throws once they have persisted for LOCK_TRANSIENT_MAX_MS of
+// wall time (a Windows wait is ~16 ms, so a wait count would stall every door call for over a minute),
+// so a genuine ACL failure fails fast instead of spinning.
+const TRANSIENT_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const LOCK_TRANSIENT_MAX_MS = 5 * 1000;
+const RENAME_RETRIES = 5;
 
 class WorkStateError extends Error {
   constructor(code, message, details = {}) {
@@ -99,14 +106,30 @@ function writeAtomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(temporary, file);
+  renameWithRetry(temporary, file);
 }
 
 function writeAtomicText(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, value, 'utf8');
-  fs.renameSync(temporary, file);
+  renameWithRetry(temporary, file);
+}
+
+// #234: a rename onto a file another process just opened or replaced can report EPERM/EBUSY on Windows.
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (!['EPERM', 'EBUSY'].includes(error.code) || attempt >= RENAME_RETRIES) {
+        try { fs.rmSync(from, { force: true }); } catch {}
+        throw error;
+      }
+      sleepBriefly();
+    }
+  }
 }
 
 function sleepBriefly() {
@@ -117,26 +140,44 @@ function sleepBriefly() {
 function withLock(root, callback) {
   const p = ensureLayout(root);
   let handle;
+  let transientSince;
   for (;;) {
     try {
       handle = fs.openSync(p.lock, 'wx');
-      fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
-      break;
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      const transient = TRANSIENT_FS_CODES.has(error.code);
+      if (error.code !== 'EEXIST' && !transient) throw error;
+      if (transient) {
+        transientSince ??= Date.now();
+        if (Date.now() - transientSince > LOCK_TRANSIENT_MAX_MS) throw error;
+      } else {
+        transientSince = undefined;
+      }
       try {
         const stat = fs.statSync(p.lock);
         if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-          const owner = readJson(p.lock, {});
+          // #234: an empty or partial lock file has no owner to find; treat it as ownerless.
+          let owner = {};
+          // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
+          try { owner = readJson(p.lock, {}) || {}; } catch (readError) { if (!(readError instanceof SyntaxError)) throw readError; }
           let alive = true;
           try { process.kill(Number(owner.pid), 0); } catch { alive = false; }
           if (!owner.pid || !alive) fs.rmSync(p.lock, { force: true });
         }
       } catch (statError) {
-        if (statError.code !== 'ENOENT') throw statError;
+        if (!['ENOENT', 'EPERM', 'EBUSY'].includes(statError.code)) throw statError;
       }
       sleepBriefly();
+      continue;
     }
+    try {
+      fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+    } catch (error) {
+      try { fs.closeSync(handle); } catch {}
+      fs.rmSync(p.lock, { force: true });
+      throw error;
+    }
+    break;
   }
   try {
     recoverPendingUnlocked(p);
@@ -144,7 +185,7 @@ function withLock(root, callback) {
     return callback(p);
   } finally {
     if (handle !== undefined) fs.closeSync(handle);
-    fs.rmSync(p.lock, { force: true });
+    fs.rmSync(p.lock, { force: true, maxRetries: 5, retryDelay: 10 });
   }
 }
 

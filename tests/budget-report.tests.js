@@ -129,3 +129,22 @@ test('#126 review: the collector section says its figures are whole-life, not th
   const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
   assert.match(md, /## Completed units by model, whole-life \(every session plus subagents; not the live budget measure\)/);
 });
+
+// --- #201 (spec #191): the meter changed on 2026-09-30 ---------------------------------
+test('#201: the budget summary says token figures before the meter change date read about 2x', () => {
+  const root = rootDir();
+  const s = buildSummary({ root, now: '2026-10-01T00:00:00.000Z' });
+  assert.equal(s.meterChange.date, '2026-09-30');
+  const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
+  assert.match(md, /Token figures before 2026-09-30 read about 2x/);
+  assert.equal(md.split('\n').filter((l) => /read about 2x/.test(l)).length, 1, 'one line');
+});
+
+test('#201: the meter change date is configuration, not a literal in the report', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ meterChange: { date: '2026-10-05' } }));
+  buildSummary({ root, now: '2026-10-06T00:00:00.000Z' });
+  const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
+  assert.match(md, /Token figures before 2026-10-05 read about 2x/);
+});
