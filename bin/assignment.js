@@ -289,7 +289,7 @@ function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3, tenan
 
 // Spec fleet #193 (#209, ADR 0011 amendment 2026-09-29): the Veto window. A ticket
 // the Principal readied under Bounded authority is not assigned for 2 hours, nor
-// (when readied from 22:00 to 07:00 Central) until 09:00 Central, nor once the
+// (when those 2 hours would touch 22:00 to 07:00 Central) until 09:00 Central, nor once the
 // owner has Vetoed it. "Readied under Bounded authority, and when" is read from the
 // triage ledger's `bounded-ready` row and not from the ready label's timeline event:
 // the label's actor is the fleet login for a bounded ready and for a finalize alike,
