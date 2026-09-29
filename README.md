@@ -116,12 +116,17 @@ powershell -File C:\Users\Cory\fleet\bin\pause.ps1 -Off
 gh issue edit <n> --add-label ready-for-agent
 gh issue comment <n> -b "Approved"                        # or "Approved with: <edits>": adopt the Principal's triage proposal; it applies the label (ADR 0011)
 
+# answer an escalation: move the record to its prior_state or a successor; the session that asked is woken (#204)
+node C:/Users/Cory/fleet/bin/work-state.js transition --id endzone:issue-<n> --to <state> --expected-revision <r> --actor cory --evidence "<your ruling>"
+
 # the Principal (ADR 0011)
 node C:/Users/Cory/fleet/bin/triage.js frontier --tenant endzone   # what pe-endzone would look at now
 node C:/Users/Cory/fleet/bin/triage.js state --tenant endzone      # ledger: pending, awaiting finalize, approved-unchanged ratio, graduation gate
 Get-Content C:\Users\Cory\fleet\state\watchdog\triage-frontier.json # the watchdog's shadow record, rewritten every tick
 New-Item C:\Users\Cory\fleet\state\flags\principal-live            # after two shadow days: expect, launch and wake pe-endzone
 ```
+
+**Questions for you (spec #192, #204, #205).** A project lead or Principal that needs you records the ask on the Work record, as an `escalated` record or, for a clean PR waiting only on your merge, a `hold`, and ends its turn idle. It never ends a turn blocked on you. Your answer wakes it: when the record leaves `escalated` or `hold` (you resolve the escalation with the command above, or you merge and the watcher records it), the state door appends a `resolution` line to the wake outbox and the Watchdog rotates the session that asked back in, naming the record and the states it left and entered (the lead for its own escalations, the Principal for the ones it raised). An ask with no Work record, such as a PR from your own session or a question about the fleet, cannot be escalated. That session puts the question in its `needs`, and the human-wait page raised from `needs` is the backstop that reaches you. That page does not wake the session when you answer, and nothing heals a blocked session by reading `needs` (fleet #84), so answer it by message.
 
 Status files: `state/STATUS.md` (dispatcher's digest), `state/status/<tenant>.md` (each project lead), `state/escalations/*.json` (anything that needs you). Ticket-07 projections, script-generated and never hand-edited: `state/status/DIGEST.md` (Needs Cory with delivery state, active work, merges, frontier exclusions, your authority) and `state/status/<tenant>-status.md`.
 
