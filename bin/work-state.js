@@ -220,13 +220,17 @@ function archiveExpiredEvents(p, now) {
   }
 }
 
-function hasEvent(p, recordId, sequence, idempotencyKey) {
-  return eventLines(p).some((event) => event.recordId === recordId
-    && (event.sequence === sequence || (idempotencyKey && event.idempotencyKey === idempotencyKey)));
+// An event is its (recordId, sequence): a journal replay re-appends the same sequence.
+// Not the idempotency key: keys are deduped per attempt by record.idempotency
+// (replayIfKnown) before any event is built, and a reserve starts that map fresh, so a
+// caller may reuse a key in a later attempt. Matching keys across the whole lineage
+// silently dropped nidus:issue-4's seq-8 abandon (2026-09-28) and wedged the record.
+function hasEvent(p, recordId, sequence) {
+  return eventLines(p).some((event) => event.recordId === recordId && event.sequence === sequence);
 }
 
 function appendEvent(p, event) {
-  if (hasEvent(p, event.recordId, event.sequence, event.idempotencyKey)) return;
+  if (hasEvent(p, event.recordId, event.sequence)) return;
   fs.mkdirSync(path.dirname(eventFile(p, event.at)), { recursive: true });
   fs.appendFileSync(eventFile(p, event.at), `${JSON.stringify(event)}\n`, 'utf8');
 }

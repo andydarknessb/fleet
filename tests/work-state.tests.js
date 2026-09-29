@@ -355,6 +355,33 @@ test('abandonment journal recovery stores one reusable snapshot and replays the 
   assert.equal(readEvents(root).filter((event) => event.recordId === id && event.type === 'assignment-abandoned').length, 1);
 });
 
+// 2026-09-28, nidus:issue-4: pl-nidus abandoned the same issue twice with the same key
+// ("pl-nidus:abandon-placeholder:4", seq 4 and seq 8). The record's idempotency map is
+// per attempt (a reserve starts it fresh), so the second abandon committed, but the event
+// ledger deduped on that key across every attempt and dropped seq 8. The abandon snapshot
+// then claimed seq 8 over a 7-event ledger, and every later reserve refused
+// ABANDON_NOT_REUSABLE until a hand repair.
+test('a caller key reused in a later attempt still appends that attempt\'s event, and the record stays reusable', () => {
+  const root = rootDir();
+  const id = 'nidus:issue-4';
+  const key = 'pl-nidus:abandon-placeholder:4';
+  reserveRecord({ root, id, tenant: 'nidus', issue: 4, manifestPath: 'm4-a', idempotencyKey: 'reserve-4-a', now: '2026-09-28T13:18:27.000Z' });
+  move(root, id, 1, 'escalated', 'escalate-4-a', 'pre-launch escalation', '2026-09-28T13:18:32.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: key, reason: 'pre-launch-escalation-ruled', now: '2026-09-28T13:50:01.000Z' });
+
+  const second = reserveRecord({ root, id, tenant: 'nidus', issue: 4, manifestPath: 'm4-b', idempotencyKey: 'reserve-4-b', now: '2026-09-28T17:19:56.000Z' });
+  move(root, id, second.revision, 'escalated', 'escalate-4-b', 'stale premises', '2026-09-28T17:20:05.000Z');
+  const again = abandonRecord({ root, id, expectedRevision: second.revision + 1, idempotencyKey: key, reason: 'pre-launch-placeholder-ruled', now: '2026-09-28T21:31:39.000Z' });
+  assert.equal(again.replayed, false);
+
+  const events = readEvents(root).filter((event) => event.recordId === id);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5, 6], 'the second attempt\'s abandon must reach the ledger');
+  assert.equal(events[5].type, 'assignment-abandoned');
+  const third = reserveRecord({ root, id, tenant: 'nidus', issue: 4, manifestPath: 'm4-c', idempotencyKey: 'reserve-4-c', now: '2026-09-29T14:00:00.000Z' });
+  assert.equal(third.record.state, 'assigned');
+  assert.equal(third.eventSequence, 7);
+});
+
 test('the CLI abandon door records the reason and permits a fresh reservation', () => {
   const root = rootDir();
   const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
