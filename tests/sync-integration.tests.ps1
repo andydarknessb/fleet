@@ -191,6 +191,57 @@ try {
   Assert-True ("$($d1.prUrl)" -eq 'https://github.com/owner/repo4/pull/424') 'the URL must be read from stdout alone, never corrupted by interleaved stderr chatter'
   $env:PATH = "$testRoot\mock-bin;$oldPath"
 
+  # --- Scenario E: every `gh pr create` value reaches gh as ONE argument. Windows
+  # --- PowerShell 5.1's Start-Process joins an -ArgumentList array with bare spaces, so
+  # --- the title "Reconcile main into integration" arrived as four arguments and gh
+  # --- refused it (live 2026-09-29 14:32Z: unknown arguments ["main" "into"
+  # --- "integration"]). The mock hands gh's raw command line to node, which splits it
+  # --- by the same Windows rules gh.exe uses, and records what arrived. TEMP holds a
+  # --- space too, so the body-file path is held to the same rule. ---
+  [IO.Directory]::CreateDirectory("$testRoot\mock-bin-argv") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\tmp with space") | Out-Null
+  Write-Utf8 "$testRoot\argv.js" ("require('fs').writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)));")
+  Write-Utf8 "$testRoot\mock-bin-argv\gh.cmd" (
+    '@echo off' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="list" (echo [] & exit /b 0)' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="create" (node "' + $testRoot + '\argv.js" "' + $testRoot + '\pr-create-argv.json" %* & echo https://github.com/owner/repo5/pull/555 & exit /b 0)' + "`r`n" +
+    'exit /b 0' + "`r`n"
+  )
+  $remoteE = "$testRoot\remoteE.git"; $repoE = "$testRoot\repoE"
+  Invoke-Git @('init', '--bare', '-q', $remoteE) | Out-Null
+  Invoke-Git @('clone', '-q', $remoteE, $repoE) | Out-Null
+  Invoke-Git @('-C', $repoE, 'config', 'user.email', 'a@b.com') | Out-Null
+  Invoke-Git @('-C', $repoE, 'config', 'user.name', 'a') | Out-Null
+  Invoke-Git @('-C', $repoE, 'checkout', '-q', '-b', 'main') | Out-Null
+  Invoke-Git @('-C', $repoE, 'commit', '-q', '--allow-empty', '-m', 'init') | Out-Null
+  Invoke-Git @('-C', $repoE, 'push', '-q', '-u', 'origin', 'main') | Out-Null
+  Invoke-Git @('-C', $repoE, 'checkout', '-q', '-b', 'integration') | Out-Null
+  Write-Utf8 "$repoE\release-only.txt" 'release content'
+  Invoke-Git @('-C', $repoE, 'add', '-A') | Out-Null
+  Invoke-Git @('-C', $repoE, 'commit', '-q', '-m', 'release-only change') | Out-Null
+  Invoke-Git @('-C', $repoE, 'push', '-q', '-u', 'origin', 'integration') | Out-Null
+  Invoke-Git @('-C', $repoE, 'checkout', '-q', 'main') | Out-Null
+  Write-Utf8 "$repoE\main-only.txt" 'main content'
+  Invoke-Git @('-C', $repoE, 'add', '-A') | Out-Null
+  Invoke-Git @('-C', $repoE, 'commit', '-q', '-m', 'main-only change') | Out-Null
+  Invoke-Git @('-C', $repoE, 'push', '-q', 'origin', 'main') | Out-Null
+  Write-Utf8 "$testRoot\tenants\e.json" (@{ name = 'e'; repo = $repoE; github = 'owner/repo5'; defaultBranch = 'main'; releaseBranch = 'integration' } | ConvertTo-Json -Compress)
+
+  $env:PATH = "$testRoot\mock-bin-argv;$oldPath"
+  $oldTemp = $env:TEMP; $oldTmp = $env:TMP
+  $env:TEMP = "$testRoot\tmp with space"; $env:TMP = "$testRoot\tmp with space"
+  try { $e1 = Run-Sync @('-Tenant', 'e') } finally { $env:TEMP = $oldTemp; $env:TMP = $oldTmp }
+  $env:PATH = "$testRoot\mock-bin;$oldPath"
+  Assert-True (Test-Path "$testRoot\pr-create-argv.json") 'the divergence must reach gh pr create'
+  # PS 5.1 ConvertFrom-Json emits a JSON array as ONE object; unroll it into strings.
+  [string[]]$argv = @((Get-Content "$testRoot\pr-create-argv.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
+  $titleAt = [array]::IndexOf($argv, '--title')
+  Assert-True ($titleAt -ge 0 -and $argv[$titleAt + 1] -eq 'Reconcile integration into main') "the title must arrive as one argument; gh saw: $($argv -join ' | ')"
+  $bodyAt = [array]::IndexOf($argv, '--body-file')
+  Assert-True ($bodyAt -ge 0 -and "$($argv[$bodyAt + 1])" -like '*tmp with space*') "the body-file path must arrive as one argument; gh saw: $($argv -join ' | ')"
+  Assert-True ($argv.Count -eq 12) "gh pr create must receive exactly its 12 arguments; gh saw $($argv.Count): $($argv -join ' | ')"
+  Assert-True ("$($e1.prUrl)" -eq 'https://github.com/owner/repo5/pull/555') 'the PR URL must still be read back'
+
   Write-Output 'sync-integration tests passed'
 } finally {
   $env:PATH = $oldPath

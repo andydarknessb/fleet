@@ -41,7 +41,10 @@ function New-ReconciliationPr {
   $errFile = [IO.Path]::GetTempFileName()
   try {
     [IO.File]::WriteAllText($bodyFile, $body, $script:Utf8)
-    $ghArgs = @('pr', 'create', '-R', $Repo, '--base', $Base, '--head', $Head, '--title', "Reconcile $Head into $Base", '--body-file', $bodyFile)
+    # One quoted command line, not an array: PS 5.1's Start-Process joins an
+    # -ArgumentList array with bare spaces, so the title reached gh as four
+    # arguments and gh refused the create (live 2026-09-29 14:32Z).
+    $ghArgs = (@('pr', 'create', '-R', $Repo, '--base', $Base, '--head', $Head, '--title', "Reconcile $Head into $Base", '--body-file', $bodyFile) | ForEach-Object { ConvertTo-ProcessArgument "$_" }) -join ' '
     $p = Start-Process -FilePath 'gh' -ArgumentList $ghArgs -NoNewWindow -PassThru -Wait -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     $exit = $p.ExitCode
     $stdout = ''; try { $stdout = Get-Content $outFile -Raw -ErrorAction SilentlyContinue } catch {}
@@ -100,7 +103,8 @@ if (-not $Apply) { Write-Output (@{ synced = $false; dryRun = $true; wouldFastFo
 $pushErrFile = [IO.Path]::GetTempFileName()
 $pushOutFile = [IO.Path]::GetTempFileName()
 try {
-  $p = Start-Process -FilePath 'git' -ArgumentList @('-C', $repo, 'push', '-q', 'origin', "origin/${rel}:refs/heads/$def") -NoNewWindow -PassThru -Wait -RedirectStandardOutput $pushOutFile -RedirectStandardError $pushErrFile
+  $pushArgs = (@('-C', $repo, 'push', '-q', 'origin', "origin/${rel}:refs/heads/$def") | ForEach-Object { ConvertTo-ProcessArgument "$_" }) -join ' '
+  $p = Start-Process -FilePath 'git' -ArgumentList $pushArgs -NoNewWindow -PassThru -Wait -RedirectStandardOutput $pushOutFile -RedirectStandardError $pushErrFile
   $ok = ($p.ExitCode -eq 0)
   $pushErrText = ''; try { $pushErrText = Get-Content $pushErrFile -Raw -ErrorAction SilentlyContinue } catch {}
 } finally { Remove-Item $pushOutFile, $pushErrFile -ErrorAction SilentlyContinue }
