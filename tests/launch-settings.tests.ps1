@@ -80,11 +80,12 @@ try {
 
   # #200 (spec #190): the real fleet-settings.json carries the auto-mode environment
   # statement (Cory's merge authorization, Nidus migrations local-only), and every
-  # role's per-session settings carry it verbatim after "$defaults".
+  # role's per-session settings carry it verbatim after "$defaults". (No sentinel case:
+  # the door copies the settings object the same way for every role.)
   $srcEnv = @((Get-Content "$sourceRoot\fleet-settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
   Assert-True ($srcEnv.Count -ge 3 -and $srcEnv[0] -eq '$defaults') 'fleet-settings.json autoMode.environment must inherit the built-in entries first'
-  Assert-True (@($srcEnv | Where-Object { $_ -match 'authorizes a fleet session' -and $_ -match 'not Merge Without Review' -and $_ -match 'release into main' }).Count -eq 1) 'the owner merge authorization must be stated once, with its conditions and its exclusions'
-  Assert-True (@($srcEnv | Where-Object { $_ -match 'Nidus #14' -and $_ -match 'local Supabase stack' }).Count -eq 1) 'Nidus migrations must be stated local-only until Nidus #14, once'
+  Assert-True (@($srcEnv | Where-Object { $_ -match 'authorizes a fleet session' -and $_ -match 'not Merge Without Review' -and $_ -match 'fleet-review' -and $_ -match 'every required check' -and $_ -match 'Endzone-Empire main' -and $_ -match 'Carve-out paths:' }).Count -eq 1) 'the owner merge authorization must be stated once, with its conditions, its exclusions and the carve-out paths'
+  Assert-True (@($srcEnv | Where-Object { $_ -match 'Nidus #14' -and $_ -match 'local stack' -and $_ -match 'supabase db push' -and $_ -match 'Cory''s' }).Count -eq 1) 'Nidus migrations must be stated local-only, with the remote commands left to Cory, once'
   [IO.File]::Copy("$sourceRoot\fleet-settings.json", "$testRoot\fleet-settings.json", $true)
   $envCases = @(
     @{ Name = 'dispatcher'; Args = @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun') },
