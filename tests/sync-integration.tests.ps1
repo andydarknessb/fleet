@@ -44,7 +44,7 @@ try {
     'if exist "' + $testRoot + '\pr-open.json" (type "' + $testRoot + '\pr-open.json") else (echo [])' + "`r`n" +
     'exit /b 0' + "`r`n" +
     ':create' + "`r`n" +
-    'echo x>> "' + $testRoot + '\pr-create-calls.log"' + "`r`n" +
+    'echo %*>> "' + $testRoot + '\pr-create-calls.log"' + "`r`n" +
     'echo {"number":501,"url":"https://github.com/owner/repo/pull/501"}> "' + $testRoot + '\pr-open.json"' + "`r`n" +
     'echo https://github.com/owner/repo/pull/501' + "`r`n" +
     'exit /b 0' + "`r`n"
@@ -86,6 +86,9 @@ try {
   Assert-True ("$($r2.prUrl)" -eq 'https://github.com/owner/repo/pull/501') 'the second tick must report the same PR'
   Assert-True (@(Get-Content "$testRoot\pr-create-calls.log").Count -eq $callsAfterFirst) 'idempotent: exactly one pr create call across two runs, not two'
   Assert-True (@(Get-Content "$testRoot\pr-create-calls.log").Count -eq 1) 'exactly one pr create call total'
+  # The live Watchdog escalated branch-diverged on every tick on 2026-09-29: Start-Process -ArgumentList
+  # does not quote an element with spaces, so gh read the title as extra arguments and refused.
+  Assert-True ((Get-Content "$testRoot\pr-create-calls.log" -Raw) -match '--title "Reconcile integration into main"') 'the reconciliation PR title must reach gh as one quoted argument'
 
   # --- Scenario B: a pure fast-forward that a pre-receive hook on the remote refuses. ---
   $remoteB = "$testRoot\remoteB.git"; $repoB = "$testRoot\repoB"
