@@ -25,12 +25,14 @@
 #      Bounded-authority flags are Cory's to create and remove, and the triage ledger is
 #      written by bin/triage.js, whose checks are the point. Edit/Write/NotebookEdit/
 #      MultiEdit on any path under state/flags/ or state/triage/ is refused, and so is a
-#      Bash/PowerShell segment that names a bounded-authority- flag or a state/triage/
-#      path unless its command word is read-only (cat, ls, dir, type, head, tail,
-#      Get-Content, Get-ChildItem, Test-Path, Get-Item, node), or that redirects into
-#      one, or that runs node -e/-p. Over-refusal is accepted; the refusal names the
-#      cause. node bin/triage.js bounded-scan (and the daily summary) never name the flag
-#      or the ledger path in their command line, so the scan's own write is unaffected.
+#      Bash/PowerShell unit (a pipeline is one unit) that names state/flags, state/triage
+#      or a bounded-a* glob unless every stage's command word is read-only (cat, ls, dir,
+#      type, head, tail, Get-Content, Get-ChildItem, Test-Path, Get-Item and plain filters
+#      such as grep or Select-Object), or that redirects into one; git clean/checkout/
+#      restore on state/ is refused; node passes only as node <fleet>/bin/triage.js.
+#      Over-refusal is accepted; the refusal names the cause. node bin/triage.js
+#      bounded-scan (and the daily summary) never name the flag or the ledger path in their
+#      command line, so the scan's own write is unaffected.
 #
 # Rollback: state/flags/principal-guard-off. Output contract: a deny is JSON on stdout
 # with permissionDecision "deny"; anything else is silence + exit 0. Never exit nonzero.
@@ -129,16 +131,38 @@ if (-not $reason -and $tool -in @('Edit', 'Write', 'NotebookEdit', 'MultiEdit'))
 if (-not $reason -and $tool -in @('Bash', 'PowerShell')) {
   $cmd2 = "$($inp.tool_input.command)"
   # Heredoc bodies are dropped (text a ticket quotes is not a command); quotes are NOT masked,
-  # since the paths this rule looks for are usually quoted.
+  # since the paths this rule looks for are usually quoted. The call is cut into units only at
+  # newline, ; && and ||: a pipeline is ONE unit, so a read-only first stage cannot launder the
+  # rest (ls state/flags | xargs rm). A unit that names a flag or the ledger is refused unless
+  # EVERY stage of it has a read-only command word, and never when it redirects into one.
+  # A name is state/flags or state/triage as a path component (end, space, quote, glob or a
+  # separator after it: rm -rf state/flags, mv state/triage x, Remove-Item state\flags\*) or any
+  # name beginning bounded-a (a glob over the flags). git clean/checkout/restore/reset/rm/mv on
+  # state/ is refused. node passes only as node <fleet>/bin/triage.js (never -e, never another
+  # script). ACCEPTED RESIDUE: a path assembled by string concatenation ('state/fl' + 'ags/...') or
+  # a script written to a file and run cannot be seen by a rule that reads the command line;
+  # Edit/Write, the ledger's door checks and Cory's review of the daily summary are the rest.
   $stripped2 = [regex]::Replace($cmd2, '<<-?\s*(["'']?)(\w+)\1[^\r\n]*\r?\n[\s\S]*?\r?\n[ \t]*\2[ \t]*(?=\r?\n|$)', '#heredoc-stripped')
-  $stateRx = 'bounded-authority-|state[\\/]triage[\\/]'
-  $readOnlyWords = @('cat', 'ls', 'dir', 'type', 'head', 'tail', 'Get-Content', 'Get-ChildItem', 'Test-Path', 'Get-Item', 'node')
-  foreach ($seg in [regex]::Split($stripped2, '\r?\n|;|&&|\|\||\||&|\(|\)')) {
-    if ($seg -notmatch $stateRx) { continue }
-    $word = ''
-    if ($seg -match '^\s*(?:\w+=\S*\s+)*(?<w>\S+)') { $word = "$($Matches['w'])" -replace '^["'']|["'']$', ''; $word = ([IO.Path]::GetFileName(($word -replace '\\', '/'))) -replace '\.exe$', '' }
-    $writes = ($seg -match ('>\s*["'']?\S*(' + $stateRx + ')')) -or (($word -eq 'node') -and ($seg -match '\s(-e|--eval|-p|--print)\b'))
-    if ($writes -or ($readOnlyWords -notcontains $word)) { $reason = $flagsCause; break }
+  $stateRx = '(?<![\w-])state[\\/](?:flags|triage)(?![\w.-])|bounded-a'
+  $readOnlyWords = @('cat', 'ls', 'dir', 'type', 'head', 'tail', 'Get-Content', 'Get-ChildItem', 'Test-Path', 'Get-Item',
+    'grep', 'rg', 'wc', 'sort', 'uniq', 'cut', 'findstr', 'Select-Object', 'Where-Object', 'Sort-Object', 'Measure-Object', 'Select-String')
+  foreach ($unit in [regex]::Split($stripped2, '\r?\n|;|&&|\|\|')) {
+    $git = $unit -match '(?:^|\s)git\s+(?:clean|checkout|restore|reset|rm|mv|stash)\b.*\bstate(?:[\\/]|\s|$|["''])'
+    if (-not ($git -or ($unit -match $stateRx))) { continue }
+    $bad = $git -or ($unit -match ('>\s*["'']?\S*(?:' + $stateRx + ')'))
+    if (-not $bad) {
+      foreach ($stage in ($unit -split '\|')) {
+        if ($stage -match '^\s*$') { continue }
+        $word = ''
+        if ($stage -match '^\s*(?:\w+=\S*\s+)*(?<w>\S+)') { $word = "$($Matches['w'])" -replace '^["'']|["'']$', ''; $word = ([IO.Path]::GetFileName(($word -replace '\\', '/'))) -replace '\.exe$', '' }
+        if ($word -eq 'node') {
+          if (($stage -notmatch '^\s*(?:\w+=\S*\s+)*\S+\s+["'']?[^\s"'']*[\\/]bin[\\/]triage\.js\b') -or ($stage -match '\s(-e|--eval|-p|--print)\b')) { $bad = $true; break }
+          continue
+        }
+        if ($readOnlyWords -notcontains $word) { $bad = $true; break }
+      }
+    }
+    if ($bad) { $reason = $flagsCause; break }
   }
 }
 
