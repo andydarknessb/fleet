@@ -309,7 +309,7 @@ test('#214: Waiting on Cory counts project lead and Principal session-hours and 
     'pl-endzone': { role: 'project-lead', hours: 1.3, episodes: 2 },
     'pl-nidus': { role: 'project-lead', hours: 0.5, episodes: 0 },
   });
-  assert.deepEqual(row.figures.dispatcherRepeats, { episodes: 3, hours: 1 }, 'the dispatcher: 30 + 15 + 15 min, reported and left out');
+  assert.deepEqual(row.figures.dispatcherWaits, { episodes: 3, hours: 1 }, 'the dispatcher: 30 + 15 + 15 min, reported and left out');
   assert.equal(row.status, 'n/a');
   assert.match(row.result, /3 session-hours in 4 episodes/);
   assert.match(row.result, /excluding the dispatcher's 3 episodes \(1 h\)/);
@@ -380,11 +380,35 @@ test('#214: IC idle share also reports the share of the week at the IC cap', () 
   const row = build(icFixture()).rows.find((r) => r.key === 'icIdleShare');
   // ic-1, ic-2 and ic-3 overlap 01:30-02:00 on 09-21: three at once for half an hour.
   assert.equal(row.figures.icCap, 3);
+  assert.equal(row.figures.icCapSource, 'config', 'no static roster.json: the scorecard.icCap default');
   assert.equal(row.figures.atCapHours, 0.5);
   assert.equal(row.figures.atCapShare, 0.003);
   assert.match(row.result, /no IC running 88\.1% of the week/);
-  assert.match(row.result, /at the cap of 3 for 0\.3%/);
+  assert.match(row.result, /at the cap of 3 \(config scorecard\.icCap\) for 0\.3%/);
   assert.match(row.result, /endzone 95\.2%, nidus 92\.9%/);
+});
+
+test('#214: the IC cap is the static roster cap less the static sessions the cap counts', () => {
+  const root = icFixture();
+  // The door's rule: cap.exemptNamePrefixes (pe-) neither count toward the cap nor are refused by it.
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ cap: { exemptNamePrefixes: ['pe-'] } }));
+  fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ cap: 4, sessions: [{ name: 'dispatcher', role: 'dispatcher' }, { name: 'pl-endzone', role: 'project-lead' }, { name: 'pe-endzone', role: 'principal' }] }));
+  const row = build(root).rows.find((r) => r.key === 'icIdleShare');
+  // Cap 4 less the dispatcher and the project lead: two ICs. ic-1/ic-2 then ic-2/ic-3 overlap from 01:00 to 03:00.
+  assert.equal(row.figures.icCap, 2);
+  assert.equal(row.figures.icCapSource, 'roster');
+  assert.equal(row.figures.atCapHours, 2);
+  assert.equal(row.figures.atCapShare, 0.012);
+  assert.match(row.result, /at the cap of 2 \(roster cap 4 less 2 static sessions\) for 1\.2%/);
+});
+
+test('#214: with the static roster unreadable the IC cap falls back to scorecard.icCap', () => {
+  const root = icFixture();
+  fs.writeFileSync(path.join(root, 'roster.json'), '{ not json');
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ scorecard: { icCap: 2 } }));
+  const row = build(root).rows.find((r) => r.key === 'icIdleShare');
+  assert.equal(row.figures.icCap, 2);
+  assert.equal(row.figures.icCapSource, 'config');
 });
 
 test('#214: IC idle share is unknown with no roster at all, and reads 100% for a week the roster covers with no IC', () => {
@@ -396,13 +420,57 @@ test('#214: IC idle share is unknown with no roster at all, and reads 100% for a
   assert.equal(row.figures.atCapShare, 0);
 });
 
-test('#214: an ask that changes inside a tick is two episodes that never overlap', () => {
+test('#214: an archive with no readable roster.json is unknown, never an archive-only reading', () => {
+  const root = icFixture();
+  fs.writeFileSync(path.join(root, 'state', 'roster.json'), '{ not json');
+  const row = build(root).rows.find((r) => r.key === 'icIdleShare');
+  assert.equal(row.status, 'unknown');
+  assert.match(row.result, /state\/roster\.json/);
+  fs.rmSync(path.join(root, 'state', 'roster.json'));
+  assert.equal(build(root).rows.find((r) => r.key === 'icIdleShare').status, 'unknown');
+});
+
+test('#214: a retired IC row with no retiredAt has no end to count and is skipped', () => {
+  const root = icFixture();
+  const archive = path.join(root, 'state', 'archive', 'roster-retired-full.jsonl');
+  fs.appendFileSync(archive, `${JSON.stringify({ name: 'ic-7', role: 'ic', tenant: 'endzone', status: 'retired', launchedAt: '2026-09-23T00:00:00Z' })}\n`);
+  const row = build(root).rows.find((r) => r.key === 'icIdleShare');
+  assert.equal(row.figures.noIcHours, 148);
+  assert.equal(row.figures.runs, 5);
+});
+
+test('#214: a reworded ask inside a continuous run is one episode', () => {
+  // A delivered page writes no new row while its key stands, so the ask text cannot split an episode.
   const root = fixtureWeek();
   fs.mkdirSync(path.join(root, 'state', 'pages'), { recursive: true });
   fs.writeFileSync(path.join(root, 'state', 'pages', 'pages.jsonl'), `${[otherPage('2026-09-20T00:00:00Z'), page('2026-09-22T12:00:05Z', 'pe-endzone', 'rule on #1'), page('2026-09-22T12:30:05Z', 'pe-endzone', 'rule on #2')].join('\n')}\n`);
   fs.writeFileSync(path.join(root, 'state', 'sentinel', 'shadow', '20260922.jsonl'), `${ticks('2026-09-22T12:00:00Z', 4).map((at) => shadowTick(at, ['human-wait:pe-endzone'])).join('\n')}\n`);
   const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
-  assert.deepEqual(row.figures.bySession, { 'pe-endzone': { role: 'principal', hours: 1, episodes: 2 } });
+  assert.deepEqual(row.figures.bySession, { 'pe-endzone': { role: 'principal', hours: 1, episodes: 1 } });
+});
+
+test('#214: a gap over the limit splits a wait into two episodes', () => {
+  const root = fixtureWeek();
+  fs.mkdirSync(path.join(root, 'state', 'pages'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'pages', 'pages.jsonl'), `${[otherPage('2026-09-20T00:00:00Z'), ...ticks('2026-09-22T12:00:00Z', 2).map((at) => page(at, 'pe-endzone', 'same')), page('2026-09-22T13:00:00Z', 'pe-endzone', 'same')].join('\n')}\n`);
+  const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
+  assert.deepEqual(row.figures.bySession, { 'pe-endzone': { role: 'principal', hours: 0.8, episodes: 2 } });
+});
+
+test('#214: Waiting on Cory is unknown when no Watchdog tick falls in the week', () => {
+  // The shadow log is written on every tick in live mode too; only the directory name is historical.
+  const root = waitFixture();
+  for (const name of fs.readdirSync(path.join(root, 'state', 'sentinel', 'shadow'))) fs.rmSync(path.join(root, 'state', 'sentinel', 'shadow', name));
+  const row = build(root).rows.find((r) => r.key === 'waitingOnCory');
+  assert.equal(row.status, 'unknown');
+  assert.match(row.result, /no Watchdog tick recorded in the week/);
+});
+
+test('#214: only the shadow files named for the days around the week are read', () => {
+  const root = waitFixture();
+  const before = build(root).rows.find((r) => r.key === 'waitingOnCory').figures.sessionHours;
+  fs.writeFileSync(path.join(root, 'state', 'sentinel', 'shadow', '20260701.jsonl'), `${ticks('2026-09-23T06:00:00Z', 4).map((at) => shadowTick(at, ['human-wait:pl-endzone'])).join('\n')}\n`);
+  assert.equal(build(root).rows.find((r) => r.key === 'waitingOnCory').figures.sessionHours, before, 'a file named for July is not read');
 });
 
 // #215 (spec #195): review pickup latency per unit, from the record entering review to the

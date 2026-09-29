@@ -326,16 +326,23 @@ function availabilityRow(base, week, settings) {
 // while a session's `needs` stands and Pushover is unconfigured or failing, and ONCE
 // when a page is delivered (a delivered page is deduped, so the row stops repeating and
 // the page log alone would read a delivered wait as one tick). So a wait's extent also
-// reads the Watchdog's own ticks (state/sentinel/shadow/*.jsonl), which list every
-// standing `human-wait:<session>` condition on every tick. An episode is a run of
-// ticks of one session with the same ask (a page row with another body opens a new one)
-// and no gap over waitGapMinutes; it runs from its first tick to its last tick plus one
-// tick, clipped to the week. A shadow-only tick inherits the ask of the page row before it.
-// The dispatcher relays the project leads' asks upward in its own words, so its rows repeat
-// theirs (audit F2). They are counted apart, in dispatcherRepeats, and left out of the row:
+// reads the Watchdog's own ticks (state/sentinel/shadow/*.jsonl: the directory name is
+// historical, the log is written on every tick in live mode too), which list every standing
+// `human-wait:<session>` condition on every tick. An episode is a run of ticks of one session
+// with no gap over waitGapMinutes; it runs from its first tick to its last tick plus one
+// tick, clipped to the week. The ask text does not split an episode: a delivered page
+// writes no new row while its key stands, so a reworded ask would split episodes in the
+// weeks before Pushover and not after. The first row's text is kept as the episode's body.
+// These are DETECTED waits: human-wait fires only once a session has been stale past the
+// watchdog threshold, so a wait is measured from its first tick, not from when the ask began.
+// The row is unknown when no Watchdog tick falls in the week. Only the shadow files named
+// for the days around the week, and the rows within a day of it, are read.
+// The dispatcher relays the project leads' asks upward in its own words, and adds asks of
+// its own (audit F2). Its waits are counted apart, in dispatcherWaits, and left out of the row:
 // on the audit's window (2026-09-23T21:17Z to 09-29) leaving them out reads 57% of the time
 // with a project lead or Principal waiting, and counting them reads 71%, the audit's two
 // figures. Only project leads and Principals are counted.
+const DAY_MS = 24 * HOUR_MS;
 const WAITING_ROLES = ['project-lead', 'principal'];
 
 function readJsonl(file) {
@@ -365,14 +372,13 @@ function waitEpisodes(observations, { tickMs, gapMs }) {
     let current = null;
     for (const seen of list) {
       const body = seen.body === null ? null : String(seen.body).trim();
-      const continues = current && seen.ms - current.last <= gapMs && (body === null || current.body === null || body === current.body);
-      if (!continues) { current = { name, start: seen.ms, last: seen.ms, body }; episodes.push(current); continue; }
+      if (!current || seen.ms - current.last > gapMs) { current = { name, start: seen.ms, last: seen.ms, body }; episodes.push(current); continue; }
       current.last = Math.max(current.last, seen.ms);
       if (current.body === null) current.body = body;
     }
   }
-  // An episode ends one tick after its last tick, or where the same session's next one starts
-  // (a new ask can open inside the last tick's span), so one session never overlaps itself.
+  // An episode ends one tick after its last tick, or where the same session's next one starts,
+  // so one session never overlaps itself even with a tick length above the gap.
   return episodes.map((episode, index) => {
     const next = episodes[index + 1];
     const end = episode.last + tickMs;
@@ -402,30 +408,39 @@ function waitingOnCoryRow(base, week, settings) {
   const observe = (name, ms, body) => { if (!observations.has(name)) observations.set(name, []); observations.get(name).push({ ms, body }); };
   for (const row of pageRows) {
     const key = String(row?.detail?.key || '');
-    if (row?.kind === 'human-wait' && key.startsWith('human-wait:') && Number.isFinite(Date.parse(row.at))) observe(key.slice('human-wait:'.length), Date.parse(row.at), row.body ?? '');
+    const at = Date.parse(row?.at || '');
+    if (row?.kind === 'human-wait' && key.startsWith('human-wait:') && at >= Date.parse(week.start) - DAY_MS && at < Date.parse(week.end) + DAY_MS) observe(key.slice('human-wait:'.length), at, row.body ?? '');
   }
+  const weekStart = Date.parse(week.start);
+  const weekEnd = Date.parse(week.end);
+  const readFrom = weekStart - DAY_MS;
+  const readTo = weekEnd + DAY_MS;
   const shadowDir = path.join(base, 'state', 'sentinel', 'shadow');
-  for (const name of fs.existsSync(shadowDir) ? fs.readdirSync(shadowDir).filter((entry) => entry.endsWith('.jsonl')).sort() : []) {
+  let ticksInWeek = 0;
+  for (const name of fs.existsSync(shadowDir) ? fs.readdirSync(shadowDir).filter((entry) => /^\d{8}\.jsonl$/.test(entry)).sort() : []) {
+    const day = Date.parse(`${name.slice(0, 4)}-${name.slice(4, 6)}-${name.slice(6, 8)}T00:00:00Z`);
+    if (!Number.isFinite(day) || day + DAY_MS <= readFrom || day >= readTo) continue;
     for (const tick of readJsonl(path.join(shadowDir, name)) || []) {
       const ms = Date.parse(tick?.at || '');
-      if (!Number.isFinite(ms) || !Array.isArray(tick.conditions)) continue;
+      if (!Number.isFinite(ms)) continue;
+      if (ms >= weekStart && ms < weekEnd) ticksInWeek += 1;
+      if (!Array.isArray(tick.conditions)) continue;
       for (const condition of tick.conditions) if (String(condition).startsWith('human-wait:')) observe(String(condition).slice('human-wait:'.length), ms, null);
     }
   }
+  if (!ticksInWeek) return { figures: { logStart: logStartText, ticks: 0 }, result: 'no Watchdog tick recorded in the week, so the waits cannot be measured', status: 'unknown' };
   const rosterRoles = new Map();
   for (const row of readJson(path.join(base, 'state', 'roster.json'), { sessions: [] }).sessions || []) if (row?.name && row.role) rosterRoles.set(row.name, String(row.role));
   const tickMs = settings.waitTickMinutes * 60000;
   const episodes = waitEpisodes(observations, { tickMs, gapMs: settings.waitGapMinutes * 60000 })
     .map((episode) => ({ ...episode, role: roleOfSession(episode.name, rosterRoles) }));
-  const weekStart = Date.parse(week.start);
-  const weekEnd = Date.parse(week.end);
   const clipped = (episode) => Math.max(0, Math.min(episode.end, weekEnd) - Math.max(episode.start, weekStart));
   const counted = [];
-  const repeats = { episodes: 0, ms: 0 };
+  const dispatcher = { episodes: 0, ms: 0 };
   for (const episode of episodes.filter((entry) => clipped(entry) > 0)) {
     if (episode.role === 'dispatcher') {
-      if (episode.start >= weekStart) repeats.episodes += 1;
-      repeats.ms += clipped(episode);
+      if (episode.start >= weekStart) dispatcher.episodes += 1;
+      dispatcher.ms += clipped(episode);
     } else if (WAITING_ROLES.includes(episode.role)) counted.push(episode);
   }
   const bySession = {};
@@ -445,13 +460,13 @@ function waitingOnCoryRow(base, week, settings) {
       sessionHours: hours(sessionMs),
       episodes: total,
       bySession: Object.fromEntries(Object.entries(bySession).sort(([a], [b]) => a.localeCompare(b)).map(([name, entry]) => [name, { role: entry.role, hours: hours(entry.ms), episodes: entry.episodes }])),
-      dispatcherRepeats: { episodes: repeats.episodes, hours: hours(repeats.ms) },
+      dispatcherWaits: { episodes: dispatcher.episodes, hours: hours(dispatcher.ms) },
       anyWaitingHours: hours(anyMs),
       anyWaitingShare: share,
       weekHours,
       logStart: logStartText,
     },
-    result: `at least one project lead or Principal waiting ${hours(anyMs)} of ${weekHours} h (${pct(share)}); ${hours(sessionMs)} session-hours in ${plural(total, 'episode')}, excluding the dispatcher's ${plural(repeats.episodes, 'episode')} (${hours(repeats.ms)} h)${partial}`,
+    result: `at least one project lead or Principal waiting ${hours(anyMs)} of ${weekHours} h (${pct(share)}); ${hours(sessionMs)} session-hours in ${plural(total, 'episode')}, excluding the dispatcher's ${plural(dispatcher.episodes, 'episode')} (${hours(dispatcher.ms)} h)${partial}`,
     status: 'n/a',
   };
 }
@@ -464,14 +479,30 @@ function waitingOnCoryRow(base, week, settings) {
 // week (168 h), not against the span the archive happens to cover: the archive reaches
 // back to the first launch, so an unclipped run or a whole-history denominator reads a
 // week that opened with ICs already running, or one the archive barely covers, wrong.
-// The cap is `scorecard.icCap`: the global six-session cap less the dispatcher and the two
-// project leads, Principals being cap-exempt (config/cycle.json cap.exemptNamePrefixes).
+// The IC cap is what the launch door leaves for ICs: the static roster's (<root>/roster.json)
+// `cap` less the static sessions the cap counts (cap.exemptNamePrefixes in config/cycle.json,
+// the Principal's `pe-`, neither count toward it nor are refused by it; absent config exempts
+// nothing). Only when that roster is unreadable does `scorecard.icCap` stand in.
+function icCapOf(base, settings) {
+  const staticRoster = readJson(path.join(base, 'roster.json'), null);
+  const cap = Number(staticRoster?.cap);
+  if (Number.isFinite(cap) && Array.isArray(staticRoster.sessions)) {
+    const exempt = ((readJson(path.join(base, 'config', 'cycle.json'), {}) || {}).cap || {}).exemptNamePrefixes;
+    const prefixes = Array.isArray(exempt) ? exempt.map(String).filter(Boolean) : [];
+    const counted = staticRoster.sessions.filter((row) => row?.name && !prefixes.some((prefix) => String(row.name).startsWith(prefix))).length;
+    if (cap - counted >= 1) return { cap: cap - counted, source: 'roster', label: `roster cap ${cap} less ${plural(counted, 'static session')}` };
+  }
+  return { cap: settings.icCap, source: 'config', label: 'config scorecard.icCap' };
+}
+
 function icIdleRow(base, week, settings) {
   const { loadRetiredRows, mergeSessionRows } = require('./measure-cycle');
   const roster = readJson(path.join(base, 'state', 'roster.json'), null);
   const retired = loadRetiredRows(path.join(base, 'state', 'archive', 'roster-retired-full.jsonl'));
-  if (!roster && retired.missing) return { figures: { sources: 0 }, result: 'no roster or roster archive to read IC runs from', status: 'unknown' };
-  const liveRows = Array.isArray(roster) ? roster : (roster?.sessions || []);
+  // The archive only holds retired rows: without the live roster the ICs running now are unknown.
+  const liveRows = Array.isArray(roster) ? roster : (Array.isArray(roster?.sessions) ? roster.sessions : null);
+  if (!liveRows) return { figures: { sources: 0 }, result: 'no readable state/roster.json to read the running ICs from', status: 'unknown' };
+  const icCap = icCapOf(base, settings);
   const weekStart = Date.parse(week.start);
   const weekEnd = Date.parse(week.end);
   const runs = [];
@@ -504,15 +535,15 @@ function icIdleRow(base, week, settings) {
   const weekHours = weekMs / HOUR_MS;
   const share = (ms) => Math.round((ms / weekMs) * 1000) / 1000;
   const idleMs = weekMs - sweep(runs, 1);
-  const atCapMs = sweep(runs, settings.icCap);
+  const atCapMs = sweep(runs, icCap.cap);
   const byTenant = {};
   for (const tenant of tenants) {
     const tenantIdle = weekMs - sweep(runs.filter((run) => run.tenant === tenant), 1);
     byTenant[tenant] = { noIcHours: hours(tenantIdle), noIcShare: share(tenantIdle) };
   }
   return {
-    figures: { weekHours, noIcHours: hours(idleMs), noIcShare: share(idleMs), byTenant, icCap: settings.icCap, atCapHours: hours(atCapMs), atCapShare: share(atCapMs), runs: runs.length },
-    result: `no IC running ${pct(share(idleMs))} of the week${tenants.length ? ` (${tenants.map((tenant) => `${tenant} ${pct(byTenant[tenant].noIcShare)}`).join(', ')})` : ''}; at the cap of ${settings.icCap} for ${pct(share(atCapMs))}`,
+    figures: { weekHours, noIcHours: hours(idleMs), noIcShare: share(idleMs), byTenant, icCap: icCap.cap, icCapSource: icCap.source, atCapHours: hours(atCapMs), atCapShare: share(atCapMs), runs: runs.length },
+    result: `no IC running ${pct(share(idleMs))} of the week${tenants.length ? ` (${tenants.map((tenant) => `${tenant} ${pct(byTenant[tenant].noIcShare)}`).join(', ')})` : ''}; at the cap of ${icCap.cap} (${icCap.label}) for ${pct(share(atCapMs))}`,
     status: 'n/a',
   };
 }
