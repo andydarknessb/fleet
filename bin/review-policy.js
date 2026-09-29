@@ -300,6 +300,9 @@ const RESOLUTION_LIKE_FIELDS = Object.freeze(['outcome', 'resolution']);
 // kebab-case category; carried findings are history and keep what they say.
 const SEVERITIES = Object.freeze(['blocker', 'major', 'minor', 'nit']);
 const CATEGORY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// Spec fleet #193 (#211): the one category with a meaning beyond its name, the mark bin/bounded-authority.js
+// reads on a send-back. It is a kebab-case string like any other; naming it is the lead's judgement.
+const CRITERIA_CATEGORY = 'criteria-defect';
 
 function validateSuppliedFinding(finding, index) {
   const name = finding && finding.id ? `${finding.id} (#${index + 1})` : `#${index + 1}`;
@@ -310,7 +313,7 @@ function validateSuppliedFinding(finding, index) {
     throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has severity ${finding.severity === undefined ? '(none)' : `'${finding.severity}'`}; severity is one of ${SEVERITIES.join(', ')} (#117)`, { finding: finding.id || index + 1, field: 'severity', allowed: SEVERITIES });
   }
   if (typeof finding.category !== 'string' || !CATEGORY_PATTERN.test(finding.category)) {
-    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has category ${finding.category === undefined ? '(none)' : `'${finding.category}'`}; category is a non-empty kebab-case string such as correctness, test-coverage or docs-drift (#117)`, { finding: finding.id || index + 1, field: 'category' });
+    throw new ReviewPolicyError('INVALID_FINDING', `finding ${name} has category ${finding.category === undefined ? '(none)' : `'${finding.category}'`}; category is a non-empty kebab-case string such as correctness, test-coverage, docs-drift or criteria-defect (the ticket's criteria were wrong or ambiguous: on a ticket the Principal readied under Bounded authority a send-back over such a finding suspends that authority, #211) (#117)`, { finding: finding.id || index + 1, field: 'category' });
   }
 }
 
@@ -1207,6 +1210,7 @@ if (require.main === module) {
 
 module.exports = {
   CLASSIFY_FLAGS,
+  CRITERIA_CATEGORY,
   COMMAND_FLAGS,
   ReviewPolicyError,
   SEVERITIES,

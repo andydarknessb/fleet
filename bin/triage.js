@@ -406,10 +406,14 @@ function normalizeIssue(issue) {
     openSubIssues,
     comments: normalizeComments(issue.comments),
     commentsTruncated: Boolean(issue.commentsTruncated || issue.comments?.pageInfo?.hasPreviousPage),
+    // Spec fleet #193 (M4): GitHub's own blocked-by edges. The bounded door refuses an OPEN one; a
+    // truncated list counts as one, since an edge it did not see may be open.
+    blockedBy: (Array.isArray(issue.blockedBy) ? issue.blockedBy : issue.blockedBy?.nodes || []).map((node) => ({ number: Number(node.number), state: String(node.state || 'OPEN').toUpperCase() })),
+    blockedByTruncated: Boolean(issue.blockedByTruncated || issue.blockedBy?.pageInfo?.hasNextPage),
   };
 }
 
-const ISSUE_QUERY = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,lastEditedAt,author{login},labels(first:20){nodes{name}},assignees(first:20){nodes{login}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(last:100){nodes{id,url,body,createdAt,lastEditedAt,author{login}} pageInfo{hasPreviousPage}}} pageInfo{hasNextPage,endCursor}}}}';
+const ISSUE_QUERY = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,lastEditedAt,author{login},labels(first:20){nodes{name}},assignees(first:20){nodes{login}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},blockedBy(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(last:100){nodes{id,url,body,createdAt,lastEditedAt,author{login}} pageInfo{hasPreviousPage}}} pageInfo{hasNextPage,endCursor}}}}';
 
 function queryGithubIssues({ repo, executable = 'gh', runner = execFileSync } = {}) {
   const [owner, name] = String(repo || '').split('/');
@@ -489,6 +493,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
   const approvals = [];
   const vetoes = [];
+  const repairs = [];
   const tickets = [];
   const skipped = [];
 
@@ -524,9 +529,17 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       continue;
     }
 
+    // 0b. (#210, ruling m2) A standing bounded ready whose ready label is missing and that the owner
+    // has not spoken on since: the label edit after the ledger row failed. Re-running
+    // `bounded-ready --issue <n>` re-applies the label, records nothing and pages nothing.
+    if (standing && !labels.has(readyLabel) && !ownerComments.some((comment) => Date.parse(comment.createdAt) > Date.parse(standing.at))) {
+      repairs.push({ kind: 'bounded-repair', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, readyAt: standing.at, reason: `bounded ready recorded at ${standing.at}, but ${readyLabel} is not on the issue` });
+      continue;
+    }
+
     // 1. An open proposal with the owner's Approved comment after it: finalize first.
     if (proposed) {
-      const approval = ownerComments.filter((comment) => comment.createdAt > proposed.at && APPROVAL_RE.test(comment.body)).pop();
+      const approval = ownerComments.filter((comment) => comment.createdAt > approvalFloor(row) && APPROVAL_RE.test(comment.body)).pop();
       if (approval) {
         approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: !isExactApproval(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
         continue;
@@ -599,11 +612,11 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
-    eligible: [...vetoes, ...approvals, ...escalationList, ...tickets],
+    eligible: [...vetoes, ...repairs, ...approvals, ...escalationList, ...tickets],
     proposeNow,
     skipped,
     premises,
-    counts: { issues: issues.length, eligible: vetoes.length + approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length, vetoes: vetoes.length },
+    counts: { issues: issues.length, eligible: vetoes.length + repairs.length + approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length, vetoes: vetoes.length, repairs: repairs.length },
   };
 }
 
@@ -639,6 +652,16 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
     }
   }
   return { tenant: String(tenant), issue: number, bodyHash: sha256(body || '') };
+}
+
+// Spec fleet #193 (m4): an Approval counts only when newer than the proposal AND newer than the
+// newest `veto` row of the issue. A Veto puts a proposal back to awaiting Approval, so an
+// `Approved` that came before it (said of the bounded ready, or of the proposal it replaced)
+// must not finalize what the owner then withdrew.
+function approvalFloor(row) {
+  const proposedAt = row && row.proposed ? String(row.proposed.at) : '';
+  const veto = ((row && row.history) || []).filter((entry) => entry.kind === 'veto' && String(entry.at) >= proposedAt).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  return veto > proposedAt ? veto : proposedAt;
 }
 
 // ------------------------------------------------------------- finalize ----
@@ -682,7 +705,7 @@ const FINALIZE_ACTOR = 'finalize-script';
 const FINALIZE_CAP = 5;
 const CLAIM_EXPIRY_MINUTES = 30;
 const NEVER_FINALIZED_LABELS = Object.freeze(['held', 'haiku-rehearsal']);
-const FIELD_KEY_RE = /^([A-Z][A-Za-z_ ]*?):[ \t]*(.*?)[ \t]*$/;
+const FIELD_KEY_RE = /^([A-Z][A-Za-z_ -]*?):[ \t]*(.*?)[ \t]*$/;   // the hyphen is for `Red-tell`
 
 // The one proposal parser. A field is a `Name:` line at column 0; its value is the text after
 // the colon plus every continuation line (indented, blank lines between them skipped), joined
@@ -925,7 +948,7 @@ function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath
     const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
     if (!proposed) continue;
     // The same rule the frontier uses for "an approval": the owner's newest approval-shaped comment after the proposal.
-    const approval = issue.comments.filter((comment) => comment.author === owner && comment.createdAt > proposed.at && APPROVAL_RE.test(comment.body)).pop();
+    const approval = issue.comments.filter((comment) => comment.author === owner && comment.createdAt > approvalFloor(row) && APPROVAL_RE.test(comment.body)).pop();
     if (!approval) continue;
     const leave = (reason, detail) => left.push(detail ? { issue: issue.number, reason, detail } : { issue: issue.number, reason });
 
@@ -979,6 +1002,7 @@ function cli(argv) {
   const args = parseArgs(rest, flags);
   const tenant = requireText(args.tenant, '--tenant');
   if (command === 'frontier') return computeFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
+  if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.now && !args.fixture) throw new WorkStateError('USAGE', `--now is for a fixture run only: the ledger's \`at\` and the Veto window are the wall clock in production (${command})`);
   if (command === 'bounded-scan') return require('./bounded-authority').boundedScan({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now });
   if (command === 'bounded-ready' || command === 'veto') {
     const door = require('./bounded-authority');
@@ -1014,11 +1038,13 @@ if (require.main === module) {
 module.exports = {
   APPROVAL_RE,
   BOUNDED_KINDS,
+  VERIFIED_PREMISE_RE,
   DEFAULT_CONFIG,
   LEDGER_KINDS,
   TRIAGE_FLAGS,
   cli,
   computeFrontier,
+  exactField,
   finalizeApprovals,
   parseProposal,
   proposalGate,
@@ -1030,7 +1056,9 @@ module.exports = {
   projectTriage,
   queryGithubIssues,
   readFixtureIssues,
+  readHeldIssues,
   readLedger,
+  readOutbox,
   readTenantConfig,
   readTriageConfig,
   recordEntry,

@@ -62,21 +62,32 @@ function standingSuspensions(root) {
 }
 
 // ------------------------------------------------------- the bounded-ready door ----
-// Spec fleet #193 (#210). `triage.js bounded-ready` records a bounded ready only when
-// every condition of the class holds, and otherwise refuses naming each one that does
-// not. The class is ADR 0011's amendment: a bug with a reproducible Red-tell that needs
-// no Ruling, has nothing open for Cory, touches no carve-out or risk-trigger path, has a
-// haiku or sonnet Tier and verified premises; plus the tenant's flag, no suspension and
-// fewer than DAILY_CAP readies that Central day. The door judges what a script can read
-// off the proposal comment; that the Red-tell really is reproducible is the Principal's
-// judgement, made before it calls the door (agents/principal.md).
+// Spec fleet #193 (#210). The door acts with no word from Cory, so it is never looser than
+// #207's finalize predicate on any clause (ruling on the QA of #209 to #211, 2026-09-29):
+//
+//   bounded = triage.js proposalGate() failures  +  the bounded-only clauses below
+//
+// proposalGate is #207's clauses 1 and 4 to 9, one function: open proposal, proposal identity,
+// not edited, body hash and \`## Premises\` heading, not an escalation ruling (fail closed),
+// whole-field Classification/Open for Cory/Blocked_by/Tier, a Ruling field, labels, holds.
+// The bounded-only clauses, each a whole field (trimmed, one trailing full stop allowed):
+//   Classification exactly bug; Ruling exactly \`none needed\`; a Red-tell and a Repro that are
+//   not placeholders (the mechanical proxy for "reproducible"; the Principal's judgement is
+//   the rest); Scope naming only repo paths (that exist, outside every carve-out and
+//   risk-trigger path, in no file whose content matches a risk-trigger pattern); premises
+//   that match the ticket body's own; no owner comment after the proposal; no earlier
+//   bounded-ready or veto row for the issue, ever (one bounded attempt per issue); no Work
+//   record for the issue; no open blocked-by edge; the tenant flag; no suspension; the cap.
+// Every failure carries a code; the door refuses on the whole list and never fails open.
 
-const PROPOSAL_FIELDS = ['Classification', 'Root cause', 'Ruling', 'Red-tell', 'Repro', 'Scope', 'Premises', 'Blocked_by', 'Tier', 'Precedent', 'Open for Cory', 'Escaped from'];
+const PLACEHOLDER = /^(?:none|n\/?a|tbd|todo|unknown|not (?:yet )?(?:known|reproducible))\.?$/i;
+// Whole-field words the ruling asks for, compared after a trailing full stop is dropped.
+const exact = (parsed, name) => triage().exactField(parsed, name);
 
 function refused(conditions) {
-  const first = conditions[0];
-  const list = conditions.map((entry) => `${entry.code}: ${entry.detail}`).join('; ');
-  return new WorkStateError('BOUNDED_REFUSED', `bounded ready refused (${list})`, { condition: first.code, conditions });
+  const plain = [...conditions].map((entry) => ({ code: entry.code, detail: entry.detail }));
+  const list = plain.map((entry) => `${entry.code}: ${entry.detail || entry.code}`).join('; ');
+  return new WorkStateError('BOUNDED_REFUSED', `bounded ready refused (${list})`, { condition: plain[0].code, conditions: plain });
 }
 
 function isoOf(value) {
@@ -91,97 +102,173 @@ function issueNumberOf(value) {
   return number;
 }
 
-// The proposal comment's fields (principal.md's shape): { Classification: 'bug', ... },
-// each value its own line and the lines under it, trimmed. null when the comment is no proposal.
-function parseProposal(body) {
-  const lines = String(body || '').split(/\r?\n/);
-  const start = lines.findIndex((line) => /^\s*##\s*Triage proposal\b/i.test(line));
-  if (start < 0) return null;
-  const collected = {};
-  let current = null;
-  for (const line of lines.slice(start + 1)) {
-    const match = /^([A-Za-z_][A-Za-z_ -]*?):[ \t]*(.*)$/.exec(line);
-    const name = match && PROPOSAL_FIELDS.find((field) => field.toLowerCase() === match[1].trim().toLowerCase());
-    if (name && !(name in collected)) { current = name; collected[name] = [match[2]]; continue; }
-    if (current) collected[current].push(line);
-  }
-  return Object.fromEntries(Object.entries(collected).map(([name, values]) => [name, values.join('\n').trim()]));
+// --- the tenant checkout at origin/<defaultBranch>: what a Scope path must exist in ---
+
+// { has(dir) -> bool, read(file) -> string|null } over the tenant checkout's local ref (staleness
+// accepted, ruling M5). A directory that git cannot show does not exist; a file it cannot show has
+// no content to test against the risk patterns (a Scope may name a file the fix will create).
+function gitRepo(tenantConfig) {
+  const dir = tenantConfig && tenantConfig.repo;
+  if (!dir) return null;
+  const branch = tenantConfig.defaultBranch || 'integration';
+  const git = (args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
+  return {
+    has(directory) { try { git(['cat-file', '-e', `origin/${branch}:${directory}`]); return true; } catch { return false; } },
+    read(file) { try { return git(['show', `origin/${branch}:${file}`]); } catch { return null; } },
+  };
 }
 
-// Files named by a Scope value: any token with a `/` or a `.`, stripped of the fences
-// and punctuation prose puts around it. A directory or a glob is not a file the door can
-// place against the carve-outs, so it is reported apart.
-function scopeTokens(scope) {
-  const tokens = String(scope || '').split(/[\s,;]+/)
-    .map((token) => token.replace(/^[`"'(\[]+|[`"')\].,:;!?]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, ''))
-    .filter(Boolean);
-  const files = [];
-  const unplaceable = [];
-  for (const token of tokens) {
-    if (!/[/.]/.test(token)) continue;
-    if (token.endsWith('/') || /[*?{}[\]]/.test(token)) unplaceable.push(token); else files.push(token);
-  }
-  return { tokens, files: [...new Set(files)], unplaceable: [...new Set(unplaceable)] };
-}
-
-const PLACEHOLDER = /^(?:none|n\/?a|tbd|todo|unknown|not (?:yet )?(?:known|reproducible))\b/i;
-
-// The class conditions read off one proposal: [{ code, detail }] for each that fails.
-function checkBoundedClass({ proposal, premisesSha, tenantConfig = {} } = {}) {
-  const failures = [];
-  const fail = (code, detail) => failures.push({ code, detail });
-  const first = (name) => String((proposal && proposal[name]) || '').split('\n')[0].trim();
-  if (!/^bug\.?$/i.test(first('Classification'))) fail('not-a-bug', `Classification is "${first('Classification') || 'missing'}", not "bug"`);
-  const redTell = String((proposal && proposal['Red-tell']) || '').trim();
-  if (!redTell || PLACEHOLDER.test(redTell)) fail('no-red-tell', 'the proposal names no Red-tell, and a bounded bug needs a reproducible one');
-  if (!/^none needed\.?$/i.test(first('Ruling'))) fail('ruling-needed', `Ruling is "${first('Ruling') || 'missing'}", not "none needed"`);
-  if (!/^none\.?$/i.test(first('Open for Cory'))) fail('open-for-cory', `Open for Cory is "${first('Open for Cory') || 'missing'}", not "none"`);
-  const tier = first('Tier');
-  if (!/^(?:haiku|sonnet)\b/i.test(tier) || /\b(?:opus|fable)\b|\|/i.test(tier)) fail('tier', `Tier is "${tier || 'missing'}"; a bounded ready is haiku or sonnet`);
-
-  // Premises: every line verified at the sha recorded with the proposal, none false.
-  const premises = String((proposal && proposal.Premises) || '').trim();
-  if (!premises) fail('premises-unverified', 'the proposal has no Premises field; write "none stated" or the verified lines');
-  else if (!/^none(?: stated)?\.?$/i.test(premises)) {
-    const recorded = premisesSha ? String(premisesSha).toLowerCase() : null;
-    for (const line of premises.split('\n').map((entry) => entry.trim()).filter(Boolean)) {
-      const stamp = /\bverified @([0-9a-f]{7,40})\s*$/i.exec(line);
-      if (/\bfalse:/i.test(line)) fail('premises-unverified', `a premise is marked false: ${line}`);
-      else if (!stamp) fail('premises-unverified', `a premise is not stamped "verified @<sha>": ${line}`);
-      else if (!recorded) fail('premises-unverified', `the proposal was recorded without --premises-sha, so "verified @${stamp[1]}" names no proposal sha`);
-      else if (!(recorded.startsWith(stamp[1].toLowerCase()) || stamp[1].toLowerCase().startsWith(recorded))) fail('premises-unverified', `a premise is verified @${stamp[1]}, not at the recorded --premises-sha ${recorded}`);
-    }
-  }
-
-  // Scope: named files only, none in a carve-out or a risk-trigger path.
-  const { matchGlob } = require('./review-policy');
-  const carveOuts = Array.isArray(tenantConfig.carveOuts) ? tenantConfig.carveOuts : [];
-  const riskTriggers = tenantConfig.riskTriggers && typeof tenantConfig.riskTriggers === 'object' ? tenantConfig.riskTriggers : {};
-  if (!carveOuts.length && !Object.keys(riskTriggers).length) {
-    fail('tenant-no-carve-outs', `tenant ${tenantConfig.name || '?'} declares no carveOuts and no riskTriggers, so no Scope can be shown to be outside them`);
-    return failures;
-  }
-  const scope = scopeTokens(proposal && proposal.Scope);
-  if (scope.unplaceable.length) fail('scope-unresolved', `Scope names a directory or a pattern (${scope.unplaceable.join(', ')}); name the files, so each can be checked against the carve-outs`);
-  else if (!scope.files.length) fail('scope-unresolved', 'Scope names no file the door can check against the carve-outs');
-  for (const token of scope.tokens) {
-    for (const glob of carveOuts) {
-      if (matchGlob(glob, token)) fail('scope-carve-out', `Scope names ${token}, inside the carve-out ${glob}`);
-    }
-    for (const [name, spec] of Object.entries(riskTriggers)) {
-      for (const glob of (spec && spec.paths) || []) {
-        if (matchGlob(glob, token)) fail('scope-risk-path', `Scope names ${token}, inside the ${name} risk-trigger path ${glob}`);
-      }
-    }
-  }
-  return failures;
+// A fixture file is an issues array, or { issues, tree: [dirs], files: { path: content } }: the
+// `tree` and `files` stand in for the tenant checkout in a test or a rehearsal.
+function readFixture(file) {
+  const { readFixtureIssues, normalizeIssue } = triage();
+  const parsed = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8').replace(/^﻿/, ''));
+  if (Array.isArray(parsed)) return { issues: readFixtureIssues(file), repo: null };
+  const tree = new Set((parsed.tree || []).map((dir) => String(dir).replace(/\/+$/, '')));
+  const files = parsed.files || {};
+  return {
+    issues: (parsed.issues || []).map((entry) => normalizeIssue(entry)),
+    repo: parsed.tree || parsed.files ? { has: (dir) => tree.has(dir), read: (name) => (Object.prototype.hasOwnProperty.call(files, name) ? String(files[name]) : null) } : null,
+  };
 }
 
 function loadIssues({ tenantConfig, fixture, issues, runner }) {
-  const { readFixtureIssues, normalizeIssue, queryGithubIssues } = triage();
-  if (issues) return issues.map((entry) => normalizeIssue(entry));
-  if (fixture) return readFixtureIssues(fixture);
-  return queryGithubIssues({ repo: tenantConfig.github, runner });
+  const { normalizeIssue, queryGithubIssues } = triage();
+  if (issues) return { issues: issues.map((entry) => normalizeIssue(entry)), repo: null };
+  if (fixture) return readFixture(fixture);
+  return { issues: queryGithubIssues({ repo: tenantConfig.github, runner }), repo: null };
+}
+
+// --- Scope (ruling M5, M6) ---
+
+// Each token of a Scope field that could name a file (it holds a `/` or a `.`), stripped of the
+// fences and punctuation prose puts around it, backslashes made slashes. A token is a repo path
+// only when it is repo-relative with a directory in it (see checkScope).
+function scopeTokens(scope) {
+  return String(scope || '').split(/[\s,;]+/)
+    .map((token) => token.replace(/^[`"'(\[]+|[`"')\].,:;!?]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, ''))
+    .filter((token) => token && /[/.]/.test(token));
+}
+
+function patternRegExp(pattern) {
+  try { return new RegExp(pattern); } catch { return new RegExp(String(pattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')); }
+}
+
+function checkScope({ scope, tenantConfig, repo }) {
+  const failures = [];
+  const fail = (code, detail) => failures.push({ code, detail });
+  const { matchGlob } = require('./review-policy');
+  const carveOuts = Array.isArray(tenantConfig.carveOuts) ? tenantConfig.carveOuts : [];
+  const riskTriggers = tenantConfig.riskTriggers && typeof tenantConfig.riskTriggers === 'object' ? tenantConfig.riskTriggers : {};
+  if (!carveOuts.length && !Object.keys(riskTriggers).length) { fail('tenant-no-carve-outs', `tenant ${tenantConfig.name || '?'} declares no carveOuts and no riskTriggers, so no Scope can be shown to be outside them`); return { failures, files: [] }; }
+  const files = [];
+  for (const token of scopeTokens(scope)) {
+    const bare = token.replace(/:\d+(?:-\d+)?$/, '');   // a line suffix is a citation, not part of the path
+    if (bare.endsWith('/') || /[*?{}[\]]/.test(bare)) { fail('scope-unresolved', `${token} is a directory or a pattern; name the files`); continue; }
+    if (/^\/|^[A-Za-z]:|^~/.test(bare) || bare.split('/').includes('..')) { fail('scope-unresolved', `${token} is not a repo-relative path`); continue; }
+    if (!bare.includes('/')) { fail('scope-unresolved', `${token} names no directory, so no path in the repository; write the full path`); continue; }
+    if (!repo) { fail('scope-unresolved', `no tenant checkout to confirm ${token} against`); continue; }
+    if (!repo.has(bare.slice(0, bare.lastIndexOf('/')))) { fail('scope-unresolved', `${token}: its directory does not exist at origin/${tenantConfig.defaultBranch || 'integration'}`); continue; }
+    files.push(bare);
+  }
+  if (!files.length && !failures.length) fail('scope-unresolved', 'Scope names no file the door can check against the carve-outs');
+  for (const file of [...new Set(files)]) {
+    for (const glob of carveOuts) if (matchGlob(glob, file)) fail('scope-carve-out', `Scope names ${file}, inside the carve-out ${glob}`);
+    for (const [name, spec] of Object.entries(riskTriggers)) {
+      for (const glob of (spec && spec.paths) || []) if (matchGlob(glob, file)) fail('scope-risk-path', `Scope names ${file}, inside the ${name} risk-trigger path ${glob}`);
+    }
+    // For the bounded door a file whose current content matches a risk-trigger pattern is a risk-trigger path.
+    const content = repo ? repo.read(file) : null;
+    if (content !== null && content !== undefined) {
+      for (const [name, spec] of Object.entries(riskTriggers)) {
+        const hit = ((spec && spec.patterns) || []).find((pattern) => patternRegExp(pattern).test(content));
+        if (hit) fail('scope-risk-pattern', `Scope names ${file}, whose content matches the ${name} risk-trigger pattern ${hit}`);
+      }
+    }
+  }
+  return { failures, files: [...new Set(files)] };
+}
+
+// --- premises (ruling M7): the proposal's block restates the ticket body's own, verified ---
+
+function checkPremises({ proposal, issue, premisesSha }) {
+  const { VERIFIED_PREMISE_RE } = triage();
+  const { readPremises } = require('./premises');
+  const fail = (detail) => [{ code: 'premises-unverified', detail }];
+  const body = readPremises(issue.body);
+  if (body.premisesError) return fail(`the ticket body's ## Premises section does not parse: ${body.premisesError.message}`);
+  if (body.premises === null) return [];   // no heading: proposalGate's no-premises-heading says so
+  const lines = proposal.premises;
+  if (body.premises.length === 0) {
+    return lines === null && /^none(?: stated)?\.?$/i.test(String(proposal.fields.Premises || '').trim()) ? [] : fail('the ticket body states no premises, and the proposal must say "none stated"');
+  }
+  if (!lines || lines.length !== body.premises.length) return fail(`the ticket body states ${body.premises.length} premise(s) and the proposal's Premises block must hold exactly that many verified lines, holding ${lines ? lines.length : 0}`);
+  const recorded = premisesSha ? String(premisesSha).toLowerCase() : null;
+  if (!recorded) return fail('the proposal was recorded without --premises-sha, so "verified @<sha>" names no proposal sha');
+  const unmatched = new Set(body.premises.map((premise) => premise.path));
+  for (const line of lines) {
+    if (/ false:/.test(line)) return fail(`a premise is marked false: ${line}`);
+    if (!VERIFIED_PREMISE_RE.test(line)) return fail(`a premise is not stamped "verified @<sha>": ${line}`);
+    const sha = (/ verified @([0-9a-f]{7,40})$/.exec(line) || [])[1];
+    if (!(recorded.startsWith(sha.toLowerCase()) || sha.toLowerCase().startsWith(recorded))) return fail(`a premise is verified @${sha}, not at the recorded --premises-sha ${recorded}`);
+    const own = [...unmatched].find((premisePath) => line.startsWith(`${premisePath}:`));
+    if (!own) return fail(`a proposal premise matches no premise of the ticket body: ${line}`);
+    unmatched.delete(own);
+  }
+  return [];
+}
+
+// --- the door's full predicate ---
+
+function hasWorkRecord(root, tenant, number) {
+  try {
+    const raw = fs.readFileSync(path.join(baseOf(root), 'state', 'work', 'active.json'), 'utf8');
+    const active = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+    const records = Array.isArray(active) ? active : Object.values((active && active.records) || active || {});
+    return records.some((record) => record && String(record.id) === `${tenant}:issue-${number}`);
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function boundedFailures({ root, tenant, number, issue, row, open, entries, projection, config, tenantConfig, repo, at, outboxPath }) {
+  const { proposalGate, parseProposal, readHeldIssues, readOutbox, ownerLoginOf } = triage();
+  const failures = [];
+  const push = (code, detail) => { if (!failures.some((entry) => entry.code === code && entry.detail === detail)) failures.push({ code, detail }); };
+  const owner = ownerLoginOf(tenantConfig);
+  const proposalComment = issue.comments.find((comment) => comment.url && comment.url === open.commentUrl) || null;
+  const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
+  const gate = proposalGate({ issue, row, proposal: proposalComment, approval: null, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough, holds: readHeldIssues(root, tenant, at) });
+  for (const failure of gate) {
+    // The gate's own "premises" (a block of at least one verified line) is replaced by the stricter
+    // body-matching check below; its edited-after check is replaced by the bounded one (edited after proposed.at).
+    if (failure.code === 'premises' || failure.code === 'edited-after-approval') continue;
+    push(failure.code, failure.detail);
+  }
+  if (gate.some((failure) => failure.code === 'no-open-proposal')) return failures;
+  if (open.reason) push('needs-approval', `the proposal is a ${open.reason} restatement, which still needs Approval (ADR 0011)`);
+  const today = assignment.chicagoDay(new Date(at).getTime());
+  const todays = entries.filter((entry) => entry.kind === 'bounded-ready' && assignment.chicagoDay(new Date(entry.at).getTime()) === today).length;
+  if (todays >= DAILY_CAP) push('daily-cap', `${todays} bounded readies are recorded for ${tenant} on ${today} (Central); the cap is ${DAILY_CAP}`);
+  if (entries.some((entry) => Number(entry.issue) === number && (entry.kind === 'bounded-ready' || entry.kind === 'veto'))) push('bounded-once', `issue #${number} already had a bounded ready or a Veto; a bounded attempt is made once per issue, and after it the issue is Cory's`);
+  if (issue.comments.some((comment) => String(comment.author).toLowerCase() === owner.toLowerCase() && Date.parse(comment.createdAt) > Date.parse(open.at))) push('owner-spoke', `${owner} commented after the proposal, and what he said is his to answer (an Approval, a question, a change), not the door's`);
+  if (hasWorkRecord(root, tenant, number)) push('live-work', `a Work record ${tenant}:issue-${number} exists; a bounded ready is for a ticket nothing has worked on`);
+  const openEdges = issue.blockedBy.filter((edge) => edge.state !== 'CLOSED');
+  if (openEdges.length || issue.blockedByTruncated) push('blocked', openEdges.length ? `blocked by open ${openEdges.map((edge) => `#${edge.number}`).join(', ')}` : 'the blocked-by list is truncated');
+  if (!proposalComment) return failures;
+  if (proposalComment.lastEditedAt && Date.parse(proposalComment.lastEditedAt) > Date.parse(open.at)) push('proposal-edited', `the proposal comment was edited at ${proposalComment.lastEditedAt}, after it was recorded at ${open.at}`);
+  const parsed = parseProposal(proposalComment.body);
+  if (exact(parsed, 'Classification') !== 'bug') push('classification', `Classification is "${(parsed.fields.Classification || 'missing').split('\n').join(' / ')}", not exactly "bug"`);
+  if (exact(parsed, 'Ruling') !== 'none needed') push('ruling-needed', `Ruling is "${(parsed.fields.Ruling || 'missing').split('\n').join(' / ')}", not exactly "none needed" (the fix goes under Root cause and Scope)`);
+  for (const [name, code] of [['Red-tell', 'no-red-tell'], ['Repro', 'no-repro']]) {
+    const value = String(parsed.fields[name] || '').trim();
+    if (!value || PLACEHOLDER.test(value)) push(code, `${name} is ${value ? `"${value}"` : 'missing'}; a bounded bug names a reproducible Red-tell and the Repro steps`);
+  }
+  for (const failure of checkPremises({ proposal: parsed, issue, premisesSha: open.premisesSha })) push(failure.code, failure.detail);
+  const scope = checkScope({ scope: parsed.fields.Scope, tenantConfig, repo });
+  for (const failure of scope.failures) push(failure.code, failure.detail);
+  return Object.assign(failures, { proposal: parsed, proposalComment, scopeFiles: scope.files });
 }
 
 // edits: [['--add-label', name], ['--remove-label', name]], applied in one gh call.
@@ -197,23 +284,31 @@ function centralClock(ms) {
   return `${assignment.chicagoDay(ms)} ${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')} Central`;
 }
 
-function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture, issues, now, runner = execFileSync, send, effects = true } = {}) {
+function tierWord(value) { return String(value || '').split('\n')[0].trim().split(/\s+/)[0].toLowerCase(); }
+
+// Order (rulings m2, m3): page, then the ledger row, then the label. A page that fails records
+// nothing and the next tick retries (a ready Cory was never told of is no Veto window at all).
+// The row must exist before the label, since the planner reads it to hold the ticket. A label
+// that fails leaves a standing row with no ready label: the frontier lists it as `bounded-repair`,
+// and running this door again re-applies the label, records nothing and pages nothing.
+function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture, issues, now, runner = execFileSync, send, effects = true, repo, outboxPath } = {}) {
   const { readLedger, projectTriage, recordEntry, readTenantConfig, ownerLoginOf, readTriageConfig } = triage();
   const number = issueNumberOf(issueValue);
   if (!tenant) throw new WorkStateError('TRIAGE_INVALID', 'tenant is required');
   const at = isoOf(now);
   const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
-  ownerLoginOf(tenantConfig);
+  const owner = ownerLoginOf(tenantConfig);
   // Gate 1: Cory's flag. Read before any GitHub call, so an unenabled tenant (Nidus) costs nothing.
   if (!isBoundedEnabled(root, tenant)) {
     throw refused([{ code: 'flag-absent', detail: `Bounded authority is not enabled for ${tenant}: state/flags/bounded-authority-${safeTenant(tenant)} does not exist, and only Cory creates it` }]);
   }
-  const all = loadIssues({ tenantConfig, fixture, issues, runner });
+  const loaded = loadIssues({ tenantConfig, fixture, issues, runner });
+  const all = loaded.issues;
   const found = all.find((entry) => entry.number === number);
   if (!found) throw refused([{ code: 'issue-not-found', detail: `issue #${number} is not among ${tenant}'s open issues` }]);
   // Gate 2: a standing suspension, lifted only by removing its file. The scan comes first, so
   // failure evidence that arrived since the last one is on file before the ready is judged.
-  scanSuspension({ root, tenant, issues: all, now: at });
+  scanSuspension({ root, tenant, issues: loadEscapeBugs({ tenantConfig, fixture, issues: fixture || issues ? all : undefined, runner }), now: at });
   if (isSuspended(root, tenant)) {
     throw refused([{ code: 'suspended', detail: `Bounded authority is suspended for ${tenant} (state/flags/bounded-authority-suspended-${safeTenant(tenant)}); only removing that file lifts it` }]);
   }
@@ -221,56 +316,57 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   const config = readTriageConfig(root);
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
   const entries = readLedger(root, tenant);
-  const row = projectTriage({ entries, now: at }).byIssue[number] || null;
+  const standing = assignment.liveBoundedReadies(entries).get(number);
+  if (standing) {
+    // A bounded ready is already recorded. Only its missing label is repaired, and only while the owner has said nothing since.
+    // The repair is of this ticket as it was when it was readied: a body changed since, or a newer proposal, is not it.
+    if (entries.some((entry) => entry.kind === 'proposed' && Number(entry.issue) === number && String(entry.at) > String(standing.at))) throw refused([{ code: 'bounded-once', detail: `a newer proposal than the bounded ready at ${standing.at} exists; an issue is readied under Bounded authority once` }]);
+    if (found.bodyHash !== standing.bodyHash) throw refused([{ code: 'body-changed', detail: `the issue body changed since the bounded ready at ${standing.at}` }]);
+    if (found.labels.includes(readyLabel)) throw refused([{ code: 'bounded-once', detail: `issue #${number} already has its bounded ready (${standing.at}) and carries ${readyLabel}` }]);
+    if (found.comments.some((comment) => String(comment.author).toLowerCase() === owner.toLowerCase() && Date.parse(comment.createdAt) > Date.parse(standing.at))) throw refused([{ code: 'owner-spoke', detail: `${owner} commented after the bounded ready at ${standing.at}; the repair is left` }]);
+    const result = { tenant, issue: number, repaired: true, readied: false, at, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false };
+    if (!effects) return result;
+    try { ghEdit({ runner, tenantConfig, number, edits: [['--add-label', readyLabel], ...(found.labels.includes(config.markerLabel) ? [['--remove-label', config.markerLabel]] : [])] }); } catch (error) {
+      throw new WorkStateError('GITHUB_WRITE_FAILED', `re-applying ${readyLabel} to #${number} failed (${String(error.stderr || error.message || error).slice(0, 200)}); run the door again`, { issue: number });
+    }
+    return { ...result, labelApplied: true };
+  }
+
+  const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
+  const row = projection.byIssue[number] || null;
   const open = row && row.proposed && !row.outcome ? row.proposed : null;
   if (!open) throw refused([{ code: 'no-open-proposal', detail: `issue #${number} has no open proposal in the ledger (none recorded, or its outcome is already recorded)` }]);
-
-  const failures = [];
-  const today = assignment.chicagoDay(new Date(at).getTime());
-  const todays = entries.filter((entry) => entry.kind === 'bounded-ready' && assignment.chicagoDay(new Date(entry.at).getTime()) === today).length;
-  if (todays >= DAILY_CAP) failures.push({ code: 'daily-cap', detail: `${todays} bounded readies are recorded for ${tenant} on ${today} (Central); the cap is ${DAILY_CAP}` });
-  if (open.reason) failures.push({ code: 'needs-approval', detail: `the proposal is a ${open.reason} restatement, which still needs Approval (ADR 0011)` });
-  if (open.recordId) failures.push({ code: 'needs-approval', detail: `the proposal answers an escalation (${open.recordId}), a ruling on live work, which still needs Approval` });
-  if (found.labels.includes(readyLabel)) failures.push({ code: 'already-ready', detail: `issue #${number} already carries ${readyLabel}` });
-  const routed = found.labels.filter((label) => config.routingLabels.includes(label));
-  if (routed.length) failures.push({ code: 'already-routed', detail: `issue #${number} carries ${routed.join(', ')}, a routing that is not the Principal's to overturn` });
-  if (found.bodyHash !== open.bodyHash) failures.push({ code: 'proposal-stale', detail: 'the issue body changed since the proposal was written; propose again' });
-  const comment = found.comments.find((entry) => idOfComment(entry.url) === idOfComment(open.commentUrl));
-  const proposal = comment ? parseProposal(comment.body) : null;
-  if (!proposal) failures.push({ code: 'proposal-not-found', detail: `the recorded proposal comment ${open.commentUrl} is not among issue #${number}'s comments, or is not a triage proposal` });
-  else failures.push(...checkBoundedClass({ proposal, premisesSha: open.premisesSha, tenantConfig }));
+  const failures = boundedFailures({ root, tenant, number, issue: found, row, open, entries, projection, config, tenantConfig, repo: repo || loaded.repo || gitRepo(tenantConfig), at, outboxPath });
   if (failures.length) throw refused(failures);
 
-  const paths = scopeTokens(proposal.Scope).files;
   const window = assignment.vetoWindow(at);
-  // Order: the ledger row first, then the label. The planner reads the row to hold the
-  // ticket for its Veto window, so the row must exist before the label makes the ticket
-  // ready; the other order leaves a moment in which a ready ticket has no window.
-  const entry = recordEntry({ root, tenant, kind: 'bounded-ready', issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, fields: { scope: paths, tier: tierWord(proposal.Tier) }, now: at });
-  const result = { tenant, issue: number, readied: true, at, windowUntil: window.until, windowRule: window.rule, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false, entry };
-  if (!effects) return result;
-  try {
-    ghEdit({ runner, tenantConfig, number, edits: [['--add-label', readyLabel], ...(found.labels.includes(config.markerLabel) ? [['--remove-label', config.markerLabel]] : [])] });
-  } catch (error) {
-    throw new WorkStateError('GITHUB_WRITE_FAILED', `the bounded ready of #${number} is recorded in the ledger but applying ${readyLabel} failed (${String(error.stderr || error.message || error).slice(0, 200)}); apply it by hand, or leave the issue for an Approval (the recorded row counts toward today's cap)`, { issue: number, entry });
-  }
-  result.labelApplied = true;
+  const proposalHash = assignment.sha256(failures.proposalComment.body);
+  const paths = failures.scopeFiles;
+  const result = { tenant, issue: number, readied: true, at, windowUntil: window.until, windowRule: window.rule, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false };
+  const record = () => recordEntry({ root, tenant, kind: 'bounded-ready', issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, fields: { scope: paths, tier: tierWord(failures.proposal.fields.Tier), proposalHash }, now: at });
+  if (!effects) return { ...result, entry: record() };
   const page = {
     kind: 'bounded-ready',
     title: `Fleet: ${tenant} #${number} readied under Bounded authority`,
-    body: `${found.title}. The Principal readied it itself, with no Approval. Nothing assigns it before ${centralClock(window.untilMs)}. Comment "Veto" on the issue to withdraw it.`,
+    body: `${found.title}. The Principal readied it itself, with no Approval. Nothing assigns it before ${centralClock(window.untilMs)}. A comment beginning "Veto" on the issue withdraws it; removing the label by hand does not.`,
     priority: 'normal',
     url: found.url,
   };
   const sender = send || require('./notify').pageSender({ root });
   let sent;
   try { sent = sender(page); } catch (error) { sent = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
-  result.paged = Boolean(sent && sent.ok);
-  result.pageDetail = (sent && sent.detail) || null;
+  if (!sent || !sent.ok) throw refused([{ code: 'page-failed', detail: `the page to Cory was not delivered (${(sent && sent.detail) || 'no detail'}); nothing was recorded, and the next tick tries again` }]);
+  result.paged = true;
+  result.pageDetail = sent.detail || null;
+  result.entry = record();
+  try {
+    ghEdit({ runner, tenantConfig, number, edits: [['--add-label', readyLabel], ...(found.labels.includes(config.markerLabel) ? [['--remove-label', config.markerLabel]] : [])] });
+  } catch (error) {
+    throw new WorkStateError('GITHUB_WRITE_FAILED', `the bounded ready of #${number} is recorded and Cory was paged, but applying ${readyLabel} failed (${String(error.stderr || error.message || error).slice(0, 200)}); the frontier lists it as bounded-repair, and running this door again re-applies the label`, { issue: number, entry: result.entry });
+  }
+  result.labelApplied = true;
   return result;
 }
-
-function tierWord(value) { return String(value || '').split('\n')[0].trim().split(/\s+/)[0].toLowerCase(); }
 
 // The veto door: the owner's Veto on a standing bounded ready. The label comes off
 // before the ledger row is written, the reverse of the ready: were the row first and
@@ -285,8 +381,7 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
   const owner = ownerLoginOf(tenantConfig);
   const standing = assignment.liveBoundedReadies(readLedger(root, tenant)).get(number);
   if (!standing) throw new WorkStateError('TRIAGE_NO_BOUNDED_READY', `issue #${number} has no standing bounded ready to veto`);
-  const all = loadIssues({ tenantConfig, fixture, issues, runner });
-  const found = all.find((entry) => entry.number === number);
+  const found = loadIssues({ tenantConfig, fixture, issues, runner }).issues.find((entry) => entry.number === number);
   if (!found) throw new WorkStateError('TRIAGE_INVALID', `issue #${number} is not among ${tenant}'s open issues`);
   const veto = found.comments.filter((comment) => comment.author.toLowerCase() === owner.toLowerCase() && assignment.VETO_RE.test(comment.body) && Date.parse(comment.createdAt) > Date.parse(standing.at)).pop();
   if (!veto) throw new WorkStateError('TRIAGE_NO_VETO', `issue #${number} has no comment from ${owner} beginning "Veto" after the bounded ready at ${standing.at}`);
@@ -314,8 +409,9 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
 //     criteria: the escalation reason `criteria-defect` (work-state.js `--reason`) or a
 //     finding whose kebab-case `category` is `criteria-defect` in the review artifact the
 //     send-back followed. The mark is the name; free text is never read.
-//   - a bug whose triage proposal says `Escaped from: #<PR>` (exactly that shape; ticket
-//     #213 adds the line) where that PR delivered a bounded ticket.
+//   - a bug (open or closed, created since the first live bounded ready) whose escape names
+//     a PR that delivered a bounded ticket: the issue form's "Escaped from PR #" field, else
+//     the newest Ruling or proposal's `Escaped from:` line, read leniently (ruling M9).
 // A Veto is not evidence: a vetoed ticket is no longer a bounded ticket at all.
 //
 // Where it runs, and why a scan: the evidence is written by three different doors (the
@@ -327,8 +423,8 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
 // ready can follow failure evidence, however late the scan otherwise ran), the daily summary
 // runs it each morning so a standing suspension is on Cory's page, and `triage.js
 // bounded-scan` runs it by hand. Evidence already ruled on is remembered in the `suspended`
-// ledger rows (their evidenceIds), so removing the flag lifts the suspension for good and
-// only new evidence suspends again.
+// ledger rows (their evidenceIds), which are stable per cause (ruling m5), so removing the flag
+// lifts the suspension for good and only new evidence suspends again.
 
 function artifactHasCategory(root, relative, category) {
   if (!relative) return false;
@@ -342,6 +438,8 @@ function artifactHasCategory(root, relative, category) {
 }
 
 // Escalations and send-backs after the ready, on the record of a still-standing bounded ticket.
+// The ids name the cause, not the event: a pr-watch walk-back that re-emits a send-back for the
+// same artifact re-emits the same id, which is already ruled on.
 function criteriaEvidence({ root, tenant, live, events }) {
   const found = [];
   for (const [issue, ready] of live) {
@@ -352,17 +450,28 @@ function criteriaEvidence({ root, tenant, live, events }) {
     for (const event of own) {
       if (event.type === 'review-recorded') lastReview = event;
       else if (event.type === 'state-escalated' && event.changes && event.changes.reason === CRITERIA_MARK) {
-        found.push({ cause: 'escalation', id: `${recordId}#${event.sequence}`, at: event.at, issue, recordId, detail: `${recordId} escalated with reason ${CRITERIA_MARK}` });
+        found.push({ cause: 'escalation', id: `escalation:${recordId}:${CRITERIA_MARK}`, at: event.at, issue, recordId, detail: `${recordId} escalated with reason ${CRITERIA_MARK}` });
       } else if (event.type === 'state-revision' && event.changes && event.changes.sendBack === true && lastReview && artifactHasCategory(root, lastReview.changes && lastReview.changes.artifact, CRITERIA_MARK)) {
-        found.push({ cause: 'send-back', id: `${recordId}#${event.sequence}`, at: event.at, issue, recordId, detail: `${recordId} sent back after a finding of category ${CRITERIA_MARK} in ${lastReview.changes.artifact}` });
+        found.push({ cause: 'send-back', id: `send-back:${recordId}:${lastReview.changes.artifact}`, at: event.at, issue, recordId, detail: `${recordId} sent back after a finding of category ${CRITERIA_MARK} in ${lastReview.changes.artifact}` });
       }
     }
   }
   return found;
 }
 
-// Open bugs whose newest proposal names, as `Escaped from: #<PR>`, a PR that delivered a bounded ticket.
-function escapeEvidence({ tenant, live, events, issues, entries }) {
+// The PR a bug says it escaped from: the form field first, else the newest Ruling or proposal.
+function escapedPrOf(issue) {
+  const { parseEscapedFrom } = require('./weekly-scorecard');
+  const form = parseEscapedFrom(issue.body);
+  if (form !== null) return form;
+  const headed = issue.comments.filter((comment) => /^\s*##\s*(?:Triage proposal|Ruling)\b/i.test(comment.body)).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  const newest = headed[headed.length - 1];
+  const line = newest && /^Escaped from:[ \t]*(.*?)[ \t]*\r?$/im.exec(newest.body);
+  const number = line && /(?:PR\s*)?#?(\d+)/i.exec(line[1]);
+  return number ? Number(number[1]) : null;
+}
+
+function escapeEvidence({ tenant, live, events, issues }) {
   const prToIssue = new Map();
   for (const issue of live.keys()) {
     for (const event of events) {
@@ -370,24 +479,43 @@ function escapeEvidence({ tenant, live, events, issues, entries }) {
       if (pr) prToIssue.set(Number(pr), issue);
     }
   }
+  const oldest = [...live.values()].map((entry) => new Date(entry.at).getTime()).sort((a, b) => a - b)[0];
   const found = [];
   for (const bug of issues) {
-    const proposal = entries.filter((entry) => entry.kind === 'proposed' && Number(entry.issue) === bug.number).pop();
-    const comment = proposal && bug.comments.find((entry) => idOfComment(entry.url) === idOfComment(proposal.commentUrl));
-    const fields = comment ? parseProposal(comment.body) : null;
-    const line = fields && fields['Escaped from'] ? fields['Escaped from'].split('\n')[0].trim() : '';
-    const match = /^#(\d+)\.?$/.exec(line);
-    if (!match) continue;
-    const pr = Number(match[1]);
-    const boundedIssue = prToIssue.get(pr);
+    if (!bug.labels.includes('bug') || Date.parse(bug.createdAt) < oldest) continue;
+    const pr = escapedPrOf(bug);
+    const boundedIssue = pr === null ? null : prToIssue.get(pr);
     if (!boundedIssue || boundedIssue === bug.number) continue;
-    found.push({ cause: 'escape', id: `escape:${bug.number}:${pr}`, at: proposal.at, issue: boundedIssue, bug: bug.number, pr, detail: `bug #${bug.number} escaped from PR #${pr}, which delivered bounded ticket #${boundedIssue}` });
+    found.push({ cause: 'escape', id: `escape:${bug.number}:${pr}`, at: bug.createdAt, issue: boundedIssue, bug: bug.number, pr, detail: `bug #${bug.number} escaped from PR #${pr}, which delivered bounded ticket #${boundedIssue}` });
   }
   return found;
 }
 
-// Read the evidence, and suspend on any not already ruled on. `issues` is the tenant's open
-// issues (the escape check reads their proposals); without it only the local evidence counts.
+// Bugs, open or closed, newest first (the ones created since a bounded ready are the ones that can have escaped from it).
+const ESCAPE_QUERY = 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){issues(first:100,states:[OPEN,CLOSED],labels:["bug"],orderBy:{field:CREATED_AT,direction:DESC}){nodes{number,title,url,body,createdAt,state,labels(first:20){nodes{name}},comments(last:100){nodes{id,url,body,createdAt,author{login}}}}}}}';
+
+function queryEscapeBugs({ repo, runner = execFileSync } = {}) {
+  const { normalizeIssue } = triage();
+  const [owner, name] = String(repo || '').split('/');
+  if (!owner || !name) throw new WorkStateError('INVALID_GITHUB_QUERY', `repo must be owner/name: ${repo}`);
+  let result;
+  try { result = JSON.parse(runner('gh', ['api', 'graphql', '-f', `query=${ESCAPE_QUERY}`, '-f', `owner=${owner}`, '-f', `name=${name}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 })); } catch (error) {
+    throw new WorkStateError('GITHUB_QUERY_FAILED', String(error.stderr || error.message || error));
+  }
+  const nodes = result && result.data && result.data.repository && result.data.repository.issues && result.data.repository.issues.nodes;
+  if (!Array.isArray(nodes)) throw new WorkStateError('GITHUB_QUERY_FAILED', 'GitHub GraphQL bug query did not return nodes');
+  return nodes.map((node) => normalizeIssue(node));
+}
+
+// The bugs the scan reads: a fixture's or a caller's issues as given, else GitHub's bugs, open and closed.
+function loadEscapeBugs({ tenantConfig, fixture, issues, runner }) {
+  if (issues) return issues;
+  if (fixture) return loadIssues({ tenantConfig, fixture, runner }).issues;
+  return queryEscapeBugs({ repo: tenantConfig.github, runner });
+}
+
+// Read the evidence, and suspend on any not already ruled on. `issues` are the tenant's bugs
+// (the escape check reads them); without them only the local evidence counts.
 function scanSuspension({ root, tenant, issues, now, events } = {}) {
   const { readLedger, recordEntry, normalizeIssue } = triage();
   const at = isoOf(now);
@@ -400,7 +528,7 @@ function scanSuspension({ root, tenant, issues, now, events } = {}) {
   const ledgerEvents = events || readEvents(root);
   const found = [
     ...criteriaEvidence({ root, tenant, live, events: ledgerEvents }),
-    ...(issues ? escapeEvidence({ tenant, live, events: ledgerEvents, issues: issues.map((entry) => normalizeIssue(entry)), entries }) : []),
+    ...(issues ? escapeEvidence({ tenant, live, events: ledgerEvents, issues: issues.map((entry) => normalizeIssue(entry)) }) : []),
   ].filter((item) => !ruledOn.has(item.id)).sort((a, b) => String(a.at).localeCompare(String(b.at)) || a.id.localeCompare(b.id));
   if (!found.length) return result;
   const first = found[0];
@@ -416,12 +544,12 @@ function scanSuspension({ root, tenant, issues, now, events } = {}) {
   return { ...result, suspended: true, wrote: !standing, evidence: found };
 }
 
-// The CLI door: load the tenant's open issues (a fixture, or GitHub) and scan.
+// The CLI door: load the tenant's bugs (a fixture, or GitHub) and scan.
 function boundedScan({ root, tenant, tenantConfigPath, fixture, issues, now, runner = execFileSync } = {}) {
   const { readTenantConfig } = triage();
   if (!tenant) throw new WorkStateError('TRIAGE_INVALID', 'tenant is required');
   const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
-  return scanSuspension({ root, tenant, issues: loadIssues({ tenantConfig, fixture, issues, runner }), now });
+  return scanSuspension({ root, tenant, issues: loadEscapeBugs({ tenantConfig, fixture, issues, runner }), now });
 }
 
 // The daily summary's scan: every tenant that has Bounded authority enabled or suspended. A
@@ -433,7 +561,7 @@ function scanTenants({ root, now, loadTenantIssues } = {}) {
     if (!isBoundedEnabled(root, tenant) && !isSuspended(root, tenant)) continue;
     let issues;
     let issuesError = null;
-    try { issues = loadTenantIssues ? loadTenantIssues(tenant, config) : triage().queryGithubIssues({ repo: config.github }); } catch (error) { issuesError = String(error.message || error).split('\n')[0]; }
+    try { issues = loadTenantIssues ? loadTenantIssues(tenant, config) : queryEscapeBugs({ repo: config.github }); } catch (error) { issuesError = String(error.message || error).split('\n')[0]; }
     try { results.push({ ...scanSuspension({ root, tenant, issues, now }), ...(issuesError ? { issuesError } : {}) }); } catch (error) { results.push({ tenant, error: String(error.message || error).split('\n')[0] }); }
   }
   return results;
@@ -447,12 +575,13 @@ module.exports = {
   boundedReady,
   boundedScan,
   centralClock,
-  checkBoundedClass,
-  parseProposal,
+  checkScope,
   chicagoDay: assignment.chicagoDay,
+  gitRepo,
   isBoundedEnabled,
   isSuspended,
   liveBoundedReadies: assignment.liveBoundedReadies,
+  queryEscapeBugs,
   scanSuspension,
   scanTenants,
   standingSuspensions,
