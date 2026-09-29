@@ -201,12 +201,17 @@ function Test-PermissionPromptNeeds { param([string]$Needs) return ("$Needs" -cm
 # respawnFlags against them before `claude respawn` replays that job. 'opus' pins Opus
 # 4.8 for ICs, 'fable' the Principal's seat (ADR 0011), 'opus-5.5' the project-lead
 # default (owner ruling 2026-09-23); a principal or lead with no -Model gets its pin.
+# An IC's sonnet pins Sonnet 5.5 (owner ruling 2026-09-28), with no -Model too; the pin
+# is the IC's alone, so an explicit -Model sonnet on another role keeps the CLI alias.
 $script:LaunchModelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5' }
+$script:IcSonnetPin = 'claude-sonnet-5-5'
 function Resolve-LaunchModel {
   param([string]$Role, [string]$Model)
   if (-not $Model -and $Role -eq 'principal') { $Model = 'fable' }
   if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
+  if (-not $Model -and $Role -eq 'ic') { $Model = 'sonnet' }
   $id = if (-not $Model) { '' } elseif ($script:LaunchModelPins.ContainsKey($Model)) { $script:LaunchModelPins[$Model] } else { $Model }
+  if ($Role -eq 'ic' -and $Model -eq 'sonnet') { $id = $script:IcSonnetPin }
   return [pscustomobject]@{ token = "$Model"; id = "$id" }
 }
 function Get-RoleEffort {

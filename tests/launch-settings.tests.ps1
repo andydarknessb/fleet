@@ -143,6 +143,7 @@ exit $LASTEXITCODE
   Assert-True ("$($rh.reason)" -match 'auto mode' -and "$($rh.reason)" -match 'fleet #28') 'the haiku refusal must name the CLI auto-mode cause'
   $rs = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
   Assert-True ($rs.dryRun -eq $true -and $rs.model -eq 'sonnet') 'a sonnet launch still dry-runs'
+  Assert-True ("$($rs.command)" -match '--model claude-sonnet-5-5 ') "a sonnet IC runs pinned Sonnet 5.5 (got: $($rs.command))"
   Assert-True ($rs.permissions -eq 'auto' -and $rs.allowRules -eq 0) "a sonnet launch reports the auto profile with no allow rules (got $($rs.permissions)/$($rs.allowRules))"
   $sonnetSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.json" -Raw | ConvertFrom-Json
   Assert-True ($sonnetSettings.permissions.defaultMode -eq 'auto') 'the sonnet settings keep defaultMode auto'
@@ -225,7 +226,7 @@ exit $LASTEXITCODE
   $rpl = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
   Assert-True ("$($rpl.command)" -match '--model claude-opus-5-5') 'a project lead with no -Model must run the pinned Opus 5.5 id'
   $rplo = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'sonnet', '-DryRun')
-  Assert-True ("$($rplo.command)" -match '--model sonnet') 'an explicit -Model must still override the project lead default'
+  Assert-True ("$($rplo.command)" -match '--model sonnet\b') 'an explicit -Model must still override the project lead default, and the IC sonnet pin stays the IC''s'
   Run-Launch @('-Role', 'principal', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
   Assert-True ($script:lastExit -eq 4) 'a principal not named pe-<tenant> must be refused as a usage error'
   Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
