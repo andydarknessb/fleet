@@ -11,13 +11,15 @@
 // Spec fleet #193 (#211): the one standing condition that does page on a quiet day is a
 // Bounded-authority suspension, which only Cory lifts; the run scans for one first.
 
+const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
 const { runStalePremiseNotice } = require('./triage');
-const { scanTenants, standingSuspensions } = require('./bounded-authority');
+const { centralClock, scanTenants, standingSuspensions } = require('./bounded-authority');
+const { plannerInputs, vetoWindow } = require('./assignment');
 
 const { DECISION_STATES } = workState;
 const MAX_ROWS = 10;
@@ -90,6 +92,27 @@ function waitingRows({ root, now } = {}) {
     });
 }
 
+// Spec fleet #193 (#209): the bounded readies still inside their Veto window, which is what
+// Cory can still withdraw. A ready made overnight keeps its window open until 09:00 Central,
+// so the 08:00 page lists it (ADR 0011 amendment). One line each.
+function windowedReadies({ root, now }) {
+  const base = baseOf(root);
+  const nowMs = new Date(now || Date.now()).getTime();
+  const dir = path.join(base, 'state', 'triage');
+  let tenants = [];
+  try { tenants = fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -'.jsonl'.length)).sort(); } catch { return []; }
+  const lines = [];
+  for (const tenant of tenants) {
+    let ready = [];
+    try { ready = plannerInputs({ root: base, tenant }).boundedReadies; } catch { continue; }
+    for (const { issue, at } of ready) {
+      const window = vetoWindow(at);
+      if (window && nowMs < window.untilMs) lines.push(`Bounded ready in its Veto window: ${tenant} #${issue}, readied ${centralClock(new Date(at).getTime())}, assignable from ${centralClock(window.untilMs)}. A comment beginning "Veto" withdraws it.`);
+    }
+  }
+  return lines;
+}
+
 // One line per standing suspension: since when, why, and the one way to lift it.
 function suspensionLine(entry) {
   const since = entry.at ? ` since ${String(entry.at).slice(0, 10)}` : '';
@@ -108,10 +131,11 @@ function buildSummary({ root, now } = {}) {
   // Spec fleet #193 (#211): a standing Bounded-authority suspension is Cory's to lift, so it
   // heads the page and is reason enough to send one on a day nothing else waits.
   const suspensions = standingSuspensions(baseOf(root));
-  if (!rows.length && !suspensions.length) return null;
+  const windowed = windowedReadies({ root, now });
+  if (!rows.length && !suspensions.length && !windowed.length) return null;
   const multiTenant = new Set(rows.map((row) => row.tenant)).size > 1;
   const shown = rows.slice(0, MAX_ROWS);
-  const lines = suspensions.map(suspensionLine);
+  const lines = [...suspensions.map(suspensionLine), ...windowed];
   lines.push(...shown.map((row) => (multiTenant
     ? `${row.tenant} #${row.issue} ${row.state} ${formatAge(row.ageMs)}`
     : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`)));
@@ -122,7 +146,7 @@ function buildSummary({ root, now } = {}) {
   const card = latestScorecard(root);
   if (card && card.week) lines.push(headlineOf(card));
   return {
-    title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length, suspensions: suspensions.length,
+    title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length, suspensions: suspensions.length, windowed: windowed.length,
   };
 }
 

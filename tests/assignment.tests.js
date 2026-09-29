@@ -974,3 +974,14 @@ test('#209: reserving a ticket inside its Veto window is refused by the planner 
   const reserved = reserveAssignment({ root, issue: issue(60), tenant: 'endzone', tenantConfig, readyLabel: 'ready-for-agent', base, now: '2026-09-29T17:00:01.000Z' });
   assert.equal(reserved.reservation.record.id, 'endzone:issue-60');
 });
+
+test('#209: the Veto reader takes the same shape as the guard hook: leading whitespace or a literal backslash-n may precede the word', () => {
+  const readyAt = '2026-09-29T15:00:00.000Z';
+  for (const body of ['  Veto: no', '\\nVeto: no', '\n\n Veto', '\\n \\nveto']) {
+    const held = windowFor(readyAt, '2026-09-29T20:00:00.000Z', { issue: { comments: [ownerComment(body, '2026-09-29T15:30:00.000Z')] } });
+    assert.deepEqual(held.reasons.map((reason) => reason.code), ['vetoed'], JSON.stringify(body));
+  }
+  for (const body of ['Not a Veto', 'x\\nVeto', 'Vetoed?']) {
+    assert.deepEqual(windowFor(readyAt, '2026-09-29T20:00:00.000Z', { issue: { comments: [ownerComment(body, '2026-09-29T15:30:00.000Z')] } }).eligible, [60], JSON.stringify(body));
+  }
+});

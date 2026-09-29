@@ -504,7 +504,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // 0. (#210) A standing bounded ready with the owner's Veto after it: withdraw the ready.
     const standing = row && row.outcome && row.outcome.kind === 'bounded-ready' ? row.outcome : null;
     if (standing) {
-      const veto = ownerComments.filter((comment) => comment.createdAt > standing.at && VETO_RE.test(comment.body)).pop();
+      const veto = ownerComments.filter((comment) => Date.parse(comment.createdAt) > Date.parse(standing.at) && VETO_RE.test(comment.body)).pop();
       if (veto) {
         vetoes.push({ kind: 'veto', number: issue.number, title: issue.title, url: issue.url, commentUrl: veto.url, at: veto.createdAt, by: veto.author, readyAt: standing.at, reason: 'owner Veto newer than the bounded ready' });
         continue;

@@ -379,3 +379,12 @@ test('#211: the Bounded authority row is good when used without a veto or a susp
   assert.equal(vetoed.status, 'watch');
   assert.equal(vetoed.figures.suspended, 0);
 });
+
+test('#211: a corrupt triage ledger makes the Bounded authority row unknown and leaves the other rows standing', () => {
+  const root = fixtureWeek();
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), 'not json\n{"kind":"x"}\n');
+  const card = build(root);
+  assert.equal(card.rows.find((r) => r.key === 'boundedAuthority').status, 'unknown');
+  assert.equal(card.rows.find((r) => r.key === 'throughput').status, 'good');
+});

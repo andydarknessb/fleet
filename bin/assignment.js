@@ -305,7 +305,9 @@ const NIGHT_ENDS_HOUR = 7;
 const WINDOW_RELEASE_HOUR = 9;
 // The Veto is recognised by shape, like `Approved` and `Re-propose`: the owner's
 // comment beginning `Veto` (hooks/principal-guard.ps1 refuses it to every fleet role).
-const VETO_RE = /^\s*veto\b/i;
+// Same shape as the guard hook's refusal (fleet #208): whitespace, or a literal backslash-n
+// left by an escaped body, may precede the word.
+const VETO_RE = /^(?:\s|\\n)*veto\b/i;
 
 const chicagoFormat = new Intl.DateTimeFormat('en-US', {
   timeZone: BOUNDED_TIMEZONE, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',

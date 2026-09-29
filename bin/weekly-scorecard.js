@@ -458,7 +458,12 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     escapedDefects: escapedRow(base, week, merged, settings, gh),
     availability: availabilityRow(base, week, settings),
     icCost: icCostRow(base, events, week, collect, dryRun),
-    boundedAuthority: boundedAuthorityRow(base, week),
+    boundedAuthority: (() => {
+      // A corrupt triage ledger makes this row unknown, never the whole scorecard.
+      try { return boundedAuthorityRow(base, week); } catch (error) {
+        return { figures: { error: String(error.message || error).split('\n')[0] }, result: `unavailable: ${String(error.message || error).split('\n')[0]}`, status: 'unknown' };
+      }
+    })(),
   };
   const rows = ROWS.map(([key, area]) => ({ key, area, ...computed[key] }));
   const weakest = rows.reduce((worst, row) => (SEVERITY[row.status] > SEVERITY[worst.status] ? row : worst), rows[0]);

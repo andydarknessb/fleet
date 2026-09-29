@@ -371,3 +371,20 @@ test('#211: a failed GitHub read in the daily scan falls back to the local evide
   assert.equal(survived.sent, true, 'an unreadable ledger fails the scan, not the summary');
   assert.ok(survived.boundedScan[0].error);
 });
+
+// Spec fleet #193 (#209): the 08:00 page lists a bounded ready still inside its Veto window,
+// which is why a ready made overnight waits until 09:00 Central.
+test('#209: the summary lists a bounded ready while its Veto window is open, alone on a quiet day, and not after', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  // 2026-09-17T05:00Z is 00:00 CDT: an overnight ready, open until 09:00 CDT (14:00Z).
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', issue: 7, at: '2026-09-17T05:00:00.000Z', actor: 'principal', bodyHash: 'h' })}\n`);
+  const eight = buildSummary({ root, now: '2026-09-17T13:00:00.000Z' });
+  assert.equal(eight.windowed, 1);
+  assert.match(eight.body, /^Bounded ready in its Veto window: endzone #7, readied 2026-09-17 00:00 Central, assignable from 2026-09-17 09:00 Central/);
+  assert.equal(buildSummary({ root, now: '2026-09-17T14:00:00.000Z' }), null, 'the window is closed at 09:00 Central');
+  const vetoed = rootDir();
+  fs.mkdirSync(path.join(vetoed, 'state', 'triage'), { recursive: true });
+  fs.writeFileSync(path.join(vetoed, 'state', 'triage', 'endzone.jsonl'), `${JSON.stringify({ kind: 'bounded-ready', issue: 7, at: '2026-09-17T05:00:00.000Z' })}\n${JSON.stringify({ kind: 'veto', issue: 7, at: '2026-09-17T06:00:00.000Z' })}\n`);
+  assert.equal(buildSummary({ root: vetoed, now: '2026-09-17T13:00:00.000Z' }), null, 'a vetoed ready is not listed');
+});

@@ -969,6 +969,7 @@ test('#210: a proposal that is not this ticket\'s open, unmodified, ordinary pro
   refusal(boundedRoot({ recordOver: { reason: 'stale-premise', premise: 'server/x.js:1: y @abc1234' } }), 'needs-approval', /stale-premise/);
   refusal(boundedRoot({ recordOver: { recordId: 'endzone:issue-7' } }), 'needs-approval', /escalation/);
   refusal(boundedRoot({ labels: ['bug', 'triage-proposed', 'ready-for-agent'] }), 'already-ready');
+  refusal(boundedRoot({ labels: ['bug', 'triage-proposed', 'needs-info'] }), 'already-routed', /needs-info/);
   const world = boundedRoot();
   world.door();
   world.calls.length = 0;
@@ -1292,4 +1293,13 @@ test('#211: bounded-scan is a triage door: it runs the scan from the CLI against
   const out = cli(['bounded-scan', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', '2026-09-29T18:05:00.000Z']);
   assert.equal(out.suspended, true);
   assert.ok(fs.existsSync(SUSPENDED_FLAG(world.root)));
+});
+
+test('#210: a Veto comment stamped in the same second as the ready but earlier is not after it; timestamps compare as times, not strings', () => {
+  const world = boundedRoot();
+  world.door();
+  // The ready is at 15:00:00.000Z; GitHub stamps a comment without milliseconds.
+  const same = { ...world.bug, labels: ['bug', 'ready-for-agent'], comments: [...world.bug.comments, { id: 'v0', url: 'https://x/v0', author: OWNER, createdAt: '2026-09-29T14:59:59Z', body: 'Veto: too early' }] };
+  fs.writeFileSync(world.fixture, JSON.stringify([same]));
+  assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T15:30:00.000Z' }).eligible, []);
 });

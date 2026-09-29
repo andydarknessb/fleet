@@ -191,6 +191,7 @@ function ghEdit({ runner, tenantConfig, number, edits }) {
   runner('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
 }
 
+// The Central wall clock of an instant, for pages and the summary: 2026-09-29 12:00 Central.
 function centralClock(ms) {
   const p = assignment.chicagoParts(ms);
   return `${assignment.chicagoDay(ms)} ${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')} Central`;
@@ -231,6 +232,8 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   if (open.reason) failures.push({ code: 'needs-approval', detail: `the proposal is a ${open.reason} restatement, which still needs Approval (ADR 0011)` });
   if (open.recordId) failures.push({ code: 'needs-approval', detail: `the proposal answers an escalation (${open.recordId}), a ruling on live work, which still needs Approval` });
   if (found.labels.includes(readyLabel)) failures.push({ code: 'already-ready', detail: `issue #${number} already carries ${readyLabel}` });
+  const routed = found.labels.filter((label) => config.routingLabels.includes(label));
+  if (routed.length) failures.push({ code: 'already-routed', detail: `issue #${number} carries ${routed.join(', ')}, a routing that is not the Principal's to overturn` });
   if (found.bodyHash !== open.bodyHash) failures.push({ code: 'proposal-stale', detail: 'the issue body changed since the proposal was written; propose again' });
   const comment = found.comments.find((entry) => idOfComment(entry.url) === idOfComment(open.commentUrl));
   const proposal = comment ? parseProposal(comment.body) : null;
@@ -285,7 +288,7 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
   const all = loadIssues({ tenantConfig, fixture, issues, runner });
   const found = all.find((entry) => entry.number === number);
   if (!found) throw new WorkStateError('TRIAGE_INVALID', `issue #${number} is not among ${tenant}'s open issues`);
-  const veto = found.comments.filter((comment) => comment.author.toLowerCase() === owner.toLowerCase() && assignment.VETO_RE.test(comment.body) && comment.createdAt > standing.at).pop();
+  const veto = found.comments.filter((comment) => comment.author.toLowerCase() === owner.toLowerCase() && assignment.VETO_RE.test(comment.body) && Date.parse(comment.createdAt) > Date.parse(standing.at)).pop();
   if (!veto) throw new WorkStateError('TRIAGE_NO_VETO', `issue #${number} has no comment from ${owner} beginning "Veto" after the bounded ready at ${standing.at}`);
   const config = readTriageConfig(root);
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
@@ -443,6 +446,7 @@ module.exports = {
   boundedFlagPath,
   boundedReady,
   boundedScan,
+  centralClock,
   checkBoundedClass,
   parseProposal,
   chicagoDay: assignment.chicagoDay,
