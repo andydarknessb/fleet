@@ -211,10 +211,9 @@ try {
     # in case Cory rotates the URL. 5s timeout: this must never be the thing that
     # makes a tick slow.
     $result = [pscustomobject]@{ configured = $false; ok = $null; error = $null }
-    $urlPath = "$FleetHome\state\pages\deadman.url"
-    if (-not (Test-Path $urlPath)) { return $result }
+    # fleet #74: state/pages/deadman.url, else state/secrets/deadman.json pingUrl (Get-FleetDeadManUrl).
     $url = ''
-    try { $url = (Get-Content $urlPath -Raw -Encoding UTF8).Trim() } catch { $result.error = "deadman.url unreadable: $(Get-OneLine $_.Exception.Message 150)"; return $result }
+    try { $url = Get-FleetDeadManUrl } catch { $result.error = "dead-man URL unreadable: $(Get-OneLine $_.Exception.Message 150)"; return $result }
     if (-not $url) { return $result }
     $result.configured = $true
     try { $null = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 5; $result.ok = $true }
@@ -1233,12 +1232,13 @@ try {
   # silence forever (no POST, no toast beyond the log-only page-gave-up line, no
   # fleet-dead repeat) even once Cory fixed it. A given-up entry is eligible
   # again after pages.retryAfterMinutes (default 60), or immediately once
-  # state/pages/pushover.json is newer than gaveUpAt (Cory just fixed it).
+  # the creds file in use (Get-FleetPushoverCredsPath: state/pages, else
+  # state/secrets) is newer than gaveUpAt (Cory just fixed it).
   $pageMaxAttempts = 3
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['maxAttempts'] -and $pagesConfig.maxAttempts) { $pageMaxAttempts = [int]$pagesConfig.maxAttempts }
   $pageRetryAfterMinutes = 60
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['retryAfterMinutes'] -and $pagesConfig.retryAfterMinutes) { $pageRetryAfterMinutes = [int]$pagesConfig.retryAfterMinutes }
-  $pushoverCredsPath = "$FleetHome\state\pages\pushover.json"
+  $pushoverCredsPath = Get-FleetPushoverCredsPath
   $pushoverCredsMtime = $null
   if (Test-Path $pushoverCredsPath) { try { $pushoverCredsMtime = (Get-Item $pushoverCredsPath).LastWriteTimeUtc } catch {} }
   $nextPaged = [pscustomobject]@{}

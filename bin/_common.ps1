@@ -28,7 +28,8 @@ function Test-CapExempt { param([string]$Name) foreach ($p in (Get-CapExemptPref
 # with retry/expire so Pushover keeps re-alerting until acknowledged, high -> 1,
 # normal -> 0). The Windows toast stays as the on-host echo (-NoToast for tests);
 # Pushover and the audit line in state/pages/pages.jsonl are the channels that always
-# run. Credentials live in state/pages/pushover.json (state/ is not committed, so the
+# run. Credentials live in state/pages/pushover.json, else state/secrets/pushover.json
+# (Get-FleetPushoverCredsPath, fleet #74; state/ is not committed, so the
 # token never lands in git) and Cory has not necessarily written that file yet: an
 # unconfigured channel is a recorded result, never a throw - a condition-detecting run
 # must not crash because Cory hasn't wired his phone up. FLEET_PUSHOVER_URL overrides
@@ -62,6 +63,37 @@ function Get-FleetPageRetryDelayMs {
   if ($env:FLEET_PAGE_RETRY_DELAY_MS) { try { $ms = [int]$env:FLEET_PAGE_RETRY_DELAY_MS } catch {} }
   return $ms
 }
+# fleet #74: ADR 0012 named state/pages/pushover.json ({token, user}) and
+# state/pages/deadman.url, but Cory wired his phone up on 2026-09-17 as
+# state/secrets/pushover.json ({apiToken, userKey}) and state/secrets/deadman.json
+# ({provider, pingUrl}), so every page recorded 'unconfigured' for twelve days.
+# The ADR's path wins when present; otherwise the secrets file is read, and
+# Send-FleetPage accepts either pair of field names.
+function Get-FleetPushoverCredsPath {
+  $pagesPath = "$FleetHome\state\pages\pushover.json"
+  $secretsPath = "$FleetHome\state\secrets\pushover.json"
+  if (-not (Test-Path $pagesPath) -and (Test-Path $secretsPath)) { return $secretsPath }
+  return $pagesPath
+}
+# Returns the dead-man ping URL, or '' when neither file names one. Throws only
+# when a present file cannot be read; the caller records that as an error. An
+# empty deadman.url falls through to the secrets file. The parse error is replaced
+# with a fixed message: PowerShell 5.1 quotes the bad text, which holds the URL,
+# and the caller writes the error to the shadow line and last-run.json.
+function Get-FleetDeadManUrl {
+  $urlPath = "$FleetHome\state\pages\deadman.url"
+  if (Test-Path $urlPath) {
+    $url = "$(Get-Content $urlPath -Raw -Encoding UTF8)".Trim()
+    if ($url) { return $url }
+  }
+  $jsonPath = "$FleetHome\state\secrets\deadman.json"
+  if (Test-Path $jsonPath) {
+    $config = $null
+    try { $config = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { throw 'state/secrets/deadman.json is not valid JSON' }
+    if ($config -and $config.PSObject.Properties['pingUrl']) { return "$($config.pingUrl)".Trim() }
+  }
+  return ''
+}
 function Send-FleetPage {
   param(
     [Parameter(Mandatory = $true)][string]$Kind,
@@ -89,21 +121,26 @@ function Send-FleetPage {
   # for "wired up wrong". Test-Path first distinguishes absent from present-but-
   # broken (Read-Json's own catch cannot: it returns $null for both an absent
   # file and a caught parse error). Never throws; never records token/user.
-  $credsPath = "$FleetHome\state\pages\pushover.json"
+  $credsPath = Get-FleetPushoverCredsPath
   $credsExists = Test-Path $credsPath
   $creds = $null; $credsReadFailed = $false
   if ($credsExists) { try { $creds = Read-Json $credsPath } catch { $credsReadFailed = $true } }
+  $credsToken = $null; $credsUser = $null
+  if ($creds) {
+    $credsToken = if ($creds.PSObject.Properties['token']) { $creds.token } elseif ($creds.PSObject.Properties['apiToken']) { $creds.apiToken } else { $null }
+    $credsUser = if ($creds.PSObject.Properties['user']) { $creds.user } elseif ($creds.PSObject.Properties['userKey']) { $creds.userKey } else { $null }
+  }
   if (-not $credsExists) {
     $result.pushover = 'unconfigured'
   } elseif ($credsReadFailed -or -not $creds) {
     $result.pushover = 'creds-unreadable'
-  } elseif (-not $creds.token -or -not $creds.user) {
+  } elseif (-not $credsToken -or -not $credsUser) {
     $result.pushover = 'creds-incomplete'
   } else {
     $endpoint = $env:FLEET_PUSHOVER_URL
     if (-not $endpoint) { $endpoint = 'https://api.pushover.net/1/messages.json' }
     $priorityValue = $script:PagePriorityValues[$Priority]
-    $payload = @{ token = $creds.token; user = $creds.user; title = $Title; message = $Body; priority = $priorityValue }
+    $payload = @{ token = $credsToken; user = $credsUser; title = $Title; message = $Body; priority = $priorityValue }
     if ($Url) { $payload.url = $Url }
     # Pushover requires retry/expire only at priority 2 (emergency); any other
     # priority refuses the request if they are present at all.
