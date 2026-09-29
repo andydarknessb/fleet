@@ -35,6 +35,9 @@ function normalizeComments(comments) {
     id: String(comment.id || ''),
     createdAt: String(comment.createdAt || ''),
     body: String(comment.body || ''),
+    // #209: the Veto is the owner's comment, so a comment carries who wrote it. The
+    // criteria hash below reads id, createdAt and body only, so an author moves no pin.
+    author: String(typeof comment.author === 'string' ? comment.author : comment.author?.login || ''),
   })).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
 }
 
@@ -284,17 +287,155 @@ function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3, tenan
   return { assignments: selected, thirdProof };
 }
 
+// Spec fleet #193 (#209, ADR 0011 amendment 2026-09-29): the Veto window. A ticket
+// the Principal readied under Bounded authority is not assigned for 2 hours, nor
+// (when readied from 22:00 to 07:00 Central) until 09:00 Central, nor once the
+// owner has Vetoed it. "Readied under Bounded authority, and when" is read from the
+// triage ledger's `bounded-ready` row and not from the ready label's timeline event:
+// the label's actor is the fleet login for a bounded ready and for a finalize alike,
+// so the timeline cannot say which kind of ready it was; the ledger row can, and it
+// is one local read with no extra GitHub call. A `veto` row ends a bounded ready.
+// This section stands alone in this file (the ledger is read here, not through
+// bin/triage.js) so every harness that carries assignment.js carries it whole.
+const BOUNDED_TIMEZONE = 'America/Chicago';
+const HOUR_MS = 60 * 60 * 1000;
+const VETO_WINDOW_MS = 2 * HOUR_MS;
+const NIGHT_STARTS_HOUR = 22;
+const NIGHT_ENDS_HOUR = 7;
+const WINDOW_RELEASE_HOUR = 9;
+// The Veto is recognised by shape, like `Approved` and `Re-propose`: the owner's
+// comment beginning `Veto` (hooks/principal-guard.ps1 refuses it to every fleet role).
+const VETO_RE = /^\s*veto\b/i;
+
+const chicagoFormat = new Intl.DateTimeFormat('en-US', {
+  timeZone: BOUNDED_TIMEZONE, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+});
+
+function chicagoParts(ms) {
+  const parts = {};
+  for (const { type, value } of chicagoFormat.formatToParts(new Date(ms))) parts[type] = Number(value);
+  return { year: parts.year, month: parts.month, day: parts.day, hour: parts.hour, minute: parts.minute, second: parts.second };
+}
+
+// Chicago's UTC offset at an instant, in ms (negative: behind UTC).
+function chicagoOffsetMs(ms) {
+  const p = chicagoParts(ms);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - Math.floor(ms / 1000) * 1000;
+}
+
+// The UTC instant at which Chicago's wall clock reads y-m-d h:00. The day may
+// overflow (day + 1 past a month end); the second pass settles a guess that fell on
+// the far side of a DST change. The release hour, 09:00, is never inside one.
+function chicagoWallToUtc(year, month, day, hour) {
+  const guess = Date.UTC(year, month - 1, day, hour, 0, 0);
+  const first = guess - chicagoOffsetMs(guess);
+  return guess - chicagoOffsetMs(first);
+}
+
+// The Chicago calendar day of an instant, YYYY-MM-DD: the "day" of the daily cap.
+function chicagoDay(ms) {
+  const p = chicagoParts(ms);
+  return `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
+}
+
+// The Veto window of a ready made at `readyAt`: 2 hours, and for a ready made from
+// 22:00 up to (not including) 07:00 Central, until 09:00 Central, whichever ends
+// later. `until` is the first instant the ticket may be assigned.
+function vetoWindow(readyAt) {
+  const readyMs = new Date(readyAt).getTime();
+  if (!Number.isFinite(readyMs)) return null;
+  const twoHours = readyMs + VETO_WINDOW_MS;
+  const p = chicagoParts(readyMs);
+  const overnight = p.hour >= NIGHT_STARTS_HOUR || p.hour < NIGHT_ENDS_HOUR;
+  if (!overnight) return { untilMs: twoHours, until: new Date(twoHours).toISOString(), rule: 'two-hours' };
+  const morning = chicagoWallToUtc(p.year, p.month, p.day + (p.hour >= NIGHT_STARTS_HOUR ? 1 : 0), WINDOW_RELEASE_HOUR);
+  const untilMs = Math.max(twoHours, morning);
+  return { untilMs, until: new Date(untilMs).toISOString(), rule: 'overnight' };
+}
+
+// A `bounded-ready` row stands until a later `veto` row on the same issue. Rows are
+// raw ledger entries, so this needs nothing of the triage projection.
+function liveBoundedReadies(entries) {
+  const sorted = [...(entries || [])].filter((entry) => entry && entry.kind).sort((left, right) => String(left.at).localeCompare(String(right.at)));
+  const live = new Map();
+  for (const entry of sorted) {
+    if (entry.kind === 'bounded-ready') live.set(Number(entry.issue), entry);
+    else if (entry.kind === 'veto') live.delete(Number(entry.issue));
+  }
+  return live;
+}
+
+// state/triage/<tenant>.jsonl as bin/triage.js writes it (append-only, a torn final
+// line is not a row). A corrupt earlier line throws, which fails the planner closed:
+// a ticket it cannot place inside or outside a Veto window is not one it may assign.
+function readTriageRows(root, tenant) {
+  const file = path.join(path.resolve(root), 'state', 'triage', `${tenant}.jsonl`);
+  if (!fs.existsSync(file)) return [];
+  const raw = fs.readFileSync(file, 'utf8');
+  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
+  const lines = text.split(/\r?\n/);
+  const rows = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index].trim()) continue;
+    try { rows.push(JSON.parse(lines[index])); } catch {
+      if (index === lines.length - 1 && !text.endsWith('\n')) break;
+      throw new WorkStateError('CORRUPT_TRIAGE_LEDGER', `invalid triage JSON in ${file} at line ${index + 1}`);
+    }
+  }
+  return rows;
+}
+
+// What the planner needs beyond GitHub facts: the tickets standing readied under
+// Bounded authority (issue, when) and the login whose `Veto` counts. No root, no ledger.
+function plannerInputs({ root, tenant, tenantConfig } = {}) {
+  const ownerLogin = tenantConfig && tenantConfig.ownerLogin ? String(tenantConfig.ownerLogin) : undefined;
+  if (!root || !tenant) return { boundedReadies: [], ownerLogin };
+  return {
+    boundedReadies: [...liveBoundedReadies(readTriageRows(root, tenant)).values()].map((entry) => ({ issue: Number(entry.issue), at: entry.at })),
+    ownerLogin,
+  };
+}
+
+// The reasons a ticket readied under Bounded authority stays off the frontier at
+// `now`: the owner's Veto after the ready (held until the door withdraws the ready),
+// else a Veto window still open. Never called for a ticket not readied that way, so
+// an owner-approved ready is untouched.
+function windowReasons({ issue, readyAt, ownerLogin, now } = {}) {
+  const readyMs = new Date(readyAt).getTime();
+  if (!Number.isFinite(readyMs)) return [];
+  const owner = String(ownerLogin || '').toLowerCase();
+  if (owner) {
+    const veto = (issue.comments || []).filter((comment) => String(comment.author || '').toLowerCase() === owner && VETO_RE.test(comment.body) && new Date(comment.createdAt).getTime() > readyMs).pop();
+    if (veto) return [{ code: 'vetoed', detail: `the owner's Veto at ${veto.createdAt} follows the Bounded-authority ready at ${new Date(readyMs).toISOString()}`, ...(veto.id ? { comment: veto.id } : {}) }];
+  }
+  const window = vetoWindow(readyMs);
+  const nowMs = new Date(now || Date.now()).getTime();
+  if (window && nowMs < window.untilMs) {
+    const why = window.rule === 'overnight'
+      ? `readied under Bounded authority at ${new Date(readyMs).toISOString()}, between 22:00 and 07:00 Central; the Veto window stays open until 09:00 Central (${window.until})`
+      : `readied under Bounded authority at ${new Date(readyMs).toISOString()}; the 2 hour Veto window is open until ${window.until}`;
+    return [{ code: 'veto-window', detail: why, until: window.until }];
+  }
+  return [];
+}
+
 // `fleetIdentity` is the GitHub login the fleet itself acts as. An assignee equal to it is
 // not evidence that someone else owns the issue: in a single-account tenant the fleet and
 // the human are the same login, nothing in either repo ever removes an assignee, and
 // excluding on it made an issue permanently invisible to the frontier (reviewed 2026-09-06,
 // ADR 0006). A genuinely foreign assignee still excludes. Leave it unset for a tenant whose
 // issues are really owned by several accounts.
-function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, tenant, now } = {}) {
+//
+// #209 (spec #193): `boundedReadies` is [{ issue, at }], the tickets standing readied
+// under Bounded authority and when (plannerInputs reads them
+// from the triage ledger); `ownerLogin` is whose comment beginning `Veto` counts. A
+// ticket readied through the owner's Approval is in neither, so nothing here touches it.
+function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, tenant, now, boundedReadies = [], ownerLogin } = {}) {
   const foreign = (assignee) => !fleetIdentity || String(assignee).toLowerCase() !== String(fleetIdentity).toLowerCase();
   if (!Array.isArray(issues)) throw new WorkStateError('INVALID_GITHUB_FIXTURE', 'issues must be an array');
   const normalized = issues.map(normalizeIssue);
   const scoped = activeRecords(active, tenant);
+  const boundedAt = new Map((boundedReadies || []).map((entry) => [Number(entry.issue), entry.at]));
   const activeByIssue = new Map(scoped.filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
   const eligible = [];
   const excluded = [];
@@ -311,6 +452,9 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     reasons.push(...localExclusionReasons(issue, skipIssues, exclusions));
     if (activeByIssue.has(issue.number)) reasons.push({ code: 'reserved', detail: `active Work record ${activeByIssue.get(issue.number).id}` });
     reasons.push(...reservationConflicts(issue, scoped));
+    if (boundedAt.has(issue.number) && (!readyLabel || issue.labels.includes(readyLabel))) {
+      reasons.push(...windowReasons({ issue, readyAt: boundedAt.get(issue.number), ownerLogin, now }));
+    }
     if (reasons.length) excluded.push({ issue: issue.number, reasons });
     else eligible.push(issue);
   }
@@ -324,7 +468,7 @@ function queryGithubIssues({ repo, readyLabel, executable = 'gh', runner = execF
     if (fetchDetails) {
       const [owner, name] = String(repo).split('/');
       if (!owner || !name) throw new Error(`repo must be owner/name when fetching issue details: ${repo}`);
-      const query = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,state,labels(first:20){nodes{name}},assignees(first:20){nodes{login}},blockedBy(first:100){nodes{number,state} pageInfo{hasNextPage}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(first:100){nodes{id,body,createdAt} pageInfo{hasNextPage}}} pageInfo{hasNextPage,endCursor}}}}';
+      const query = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,state,labels(first:20){nodes{name}},assignees(first:20){nodes{login}},blockedBy(first:100){nodes{number,state} pageInfo{hasNextPage}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(first:100){nodes{id,body,createdAt,author{login}} pageInfo{hasNextPage}}} pageInfo{hasNextPage,endCursor}}}}';
       const nodes = [];
       let cursor = null;
       do {
@@ -512,10 +656,13 @@ function assignPremiseCheck({ issue, repoPath, base, premisesRechecked, runner }
   return check;
 }
 
-function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, permissions, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, premisesRechecked, now, actor = 'assignment-planner', runner } = {}) {
+function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, permissions, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, premisesRechecked, now, actor = 'assignment-planner', runner, boundedReadies } = {}) {
   const proofRecords = hydrateActiveReservations(active, issues, tenant);
   const explicit = explicitReservations(reservations);
-  const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, tenant, now });
+  // #209: the Veto window binds the assign door itself, not only the CLI that computed
+  // the frontier first, so a caller that passes no set gets the ledger's.
+  const bounded = boundedReadies !== undefined ? { boundedReadies, ownerLogin: tenantConfig.ownerLogin } : plannerInputs({ root, tenant, tenantConfig });
+  const frontier = selectFrontier({ issues: [explicit ? { ...issue, reservations: explicit } : issue], readyLabel, active: proofRecords, skipIssues, exclusions, fleetIdentity: tenantConfig.fleetIdentity, tenant, now, ...bounded });
   if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'issue is not eligible for assignment', { excluded: frontier.excluded });
   const normalized = frontier.eligible[0];
   // Spec fleet #92: a section that exists and does not parse is refused before
@@ -694,7 +841,7 @@ function cli(argv) {
     const readyLabel = args['ready-label'] || config.readyLabel || 'ready-for-agent';
     const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: args.repo || config.github, readyLabel, fetchDetails: true });
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
-    return selectFrontier({ issues, readyLabel, active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`)), exclusions, fleetIdentity: config.fleetIdentity, tenant, now: args.now });
+    return selectFrontier({ issues, readyLabel, active: readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json')), skipIssues: readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`)), exclusions, fleetIdentity: config.fleetIdentity, tenant, now: args.now, ...plannerInputs({ root: args.root, tenant, tenantConfig: config }) });
   }
   if (command === 'assign' || command === 'proof') {
     // One loader for both doors: the tenant file names the repo and ready label, the
@@ -707,7 +854,7 @@ function cli(argv) {
     const reservationRecords = hydrateActiveReservations(active, issues, tenant);
     const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`));
     const exclusions = require('./exclusions').activeExclusions({ root: args.root, tenant, now: args.now });
-    const frontier = selectFrontier({ issues, readyLabel, active: reservationRecords, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, tenant, now: args.now });
+    const frontier = selectFrontier({ issues, readyLabel, active: reservationRecords, skipIssues, exclusions, fleetIdentity: config.fleetIdentity, tenant, now: args.now, ...plannerInputs({ root: args.root, tenant, tenantConfig: config }) });
     if (!frontier.eligible.length) throw new WorkStateError('NO_FRONTIER', 'no eligible issue', { excluded: frontier.excluded });
     if (command === 'proof') {
       // The machine-readable independence proof a third assignment must carry: the
@@ -762,11 +909,16 @@ if (require.main === module) {
 
 module.exports = {
   FLAGS,
+  BOUNDED_TIMEZONE,
+  VETO_RE,
+  VETO_WINDOW_MS,
   IC_MODELS,
   IC_PERMISSION_PROFILES,
   acknowledgeAssignment,
   buildManifest,
   buildLaunchPlan,
+  chicagoDay,
+  chicagoParts,
   cli,
   criteriaHash,
   criteriaSentences,
@@ -775,7 +927,9 @@ module.exports = {
   invalidateManifest,
   independenceProof,
   launchReservedAssignment,
+  liveBoundedReadies,
   parseArgs,
+  plannerInputs,
   normalizeIssue,
   readTenantConfig,
   queryGithubIssues,
@@ -785,4 +939,6 @@ module.exports = {
   selectFrontier,
   sha256,
   validateManifest,
+  vetoWindow,
+  windowReasons,
 };

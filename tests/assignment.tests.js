@@ -851,3 +851,126 @@ test('#154: the assignment loader refuses a tenant whose fleetIdentity is its ow
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', fleetIdentity: 'fleet-bot', ownerLogin: 'andydarknessb' }));
   assert.equal(readTenantConfig(root, 'endzone').fleetIdentity, 'fleet-bot');
 });
+
+// Spec fleet #193 (#209): the planner holds a ticket readied under Bounded authority
+// for its Veto window and off the frontier once the owner Vetoes it. "Readied under
+// Bounded authority, and when" comes from the triage ledger's `bounded-ready` row;
+// an owner-approved ready has no such row and is never held.
+const OWNER = 'cory-owner';
+function ownerComment(body, createdAt, author = OWNER) {
+  return { id: `c-${author}-${createdAt}`, createdAt, body, author: { login: author } };
+}
+function windowFor(readyAt, now, extra = {}) {
+  const result = selectFrontier({
+    issues: [issue(60, extra.issue)], readyLabel: 'ready-for-agent', ownerLogin: OWNER, now,
+    boundedReadies: extra.boundedReadies === undefined ? [{ issue: 60, at: readyAt }] : extra.boundedReadies,
+  });
+  return { eligible: result.eligible.map((entry) => entry.number), reasons: (result.excluded[0]?.reasons || []) };
+}
+
+test('#209: a bounded ready less than 2 hours old is off the frontier with a reason that names the Veto window', () => {
+  // 2026-09-29T15:00Z is 10:00 CDT: daytime.
+  const held = windowFor('2026-09-29T15:00:00.000Z', '2026-09-29T16:59:00.000Z');
+  assert.deepEqual(held.eligible, []);
+  assert.deepEqual(held.reasons.map((reason) => reason.code), ['veto-window']);
+  assert.match(held.reasons[0].detail, /Veto window/);
+  assert.equal(held.reasons[0].until, '2026-09-29T17:00:00.000Z');
+  assert.deepEqual(windowFor('2026-09-29T15:00:00.000Z', '2026-09-29T17:00:00.000Z').eligible, [60], 'the window closes at exactly two hours');
+});
+
+test('#209: a bounded ready applied from 22:00 to 07:00 Central stays off the frontier until 09:00 Central', () => {
+  // 2026-09-30T04:00Z is 23:00 CDT the evening of 09-29: until 09:00 CDT (14:00Z) on 09-30.
+  const late = '2026-09-30T04:00:00.000Z';
+  assert.equal(windowFor(late, '2026-09-30T13:59:00.000Z').reasons[0].code, 'veto-window');
+  assert.match(windowFor(late, '2026-09-30T13:59:00.000Z').reasons[0].detail, /09:00 Central/);
+  assert.deepEqual(windowFor(late, '2026-09-30T14:00:00.000Z').eligible, [60]);
+  // 06:30 CDT (11:30Z): the two hours would end at 08:30, the night rule holds it to 09:00.
+  assert.equal(windowFor('2026-09-29T11:30:00.000Z', '2026-09-29T13:59:00.000Z').reasons[0].code, 'veto-window');
+  assert.deepEqual(windowFor('2026-09-29T11:30:00.000Z', '2026-09-29T14:00:00.000Z').eligible, [60]);
+  // 07:00 CDT sharp is daytime again: two hours only.
+  assert.deepEqual(windowFor('2026-09-29T12:00:00.000Z', '2026-09-29T14:00:00.000Z').eligible, [60]);
+  // 22:00 CDT sharp is night.
+  assert.equal(windowFor('2026-09-30T03:00:00.000Z', '2026-09-30T13:00:00.000Z').reasons[0].code, 'veto-window');
+});
+
+test('#209: Central time follows daylight saving in both directions', () => {
+  // Winter (CST, UTC-6): 2026-12-10T04:00Z is 22:00 CST on 12-09; 09:00 CST is 15:00Z.
+  assert.equal(windowFor('2026-12-10T04:00:00.000Z', '2026-12-10T14:59:00.000Z').reasons[0].code, 'veto-window');
+  assert.deepEqual(windowFor('2026-12-10T04:00:00.000Z', '2026-12-10T15:00:00.000Z').eligible, [60]);
+  // Spring forward, 2026-03-08 02:00 CST -> 03:00 CDT: 07:30Z is 01:30 CST, 09:00 CDT is 14:00Z.
+  assert.equal(windowFor('2026-03-08T07:30:00.000Z', '2026-03-08T13:59:00.000Z').reasons[0].code, 'veto-window');
+  assert.deepEqual(windowFor('2026-03-08T07:30:00.000Z', '2026-03-08T14:00:00.000Z').eligible, [60]);
+  // Fall back, 2026-11-01 02:00 CDT -> 01:00 CST: 06:30Z is 01:30 CDT, 09:00 CST is 15:00Z.
+  assert.equal(windowFor('2026-11-01T06:30:00.000Z', '2026-11-01T14:59:00.000Z').reasons[0].code, 'veto-window');
+  assert.deepEqual(windowFor('2026-11-01T06:30:00.000Z', '2026-11-01T15:00:00.000Z').eligible, [60]);
+  // 22:30 CDT on the evening of 10-31 (03:30Z) holds to 09:00 CST the next day (15:00Z).
+  assert.deepEqual(windowFor('2026-11-01T03:30:00.000Z', '2026-11-01T14:59:00.000Z').eligible, []);
+  assert.deepEqual(windowFor('2026-11-01T03:30:00.000Z', '2026-11-01T15:00:00.000Z').eligible, [60]);
+});
+
+test('#209: an owner comment beginning Veto, made after the ready, keeps the ticket off the frontier past its window', () => {
+  const readyAt = '2026-09-29T15:00:00.000Z';
+  const later = '2026-09-29T20:00:00.000Z';
+  const vetoed = windowFor(readyAt, later, { issue: { comments: [ownerComment('Veto: not this week', '2026-09-29T15:30:00.000Z')] } });
+  assert.deepEqual(vetoed.eligible, []);
+  assert.deepEqual(vetoed.reasons.map((reason) => reason.code), ['vetoed']);
+  // Nothing else counts as a Veto: another login, the word mid-comment, a comment before the ready.
+  const notVetoes = [
+    ownerComment('Veto: not this week', '2026-09-29T15:30:00.000Z', 'fleet-bot'),
+    ownerComment('I will not veto this one', '2026-09-29T15:30:00.000Z'),
+    ownerComment('Veto: too early', '2026-09-29T14:59:00.000Z'),
+  ];
+  for (const comment of notVetoes) assert.deepEqual(windowFor(readyAt, later, { issue: { comments: [comment] } }).eligible, [60], comment.body);
+});
+
+test('#209: a ticket readied through the owner Approval is unaffected, whatever its comments say', () => {
+  const approved = windowFor('2026-09-29T15:00:00.000Z', '2026-09-29T15:05:00.000Z', { boundedReadies: [], issue: { comments: [ownerComment('Veto: hmm', '2026-09-29T15:01:00.000Z')] } });
+  assert.deepEqual(approved.eligible, [60], 'no bounded-ready row, so neither the window nor a Veto comment applies');
+  const otherTicket = windowFor('2026-09-29T15:00:00.000Z', '2026-09-29T15:05:00.000Z', { boundedReadies: [{ issue: 61, at: '2026-09-29T15:00:00.000Z' }] });
+  assert.deepEqual(otherTicket.eligible, [60], 'another ticket\'s bounded ready holds only that ticket');
+});
+
+function plannerRoot(rows) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-209-'));
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'example/repo', readyLabel: 'ready-for-agent', fleetIdentity: 'fleet-bot', ownerLogin: OWNER, defaultBranch: 'integration' }));
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), rows.map((row) => `${JSON.stringify({ schemaVersion: 1, tenant: 'endzone', actor: 'principal', ...row })}\n`).join(''));
+  return root;
+}
+
+test('#209: the frontier door reads the triage ledger, so a bounded ready is held and a vetoed one is released only by the door\'s veto row', () => {
+  const ready = { kind: 'bounded-ready', issue: 60, at: '2026-09-29T15:00:00.000Z' };
+  const root = plannerRoot([ready]);
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(60), issue(61)]));
+  const common = ['--root', root, '--tenant', 'endzone', '--fixture', fixture];
+  const inside = cli(['frontier', ...common, '--now', '2026-09-29T16:00:00.000Z']);
+  assert.deepEqual(inside.eligible.map((entry) => entry.number), [61]);
+  assert.equal(inside.excluded.find((entry) => entry.issue === 60).reasons[0].code, 'veto-window');
+  const after = cli(['frontier', ...common, '--now', '2026-09-29T17:00:00.000Z']);
+  assert.deepEqual(after.eligible.map((entry) => entry.number), [60, 61]);
+  // The owner's Veto comment holds it even after the window; the assign door refuses it too.
+  fs.writeFileSync(fixture, JSON.stringify([issue(60, { comments: [ownerComment('Veto: no', '2026-09-29T15:20:00.000Z')] }), issue(61)]));
+  const vetoed = cli(['frontier', ...common, '--now', '2026-09-30T00:00:00.000Z']);
+  assert.equal(vetoed.excluded.find((entry) => entry.issue === 60).reasons[0].code, 'vetoed');
+  assert.throws(() => cli(['assign', ...common, '--issue', '60', '--base-sha', 'a'.repeat(40), '--now', '2026-09-30T00:00:00.000Z']), (error) => error.code === 'NO_FRONTIER');
+  // Once the door has recorded the veto (label removed, proposal back to awaiting Approval), a later
+  // owner Approval that readies the ticket again is an ordinary ready: nothing holds it.
+  fs.appendFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${JSON.stringify({ schemaVersion: 1, tenant: 'endzone', actor: 'principal', kind: 'veto', issue: 60, at: '2026-09-29T15:30:00.000Z' })}\n`);
+  fs.writeFileSync(fixture, JSON.stringify([issue(60), issue(61)]));
+  const reapproved = cli(['frontier', ...common, '--now', '2026-09-29T15:45:00.000Z']);
+  assert.deepEqual(reapproved.eligible.map((entry) => entry.number), [60, 61]);
+});
+
+test('#209: reserving a ticket inside its Veto window is refused by the planner itself, not only by the CLI', () => {
+  const root = plannerRoot([{ kind: 'bounded-ready', issue: 60, at: '2026-09-29T15:00:00.000Z' }]);
+  const base = { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) };
+  const tenantConfig = { ownerLogin: OWNER, fleetIdentity: 'fleet-bot' };
+  assert.throws(
+    () => reserveAssignment({ root, issue: issue(60), tenant: 'endzone', tenantConfig, readyLabel: 'ready-for-agent', base, now: '2026-09-29T16:00:00.000Z' }),
+    (error) => error.code === 'NO_FRONTIER' && error.excluded[0].reasons[0].code === 'veto-window',
+  );
+  const reserved = reserveAssignment({ root, issue: issue(60), tenant: 'endzone', tenantConfig, readyLabel: 'ready-for-agent', base, now: '2026-09-29T17:00:01.000Z' });
+  assert.equal(reserved.reservation.record.id, 'endzone:issue-60');
+});

@@ -300,6 +300,7 @@ function cli(argv) {
         const file = path.join(base, relative);
         return fs.existsSync(file) ? JSON.parse(stripBom(fs.readFileSync(file, 'utf8'))) : fallback;
       };
+      const tenantConfig = assignment.readTenantConfig(args.root, tenant);
       planner = assignment.selectFrontier({
         issues, readyLabel,
         active: readState(path.join('state', 'work', 'active.json'), []),
@@ -307,9 +308,12 @@ function cli(argv) {
         exclusions: exclusions.activeExclusions({ root: args.root, tenant, now: args.now }),
         // The observer must apply exactly the rules the planner will apply when it is
         // authoritative, or the ledger records a difference the live path would not make.
-        fleetIdentity: assignment.readTenantConfig(args.root, tenant).fleetIdentity,
+        fleetIdentity: tenantConfig.fleetIdentity,
         tenant,
         now: args.now,
+        // #209: and the Veto window, or the observer would record a difference the live path
+        // would not make.
+        ...assignment.plannerInputs({ root: base, tenant, tenantConfig }),
       });
     } catch (error) {
       planner = { eligible: [], excluded: [], error: `${error.code || 'ERROR'}: ${error.message}` };
