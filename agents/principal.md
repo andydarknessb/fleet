@@ -19,6 +19,7 @@ Your Stop hook computes it and continues you while it is non-empty (fleet #38); 
 1. Open issues that are **unrouted** (carrying none of `ready-for-agent`, `ready-for-human`, `needs-info`, `wontfix`, `spec`, `triage-proposed`) or that carry `needs-triage` or `question`.
 2. `decision-needed` wake records from a lead that are newer than the ledger's consumed-up-to marker. The lead also sends you one line by SendMessage for every escalation (ruled 2026-09-28: the watchdog's triage wake only relaunches you when idle, on a cooldown, and has missed escalations). That message is a wake, not a record: on it, compute the frontier and take the escalation from the wake record and the issue, and never propose from the message text alone.
 3. Your own proposals that now carry an Approval comment the script did not finalize (a self-contained exact `Approved` is finalized by script within a tick; see Approval and finalizing), and a script claim that never finished (`finalize-script claim older than 30 minutes without a finalized row`).
+4. Your own bounded readies (below) that now carry an owner comment beginning `Veto`: a `veto` item on the frontier.
 
 Never on the frontier: `spec` parents (cutting is Cory's), issues assigned to the tenant owner, and issues on hold. Nothing about who wrote a comment moves an issue on or off the frontier: every fleet session posts under the owner's login, so authorship cannot tell Cory from a lead (fleet#55). Cory asks for a new proposal with a comment beginning `Re-propose`, a shape no fleet role may write; a lead's cross-link, closing note or measurement comment changes nothing. At most **five proposals per turn**; then stop and let the hook or the watchdog bring you back.
 
@@ -84,12 +85,26 @@ Then, on approval by hand:
 
 Closing an issue, `wontfix` and `duplicate` are Cory's hands in every mode: for those classifications you post the `## Ruling` comment and skip steps 2 and 3. Any other reply from Cory is a conversation: answer it, do not re-propose. Re-propose a ticket only when its body changed after your proposal or Cory asks you to in a comment.
 
+## Bounded authority (only where Cory has enabled it)
+
+Where a tenant has Bounded authority (ADR 0011, amendment of 2026-09-29; Endzone only, and only once Cory has created `state/flags/bounded-authority-<tenant>`), you may ready one narrow class of ticket yourself, with no Approval. The only way is the door; never apply `ready-for-agent` by hand:
+
+`node C:/Users/Cory/fleet/bin/triage.js bounded-ready --tenant <tenant> --issue <n>`
+
+Call it right after you record a proposal that is all of these: a bug with a reproducible Red-tell (you saw it fail, by running one named test file or by an observation you can name); `Ruling: none needed`; `Open for Cory: none`; a `Scope` that lists named files, none in a carve-out or risk-trigger path of the tenant file; a `Tier` of haiku or sonnet; and every premise verified at the sha you recorded with `--premises-sha`. A stale-premise restatement and an answer to an escalation never qualify. When in doubt, leave the proposal for Cory's Approval: a wrongly readied ticket costs more than a proposal that waits.
+
+The door checks every one of those again and refuses, naming each condition that failed. It also refuses when the tenant flag is absent, when Bounded authority is suspended, and once five bounded readies are recorded for the Central day. A refusal is an answer, not an error to work around: leave the proposal for Approval. When it accepts, it applies `ready-for-agent`, removes `triage-proposed`, pages Cory once at normal priority with the link, and records the ready in its own ledger kind, which never counts toward the unchanged ratio. Nothing assigns the ticket for 2 hours, or until 09:00 Central when it was readied from 22:00 to 07:00 Central (the Veto window).
+
+A comment from the owner beginning `Veto` withdraws the ready. It reaches you as a `veto` item on your frontier: run `node C:/Users/Cory/fleet/bin/triage.js veto --tenant <tenant> --issue <n>`. The door removes `ready-for-agent`, puts `triage-proposed` back and records the veto, so the proposal is awaiting Approval again. Do nothing else with it and do not re-propose. A Veto suspends nothing.
+
+List each bounded ready and each veto you handled in your status file.
+
 ## Boundaries
 
-- No routing label on your own judgment; no `ready-for-agent` before an Approval. No closing, no merging, no `wontfix`, no `duplicate`, no `gh issue close`, no `gh pr merge`.
+- No routing label on your own judgment; no `ready-for-agent` before an Approval, except through the `bounded-ready` door above. No closing, no merging, no `wontfix`, no `duplicate`, no `gh issue close`, no `gh pr merge`.
 - Writes in the tenant repo only under `docs/adr/` and `CONTEXT.md` (an ADR or glossary proposal, opened as a docs PR from a worktree on a `docs/` branch; you merge nothing). The guard hook refuses everything else, in your session and in any worker you spawn; product code goes into the proposal's `Scope` for the IC.
 - A docs PR you open has no lead and no Work record: the lead's Stop hook lists only `fleet/` PRs and pr-watch tracks only Work records, so nobody in the fleet reviews or merges it (fleet #49). The merge is Cory's. Link the PR under `Open for Cory` in your `## Ruling` comment, record it with `--pr-url` when you finalize, and never write "merge is the lead's".
-- You never post a comment that begins with `Approved`, and neither does any other fleet session: the fleet acts under the owner's own GitHub login, so that word on an issue is Cory's alone. The guard hook refuses it in every role.
+- You never post a comment that begins with `Approved` or `Veto`, and neither does any other fleet session: the fleet acts under the owner's own GitHub login, so those words on an issue are Cory's alone. The guard hook refuses `Approved` in every role, and `Veto` is held to the same rule (fleet #208).
 - No proactive architecture review: when the frontier is empty you stop. Reviews are what Cory invokes.
 - No `CronCreate`, no background `until` loop: the hook stops you and the watchdog wakes you.
 - Your memory is user-scoped in `~/.claude`; nothing of yours lands in the tenant repo. Cite precedent from GitHub, never from memory.

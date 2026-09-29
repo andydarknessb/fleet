@@ -262,7 +262,8 @@ test('the CLI refuses an unknown flag with exit 2 and a missing tenant as usage;
   const state = JSON.parse(run(['state', '--root', root, '--tenant', 'endzone', '--now', NOW]).stdout.trim());
   assert.deepEqual(state.pending.map((row) => row.issue), [1]);
   assert.equal('byIssue' in state, false, 'the state command prints the summary, not the per-issue fold');
-  assert.deepEqual(Object.keys(TRIAGE_FLAGS), ['frontier', 'record', 'state', 'hash', 'finalize']);
+  assert.deepEqual(Object.keys(TRIAGE_FLAGS).slice(0, 5), ['frontier', 'record', 'state', 'hash', 'finalize']);
+  for (const door of ['bounded-ready', 'veto']) assert.ok(door in TRIAGE_FLAGS, door);   // #210
   assert.equal(typeof cli, 'function');
 });
 
@@ -766,7 +767,7 @@ test('#207: a standing bounded-ready row is not finalized by script (clause 1)',
   const world = finalizeWorld({ afterPropose: (root) => fs.appendFileSync(triage.ledgerPath(root, 'endzone'), JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', at: '2026-09-10T06:00:00.000Z', actor: 'principal', issue: 40 }) + '\n') });
   const result = world.finalize();
   assert.deepEqual(result.finalized, []);
-  assert.equal(result.left[0].reason, 'no-open-proposal');
+  assert.equal(result.left[0].reason, 'decided');
 });
 
 test('#207: recovery of a claim with no comment url does not render an empty approval link', () => {
@@ -815,4 +816,268 @@ test('#207: the frontier lists any actor\'s unfinished claim older than 30 minut
   assert.equal(result.eligible[0].edits, 'tier sonnet');
   assert.match(result.eligible[0].reason, /claim older than 30 minutes without a finalized row/);
   assert.equal(result.eligible[0].commentUrl, approvalUrl(70));
+});
+
+// ---------------------------------------------------------------------------
+// Spec fleet #193 (#210): Bounded authority. The Principal readies a bug of the
+// bounded class itself through one door, behind a per-tenant flag Cory creates.
+// Tests drive the door with a fixture issue and fake gh and page seams, and assert
+// what it produces: ledger rows, gh label commands, pages, refusals.
+// ---------------------------------------------------------------------------
+const bounded = require('../bin/bounded-authority');
+
+const BNOW = '2026-09-29T15:00:00.000Z';   // 10:00 CDT, a Tuesday
+const PREMISE_SHA = 'def5678';
+const PROPOSAL_URL = 'https://github.com/owner/repo/issues/7#issuecomment-5001';
+
+function proposalBody(over = {}) {
+  const fields = {
+    Classification: 'bug',
+    'Root cause': 'server/services/foo.js:10 reads a null.',
+    Ruling: 'none needed',
+    'Red-tell': 'server/test/foo.test.js fails today on the null read and passes when guarded',
+    Repro: 'none',
+    Scope: 'lists exactly `server/services/foo.js` and `server/test/foo.test.js`',
+    Premises: [`  server/services/foo.js:10: foo reads a null @abc1234 verified @${PREMISE_SHA}`],
+    Blocked_by: 'none',
+    Tier: 'sonnet',
+    Precedent: 'none',
+    'Open for Cory': 'none',
+    ...over,
+  };
+  const lines = ['## Triage proposal (advisory)'];
+  for (const [name, value] of Object.entries(fields)) {
+    if (value === null) continue;
+    if (Array.isArray(value)) { lines.push(`${name}:`, ...value); } else lines.push(`${name}: ${value}`);
+  }
+  return lines.join('\n');
+}
+
+const CARVE_OUTS = ['server/db/migrations/**', '**/knexfile*', '.github/workflows/**', '.env*', 'netlify.toml'];
+const RISK = { auth: { paths: ['server/middleware/**', 'server/routes/auth*'], patterns: ['jwt'] }, 'data-integrity': { paths: ['server/db/**'], patterns: [] } };
+
+// A tenant root with the flag, an open proposal on issue 7 carrying the given fields.
+function boundedRoot({ flag = true, suspended = false, tenant = 'endzone', carveOuts = CARVE_OUTS, riskTriggers = RISK, proposal = {}, recordOver = {}, issueOver = {}, extraComments = [], labels = ['bug', 'triage-proposed'] } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-bounded-'));
+  for (const dir of ['tenants', 'config', path.join('state', 'watch'), path.join('state', 'flags')]) fs.mkdirSync(path.join(root, dir), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', `${tenant}.json`), JSON.stringify({ name: tenant, github: 'owner/repo', readyLabel: 'ready-for-agent', fleetIdentity: FLEET, ownerLogin: OWNER, carveOuts, riskTriggers }));
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ triage: { maxProposalsPerTurn: 2 } }));
+  if (flag) fs.writeFileSync(path.join(root, 'state', 'flags', `bounded-authority-${tenant}`), '');
+  if (suspended) fs.writeFileSync(path.join(root, 'state', 'flags', `bounded-authority-suspended-${tenant}`), JSON.stringify({ cause: 'test' }));
+  const proposalComment = { id: 'p1', url: PROPOSAL_URL, author: FLEET, createdAt: '2026-09-29T09:00:00.000Z', body: proposalBody(proposal) };
+  const bug = issue(7, { labels, comments: [proposalComment, ...extraComments], body: 'The foo page crashes.', createdAt: '2026-09-28T00:00:00.000Z', ...issueOver });
+  const bodyHash = triage.normalizeIssue(issue(7, { body: 'The foo page crashes.' })).bodyHash;   // the body the proposal was written against
+  recordEntry({ root, tenant, kind: 'proposed', issue: 7, bodyHash, commentUrl: PROPOSAL_URL, model: 'fable', premisesSha: PREMISE_SHA, now: '2026-09-29T09:00:01.000Z', ...recordOver });
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([bug]));
+  const calls = [];
+  const pages = [];
+  const runner = (exe, args) => { calls.push([exe, ...args]); return ''; };
+  const send = (message) => { pages.push(message); return { ok: true, detail: 'pushover delivered' }; };
+  const door = (extra = {}) => bounded.boundedReady({ root, tenant, issue: 7, fixture, now: BNOW, runner, send, ...extra });
+  return { root, tenant, fixture, calls, pages, door, bug, bodyHash };
+}
+
+function boundedRows(world) { return readLedger(world.root, world.tenant).filter((entry) => entry.kind === 'bounded-ready').length; }
+
+function refusal(world, condition, pattern) {
+  const before = boundedRows(world);
+  assert.throws(() => world.door(), (error) => {
+    assert.equal(error.code, 'BOUNDED_REFUSED');
+    assert.equal(error.condition, condition, error.message);
+    if (pattern) assert.match(error.message, pattern);
+    return true;
+  });
+  assert.equal(world.calls.length, 0, 'a refusal changes nothing on GitHub');
+  assert.equal(world.pages.length, 0, 'a refusal pages nobody');
+  assert.equal(boundedRows(world), before, 'a refusal records nothing');
+}
+
+test('#210: a bounded bug is readied: the ready label goes on, the marker comes off, Cory is paged once at normal priority with the link, and the ledger holds its own kind', () => {
+  const world = boundedRoot();
+  const result = world.door();
+  assert.equal(result.readied, true);
+  assert.deepEqual(world.calls, [['gh', 'issue', 'edit', '7', '-R', 'owner/repo', '--add-label', 'ready-for-agent', '--remove-label', 'triage-proposed']]);
+  assert.equal(world.pages.length, 1);
+  assert.equal(world.pages[0].priority, 'normal');
+  assert.equal(world.pages[0].url, 'https://github.com/owner/repo/issues/7');
+  assert.match(world.pages[0].body, /Veto/);
+  assert.ok(!/—/.test(world.pages[0].title + world.pages[0].body), 'no em-dash in page text');
+  const rows = readLedger(world.root, 'endzone').filter((entry) => entry.kind === 'bounded-ready');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].issue, 7);
+  assert.equal(rows[0].at, BNOW);
+  assert.equal(rows[0].bodyHash, world.bodyHash);
+  assert.equal(rows[0].commentUrl, PROPOSAL_URL);
+  // The proposal is no longer pending or awaiting a finalize: it was routed.
+  const state = projectTriage({ entries: readLedger(world.root, 'endzone'), now: BNOW });
+  assert.deepEqual(state.pending, []);
+  assert.deepEqual(state.awaitingFinalize, []);
+  // The planner sees the ready and holds it for its window.
+  const planned = require('../bin/assignment').plannerInputs({ root: world.root, tenant: 'endzone', tenantConfig: { ownerLogin: OWNER } });
+  assert.deepEqual(planned.boundedReadies, [{ issue: 7, at: BNOW }]);
+});
+
+test('#210: the CLI reads a fixture issue and records the ready; the fixture source touches neither GitHub nor the pager', () => {
+  const world = boundedRoot();
+  const out = cli(['bounded-ready', '--root', world.root, '--tenant', 'endzone', '--issue', '7', '--fixture', world.fixture, '--now', BNOW]);
+  assert.equal(out.readied, true);
+  assert.equal(out.source, 'fixture');
+  assert.equal(out.labelApplied, false);
+  assert.equal(out.paged, false);
+  assert.equal(readLedger(world.root, 'endzone').filter((entry) => entry.kind === 'bounded-ready').length, 1);
+});
+
+test('#210: the door refuses each condition it does not hold, and names it', () => {
+  refusal(boundedRoot({ proposal: { Classification: 'feature' } }), 'not-a-bug');
+  refusal(boundedRoot({ proposal: { Classification: 'duplicate of #4' } }), 'not-a-bug');
+  refusal(boundedRoot({ proposal: { 'Red-tell': 'none' } }), 'no-red-tell');
+  refusal(boundedRoot({ proposal: { 'Red-tell': null } }), 'no-red-tell');
+  refusal(boundedRoot({ proposal: { Ruling: 'Whether guest users may see the foo page' } }), 'ruling-needed');
+  refusal(boundedRoot({ proposal: { 'Open for Cory': 'Should the foo page show ties?' } }), 'open-for-cory');
+  refusal(boundedRoot({ proposal: { Tier: 'opus' } }), 'tier');
+  refusal(boundedRoot({ proposal: { Tier: 'fable' } }), 'tier');
+  refusal(boundedRoot({ proposal: { Premises: ['  server/services/foo.js:10: foo reads a null @abc1234 false: the code guards it at line 9'] } }), 'premises-unverified', /false/);
+  refusal(boundedRoot({ proposal: { Premises: ['  server/services/foo.js:10: foo reads a null @abc1234'] } }), 'premises-unverified');
+  refusal(boundedRoot({ proposal: { Premises: [`  server/services/foo.js:10: foo reads a null @abc1234 verified @${PREMISE_SHA}`, '  server/x.js:2: x is set @abc1234 false: it is not'] } }), 'premises-unverified');
+  refusal(boundedRoot({ proposal: { Premises: [`  server/services/foo.js:10: foo reads a null @abc1234 verified @0123456`] } }), 'premises-unverified', /premises-sha/);
+  refusal(boundedRoot({ recordOver: { premisesSha: undefined } }), 'premises-unverified', /premises-sha/);
+});
+
+test('#210: a ticket with no Premises section may be bounded; the door only refuses a premise that is not verified', () => {
+  const world = boundedRoot({ proposal: { Premises: 'none stated' }, recordOver: { premisesSha: undefined } });
+  assert.equal(world.door().readied, true);
+});
+
+test('#210: Scope inside a carve-out or a risk-trigger path is refused, naming the path and the glob; a scope it cannot place is refused too', () => {
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `server/db/migrations/0099_fix.sql` and `server/test/foo.test.js`' } }), 'scope-carve-out', /server\/db\/migrations\/0099_fix\.sql/);
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `server/knexfile.js`' } }), 'scope-carve-out', /knexfile/);
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `.github/workflows/ci.yml`' } }), 'scope-carve-out');
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `.env.local` and `src/a.js`' } }), 'scope-carve-out');
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly netlify.toml and src/a.js.' } }), 'scope-carve-out', /netlify\.toml/);
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `server/middleware/requireMember.js` and `server/test/x.test.js`' } }), 'scope-risk-path', /auth/);
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `server/db/queries.js`' } }), 'scope-risk-path', /data-integrity/);
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `server/db/`' } }), 'scope-unresolved');
+  refusal(boundedRoot({ proposal: { Scope: 'lists exactly `server/services/*.js`' } }), 'scope-unresolved');
+  refusal(boundedRoot({ proposal: { Scope: 'the foo service' } }), 'scope-unresolved');
+  refusal(boundedRoot({ carveOuts: [], riskTriggers: {} }), 'tenant-no-carve-outs');
+});
+
+test('#210: a proposal that is not this ticket\'s open, unmodified, ordinary proposal is refused', () => {
+  refusal(boundedRoot({ issueOver: { body: 'The body was edited after the proposal.' } }), 'proposal-stale');
+  refusal(boundedRoot({ recordOver: { commentUrl: 'https://github.com/owner/repo/issues/7#issuecomment-9999' } }), 'proposal-not-found');
+  refusal(boundedRoot({ recordOver: { reason: 'stale-premise', premise: 'server/x.js:1: y @abc1234' } }), 'needs-approval', /stale-premise/);
+  refusal(boundedRoot({ recordOver: { recordId: 'endzone:issue-7' } }), 'needs-approval', /escalation/);
+  refusal(boundedRoot({ labels: ['bug', 'triage-proposed', 'ready-for-agent'] }), 'already-ready');
+  const world = boundedRoot();
+  world.door();
+  world.calls.length = 0;
+  world.pages.length = 0;
+  refusal(world, 'no-open-proposal');   // a second ready on the same proposal
+});
+
+test('#210: at most 5 bounded readies per tenant per Central day; the sixth is refused, and a vetoed one still counts', () => {
+  const world = boundedRoot();
+  const rows = [
+    ['2026-09-29T05:30:00.000Z', 101], ['2026-09-29T08:00:00.000Z', 102], ['2026-09-29T13:00:00.000Z', 103], ['2026-09-29T14:00:00.000Z', 104], ['2026-09-29T14:30:00.000Z', 105],
+  ];
+  for (const [at, number] of rows) fs.appendFileSync(triage.ledgerPath(world.root, 'endzone'), `${JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', issue: number, at, actor: 'principal' })}\n`);
+  fs.appendFileSync(triage.ledgerPath(world.root, 'endzone'), `${JSON.stringify({ schemaVersion: 1, kind: 'veto', tenant: 'endzone', issue: 105, at: '2026-09-29T14:40:00.000Z', actor: 'principal', by: OWNER })}\n`);
+  refusal(world, 'daily-cap', /5/);
+  // 05:30Z on 09-29 is 00:30 CDT, the same Central day as 15:00Z; a ready at 04:30Z was the day before.
+  const other = boundedRoot();
+  for (const [at, number] of [['2026-09-29T04:30:00.000Z', 101], ['2026-09-29T08:00:00.000Z', 102], ['2026-09-29T13:00:00.000Z', 103], ['2026-09-29T14:00:00.000Z', 104], ['2026-09-29T14:30:00.000Z', 105]]) {
+    fs.appendFileSync(triage.ledgerPath(other.root, 'endzone'), `${JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', issue: number, at, actor: 'principal' })}\n`);
+  }
+  assert.equal(other.door().readied, true, 'four on this Central day and one on the previous one leaves room for a fifth');
+});
+
+test('#210: no tenant flag, no bounded ready: Nidus and any tenant Cory has not enabled are refused without a GitHub read; a standing suspension refuses too', () => {
+  const unflagged = boundedRoot({ flag: false });
+  assert.throws(() => unflagged.door({ fixture: undefined, issues: undefined, runner: () => { throw new Error('no GitHub read may happen'); } }), (error) => error.code === 'BOUNDED_REFUSED' && error.condition === 'flag-absent');
+  assert.equal(unflagged.pages.length, 0);
+  refusal(boundedRoot({ flag: false }), 'flag-absent', /bounded-authority-endzone/);
+  refusal(boundedRoot({ tenant: 'nidus', flag: false }), 'flag-absent');
+  refusal(boundedRoot({ suspended: true }), 'suspended', /removing/);
+  // The flag is per tenant: another tenant's flag does not enable this one.
+  const world = boundedRoot({ flag: false });
+  fs.writeFileSync(path.join(world.root, 'state', 'flags', 'bounded-authority-nidus'), '');
+  refusal(world, 'flag-absent');
+});
+
+test('#210: record cannot write a bounded ready or a veto; only the doors can', () => {
+  const world = boundedRoot();
+  for (const kind of ['bounded-ready', 'veto', 'suspended']) {
+    assert.throws(() => cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', kind, '--issue', '7', '--now', BNOW]), (error) => error.code === 'USAGE' && /door/.test(error.message), kind);
+  }
+});
+
+test('#210: a bounded ready never enters the unchanged ratio that earned the authority', () => {
+  const root = rootDir();
+  const at = (day) => `2026-09-${String(day).padStart(2, '0')}T10:00:00.000Z`;
+  for (let n = 1; n <= 10; n += 1) {
+    recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: n, bodyHash: `h${n}`, commentUrl: `https://x/${n}`, model: 'fable', now: at(n) });
+    recordEntry({ root, tenant: 'endzone', kind: n === 10 ? 'approved-with-edits' : 'approved', issue: n, by: OWNER, edits: n === 10 ? 'narrower scope' : undefined, now: `2026-09-${String(n).padStart(2, '0')}T11:00:00.000Z` });
+  }
+  const before = projectTriage({ entries: readLedger(root, 'endzone'), now: NOW });
+  for (const n of [21, 22, 23]) {
+    recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: n, bodyHash: `h${n}`, commentUrl: `https://x/${n}`, model: 'fable', now: '2026-09-11T10:00:00.000Z' });
+    recordEntry({ root, tenant: 'endzone', kind: 'bounded-ready', issue: n, bodyHash: `h${n}`, now: '2026-09-11T10:05:00.000Z' });
+  }
+  recordEntry({ root, tenant: 'endzone', kind: 'veto', issue: 23, by: OWNER, now: '2026-09-11T11:00:00.000Z' });
+  const after = projectTriage({ entries: readLedger(root, 'endzone'), now: NOW });
+  assert.deepEqual(after.allTime, before.allTime);
+  assert.deepEqual(after.window, before.window);
+  assert.equal(after.graduation.decided, before.graduation.decided);
+  assert.equal(after.graduation.unchangedRatio, 0.9);
+  assert.deepEqual(after.pending.map((entry) => entry.issue), [23], 'the vetoed proposal is awaiting Approval again; the two standing bounded readies are not pending');
+});
+
+test('#210: an owner Veto is an item on the Principal\'s frontier; the veto door removes the ready label, records the veto and returns the proposal to awaiting Approval', () => {
+  const world = boundedRoot();
+  world.door();
+  // Nothing to do while the owner has said nothing.
+  const quiet = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T15:30:00.000Z' });
+  assert.deepEqual(quiet.eligible, []);
+  const readyLabelled = { ...world.bug, labels: ['bug', 'ready-for-agent'], comments: [...world.bug.comments, { id: 'v1', url: 'https://github.com/owner/repo/issues/7#issuecomment-6001', author: OWNER, createdAt: '2026-09-29T15:20:00.000Z', body: 'Veto: this needs a design call first.' }] };
+  fs.writeFileSync(world.fixture, JSON.stringify([readyLabelled]));
+  const frontier = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T15:30:00.000Z' });
+  assert.equal(frontier.eligible.length, 1);
+  assert.equal(frontier.eligible[0].kind, 'veto');
+  assert.equal(frontier.eligible[0].number, 7);
+  assert.equal(frontier.eligible[0].commentUrl, 'https://github.com/owner/repo/issues/7#issuecomment-6001');
+  world.calls.length = 0;
+  const vetoed = bounded.vetoReady({ root: world.root, tenant: 'endzone', issue: 7, fixture: world.fixture, now: '2026-09-29T15:31:00.000Z', runner: (exe, args) => { world.calls.push([exe, ...args]); return ''; } });
+  assert.equal(vetoed.vetoed, true);
+  assert.deepEqual(world.calls, [['gh', 'issue', 'edit', '7', '-R', 'owner/repo', '--remove-label', 'ready-for-agent', '--add-label', 'triage-proposed']]);
+  const rows = readLedger(world.root, 'endzone');
+  const veto = rows.find((entry) => entry.kind === 'veto');
+  assert.equal(veto.issue, 7);
+  assert.equal(veto.by, OWNER);
+  assert.equal(veto.commentUrl, 'https://github.com/owner/repo/issues/7#issuecomment-6001');
+  assert.deepEqual(projectTriage({ entries: rows, now: '2026-09-29T16:00:00.000Z' }).pending.map((entry) => entry.issue), [7], 'awaiting Approval again');
+  // The planner no longer holds it as a bounded ready, so an owner Approval that readies it again is ordinary.
+  assert.deepEqual(require('../bin/assignment').plannerInputs({ root: world.root, tenant: 'endzone', tenantConfig: {} }).boundedReadies, []);
+  // With the marker back and the ready label off, a later Approved comment is finalized like any other.
+  const approvedLater = { ...world.bug, labels: ['bug', 'triage-proposed'], comments: [...readyLabelled.comments, { id: 'a1', url: 'https://github.com/owner/repo/issues/7#issuecomment-6002', author: OWNER, createdAt: '2026-09-29T16:10:00.000Z', body: 'Approved' }] };
+  fs.writeFileSync(world.fixture, JSON.stringify([approvedLater]));
+  const later = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T16:30:00.000Z' });
+  assert.deepEqual(later.eligible.map((entry) => entry.kind), ['approval']);
+  // A Veto suspends nothing (#211 pins the flag too).
+  assert.ok(!fs.existsSync(path.join(world.root, 'state', 'flags', 'bounded-authority-suspended-endzone')));
+});
+
+test('#210: the veto door refuses when the owner has not vetoed, when only the fleet says Veto, and when there is no standing bounded ready', () => {
+  const world = boundedRoot();
+  world.door();
+  const veto = (over = {}) => bounded.vetoReady({ root: world.root, tenant: 'endzone', issue: 7, fixture: world.fixture, now: '2026-09-29T15:31:00.000Z', runner: () => { throw new Error('no label change may happen'); }, ...over });
+  assert.throws(() => veto(), (error) => error.code === 'TRIAGE_NO_VETO');
+  const fleetOnly = { ...world.bug, labels: ['bug', 'ready-for-agent'], comments: [...world.bug.comments, { id: 'v1', url: 'https://x/v1', author: FLEET, createdAt: '2026-09-29T15:20:00.000Z', body: 'Veto: pretending to be the owner' }] };
+  fs.writeFileSync(world.fixture, JSON.stringify([fleetOnly]));
+  assert.throws(() => veto(), (error) => error.code === 'TRIAGE_NO_VETO');
+  const early = { ...fleetOnly, comments: [{ id: 'v0', url: 'https://x/v0', author: OWNER, createdAt: '2026-09-29T14:00:00.000Z', body: 'Veto: before the ready' }, ...world.bug.comments] };
+  fs.writeFileSync(world.fixture, JSON.stringify([early]));
+  assert.throws(() => veto(), (error) => error.code === 'TRIAGE_NO_VETO', 'a Veto before the ready withdraws nothing');
+  const unreadied = boundedRoot();
+  assert.throws(() => bounded.vetoReady({ root: unreadied.root, tenant: 'endzone', issue: 7, fixture: unreadied.fixture, now: BNOW, runner: () => '' }), (error) => error.code === 'TRIAGE_NO_BOUNDED_READY');
 });

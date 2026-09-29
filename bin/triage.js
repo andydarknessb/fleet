@@ -16,7 +16,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { WorkStateError, parseArgs } = require('./work-state');
-const { sha256 } = require('./assignment');
+const { sha256, VETO_RE } = require('./assignment');
 const { readPremises } = require('./premises');
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -28,7 +28,11 @@ const DEFAULT_CONFIG = Object.freeze({
   graduation: { minProposals: 30, minDays: 14, minUnchangedRatio: 0.9 },
 });
 
-const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed']);
+// Spec fleet #193 (#210, #211): the bounded kinds are written only by their doors
+// (bin/bounded-authority.js: bounded-ready, veto, and the suspension scan), never by
+// `record`, and none of them is an outcome the unchanged ratio counts.
+const BOUNDED_KINDS = Object.freeze(['bounded-ready', 'veto', 'suspended']);
+const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed', ...BOUNDED_KINDS]);
 const OUTCOME_KINDS = Object.freeze(['approved', 'approved-with-edits', 'rejected', 'superseded']);
 const APPROVAL_RE = /^\s*approved(\s+with\s*:|\b)/i;
 const APPROVAL_WITH_EDITS_RE = /^\s*approved\s+with\s*:/i;
@@ -136,7 +140,7 @@ function appendEntry(root, tenant, entry) {
   return entry;
 }
 
-function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, now } = {}) {
+function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, fields, now } = {}) {
   if (!LEDGER_KINDS.includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `kind must be one of ${LEDGER_KINDS.join(', ')}`);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : 'principal' };
@@ -164,6 +168,16 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     if (kind === 'approved-with-edits') entry.edits = requireText(edits, 'edits');
   }
   if (kind === 'superseded') entry.bodyHash = requireText(bodyHash, 'body-hash');
+  if (kind === 'bounded-ready') {
+    entry.bodyHash = requireText(bodyHash, 'body-hash');
+    if (commentUrl) entry.commentUrl = String(commentUrl);
+  }
+  if (kind === 'veto') {
+    entry.by = requireText(by, 'by');
+    if (commentUrl) entry.commentUrl = String(commentUrl);
+  }
+  // `fields` is the door's own detail (scope, tier, cause...); it never overrides a core key.
+  if (fields && BOUNDED_KINDS.includes(kind)) for (const [key, value] of Object.entries(fields)) if (!(key in entry)) entry[key] = value;
   if (kind === 'finalized') {
     const applied = String(labels || '').split(',').map((label) => label.trim()).filter(Boolean);
     entry.labels = applied;
@@ -188,11 +202,12 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
   if (kind === 'proposed') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
     if (open && open.proposed && !open.outcome) throw new WorkStateError('TRIAGE_PROPOSAL_OPEN', `issue #${entry.issue} already has an open proposal at ${open.proposed.at}; record its outcome first`);
-  } else if (kind !== 'consumed') {
+  } else if (kind !== 'consumed' && kind !== 'suspended') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
     if (!open || !open.proposed) throw new WorkStateError('TRIAGE_NO_PROPOSAL', `issue #${entry.issue} has no proposal to ${kind}`);
     // #207: the outcome row is a first-writer-wins claim (the finalize script and the Principal both take it before posting a Ruling).
-    if (OUTCOME_KINDS.includes(kind) && open.outcome) throw new WorkStateError('TRIAGE_ALREADY_DECIDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at} by ${open.outcome.actor || 'principal'}`, { decidedBy: open.outcome.actor || 'principal' });
+    if ((OUTCOME_KINDS.includes(kind) || kind === 'bounded-ready') && open.outcome) throw new WorkStateError('TRIAGE_ALREADY_DECIDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at} by ${open.outcome.actor || 'principal'}`, { decidedBy: open.outcome.actor || 'principal' });
+    if (kind === 'veto' && !(open.outcome && open.outcome.kind === 'bounded-ready')) throw new WorkStateError('TRIAGE_NO_BOUNDED_READY', `issue #${entry.issue} has no standing bounded ready to veto`);
     if (kind === 'finalized' && !open.outcome) throw new WorkStateError('TRIAGE_NOT_APPROVED', `issue #${entry.issue} has no approval to finalize`);
   }
   appendEntry(root, tenant, entry);
@@ -304,6 +319,11 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     row.history.push(entry);
     if (entry.kind === 'proposed') { row.proposed = entry; row.outcome = null; row.finalized = null; if (!firstProposedAt) firstProposedAt = entry.at; }
     else if (OUTCOME_KINDS.includes(entry.kind)) { if (row.proposed && !row.outcome) { row.outcome = entry; outcomes.push(entry); } }
+    // Spec fleet #193: a bounded ready routes the proposal without an Approval, so it is
+    // the row's outcome but never one of `outcomes`, which is what the ratio tallies; a veto
+    // takes it back and the proposal is awaiting Approval again.
+    else if (entry.kind === 'bounded-ready') { if (row.proposed && !row.outcome) row.outcome = entry; }
+    else if (entry.kind === 'veto') { if (row.outcome && row.outcome.kind === 'bounded-ready') { row.outcome = null; row.finalized = null; } }
     else if (entry.kind === 'finalized') { if (row.outcome) row.finalized = entry; }
   }
   const rows = Object.values(byIssue).sort((left, right) => left.issue - right.issue);
@@ -468,6 +488,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   const marker = config.markerLabel;
   const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
   const approvals = [];
+  const vetoes = [];
   const tickets = [];
   const skipped = [];
 
@@ -479,6 +500,16 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
     const ownerComments = issue.comments.filter((comment) => comment.author === owner);
     const newest = issue.comments[issue.comments.length - 1] || null;
+
+    // 0. (#210) A standing bounded ready with the owner's Veto after it: withdraw the ready.
+    const standing = row && row.outcome && row.outcome.kind === 'bounded-ready' ? row.outcome : null;
+    if (standing) {
+      const veto = ownerComments.filter((comment) => comment.createdAt > standing.at && VETO_RE.test(comment.body)).pop();
+      if (veto) {
+        vetoes.push({ kind: 'veto', number: issue.number, title: issue.title, url: issue.url, commentUrl: veto.url, at: veto.createdAt, by: veto.author, readyAt: standing.at, reason: 'owner Veto newer than the bounded ready' });
+        continue;
+      }
+    }
 
     // 0. #207: an outcome (any actor's) with no finalized row is an unfinished claim. The finalize
     // script finishes its own on its next run; past CLAIM_EXPIRY_MINUTES it returns here for the
@@ -563,15 +594,16 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   }
 
   approvals.sort((left, right) => left.at.localeCompare(right.at));
+  vetoes.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
-    eligible: [...approvals, ...escalationList, ...tickets],
+    eligible: [...vetoes, ...approvals, ...escalationList, ...tickets],
     proposeNow,
     skipped,
     premises,
-    counts: { issues: issues.length, eligible: approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length },
+    counts: { issues: issues.length, eligible: vetoes.length + approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length, vetoes: vetoes.length },
   };
 }
 
@@ -759,7 +791,9 @@ function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_
   const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
   if (!proposed) { fail('no-open-proposal', row && row.outcome ? `outcome ${row.outcome.kind} recorded` : 'no open proposal'); return failures; }
   const history = row.history || [];
-  if (history.some((entry) => entry.kind === 'bounded-ready' && String(entry.at) >= String(proposed.at))) { fail('no-open-proposal', 'a bounded-ready row stands'); return failures; }
+  // A bounded-ready row stands until a later veto row (a vetoed proposal is back to awaiting Approval).
+  const lastAt = (kind) => history.filter((entry) => entry.kind === kind && String(entry.at) >= String(proposed.at)).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  if (lastAt('bounded-ready') && lastAt('bounded-ready') > lastAt('veto')) { fail('no-open-proposal', 'a bounded-ready row stands'); return failures; }
   const before = approval ? approval.createdAt : null;
   const headed = issue.comments.filter((comment) => PROPOSAL_HEADING_RE.test(comment.body) && (before === null || comment.createdAt < before));
   const newest = headed[headed.length - 1];   // clause 4
@@ -883,6 +917,11 @@ function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath
   let claims = 0;
   for (const issue of sorted) {
     const row = projection.byIssue[issue.number] || null;
+    // Spec fleet #193: a standing bounded ready is a decision already taken; an Approval after it is left to the frontier's rules, never finalized here.
+    if (row && row.proposed && row.outcome && row.outcome.kind === 'bounded-ready') {
+      if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > row.proposed.at && APPROVAL_RE.test(comment.body))) left.push({ issue: issue.number, reason: 'decided', detail: 'a bounded ready stands' });
+      continue;
+    }
     const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
     if (!proposed) continue;
     // The same rule the frontier uses for "an approval": the owner's newest approval-shaped comment after the proposal.
@@ -926,8 +965,11 @@ const TRIAGE_FLAGS = Object.freeze({
   state: ['root', 'tenant', 'now', 'days'],
   hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
   finalize: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
+  // Spec fleet #193 (#210): the Bounded-authority doors (bin/bounded-authority.js).
+  'bounded-ready': ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
+  veto: ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -936,7 +978,13 @@ function cli(argv) {
   const args = parseArgs(rest, flags);
   const tenant = requireText(args.tenant, '--tenant');
   if (command === 'frontier') return computeFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
+  if (command === 'bounded-ready' || command === 'veto') {
+    const door = require('./bounded-authority');
+    const options = { root: args.root, tenant, issue: args.issue, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now, effects: !args.fixture };
+    return command === 'veto' ? door.vetoReady(options) : door.boundedReady(options);
+  }
   if (command === 'record') {
+    if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto), which checks what it records`);
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
       by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
@@ -963,6 +1011,7 @@ if (require.main === module) {
 
 module.exports = {
   APPROVAL_RE,
+  BOUNDED_KINDS,
   DEFAULT_CONFIG,
   LEDGER_KINDS,
   TRIAGE_FLAGS,
@@ -975,9 +1024,12 @@ module.exports = {
   issueBodyHash,
   ledgerPath,
   normalizeIssue,
+  ownerLoginOf,
   projectTriage,
   queryGithubIssues,
+  readFixtureIssues,
   readLedger,
+  readTenantConfig,
   readTriageConfig,
   recordEntry,
   runStalePremiseNotice,
