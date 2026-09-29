@@ -102,7 +102,7 @@ if ($tool -in @('Bash', 'PowerShell')) {
         break
       }
       if ("$body" -match '^\s*(\\n|\s)*re-?propose\b') {
-        $reason = "a comment that begins 'Re-propose' is the tenant owner's ask for a new Triage proposal and no fleet session may post one under any role (fleet#55): the fleet acts under the owner's own GitHub login, so bin/triage.js reads the shape, not the author. Say what you mean in other words ('the scope changed; the Principal should look again') or leave the ask to Cory $cite"
+        $reason = "a comment that begins 'Re-propose' is the tenant owner's ask for a new Triage proposal and no fleet session may post one under any role (fleet#55): a re-proposal ask is the owner's alone, bin/triage.js recognises it by shape and author, and this guard is the second lock. Say what you mean in other words ('the scope changed; the Principal should look again') or leave the ask to Cory $cite"
         break
       }
       # fleet#208: matched exactly like Approved (case-insensitive, leading whitespace or a literal \n skipped, first word only).
