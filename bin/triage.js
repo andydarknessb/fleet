@@ -532,7 +532,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // 0b. (#210, ruling m2) A standing bounded ready whose ready label is missing and that the owner
     // has not spoken on since: the label edit after the ledger row failed. Re-running
     // `bounded-ready --issue <n>` re-applies the label, records nothing and pages nothing.
-    if (standing && !labels.has(readyLabel) && !ownerComments.some((comment) => Date.parse(comment.createdAt) > Date.parse(standing.at))) {
+    if (standing && standing.paged === true && !labels.has(readyLabel) && ![...labels].some((label) => config.routingLabels.includes(label) || ['held', 'haiku-rehearsal'].includes(label)) && !ownerComments.some((comment) => Date.parse(comment.createdAt) > Date.parse(standing.at))) {
       repairs.push({ kind: 'bounded-repair', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, readyAt: standing.at, reason: `bounded ready recorded at ${standing.at}, but ${readyLabel} is not on the issue` });
       continue;
     }
@@ -1003,6 +1003,7 @@ function cli(argv) {
   const tenant = requireText(args.tenant, '--tenant');
   if (command === 'frontier') return computeFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.now && !args.fixture) throw new WorkStateError('USAGE', `--now is for a fixture run only: the ledger's \`at\` and the Veto window are the wall clock in production (${command})`);
+  if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.fixture && path.resolve(args.root || path.resolve(__dirname, '..')).toLowerCase() === path.resolve(__dirname, '..').toLowerCase()) throw new WorkStateError('USAGE', `--fixture is for a temp --root: on the fleet's own root a rehearsal would write state a live run acts on (${command})`);
   if (command === 'bounded-scan') return require('./bounded-authority').boundedScan({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now });
   if (command === 'bounded-ready' || command === 'veto') {
     const door = require('./bounded-authority');
@@ -1010,6 +1011,7 @@ function cli(argv) {
     return command === 'veto' ? door.vetoReady(options) : door.boundedReady(options);
   }
   if (command === 'record') {
+    if (args.now && Date.parse(args.now) > Date.now() + 5 * 60000) throw new WorkStateError('USAGE', 'record --now is in the future: the ledger\'s time is the wall clock, and a later time would put a proposal after the comments it should answer to');
     if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto, bounded-scan), which checks what it records`);
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,

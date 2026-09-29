@@ -885,7 +885,7 @@ function boundedRoot({ flag = true, suspended = false, tenant = 'endzone', tenan
   const order = [];
   const runner = (exe, args) => { calls.push([exe, ...args]); order.push(`label:${readLedger(root, tenant).some((entry) => entry.kind === 'bounded-ready') ? 'row' : 'norow'}`); return ''; };
   const send = (message) => { pages.push(message); order.push(`page:${readLedger(root, tenant).some((entry) => entry.kind === 'bounded-ready') ? 'row' : 'norow'}`); return { ok: true, detail: 'pushover delivered' }; };
-  const repo = { has: (dir) => tree.includes(dir), read: (file) => (Object.prototype.hasOwnProperty.call(files, file) ? files[file] : null) };
+  const repo = { has: (dir) => tree.includes(dir), read: (file) => (Object.prototype.hasOwnProperty.call(files, file) ? files[file] : null), list: (dir) => Object.keys(files).filter((name) => name.slice(0, name.lastIndexOf('/')) === dir).map((name) => name.slice(name.lastIndexOf('/') + 1)) };
   const door = (extra = {}) => bounded.boundedReady({ root, tenant, issue: 7, fixture, now: BNOW, runner, send, repo, ...extra });
   return { root, tenant, fixture, calls, pages, order, door, bug, bodyHash, runner, send, repo };
 }
@@ -976,7 +976,9 @@ test('#210: the CLI reads a fixture issue and records the ready; the fixture sou
   assert.equal(out.source, 'fixture');
   assert.equal(out.labelApplied, false);
   assert.equal(out.paged, false);
-  assert.equal(boundedRows(world), 1);
+  assert.equal(out.recorded, false, 'a fixture run records nothing (QA B-1)');
+  assert.equal(out.entry.kind, 'bounded-ready', 'the entry it would have recorded is returned');
+  assert.equal(boundedRows(world), 0);
   for (const door of ['bounded-ready', 'veto']) {
     assert.throws(() => cli([door, '--root', world.root, '--tenant', 'endzone', '--issue', '7', '--now', BNOW]), (error) => error.code === 'USAGE' && /fixture/.test(error.message), door);
   }
@@ -1023,6 +1025,20 @@ const LEAVES = [
   ['Scope a basename only', { proposal: { Scope: 'lists exactly `20260929000001_fix.js` and `foo.service.js`' } }, 'scope-unresolved', /names no directory/],
   ['Scope with a .. segment', { proposal: { Scope: 'lists exactly server/services/../db/migrations/x.js' } }, 'scope-unresolved'],
   ['Scope a directory', { proposal: { Scope: 'lists exactly `server/services/`' } }, 'scope-unresolved'],
+  ['Scope with a line anchor (#L12) on a risk file', { proposal: { Scope: 'lists exactly `server/modules/auth.js#L12`' } }, 'scope-risk-path', /auth/],
+  ['Scope with :12:5 on a risk file', { proposal: { Scope: 'lists exactly `server/modules/auth.js:12:5`' } }, 'scope-risk-path'],
+  ['Scope with :L12 on a risk file', { proposal: { Scope: 'lists exactly `server/modules/auth.js:L12`' } }, 'scope-risk-path'],
+  ['Scope with a line range on a risk file', { proposal: { Scope: 'lists exactly `server/modules/auth.js:12-30`' } }, 'scope-risk-path'],
+  ['Scope with an @sha suffix', { proposal: { Scope: 'lists exactly `server/modules/auth.js@abc1234`' } }, 'scope-unresolved'],
+  ['Scope with a doubled slash', { proposal: { Scope: 'lists exactly `server/modules//auth.js`' } }, 'scope-unresolved'],
+  ['Scope with a dot segment', { proposal: { Scope: 'lists exactly `server/./modules/auth.js`' } }, 'scope-unresolved'],
+  ['Scope a risk file in another case (Auth.js)', { proposal: { Scope: 'lists exactly `server/modules/Auth.js`' } }, 'scope-risk-path'],
+  ['Scope a risk file in another case (auth.JS)', { proposal: { Scope: 'lists exactly `server/modules/auth.JS`' } }, 'scope-risk-path'],
+  ['Scope a file that differs only in case from an existing one', { files: { 'server/services/Foo.js': 'x' }, proposal: { Scope: 'lists exactly `server/services/foo.js`' } }, 'scope-unresolved', /differs only in case/],
+  ['Scope a markdown link', { proposal: { Scope: 'lists exactly [auth](server/services/foo.js)' } }, 'scope-unresolved'],
+  ['Scope with a prose token (etc)', { proposal: { Scope: 'lists exactly `server/services/foo.js`, etc' } }, 'scope-unresolved', /not a path/],
+  ['Scope with an ellipsis', { proposal: { Scope: 'lists exactly `server/services/foo.js` and ...' } }, 'scope-unresolved'],
+  ['Scope with a trailing description', { proposal: { Scope: 'lists exactly `server/services/foo.js` and the pool module' } }, 'scope-unresolved'],
   ['Scope a pattern', { proposal: { Scope: 'lists exactly `server/services/*.js`' } }, 'scope-unresolved'],
   ['Scope no path at all', { proposal: { Scope: 'the foo service' } }, 'scope-unresolved'],
   ['Scope a migration (the real Endzone carve-out)', { proposal: { Scope: 'lists exactly `server/db/migrations/0099_fix.sql` and `server/test/foo.test.js`' } }, 'scope-carve-out', /server\/db\/migrations\/0099_fix\.sql/],
@@ -1032,14 +1048,16 @@ const LEAVES = [
   ['Scope the advisory lock (a real risk-trigger path)', { proposal: { Scope: 'lists exactly `server/modules/advisoryLock.js`' } }, 'scope-risk-path', /concurrency/],
   ['Scope the scoring engine (a real risk-trigger path)', { proposal: { Scope: 'lists exactly `server/services/matchupScoring.service.js`' } }, 'scope-risk-path', /data-integrity/],
   ['Scope a file whose content holds FOR UPDATE', { files: { 'server/services/foo.js': 'const rows = await db.raw("SELECT * FROM t FOR UPDATE");' } }, 'scope-risk-pattern', /FOR UPDATE/],
-  ['a body premise the proposal block omits', { proposal: { Premises: [PREMISE_LINE, '  server/db/x.js:3: x is set @abc1234 verified @def5678'] } }, 'premises-unverified'],
+  ['a body with 2 premises and a proposal block with 1', { body: `${B_BODY}server/db/x.js:3: x is set @abc1234\n` }, 'premises-unverified', /states 2 premise/],
+  ['a proposal block with 2 lines under a body with 1', { proposal: { Premises: [PREMISE_LINE, '  server/db/x.js:3: x is set @abc1234 verified @def5678'] } }, 'premises-unverified', /states 1 premise/],
+  ['a body that lacks the Premises heading', { body: 'The foo page crashes.\n' }, 'no-premises-heading'],
   ['Premises none stated while the body states one', { proposal: { Premises: 'none stated' } }, 'premises-unverified', /states 1 premise/],
   ['a proposal premise the body never states', { proposal: { Premises: ['  server/services/bar.js:9: bar reads a null @abc1234 verified @def5678'] } }, 'premises-unverified', /matches no premise/],
   ['a false premise', { proposal: { Premises: ['  server/services/foo.js:10: foo reads a null @abc1234 false: the code guards it at line 9'] } }, 'premises-unverified'],
   ['an unstamped premise', { proposal: { Premises: ['  server/services/foo.js:10: foo reads a null @abc1234'] } }, 'premises-unverified'],
   ['a premise verified at another sha', { proposal: { Premises: ['  server/services/foo.js:10: foo reads a null @abc1234 verified @0123456'] } }, 'premises-unverified', /premises-sha/],
   ['a proposal recorded without --premises-sha', { recordOver: { premisesSha: undefined } }, 'premises-unverified', /premises-sha/],
-  ['the proposal comment edited after it was recorded', { proposalOver: { lastEditedAt: '2026-09-29T09:30:00.000Z' } }, 'proposal-edited'],
+  ['the proposal comment edited after it was recorded', { proposalOver: { lastEditedAt: '2026-09-29T09:30:00.000Z' } }, 'edited-after-approval', /proposal-edited/],
   ['the issue body changed since the proposal', { issueOver: { body: 'The body was edited after the proposal.' } }, 'body-changed'],
   ['the recorded proposal comment is not in the thread', { recordOver: { commentUrl: 'https://github.com/owner/repo/issues/7#issuecomment-9999' } }, 'stale-proposal'],
   ['a newer proposal in the thread than the ledger\'s', { extraComments: [{ ...comment(FLEET, '## Triage proposal (advisory)\nClassification: bug', '2026-09-29T09:10:00.000Z'), url: 'https://github.com/owner/repo/issues/7#issuecomment-5002' }] }, 'stale-proposal'],
@@ -1179,7 +1197,10 @@ test('#210 m4: an Approval said before a Veto does not finalize what the Veto wi
   // propose, bounded ready, Approved, Veto: the veto item is all there is.
   thread(['bug', 'ready-for-agent']);
   assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T15:30:00.000Z' }).eligible.map((item) => item.kind), ['veto']);
-  bounded.vetoReady({ root: world.root, tenant: 'endzone', issue: 7, fixture: world.fixture, now: '2026-09-29T15:31:00.000Z', effects: false });
+  const dry = bounded.vetoReady({ root: world.root, tenant: 'endzone', issue: 7, fixture: world.fixture, now: '2026-09-29T15:31:00.000Z', effects: false });
+  assert.equal(dry.recorded, false);
+  assert.ok(!readLedger(world.root, 'endzone').some((entry) => entry.kind === 'veto'), 'a dry veto records nothing');
+  bounded.vetoReady({ root: world.root, tenant: 'endzone', issue: 7, fixture: world.fixture, now: '2026-09-29T15:31:00.000Z', runner: world.runner });
   thread(['bug', 'triage-proposed']);
   const after = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-29T15:40:00.000Z' });
   assert.deepEqual(after.eligible, [], 'the earlier Approved is older than the veto row');
@@ -1434,6 +1455,62 @@ test('#211: bounded-scan is a triage door: it runs the scan from the CLI against
   const world = readiedUnit();
   escalate(world, { reason: 'criteria-defect' });
   const out = cli(['bounded-scan', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', '2026-09-29T18:05:00.000Z']);
-  assert.equal(out.suspended, true);
-  assert.ok(fs.existsSync(SUSPENDED_FLAG(world.root)));
+  assert.equal(out.suspended, true, 'it reports what it would suspend on');
+  assert.equal(out.dryRun, true);
+  assert.equal(out.wrote, false);
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(world.root)), 'a fixture scan writes no flag (QA B-1)');
+  assert.equal(suspensionRows(world).length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Re-QA of the rework (2026-09-29): B-1, M-A and the minors.
+// ---------------------------------------------------------------------------
+
+test('#210 B-1: --fixture on the fleet\'s own root is refused before anything is read, on every bounded door', () => {
+  const world = boundedRoot();
+  for (const door of ['bounded-ready', 'veto']) {
+    assert.throws(() => cli([door, '--tenant', 'endzone', '--issue', '7', '--fixture', world.fixture]), (error) => error.code === 'USAGE' && /own root/.test(error.message), `${door} with the default root`);
+    assert.throws(() => cli([door, '--root', path.join(__dirname, '..'), '--tenant', 'endzone', '--issue', '7', '--fixture', world.fixture]), (error) => error.code === 'USAGE' && /own root/.test(error.message), `${door} with the root named`);
+  }
+  assert.throws(() => cli(['bounded-scan', '--tenant', 'endzone', '--fixture', world.fixture]), (error) => error.code === 'USAGE' && /own root/.test(error.message));
+});
+
+test('#210 B-1: the row records that Cory was paged; a repair refuses a row that did not page, and the frontier does not offer one', () => {
+  const world = boundedRoot();
+  world.door();
+  const row = readLedger(world.root, 'endzone').find((entry) => entry.kind === 'bounded-ready');
+  assert.equal(row.paged, true);
+  assert.match(row.pageDetail, /pushover/);
+  // A row with no paged flag (whatever wrote it) is never repaired into a ready label.
+  const raw = boundedRoot();
+  fs.appendFileSync(triage.ledgerPath(raw.root, 'endzone'), `${JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', issue: 7, at: BNOW, actor: 'principal', bodyHash: raw.bodyHash })}\n`);
+  assert.deepEqual(computeFrontier({ root: raw.root, tenant: 'endzone', fixture: raw.fixture, now: '2026-09-29T15:30:00.000Z' }).eligible, []);
+  assert.throws(() => raw.door({ now: '2026-09-29T15:31:00.000Z' }), (error) => error.condition === 'unpaged-ready');
+  assert.equal(raw.calls.length, 0);
+});
+
+test('#210 B-1: a repair re-checks what the door checked: a held label, a hold, a Work record', () => {
+  const failLabel = () => { const world = boundedRoot(); assert.throws(() => world.door({ runner: () => { throw new Error('gh 502'); } }), (error) => error.code === 'GITHUB_WRITE_FAILED'); return world; };
+  const held = failLabel();
+  fs.writeFileSync(held.fixture, JSON.stringify([{ ...held.bug, labels: ['bug', 'held'] }]));
+  assert.throws(() => held.door(), (error) => error.condition === 'labels');
+  assert.ok(!computeFrontier({ root: held.root, tenant: 'endzone', fixture: held.fixture, now: '2026-09-29T15:30:00.000Z' }).eligible.some((item) => item.kind === 'bounded-repair'), 'no repair is offered on a held issue');
+  const skipped = failLabel();
+  SKIP(skipped.root);
+  assert.throws(() => skipped.door(), (error) => error.condition === 'held');
+  const worked = failLabel();
+  fs.mkdirSync(path.join(worked.root, 'state', 'work'), { recursive: true });
+  fs.writeFileSync(path.join(worked.root, 'state', 'work', 'active.json'), JSON.stringify({ records: { 'endzone:issue-7': { id: 'endzone:issue-7', state: 'implementing' } } }));
+  assert.throws(() => worked.door(), (error) => error.condition === 'live-work');
+});
+
+test('#210 minors: a proposal recorded in the door\'s future refuses, the owner-spoke floor is the earlier of the ledger time and the comment time, and the gate\'s edited code stays', () => {
+  refusal(boundedRoot({ recordOver: { now: '2026-09-30T09:00:00.000Z' } }), 'proposal-in-future');
+  // The ledger says the proposal was recorded tomorrow, but the comment is from this morning: the owner's later comment still counts.
+  const spoke = boundedRoot({ recordOver: { now: '2026-09-30T09:00:00.000Z' }, extraComments: [comment(OWNER, 'No, do not ready this', '2026-09-29T10:00:00.000Z')] });
+  assert.ok(codesOf(spoke).includes('owner-spoke'));
+  const edited = boundedRoot({ proposalOver: { lastEditedAt: '2026-09-29T09:00:00.800Z' } });
+  assert.ok(codesOf(edited).includes('edited-after-approval'), 'edited after it was posted, though before it was recorded');
+  const world = boundedRoot();
+  assert.throws(() => cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', 'proposed', '--issue', '9', '--body-hash', 'h', '--comment-url', 'https://x/9', '--model', 'fable', '--now', '2099-01-01T00:00:00.000Z']), (error) => error.code === 'USAGE' && /future/.test(error.message));
 });

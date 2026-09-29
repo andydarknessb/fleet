@@ -115,6 +115,7 @@ function gitRepo(tenantConfig) {
   return {
     has(directory) { try { git(['cat-file', '-e', `origin/${branch}:${directory}`]); return true; } catch { return false; } },
     read(file) { try { return git(['show', `origin/${branch}:${file}`]); } catch { return null; } },
+    list(directory) { try { return git(['ls-tree', '--name-only', `origin/${branch}:${directory}`]).split(/\r?\n/).filter(Boolean); } catch { return []; } },
   };
 }
 
@@ -128,7 +129,7 @@ function readFixture(file) {
   const files = parsed.files || {};
   return {
     issues: (parsed.issues || []).map((entry) => normalizeIssue(entry)),
-    repo: parsed.tree || parsed.files ? { has: (dir) => tree.has(dir), read: (name) => (Object.prototype.hasOwnProperty.call(files, name) ? String(files[name]) : null) } : null,
+    repo: parsed.tree || parsed.files ? { has: (dir) => tree.has(dir), read: (name) => (Object.prototype.hasOwnProperty.call(files, name) ? String(files[name]) : null), list: (dir) => Object.keys(files).filter((name) => name.slice(0, name.lastIndexOf('/')) === dir).map((name) => name.slice(name.lastIndexOf('/') + 1)) } : null,
   };
 }
 
@@ -141,19 +142,30 @@ function loadIssues({ tenantConfig, fixture, issues, runner }) {
 
 // --- Scope (ruling M5, M6) ---
 
-// Each token of a Scope field that could name a file (it holds a `/` or a `.`), stripped of the
-// fences and punctuation prose puts around it, backslashes made slashes. A token is a repo path
-// only when it is repo-relative with a directory in it (see checkScope).
+// The tokens of a Scope field: the field's words after an optional leading "lists exactly" (or
+// "lists only", "touches only"), with the joining words "and" and "or" dropped, split on
+// whitespace, commas and semicolons, and stripped of the fences prose puts around a path. Every
+// token that is left must be a repo path, so any other prose (`etc`, `...`, "and the pool
+// module") is not a path and refuses (ruling on the re-QA, M-A and its minor 2).
 function scopeTokens(scope) {
-  return String(scope || '').split(/[\s,;]+/)
-    .map((token) => token.replace(/^[`"'(\[]+|[`"')\].,:;!?]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, ''))
-    .filter((token) => token && /[/.]/.test(token));
+  const text = String(scope || '').replace(/^\s*(?:lists|touches|edits|changes)\s+(?:exactly|only)\b/i, '');
+  return text.split(/[\s,;]+/)
+    .filter(Boolean)
+    .map((raw) => ({ raw, token: raw.replace(/^[`"'(\[]+|[`"')\].,:;!?]+$/g, '').replace(/\\/g, '/').replace(/^\.\//, '') }))
+    .filter(({ raw, token }) => token || raw)
+    .filter(({ token }) => !/^(?:and|or)$/i.test(token));
 }
 
 function patternRegExp(pattern) {
   try { return new RegExp(pattern); } catch { return new RegExp(String(pattern).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')); }
 }
 
+// A Scope token is a repo path only when, after its line anchor is dropped (`#L12`, `:12`,
+// `:12:5`, `:L12`, `:12-30`), it is made of [A-Za-z0-9._/-] alone with a directory in it and no
+// empty, `.` or `..` segment, and its directory exists at origin/<defaultBranch>. Anything
+// else is scope-unresolved, never guessed at. Globs are matched case-insensitively, and a
+// token that differs only in case from a file that exists is refused, so `Auth.js` is not a way
+// around `auth.js`.
 function checkScope({ scope, tenantConfig, repo }) {
   const failures = [];
   const fail = (code, detail) => failures.push({ code, detail });
@@ -161,21 +173,29 @@ function checkScope({ scope, tenantConfig, repo }) {
   const carveOuts = Array.isArray(tenantConfig.carveOuts) ? tenantConfig.carveOuts : [];
   const riskTriggers = tenantConfig.riskTriggers && typeof tenantConfig.riskTriggers === 'object' ? tenantConfig.riskTriggers : {};
   if (!carveOuts.length && !Object.keys(riskTriggers).length) { fail('tenant-no-carve-outs', `tenant ${tenantConfig.name || '?'} declares no carveOuts and no riskTriggers, so no Scope can be shown to be outside them`); return { failures, files: [] }; }
+  const branch = tenantConfig.defaultBranch || 'integration';
   const files = [];
-  for (const token of scopeTokens(scope)) {
-    const bare = token.replace(/:\d+(?:-\d+)?$/, '');   // a line suffix is a citation, not part of the path
-    if (bare.endsWith('/') || /[*?{}[\]]/.test(bare)) { fail('scope-unresolved', `${token} is a directory or a pattern; name the files`); continue; }
-    if (/^\/|^[A-Za-z]:|^~/.test(bare) || bare.split('/').includes('..')) { fail('scope-unresolved', `${token} is not a repo-relative path`); continue; }
-    if (!bare.includes('/')) { fail('scope-unresolved', `${token} names no directory, so no path in the repository; write the full path`); continue; }
-    if (!repo) { fail('scope-unresolved', `no tenant checkout to confirm ${token} against`); continue; }
-    if (!repo.has(bare.slice(0, bare.lastIndexOf('/')))) { fail('scope-unresolved', `${token}: its directory does not exist at origin/${tenantConfig.defaultBranch || 'integration'}`); continue; }
+  for (const { raw, token } of scopeTokens(scope)) {
+    const shown = raw;
+    const bare = token.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/(?::L?\d+)+(?:-L?\d+)?$/i, '');
+    if (bare.endsWith('/') || /[*?{}[\]]/.test(bare)) { fail('scope-unresolved', `${shown} is a directory or a pattern; name the files`); continue; }
+    if (!bare || !/^[A-Za-z0-9._/-]+$/.test(bare)) { fail('scope-unresolved', `${shown} is not a path (it holds something other than letters, digits and . _ / -)`); continue; }
+    if (!bare.includes('/')) { fail('scope-unresolved', /\./.test(bare) && /[A-Za-z0-9]/.test(bare) ? `${shown} names no directory, so no path in the repository; write the full path` : `${shown} is not a path`); continue; }
+    const segments = bare.split('/');
+    if (bare.startsWith('/') || segments.some((segment) => segment === '' || segment === '.' || segment === '..')) { fail('scope-unresolved', `${shown} is not a clean repo-relative path (no leading /, empty, . or .. segment)`); continue; }
+    if (!repo) { fail('scope-unresolved', `no tenant checkout to confirm ${shown} against`); continue; }
+    const directory = segments.slice(0, -1).join('/');
+    if (!repo.has(directory)) { fail('scope-unresolved', `${shown}: its directory does not exist at origin/${branch}`); continue; }
+    const twin = typeof repo.list === 'function' ? (repo.list(directory) || []).find((name) => name.toLowerCase() === segments[segments.length - 1].toLowerCase() && name !== segments[segments.length - 1]) : null;
+    if (twin) { fail('scope-unresolved', `${shown} differs only in case from the existing ${directory}/${twin}`); continue; }
     files.push(bare);
   }
   if (!files.length && !failures.length) fail('scope-unresolved', 'Scope names no file the door can check against the carve-outs');
   for (const file of [...new Set(files)]) {
-    for (const glob of carveOuts) if (matchGlob(glob, file)) fail('scope-carve-out', `Scope names ${file}, inside the carve-out ${glob}`);
+    const folded = file.toLowerCase();
+    for (const glob of carveOuts) if (matchGlob(String(glob).toLowerCase(), folded)) fail('scope-carve-out', `Scope names ${file}, inside the carve-out ${glob}`);
     for (const [name, spec] of Object.entries(riskTriggers)) {
-      for (const glob of (spec && spec.paths) || []) if (matchGlob(glob, file)) fail('scope-risk-path', `Scope names ${file}, inside the ${name} risk-trigger path ${glob}`);
+      for (const glob of (spec && spec.paths) || []) if (matchGlob(String(glob).toLowerCase(), folded)) fail('scope-risk-path', `Scope names ${file}, inside the ${name} risk-trigger path ${glob}`);
     }
     // For the bounded door a file whose current content matches a risk-trigger pattern is a risk-trigger path.
     const content = repo ? repo.read(file) : null;
@@ -242,8 +262,9 @@ function boundedFailures({ root, tenant, number, issue, row, open, entries, proj
   const gate = proposalGate({ issue, row, proposal: proposalComment, approval: null, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough, holds: readHeldIssues(root, tenant, at) });
   for (const failure of gate) {
     // The gate's own "premises" (a block of at least one verified line) is replaced by the stricter
-    // body-matching check below; its edited-after check is replaced by the bounded one (edited after proposed.at).
-    if (failure.code === 'premises' || failure.code === 'edited-after-approval') continue;
+    // body-matching check below. Its edited-after-approval code stays (with no approval it means the comment was edited
+    // after it was posted), beside the bounded proposal-edited (edited after it was recorded).
+    if (failure.code === 'premises') continue;
     push(failure.code, failure.detail);
   }
   if (gate.some((failure) => failure.code === 'no-open-proposal')) return failures;
@@ -252,7 +273,10 @@ function boundedFailures({ root, tenant, number, issue, row, open, entries, proj
   const todays = entries.filter((entry) => entry.kind === 'bounded-ready' && assignment.chicagoDay(new Date(entry.at).getTime()) === today).length;
   if (todays >= DAILY_CAP) push('daily-cap', `${todays} bounded readies are recorded for ${tenant} on ${today} (Central); the cap is ${DAILY_CAP}`);
   if (entries.some((entry) => Number(entry.issue) === number && (entry.kind === 'bounded-ready' || entry.kind === 'veto'))) push('bounded-once', `issue #${number} already had a bounded ready or a Veto; a bounded attempt is made once per issue, and after it the issue is Cory's`);
-  if (issue.comments.some((comment) => String(comment.author).toLowerCase() === owner.toLowerCase() && Date.parse(comment.createdAt) > Date.parse(open.at))) push('owner-spoke', `${owner} commented after the proposal, and what he said is his to answer (an Approval, a question, a change), not the door's`);
+  // The floor is the earlier of the ledger's time and the comment's own, so a proposal recorded with a later --now cannot hide an owner comment.
+  const spokeFloor = Math.min(Date.parse(open.at), proposalComment ? Date.parse(proposalComment.createdAt) : Infinity);
+  if (Date.parse(open.at) > Date.parse(at) + 60000) push('proposal-in-future', `the ledger says the proposal was recorded at ${open.at}, after now (${at})`);
+  if (issue.comments.some((comment) => String(comment.author).toLowerCase() === owner.toLowerCase() && Date.parse(comment.createdAt) > spokeFloor)) push('owner-spoke', `${owner} commented after the proposal, and what he said is his to answer (an Approval, a question, a change), not the door's`);
   if (hasWorkRecord(root, tenant, number)) push('live-work', `a Work record ${tenant}:issue-${number} exists; a bounded ready is for a ticket nothing has worked on`);
   const openEdges = issue.blockedBy.filter((edge) => edge.state !== 'CLOSED');
   if (openEdges.length || issue.blockedByTruncated) push('blocked', openEdges.length ? `blocked by open ${openEdges.map((edge) => `#${edge.number}`).join(', ')}` : 'the blocked-by list is truncated');
@@ -308,8 +332,8 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   if (!found) throw refused([{ code: 'issue-not-found', detail: `issue #${number} is not among ${tenant}'s open issues` }]);
   // Gate 2: a standing suspension, lifted only by removing its file. The scan comes first, so
   // failure evidence that arrived since the last one is on file before the ready is judged.
-  scanSuspension({ root, tenant, issues: loadEscapeBugs({ tenantConfig, fixture, issues: fixture || issues ? all : undefined, runner }), now: at });
-  if (isSuspended(root, tenant)) {
+  const scanned = scanSuspension({ root, tenant, issues: loadEscapeBugs({ tenantConfig, fixture, issues: fixture || issues ? all : undefined, runner }), now: at, dryRun: !effects });
+  if (isSuspended(root, tenant) || scanned.suspended) {
     throw refused([{ code: 'suspended', detail: `Bounded authority is suspended for ${tenant} (state/flags/bounded-authority-suspended-${safeTenant(tenant)}); only removing that file lifts it` }]);
   }
 
@@ -323,7 +347,14 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
     if (entries.some((entry) => entry.kind === 'proposed' && Number(entry.issue) === number && String(entry.at) > String(standing.at))) throw refused([{ code: 'bounded-once', detail: `a newer proposal than the bounded ready at ${standing.at} exists; an issue is readied under Bounded authority once` }]);
     if (found.bodyHash !== standing.bodyHash) throw refused([{ code: 'body-changed', detail: `the issue body changed since the bounded ready at ${standing.at}` }]);
     if (found.labels.includes(readyLabel)) throw refused([{ code: 'bounded-once', detail: `issue #${number} already has its bounded ready (${standing.at}) and carries ${readyLabel}` }]);
+    // Only a row that records Cory was paged is repaired: a row without that is not a ready he was told of.
+    if (standing.paged !== true) throw refused([{ code: 'unpaged-ready', detail: `the bounded-ready row at ${standing.at} does not record that Cory was paged, so it is not repaired into a ready label` }]);
     if (found.comments.some((comment) => String(comment.author).toLowerCase() === owner.toLowerCase() && Date.parse(comment.createdAt) > Date.parse(standing.at))) throw refused([{ code: 'owner-spoke', detail: `${owner} commented after the bounded ready at ${standing.at}; the repair is left` }]);
+    const barred = found.labels.filter((label) => [...config.routingLabels, 'held', 'haiku-rehearsal', tenantConfig.escalationLabel].filter(Boolean).includes(label));
+    if (barred.length) throw refused([{ code: 'labels', detail: `issue #${number} carries ${barred.join(', ')}, so the ready label is not re-applied` }]);
+    const hold = triage().readHeldIssues(root, tenant, at).get(number);
+    if (hold) throw refused([{ code: 'held', detail: hold }]);
+    if (hasWorkRecord(root, tenant, number)) throw refused([{ code: 'live-work', detail: `a Work record ${tenant}:issue-${number} exists` }]);
     const result = { tenant, issue: number, repaired: true, readied: false, at, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false };
     if (!effects) return result;
     try { ghEdit({ runner, tenantConfig, number, edits: [['--add-label', readyLabel], ...(found.labels.includes(config.markerLabel) ? [['--remove-label', config.markerLabel]] : [])] }); } catch (error) {
@@ -343,8 +374,9 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   const proposalHash = assignment.sha256(failures.proposalComment.body);
   const paths = failures.scopeFiles;
   const result = { tenant, issue: number, readied: true, at, windowUntil: window.until, windowRule: window.rule, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false };
-  const record = () => recordEntry({ root, tenant, kind: 'bounded-ready', issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, fields: { scope: paths, tier: tierWord(failures.proposal.fields.Tier), proposalHash }, now: at });
-  if (!effects) return { ...result, entry: record() };
+  const detail = { scope: paths, tier: tierWord(failures.proposal.fields.Tier), proposalHash };
+  // With effects off (a fixture run) NOTHING is recorded: a row written by a rehearsal is a row a live run could act on (QA B-1). The entry it would have written is returned.
+  if (!effects) return { ...result, recorded: false, entry: { schemaVersion: 1, kind: 'bounded-ready', tenant, at, actor: 'principal', issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, ...detail, paged: false } };
   const page = {
     kind: 'bounded-ready',
     title: `Fleet: ${tenant} #${number} readied under Bounded authority`,
@@ -358,7 +390,8 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   if (!sent || !sent.ok) throw refused([{ code: 'page-failed', detail: `the page to Cory was not delivered (${(sent && sent.detail) || 'no detail'}); nothing was recorded, and the next tick tries again` }]);
   result.paged = true;
   result.pageDetail = sent.detail || null;
-  result.entry = record();
+  result.entry = recordEntry({ root, tenant, kind: 'bounded-ready', issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, fields: { ...detail, paged: true, pageDetail: sent.detail || null }, now: at });
+  result.recorded = true;
   try {
     ghEdit({ runner, tenantConfig, number, edits: [['--add-label', readyLabel], ...(found.labels.includes(config.markerLabel) ? [['--remove-label', config.markerLabel]] : [])] });
   } catch (error) {
@@ -387,8 +420,9 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
   if (!veto) throw new WorkStateError('TRIAGE_NO_VETO', `issue #${number} has no comment from ${owner} beginning "Veto" after the bounded ready at ${standing.at}`);
   const config = readTriageConfig(root);
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
-  const result = { tenant, issue: number, vetoed: true, at, source: fixture ? 'fixture' : 'github', labelChanged: false };
-  if (effects) {
+  const result = { tenant, issue: number, vetoed: true, at, source: fixture ? 'fixture' : 'github', labelChanged: false, recorded: false };
+  if (!effects) return { ...result, entry: { schemaVersion: 1, kind: 'veto', tenant, at, actor: 'principal', issue: number, by: owner, ...(veto.url ? { commentUrl: veto.url } : {}) } };
+  {
     try {
       ghEdit({ runner, tenantConfig, number, edits: [['--remove-label', readyLabel], ['--add-label', config.markerLabel]] });
     } catch (error) {
@@ -397,6 +431,7 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
     result.labelChanged = true;
   }
   result.entry = recordEntry({ root, tenant, kind: 'veto', issue: number, by: owner, commentUrl: veto.url || undefined, now: at });
+  result.recorded = true;
   return result;
 }
 
@@ -516,7 +551,7 @@ function loadEscapeBugs({ tenantConfig, fixture, issues, runner }) {
 
 // Read the evidence, and suspend on any not already ruled on. `issues` are the tenant's bugs
 // (the escape check reads them); without them only the local evidence counts.
-function scanSuspension({ root, tenant, issues, now, events } = {}) {
+function scanSuspension({ root, tenant, issues, now, events, dryRun = false } = {}) {
   const { readLedger, recordEntry, normalizeIssue } = triage();
   const at = isoOf(now);
   const entries = readLedger(root, tenant);
@@ -531,6 +566,8 @@ function scanSuspension({ root, tenant, issues, now, events } = {}) {
     ...(issues ? escapeEvidence({ tenant, live, events: ledgerEvents, issues: issues.map((entry) => normalizeIssue(entry)) }) : []),
   ].filter((item) => !ruledOn.has(item.id)).sort((a, b) => String(a.at).localeCompare(String(b.at)) || a.id.localeCompare(b.id));
   if (!found.length) return result;
+  // A dry run (a fixture) reports what it would suspend on and writes neither the flag nor the row.
+  if (dryRun) return { ...result, suspended: true, wrote: false, dryRun: true, evidence: found };
   const first = found[0];
   const evidenceIds = found.map((item) => item.id);
   // The flag first, then the row: a row without its flag would leave the evidence "ruled on"
@@ -549,7 +586,7 @@ function boundedScan({ root, tenant, tenantConfigPath, fixture, issues, now, run
   const { readTenantConfig } = triage();
   if (!tenant) throw new WorkStateError('TRIAGE_INVALID', 'tenant is required');
   const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
-  return scanSuspension({ root, tenant, issues: loadEscapeBugs({ tenantConfig, fixture, issues, runner }), now });
+  return scanSuspension({ root, tenant, issues: loadEscapeBugs({ tenantConfig, fixture, issues, runner }), now, dryRun: Boolean(fixture) });
 }
 
 // The daily summary's scan: every tenant that has Bounded authority enabled or suspended. A
