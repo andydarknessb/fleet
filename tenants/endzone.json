@@ -25,19 +25,19 @@
   },
   "riskTriggers": {
     "auth": {
-      "paths": ["server/middleware/**", "server/services/leagueRole*", "server/routes/auth*"],
+      "paths": ["server/middleware/**", "server/services/leagueRole*", "server/routes/auth*", "server/modules/auth.js", "server/modules/refreshCookie.js"],
       "patterns": ["requireMember", "isMember\\(", "leagueRole", "jwt", "JWT_SECRET"]
     },
     "security": {
-      "paths": [],
+      "paths": ["server/modules/encryption.js", "server/modules/clientOrigins.js", "server/modules/imageSniff.js", "server/modules/rateLimit.js"],
       "patterns": ["dangerouslySetInnerHTML", "child_process", "execSync", "eval\\(", "innerHTML"]
     },
     "data-integrity": {
-      "paths": ["server/db/**", "server/services/scoring*"],
+      "paths": ["server/db/**", "server/services/scoring*", "server/services/matchupScoring*", "server/services/playerStatsWrite*", "server/services/boxScoreApply*", "server/services/waiver*"],
       "patterns": ["ON DELETE", "dropColumn", "alterTable\\("]
     },
     "concurrency": {
-      "paths": [],
+      "paths": ["server/modules/advisoryLock.js", "server/modules/pool.js", "server/services/pickClock*", "server/services/waiver*"],
       "patterns": ["FOR UPDATE", "advisory"]
     },
     "destructive": {

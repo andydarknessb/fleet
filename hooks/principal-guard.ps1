@@ -5,8 +5,9 @@
 #      - Edit/Write/NotebookEdit/MultiEdit only under: the tenant repo's docs/adr/ and
 #        CONTEXT.md (also inside .claude/worktrees/<x>/ for a docs PR), the fleet's
 #        docs/adr/ and CONTEXT.md, its own status file state/status/pe-<tenant>.md,
-#        state/triage/ (bin/triage.js is the writer; the door's state denials still
-#        apply), the user's ~/.claude (memory, plans) and the temp directory.
+#        the user's ~/.claude (memory, plans) and the temp directory. The triage
+#        ledger is NOT writable here: it is written only through node bin/triage.js,
+#        whose doors check what they record (rule 2b below).
 #      - Bash/PowerShell: no bare test suite (npm test / npx jest / node --test with no
 #        file; test:server:all / :sweep ever), no sync-* script, no gh issue close,
 #        no gh pr merge, no wontfix/duplicate label, no git push to a branch outside
@@ -22,6 +23,30 @@
 #      lock (ADR 0011 amendment). The rule reads the command being invoked, not
 #      prose or heredoc text that quotes one, and a body it cannot inspect (stdin,
 #      --body-file -) is refused on its own terms with the fix named (fleet #70).
+#   2b. every fleet role (spec fleet #193, ruling on the QA of #209 to #211): the
+#      Bounded-authority flags are Cory's to create and remove, and the triage ledger is
+#      written by bin/triage.js, whose checks are the point. Edit/Write/NotebookEdit/
+#      MultiEdit on any path under state/flags/ or state/triage/ is refused, and so is a
+#      Bash/PowerShell unit (cut at newline, ; & && ||; a pipeline is one unit) that
+#      names state/flags, state/triage, a wildcard component after state/ or a bounded-a*
+#      glob is refused unless it is plain: no ( ) { } or backtick (no subexpression, no
+#      script block, no interpreter body), no redirect into the name, and every pipeline
+#      stage's command word is read-only (cat, ls, dir, type, head, tail, Get-Content,
+#      Get-ChildItem, Test-Path, Get-Item, grep, wc, cut, findstr, Select-Object,
+#      Where-Object, Sort-Object, Measure-Object, Select-String). sort, uniq and rg are
+#      not on the list: they can write (sort -o, uniq in out, rg --pre). git clean/
+#      checkout/restore/reset/rm/mv/stash on state/, and cd/Push-Location into state in a
+#      call that also names flags or triage, are refused. node passes only as node
+#      <FLEET_HOME>/bin/triage.js, the script resolved against cwd. A heredoc fed to an
+#      interpreter (bash, sh, node, python, powershell, pwsh, cmd) is scanned as commands;
+#      any other heredoc is stripped. Quotes are dropped and path separators collapsed
+#      before matching. Over-refusal is accepted; the refusal names the cause. node
+#      bin/triage.js bounded-scan (and the daily summary) never name the flag or the
+#      ledger path in their command line, so the scan's own write is unaffected.
+#      ACCEPTED RESIDUE: a path built by string concatenation, a variable (X=state; rm
+#      $X/flags) or a script written to a file and run cannot be seen by a rule that reads
+#      the command line; Edit/Write, the ledger's door checks and Cory's daily summary
+#      are the rest.
 #
 # Rollback: state/flags/principal-guard-off. Output contract: a deny is JSON on stdout
 # with permissionDecision "deny"; anything else is silence + exit 0. Never exit nonzero.
@@ -42,6 +67,8 @@ function Normalize-Path {
   param([string]$Path, [string]$Cwd)
   if (-not $Path) { return '' }
   $p = $Path
+  if ($p -match '^\\\\\?\\') { $p = $p.Substring(4) }
+  if ($p -match '^\\\\(?:localhost|127\.0\.0\.1)\\([A-Za-z])\$\\') { $p = $Matches[1] + ':\' + $p.Substring($Matches[0].Length) }
   if ($p -match '^~[\\/]') { $p = $env:USERPROFILE + $p.Substring(1) }
   if (-not [IO.Path]::IsPathRooted($p) -and $Cwd) { $p = Join-Path $Cwd $p }
   try { $p = [IO.Path]::GetFullPath($p) } catch {}
@@ -114,6 +141,58 @@ if ($tool -in @('Bash', 'PowerShell')) {
   }
 }
 
+# --- rule 2b: the Bounded-authority flags and the triage ledger (every fleet role) ---
+$flagsCause = "the Bounded-authority flags (state/flags/bounded-authority-*) are Cory's to create and remove, and the triage ledger (state/triage/) is written by node bin/triage.js, whose doors check what they record; say what you found in your status file instead $cite"
+if (-not $reason -and $tool -in @('Edit', 'Write', 'NotebookEdit', 'MultiEdit')) {
+  $t2 = "$($inp.tool_input.file_path)"; if (-not $t2) { $t2 = "$($inp.tool_input.notebook_path)" }
+  $t2N = Normalize-Path $t2 "$($inp.cwd)"
+  $homeN2 = Normalize-Path $home_ ''
+  if ($t2N -match "^$(Escape-Rx $homeN2)/state/(flags|triage)[. ]*(:[^/]*)?(/|$)") { $reason = $flagsCause }
+}
+if (-not $reason -and $tool -in @('Bash', 'PowerShell')) {
+  $cmd2 = "$($inp.tool_input.command)"
+  # A heredoc fed to an interpreter is a script: its body is scanned as commands. Any other
+  # heredoc (a ticket or a note written with cat) is text and is stripped.
+  $scan = [regex]::Replace($cmd2, '(?m)^(?<pre>[^\r\n]*?)<<-?\s*(?<q>["'']?)(?<d>\w+)\k<q>(?<post>[^\r\n]*)\r?\n(?<body>[\s\S]*?)\r?\n[ \t]*\k<d>[ \t]*(?=\r?\n|$)',
+    [System.Text.RegularExpressions.MatchEvaluator]{
+      param($m)
+      if ($m.Groups['pre'].Value -match '(?<![\w.-])(?:bash|sh|zsh|dash|node|nodejs|python\d*|powershell|pwsh|cmd)(?:\.exe)?(?![\w-])') { return $m.Groups['pre'].Value + ' ' + $m.Groups['post'].Value + "`n" + $m.Groups['body'].Value }
+      return $m.Groups['pre'].Value + ' ' + $m.Groups['post'].Value + '#heredoc-stripped'
+    })
+  # Quotes are dropped and every run of separators (and ./ segments) becomes one /, so that
+  # state//flags, state/./flags, state\flags, state/"flags" and 'state'/flags all read alike.
+  $norm = (($scan -replace '\\\\\?\\', '') -replace '["'']', '') -replace '[\\/]+(\.[\\/]+)*', '/'
+  $stateRx = '(?<![\w-])state/(?:flags|triage)(?![\w.-])|(?<![\w-])state/[^\s/]*[*?\[]|(?<![\w-])bounded-(?:authority-|a[\w-]*[*?\[])'
+  $readOnlyWords = @('cat', 'ls', 'dir', 'type', 'head', 'tail', 'Get-Content', 'Get-ChildItem', 'Test-Path', 'Get-Item',
+    'grep', 'wc', 'cut', 'findstr', 'Select-Object', 'Where-Object', 'Sort-Object', 'Measure-Object', 'Select-String')
+  # cd/Push-Location into state, in a call that also names flags or triage: the relative rm that follows is unseen.
+  if (($norm -match '(?:^|[\s;&|(])(?:cd|chdir|pushd|Push-Location|Set-Location|sl)\s+\S*(?<![\w-])state/?(?=\s|;|&|\||$)') -and ($norm -match '(?<![\w-])(?:flags|triage)(?![\w-])')) { $reason = $flagsCause }
+  if (-not $reason) {
+    $pinned = Normalize-Path "$home_/bin/triage.js" ''
+    foreach ($unit in [regex]::Split($norm, '\r?\n|;|&&|\|\||&')) {
+      $git = ($unit -match 'git(?:\s+-[Cc]\s+\S+|\s+--?\S+)*\s+(?:clean|checkout|restore|reset|rm|mv|stash)\b') -and ($unit -match '(?<![\w-])state(?:/|\s|$)')
+      if (-not ($git -or ($unit -match $stateRx))) { continue }
+      # Plain or refused: a subexpression, a script block or a backtick makes the unit something this rule cannot read.
+      $bad = $git -or ($unit -match '[(){}`]') -or ($unit -match ('>\s*\S*(?:' + $stateRx + ')'))
+      if (-not $bad) {
+        foreach ($stage in ($unit -split '\|')) {
+          if ($stage -match '^\s*$') { continue }
+          $word = ''
+          if ($stage -match '^\s*(?:\w+=\S*\s+)*(?<w>\S+)') { $word = ([IO.Path]::GetFileName("$($Matches['w'])")) -replace '\.exe$', '' }
+          if ($word -eq 'node') {
+            $script = ''
+            if ($stage -match '^\s*\S+\s+(?<s>\S+)') { $script = $Matches['s'] }
+            if ((Normalize-Path $script "$($inp.cwd)") -ne $pinned) { $bad = $true; break }
+            continue
+          }
+          if ($readOnlyWords -notcontains $word) { $bad = $true; break }
+        }
+      }
+      if ($bad) { $reason = $flagsCause; break }
+    }
+  }
+}
+
 # --- rule set 1: the Principal's write and action boundary ---
 if (-not $reason -and $role -eq 'principal') {
   $repo = ''
@@ -133,7 +212,6 @@ if (-not $reason -and $role -eq 'principal') {
   $insideRules += "^$(Escape-Rx $homeN)/docs/adr/[^/]+\.md$"
   $insideRules += "^$(Escape-Rx $homeN)/context\.md$"
   if ($tenant) { $insideRules += "^$(Escape-Rx $homeN)/state/status/pe-$(Escape-Rx $tenant.ToLowerInvariant())\.md$" }
-  $insideRules += "^$(Escape-Rx $homeN)/state/triage/"
   $outsideRules = @()
   if ($profileN) { $outsideRules += "^$(Escape-Rx $profileN)/\.claude/" }
   if ($tempN) { $outsideRules += "^$(Escape-Rx $tempN)/" }
@@ -148,7 +226,7 @@ if (-not $reason -and $role -eq 'principal') {
     $allowed = if ($inside) { $insideRules } else { $outsideRules }
     foreach ($rx in $allowed) { if ($ok) { break }; if ($targetN -match $rx) { $ok = $true; break } }
     if (-not $ok) {
-      $reason = "the Principal writes only ADR and glossary proposals (docs/adr/*.md, CONTEXT.md in the tenant repo or the fleet), its own status file (state/status/pe-<tenant>.md), the triage ledger through bin/triage.js, and its own memory; '$target' is none of those. Product code is an IC's: put the change in the proposal's Scope and Red-tell for the IC $cite"
+      $reason = "the Principal writes only ADR and glossary proposals (docs/adr/*.md, CONTEXT.md in the tenant repo or the fleet), its own status file (state/status/pe-<tenant>.md) and its own memory (the triage ledger is written through bin/triage.js only); '$target' is none of those. Product code is an IC's: put the change in the proposal's Scope and Red-tell for the IC $cite"
     }
   } elseif ($tool -in @('Bash', 'PowerShell')) {
     $cmd = "$($inp.tool_input.command)"

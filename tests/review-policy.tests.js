@@ -2234,3 +2234,16 @@ test('#154: the review-policy loader refuses a tenant whose fleetIdentity is its
   fs.writeFileSync(path.join(root, 'tenants', 'shared.json'), JSON.stringify({ name: 'shared', github: 'owner/repo', reviewStatus: 'fleet-review', fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' }));
   assert.throws(() => attestPullRequest({ root, tenantName: 'shared', prNumber: 1, headSha: 'a'.repeat(40), artifactPath: __filename, gh: () => '{}' }), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
 });
+
+test('#211: criteria-defect is a named finding category: it records as written, and the refusal for a bad category names it', () => {
+  assert.equal(require('../bin/review-policy').CRITERIA_CATEGORY, 'criteria-defect');
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const recorded = formalAt(root, revision, [{ file: 'a.js', claim: 'the criterion cannot be met as written', severity: 'major', category: 'criteria-defect' }]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8')).findings[0].category, 'criteria-defect');
+  const other = rootDir();
+  assert.throws(
+    () => formalAt(other, seedRecord(other), [{ file: 'a.js', claim: 'x', severity: 'minor', category: 'Criteria Defect' }]),
+    (error) => error.code === 'INVALID_FINDING' && /criteria-defect/.test(error.message),
+  );
+});

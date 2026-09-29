@@ -186,6 +186,112 @@ try {
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 
+  # --- spec fleet #193: the Bounded-authority flags and the triage ledger are not a session's to write (every role) ---
+  Assert-Denied (Run-Guard -Role principal -Tool Write -ToolInput (WriteTo "$testRoot\state\triage\test.jsonl")) 'a Principal Write of the triage ledger' 'bin/triage.js'
+  Assert-Denied (Run-Guard -Role principal -Tool Edit -ToolInput @{ file_path = "$testRoot\state\triage\test.jsonl"; old_string = 'a'; new_string = 'b' }) 'a Principal Edit of the triage ledger'
+  Assert-Denied (Run-Guard -Role ic -Tool Write -ToolInput (WriteTo "$testRoot\state\flags\bounded-authority-test")) 'an IC Write of the tenant flag' 'Cory'
+  Assert-Denied (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$testRoot\state\flags\bounded-authority-suspended-test")) 'a lead Write of the suspension flag'
+  Assert-Denied (Run-Guard -Role dispatcher -Tool NotebookEdit -ToolInput @{ notebook_path = "$testRoot\state\triage\x.ipynb" }) 'a NotebookEdit under state/triage'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'rm state/flags/bounded-authority-test')) 'an IC rm of the tenant flag' 'Cory'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'echo ''{"kind":"suspended"}'' >> state/triage/test.jsonl')) 'an IC echo appended to the ledger' 'bin/triage.js'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cat notes.txt > state/triage/test.jsonl')) 'a read-only command word redirected into the ledger'
+  Assert-Denied (Run-Guard -Role project-lead -Tool PowerShell -ToolInput (Bash "Remove-Item $testRoot\state\flags\bounded-authority-suspended-test")) 'a PowerShell Remove-Item of the suspension flag'
+  Assert-Denied (Run-Guard -Role project-lead -Tool PowerShell -ToolInput (Bash "Set-Content $testRoot\state\triage\test.jsonl 'x'")) 'a PowerShell Set-Content of the ledger'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'node -e "require(''fs'').writeFileSync(''state/flags/bounded-authority-test'','''')"')) 'node -e writing a flag'
+  Assert-Denied (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'touch state/flags/bounded-authority-test') -AgentId 'w9') 'a Principal worker touching the flag'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cat state/flags/bounded-authority-suspended-test')) 'reading the suspension flag'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'ls state/triage/')) 'listing the ledger directory'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'tail -n 5 state/triage/test.jsonl')) 'tailing the ledger'
+  Assert-Allowed (Run-Guard -Role dispatcher -Tool PowerShell -ToolInput (Bash "Get-Content $testRoot\state\triage\test.jsonl")) 'Get-Content of the ledger'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'node C:/Users/Cory/fleet/bin/triage.js bounded-scan --tenant test')) 'the scan door, which names neither the flag nor the ledger path'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'node C:/Users/Cory/fleet/bin/triage.js bounded-ready --tenant test --issue 7')) 'the bounded-ready door'
+  Assert-Denied (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'New-Item state/flags/notifier-live')) 'any flag under state/flags belongs to Cory, not only the bounded ones' 'Cory'
+  Assert-Allowed (Run-Guard -Role principal -Tool Write -ToolInput (WriteTo "$testRoot\state\status\pe-test.md")) 'the Principal''s own status file still writes'
+
+  # --- re-QA (M-B): the bypasses of the first cut of rule 2b, each refused ---
+  foreach ($case in @(
+    @('ic', 'Bash', 'rm -rf state/flags'),
+    @('ic', 'Bash', 'rm state/flags/*'),
+    @('ic', 'Bash', 'rm state/flags/bounded-a*'),
+    @('ic', 'Bash', 'rm -r state/triage'),
+    @('ic', 'Bash', 'mv state/triage state/triage.bak'),
+    @('ic', 'Bash', 'git clean -fdx state/'),
+    @('ic', 'Bash', 'git checkout -- state/flags'),
+    @('ic', 'Bash', 'git checkout -- state/triage/test.jsonl'),
+    @('ic', 'Bash', 'git restore state/flags'),
+    @('ic', 'Bash', 'ls state/flags/bounded-authority-* | xargs rm'),
+    @('ic', 'Bash', 'cat x.jsonl | tee -a state/triage/test.jsonl'),
+    @('ic', 'Bash', 'find state/flags -name "bounded-authority-*" -delete'),
+    @('ic', 'Bash', 'cp /tmp/empty state/flags/bounded-authority-test'),
+    @('ic', 'Bash', 'node C:/tmp/rm.js state/flags/bounded-authority-test'),
+    @('ic', 'Bash', 'node C:/tmp/cleanup.js state/triage'),
+    @('project-lead', 'PowerShell', 'Remove-Item state\flags\*'),
+    @('project-lead', 'PowerShell', 'Remove-Item state\flags\bounded-auth*'),
+    @('project-lead', 'PowerShell', 'Get-ChildItem state\flags\bounded-authority-* | Remove-Item'),
+    @('project-lead', 'PowerShell', 'Copy-Item C:\tmp\x state\flags\bounded-authority-test'),
+    @('project-lead', 'PowerShell', 'type nul > state\flags\bounded-authority-test'),
+    @('project-lead', 'PowerShell', '"x" | Out-File -Append state\triage\test.jsonl')
+  )) {
+    Assert-Denied (Run-Guard -Role $case[0] -Tool $case[1] -ToolInput (Bash $case[2])) "the bypass: $($case[2])" 'Cory'
+  }
+  # A pipeline is one unit: read-only stages all the way through are still allowed.
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'cat state/triage/test.jsonl | tail -n 3')) 'a read-only pipeline over the ledger'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'ls state/flags | grep bounded')) 'ls piped to grep'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool PowerShell -ToolInput (Bash 'Get-ChildItem state\flags | Select-Object -First 3')) 'Get-ChildItem piped to Select-Object'
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash 'node C:/Users/Cory/fleet/bin/triage.js state --tenant test')) 'a triage door that names neither'
+  # The accepted residue (named in the hook): a path built by string concatenation, or a script written to a file and run,
+  # is not seen by a rule that reads the command line. The hook's own comment says so.
+  # --- final QA: units, subexpressions, interpreters, spellings, git options, the node pin ---
+  $F = 'state/flags/bounded-authority-suspended-test'
+  $L = 'state/triage/test.jsonl'
+  foreach ($case in @(
+    @('ic', 'Bash', "cat $F & rm $F"),
+    @('ic', 'Bash', "ls `$(rm $F)"),
+    @('ic', 'Bash', "cat ``rm $F``"),
+    @('ic', 'Bash', "sort -o $L C:/tmp/forged.jsonl"),
+    @('ic', 'Bash', "uniq C:/tmp/forged.jsonl $L"),
+    @('ic', 'Bash', 'uniq /dev/null state/flags/bounded-authority-test'),
+    @('ic', 'Bash', 'rg --pre C:/tmp/evil.sh x state/triage/test.jsonl'),
+    @('project-lead', 'PowerShell', "Get-Content (Remove-Item $F)"),
+    @('project-lead', 'PowerShell', "Test-Path $F -or (Remove-Item $F)"),
+    @('project-lead', 'PowerShell', 'Get-ChildItem state\flags | Where-Object { $_.Delete() }'),
+    @('project-lead', 'PowerShell', 'Get-ChildItem state\flags | Select-Object @{e={Remove-Item $_.FullName}}'),
+    @('ic', 'Bash', "bash <<'EOF'`nrm -f $F`nEOF"),
+    @('ic', 'Bash', "node <<'EOF'`nrequire('fs').unlinkSync('$F')`nEOF"),
+    @('ic', 'Bash', 'sh -c "rm state/flags/x"'),
+    @('ic', 'Bash', 'rm -rf state/"flags"'),
+    @('ic', 'Bash', "rm -rf 'state'/flags"),
+    @('ic', 'Bash', 'rm -rf state//flags'),
+    @('ic', 'Bash', 'rm -rf state/./flags'),
+    @('ic', 'Bash', 'rm -rf state\flags'),
+    @('ic', 'Bash', 'rm -rf state/f*s'),
+    @('ic', 'Bash', 'rm state/*/bounded-*'),
+    @('ic', 'Bash', 'cd C:/Users/Cory/fleet/state && rm -rf flags'),
+    @('project-lead', 'PowerShell', 'Push-Location C:\Users\Cory\fleet\state; Remove-Item flags -Recurse'),
+    @('ic', 'Bash', 'git -C C:/Users/Cory/fleet clean -fdx state/'),
+    @('ic', 'Bash', 'git -c core.x=y checkout -- state/flags'),
+    @('ic', 'Bash', 'git --no-pager restore state/triage'),
+    @('principal', 'Bash', "node C:/tmp/x/bin/triage.js $F"),
+    @('principal', 'Bash', "node $testRoot/bin/triage.js.evil $F"),
+    @('principal', 'Bash', "node -r C:/tmp/evil.js $testRoot/bin/triage.js $F"),
+    @('principal', 'Bash', "NODE_OPTIONS='--require C:/tmp/evil.js' node $testRoot/bin/triage.js $F")
+  )) {
+    Assert-Denied (Run-Guard -Role $case[0] -Tool $case[1] -ToolInput (Bash $case[2])) "the bypass: $($case[2])" 'Cory'
+  }
+  Assert-Allowed (Run-Guard -Role principal -Tool Bash -ToolInput (Bash "node $testRoot/bin/triage.js hash --tenant test --issue 1 # notes on state/flags")) 'the pinned triage door, whatever its arguments name'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "cat > note.md <<'EOF'`nthe flag lives in state/flags/bounded-authority-test`nEOF`necho done")) 'a heredoc that documents the path for a non-interpreter'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "cat $F 2>&1 | head -n 3")) 'a read-only pipeline with a stderr redirect'
+  # The path spellings the Edit/Write rule sees through.
+  $drive = $testRoot.Substring(0, 1).ToLowerInvariant()
+  foreach ($p in @("\\?\$testRoot\state\flags\bounded-authority-test", ("\\localhost\$drive" + [char]36 + $testRoot.Substring(2) + '\state\flags\bounded-authority-test'), "$testRoot\state\flags.\bounded-authority-test", "$testRoot\state\triage \x.jsonl")) {
+    Assert-Denied (Run-Guard -Role ic -Tool Write -ToolInput (WriteTo $p)) "a Write through the spelling $p" 'Cory'
+  }
+
+  # Names that only look like the flag stay allowed: a branch or prose that says bounded-authority.
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'git push origin fleet/212-bounded-authority-go-live')) 'a push of a branch named for Bounded authority'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "the bounded-authority flag stands until Cory removes it"')) 'prose about the flag'
+  Assert-Denied (Run-Guard -Role ic -Tool Write -ToolInput (WriteTo "$testRoot\state\triage::$([char]36)DATA")) 'a Write through an alternate data stream of the ledger directory' 'Cory'
+
   # --- no fleet identity, rollback flag ---
   $env:FLEET_HOME = ''; $env:FLEET_ROLE = ''
   $payload = @{ tool_name = 'Bash'; tool_input = @{ command = 'gh issue comment 1 -b "Approved"' } } | ConvertTo-Json -Compress

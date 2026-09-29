@@ -1587,3 +1587,18 @@ test('reserve scopes the conflict set and the third-assignment count to the reco
     'endzone\'s own count is unchanged by nidus joining',
   );
 });
+
+// Spec fleet #193 (#211): an escalation can name that the ticket's criteria were wrong
+// or ambiguous, by the reason `criteria-defect`; unlike stale-premise it carries no premise.
+test('#211: an escalation may carry the named reason criteria-defect with no premise; the wake and the event carry it, and free text still is not a reason', () => {
+  const root = rootDir();
+  const record = makeRecord(root);
+  assert.throws(() => transitionRecord({ root, id: record.record.id, to: 'escalated', expectedRevision: 1, evidence: 'the criteria were ambiguous', reason: 'criteria are ambiguous', idempotencyKey: 'esc-free', now: '2026-09-01T01:00:00.000Z' }), (error) => error.code === 'USAGE');
+  transitionRecord({ root, id: record.record.id, to: 'escalated', expectedRevision: 1, evidence: 'the criteria contradict each other', reason: 'criteria-defect', idempotencyKey: 'esc-named', actor: 'pl-endzone', now: '2026-09-01T01:00:00.000Z' });
+  const event = readEvents(root).find((entry) => entry.type === 'state-escalated');
+  assert.equal(event.changes.reason, 'criteria-defect');
+  assert.ok(!('premise' in event.changes) || event.changes.premise === undefined);
+  const wake = fs.readFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).pop();
+  assert.equal(wake.reason, 'criteria-defect');
+  assert.ok(!('premise' in wake));
+});
