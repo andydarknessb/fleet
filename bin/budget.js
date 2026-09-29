@@ -115,6 +115,7 @@ async function applyBudgets({ root, claudeHome, tenant, now, live, actor = 'budg
     let totals;
     try { totals = await sumTranscriptTokens(transcript); } catch (error) { entry.reason = `transcript unreadable: ${error.message}`; results.push(entry); continue; }
     entry.jobTokens = totals.jobTokens;
+    entry.usageRowsWithoutId = totals.usageRowsWithoutId;
     const verdict = decide({ jobTokens: totals.jobTokens, record, config });
     entry.decision = verdict.decision;
     entry.threshold = verdict.threshold;

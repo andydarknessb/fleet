@@ -24,11 +24,15 @@ function asNumber(value) {
   return Number.isFinite(number) ? number : 0;
 }
 
-function createUsageReader() {
+// `claimed` is an optional Map shared by the readers of one session's files (its own
+// transcript and its subagents'). A response id already claimed by another reader is
+// counted there, once, and skipped here: a fork or a shared row copies a response into a
+// second file with the same message id, and counting it per file counts it twice.
+function createUsageReader({ claimed = null } = {}) {
   const byResponse = new Map();
   const unkeyed = { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0 };
   let usageRowsWithoutId = 0;
-  return {
+  const reader = {
     // Takes one parsed transcript row; a row with no usage adds nothing.
     add(row) {
       const usage = row && row.message && row.message.usage;
@@ -46,7 +50,15 @@ function createUsageReader() {
         return;
       }
       const seen = byResponse.get(id);
-      if (!seen) { byResponse.set(id, figures); return; }
+      if (!seen) {
+        if (claimed) {
+          const owner = claimed.get(id);
+          if (owner && owner !== reader) return;
+          claimed.set(id, reader);
+        }
+        byResponse.set(id, figures);
+        return;
+      }
       for (const key of Object.keys(figures)) seen[key] = Math.max(seen[key], figures[key]);
     },
     totals() {
@@ -59,6 +71,7 @@ function createUsageReader() {
       return totals;
     },
   };
+  return reader;
 }
 
 // Streamed: a long-lived project lead's transcript runs to tens of MB.

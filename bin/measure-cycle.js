@@ -117,7 +117,8 @@ function addReferences(target, text) {
   }
 }
 
-function parseTranscript(contents, sourcePath) {
+// `claimed`: the response ids already counted in this session's other files (#201).
+function parseTranscript(contents, sourcePath, claimed = null) {
   const rows = [];
   let malformedLines = 0;
   for (const line of String(contents || '').split(/\r?\n/)) {
@@ -145,7 +146,7 @@ function parseTranscript(contents, sourcePath) {
   const toolResults = new Map();
   const searchParts = [];
   // #201: one usage per model response id (the shared reader), not one per row.
-  const usageReader = createUsageReader();
+  const usageReader = createUsageReader({ claimed });
 
   for (const row of rows) {
     sessionId = sessionId || row.sessionId || row.session_id || null;
@@ -648,6 +649,7 @@ function unitMetrics(units, roles, budgets) {
     const median = percentile(values, 0.5);
     return [key, { units: values.length, jobTokensMedian: median, jobTokensP90: percentile(values, 0.9), target, pass: target === null || median === null ? null : median < target }];
   }));
+  const perPrVoid = b.projectLeadFreshPerMergedPrVoid === true;
   const verdict = (value, limit, kind) => (value === null || limit === undefined || limit === null ? null : (kind === 'max' ? value <= limit : value < limit));
   const baseline = Number(b.baselineControlPlaneFreshPerCompletedUnit);
   const reductionTarget = Number(b.controlPlaneFreshReduction);
@@ -658,7 +660,8 @@ function unitMetrics(units, roles, budgets) {
   metrics.controlPlaneFreshReductionVsBaseline = reduction === null ? null : Math.round(reduction * 1000) / 1000;
   metrics.budgets = {
     controlPlaneFreshReduction: { target: Number.isFinite(reductionTarget) ? reductionTarget : null, actual: metrics.controlPlaneFreshReductionVsBaseline, void: baselineVoid, pass: reduction === null || !Number.isFinite(reductionTarget) ? null : reduction >= reductionTarget },
-    projectLeadFreshPerMergedPr: { limit: b.projectLeadFreshPerMergedPr ?? null, actual: metrics.projectLeadFreshPerMergedPr, pass: verdict(metrics.projectLeadFreshPerMergedPr, b.projectLeadFreshPerMergedPr, 'lt') },
+    // #201: the limit was set on the doubled meter, so it is void until the #139 re-baseline.
+    projectLeadFreshPerMergedPr: { limit: b.projectLeadFreshPerMergedPr ?? null, actual: metrics.projectLeadFreshPerMergedPr, void: perPrVoid, pass: perPrVoid ? null : verdict(metrics.projectLeadFreshPerMergedPr, b.projectLeadFreshPerMergedPr, 'lt') },
     icJobTokensMedian: { reference, actual: metrics.icJobTokensMedian, pass: null, judged: false },
   };
   return metrics;
@@ -831,8 +834,8 @@ function renderSummary(report) {
   lines.push(b.controlPlaneFreshReduction?.void
     ? `control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (baseline void: it was measured on double-counted tokens, so no reduction is judged until the 10-19 re-baseline, fleet #139)`
     : `control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (reduction vs baseline ${pct(u.controlPlaneFreshReductionVsBaseline)}, target ${pct(b.controlPlaneFreshReduction?.target)})${mark(b.controlPlaneFreshReduction?.pass)}`);
-  lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (limit ${show(b.projectLeadFreshPerMergedPr?.limit)}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
-  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; reference ${show(u.budgets?.icJobTokensMedian?.reference)}, not a verdict)`);
+  lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (${b.projectLeadFreshPerMergedPr?.void ? 'limit void: set on doubled units, no verdict until the 10-19 re-baseline, fleet #139' : `limit ${show(b.projectLeadFreshPerMergedPr?.limit)}`}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
+  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; reference ${show(u.budgets?.icJobTokensMedian?.reference)} (doubled units, re-baseline #139), not a verdict)`);
   const icFamilies = Object.entries(u.icByModel || {});
   if (icFamilies.length) {
     lines.push('IC job tokens by model (judged only where a target is set):');
@@ -894,7 +897,7 @@ function listTranscriptFiles(root) {
 // #126: a session's subagents live beside its transcript as
 // <sessionId>/subagents/agent-<id>.jsonl, each with agent-<id>.meta.json naming its
 // agentType and model. A missing or unreadable meta file leaves the agent `unknown`.
-function readSubagents(sessionFile) {
+function readSubagents(sessionFile, claimed = null) {
   const dir = path.join(path.dirname(sessionFile), path.basename(sessionFile, '.jsonl'), 'subagents');
   if (!fs.existsSync(dir)) return [];
   const agents = [];
@@ -904,7 +907,7 @@ function readSubagents(sessionFile) {
     let meta = null;
     try { meta = JSON.parse(fs.readFileSync(path.join(dir, `agent-${agentId}.meta.json`), 'utf8')); } catch { meta = null; }
     let parsed;
-    try { parsed = parseTranscript(fs.readFileSync(file, 'utf8'), file); } catch { continue; }
+    try { parsed = parseTranscript(fs.readFileSync(file, 'utf8'), file, claimed); } catch { continue; }
     agents.push({
       agentId,
       agentType: meta?.agentType || 'unknown',
@@ -1000,7 +1003,8 @@ function collectFromFiles({ transcriptsDir, rosterPath, retiredPath, outputDir, 
   let transcriptFiles = allTranscriptFiles.filter((file) => {
     return wantedSessionIds.size === 0 || wantedSessionIds.has(path.basename(file, '.jsonl'));
   });
-  const transcripts = transcriptFiles.map((file) => ({ ...parseTranscript(fs.readFileSync(file, 'utf8'), file), subagents: readSubagents(file) }));
+  // #201: one claimed-id map per session, shared by its own file and its subagent files.
+  const transcripts = transcriptFiles.map((file) => { const claimed = new Map(); return { ...parseTranscript(fs.readFileSync(file, 'utf8'), file, claimed), subagents: readSubagents(file, claimed) }; });
   let cycles = buildCycleRecords({ roster, transcripts, allowTranscriptEvidence: true });
   let verificationErrors = [];
   if (verifyGithub) {

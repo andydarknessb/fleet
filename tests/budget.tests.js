@@ -333,3 +333,13 @@ test('#201: the shipped config halves the triggers the doubled meter was tuned o
   const budget = require('../bin/budget').budgetConfig(path.join(__dirname, '..'));
   assert.deepEqual(budget, { warnTokens: 25000, escalateTokens: 175000 });
 });
+
+test('#201: last.json carries usageRowsWithoutId for each measured record', async () => {
+  const root = rootDir();
+  rosterIc(root, 71, 's71'); transcript(root, 's71', [[10000, 5000], [20000, 5000]]);
+  unit(root, 71, 'review');
+  const result = await run(root);
+  assert.equal(result.records[0].usageRowsWithoutId, 2, 'the two id-less rows are flagged');
+  const last = JSON.parse(fs.readFileSync(path.join(root, 'state', 'budget', 'last.json'), 'utf8'));
+  assert.equal(last.records[0].usageRowsWithoutId, 2);
+});

@@ -32,6 +32,7 @@
     "baselineControlPlaneVoid": true,
     "controlPlaneFreshReduction": 0.7,
     "projectLeadFreshPerMergedPr": 25000,
+    "projectLeadFreshPerMergedPrVoid": true,
     "icJobTokensMedianReference": 60000,
     "icJobTokensTargets": { "haiku": null, "sonnet": null, "opus": null, "fable": null }
   },
