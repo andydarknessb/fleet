@@ -110,3 +110,36 @@ the `agents/ic.md` frontmatter does not override it.
 Verification is the next rehearsal, a re-run of #164's procedure against this
 profile. The fourth ticket's reopen and its `verifiedCliVersion` wait on its
 verdict.
+
+## Amendment 2 (2026-09-28, fleet #181): refuse, never prompt
+
+The second rehearsal (Endzone #1730, PR #1734) cleared every wait Amendment 1
+covered. It stopped once, on `gh issue view ... | python3 -c ... | head`, and it
+skipped `ic.md` step 5. Its transcript corrected Amendment 1 on compound Bash.
+Pipes, `&&`, `;` and `2>&1` between allowed commands ran with no prompt. What
+prompts is a command the allow list does not cover, or a redirect to a path
+outside the allowed directories.
+
+- **Refuse, never prompt.** Under `acceptEdits` a call outside the allow list
+  becomes a prompt, and a background IC has nobody there to answer it.
+  `hooks/allowlist-gate.js` (PreToolUse, Bash and PowerShell) runs only for
+  sessions launched with `FLEET_PERMISSIONS=allowlist`. It refuses such a call
+  with a reason that names the allowed commands:
+  - a command no `Bash(...)` rule of the session's resolved allow list covers,
+    unless it is a listed read-only command;
+  - a redirect to a file outside the working directory and the additional
+    directories;
+  - a drive or `/tmp` path argument outside them;
+  - command substitution outside quotes;
+  - any PowerShell call.
+
+  The IC reads the reason and rewrites the call. The gate fails open and has a
+  rollback flag, `state/flags/allowlist-gate-off`.
+- **The role file states the real rule.** It is per command, not "one command per
+  call". The gate enforces it, so a haiku IC that ignores the prose still meets it.
+- **Step 5 is mechanical.** `pr-ready-check.js` classifies the diff with the
+  tenant's risk triggers. When the classification reports `riskReview` and the
+  Work record has no risk review at the head, it reports a `risk-review` DEFECT.
+  A PR the IC opens without its risk review therefore fails its own pre-ready check.
+
+Verification is the next rehearsal, a re-run of #164's procedure.

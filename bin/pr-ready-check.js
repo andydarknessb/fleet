@@ -22,12 +22,18 @@
 //                    acceptance-criteria checkbox of the issue (`gh issue view`,
 //                    bounded) and no empty evidence cell.
 //   lint             the tenant's `lintCommand`, when the tenant file sets one.
+//   risk-review      the diff's classification (review-policy.js classify, the
+//                    tenant's riskTriggers) reports riskReview, and the Work record
+//                    <tenant>:issue-<n> carries no risk review at the head (ic.md
+//                    step 5). Checked only with --tenant. Fleet #181: a haiku IC
+//                    skipped step 5 and this check exited 0 anyway.
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync, execSync } = require('node:child_process');
 
 const workState = require('./work-state');
+const reviewPolicy = require('./review-policy');
 
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const FLAGS = ['repo', 'base', 'head', 'issue', 'body', 'tenant', 'root'];
@@ -288,6 +294,30 @@ function lintDefects({ repo, command, run }) {
   }
 }
 
+// --- risk review (ic.md step 5) ---------------------------------------------------
+
+function readCycleConfig(root) {
+  const file = path.join(path.resolve(root || DEFAULT_ROOT), 'config', 'cycle.json');
+  if (!fs.existsSync(file)) return {};
+  let text = fs.readFileSync(file, 'utf8');
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  return JSON.parse(text);
+}
+
+function riskDefects({ repo, base, head, issue, tenant, root, classify, getRecord }) {
+  if (!tenant?.name) return [];
+  const classified = (classify || reviewPolicy.classifyFromGit)({ repoPath: repo, baseRef: base, headRef: head, tenant, config: readCycleConfig(root) });
+  if (!classified.classification?.riskReview) return [];
+  const id = `${tenant.name}:issue-${issue}`;
+  let record = null;
+  try { record = (getRecord || workState.getRecord)({ root: path.resolve(root || DEFAULT_ROOT), id }); } catch (error) { if (error.code !== 'NOT_FOUND') throw error; }
+  const risk = record?.review?.risk || null;
+  if (risk && risk.headSha === classified.headSha) return [];
+  const names = (classified.classification.triggers || []).map((trigger) => trigger.class || trigger).join(', ');
+  const where = risk ? `the recorded risk review ${risk.artifact} is at ${String(risk.headSha).slice(0, 8)}, not this head` : `${id} records no risk review`;
+  return [{ kind: 'risk-review', detail: `the diff trips risk trigger(s) ${names} at ${String(classified.headSha).slice(0, 8)} and ${where}. Spawn one qa-reviewer (opus) with those classes as its angle, verify its findings, and record it with review-policy.js record --kind risk at this head before the PR (ic.md step 5)` }];
+}
+
 // --- the check ----------------------------------------------------------------------
 
 function loadTenant(root, name) {
@@ -307,6 +337,7 @@ function checkPullRequest(options = {}) {
     ...closingDefects(bodyText, issue, tenant?.github || null),
     ...criteriaDefects(bodyText, options.issueBody !== undefined ? options.issueBody : issueBodyOf({ issue, tenant, repo, gh: options.gh }), issue),
     ...lintDefects({ repo, command: tenant?.lintCommand, run: options.lintRunner }),
+    ...riskDefects({ repo, base, head, issue, tenant, root: options.root, classify: options.classify, getRecord: options.getRecord }),
   ];
   return { ok: defects.length === 0, defects };
 }
@@ -327,7 +358,7 @@ function cli(argv) {
   const tenant = args.tenant && args.tenant !== 'true' ? loadTenant(args.root, args.tenant) : null;
   return checkPullRequest({
     repo: args.repo, base: args.base, head: args.head, issue: Number(args.issue),
-    bodyText: fs.readFileSync(args.body, 'utf8'), tenant,
+    bodyText: fs.readFileSync(args.body, 'utf8'), tenant, root: args.root,
   });
 }
 
@@ -352,5 +383,6 @@ module.exports = {
   criteriaDefects,
   cli,
   removedIdentifiers,
+  riskDefects,
   staleReferences,
 };
