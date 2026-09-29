@@ -2,13 +2,18 @@
   "crossSessionInbound": "accept",
   "permissions": { "defaultMode": "auto" },
   "autoMode": {
+    "environment": [
+      "$defaults",
+      "Fleet merge authorization (ADR 0014, ADR 0015). The tenant owner, Cory (GitHub login andydarknessb), authorizes a fleet session running as the project lead (FLEET_ROLE=project-lead) to merge a fleet/* pull request into its tenant's default branch (Endzone-Empire: integration; Nidus: master) when all of these hold: that session recorded a formal review at the PR's current head with bin/review-policy.js, the fleet-review commit status at that head is success, and every required check at that head is green. A merge that meets those conditions is reviewed and authorized by the owner; it is not Merge Without Review. The authorization never covers a release into main, a path listed in the tenant's carveOuts (tenants/<name>.json), or a PR with no formal review recorded at its current head. Those merges are Cory's own.",
+      "Nidus (andydarknessb/Nidus) has no hosted database until Nidus #14 ships a hosted project. A file under supabase/migrations/ applies only to the local Supabase stack started with supabase start, so writing, editing or applying a Nidus migration changes no production system. Nidus migrations become a carve-out before the hosted project goes live."
+    ],
     "allow": [
       "$defaults",
       "gh pr merge by the fleet project lead (FLEET_ROLE=project-lead) of a fleet/* PR into its tenant's defaultBranch (integration), after that session recorded a formal review at the PR's current head with bin/review-policy.js (fleet-review status success). Cory, the repo owner, delegated this reviewed merge to the project lead, so it is not Merge Without Review. It never covers the releaseBranch (main), a carve-out path (migrations, deploy hooks, .env*, CI secrets), or a PR with no formal review recorded at its head"
     ],
     "soft_deny": [
       "$defaults",
-      "Bash(git push:* --force*) on andydarknessb/Endzone-Empire — public repo, main has no branch protection/rulesets listed",
+      "Bash(git push:* --force*) on andydarknessb/Endzone-Empire — public repo; main is release-only under ruleset main-release-only and integration refuses force-push (fleet #199, 2026-09-29)",
       "Writes or deploys touching RENDER_PRODUCTION_DEPLOY_HOOK, RENDER_WORKER_DEPLOY_HOOK, or NETLIFY_PRODUCTION_BUILD_HOOK for this repo",
       "git push to any tenant's defaultBranch or releaseBranch (integration, main, master); fleet sessions push feature branches only and merge through gh pr merge into the defaultBranch; merging or pushing anything into main is Cory's",
       "git worktree remove or rm -r of any path not under a tenant's .claude/worktrees/ directory",

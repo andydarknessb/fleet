@@ -78,6 +78,28 @@ try {
   Assert-True ($null -ne $r2b.budget) 'tool-contract-off must not disable the ceiling estimate'
   Remove-Item "$testRoot\state\flags\tool-contract-off"
 
+  # #200 (spec #190): the real fleet-settings.json carries the auto-mode environment
+  # statement (Cory's merge authorization, Nidus migrations local-only), and every
+  # role's per-session settings carry it verbatim after "$defaults".
+  $srcEnv = @((Get-Content "$sourceRoot\fleet-settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
+  Assert-True ($srcEnv.Count -ge 3 -and $srcEnv[0] -eq '$defaults') 'fleet-settings.json autoMode.environment must inherit the built-in entries first'
+  Assert-True (@($srcEnv | Where-Object { $_ -match 'authorizes a fleet session' -and $_ -match 'not Merge Without Review' -and $_ -match 'release into main' }).Count -eq 1) 'the owner merge authorization must be stated once, with its conditions and its exclusions'
+  Assert-True (@($srcEnv | Where-Object { $_ -match 'Nidus #14' -and $_ -match 'local Supabase stack' }).Count -eq 1) 'Nidus migrations must be stated local-only until Nidus #14, once'
+  [IO.File]::Copy("$sourceRoot\fleet-settings.json", "$testRoot\fleet-settings.json", $true)
+  $envCases = @(
+    @{ Name = 'dispatcher'; Args = @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun') },
+    @{ Name = 'pl-test'; Args = @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun') },
+    @{ Name = 'pe-test'; Args = @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun') },
+    @{ Name = 'ic-42'; Args = @('-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'Implement issue 42.', '-DryRun') }
+  )
+  foreach ($case in $envCases) {
+    $re = Run-Launch $case.Args
+    Assert-True ($re.dryRun -eq $true) "the $($case.Name) dry run under the real fleet settings must pass the gates (got: $re)"
+    $gotEnv = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
+    Assert-True (($gotEnv.Count -eq $srcEnv.Count) -and (@(for ($i = 0; $i -lt $srcEnv.Count; $i++) { $gotEnv[$i] -ceq $srcEnv[$i] }) -notcontains $false)) "$($case.Name) per-session settings must carry the environment statement verbatim"
+  }
+  Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
+
   # Case 3: an over-ceiling launch fails before assignment with a source breakdown.
   # A 60K-char prompt (~15K tokens; dispatcher ceiling is 12K) exceeds the Windows
   # command line, so a runner reads it from a file inside the child process.
