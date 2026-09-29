@@ -59,6 +59,9 @@ try {
   $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
   $fleetDeadRepeatMinutes = 120   # ticket 78: pages.fleetDeadRepeatMinutes, default 120 (two hours)
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatMinutes'] -and $pagesConfig.fleetDeadRepeatMinutes) { $fleetDeadRepeatMinutes = [int]$pagesConfig.fleetDeadRepeatMinutes }
+  # #197: pages.fleetDeadRepeatPriority (emergency|high|normal), default high; anything else falls back to high so a typo never throws a tick.
+  $fleetDeadRepeatPriority = 'high'
+  if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatPriority'] -and @('emergency', 'high', 'normal') -contains "$($pagesConfig.fleetDeadRepeatPriority)") { $fleetDeadRepeatPriority = "$($pagesConfig.fleetDeadRepeatPriority)" }
   $fullCycleConfig = $null; try { $fullCycleConfig = Read-Json "$FleetHome\config\cycle.json" } catch {}   # ticket 81: recursive scan for keys ending in Until
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
@@ -100,7 +103,7 @@ try {
   # --- specific kind is never shadowed by a shorter one.
   # ---
   # --- Every kind the Watchdog can build today, on purpose (tests/watchdog.tests.ps1
-  # --- walks this list): fleet-dead=emergency, permission-wait=high, launch-retry=high,
+  # --- walks this list): fleet-dead=high (#197), permission-wait=high, launch-retry=high,
   # --- branch-diverged=high, human-wait=normal (all ADR 0012-ruled, human-wait by
   # --- Cory's 2026-09-18 heal ruling); sentinel-stale, check-failed,
   # --- state-unreadable, double-actor, and the check-escalation kinds stray,
@@ -116,7 +119,10 @@ try {
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
+  # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
+  # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
+  # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -1329,6 +1335,7 @@ try {
         }
       }
 
+      $deliveredThisTick = $false   # #197: a page delivered in THIS tick has no repeat clock to run yet
       if (-not $entry.deliveredAt -and -not $entry.gaveUpAt) {
         $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
         $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $entry.url -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
@@ -1338,6 +1345,7 @@ try {
         $countsAsAttempt = ($pageResult.pushover -is [bool])
         if ($pageResult.pushover -eq $true) {
           $entry.deliveredAt = Now-Iso
+          $deliveredThisTick = $true
         } elseif ($countsAsAttempt) {
           $entry.attempts++
           $entry.lastAttemptAt = Now-Iso
@@ -1358,15 +1366,17 @@ try {
       # once, at +fleetDeadRepeatMinutes past its DELIVERY time (an undelivered page
       # has no repeat clock to run), never a third time. An unparseable or
       # future-dated deliveredAt fails toward repeating NOW rather than silently
-      # losing the one repeat the ADR grants.
-      if ($c.key -eq 'fleet-dead' -and $entry.deliveredAt -and -not $entry.repeatedAt) {
+      # losing the one repeat the ADR grants. #197: never in the tick that delivered the first
+      # page - that deliveredAt is later than this tick's $now, reads as future-dated, and would
+      # page the repeat back to back with the first.
+      if ($c.key -eq 'fleet-dead' -and $entry.deliveredAt -and -not $entry.repeatedAt -and -not $deliveredThisTick) {
         $deliveredAtUtc = ConvertTo-UtcDateTime $entry.deliveredAt
         $dueNow = (-not $deliveredAtUtc) -or ($deliveredAtUtc -gt $now) -or ((New-TimeSpan -Start $deliveredAtUtc -End $now).TotalMinutes -ge $fleetDeadRepeatMinutes)
         if ($dueNow) {
           $entry.repeatedAt = Now-Iso
           $repeatBody = "$($c.detail) (repeat: fleet-dead has stood over $fleetDeadRepeatMinutes min with no third page to follow)"
-          $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority 'emergency' -Detail ([pscustomobject]@{ key = $c.key; repeat = $true }) -NoToast:$NoToast
-          $repeatPaged = [pscustomobject]@{ key = $c.key; priority = 'emergency'; page = $repeatResult }
+          $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority $fleetDeadRepeatPriority -Detail ([pscustomobject]@{ key = $c.key; repeat = $true }) -NoToast:$NoToast
+          $repeatPaged = [pscustomobject]@{ key = $c.key; priority = $fleetDeadRepeatPriority; page = $repeatResult }
         }
       }
     }
