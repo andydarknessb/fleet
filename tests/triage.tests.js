@@ -262,7 +262,7 @@ test('the CLI refuses an unknown flag with exit 2 and a missing tenant as usage;
   const state = JSON.parse(run(['state', '--root', root, '--tenant', 'endzone', '--now', NOW]).stdout.trim());
   assert.deepEqual(state.pending.map((row) => row.issue), [1]);
   assert.equal('byIssue' in state, false, 'the state command prints the summary, not the per-issue fold');
-  assert.deepEqual(Object.keys(TRIAGE_FLAGS), ['frontier', 'record', 'state', 'hash']);
+  assert.deepEqual(Object.keys(TRIAGE_FLAGS), ['frontier', 'record', 'state', 'hash', 'finalize']);
   assert.equal(typeof cli, 'function');
 });
 
@@ -424,4 +424,205 @@ test('#154: a fleet comment matching the re-propose pattern is not the owner ask
 test('#154: the triage loader refuses a tenant whose fleetIdentity is its ownerLogin', () => {
   const root = rootDir({ ownerLogin: FLEET });
   assert.throws(() => triage.computeFrontier({ root, tenant: 'endzone', fixture: writeFixture(root, []), now: NOW }), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
+});
+
+// #207 (spec #193): an exact `Approved` from the owner finalizes by script. Anything
+// qualified is an approval WITH edits and stays the Principal's.
+const PROPOSAL = [
+  '## Triage proposal (advisory)',
+  'Classification: bug',
+  'Root cause: the list drops the last row (src/list.js:12).',
+  'Ruling: none needed',
+  'Red-tell: tests/list.test.js "keeps the last row" is red today',
+  'Repro: none',
+  'Scope: lists exactly src/list.js and tests/list.test.js',
+  'Premises:',
+  '  src/list.js: slices one short @abcdef1 verified @abcdef2',
+  'Blocked_by: none',
+  'Tier: sonnet',
+  'Precedent: none',
+  'Open for Cory: none',
+].join('\n');
+const PROPOSED_AT = '2026-09-10T00:00:00.000Z';
+const APPROVED_AT = '2026-09-11T00:00:00.000Z';
+const PROPOSAL_URL = 'https://github.com/owner/repo/issues/40#issuecomment-proposal';
+
+// One open proposal on #40 with the given comments after it; returns the root, fixture and readers.
+function finalizeWorld({ approval = 'Approved', proposal = PROPOSAL, body = 'Body of #40', proposedBody = body, labels = ['needs-triage', 'triage-proposed'], extraComments = [], recordId, outbox } = {}) {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: triage.normalizeIssue(issue(40, { body: proposedBody })).bodyHash, commentUrl: PROPOSAL_URL, model: 'fable', recordId, now: PROPOSED_AT });
+  const comments = [{ id: 'proposal', url: PROPOSAL_URL, author: FLEET, body: proposal, createdAt: PROPOSED_AT }];
+  if (approval !== null) comments.push(comment(OWNER, approval, APPROVED_AT, 'approval'));
+  comments.push(...extraComments);
+  const fixture = writeFixture(root, [issue(40, { body, labels, comments })]);
+  if (outbox) fs.writeFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), `${outbox.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  const fixtureIssue = () => JSON.parse(fs.readFileSync(fixture, 'utf8'))[0];
+  const finalize = (extra = {}) => triage.finalizeApprovals({ root, tenant: 'endzone', fixture, now: NOW, ...extra });
+  return { root, fixture, fixtureIssue, finalize };
+}
+
+test('#207: an exact Approved is finalized: Ruling comment (the proposal verbatim), ready label, marker removed, ledger recorded', () => {
+  const world = finalizeWorld({ approval: '  Approved \n' });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized.map((row) => row.issue), [40]);
+  const after = world.fixtureIssue();
+  const ruling = after.comments[after.comments.length - 1];
+  assert.match(ruling.body, /^## Ruling\n/);
+  assert.ok(ruling.body.includes(PROPOSAL.split('\n').slice(1).join('\n')), 'the proposal is restated verbatim under the Ruling heading');
+  assert.ok(!ruling.body.includes('## Triage proposal'), 'the proposal heading gives way to the Ruling heading');
+  assert.deepEqual([...after.labels].sort(), ['needs-triage', 'ready-for-agent']);
+  const ledger = readLedger(world.root, 'endzone');
+  assert.deepEqual(ledger.slice(1).map((row) => row.kind), ['approved', 'finalized']);
+  assert.equal(ledger[1].by, OWNER);
+  assert.equal(ledger[1].commentUrl, 'https://github.com/owner/repo/issues/1#issuecomment-approval');
+  assert.deepEqual(ledger[2].labels, ['ready-for-agent']);
+  assert.equal(projectTriage({ entries: ledger, now: NOW }).allTime.unchanged, 1, 'an exact approval counts as approved unchanged');
+  // The frontier the watchdog computes next no longer holds the ticket, so no Principal is woken for it.
+  const next = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW });
+  assert.deepEqual(next.eligible, []);
+  // A replay changes nothing: no second Ruling, no second ledger row.
+  assert.deepEqual(world.finalize().finalized, []);
+  assert.equal(world.fixtureIssue().comments.length, after.comments.length);
+  assert.equal(readLedger(world.root, 'endzone').length, 3);
+});
+
+test('#207: a qualified approval is an approval with edits: the script leaves it and the frontier still shows it to the Principal', () => {
+  for (const body of ['Approved with: tier sonnet', 'Approved, but skip the second premise', 'Approved. Also ping me first.', 'Approved!', 'Approved with']) {
+    const world = finalizeWorld({ approval: body });
+    const result = world.finalize();
+    assert.deepEqual(result.finalized, [], body);
+    assert.equal(result.left.find((row) => row.issue === 40).reason, 'approval is not exactly "Approved"', body);
+    assert.equal(world.fixtureIssue().comments.length, 2, `${body}: nothing posted`);
+    assert.deepEqual(world.fixtureIssue().labels, ['needs-triage', 'triage-proposed'], `${body}: labels untouched`);
+    assert.equal(readLedger(world.root, 'endzone').length, 1, `${body}: nothing recorded`);
+    const item = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible[0];
+    assert.equal(item.kind, 'approval', body);
+    assert.equal(item.withEdits, true, `${body}: a qualified approval is with edits, never unchanged`);
+  }
+  const exact = finalizeWorld({ approval: 'Approved' });
+  assert.equal(computeFrontier({ root: exact.root, tenant: 'endzone', fixture: exact.fixture, now: NOW }).eligible[0].withEdits, false);
+  assert.equal(triage.isExactApproval('Approved'), true);
+  assert.equal(triage.isExactApproval('\r\napproved\r\n'), true);
+  assert.equal(triage.isExactApproval('Approved, but skip X'), false);
+  assert.equal(triage.isExactApproval('Approved with: edits'), false);
+  assert.equal(triage.isExactApproval('Not approved'), false);
+});
+
+test('#207: only the owner login can approve, and only when the approval is the last thing the owner said', () => {
+  const byFleet = finalizeWorld({ approval: null, extraComments: [comment(FLEET, 'Approved', APPROVED_AT)] });
+  assert.deepEqual(byFleet.finalize().finalized, [], 'the fleet identity cannot approve');
+  const early = finalizeWorld({ approval: null, extraComments: [comment(OWNER, 'Approved', '2026-09-09T00:00:00.000Z')] });
+  assert.deepEqual(early.finalize().finalized, [], 'an approval older than the proposal does not count');
+  const talked = finalizeWorld({ extraComments: [comment(OWNER, 'Actually, hold on, what about the mobile view?', '2026-09-11T01:00:00.000Z')] });
+  const left = talked.finalize();
+  assert.deepEqual(left.finalized, []);
+  assert.match(left.left[0].reason, /owner commented after the approval/);
+});
+
+test('#207: a changed body hash leaves the approval to the Principal', () => {
+  const world = finalizeWorld({ body: 'Body of #40, edited after the proposal', proposedBody: 'Body of #40' });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.match(result.left[0].reason, /body changed since the proposal/);
+  assert.equal(world.fixtureIssue().comments.length, 2);
+  assert.equal(readLedger(world.root, 'endzone').length, 1);
+  assert.equal(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible[0].kind, 'approval', 'the Principal still sees it');
+});
+
+test('#207: an escalation ruling is left to the Principal, whether its proposal carried the record id or a decision-needed wake is still unconsumed', () => {
+  const recorded = finalizeWorld({ recordId: 'endzone:issue-40' });
+  const one = recorded.finalize();
+  assert.deepEqual(one.finalized, []);
+  assert.match(one.left[0].reason, /escalation ruling/);
+  const woken = finalizeWorld({ outbox: [{ at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-40', wake: 'decision-needed', evidence: 'stuck' }] });
+  const two = woken.finalize();
+  assert.deepEqual(two.finalized, []);
+  assert.match(two.left[0].reason, /escalation ruling/);
+  const consumed = finalizeWorld({ outbox: [{ at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-40', wake: 'decision-needed', evidence: 'stuck' }] });
+  recordEntry({ root: consumed.root, tenant: 'endzone', kind: 'consumed', through: '2026-09-09T12:00:00.000Z', now: '2026-09-09T12:00:01.000Z' });
+  assert.equal(consumed.finalize().finalized.length, 1, 'a consumed wake is not an open escalation');
+  const other = finalizeWorld({ outbox: [{ at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-41', wake: 'decision-needed', evidence: 'another issue' }] });
+  assert.equal(other.finalize().finalized.length, 1, 'a wake on another issue is not this one');
+});
+
+test('#207: the script finalizes only what it can finalize verbatim: bug or feature, with no false premise', () => {
+  for (const [why, proposal] of [
+    ['wontfix is the owner\'s hands', PROPOSAL.replace('Classification: bug', 'Classification: wontfix')],
+    ['a duplicate is the owner\'s hands', PROPOSAL.replace('Classification: bug', 'Classification: duplicate of #12')],
+    ['a question is a conversation', PROPOSAL.replace('Classification: bug', 'Classification: question')],
+    ['a false premise must be restated in the body first', PROPOSAL.replace('verified @abcdef2', 'false: the slice is already correct')],
+    ['no classification line', PROPOSAL.replace('Classification: bug\n', '')],
+  ]) {
+    const world = finalizeWorld({ proposal });
+    const result = world.finalize();
+    assert.deepEqual(result.finalized, [], why);
+    assert.equal(world.fixtureIssue().comments.length, 2, why);
+  }
+  const feature = finalizeWorld({ proposal: PROPOSAL.replace('Classification: bug', 'Classification: feature') });
+  assert.equal(feature.finalize().finalized.length, 1);
+  assert.ok(feature.fixtureIssue().labels.includes('ready-for-agent'));
+});
+
+test('#207: a proposal comment that cannot be found leaves the approval to the Principal', () => {
+  const world = finalizeWorld();
+  const fixture = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  fixture[0].comments[0].body = 'a comment that is not a proposal';
+  fixture[0].comments[0].url = 'https://github.com/owner/repo/issues/40#issuecomment-other';
+  fs.writeFileSync(world.fixture, JSON.stringify(fixture));
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.match(result.left[0].reason, /proposal comment not found/);
+});
+
+// A runner that answers the issue query from `seed` and hands every other gh call to `write`.
+function ghRunner(seed, write) {
+  return (exe, args, options) => {
+    if (args[0] === 'api') return JSON.stringify({ data: { repository: { issues: { nodes: seed, pageInfo: { hasNextPage: false } } } } });
+    return write(exe, args, options);
+  };
+}
+
+test('#207: a finalize interrupted after the Ruling posted does not post it twice; the next run completes the labels and the ledger', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const writes = [];
+  let failOnce = true;
+  const write = (exe, args) => {
+    writes.push(args.slice(0, 2).join(' '));
+    if (args[1] === 'edit' && failOnce) { failOnce = false; throw Object.assign(new Error('gh: 502'), { stderr: 'HTTP 502' }); }
+    return '';
+  };
+  const first = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, write) });
+  assert.deepEqual(first.finalized, []);
+  assert.match(first.errors[0].message, /502/);
+  assert.deepEqual(writes, ['issue comment', 'issue edit'], 'the Ruling was posted, then the label edit failed');
+  assert.equal(readLedger(world.root, 'endzone').length, 1, 'nothing is recorded until every GitHub write landed');
+  // Second run: GitHub now shows the Ruling comment already there.
+  seed[0].comments.push({ id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: '## Ruling\nClassification: bug', createdAt: '2026-09-11T00:01:00.000Z' });
+  writes.length = 0;
+  const second = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, write) });
+  assert.deepEqual(second.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(writes, ['issue edit'], 'no second Ruling comment');
+  assert.deepEqual(readLedger(world.root, 'endzone').slice(1).map((row) => row.kind), ['approved', 'finalized']);
+});
+
+test('#207: against GitHub the writes are one gh comment (body on stdin) and one gh edit that adds the ready label and removes the marker', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const calls = [];
+  const result = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, (exe, args, options) => { calls.push({ exe, args, input: options && options.input }); return ''; }) });
+  assert.equal(result.finalized.length, 1);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].args, ['issue', 'comment', '40', '-R', 'owner/repo', '--body-file', '-']);
+  assert.match(calls[0].input, /^## Ruling\n/);
+  assert.deepEqual(calls[1].args, ['issue', 'edit', '40', '-R', 'owner/repo', '--add-label', 'ready-for-agent', '--remove-label', 'triage-proposed']);
+});
+
+test('#207: the finalize CLI runs against a fixture and prints what it finalized and what it left', () => {
+  const world = finalizeWorld();
+  const out = cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', NOW]);
+  assert.deepEqual(out.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(out.finalized[0].labels, ['ready-for-agent']);
+  assert.ok(TRIAGE_FLAGS.finalize.includes('fixture'));
+  assert.throws(() => cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixtrue', 'x']), (error) => /unknown flag/.test(error.message));
 });

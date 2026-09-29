@@ -32,6 +32,11 @@ const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits
 const OUTCOME_KINDS = Object.freeze(['approved', 'approved-with-edits', 'rejected', 'superseded']);
 const APPROVAL_RE = /^\s*approved(\s+with\s*:|\b)/i;
 const APPROVAL_WITH_EDITS_RE = /^\s*approved\s+with\s*:/i;
+// #207 (spec #193): the exact approval is the one word `Approved`, whitespace aside. Anything
+// else that APPROVAL_RE admits ("Approved with: ...", "Approved, but skip X") is an approval
+// WITH edits and stays with the Principal.
+const EXACT_APPROVAL_RE = /^\s*approved\s*$/i;
+function isExactApproval(body) { return EXACT_APPROVAL_RE.test(String(body || '')); }
 // fleet#55: the fleet posts under the tenant's ownerLogin, so authorship cannot
 // tell Cory from a session. A re-proposal ask is therefore a comment that BEGINS
 // "Re-propose", a wording hooks/principal-guard.ps1 refuses to every fleet role
@@ -477,7 +482,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     if (proposed) {
       const approval = ownerComments.filter((comment) => comment.createdAt > proposed.at && APPROVAL_RE.test(comment.body)).pop();
       if (approval) {
-        approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: APPROVAL_WITH_EDITS_RE.test(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
+        approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: !isExactApproval(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
         continue;
       }
     }
@@ -589,6 +594,154 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
   return { tenant: String(tenant), issue: number, bodyHash: sha256(body || '') };
 }
 
+// ------------------------------------------------------------- finalize ----
+// #207 (spec #193): an exact `Approved` from the owner turns an open proposal into a
+// Ruling and a ready ticket within one tick, with no Principal session: the Ruling
+// comment (the proposal verbatim), the ready label, the marker removed, the ledger
+// recorded. Everything else is left where it was, for the Principal: a qualified
+// approval, a body edited since the proposal, an escalation ruling, and any proposal
+// the script cannot restate verbatim (a false premise wants the body edited first;
+// wontfix, duplicate and question are the owner's hands or a conversation).
+
+const PROPOSAL_HEADING_RE = /^\s*##\s*Triage proposal\b/i;
+const RULING_HEADING_RE = /^\s*##\s*Ruling\b/i;
+const FALSE_PREMISE_RE = /@[0-9a-f]{7,40}\s+false:/i;
+const FINALIZE_ACTOR = 'finalize-script';
+
+// The Ruling is the proposal restated under its own heading; nothing else is added.
+function rulingBodyFor(proposalBody) {
+  const lines = String(proposalBody || '').replace(/\r\n/g, '\n').split('\n');
+  const first = lines.findIndex((line) => line.trim());
+  if (first >= 0 && PROPOSAL_HEADING_RE.test(lines[first])) lines.splice(first, 1);
+  return `## Ruling\n${lines.join('\n').replace(/^\n+/, '')}`;
+}
+
+function proposalClassification(proposalBody) {
+  const match = /^\s*Classification:\s*(\S+)/im.exec(String(proposalBody || ''));
+  return match ? match[1].toLowerCase().replace(/[.,;]+$/, '') : null;
+}
+
+// An escalation ruling: the proposal answered a lead's decision-needed wake (its ledger
+// entry carries the wake's record id), or a wake for the issue is still past the
+// consumed-up-to marker. Fail closed: either one keeps the approval with the Principal.
+function escalationReason({ proposed, issueNumber, tenant, outbox, consumedThrough }) {
+  if (proposed.recordId) return `proposal was recorded against wake ${proposed.recordId}`;
+  for (const record of outbox) {
+    if (!record || record.wake !== 'decision-needed' || !record.at) continue;
+    const parsed = parseRecordIssue(record.recordId);
+    if (parsed.tenant !== String(tenant) || parsed.issue !== issueNumber) continue;
+    if (consumedThrough && String(record.at) <= consumedThrough) continue;
+    return `decision-needed wake ${record.recordId} at ${record.at} is not consumed`;
+  }
+  return null;
+}
+
+function ghIssueWriter({ repo, runner }) {
+  const run = (args, input) => {
+    try {
+      runner('gh', args, { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
+    } catch (error) {
+      throw new WorkStateError('GITHUB_WRITE_FAILED', String(error.stderr || error.message || error).trim());
+    }
+  };
+  return {
+    comment(number, body) { run(['issue', 'comment', String(number), '-R', repo, '--body-file', '-'], body); },
+    relabel(number, { add, remove }) {
+      const args = ['issue', 'edit', String(number), '-R', repo, '--add-label', add];
+      if (remove) args.push('--remove-label', remove);
+      run(args);
+    },
+  };
+}
+
+// The fixture stands in for GitHub in tests and in the watchdog test: a finalize against
+// it edits the fixture file, so the next frontier read sees what GitHub would show.
+function fixtureIssueWriter({ file, author, at }) {
+  const edit = (number, change) => {
+    const issues = readJsonFile(path.resolve(file), null);
+    const target = issues.find((entry) => Number(entry.number) === Number(number));
+    if (!target) throw new WorkStateError('TRIAGE_INVALID', `issue #${number} is not in the fixture ${file}`);
+    change(target);
+    fs.writeFileSync(path.resolve(file), JSON.stringify(issues), 'utf8');
+  };
+  return {
+    comment(number, body) {
+      edit(number, (target) => {
+        const comments = normalizeComments(target.comments);
+        const id = `finalize-${number}-${comments.length + 1}`;
+        comments.push({ id, url: `${target.url || ''}#issuecomment-${id}`, createdAt: at, author, body });
+        target.comments = comments;
+      });
+    },
+    relabel(number, { add, remove }) {
+      edit(number, (target) => {
+        const labels = normalizeLabels(target.labels).filter((label) => label !== remove);
+        if (!labels.includes(add)) labels.push(add);
+        target.labels = labels;
+      });
+    },
+  };
+}
+
+function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner = execFileSync } = {}) {
+  const config = readTriageConfig(root);
+  const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
+  const owner = ownerLoginOf(tenantConfig);
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const issues = fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner });
+  const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
+  const projection = projectTriage({ entries: readLedger(root, tenant), now: at, windowDays: config.windowDays, graduation: config.graduation });
+  const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
+  const marker = config.markerLabel;
+  const routing = new Set([readyLabel, ...config.routingLabels]);
+  const writer = fixture
+    ? fixtureIssueWriter({ file: fixture, author: tenantConfig.fleetIdentity || 'fleet', at })
+    : ghIssueWriter({ repo: tenantConfig.github, runner });
+  const finalized = [];
+  const left = [];
+  const errors = [];
+
+  for (const issue of [...issues].sort((a, b) => a.number - b.number)) {
+    const row = projection.byIssue[issue.number] || null;
+    const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
+    if (!proposed) continue;
+    // The same rule the frontier uses for "an approval": the owner's newest approval-shaped comment after the proposal.
+    const approval = issue.comments.filter((comment) => comment.author === owner && comment.createdAt > proposed.at && APPROVAL_RE.test(comment.body)).pop();
+    if (!approval) continue;
+    const leave = (reason) => left.push({ issue: issue.number, reason });
+
+    if (!isExactApproval(approval.body)) { leave('approval is not exactly "Approved"'); continue; }
+    if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > approval.createdAt)) { leave('owner commented after the approval'); continue; }
+    if (issue.bodyHash !== proposed.bodyHash) { leave('body changed since the proposal'); continue; }
+    const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant, outbox, consumedThrough: projection.consumedThrough });
+    if (escalation) { leave(`escalation ruling: ${escalation}`); continue; }
+    const labels = new Set(issue.labels);
+    const routed = [...labels].filter((label) => routing.has(label));
+    if (routed.length) { leave(`already routed (${routed.join(', ')})`); continue; }
+
+    const proposal = issue.comments.find((comment) => comment.url && comment.url === proposed.commentUrl)
+      || issue.comments.filter((comment) => comment.createdAt <= approval.createdAt && PROPOSAL_HEADING_RE.test(comment.body)).pop();
+    if (!proposal) { leave(`proposal comment not found in the ${issue.commentsTruncated ? 'truncated ' : ''}thread`); continue; }
+    const classification = proposalClassification(proposal.body);
+    if (classification !== 'bug' && classification !== 'feature') { leave(`classification ${classification || 'missing'} is not finalized by script`); continue; }
+    if (FALSE_PREMISE_RE.test(proposal.body)) { leave('a premise is marked false; the body must be restated first'); continue; }
+
+    try {
+      // A Ruling already posted after the approval (an earlier run cut short) is not posted twice.
+      const posted = issue.comments.some((comment) => comment.createdAt > approval.createdAt && RULING_HEADING_RE.test(comment.body));
+      if (!posted) writer.comment(issue.number, rulingBodyFor(proposal.body));
+      writer.relabel(issue.number, { add: readyLabel, remove: labels.has(marker) ? marker : null });
+      // Recorded last: nothing is on the ledger until every GitHub write landed, so a retry starts clean.
+      recordEntry({ root, tenant, kind: 'approved', issue: issue.number, by: owner, commentUrl: approval.url, actor: FINALIZE_ACTOR, now: at });
+      recordEntry({ root, tenant, kind: 'finalized', issue: issue.number, labels: readyLabel, actor: FINALIZE_ACTOR, now: at });
+      finalized.push({ issue: issue.number, url: issue.url, commentUrl: approval.url, labels: [readyLabel] });
+    } catch (error) {
+      errors.push({ issue: issue.number, message: String(error.message || error) });
+    }
+  }
+  return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', at, finalized, left, errors };
+}
+
 // ------------------------------------------------------------------ CLI ----
 
 const TRIAGE_FLAGS = Object.freeze({
@@ -596,8 +749,9 @@ const TRIAGE_FLAGS = Object.freeze({
   record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'reason', 'premise', 'now'],
   state: ['root', 'tenant', 'now', 'days'],
   hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
+  finalize: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -612,6 +766,7 @@ function cli(argv) {
       by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
     });
   }
+  if (command === 'finalize') return finalizeApprovals({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
   const config = readTriageConfig(args.root);
   const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation });
@@ -637,6 +792,8 @@ module.exports = {
   TRIAGE_FLAGS,
   cli,
   computeFrontier,
+  finalizeApprovals,
+  isExactApproval,
   issueBodyHash,
   ledgerPath,
   normalizeIssue,
