@@ -5,8 +5,11 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { evaluateChecks, planRecord, runWatch, closingLinked, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
+const { evaluateChecks, planRecord, runWatch, closingLinked, closingLinkage, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
 const workState = require('../bin/work-state');
+const exclusions = require('../bin/exclusions');
+const { selectFrontier } = require('../bin/assignment');
+const { CASES: CLOSING_CASES, ISSUE: CLOSING_ISSUE, REPO: CLOSING_REPO } = require('./closing-link.cases');
 
 function rootDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-pr-watch-'));
@@ -52,8 +55,9 @@ function pr(overrides = {}) {
 function view(overrides = {}) {
   return { number: 77, state: 'OPEN', isDraft: false, mergedAt: null, headRefOid: 'abc123', statusCheckRollup: [], closingIssuesReferences: [], body: '', ...overrides };
 }
-function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false } = {}) {
+function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false, issueState = 'OPEN', failIssue = false } = {}) {
   return {
+    issueState: () => { if (failIssue) throw new Error('boom: issue view down'); return issueState; },
     listOpenPrs: () => { if (failList) throw new Error('boom: api down'); return JSON.parse(JSON.stringify(open)); },
     viewPr: () => { if (failView) throw new Error('boom: view down'); return JSON.parse(JSON.stringify(viewResult)); },
   };
@@ -102,6 +106,20 @@ test('closingLinked follows the #330 grammar: colon and URL forms link, code spa
   assert.equal(closingLinked(view({ body: 'Closes #421' }), 42, 'owner/repo'), false);
   assert.equal(closingLinked(view({ closingIssuesReferences: [{ number: 42 }], body: '' }), 42, 'owner/repo'), true);
 });
+
+// #202: the shared parser cases (tests/closing-link.cases.js), the same table
+// pr-ready-check.tests.js runs. Here: the watcher's verdict, and what a settled
+// ci-wait tick then does with it (only `none` escalates).
+for (const c of CLOSING_CASES) {
+  test(`#202 shared closing-link case: ${c.name} is ${c.expect}`, () => {
+    const viewPr = view({ body: c.body });
+    assert.equal(closingLinkage(viewPr, CLOSING_ISSUE, CLOSING_REPO), c.expect);
+    const rec = { id: 'endzone:issue-42', tenant: 'endzone', issue: CLOSING_ISSUE, state: 'ci-wait', revision: 3, github: { prNumber: 77 } };
+    const plan = planRecord({ record: rec, openPr: pr({ statusCheckRollup: GREEN }), viewPr, policy: { ciGates: ['g1', 'g2'], watchedChecks: [], ignoredChecks: [] }, repo: CLOSING_REPO });
+    assert.equal(plan.actions.length, 1);
+    assert.equal(plan.actions[0].to, c.expect === 'none' ? 'escalated' : 'review');
+  });
+}
 
 test('hop paths come from the store transitions, including escalated resolutions from any prior state', () => {
   assert.deepEqual(hopsTo('implementing', 'merged'), ['pr-open', 'review', 'merged']);
@@ -231,7 +249,12 @@ test('a watcher escalation self-resolves when linkage appears, then settles norm
   assert.equal(record(root).state, 'ci-wait');
   watch(root, fixed);
   assert.equal(record(root).state, 'review');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'checks-settled']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'checks-settled']);
+  // #204: the watcher's own self-resolve line says it raised and resolved the decision (the lead is still woken for it).
+  const selfResolved = outbox(root).find((w) => w.wake === 'resolution');
+  assert.equal(selfResolved.raisedBy, selfResolved.actor);
+  assert.equal(selfResolved.from, 'escalated');
+  assert.equal(selfResolved.to, 'ci-wait');
 });
 
 test('close, reopen, close again escalates twice - no permanent replay wedge', () => {
@@ -245,7 +268,7 @@ test('close, reopen, close again escalates twice - no permanent replay wedge', (
   assert.equal(record(root).state, 'ci-wait');
   watch(root, closed);
   assert.equal(record(root).state, 'escalated');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'decision-needed']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'decision-needed']);
 });
 
 test('an escalation with prior_state hold resolves to merged in a single legal hop', () => {
@@ -343,7 +366,9 @@ function resolveAsLead(root, to, evidence = 'Refs is deliberate: AC1 is escalate
     idempotencyKey: `pl-resolve-${record(root).revision}`, actor: 'pl-endzone', evidence, now: now(),
   });
 }
-const REFS_BODY = 'Refs #42 (deliberate; AC1 ruling open)';
+// #202: an explained Refs is deliberate at the watcher, so the fleet#44 memory is for the
+// bodies with neither a closing keyword nor an explained Refs (here a bare Refs line).
+const REFS_BODY = 'Refs #42';
 
 test('fleet#44: a lead-resolved closing-linkage escalation is not re-raised while the body is unchanged', () => {
   const root = rootDir();
@@ -360,7 +385,7 @@ test('fleet#44: a lead-resolved closing-linkage escalation is not re-raised whil
     if (tick > 0) assert.deepEqual(health.actions, [], `tick ${tick}: steady state is silent`);
   }
   assert.equal(record(root).github.observation.closingVerified, false, 'the observation says what the body says');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed'], 'one page, not one per tick');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution'], 'one page and one resolution wake, not one of each per tick');
 });
 
 test('fleet#44: the ruling survives a re-ready: settled gates at a new head go to review with checks-settled, never back to escalated', () => {
@@ -377,7 +402,7 @@ test('fleet#44: the ruling survives a re-ready: settled gates at a new head go t
   watch(root, rereadied);
   const rec = record(root);
   assert.equal(rec.state, 'review', 'settled gates on a ruled body reach review');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'checks-settled']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'checks-settled']);
   const settledEvent = events(root).filter((e) => e.type === 'state-review').pop();
   assert.match(String(settledEvent.evidence), /ruled deliberate by the lead/);
 });
@@ -387,12 +412,40 @@ test('fleet#44: an edited body is a new fact and escalates again; a closing keyw
   seed(root, { state: 'review' });
   watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: REFS_BODY }) }));
   resolveAsLead(root, 'review');
-  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42 and the ruling paragraph was rewritten' }) }));
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'See #42 for the rest' }) }));
   assert.equal(record(root).state, 'escalated', 'a different body was never ruled on');
   assert.equal(record(root).prior_state, 'review');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'decision-needed']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'decision-needed']);
   watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
   assert.equal(record(root).state, 'review', 'linkage appearing still self-resolves the watcher own escalation');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'decision-needed', 'resolution']);
+});
+
+test('#202: an explained Refs is deliberate: settled gates go to review with checks-settled and no escalation, and later ticks stay silent', () => {
+  const root = rootDir();
+  seed(root);
+  const f = fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42 (deliberate; AC1 ruling open)' }) });
+  watch(root, f);
+  const rec = record(root);
+  assert.equal(rec.state, 'review');
+  assert.equal(rec.github.observation.closingVerified, false, 'the observation still says the body carries no closing keyword');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
+  assert.match(String(events(root).filter((e) => e.type === 'state-review').pop().evidence), /explained Refs for #42 on PR #77, deliberate/);
+  assert.equal(events(root).filter((e) => e.type === 'state-escalated').length, 0);
+  for (let tick = 0; tick < 3; tick += 1) assert.deepEqual(watch(root, f).actions, [], `tick ${tick}: steady state is silent`);
+});
+
+test('#202: an explained Refs in review stays put; the next-line explanation counts, and a bare Refs line still escalates', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  const green = [pr({ statusCheckRollup: GREEN })];
+  watch(root, fetchers({ open: green, viewResult: view({ body: 'Refs #42\r\nThe migration stays with Cory.' }) }));
+  assert.equal(record(root).state, 'review', 'no closing-linkage escalation for an explained Refs');
+  watch(root, fetchers({ open: green, viewResult: view({ body: 'Refs #42' }) }));
+  assert.equal(record(root).state, 'escalated', 'neither a keyword nor an explanation is still a defect');
+  assert.match(String(record(root).decisionEvidence), /no closing linkage|disappeared/);
+  watch(root, fetchers({ open: green, viewResult: view({ body: 'Refs #42: the migration stays with Cory' }) }));
+  assert.equal(record(root).state, 'review', 'the body edited to an explained Refs resolves the watcher escalation');
 });
 
 test('fleet#34: a re-readied PR whose record sits in review re-enters ci-wait on the new head, then wakes checks-settled when it settles', () => {
@@ -768,4 +821,189 @@ test('#155: a view with no mergedBy records null rather than guessing a login', 
 test('#155: the gh adapter asks GitHub for mergedBy', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'bin', 'pr-watch.js'), 'utf8');
   assert.match(source, /'--json', 'number,state,isDraft,mergedAt,mergedBy,/);
+});
+
+// #203 (spec #192): a merged explained Refs excludes its issue until the issue closes.
+// The planner reads the exclusion ledger through selectFrontier, so these assert the
+// ledger rows a tick writes and what the frontier then does with the issue.
+const REFS_EXPLAINED = 'Refs #42: the migration stays with Cory';
+const MERGED_REFS = () => view({ state: 'MERGED', mergedAt: '2026-09-29T10:00:00Z', mergedBy: { login: 'cory' }, body: REFS_EXPLAINED });
+const ISSUE_42 = { number: 42, state: 'OPEN', labels: ['ready-for-agent'], createdAt: '2026-08-01T00:00:00.000Z' };
+function frontier(root) {
+  return selectFrontier({ issues: [ISSUE_42], readyLabel: 'ready-for-agent', exclusions: exclusions.activeExclusions({ root, tenant: 'endzone' }), tenant: 'endzone' });
+}
+function exclusionRows(root) { return exclusions.readExclusions(root, 'endzone'); }
+
+test('#203: observing a merged explained Refs records one fleet-owned exclusion naming the PR, released by the issue closing', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(record(root).state, 'merged');
+  const rows = exclusionRows(root);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, 'exclusion-added');
+  assert.equal(rows[0].tenant, 'endzone');
+  assert.equal(rows[0].issue, 42);
+  assert.equal(rows[0].owner, 'fleet');
+  assert.equal(rows[0].actor, 'pr-watch');
+  assert.match(rows[0].reason, /PR #77 merged/);
+  assert.match(rows[0].evidence, /gh pr view 77/);
+  assert.deepEqual(rows[0].recheck, { event: { type: 'issue-closed', issue: 42 } });
+});
+
+test('#203: the planner refuses the issue while the exclusion stands, and the issue closing releases it so a reopened issue is back on the frontier', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  const refused = frontier(root);
+  assert.deepEqual(refused.eligible, []);
+  assert.deepEqual(refused.excluded[0].reasons.map((r) => r.code), ['frontier-exclusion']);
+  assert.match(refused.excluded[0].reasons[0].detail, /PR #77 merged/);
+
+  // The issue is still open: later ticks leave the exclusion standing (and record nothing).
+  const stillOpen = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'OPEN' }));
+  assert.equal(stillOpen.ok, true);
+  assert.equal(exclusionRows(root).length, 1);
+  assert.equal(frontier(root).eligible.length, 0);
+
+  // The lead closes the issue by hand: the next tick lifts the exclusion.
+  const closed = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
+  assert.ok(closed.actions.some((a) => /lifted/.test(a) && /endzone:excl-42/.test(a)), 'the tick reports the release');
+  const rows = exclusionRows(root);
+  assert.deepEqual(rows.map((r) => r.kind), ['exclusion-added', 'exclusion-lifted']);
+  assert.equal(rows[1].actor, 'pr-watch');
+  assert.match(rows[1].evidence, /issue #42 is CLOSED/);
+  assert.equal(exclusions.projectTenant({ root, tenant: 'endzone' }).discharged[0].dischargedBy, 'lifted');
+  // Reopened: GitHub lists it as open again, and nothing stands in its way.
+  assert.deepEqual(frontier(root).eligible.map((i) => i.number), [42]);
+  // A reopen after the release is not excluded again by later ticks.
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'OPEN' }));
+  assert.equal(exclusionRows(root).length, 2);
+  assert.deepEqual(frontier(root).eligible.map((i) => i.number), [42]);
+});
+
+test('#203: a replay of the merge (the exclusion already written by a partial earlier tick, or already released) records no second exclusion', () => {
+  for (const lifted of [false, true]) {
+    const root = rootDir();
+    seed(root, { state: 'review' });
+    // A prior tick wrote the exclusion, then died before the merged transition committed.
+    exclusions.addExclusion({
+      root, tenant: 'endzone', issue: 42, owner: 'fleet', actor: 'pr-watch', id: 'endzone:excl-42-pr-77',
+      reason: 'PR #77 merged with an explained Refs for #42', evidence: 'gh pr view 77',
+      recheck: { event: { type: 'issue-closed', issue: 42 } },
+    });
+    if (lifted) exclusions.liftExclusion({ root, tenant: 'endzone', id: 'endzone:excl-42-pr-77', actor: 'pr-watch', evidence: 'issue #42 is CLOSED' });
+    assert.equal(record(root).state, 'review', 'the record is still watched');
+    const health = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'OPEN' }));
+    assert.equal(health.ok, true);
+    assert.equal(record(root).state, 'merged');
+    assert.equal(exclusionRows(root).filter((r) => r.kind === 'exclusion-added').length, 1, `lifted=${lifted}: exactly one exclusion-added row`);
+    assert.doesNotMatch(health.actions.join(' '), /not recorded/, 'a replay of the fleet own id is silent');
+  }
+});
+
+test('#203: a replayed observation records no second exclusion', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  const f = fetchers({ open: [], viewResult: MERGED_REFS() });
+  watch(root, f);
+  const eventCount = events(root).length;
+  for (let tick = 0; tick < 3; tick += 1) assert.deepEqual(watch(root, f).actions, [], `tick ${tick}: nothing new`);
+  assert.equal(exclusionRows(root).length, 1);
+  assert.equal(events(root).length, eventCount);
+  // Even after the release, the merge is not observed again: still one exclusion ever added.
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
+  watch(root, f);
+  assert.equal(exclusionRows(root).filter((r) => r.kind === 'exclusion-added').length, 1);
+});
+
+test('#203: a different exclusion already standing says so in the health actions: the fleet records none and does not retry', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 42, reason: 'lead holds it by hand', evidence: 'e', owner: 'pl-endzone', actor: 'pl-endzone', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  const health = watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.ok(health.actions.includes('endzone:issue-42: fleet exclusion for PR #77 not recorded; endzone:excl-42-1 already stands and the fleet does not retry (if it lapses before #42 closes, exclude by hand)'), health.actions.join(' | '));
+  assert.equal(exclusionRows(root).length, 1);
+});
+
+test('#203: a hand exclusion already standing for the issue is not doubled, and the merge still completes', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 42, reason: 'lead holds it by hand', evidence: 'e', owner: 'pl-endzone', actor: 'pl-endzone', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  const health = watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(health.ok, true);
+  assert.equal(record(root).state, 'merged');
+  assert.equal(exclusionRows(root).length, 1);
+});
+
+test('#203: a merge whose linkage is a closing keyword, a bare Refs, or nothing records no exclusion', () => {
+  for (const body of ['Closes #42', 'Refs #42', 'Just a body.']) {
+    const root = rootDir();
+    seed(root, { state: 'review' });
+    watch(root, fetchers({ open: [], viewResult: view({ state: 'MERGED', mergedAt: '2026-09-29T10:00:00Z', body }) }));
+    assert.equal(record(root).state, 'merged');
+    assert.deepEqual(exclusionRows(root), [], `body ${JSON.stringify(body)}`);
+  }
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: view({ state: 'MERGED', mergedAt: '2026-09-29T10:00:00Z', closingIssuesReferences: [{ number: 42 }], body: REFS_EXPLAINED }) }));
+  assert.deepEqual(exclusionRows(root), [], 'a native closing reference closes the issue at the merge');
+});
+
+test('#203: a merge observed from an early state or from the watcher own escalation also records the exclusion; a dry run records nothing', () => {
+  const early = rootDir();
+  seed(early, { state: 'ci-wait' });
+  watch(early, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(record(early).state, 'merged');
+  assert.equal(exclusionRows(early).length, 1);
+
+  const escalated = rootDir();
+  seed(escalated, { state: 'review' });
+  watch(escalated, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42' }) }));
+  assert.equal(record(escalated).state, 'escalated');
+  watch(escalated, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(record(escalated).state, 'merged');
+  assert.equal(exclusionRows(escalated).length, 1);
+
+  const dry = rootDir();
+  seed(dry, { state: 'review' });
+  watch(dry, fetchers({ open: [], viewResult: MERGED_REFS() }), { dryRun: true });
+  assert.equal(record(dry).state, 'review');
+  assert.deepEqual(exclusionRows(dry), []);
+});
+
+test('#203: the release runs with no watched record, retains the exclusion when the issue view fails, and leaves other tenants and other exclusions alone', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 50, reason: 'hand hold', evidence: 'e', owner: 'cory', actor: 'cory', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  exclusions.addExclusion({ root, tenant: 'other', issue: 42, reason: 'other tenant', evidence: 'e', owner: 'fleet', actor: 'pr-watch', recheck: { event: { type: 'issue-closed', issue: 42 } } });
+  // Nothing is watched now (the record merged); the tick still reaches the release step.
+  const failing = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), failIssue: true }));
+  assert.equal(failing.ok, true, 'a transient release read is not a record-action failure');
+  assert.equal(failing.failures, 0);
+  assert.equal(failing.releaseFailures, 1);
+  assert.match(failing.actions.join(' '), /issue view failed, retained/);
+  assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 2, 'an unreadable issue is never read as closed');
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [50], 'only the issue-closed exclusion of this tenant was released');
+  assert.equal(exclusions.activeExclusions({ root, tenant: 'other' }).length, 1);
+});
+
+test('#203: an issue that no longer resolves (deleted or transferred) releases its exclusion with that as the evidence, and counts no failure', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  const gone = fetchers({ open: [], viewResult: MERGED_REFS() });
+  gone.issueState = () => { throw new Error('GraphQL: Could not resolve to an issue or pull request with the number of 42. (repository.issue)'); };
+  const health = watch(root, gone);
+  assert.equal(health.ok, true);
+  assert.equal(health.failures, 0);
+  assert.equal(health.releaseFailures, 0);
+  assert.match(health.actions.join(' '), /endzone:excl-42-pr-77: lifted, issue #42 no longer resolves/);
+  const lift = exclusionRows(root).pop();
+  assert.equal(lift.kind, 'exclusion-lifted');
+  assert.match(lift.evidence, /^issue #42 no longer resolves \(gh issue view: .*Could not resolve to an issue/);
+  assert.ok(lift.evidence.length < 250);
+  assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 0);
 });

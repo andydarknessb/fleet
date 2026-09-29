@@ -57,12 +57,19 @@ try {
   Assert-True (($tenantFiles -join ',') -eq 'endzone.json') "the scratch root carries one tenant file (got $($tenantFiles -join ','))"
   $scratchTenant = Get-Content "$scratch\tenants\endzone.json" -Raw | ConvertFrom-Json
   Assert-True ($scratchTenant.repo -eq $sourceTenant.repo -and $scratchTenant.github -eq $sourceTenant.github) 'the tenant file names the real tenant checkout and repo'
+  Assert-True ($scratchTenant.readyLabel -eq 'haiku-rehearsal') "the scratch tenant's ready label is haiku-rehearsal, which the live planner skips (got $($scratchTenant.readyLabel))"
   $staticRoster = Get-Content "$scratch\roster.json" -Raw | ConvertFrom-Json
   Assert-True ([int]$staticRoster.cap -eq 1 -and @($staticRoster.sessions).Count -eq 0) 'the scratch roster is capped at one session and lists none'
   $stateFiles = @(Get-ChildItem "$scratch\state" -Recurse -File -Force | Where-Object { $_.Name -ne '.gitkeep' -and $_.FullName -ne "$scratch\state\roster.json" })
   Assert-True ($stateFiles.Count -eq 0) "the scratch state holds no files beyond an empty live roster (got $(@($stateFiles | ForEach-Object { $_.FullName }) -join ', '))"
   foreach ($dir in 'sessions', 'work', 'events', 'manifests', 'flags', 'watch') { Assert-True (Test-Path -LiteralPath "$scratch\state\$dir" -PathType Container) "the scratch state has state\$dir" }
   Assert-True (-not (Test-Path -LiteralPath "$scratch\.scratch")) 'the source .scratch notes are not copied'
+  # Spec #94 (#165): a scratch root is where a CLI re-test runs, so its profile carries no
+  # recorded version and the launch door does not refuse the installed CLI there.
+  $scratchProfile = Get-Content "$scratch\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  Assert-True ($scratchProfile.PSObject.Properties['verifiedCliVersion'] -and $null -eq $scratchProfile.verifiedCliVersion) 'the scratch profile clears verifiedCliVersion so a rehearsal runs on the installed CLI'
+  Assert-True ($scratchProfile.rehearsalRoot -eq $true) 'the scratch profile is marked as a rehearsal root'
+  Assert-True (-not (Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json).PSObject.Properties['rehearsalRoot']) 'the source profile is never a rehearsal root'
   $scratchFwd = $scratch.Replace('\', '/')
   $settingsText = Get-Content "$scratch\fleet-settings.json" -Raw
   $hookCommands = @(($settingsText | ConvertFrom-Json).hooks.PSObject.Properties | ForEach-Object { $_.Value } | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })

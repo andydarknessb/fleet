@@ -72,6 +72,17 @@ test('frontier ordering and exclusion evidence are deterministic', () => {
   assert.ok(excluded.get(10).includes('frontier-exclusion'));
 });
 
+test('a haiku-rehearsal issue is off the live frontier even when it carries the ready label (fleet #182)', () => {
+  const issues = [issue(11, { labels: ['ready-for-agent', 'haiku-rehearsal'] }), issue(12)];
+  const live = selectFrontier({ issues, readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(live.eligible.map((entry) => entry.number), [12]);
+  const reasons = live.excluded.find((entry) => entry.issue === 11).reasons.map((reason) => reason.code);
+  assert.deepEqual(reasons, ['haiku-rehearsal']);
+  // A scratch root whose tenant readyLabel is haiku-rehearsal is the rehearsal's own planner: it must still offer the issue.
+  const scratch = selectFrontier({ issues, readyLabel: 'haiku-rehearsal', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(scratch.eligible.map((entry) => entry.number), [11]);
+});
+
 test('reservation attempts cannot claim the same component', () => {
   const root = rootDir();
   reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, reservations: { components: ['src/shared'] }, idempotencyKey: 'reserve-0', now: '2026-09-01T00:00:00.000Z' });
@@ -551,8 +562,8 @@ test('assign pins the permission profile: haiku only under allowlist, sonnet und
   for (const [number, extra, label] of [[81, { model: 'haiku' }, 'no flag'], [82, { model: 'haiku', permissions: 'auto' }, '--permissions auto']]) {
     assert.throws(
       () => reserve(number, extra),
-      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message),
-      `haiku with ${label} is refused with the fleet #28 cause`,
+      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message) && /--permissions allowlist/.test(error.message),
+      `haiku with ${label} is refused with the fleet #28 cause and the flag to pass`,
     );
   }
 
@@ -850,4 +861,19 @@ test('#154: the assignment loader refuses a tenant whose fleetIdentity is its ow
   assert.throws(() => readTenantConfig(root, 'endzone'), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', fleetIdentity: 'fleet-bot', ownerLogin: 'andydarknessb' }));
   assert.equal(readTenantConfig(root, 'endzone').fleetIdentity, 'fleet-bot');
+});
+
+// #203: a merged Refs PR retires its Work record, and a retired record no longer reserves
+// its issue, so without the fleet's issue-closed exclusion the planner would hand the
+// delivered work out again.
+test('#203: a retired Work record does not reserve its issue, so the issue-closed exclusion is what refuses it until the exclusion is released', () => {
+  const issues = [issue(42)];
+  const active = [{ id: 'endzone:issue-42', tenant: 'endzone', issue: 42, state: 'retired' }];
+  const exclusion = { id: 'endzone:excl-42-pr-77', tenant: 'endzone', issue: 42, reason: 'PR #77 merged with an explained Refs for #42', owner: 'fleet', evidence: 'gh pr view 77', recheck: { event: { type: 'issue-closed', issue: 42 } } };
+  const standing = selectFrontier({ issues, readyLabel: 'ready-for-agent', active, exclusions: [exclusion], tenant: 'endzone' });
+  assert.deepEqual(standing.eligible, []);
+  assert.deepEqual(standing.excluded[0].reasons.map((reason) => reason.code), ['frontier-exclusion']);
+  assert.equal(standing.excluded[0].reasons[0].owner, 'fleet');
+  const released = selectFrontier({ issues, readyLabel: 'ready-for-agent', active, exclusions: [], tenant: 'endzone' });
+  assert.deepEqual(released.eligible.map((entry) => entry.number), [42]);
 });

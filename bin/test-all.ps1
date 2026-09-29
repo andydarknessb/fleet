@@ -1,7 +1,7 @@
 # Fleet aggregate test runner (#112, ADR 0013): every tests/*.tests.js (node --test)
 # and every tests/*.tests.ps1 (Windows PowerShell 5.1), SERIALLY, each in its own
-# process. Suites never run in parallel: the work-state mutex test flakes under
-# parallel load (ADR 0013 Consequences). One line per suite (outcome, exit code,
+# process. Suites never run in parallel (ADR 0013 Consequences; the mutex flake
+# once blamed on parallel load was a Windows lock race, #234). One line per suite (outcome, exit code,
 # seconds); exit 1 naming every failed suite, 0 when all passed, 2 when -Filter
 # matched nothing. CI (.github/workflows/ci.yml, job `fleet-ci`) runs exactly this.
 #

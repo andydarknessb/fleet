@@ -65,3 +65,26 @@ never-sleep power plan: simpler, and the dead-man covers what is left.
   standing session retires, and the Reporting line is rewritten then, not now.
 - The Pushover token and the dead-man URL live under `state/`, never in the
   repository.
+
+## Amendment 2026-09-29 - a dead fleet pages at high
+
+`fleet-dead` pages at high priority, not emergency. Dead-man silence stays at
+emergency, because when the host or the Watchdog is gone nothing else can page.
+
+The two-hour repeat also goes out at high, until sessions that need Cory
+escalate and end idle instead of ending their turns blocked on him (audit item
+6). From then on, a waiting ask is an `escalated` or `hold` record, which this
+ADR already excludes from "work waiting". A fleet still dead after two hours is
+then a real outage, and the repeat returns to emergency as the Consequences
+above say. Today the repeat's priority is hard-coded to emergency in the
+Watchdog, so it must read the configured priority instead.
+
+Why: emergency priority makes Pushover repeat every 2 minutes for up to 2
+hours until acknowledged. That fits production being down, and a dead fleet
+costs throughput, never users. From 09-25 to 09-29 the `fleet-dead` episodes
+mostly meant every session was waiting on Cory, and each of those waits
+already had its own page. There was also a separate false class, 41 of 92 rows
+on 09-23 and 09-24 that listed fresh `-1m` heartbeats; it has not recurred
+since.
+
+Source: the 2026-09-29 fleet audit (ruling R1) and its grill (Q1).

@@ -125,3 +125,17 @@ the token are the two steps only Cory can do in a browser.
 
 A second account is a second thing to keep alive. If the token expires the
 fleet stops launching, loudly, and the fix is the wizard's token stage.
+
+## Status note - 2026-09-29 (fleet #199)
+
+The release ruleset exists. `main-release-only` on andydarknessb/Endzone-Empire
+(ruleset 24207677, created 2026-09-29) restricts updates to `main`, blocks
+deletion and force-push, and bypasses only the repository admin role. The
+fleet identity is not a bypass actor, so "it cannot merge into `main`" above
+is now enforced by GitHub, not by role text. The same day
+`master-review-gate` on andydarknessb/Nidus (ruleset 24207679) put the Review
+gate on `master`: the `ci` check and the `fleet-review` status are required,
+with the same admin bypass for Cory's direct pushes; and
+`integration-required-checks` (ruleset 21529626) gained deletion and
+force-push blocks. Cory's first release merge under the ruleset is recorded
+on fleet #199, with whether `gh pr merge` needed `--admin`.

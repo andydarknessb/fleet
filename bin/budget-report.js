@@ -11,6 +11,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 const { modelFamily } = require('./measure-cycle');
+const { meterChange } = require('./transcript-usage');
 
 // fleet#4: refuse an unknown flag rather than silently ignore it.
 class BudgetReportError extends Error {
@@ -112,6 +113,8 @@ function buildSummary({ root, now } = {}) {
   }
   const summary = {
     at,
+    // #201: figures before this date count each model response once per transcript row.
+    meterChange: meterChange(readJson(path.join(base, 'config', 'cycle.json'), {})),
     soak: last?.config ? { warnTokens: last.config.warnTokens, escalateTokens: last.config.escalateTokens, warningOnly: last.config.escalateTokens === null || last.config.escalateTokens === undefined } : null,
     totals: { crossings: crossings.length, warnings: crossings.filter((c) => c.kind === 'budget-warning').length, extensions: crossings.filter((c) => c.kind === 'budget-extended').length, escalations: crossings.filter((c) => c.kind === 'budget-escalation').length },
     byDay,
@@ -129,6 +132,7 @@ function buildSummary({ root, now } = {}) {
 
 function render(s) {
   const lines = [`# IC budget summary - ${s.at}`, ''];
+  if (s.meterChange) lines.push(s.meterChange.note);
   if (s.soak) lines.push(`thresholds: warn ${s.soak.warnTokens}, escalate ${s.soak.escalateTokens === null || s.soak.escalateTokens === undefined ? 'OFF (warning-only soak)' : s.soak.escalateTokens} job tokens`);
   lines.push(`crossings: ${s.totals.crossings} (warnings ${s.totals.warnings}, extensions ${s.totals.extensions}, escalations ${s.totals.escalations})`, '');
   lines.push('## By day', '');

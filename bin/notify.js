@@ -406,7 +406,7 @@ function pageSender({ root, powershell = 'powershell.exe' } = {}) {
       const last = String(raw).trim().split(/\r?\n/).pop() || '{}';
       const result = JSON.parse(last);
       if (result.pushover === true) return { ok: true, detail: 'pushover delivered' };
-      if (result.pushover === 'unconfigured') return { ok: false, detail: 'page channel unconfigured: state/pages/pushover.json is missing' };
+      if (result.pushover === 'unconfigured') return { ok: false, detail: 'page channel unconfigured: neither state/pages/pushover.json nor state/secrets/pushover.json exists' };
       return { ok: false, detail: `page channel failed: ${result.pushoverError || 'pushover not delivered'}` };
     } catch (error) {
       return { ok: false, detail: `page channel failed: ${String(error.stderr || error.message || error).slice(0, 200)}` };
