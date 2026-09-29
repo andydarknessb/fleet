@@ -444,7 +444,11 @@ test('cross-process mutex serializes concurrent compare-and-swap attempts', asyn
 function withFsFault(method, faultFor, body) {
   const original = fs[method];
   const originalWait = Atomics.wait;
+  const originalNow = Date.now;
+  let skew = 0;
   const probe = { failures: 0, waits: 0 };
+  // Each stubbed wait advances the clock the way a real ~16 ms Windows wait would.
+  Date.now = () => originalNow() + skew;
   fs[method] = function faulty(target, ...rest) {
     const code = faultFor(String(target), probe);
     if (code) {
@@ -455,6 +459,7 @@ function withFsFault(method, faultFor, body) {
   };
   Atomics.wait = (...args) => {
     probe.waits += 1;
+    skew += 16;
     return probe.onWait ? probe.onWait() : 'timed-out';
   };
   try {
@@ -462,6 +467,7 @@ function withFsFault(method, faultFor, body) {
   } finally {
     fs[method] = original;
     Atomics.wait = originalWait;
+    Date.now = originalNow;
   }
 }
 
@@ -479,27 +485,114 @@ test('lock open retries EPERM, EACCES and EBUSY like a held lock', () => {
   }
 });
 
-test('lock open throws a genuine permission failure after a bounded wait', () => {
+test('lock open throws a genuine permission failure after about five seconds of waiting', () => {
   const root = rootDir();
   withFsFault('openSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
     assert.throws(() => makeRecord(root), (error) => error.code === 'EPERM');
-    assert.ok(probe.failures > 1 && probe.failures <= 100000);
+    // 16 ms per wait: 5 s is about 312 waits, far below the old 6000-wait bound (~94 s on Windows).
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
   });
 });
 
-test('lock probe forgives a delete-pending lock that stats as EPERM', () => {
+test('a held lock is waited on however long, only transient errors are time bounded', () => {
   const root = rootDir();
   makeRecord(root);
   const lock = path.join(root, 'state', 'work', '.lock');
   fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
-  withFsFault('statSync', (target, probe) => (isLock(target) && probe.failures < 3 ? 'EBUSY' : null), (probe) => {
+  withFsFault('statSync', () => null, (probe) => {
     probe.onWait = () => {
-      if (probe.failures >= 3) fs.rmSync(lock, { force: true });
+      if (probe.waits >= 1000) fs.rmSync(lock, { force: true });
       return 'timed-out';
     };
     assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
-    assert.equal(probe.failures, 3);
+    assert.ok(probe.waits >= 1000);
   });
+});
+
+test('lock probe forgives a delete-pending lock that stats as EPERM or EBUSY', () => {
+  for (const code of ['EPERM', 'EBUSY']) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = path.join(root, 'state', 'work', '.lock');
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+    withFsFault('statSync', (target, probe) => (isLock(target) && probe.failures < 3 ? code : null), (probe) => {
+      probe.onWait = () => {
+        if (probe.failures >= 3) fs.rmSync(lock, { force: true });
+        return 'timed-out';
+      };
+      assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+      assert.equal(probe.failures, 3);
+    });
+  }
+});
+
+function staleLock(root, content) {
+  const lock = path.join(root, 'state', 'work', '.lock');
+  fs.writeFileSync(lock, content);
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(lock, old, old);
+  return lock;
+}
+
+test('a stale lock with empty or partial content is broken instead of wedging every call', () => {
+  for (const content of ['', '{"pid":']) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = staleLock(root, content);
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(fs.existsSync(lock), false);
+  }
+});
+
+test('breaking a stale lock forgives a delete-pending removal that reports EPERM', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  withFsFault('rmSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.failures, 2);
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('breaking a stale lock forgives a lock that reads as EPERM', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  withFsFault('readFileSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.failures, 2);
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('a failed write of the lock owner releases the lock and throws', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = path.join(root, 'state', 'work', '.lock');
+  withFsFault('writeFileSync', (target, probe) => (/^\d+$/.test(target) && probe.failures < 1 ? 'ENOSPC' : null), (probe) => {
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'ENOSPC');
+    assert.equal(probe.failures, 1);
+  });
+  assert.equal(fs.existsSync(lock), false);
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+});
+
+test('releasing the lock retries a transient EBUSY so a committed write does not surface an error', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const original = fs.rmSync;
+  // Stand-in for Windows: the lock is busy for a moment unless the caller asks rmSync to retry.
+  fs.rmSync = function busy(target, options = {}) {
+    if (isLock(String(target)) && !options.maxRetries) throw Object.assign(new Error('EBUSY: simulated'), { code: 'EBUSY' });
+    return original.call(this, target, options);
+  };
+  try {
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+  } finally {
+    fs.rmSync = original;
+  }
+  assert.equal(fs.existsSync(path.join(root, 'state', 'work', '.lock')), false);
 });
 
 test('atomic write retries a rename that reports EPERM or EBUSY', () => {
@@ -513,11 +606,13 @@ test('atomic write retries a rename that reports EPERM or EBUSY', () => {
   }
 });
 
-test('atomic write throws when a rename keeps failing', () => {
+test('atomic write throws when a rename keeps failing and leaves no temporary file behind', () => {
   const root = rootDir();
   withFsFault('renameSync', () => 'EPERM', () => {
     assert.throws(() => makeRecord(root), (error) => error.code === 'EPERM');
   });
+  const leftovers = fs.readdirSync(path.join(root, 'state', 'work')).filter((name) => name.endsWith('.tmp'));
+  assert.deepEqual(leftovers, []);
 });
 
 test('pending journals recover kill points between replacement and append', () => {
