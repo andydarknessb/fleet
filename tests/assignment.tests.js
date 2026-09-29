@@ -985,3 +985,53 @@ test('#209: the Veto reader takes the same shape as the guard hook: leading whit
     assert.deepEqual(windowFor(readyAt, '2026-09-29T20:00:00.000Z', { issue: { comments: [ownerComment(body, '2026-09-29T15:30:00.000Z')] } }).eligible, [60], JSON.stringify(body));
   }
 });
+
+// Ruling on the QA of #209 (m1): the whole 2 hour window must be waking hours, so a ready whose window
+// would touch 22:00 to 07:00 Central (a ready made from 20:00) waits for 09:00 Central.
+test('#209 m1: a ready made at 20:30 Central is held until 09:00 Central; one made at 19:59 is released at 21:59', () => {
+  // 2026-09-30T01:30Z is 20:30 CDT on 09-29.
+  const evening = '2026-09-30T01:30:00.000Z';
+  assert.equal(windowFor(evening, '2026-09-30T13:59:00.000Z').reasons[0].code, 'veto-window');
+  assert.match(windowFor(evening, '2026-09-30T13:59:00.000Z').reasons[0].detail, /22:00 to 07:00 Central/);
+  assert.deepEqual(windowFor(evening, '2026-09-30T14:00:00.000Z').eligible, [60]);
+  // 19:59 CDT (00:59Z): the window ends at 21:59 and never touches 22:00.
+  const early = '2026-09-30T00:59:00.000Z';
+  assert.equal(windowFor(early, '2026-09-30T02:58:00.000Z').reasons[0].code, 'veto-window');
+  assert.deepEqual(windowFor(early, '2026-09-30T02:59:00.000Z').eligible, [60]);
+  // 20:00 sharp touches 22:00 at the window's end.
+  assert.equal(windowFor('2026-09-30T01:00:00.000Z', '2026-09-30T13:00:00.000Z').reasons[0].code, 'veto-window');
+});
+
+test('#209 B1: the first bounded-ready row of an issue is the one a veto ends, and a later row never re-arms the window', () => {
+  const { liveBoundedReadies } = require('../bin/assignment');
+  const rows = [
+    { kind: 'bounded-ready', issue: 60, at: '2026-09-29T15:00:00.000Z' },
+    { kind: 'veto', issue: 60, at: '2026-09-29T15:30:00.000Z' },
+    { kind: 'bounded-ready', issue: 60, at: '2026-09-29T16:00:00.000Z' },
+    { kind: 'bounded-ready', issue: 61, at: '2026-09-29T15:00:00.000Z' },
+    { kind: 'bounded-ready', issue: 61, at: '2026-09-29T16:00:00.000Z' },
+  ];
+  const live = liveBoundedReadies(rows);
+  assert.equal(live.has(60), false, 'vetoed once, never live again');
+  assert.equal(live.get(61).at, '2026-09-29T15:00:00.000Z', 'the first row stands');
+});
+
+test('#209 M10: the window is measured against the wall clock unless a fixture is in play: windowNow overrides now', () => {
+  const held = selectFrontier({ issues: [issue(60)], readyLabel: 'ready-for-agent', ownerLogin: OWNER, now: '2027-01-01T00:00:00.000Z', windowNow: '2026-09-29T16:00:00.000Z', boundedReadies: [{ issue: 60, at: '2026-09-29T15:00:00.000Z' }] });
+  assert.deepEqual(held.eligible, [], 'a --now far in the future does not release a ticket the wall clock still holds');
+  const { windowNowFor } = require('../bin/assignment');
+  assert.equal(windowNowFor({ fixture: 'x.json', now: '2026-09-29T16:00:00.000Z' }), '2026-09-29T16:00:00.000Z');
+  assert.notEqual(windowNowFor({ fixture: undefined, now: '2099-01-01T00:00:00.000Z' }), '2099-01-01T00:00:00.000Z');
+  const root = plannerRoot([{ kind: 'bounded-ready', issue: 60, at: '2026-09-29T15:00:00.000Z' }]);
+  const base = { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) };
+  assert.throws(
+    () => reserveAssignment({ root, issue: issue(60), tenant: 'endzone', tenantConfig: { ownerLogin: OWNER, fleetIdentity: 'fleet-bot' }, readyLabel: 'ready-for-agent', base, now: '2099-01-01T00:00:00.000Z', windowNow: '2026-09-29T16:00:00.000Z' }),
+    (error) => error.code === 'NO_FRONTIER' && error.excluded[0].reasons[0].code === 'veto-window',
+  );
+});
+
+test('#209 m7: plannerInputs throws on a missing tenant instead of answering "nothing is bounded"', () => {
+  const { plannerInputs } = require('../bin/assignment');
+  assert.throws(() => plannerInputs({ root: plannerRoot([]), tenantConfig: {} }), (error) => error.code === 'USAGE');
+  assert.deepEqual(plannerInputs({ root: plannerRoot([]), tenant: 'endzone', tenantConfig: {} }).boundedReadies, []);
+});

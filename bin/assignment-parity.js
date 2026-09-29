@@ -311,6 +311,7 @@ function cli(argv) {
         fleetIdentity: tenantConfig.fleetIdentity,
         tenant,
         now: args.now,
+        windowNow: assignment.windowNowFor({ fixture, now: args.now }),
         // #209: and the Veto window, or the observer would record a difference the live path
         // would not make.
         ...assignment.plannerInputs({ root: base, tenant, tenantConfig }),
