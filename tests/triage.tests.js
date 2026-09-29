@@ -263,7 +263,7 @@ test('the CLI refuses an unknown flag with exit 2 and a missing tenant as usage;
   assert.deepEqual(state.pending.map((row) => row.issue), [1]);
   assert.equal('byIssue' in state, false, 'the state command prints the summary, not the per-issue fold');
   assert.deepEqual(Object.keys(TRIAGE_FLAGS).slice(0, 5), ['frontier', 'record', 'state', 'hash', 'finalize']);
-  for (const door of ['bounded-ready', 'veto']) assert.ok(door in TRIAGE_FLAGS, door);   // #210
+  for (const door of ['bounded-ready', 'veto', 'bounded-scan']) assert.ok(door in TRIAGE_FLAGS, door);   // #210, #211
   assert.equal(typeof cli, 'function');
 });
 
@@ -875,7 +875,7 @@ function boundedRoot({ flag = true, suspended = false, tenant = 'endzone', carve
   const runner = (exe, args) => { calls.push([exe, ...args]); return ''; };
   const send = (message) => { pages.push(message); return { ok: true, detail: 'pushover delivered' }; };
   const door = (extra = {}) => bounded.boundedReady({ root, tenant, issue: 7, fixture, now: BNOW, runner, send, ...extra });
-  return { root, tenant, fixture, calls, pages, door, bug, bodyHash };
+  return { root, tenant, fixture, calls, pages, door, bug, bodyHash, runner, send };
 }
 
 function boundedRows(world) { return readLedger(world.root, world.tenant).filter((entry) => entry.kind === 'bounded-ready').length; }
@@ -1080,4 +1080,216 @@ test('#210: the veto door refuses when the owner has not vetoed, when only the f
   assert.throws(() => veto(), (error) => error.code === 'TRIAGE_NO_VETO', 'a Veto before the ready withdraws nothing');
   const unreadied = boundedRoot();
   assert.throws(() => bounded.vetoReady({ root: unreadied.root, tenant: 'endzone', issue: 7, fixture: unreadied.fixture, now: BNOW, runner: () => '' }), (error) => error.code === 'TRIAGE_NO_BOUNDED_READY');
+});
+
+// ---------------------------------------------------------------------------
+// Spec fleet #193 (#211): Bounded authority suspends itself on failure evidence.
+// The suspension scan (bin/bounded-authority.js, run by the bounded-ready door and by
+// the daily summary) reads the triage ledger, the event ledger, the findings artifacts
+// and the open issues' proposals, and writes the suspension flag on:
+//   - an escalation or a send-back on a bounded ticket marked `criteria-defect`
+//     (the escalation reason, or a finding category), never free text;
+//   - a bug whose proposal says `Escaped from: #<PR>` where that PR delivered a bounded ticket.
+// A Veto is not evidence. Only removing the flag lifts a suspension.
+// ---------------------------------------------------------------------------
+const workState = require('../bin/work-state');
+
+const SUSPENDED_FLAG = (root) => path.join(root, 'state', 'flags', 'bounded-authority-suspended-endzone');
+const AFTER_READY = '2026-09-29T17:05:00.000Z';   // past the 2 hour window that started at BNOW
+
+// A bounded ready on issue 7 (through the door) and its Work record on PR 1007, implementing.
+function readiedUnit(over = {}) {
+  const world = boundedRoot(over);
+  world.door();
+  const id = 'endzone:issue-7';
+  workState.createRecord({ root: world.root, id, tenant: 'endzone', issue: 7, state: 'implementing', github: { issueNumber: 7, prNumber: 1007 }, actor: 'test', idempotencyKey: 'c-7', now: AFTER_READY });
+  return { ...world, id };
+}
+
+function escalate(world, { reason, now = '2026-09-29T18:00:00.000Z', id = world.id, key = 'esc-7', evidence = 'wake:decision-needed; the acceptance criteria contradict each other', revision = 1 } = {}) {
+  return workState.transitionRecord({ root: world.root, id, to: 'escalated', expectedRevision: revision, evidence, ...(reason ? { reason } : {}), idempotencyKey: key, actor: 'pl-endzone', now });
+}
+
+// A record walked to review with a formal review whose artifact carries `category`, then sent back.
+function sendBack(world, category, { now = '2026-09-29T19:00:00.000Z' } = {}) {
+  const at = (minutes) => new Date(new Date(now).getTime() + minutes * 60000).toISOString();
+  let revision = 1;
+  for (const [index, to] of ['pr-open', 'ci-wait', 'review'].entries()) {
+    revision = workState.transitionRecord({ root: world.root, id: world.id, to, expectedRevision: revision, idempotencyKey: `s-${to}`, actor: 'pr-watch', evidence: to, now: at(index) }).revision;
+  }
+  const relative = 'state/reviews/endzone_issue-7/formal-001.json';
+  fs.mkdirSync(path.join(world.root, 'state', 'reviews', 'endzone_issue-7'), { recursive: true });
+  fs.writeFileSync(path.join(world.root, relative), JSON.stringify({ findings: [{ id: 'f1', severity: 'major', category, status: 'open', summary: 'the criterion cannot be met as written' }] }));
+  revision = workState.recordReview({ root: world.root, id: world.id, expectedRevision: revision, actor: 'pl-endzone', idempotencyKey: 'formal-7', now: at(4), review: { kind: 'formal', headSha: 'a'.repeat(40), artifact: relative } }).revision;
+  return workState.transitionRecord({ root: world.root, id: world.id, to: 'revision', expectedRevision: revision, idempotencyKey: 'back-7', actor: 'pl-endzone', evidence: 'sent back with the findings artifact', now: at(6) });
+}
+
+function suspensionRows(world) { return readLedger(world.root, 'endzone').filter((entry) => entry.kind === 'suspended'); }
+
+test('#211: an escalation marked criteria-defect on a bounded ticket writes the suspension flag and its ledger row; the door then refuses', () => {
+  const world = readiedUnit();
+  escalate(world, { reason: 'criteria-defect' });
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(world.root)));
+  const scan = bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' });
+  assert.equal(scan.suspended, true);
+  assert.equal(scan.wrote, true);
+  const flag = JSON.parse(fs.readFileSync(SUSPENDED_FLAG(world.root), 'utf8'));
+  assert.equal(flag.tenant, 'endzone');
+  assert.equal(flag.cause, 'escalation');
+  assert.equal(flag.issue, 7);
+  assert.equal(flag.at, '2026-09-29T18:05:00.000Z');
+  const rows = suspensionRows(world);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].cause, 'escalation');
+  assert.equal(rows[0].standing, false);
+  assert.deepEqual(rows[0].evidenceIds, ['endzone:issue-7#2']);
+  // The next bounded ready, on any ticket, is refused until Cory removes the flag.
+  const another = boundedRoot();
+  fs.copyFileSync(SUSPENDED_FLAG(world.root), SUSPENDED_FLAG(another.root));
+  refusal(another, 'suspended');
+  // The scan is idempotent: the same evidence writes nothing twice.
+  const again = bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-29T18:10:00.000Z' });
+  assert.equal(again.wrote, false);
+  assert.equal(suspensionRows(world).length, 1);
+});
+
+test('#211: the bounded-ready door scans first, so evidence that arrived since the last scan stops the very next ready', () => {
+  const world = readiedUnit();
+  escalate(world, { reason: 'criteria-defect' });
+  // A second proposal on issue 8 that would otherwise qualify.
+  const eight = issue(8, { labels: ['bug', 'triage-proposed'], body: 'Another crash.', comments: [{ id: 'p8', url: 'https://github.com/owner/repo/issues/8#issuecomment-8001', author: FLEET, createdAt: '2026-09-29T09:30:00.000Z', body: proposalBody() }] });
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 8, bodyHash: triage.normalizeIssue(eight).bodyHash, commentUrl: 'https://github.com/owner/repo/issues/8#issuecomment-8001', model: 'fable', premisesSha: PREMISE_SHA, now: '2026-09-29T09:30:01.000Z' });
+  fs.writeFileSync(world.fixture, JSON.stringify([world.bug, eight]));
+  assert.throws(() => bounded.boundedReady({ root: world.root, tenant: 'endzone', issue: 8, fixture: world.fixture, now: '2026-09-29T18:30:00.000Z', runner: world.runner, send: () => ({ ok: true }) }), (error) => error.condition === 'suspended');
+  assert.ok(fs.existsSync(SUSPENDED_FLAG(world.root)), 'the door wrote the flag it found evidence for');
+});
+
+test('#211: a send-back on a bounded ticket whose finding category is criteria-defect suspends; any other category does not', () => {
+  const marked = readiedUnit();
+  sendBack(marked, 'criteria-defect');
+  assert.equal(bounded.scanSuspension({ root: marked.root, tenant: 'endzone', now: '2026-09-29T20:00:00.000Z' }).suspended, true);
+  assert.equal(suspensionRows(marked)[0].cause, 'send-back');
+  const ordinary = readiedUnit();
+  sendBack(ordinary, 'correctness');
+  const scan = bounded.scanSuspension({ root: ordinary.root, tenant: 'endzone', now: '2026-09-29T20:00:00.000Z' });
+  assert.equal(scan.suspended, false);
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(ordinary.root)));
+});
+
+test('#211: an escalation without the named reason is not a criteria mark, whatever its free text says, and another named reason is not one either', () => {
+  const world = readiedUnit();
+  escalate(world, { evidence: 'wake:decision-needed; criteria-defect: the criteria were wrong' });
+  const scan = bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' });
+  assert.equal(scan.suspended, false);
+  assert.deepEqual(scan.evidence, []);
+  const stale = readiedUnit();
+  workState.transitionRecord({ root: stale.root, id: stale.id, to: 'escalated', expectedRevision: 1, evidence: 'wake:decision-needed; a premise moved', reason: 'stale-premise', premise: 'server/x.js:1: y @abc1234', idempotencyKey: 'esc-stale', actor: 'pl-endzone', now: '2026-09-29T18:00:00.000Z' });
+  assert.equal(bounded.scanSuspension({ root: stale.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' }).suspended, false, 'stale-premise is not a criteria mark');
+});
+
+test('#211: a criteria mark on a ticket that was not readied under Bounded authority, or before its ready, suspends nothing', () => {
+  // An ordinary ticket: a proposal, an Approval, no bounded-ready row.
+  const world = boundedRoot();
+  workState.createRecord({ root: world.root, id: 'endzone:issue-7', tenant: 'endzone', issue: 7, state: 'implementing', github: { issueNumber: 7, prNumber: 1007 }, actor: 'test', idempotencyKey: 'c-7', now: AFTER_READY });
+  escalate({ ...world, id: 'endzone:issue-7' }, { reason: 'criteria-defect' });
+  assert.equal(bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' }).suspended, false);
+  // A mark that predates the bounded ready belongs to an earlier attempt.
+  const early = boundedRoot();
+  workState.createRecord({ root: early.root, id: 'endzone:issue-7', tenant: 'endzone', issue: 7, state: 'implementing', github: { issueNumber: 7, prNumber: 1007 }, actor: 'test', idempotencyKey: 'c-7', now: '2026-09-29T08:00:00.000Z' });
+  escalate({ ...early, id: 'endzone:issue-7' }, { reason: 'criteria-defect', now: '2026-09-29T08:30:00.000Z' });
+  early.door();
+  assert.equal(bounded.scanSuspension({ root: early.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' }).suspended, false);
+});
+
+function escapedBug(escapedFrom, { number = 8 } = {}) {
+  return issue(number, {
+    labels: ['bug', 'triage-proposed'], body: 'Something broke after a fleet PR.',
+    comments: [{ id: `p${number}`, url: `https://github.com/owner/repo/issues/${number}#issuecomment-${number}001`, author: FLEET, createdAt: '2026-09-30T09:00:00.000Z', body: proposalBody({ 'Escaped from': escapedFrom }) }],
+  });
+}
+function proposeBug(world, bug) {
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: bug.number, bodyHash: triage.normalizeIssue(bug).bodyHash, commentUrl: bug.comments[0].url, model: 'fable', premisesSha: PREMISE_SHA, now: '2026-09-30T09:00:01.000Z' });
+}
+
+test('#211: a bug whose proposal says Escaped from the PR that delivered a bounded ticket writes the suspension flag', () => {
+  const world = readiedUnit();
+  const bug = escapedBug('#1007');
+  proposeBug(world, bug);
+  const scan = bounded.scanSuspension({ root: world.root, tenant: 'endzone', issues: [world.bug, bug], now: '2026-09-30T10:00:00.000Z' });
+  assert.equal(scan.suspended, true);
+  const flag = JSON.parse(fs.readFileSync(SUSPENDED_FLAG(world.root), 'utf8'));
+  assert.equal(flag.cause, 'escape');
+  assert.equal(flag.issue, 7);
+  assert.equal(flag.bug, 8);
+  assert.equal(flag.pr, 1007);
+  assert.deepEqual(suspensionRows(world)[0].evidenceIds, ['escape:8:1007']);
+});
+
+test('#211: Escaped from another PR, none or unknown, or a bug the scan was not shown, does not suspend', () => {
+  for (const value of ['#999', 'none', 'unknown', '1007', 'PR 1007 maybe']) {
+    const world = readiedUnit();
+    const bug = escapedBug(value);
+    proposeBug(world, bug);
+    assert.equal(bounded.scanSuspension({ root: world.root, tenant: 'endzone', issues: [world.bug, bug], now: '2026-09-30T10:00:00.000Z' }).suspended, false, value);
+  }
+  const world = readiedUnit();
+  const bug = escapedBug('#1007');
+  proposeBug(world, bug);
+  assert.equal(bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-30T10:00:00.000Z' }).suspended, false, 'with no issues to read the local evidence alone decides');
+});
+
+test('#211: a Veto does not suspend', () => {
+  const world = readiedUnit();
+  const vetoedIssue = { ...world.bug, labels: ['bug', 'ready-for-agent'], comments: [...world.bug.comments, { id: 'v1', url: 'https://github.com/owner/repo/issues/7#issuecomment-6001', author: OWNER, createdAt: '2026-09-29T15:20:00.000Z', body: 'Veto: not now.' }] };
+  fs.writeFileSync(world.fixture, JSON.stringify([vetoedIssue]));
+  bounded.vetoReady({ root: world.root, tenant: 'endzone', issue: 7, fixture: world.fixture, now: '2026-09-29T15:31:00.000Z', runner: world.runner });
+  const scan = bounded.scanSuspension({ root: world.root, tenant: 'endzone', issues: [vetoedIssue], now: '2026-09-29T16:00:00.000Z' });
+  assert.equal(scan.suspended, false);
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(world.root)));
+  assert.equal(suspensionRows(world).length, 0);
+});
+
+test('#211: only removing the flag lifts a suspension, and the same evidence never suspends twice; new evidence does', () => {
+  const world = readiedUnit();
+  escalate(world, { reason: 'criteria-defect' });
+  bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' });
+  assert.equal(bounded.isSuspended(world.root, 'endzone'), true);
+  // Nothing but the file's removal lifts it: more scans, and the passing of time, leave it standing.
+  bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-10-05T00:00:00.000Z' });
+  assert.equal(bounded.isSuspended(world.root, 'endzone'), true);
+  fs.rmSync(SUSPENDED_FLAG(world.root));
+  const lifted = bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-10-05T00:00:00.000Z' });
+  assert.equal(lifted.suspended, false, 'the evidence Cory already ruled on does not re-suspend');
+  assert.equal(suspensionRows(world).length, 1);
+  // A different bounded ticket failing later suspends again.
+  fs.appendFileSync(triage.ledgerPath(world.root, 'endzone'), `${JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', issue: 12, at: '2026-10-05T01:00:00.000Z', actor: 'principal', bodyHash: 'h12' })}\n`);
+  workState.createRecord({ root: world.root, id: 'endzone:issue-12', tenant: 'endzone', issue: 12, state: 'implementing', github: { issueNumber: 12, prNumber: 1012 }, actor: 'test', idempotencyKey: 'c-12', now: '2026-10-05T04:00:00.000Z' });
+  escalate({ ...world, id: 'endzone:issue-12' }, { reason: 'criteria-defect', now: '2026-10-05T05:00:00.000Z', key: 'esc-12' });
+  const again = bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-10-05T06:00:00.000Z' });
+  assert.equal(again.suspended, true);
+  assert.equal(suspensionRows(world).length, 2);
+  assert.equal(suspensionRows(world)[1].issue, 12);
+});
+
+test('#211: evidence that arrives while a suspension stands is recorded once and does not re-suspend after the flag is removed', () => {
+  const world = readiedUnit();
+  escalate(world, { reason: 'criteria-defect' });
+  bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-29T18:05:00.000Z' });
+  const bug = escapedBug('#1007');
+  proposeBug(world, bug);
+  const during = bounded.scanSuspension({ root: world.root, tenant: 'endzone', issues: [world.bug, bug], now: '2026-09-30T10:00:00.000Z' });
+  assert.equal(during.wrote, false, 'the flag already stands');
+  const rows = suspensionRows(world);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].standing, true, 'logged as evidence, not counted as a second suspension');
+  fs.rmSync(SUSPENDED_FLAG(world.root));
+  assert.equal(bounded.scanSuspension({ root: world.root, tenant: 'endzone', issues: [world.bug, bug], now: '2026-09-30T11:00:00.000Z' }).suspended, false);
+});
+
+test('#211: bounded-scan is a triage door: it runs the scan from the CLI against a fixture', () => {
+  const world = readiedUnit();
+  escalate(world, { reason: 'criteria-defect' });
+  const out = cli(['bounded-scan', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', '2026-09-29T18:05:00.000Z']);
+  assert.equal(out.suspended, true);
+  assert.ok(fs.existsSync(SUSPENDED_FLAG(world.root)));
 });

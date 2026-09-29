@@ -103,7 +103,8 @@ test('#131: a fixture week produces all eight rows in markdown and JSON', () => 
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
   assert.equal(card.week.label, '2026-09-21..2026-09-27');
   const json = JSON.parse(fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.json'), 'utf8'));
-  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'icCost']);
+  assert.deepEqual(json.rows.map((r) => r.key).slice(0, 8), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'icCost']);
+  assert.equal(json.rows[8].key, 'boundedAuthority', 'spec #193 adds the ninth row');
   const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
   for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'IC cost']) {
     assert.match(md, new RegExp(`^\\| ${area.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|`, 'm'), area);
@@ -334,4 +335,47 @@ test('#213: the newest comment headed Ruling or Triage proposal decides: a later
   assert.deepEqual(parseProposalEscapedFrom([proposalComment('unknown', '2026-09-24T00:00:00Z'), ruling('#12', '2026-09-25T00:00:00Z')]), { kind: 'pr', pr: 12 });
   assert.deepEqual(parseProposalEscapedFrom([ruling('#12', '2026-09-25T00:00:00Z'), proposalComment('none', '2026-09-26T00:00:00Z')]), { kind: 'none' });
   assert.deepEqual(parseProposalEscapedFrom([proposalComment('#5', '2026-09-24T00:00:00Z'), { createdAt: '2026-09-25T00:00:00Z', body: '## Ruling\nrestated without the line' }]), null);
+});
+
+// Spec fleet #193 (#211): the scorecard gains a row for how Bounded authority was used:
+// bounded readies, vetoes and suspensions in the week, and any suspension still standing.
+function triageRows(root, tenant, rows) {
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'triage', `${tenant}.jsonl`), rows.map((row) => `${JSON.stringify({ schemaVersion: 1, tenant, actor: 'principal', ...row })}\n`).join(''));
+}
+
+test('#211: the Bounded authority row counts the week\'s bounded readies, vetoes and suspensions, and names a standing suspension', () => {
+  const root = fixtureWeek();
+  triageRows(root, 'endzone', [
+    { kind: 'bounded-ready', issue: 21, at: '2026-09-15T10:00:00.000Z', bodyHash: 'a' },      // the week before
+    { kind: 'bounded-ready', issue: 22, at: '2026-09-22T10:00:00.000Z', bodyHash: 'b' },
+    { kind: 'bounded-ready', issue: 23, at: '2026-09-23T10:00:00.000Z', bodyHash: 'c' },
+    { kind: 'bounded-ready', issue: 24, at: '2026-09-27T23:59:00.000Z', bodyHash: 'd' },
+    { kind: 'veto', issue: 23, at: '2026-09-23T12:00:00.000Z', by: 'owner' },
+    { kind: 'suspended', issue: 22, at: '2026-09-25T10:00:00.000Z', cause: 'escalation', standing: false, evidenceIds: ['endzone:issue-22#4'] },
+    { kind: 'suspended', issue: 24, at: '2026-09-26T10:00:00.000Z', cause: 'escape', standing: true, evidenceIds: ['escape:30:1024'] },   // evidence while one already stood
+    { kind: 'proposed', issue: 25, at: '2026-09-24T10:00:00.000Z', bodyHash: 'e', commentUrl: 'https://x/25', model: 'fable' },
+  ]);
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'bounded-authority-suspended-endzone'), JSON.stringify({ tenant: 'endzone', at: '2026-09-25T10:00:00.000Z', cause: 'escalation', issue: 22, detail: 'endzone:issue-22 escalated with reason criteria-defect' }));
+  const card = build(root);
+  const row = card.rows.find((r) => r.key === 'boundedAuthority');
+  assert.equal(row.area, 'Bounded authority');
+  assert.deepEqual(row.figures, { readied: 3, vetoed: 1, suspended: 1, standing: ['endzone'], byTenant: { endzone: { readied: 3, vetoed: 1, suspended: 1 } } });
+  assert.match(row.result, /3 readied under Bounded authority, 1 vetoed, 1 suspension/);
+  assert.match(row.result, /suspension standing: endzone/);
+  assert.equal(row.status, 'weak');
+  assert.match(renderScorecard(card), /^\| Bounded authority \|/m);
+});
+
+test('#211: the Bounded authority row is good when used without a veto or a suspension, watch after a veto, and n/a when unused', () => {
+  const at = (day) => `2026-09-${day}T10:00:00.000Z`;
+  const rowFor = (rows) => { const root = fixtureWeek(); if (rows) triageRows(root, 'endzone', rows); return build(root).rows.find((r) => r.key === 'boundedAuthority'); };
+  const unused = rowFor(null);
+  assert.equal(unused.status, 'n/a');
+  assert.match(unused.result, /0 readied under Bounded authority, 0 vetoed, 0 suspensions/);
+  assert.equal(rowFor([{ kind: 'bounded-ready', issue: 22, at: at(22), bodyHash: 'b' }]).status, 'good');
+  const vetoed = rowFor([{ kind: 'bounded-ready', issue: 22, at: at(22), bodyHash: 'b' }, { kind: 'veto', issue: 22, at: at(22), by: 'owner' }]);
+  assert.equal(vetoed.status, 'watch');
+  assert.equal(vetoed.figures.suspended, 0);
 });

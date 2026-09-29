@@ -20,7 +20,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const assignment = require('./assignment');
-const { WorkStateError } = require('./work-state');
+const { WorkStateError, readEvents, readTenantConfigs } = require('./work-state');
 
 // At most this many bounded readies per tenant per Central calendar day.
 const DAILY_CAP = 5;
@@ -32,6 +32,8 @@ const CRITERIA_MARK = 'criteria-defect';
 
 function baseOf(root) { return path.resolve(root || path.resolve(__dirname, '..')); }
 function triage() { return require('./triage'); }
+// A comment's identity across URL spellings: its issuecomment id.
+const idOfComment = (url) => (/issuecomment-(\d+)/.exec(String(url || '')) || [])[1] || String(url || '');
 
 // ------------------------------------------------------------------ flags ----
 
@@ -208,7 +210,9 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   const all = loadIssues({ tenantConfig, fixture, issues, runner });
   const found = all.find((entry) => entry.number === number);
   if (!found) throw refused([{ code: 'issue-not-found', detail: `issue #${number} is not among ${tenant}'s open issues` }]);
-  // Gate 2: a standing suspension, lifted only by removing its file.
+  // Gate 2: a standing suspension, lifted only by removing its file. The scan comes first, so
+  // failure evidence that arrived since the last one is on file before the ready is judged.
+  scanSuspension({ root, tenant, issues: all, now: at });
   if (isSuspended(root, tenant)) {
     throw refused([{ code: 'suspended', detail: `Bounded authority is suspended for ${tenant} (state/flags/bounded-authority-suspended-${safeTenant(tenant)}); only removing that file lifts it` }]);
   }
@@ -228,8 +232,7 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   if (open.recordId) failures.push({ code: 'needs-approval', detail: `the proposal answers an escalation (${open.recordId}), a ruling on live work, which still needs Approval` });
   if (found.labels.includes(readyLabel)) failures.push({ code: 'already-ready', detail: `issue #${number} already carries ${readyLabel}` });
   if (found.bodyHash !== open.bodyHash) failures.push({ code: 'proposal-stale', detail: 'the issue body changed since the proposal was written; propose again' });
-  const idOf = (url) => (/issuecomment-(\d+)/.exec(String(url || '')) || [])[1] || String(url || '');
-  const comment = found.comments.find((entry) => idOf(entry.url) === idOf(open.commentUrl));
+  const comment = found.comments.find((entry) => idOfComment(entry.url) === idOfComment(open.commentUrl));
   const proposal = comment ? parseProposal(comment.body) : null;
   if (!proposal) failures.push({ code: 'proposal-not-found', detail: `the recorded proposal comment ${open.commentUrl} is not among issue #${number}'s comments, or is not a triage proposal` });
   else failures.push(...checkBoundedClass({ proposal, premisesSha: open.premisesSha, tenantConfig }));
@@ -299,18 +302,155 @@ function vetoReady({ root, tenant, issue: issueValue, tenantConfigPath, fixture,
   return result;
 }
 
+// ------------------------------------------------------- the suspension scan ----
+// Spec fleet #193 (#211, ADR 0011 amendment). Bounded authority suspends itself on
+// evidence that the bounded class is failing, by writing
+// state/flags/bounded-authority-suspended-<tenant>. Only Cory lifts it, by removing the
+// file; nothing here ever deletes it. The evidence is one of:
+//   - an escalation or a send-back on a bounded ticket, marked as caused by the ticket's
+//     criteria: the escalation reason `criteria-defect` (work-state.js `--reason`) or a
+//     finding whose kebab-case `category` is `criteria-defect` in the review artifact the
+//     send-back followed. The mark is the name; free text is never read.
+//   - a bug whose triage proposal says `Escaped from: #<PR>` (exactly that shape; ticket
+//     #213 adds the line) where that PR delivered a bounded ticket.
+// A Veto is not evidence: a vetoed ticket is no longer a bounded ticket at all.
+//
+// Where it runs, and why a scan: the evidence is written by three different doors (the
+// escalation door in work-state.js, the review door in review-policy.js, and the Principal's
+// proposal on a bug, which lives only as a GitHub comment), so no single door call sees all
+// of it, and hooking the first two into the ledger would couple both to the triage ledger. A
+// scan reads them all, and is idempotent, so it can run wherever it is cheap: the
+// bounded-ready door runs it first (a ready is the only act suspension forbids, so no bounded
+// ready can follow failure evidence, however late the scan otherwise ran), the daily summary
+// runs it each morning so a standing suspension is on Cory's page, and `triage.js
+// bounded-scan` runs it by hand. Evidence already ruled on is remembered in the `suspended`
+// ledger rows (their evidenceIds), so removing the flag lifts the suspension for good and
+// only new evidence suspends again.
+
+function artifactHasCategory(root, relative, category) {
+  if (!relative) return false;
+  const base = path.resolve(root);
+  const file = path.resolve(base, String(relative));
+  if (file !== base && !file.startsWith(base + path.sep)) return false;
+  try {
+    const artifact = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return (artifact.findings || []).some((finding) => finding && finding.category === category);
+  } catch { return false; }
+}
+
+// Escalations and send-backs after the ready, on the record of a still-standing bounded ticket.
+function criteriaEvidence({ root, tenant, live, events }) {
+  const found = [];
+  for (const [issue, ready] of live) {
+    const recordId = `${tenant}:issue-${issue}`;
+    const readyMs = new Date(ready.at).getTime();
+    const own = events.filter((event) => event.recordId === recordId && new Date(event.at).getTime() > readyMs).sort((a, b) => a.sequence - b.sequence);
+    let lastReview = null;
+    for (const event of own) {
+      if (event.type === 'review-recorded') lastReview = event;
+      else if (event.type === 'state-escalated' && event.changes && event.changes.reason === CRITERIA_MARK) {
+        found.push({ cause: 'escalation', id: `${recordId}#${event.sequence}`, at: event.at, issue, recordId, detail: `${recordId} escalated with reason ${CRITERIA_MARK}` });
+      } else if (event.type === 'state-revision' && event.changes && event.changes.sendBack === true && lastReview && artifactHasCategory(root, lastReview.changes && lastReview.changes.artifact, CRITERIA_MARK)) {
+        found.push({ cause: 'send-back', id: `${recordId}#${event.sequence}`, at: event.at, issue, recordId, detail: `${recordId} sent back after a finding of category ${CRITERIA_MARK} in ${lastReview.changes.artifact}` });
+      }
+    }
+  }
+  return found;
+}
+
+// Open bugs whose newest proposal names, as `Escaped from: #<PR>`, a PR that delivered a bounded ticket.
+function escapeEvidence({ tenant, live, events, issues, entries }) {
+  const prToIssue = new Map();
+  for (const issue of live.keys()) {
+    for (const event of events) {
+      const pr = event.recordId === `${tenant}:issue-${issue}` && event.changes && event.changes.prNumber;
+      if (pr) prToIssue.set(Number(pr), issue);
+    }
+  }
+  const found = [];
+  for (const bug of issues) {
+    const proposal = entries.filter((entry) => entry.kind === 'proposed' && Number(entry.issue) === bug.number).pop();
+    const comment = proposal && bug.comments.find((entry) => idOfComment(entry.url) === idOfComment(proposal.commentUrl));
+    const fields = comment ? parseProposal(comment.body) : null;
+    const line = fields && fields['Escaped from'] ? fields['Escaped from'].split('\n')[0].trim() : '';
+    const match = /^#(\d+)\.?$/.exec(line);
+    if (!match) continue;
+    const pr = Number(match[1]);
+    const boundedIssue = prToIssue.get(pr);
+    if (!boundedIssue || boundedIssue === bug.number) continue;
+    found.push({ cause: 'escape', id: `escape:${bug.number}:${pr}`, at: proposal.at, issue: boundedIssue, bug: bug.number, pr, detail: `bug #${bug.number} escaped from PR #${pr}, which delivered bounded ticket #${boundedIssue}` });
+  }
+  return found;
+}
+
+// Read the evidence, and suspend on any not already ruled on. `issues` is the tenant's open
+// issues (the escape check reads their proposals); without it only the local evidence counts.
+function scanSuspension({ root, tenant, issues, now, events } = {}) {
+  const { readLedger, recordEntry, normalizeIssue } = triage();
+  const at = isoOf(now);
+  const entries = readLedger(root, tenant);
+  const live = assignment.liveBoundedReadies(entries);
+  const standing = isSuspended(root, tenant);
+  const result = { tenant, at, suspended: standing, wrote: false, evidence: [] };
+  if (!live.size) return result;
+  const ruledOn = new Set(entries.filter((entry) => entry.kind === 'suspended').flatMap((entry) => entry.evidenceIds || []));
+  const ledgerEvents = events || readEvents(root);
+  const found = [
+    ...criteriaEvidence({ root, tenant, live, events: ledgerEvents }),
+    ...(issues ? escapeEvidence({ tenant, live, events: ledgerEvents, issues: issues.map((entry) => normalizeIssue(entry)), entries }) : []),
+  ].filter((item) => !ruledOn.has(item.id)).sort((a, b) => String(a.at).localeCompare(String(b.at)) || a.id.localeCompare(b.id));
+  if (!found.length) return result;
+  const first = found[0];
+  const evidenceIds = found.map((item) => item.id);
+  // The flag first, then the row: a row without its flag would leave the evidence "ruled on"
+  // and the authority armed; a flag without its row is repaired by the next scan.
+  if (!standing) {
+    const flag = { schemaVersion: 1, tenant, at, cause: first.cause, issue: first.issue, ...(first.recordId ? { recordId: first.recordId } : {}), ...(first.bug ? { bug: first.bug, pr: first.pr } : {}), evidenceIds, detail: first.detail };
+    fs.mkdirSync(flagsDir(root), { recursive: true });
+    try { fs.writeFileSync(suspensionFlagPath(root, tenant), `${JSON.stringify(flag, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  }
+  recordEntry({ root, tenant, kind: 'suspended', issue: first.issue, now: at, fields: { cause: first.cause, standing, evidenceIds, detail: first.detail } });
+  return { ...result, suspended: true, wrote: !standing, evidence: found };
+}
+
+// The CLI door: load the tenant's open issues (a fixture, or GitHub) and scan.
+function boundedScan({ root, tenant, tenantConfigPath, fixture, issues, now, runner = execFileSync } = {}) {
+  const { readTenantConfig } = triage();
+  if (!tenant) throw new WorkStateError('TRIAGE_INVALID', 'tenant is required');
+  const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
+  return scanSuspension({ root, tenant, issues: loadIssues({ tenantConfig, fixture, issues, runner }), now });
+}
+
+// The daily summary's scan: every tenant that has Bounded authority enabled or suspended. A
+// failed GitHub read falls back to the local evidence; a failed scan never stops the summary.
+function scanTenants({ root, now, loadTenantIssues } = {}) {
+  const configs = readTenantConfigs(root);
+  const results = [];
+  for (const [tenant, config] of Object.entries(configs)) {
+    if (!isBoundedEnabled(root, tenant) && !isSuspended(root, tenant)) continue;
+    let issues;
+    let issuesError = null;
+    try { issues = loadTenantIssues ? loadTenantIssues(tenant, config) : triage().queryGithubIssues({ repo: config.github }); } catch (error) { issuesError = String(error.message || error).split('\n')[0]; }
+    try { results.push({ ...scanSuspension({ root, tenant, issues, now }), ...(issuesError ? { issuesError } : {}) }); } catch (error) { results.push({ tenant, error: String(error.message || error).split('\n')[0] }); }
+  }
+  return results;
+}
+
 module.exports = {
   CRITERIA_MARK,
   DAILY_CAP,
   VETO_RE: assignment.VETO_RE,
   boundedFlagPath,
   boundedReady,
+  boundedScan,
   checkBoundedClass,
   parseProposal,
   chicagoDay: assignment.chicagoDay,
   isBoundedEnabled,
   isSuspended,
   liveBoundedReadies: assignment.liveBoundedReadies,
+  scanSuspension,
+  scanTenants,
   standingSuspensions,
   suspensionFlagPath,
   vetoReady,

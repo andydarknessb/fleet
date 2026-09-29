@@ -8,6 +8,8 @@
 // at any time, never the source of anything, so this reads the ledger, not
 // the markdown. Nothing waiting sends nothing: a quiet day pages nobody, and
 // a page every morning regardless would train Cory to stop reading it.
+// Spec fleet #193 (#211): the one standing condition that does page on a quiet day is a
+// Bounded-authority suspension, which only Cory lifts; the run scans for one first.
 
 const path = require('node:path');
 const workState = require('./work-state');
@@ -15,6 +17,7 @@ const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
 const { runStalePremiseNotice } = require('./triage');
+const { scanTenants, standingSuspensions } = require('./bounded-authority');
 
 const { DECISION_STATES } = workState;
 const MAX_ROWS = 10;
@@ -87,6 +90,13 @@ function waitingRows({ root, now } = {}) {
     });
 }
 
+// One line per standing suspension: since when, why, and the one way to lift it.
+function suspensionLine(entry) {
+  const since = entry.at ? ` since ${String(entry.at).slice(0, 10)}` : '';
+  const why = entry.detail ? `: ${String(entry.detail).replace(/\s+/g, ' ').slice(0, 200)}` : '';
+  return `Bounded authority is suspended for ${entry.tenant}${since}${why}. Removing state/flags/bounded-authority-suspended-${entry.tenant} lifts it.`;
+}
+
 // null when nothing is waiting: the caller's job is to send nothing at all,
 // not an empty page. Rows keep the ticket's plain "#issue state age" only
 // while every waiting row belongs to one tenant; once they span more than
@@ -95,12 +105,16 @@ function waitingRows({ root, now } = {}) {
 // shifts depending on how many rows happen to be shown.
 function buildSummary({ root, now } = {}) {
   const rows = waitingRows({ root, now });
-  if (!rows.length) return null;
+  // Spec fleet #193 (#211): a standing Bounded-authority suspension is Cory's to lift, so it
+  // heads the page and is reason enough to send one on a day nothing else waits.
+  const suspensions = standingSuspensions(baseOf(root));
+  if (!rows.length && !suspensions.length) return null;
   const multiTenant = new Set(rows.map((row) => row.tenant)).size > 1;
   const shown = rows.slice(0, MAX_ROWS);
-  const lines = shown.map((row) => (multiTenant
+  const lines = suspensions.map(suspensionLine);
+  lines.push(...shown.map((row) => (multiTenant
     ? `${row.tenant} #${row.issue} ${row.state} ${formatAge(row.ageMs)}`
-    : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`));
+    : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`)));
   if (rows.length > MAX_ROWS) lines.push(`and ${rows.length - MAX_ROWS} more`);
   // #131: the latest weekly scorecard's headline (the week and its weakest row) rides
   // the page as its last line. No scorecard file, no line; and a scorecard alone never
@@ -108,7 +122,7 @@ function buildSummary({ root, now } = {}) {
   const card = latestScorecard(root);
   if (card && card.week) lines.push(headlineOf(card));
   return {
-    title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length,
+    title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length, suspensions: suspensions.length,
   };
 }
 
@@ -128,13 +142,21 @@ function runDailySummary(options = {}) {
   const send = options.send || pageSender({ root: base });
   const notice = runStalePremiseNotice({ root: base, now: options.now, send, dryRun: Boolean(options.dryRun) });
   const staleNotice = notice.armed ? { staleNotice: notice } : {};
+  // Spec fleet #193 (#211): scan for Bounded-authority failure evidence before summarizing, so a
+  // suspension the scan writes is on this morning's page. A dry run writes nothing, so it scans
+  // nothing; a scan that fails costs the scan, never the summary.
+  let scanned = [];
+  if (!options.dryRun) {
+    try { scanned = scanTenants({ root: base, now: options.now, loadTenantIssues: options.loadTenantIssues }); } catch (error) { scanned = [{ error: String(error.message || error).split('\n')[0] }]; }
+  }
+  const boundedScan = scanned.length ? { boundedScan: scanned } : {};
   const summary = buildSummary({ root: base, now: options.now });
-  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice };
+  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice, ...boundedScan };
   if (options.dryRun) return { sent: false, attempted: false, count: summary.count, dryRun: true, summary, ...staleNotice };
   let result;
   try { result = send(summary); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
   const ok = Boolean(result && result.ok);
-  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice };
+  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice, ...boundedScan };
 }
 
 function cli(argv) {

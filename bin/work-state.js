@@ -811,7 +811,10 @@ function sendBackCount(record) {
   return Object.values(record?.idempotency || {}).filter((entry) => entry && (entry.type === 'transition:review->revision' || entry.sendBack === true)).length;
 }
 
-const ESCALATION_REASONS = Object.freeze(['stale-premise']);
+// Spec fleet #193 (#211): `criteria-defect` marks an escalation as caused by the ticket's own
+// criteria being wrong or ambiguous; it carries no premise. On a ticket the Principal readied
+// under Bounded authority the mark suspends that authority (bin/bounded-authority.js).
+const ESCALATION_REASONS = Object.freeze(['stale-premise', 'criteria-defect']);
 
 function validateTransition(record, to, options) {
   if (!STATES.includes(to)) throw new WorkStateError('INVALID_STATE', `unknown state '${to}'`);
@@ -838,12 +841,13 @@ function validateTransition(record, to, options) {
     }
   }
   if (to === 'escalated' && !options.evidence) throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'escalated requires decision evidence');
-  // Spec fleet #92 (#144): an escalation may name its reason; the one reason so far
-  // is a stale premise, and it carries the premise line verbatim to the Principal.
+  // Spec fleet #92 (#144): an escalation may name its reason. A stale premise carries the
+  // premise line verbatim to the Principal; criteria-defect (#211) carries none.
   if (options.reason !== undefined || options.premise !== undefined) {
     if (to !== 'escalated') throw new WorkStateError('USAGE', '--reason and --premise belong to an escalation (--to escalated)');
     if (!ESCALATION_REASONS.includes(options.reason)) throw new WorkStateError('USAGE', `--reason must be one of ${ESCALATION_REASONS.join(', ')}`);
-    if (!options.premise || !String(options.premise).trim()) throw new WorkStateError('USAGE', '--reason stale-premise needs --premise "<the premise line verbatim>"');
+    if (options.reason === 'stale-premise' && (!options.premise || !String(options.premise).trim())) throw new WorkStateError('USAGE', '--reason stale-premise needs --premise "<the premise line verbatim>"');
+    if (options.reason === 'criteria-defect' && options.premise !== undefined) throw new WorkStateError('USAGE', '--reason criteria-defect takes no --premise');
   }
   if (fromEscalated && (!options.evidence || !record.prior_state)) {
     throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'escalation resolution requires prior_state and decision evidence');
@@ -932,7 +936,7 @@ function transitionRecord(options = {}) {
       evidence: options.evidence,
       changes: {
         from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null,
-        ...(options.reason ? { reason: options.reason, premise: String(options.premise) } : {}),
+        ...(options.reason ? { reason: options.reason, ...(options.premise !== undefined ? { premise: String(options.premise) } : {}) } : {}),
         // #155: who merged, from GitHub's mergedBy; null when the observation did not say.
         ...(to === 'merged' ? { mergedBy: githubObservation?.mergedBy ? String(githubObservation.mergedBy) : null } : {}),
         ...(to === 'revision' ? { sendBack, ...(options.ruling ? { ruling: String(options.ruling) } : {}) } : {}),

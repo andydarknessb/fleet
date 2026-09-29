@@ -968,8 +968,9 @@ const TRIAGE_FLAGS = Object.freeze({
   // Spec fleet #193 (#210): the Bounded-authority doors (bin/bounded-authority.js).
   'bounded-ready': ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
   veto: ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
+  'bounded-scan': ['root', 'tenant', 'tenant-config', 'fixture', 'now'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), bounded-scan (--tenant [--fixture <issues.json>] [--now <iso>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -978,13 +979,14 @@ function cli(argv) {
   const args = parseArgs(rest, flags);
   const tenant = requireText(args.tenant, '--tenant');
   if (command === 'frontier') return computeFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
+  if (command === 'bounded-scan') return require('./bounded-authority').boundedScan({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now });
   if (command === 'bounded-ready' || command === 'veto') {
     const door = require('./bounded-authority');
     const options = { root: args.root, tenant, issue: args.issue, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now, effects: !args.fixture };
     return command === 'veto' ? door.vetoReady(options) : door.boundedReady(options);
   }
   if (command === 'record') {
-    if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto), which checks what it records`);
+    if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto, bounded-scan), which checks what it records`);
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
       by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,

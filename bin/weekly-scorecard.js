@@ -60,6 +60,7 @@ const ROWS = [
   ['escapedDefects', 'Escaped defects'],
   ['availability', 'Availability'],
   ['icCost', 'IC cost'],
+  ['boundedAuthority', 'Bounded authority'],
 ];
 const SEVERITY = { weak: 4, unknown: 3, watch: 2, good: 1, 'n/a': 0 };
 
@@ -363,6 +364,43 @@ function icCostRow(base, events, week, collect, dryRun) {
   };
 }
 
+// Spec fleet #193 (#211): how Bounded authority was used, from the triage ledger's own
+// kinds: bounded readies, vetoes and suspensions recorded in the week (a scan that found
+// evidence while a suspension already stood is logged with standing: true and is not a
+// second suspension), plus any suspension flag still standing. A suspension, in the week or
+// still standing, is weak: it is the authority's own failure evidence. A veto is watch: it
+// can be about timing, and suspends nothing. Used with neither is good; not used is n/a.
+function boundedAuthorityRow(base, week) {
+  const dir = path.join(base, 'state', 'triage');
+  const byTenant = {};
+  if (fs.existsSync(dir)) {
+    const { readLedger } = require('./triage');
+    for (const name of fs.readdirSync(dir).filter((entry) => entry.endsWith('.jsonl')).sort()) {
+      const tenant = name.slice(0, -'.jsonl'.length);
+      const counts = { readied: 0, vetoed: 0, suspended: 0 };
+      for (const entry of readLedger(base, tenant)) {
+        if (!inWeek(week, entry.at)) continue;
+        if (entry.kind === 'bounded-ready') counts.readied += 1;
+        else if (entry.kind === 'veto') counts.vetoed += 1;
+        else if (entry.kind === 'suspended' && entry.standing !== true) counts.suspended += 1;
+      }
+      if (counts.readied || counts.vetoed || counts.suspended) byTenant[tenant] = counts;
+    }
+  }
+  const total = Object.values(byTenant).reduce((sum, counts) => ({ readied: sum.readied + counts.readied, vetoed: sum.vetoed + counts.vetoed, suspended: sum.suspended + counts.suspended }), { readied: 0, vetoed: 0, suspended: 0 });
+  const standing = require('./bounded-authority').standingSuspensions(base).map((entry) => entry.tenant);
+  const used = total.readied || total.vetoed || total.suspended || standing.length;
+  let status = 'n/a';
+  if (standing.length || total.suspended) status = 'weak';
+  else if (total.vetoed) status = 'watch';
+  else if (used) status = 'good';
+  return {
+    figures: { ...total, standing, byTenant },
+    result: `${total.readied} readied under Bounded authority, ${total.vetoed} vetoed, ${plural(total.suspended, 'suspension')}${standing.length ? `; suspension standing: ${standing.join(', ')}` : ''}`,
+    status,
+  };
+}
+
 function verifyWeek(base, week) {
   const runs = readHistory(base).filter((line) => inWeek(week, line.at));
   return { runs: runs.length, pass: runs.filter((line) => line.pass === true).length, fail: runs.filter((line) => line.pass === false).length };
@@ -420,6 +458,7 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     escapedDefects: escapedRow(base, week, merged, settings, gh),
     availability: availabilityRow(base, week, settings),
     icCost: icCostRow(base, events, week, collect, dryRun),
+    boundedAuthority: boundedAuthorityRow(base, week),
   };
   const rows = ROWS.map(([key, area]) => ({ key, area, ...computed[key] }));
   const weakest = rows.reduce((worst, row) => (SEVERITY[row.status] > SEVERITY[worst.status] ? row : worst), rows[0]);

@@ -287,3 +287,87 @@ test('#148: the daily run pages the due stale-premise notice once, quiet day or 
   const dry = cli(['--root', failingRoot, '--now', '2026-10-01T08:00:00.000Z', '--dry-run']);
   assert.equal(dry.staleNotice.dryRun, true);
 });
+
+// Spec fleet #193 (#211): the daily summary shows a standing Bounded-authority suspension
+// until Cory removes its flag, and runs the suspension scan first so the morning page is
+// current. A standing suspension is a reason to page even on a day nothing else waits.
+const SUSPENSION_FLAG = (root) => path.join(root, 'state', 'flags', 'bounded-authority-suspended-endzone');
+function standSuspension(root, extra = {}) {
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(SUSPENSION_FLAG(root), JSON.stringify({ schemaVersion: 1, tenant: 'endzone', at: '2026-09-16T18:05:00.000Z', cause: 'escalation', issue: 7, detail: 'endzone:issue-7 escalated with reason criteria-defect', ...extra }));
+}
+
+test('#211: a standing suspension is the first line of the summary, alone on a quiet day, and gone when the flag is removed', () => {
+  const root = rootDir();
+  standSuspension(root);
+  const summary = buildSummary({ root, now: NOW });
+  assert.equal(summary.priority, 'normal');
+  const lines = summary.body.split('\n');
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^Bounded authority is suspended for endzone since 2026-09-16/);
+  assert.match(lines[0], /escalated with reason criteria-defect/);
+  assert.match(lines[0], /state\/flags\/bounded-authority-suspended-endzone/);
+  assert.equal(summary.count, 0);
+  assert.equal(summary.suspensions, 1);
+  seedDecision(root, { issue: 4, to: 'escalated', enteredAt: hoursAgo(2) });
+  assert.deepEqual(buildSummary({ root, now: NOW }).body.split('\n').slice(1), ['#4 escalated 2h'], 'the waiting rows follow');
+  fs.rmSync(SUSPENSION_FLAG(root));
+  assert.deepEqual(buildSummary({ root, now: NOW }).body.split('\n'), ['#4 escalated 2h']);
+});
+
+test('#211: the daily run pages a standing suspension every day until the flag is removed', () => {
+  const root = rootDir();
+  standSuspension(root);
+  const send = sender();
+  const first = runDailySummary({ root, now: NOW, send });
+  assert.equal(first.sent, true);
+  assert.equal(send.calls.length, 1);
+  assert.match(send.calls[0].body, /Bounded authority is suspended for endzone/);
+  runDailySummary({ root, now: '2026-09-18T20:00:00.000Z', send });
+  assert.equal(send.calls.length, 2);
+  fs.rmSync(SUSPENSION_FLAG(root));
+  runDailySummary({ root, now: '2026-09-19T20:00:00.000Z', send });
+  assert.equal(send.calls.length, 2, 'lifted: a quiet day pages nobody again');
+});
+
+// A bounded ticket whose record escalated with the named reason after its ready.
+function failedBoundedTicket(root) {
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'bounded-authority-endzone'), '');
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${JSON.stringify({ schemaVersion: 1, kind: 'bounded-ready', tenant: 'endzone', issue: 7, at: hoursAgo(30), actor: 'principal', bodyHash: 'h7' })}\n`);
+  workState.createRecord({ root, id: 'endzone:issue-7', tenant: 'endzone', issue: 7, state: 'implementing', github: { issueNumber: 7, prNumber: 1007 }, actor: 'test', idempotencyKey: 'c-7', now: hoursAgo(26) });
+  workState.transitionRecord({ root, id: 'endzone:issue-7', to: 'escalated', expectedRevision: 1, evidence: 'wake:decision-needed; the criteria contradict each other', reason: 'criteria-defect', idempotencyKey: 'esc-7', actor: 'pl-endzone', now: hoursAgo(20) });
+}
+
+test('#211: the daily run scans for suspension evidence first, so the morning page shows a suspension the scan just wrote', () => {
+  const root = rootDir();
+  failedBoundedTicket(root);
+  const send = sender();
+  const dry = runDailySummary({ root, now: NOW, send, dryRun: true, loadTenantIssues: () => [] });
+  assert.ok(!fs.existsSync(SUSPENSION_FLAG(root)), 'a dry run writes no flag');
+  assert.equal(dry.boundedScan, undefined);
+  const result = runDailySummary({ root, now: NOW, send, loadTenantIssues: () => [] });
+  assert.ok(fs.existsSync(SUSPENSION_FLAG(root)));
+  assert.equal(result.boundedScan[0].wrote, true);
+  assert.equal(send.calls.length, 1);
+  assert.match(send.calls[0].body, /^Bounded authority is suspended for endzone/);
+});
+
+test('#211: a failed GitHub read in the daily scan falls back to the local evidence and never stops the summary', () => {
+  const root = rootDir();
+  failedBoundedTicket(root);
+  seedDecision(root, { issue: 5, to: 'hold', enteredAt: hoursAgo(1) });
+  const send = sender();
+  const result = runDailySummary({ root, now: NOW, send, loadTenantIssues: () => { throw new Error('HTTP 502'); } });
+  assert.equal(result.boundedScan[0].issuesError, 'HTTP 502');
+  assert.ok(fs.existsSync(SUSPENSION_FLAG(root)), 'the local evidence still suspended it');
+  assert.match(send.calls[0].body, /suspended for endzone[\s\S]*#5 hold 1h/);
+  const corrupt = rootDir();
+  failedBoundedTicket(corrupt);
+  fs.appendFileSync(path.join(corrupt, 'state', 'triage', 'endzone.jsonl'), 'not json\n{"kind":"x"}\n');
+  seedDecision(corrupt, { issue: 6, to: 'hold', enteredAt: hoursAgo(1) });
+  const survived = runDailySummary({ root: corrupt, now: NOW, send: sender(), loadTenantIssues: () => [] });
+  assert.equal(survived.sent, true, 'an unreadable ledger fails the scan, not the summary');
+  assert.ok(survived.boundedScan[0].error);
+});

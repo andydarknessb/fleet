@@ -97,6 +97,8 @@ The door checks every one of those again and refuses, naming each condition that
 
 A comment from the owner beginning `Veto` withdraws the ready. It reaches you as a `veto` item on your frontier: run `node C:/Users/Cory/fleet/bin/triage.js veto --tenant <tenant> --issue <n>`. The door removes `ready-for-agent`, puts `triage-proposed` back and records the veto, so the proposal is awaiting Approval again. Do nothing else with it and do not re-propose. A Veto suspends nothing.
 
+Bounded authority suspends itself. A scan (run by the door, by the daily summary, or by hand with `triage.js bounded-scan --tenant <tenant>`) writes `state/flags/bounded-authority-suspended-<tenant>` when an escalation or a send-back on a bounded ticket is marked `criteria-defect` (the criteria were wrong or ambiguous), or when a bug's proposal says `Escaped from: #<PR>` for a PR that delivered a bounded ticket, so that line must be exactly `#<PR number>`, `none` or `unknown`. While the flag stands the door refuses. You never remove it and you never work around it: only Cory lifts a suspension, by deleting the file, and the daily summary tells him it stands. An escalation whose frontier item carries `escalationReason: criteria-defect` is an ordinary escalation for you: propose the corrected criteria.
+
 List each bounded ready and each veto you handled in your status file.
 
 ## Boundaries
