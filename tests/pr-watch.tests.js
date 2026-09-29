@@ -7,6 +7,8 @@ const test = require('node:test');
 
 const { evaluateChecks, planRecord, runWatch, closingLinked, closingLinkage, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
 const workState = require('../bin/work-state');
+const exclusions = require('../bin/exclusions');
+const { selectFrontier } = require('../bin/assignment');
 const { CASES: CLOSING_CASES, ISSUE: CLOSING_ISSUE, REPO: CLOSING_REPO } = require('./closing-link.cases');
 
 function rootDir() {
@@ -53,8 +55,9 @@ function pr(overrides = {}) {
 function view(overrides = {}) {
   return { number: 77, state: 'OPEN', isDraft: false, mergedAt: null, headRefOid: 'abc123', statusCheckRollup: [], closingIssuesReferences: [], body: '', ...overrides };
 }
-function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false } = {}) {
+function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false, issueState = 'OPEN', failIssue = false } = {}) {
   return {
+    issueState: () => { if (failIssue) throw new Error('boom: issue view down'); return issueState; },
     listOpenPrs: () => { if (failList) throw new Error('boom: api down'); return JSON.parse(JSON.stringify(open)); },
     viewPr: () => { if (failView) throw new Error('boom: view down'); return JSON.parse(JSON.stringify(viewResult)); },
   };
@@ -812,4 +815,140 @@ test('#155: a view with no mergedBy records null rather than guessing a login', 
 test('#155: the gh adapter asks GitHub for mergedBy', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'bin', 'pr-watch.js'), 'utf8');
   assert.match(source, /'--json', 'number,state,isDraft,mergedAt,mergedBy,/);
+});
+
+// #203 (spec #192): a merged explained Refs excludes its issue until the issue closes.
+// The planner reads the exclusion ledger through selectFrontier, so these assert the
+// ledger rows a tick writes and what the frontier then does with the issue.
+const REFS_EXPLAINED = 'Refs #42: the migration stays with Cory';
+const MERGED_REFS = () => view({ state: 'MERGED', mergedAt: '2026-09-29T10:00:00Z', mergedBy: { login: 'cory' }, body: REFS_EXPLAINED });
+const ISSUE_42 = { number: 42, state: 'OPEN', labels: ['ready-for-agent'], createdAt: '2026-08-01T00:00:00.000Z' };
+function frontier(root) {
+  return selectFrontier({ issues: [ISSUE_42], readyLabel: 'ready-for-agent', exclusions: exclusions.activeExclusions({ root, tenant: 'endzone' }), tenant: 'endzone' });
+}
+function exclusionRows(root) { return exclusions.readExclusions(root, 'endzone'); }
+
+test('#203: observing a merged explained Refs records one fleet-owned exclusion naming the PR, released by the issue closing', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(record(root).state, 'merged');
+  const rows = exclusionRows(root);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, 'exclusion-added');
+  assert.equal(rows[0].tenant, 'endzone');
+  assert.equal(rows[0].issue, 42);
+  assert.equal(rows[0].owner, 'fleet');
+  assert.equal(rows[0].actor, 'pr-watch');
+  assert.match(rows[0].reason, /PR #77 merged/);
+  assert.match(rows[0].evidence, /gh pr view 77/);
+  assert.deepEqual(rows[0].recheck, { event: { type: 'issue-closed', issue: 42 } });
+});
+
+test('#203: the planner refuses the issue while the exclusion stands, and the issue closing releases it so a reopened issue is back on the frontier', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  const refused = frontier(root);
+  assert.deepEqual(refused.eligible, []);
+  assert.deepEqual(refused.excluded[0].reasons.map((r) => r.code), ['frontier-exclusion']);
+  assert.match(refused.excluded[0].reasons[0].detail, /PR #77 merged/);
+
+  // The issue is still open: later ticks leave the exclusion standing (and record nothing).
+  const stillOpen = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'OPEN' }));
+  assert.equal(stillOpen.ok, true);
+  assert.equal(exclusionRows(root).length, 1);
+  assert.equal(frontier(root).eligible.length, 0);
+
+  // The lead closes the issue by hand: the next tick lifts the exclusion.
+  const closed = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
+  assert.ok(closed.actions.some((a) => /lifted/.test(a) && /endzone:excl-42/.test(a)), 'the tick reports the release');
+  const rows = exclusionRows(root);
+  assert.deepEqual(rows.map((r) => r.kind), ['exclusion-added', 'exclusion-lifted']);
+  assert.equal(rows[1].actor, 'pr-watch');
+  assert.match(rows[1].evidence, /issue #42 is CLOSED/);
+  assert.equal(exclusions.projectTenant({ root, tenant: 'endzone' }).discharged[0].dischargedBy, 'lifted');
+  // Reopened: GitHub lists it as open again, and nothing stands in its way.
+  assert.deepEqual(frontier(root).eligible.map((i) => i.number), [42]);
+  // A reopen after the release is not excluded again by later ticks.
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'OPEN' }));
+  assert.equal(exclusionRows(root).length, 2);
+  assert.deepEqual(frontier(root).eligible.map((i) => i.number), [42]);
+});
+
+test('#203: a replayed observation records no second exclusion', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  const f = fetchers({ open: [], viewResult: MERGED_REFS() });
+  watch(root, f);
+  const eventCount = events(root).length;
+  for (let tick = 0; tick < 3; tick += 1) assert.deepEqual(watch(root, f).actions, [], `tick ${tick}: nothing new`);
+  assert.equal(exclusionRows(root).length, 1);
+  assert.equal(events(root).length, eventCount);
+  // Even after the release, the merge is not observed again: still one exclusion ever added.
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
+  watch(root, f);
+  assert.equal(exclusionRows(root).filter((r) => r.kind === 'exclusion-added').length, 1);
+});
+
+test('#203: a hand exclusion already standing for the issue is not doubled, and the merge still completes', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 42, reason: 'lead holds it by hand', evidence: 'e', owner: 'pl-endzone', actor: 'pl-endzone', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  const health = watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(health.ok, true);
+  assert.equal(record(root).state, 'merged');
+  assert.equal(exclusionRows(root).length, 1);
+});
+
+test('#203: a merge whose linkage is a closing keyword, a bare Refs, or nothing records no exclusion', () => {
+  for (const body of ['Closes #42', 'Refs #42', 'Just a body.']) {
+    const root = rootDir();
+    seed(root, { state: 'review' });
+    watch(root, fetchers({ open: [], viewResult: view({ state: 'MERGED', mergedAt: '2026-09-29T10:00:00Z', body }) }));
+    assert.equal(record(root).state, 'merged');
+    assert.deepEqual(exclusionRows(root), [], `body ${JSON.stringify(body)}`);
+  }
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: view({ state: 'MERGED', mergedAt: '2026-09-29T10:00:00Z', closingIssuesReferences: [{ number: 42 }], body: REFS_EXPLAINED }) }));
+  assert.deepEqual(exclusionRows(root), [], 'a native closing reference closes the issue at the merge');
+});
+
+test('#203: a merge observed from an early state or from the watcher own escalation also records the exclusion; a dry run records nothing', () => {
+  const early = rootDir();
+  seed(early, { state: 'ci-wait' });
+  watch(early, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(record(early).state, 'merged');
+  assert.equal(exclusionRows(early).length, 1);
+
+  const escalated = rootDir();
+  seed(escalated, { state: 'review' });
+  watch(escalated, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Refs #42' }) }));
+  assert.equal(record(escalated).state, 'escalated');
+  watch(escalated, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.equal(record(escalated).state, 'merged');
+  assert.equal(exclusionRows(escalated).length, 1);
+
+  const dry = rootDir();
+  seed(dry, { state: 'review' });
+  watch(dry, fetchers({ open: [], viewResult: MERGED_REFS() }), { dryRun: true });
+  assert.equal(record(dry).state, 'review');
+  assert.deepEqual(exclusionRows(dry), []);
+});
+
+test('#203: the release runs with no watched record, retains the exclusion when the issue view fails, and leaves other tenants and other exclusions alone', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 50, reason: 'hand hold', evidence: 'e', owner: 'cory', actor: 'cory', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  exclusions.addExclusion({ root, tenant: 'other', issue: 42, reason: 'other tenant', evidence: 'e', owner: 'fleet', actor: 'pr-watch', recheck: { event: { type: 'issue-closed', issue: 42 } } });
+  // Nothing is watched now (the record merged); the tick still reaches the release step.
+  const failing = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), failIssue: true }));
+  assert.equal(failing.ok, false);
+  assert.match(failing.actions.join(' '), /issue view failed, retained/);
+  assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 2, 'an unreadable issue is never read as closed');
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [50], 'only the issue-closed exclusion of this tenant was released');
+  assert.equal(exclusions.activeExclusions({ root, tenant: 'other' }).length, 1);
 });

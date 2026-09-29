@@ -12,8 +12,11 @@ const path = require('node:path');
 const { STATES, WorkStateError, readEvents, parseArgs } = require('./work-state');
 
 // A recheck event of this type is never looked up in the Fleet ledger: it means
-// "only the owner's lift releases this exclusion".
-const LIFT_ONLY_RECHECK_EVENTS = Object.freeze(['exclusion-lifted']);
+// "only a lift releases this exclusion". `exclusion-lifted` is the owner's lift.
+// #203: `issue-closed` is an event GitHub owns, not the Fleet ledger, so the fleet
+// observes it (pr-watch reads the issue each tick) and lifts the exclusion when it
+// happens; the lift is the release, and history stays in the ledger.
+const LIFT_ONLY_RECHECK_EVENTS = Object.freeze(['exclusion-lifted', 'issue-closed']);
 // Every event type the ledger can carry for a record; anything else is a typo
 // that would make an exclusion undischargeable by accident.
 const LEDGER_EVENT_TYPES = Object.freeze([

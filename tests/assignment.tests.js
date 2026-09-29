@@ -851,3 +851,18 @@ test('#154: the assignment loader refuses a tenant whose fleetIdentity is its ow
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', fleetIdentity: 'fleet-bot', ownerLogin: 'andydarknessb' }));
   assert.equal(readTenantConfig(root, 'endzone').fleetIdentity, 'fleet-bot');
 });
+
+// #203: a merged Refs PR retires its Work record, and a retired record no longer reserves
+// its issue, so without the fleet's issue-closed exclusion the planner would hand the
+// delivered work out again.
+test('#203: a retired Work record does not reserve its issue, so the issue-closed exclusion is what refuses it until the exclusion is released', () => {
+  const issues = [issue(42)];
+  const active = [{ id: 'endzone:issue-42', tenant: 'endzone', issue: 42, state: 'retired' }];
+  const exclusion = { id: 'endzone:excl-42-pr-77', tenant: 'endzone', issue: 42, reason: 'PR #77 merged with an explained Refs for #42', owner: 'fleet', evidence: 'gh pr view 77', recheck: { event: { type: 'issue-closed', issue: 42 } } };
+  const standing = selectFrontier({ issues, readyLabel: 'ready-for-agent', active, exclusions: [exclusion], tenant: 'endzone' });
+  assert.deepEqual(standing.eligible, []);
+  assert.deepEqual(standing.excluded[0].reasons.map((reason) => reason.code), ['frontier-exclusion']);
+  assert.equal(standing.excluded[0].reasons[0].owner, 'fleet');
+  const released = selectFrontier({ issues, readyLabel: 'ready-for-agent', active, exclusions: [], tenant: 'endzone' });
+  assert.deepEqual(released.eligible.map((entry) => entry.number), [42]);
+});

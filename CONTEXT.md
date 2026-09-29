@@ -319,6 +319,9 @@ exclusion is structured and names a reason, evidence pointer, owner, and
 recheck event or expiry; it lives in the tenant's exclusion ledger
 (`state/exclusions/<tenant>.jsonl`, append-only) and leaves the frontier by
 its owner's lift, its expiry, or the named Fleet event, keeping its history.
+The fleet records one itself when it observes a merged PR whose linkage is an
+explained `Refs`: owned by the fleet, its recheck event is the issue closing,
+which the watcher observes and lifts.
 GitHub labels, assignees, dependencies, and sub-issue structure take
 precedence whenever they can express the condition.
 _Avoid_: hold (a reviewed PR waiting for Cory), skip, blocked
