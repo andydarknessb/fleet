@@ -450,7 +450,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     ciGates: tenantConfig.ciGates || [], watchedChecks: tenantConfig.watchedChecks || [],
     ignoredChecks: tenantConfig.ignoredChecks || [],
   };
-  const health = { at: new Date().toISOString(), ok: true, error: null, tenant: tenantName, records: 0, ghCalls: 0, failures: 0, actions: [], dryRun };
+  const health = { at: new Date().toISOString(), ok: true, error: null, tenant: tenantName, records: 0, ghCalls: 0, failures: 0, releaseFailures: 0, actions: [], dryRun };
   const finish = () => {
     // The shadow projection runs LAST: retiring a roster-dropped IC before its
     // record was advanced would archive an in-flight PR unwatched (review F3).
@@ -578,10 +578,11 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
 // and records nothing (EXCLUSION_EXISTS); a different exclusion already standing for the
 // issue (a lead's hand exclusion) means the issue is already refused, so nothing is added.
 function recordMergedRefsExclusion({ root, tenantName, actor, exclusion, health }) {
+  const fixedId = `${tenantName}:excl-${exclusion.issue}-pr-${exclusion.prNumber}`;
   try {
     const added = exclusions.addExclusion({
       root, tenant: tenantName, issue: exclusion.issue, owner: 'fleet', actor,
-      id: `${tenantName}:excl-${exclusion.issue}-pr-${exclusion.prNumber}`,
+      id: fixedId,
       reason: `PR #${exclusion.prNumber} merged with an explained Refs for #${exclusion.issue}; the issue stays open until it closes, and its work is delivered`,
       evidence: `gh pr view ${exclusion.prNumber} (merged at ${exclusion.mergedAt})`,
       recheck: { event: { type: 'issue-closed', issue: exclusion.issue } },
@@ -589,6 +590,12 @@ function recordMergedRefsExclusion({ root, tenantName, actor, exclusion, health 
     health.actions.push(`${tenantName}:issue-${exclusion.issue}: excluded ${added.id} (PR #${exclusion.prNumber} merged with an explained Refs)`);
   } catch (error) {
     if (error.code !== 'EXCLUSION_EXISTS') throw error;
+    // The fleet's own fixed id means this is a replay: silent. Any other id is a different
+    // exclusion (a lead's hand exclusion) that already refuses the issue; say so once, since
+    // the fleet does not retry and a lapse before its issue is closed would put it back.
+    if (error.id !== fixedId) {
+      health.actions.push(`${tenantName}:issue-${exclusion.issue}: fleet exclusion for PR #${exclusion.prNumber} not recorded; ${error.id} already stands and the fleet does not retry (if it lapses before #${exclusion.issue} closes, exclude by hand)`);
+    }
   }
 }
 
@@ -610,8 +617,25 @@ function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRu
       state = String(fetchers.issueState(entry.issue) || '').toUpperCase();
       health.ghCalls += 1;
     } catch (error) {
-      health.failures += 1;
-      health.actions.push(`${entry.id}: issue view failed, retained (${String(error.message || error).slice(0, 120)})`);
+      const message = String(error.message || error);
+      if (/could not resolve to an issue/i.test(message)) {
+        // Deleted or transferred: the issue can never close here, so nothing else would
+        // ever release the exclusion. Lift it, say why, and count no failure.
+        if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${entry.issue} no longer resolves)`); continue; }
+        try {
+          exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${entry.issue} no longer resolves (gh issue view: ${message.slice(0, 120)})` });
+          health.actions.push(`${entry.id}: lifted, issue #${entry.issue} no longer resolves`);
+        } catch (liftError) {
+          if (liftError.code === 'EXCLUSION_NOT_ACTIVE') continue;
+          health.failures += 1;
+          health.actions.push(`${entry.id}: lift failed (${liftError.code || ''} ${String(liftError.message).slice(0, 120)})`);
+        }
+        continue;
+      }
+      // A transient read error retains the exclusion and is counted apart from record
+      // action failures: it is not a failed tick, and the next tick reads again.
+      health.releaseFailures += 1;
+      health.actions.push(`${entry.id}: issue view failed, retained (${message.slice(0, 120)})`);
       continue;
     }
     if (state !== 'CLOSED') continue;

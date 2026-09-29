@@ -5,9 +5,10 @@
 // the watcher. It decides among three cases for one issue:
 //
 //   closing  a closing keyword (close/fix/resolve) names the issue: the merge closes it.
-//   refs     no closing keyword, but a `Refs #n` line with an explanation (words after it
-//            on the line, or the next non-empty line): a deliberate partial PR
-//            (ic.md step 6). The shape pr-ready-check accepted before this module.
+//   refs     no closing keyword, but a `Refs #n` line with an explanation: prose after it
+//            on the line, or prose on the next non-empty line (not a heading, table row,
+//            rule, linkage line, footer or bare URL): a deliberate partial PR (ic.md
+//            step 6).
 //   none     neither.
 //
 // Code fences and code spans are stripped first, and a keyword must share its line with
@@ -40,15 +41,32 @@ function closingKeywords(body, repo = null) {
   return found;
 }
 
-// `Refs #n` (or `Ref`, as a list item too) followed by the explanation: words after it
-// on the line, or a non-empty next line. A bare `Refs #n` explains nothing.
+// Prose: two words of three letters or more, so a stray word or an issue tail is not one.
+const PROSE = /[A-Za-z]{3,}.*\s.*[A-Za-z]{3,}/;
+// What the next line may not be if it is to explain a bare `Refs #n` (Ruling on #202):
+// structure and boilerplate that merely follow it in a PR body.
+const NOT_AN_EXPLANATION = Object.freeze([
+  /^#{1,6}\s/,                                                // heading
+  /^\|/,                                                      // table row
+  /^([-*_])(\s*\1){2,}$/,                                      // horizontal rule
+  /^(?:[-*]\s*)?(?:refs?|close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?\s+(?:[\w./-]*#\d+|https:\/\/github\.com\/)/i, // another linkage line
+  /generated with \[claude code\]|claude\.com\/claude-code/i, // the Claude Code footer
+  /^\u{1F916}/u,
+  /^https?:\/\/\S+$/,                                          // a bare URL
+]);
+
+// `Refs #n` (or `Ref`, as a list item too) followed by the explanation: prose after it
+// on the line, or, failing that, prose on the first non-empty line after it (only that
+// one line is examined). A bare `Refs #n` explains nothing.
 function explainedRefs(body, issue) {
   const n = Number(issue);
   const lines = stripCode(body).split(/\r?\n/);
   const at = lines.findIndex((line) => new RegExp(`^\\s*(?:[-*]\\s*)?Refs?\\s+#${n}\\b`, 'i').test(line));
   if (at === -1) return false;
   const rest = lines[at].replace(new RegExp(`^.*?#${n}\\b`), '');
-  return /[A-Za-z]{3,}.*\s.*[A-Za-z]{3,}/.test(rest) || (lines.slice(at + 1).find((line) => line.trim()) || '').trim().length > 0;
+  if (PROSE.test(rest)) return true;
+  const next = (lines.slice(at + 1).find((line) => line.trim()) || '').trim();
+  return PROSE.test(next) && !NOT_AN_EXPLANATION.some((pattern) => pattern.test(next));
 }
 
 // The verdict for `issue`: 'closing', 'refs' or 'none'. `repo` is the tenant's

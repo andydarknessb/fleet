@@ -24,6 +24,7 @@ const CASES = Object.freeze([
   { name: 'Refs with the explanation on the next line', body: 'Refs #42\nLeaves the migration for Cory.', expect: 'refs' },
   { name: 'Refs with the explanation after blank lines and CRLF', body: 'Refs #42\r\n\r\n   \r\nWhat remains is the AC1 ruling.', expect: 'refs' },
   { name: 'Refs as a list item', body: '- Refs #42 keeps the ruling open', expect: 'refs' },
+  { name: 'Refs, a blank line, then a prose sentence', body: 'Refs #42\n\nThe migration stays with Cory until the ruling lands.', expect: 'refs' },
   { name: 'Refs is case-insensitive and may be singular or plural', body: 'ref #42 the follow-up lands in the next ticket', expect: 'refs' },
 
   { name: 'an empty body', body: '', expect: 'none' },
@@ -40,6 +41,18 @@ const CASES = Object.freeze([
   { name: 'a keyword for another issue', body: 'Closes #43', expect: 'none' },
   { name: 'a keyword into another repository', body: 'Closes other/repo#42', expect: 'none' },
   { name: 'a Refs line for another issue', body: 'Refs #43 with an explanation of what remains', expect: 'none' },
+  // The next line explains only when it is prose: not a footer, heading, table row, rule,
+  // linkage line or bare URL (fleet Ruling on #202: a bare Refs must not be rescued by
+  // whatever the body happens to say next).
+  { name: 'a bare Refs line then the Claude Code footer', body: 'Refs #42\n\n\u{1F916} Generated with [Claude Code](https://claude.com/claude-code)', expect: 'none' },
+  { name: 'a bare Refs line then a footer without the robot', body: 'Refs #42\nGenerated with [Claude Code](https://claude.com/claude-code)', expect: 'none' },
+  { name: 'a bare Refs line then a heading', body: 'Refs #42\n## What changed', expect: 'none' },
+  { name: 'a bare Refs line then a Refs line for another issue', body: 'Refs #42\nRefs #43 and the words that explain that one', expect: 'none' },
+  { name: 'a bare Refs line then a closing line for another issue', body: 'Refs #42\nCloses #43 once the rest lands', expect: 'none' },
+  { name: 'a bare Refs line then the criteria table', body: 'Refs #42\n| Criterion | Evidence |\n|---|---|', expect: 'none' },
+  { name: 'a bare Refs line then a horizontal rule', body: 'Refs #42\n---', expect: 'none' },
+  { name: 'a bare Refs line then a session URL', body: 'Refs #42\nhttps://claude.ai/code/session_x', expect: 'none' },
+  { name: 'a bare Refs line then one word', body: 'Refs #42\nLater.', expect: 'none' },
 ]);
 
 module.exports = { CASES, ISSUE, REPO };

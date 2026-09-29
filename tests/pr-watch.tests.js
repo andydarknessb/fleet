@@ -876,6 +876,26 @@ test('#203: the planner refuses the issue while the exclusion stands, and the is
   assert.deepEqual(frontier(root).eligible.map((i) => i.number), [42]);
 });
 
+test('#203: a replay of the merge (the exclusion already written by a partial earlier tick, or already released) records no second exclusion', () => {
+  for (const lifted of [false, true]) {
+    const root = rootDir();
+    seed(root, { state: 'review' });
+    // A prior tick wrote the exclusion, then died before the merged transition committed.
+    exclusions.addExclusion({
+      root, tenant: 'endzone', issue: 42, owner: 'fleet', actor: 'pr-watch', id: 'endzone:excl-42-pr-77',
+      reason: 'PR #77 merged with an explained Refs for #42', evidence: 'gh pr view 77',
+      recheck: { event: { type: 'issue-closed', issue: 42 } },
+    });
+    if (lifted) exclusions.liftExclusion({ root, tenant: 'endzone', id: 'endzone:excl-42-pr-77', actor: 'pr-watch', evidence: 'issue #42 is CLOSED' });
+    assert.equal(record(root).state, 'review', 'the record is still watched');
+    const health = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'OPEN' }));
+    assert.equal(health.ok, true);
+    assert.equal(record(root).state, 'merged');
+    assert.equal(exclusionRows(root).filter((r) => r.kind === 'exclusion-added').length, 1, `lifted=${lifted}: exactly one exclusion-added row`);
+    assert.doesNotMatch(health.actions.join(' '), /not recorded/, 'a replay of the fleet own id is silent');
+  }
+});
+
 test('#203: a replayed observation records no second exclusion', () => {
   const root = rootDir();
   seed(root, { state: 'review' });
@@ -889,6 +909,15 @@ test('#203: a replayed observation records no second exclusion', () => {
   watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
   watch(root, f);
   assert.equal(exclusionRows(root).filter((r) => r.kind === 'exclusion-added').length, 1);
+});
+
+test('#203: a different exclusion already standing says so in the health actions: the fleet records none and does not retry', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 42, reason: 'lead holds it by hand', evidence: 'e', owner: 'pl-endzone', actor: 'pl-endzone', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  const health = watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  assert.ok(health.actions.includes('endzone:issue-42: fleet exclusion for PR #77 not recorded; endzone:excl-42-1 already stands and the fleet does not retry (if it lapses before #42 closes, exclude by hand)'), health.actions.join(' | '));
+  assert.equal(exclusionRows(root).length, 1);
 });
 
 test('#203: a hand exclusion already standing for the issue is not doubled, and the merge still completes', () => {
@@ -945,10 +974,30 @@ test('#203: the release runs with no watched record, retains the exclusion when 
   exclusions.addExclusion({ root, tenant: 'other', issue: 42, reason: 'other tenant', evidence: 'e', owner: 'fleet', actor: 'pr-watch', recheck: { event: { type: 'issue-closed', issue: 42 } } });
   // Nothing is watched now (the record merged); the tick still reaches the release step.
   const failing = watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), failIssue: true }));
-  assert.equal(failing.ok, false);
+  assert.equal(failing.ok, true, 'a transient release read is not a record-action failure');
+  assert.equal(failing.failures, 0);
+  assert.equal(failing.releaseFailures, 1);
   assert.match(failing.actions.join(' '), /issue view failed, retained/);
   assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 2, 'an unreadable issue is never read as closed');
   watch(root, fetchers({ open: [], viewResult: MERGED_REFS(), issueState: 'CLOSED' }));
   assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [50], 'only the issue-closed exclusion of this tenant was released');
   assert.equal(exclusions.activeExclusions({ root, tenant: 'other' }).length, 1);
+});
+
+test('#203: an issue that no longer resolves (deleted or transferred) releases its exclusion with that as the evidence, and counts no failure', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [], viewResult: MERGED_REFS() }));
+  const gone = fetchers({ open: [], viewResult: MERGED_REFS() });
+  gone.issueState = () => { throw new Error('GraphQL: Could not resolve to an issue or pull request with the number of 42. (repository.issue)'); };
+  const health = watch(root, gone);
+  assert.equal(health.ok, true);
+  assert.equal(health.failures, 0);
+  assert.equal(health.releaseFailures, 0);
+  assert.match(health.actions.join(' '), /endzone:excl-42-pr-77: lifted, issue #42 no longer resolves/);
+  const lift = exclusionRows(root).pop();
+  assert.equal(lift.kind, 'exclusion-lifted');
+  assert.match(lift.evidence, /^issue #42 no longer resolves \(gh issue view: .*Could not resolve to an issue/);
+  assert.ok(lift.evidence.length < 250);
+  assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 0);
 });
