@@ -1737,6 +1737,14 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     $dm4 = Run-Watchdog
     Assert-True ($dm4.deadMan.configured -eq $false -and $null -eq $dm4.deadMan.ok) 'an absent deadman.url must be recorded, not thrown'
     Assert-True (@(Get-Content $dmLog | Where-Object { $_ }).Count -eq 3) 'no GET is attempted when unconfigured'
+    # Case DM5 (fleet #74, red-tell): with no deadman.url, state/secrets/deadman.json
+    # pingUrl (where Cory wrote it) is pinged instead.
+    [IO.Directory]::CreateDirectory("$testRoot\state\secrets") | Out-Null
+    Write-Utf8 "$testRoot\state\secrets\deadman.json" (@{ provider = 'healthchecks.io'; pingUrl = $dmMock.Prefix } | ConvertTo-Json -Compress)
+    $dm5 = Run-Watchdog
+    Remove-Item "$testRoot\state\secrets\deadman.json"
+    Assert-True ($dm5.deadMan.configured -eq $true -and $dm5.deadMan.ok -eq $true) "state/secrets/deadman.json pingUrl must be pinged when deadman.url is absent (got $($dm5.deadMan | ConvertTo-Json -Compress))"
+    Assert-True (@(Get-Content $dmLog | Where-Object { $_ }).Count -eq 4) 'the secrets-file URL gets exactly one GET'
     Write-Utf8 "$testRoot\state\pages\deadman.url" $dmMock.Prefix
   } finally {
     if ($dmMock -and $dmMock.Job) { Stop-Job $dmMock.Job -ErrorAction SilentlyContinue; Remove-Job $dmMock.Job -Force -ErrorAction SilentlyContinue }

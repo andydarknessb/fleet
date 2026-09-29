@@ -72,6 +72,17 @@ test('frontier ordering and exclusion evidence are deterministic', () => {
   assert.ok(excluded.get(10).includes('frontier-exclusion'));
 });
 
+test('a haiku-rehearsal issue is off the live frontier even when it carries the ready label (fleet #182)', () => {
+  const issues = [issue(11, { labels: ['ready-for-agent', 'haiku-rehearsal'] }), issue(12)];
+  const live = selectFrontier({ issues, readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(live.eligible.map((entry) => entry.number), [12]);
+  const reasons = live.excluded.find((entry) => entry.issue === 11).reasons.map((reason) => reason.code);
+  assert.deepEqual(reasons, ['haiku-rehearsal']);
+  // A scratch root whose tenant readyLabel is haiku-rehearsal is the rehearsal's own planner: it must still offer the issue.
+  const scratch = selectFrontier({ issues, readyLabel: 'haiku-rehearsal', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(scratch.eligible.map((entry) => entry.number), [11]);
+});
+
 test('reservation attempts cannot claim the same component', () => {
   const root = rootDir();
   reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, reservations: { components: ['src/shared'] }, idempotencyKey: 'reserve-0', now: '2026-09-01T00:00:00.000Z' });
@@ -551,8 +562,8 @@ test('assign pins the permission profile: haiku only under allowlist, sonnet und
   for (const [number, extra, label] of [[81, { model: 'haiku' }, 'no flag'], [82, { model: 'haiku', permissions: 'auto' }, '--permissions auto']]) {
     assert.throws(
       () => reserve(number, extra),
-      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message),
-      `haiku with ${label} is refused with the fleet #28 cause`,
+      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message) && /--permissions allowlist/.test(error.message),
+      `haiku with ${label} is refused with the fleet #28 cause and the flag to pass`,
     );
   }
 
