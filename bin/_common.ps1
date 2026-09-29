@@ -28,7 +28,8 @@ function Test-CapExempt { param([string]$Name) foreach ($p in (Get-CapExemptPref
 # with retry/expire so Pushover keeps re-alerting until acknowledged, high -> 1,
 # normal -> 0). The Windows toast stays as the on-host echo (-NoToast for tests);
 # Pushover and the audit line in state/pages/pages.jsonl are the channels that always
-# run. Credentials live in state/pages/pushover.json (state/ is not committed, so the
+# run. Credentials live in state/pages/pushover.json, else state/secrets/pushover.json
+# (Get-FleetPushoverCredsPath, fleet #74; state/ is not committed, so the
 # token never lands in git) and Cory has not necessarily written that file yet: an
 # unconfigured channel is a recorded result, never a throw - a condition-detecting run
 # must not crash because Cory hasn't wired his phone up. FLEET_PUSHOVER_URL overrides
@@ -75,13 +76,20 @@ function Get-FleetPushoverCredsPath {
   return $pagesPath
 }
 # Returns the dead-man ping URL, or '' when neither file names one. Throws only
-# when a present file cannot be read; the caller records that as an error.
+# when a present file cannot be read; the caller records that as an error. An
+# empty deadman.url falls through to the secrets file. The parse error is replaced
+# with a fixed message: PowerShell 5.1 quotes the bad text, which holds the URL,
+# and the caller writes the error to the shadow line and last-run.json.
 function Get-FleetDeadManUrl {
   $urlPath = "$FleetHome\state\pages\deadman.url"
-  if (Test-Path $urlPath) { return "$(Get-Content $urlPath -Raw -Encoding UTF8)".Trim() }
+  if (Test-Path $urlPath) {
+    $url = "$(Get-Content $urlPath -Raw -Encoding UTF8)".Trim()
+    if ($url) { return $url }
+  }
   $jsonPath = "$FleetHome\state\secrets\deadman.json"
   if (Test-Path $jsonPath) {
-    $config = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $config = $null
+    try { $config = Get-Content $jsonPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { throw 'state/secrets/deadman.json is not valid JSON' }
     if ($config -and $config.PSObject.Properties['pingUrl']) { return "$($config.pingUrl)".Trim() }
   }
   return ''

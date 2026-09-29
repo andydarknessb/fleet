@@ -1232,7 +1232,8 @@ try {
   # silence forever (no POST, no toast beyond the log-only page-gave-up line, no
   # fleet-dead repeat) even once Cory fixed it. A given-up entry is eligible
   # again after pages.retryAfterMinutes (default 60), or immediately once
-  # state/pages/pushover.json is newer than gaveUpAt (Cory just fixed it).
+  # the creds file in use (Get-FleetPushoverCredsPath: state/pages, else
+  # state/secrets) is newer than gaveUpAt (Cory just fixed it).
   $pageMaxAttempts = 3
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['maxAttempts'] -and $pagesConfig.maxAttempts) { $pageMaxAttempts = [int]$pagesConfig.maxAttempts }
   $pageRetryAfterMinutes = 60
