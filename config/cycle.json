@@ -7,6 +7,7 @@
     "ic": 35000,
     "principal": 30000
   },
+  "meterChange": { "date": "2026-09-30" },
   "cap": {
     "exemptNamePrefixes": ["pe-"]
   },
@@ -19,8 +20,8 @@
     "graduation": { "minProposals": 30, "minDays": 14, "minUnchangedRatio": 0.9 }
   },
   "ic": {
-    "warnTokens": 50000,
-    "escalateTokens": 350000
+    "warnTokens": 25000,
+    "escalateTokens": 175000
   },
   "frontierWake": {
     "cooldownMinutes": 60,
@@ -28,6 +29,7 @@
   },
   "budgets": {
     "baselineControlPlaneFreshPerCompletedUnit": 201505,
+    "baselineControlPlaneVoid": true,
     "controlPlaneFreshReduction": 0.7,
     "projectLeadFreshPerMergedPr": 25000,
     "icJobTokensMedianReference": 60000,
@@ -54,8 +56,8 @@
   },
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },
-    "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 250000 },
-    "principal": { "maxAgeHours": 24, "maxJobTokens": 250000 }
+    "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 125000 },
+    "principal": { "maxAgeHours": 24, "maxJobTokens": 125000 }
   },
   "watchdog": {
     "staleMinutes": 45,

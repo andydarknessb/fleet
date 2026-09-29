@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
+const { createUsageReader } = require('./transcript-usage');
 
 // The Principal (ADR 0011) is control plane: it routes tickets and proposes rulings, never implements a unit.
 const CONTROL_PLANE_ROLES = new Set(['dispatcher', 'project-lead', 'sentinel', 'notifier', 'principal']);
@@ -143,12 +144,8 @@ function parseTranscript(contents, sourcePath) {
   const turns = [];
   const toolResults = new Map();
   const searchParts = [];
-  const usage = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheCreationInputTokens: 0,
-    cacheReadInputTokens: 0,
-  };
+  // #201: one usage per model response id (the shared reader), not one per row.
+  const usageReader = createUsageReader();
 
   for (const row of rows) {
     sessionId = sessionId || row.sessionId || row.session_id || null;
@@ -198,10 +195,7 @@ function parseTranscript(contents, sourcePath) {
     const outputTokens = asNumber(rowUsage.output_tokens);
     const cacheCreationInputTokens = asNumber(rowUsage.cache_creation_input_tokens);
     const cacheReadInputTokens = asNumber(rowUsage.cache_read_input_tokens);
-    usage.inputTokens += inputTokens;
-    usage.outputTokens += outputTokens;
-    usage.cacheCreationInputTokens += cacheCreationInputTokens;
-    usage.cacheReadInputTokens += cacheReadInputTokens;
+    usageReader.add(row);
     const content = row.message.content || [];
     const text = textFromContent(content);
     const toolCalls = toolCallsFromContent(content).map((tool) => ({
@@ -222,6 +216,7 @@ function parseTranscript(contents, sourcePath) {
     });
   }
 
+  const { usageResponses, usageRowsWithoutId, ...usage } = usageReader.totals();
   const allText = searchParts.filter(Boolean).join('\n');
   const nameIssue = String(name || '').match(/(?:^|\b)ic-(\d+)(?:\b|$)/i);
   const branchIssue = allText.match(/\bfleet\/(\d+)-/i);
@@ -260,6 +255,8 @@ function parseTranscript(contents, sourcePath) {
     assistantMessages,
     userMessages,
     usage,
+    usageResponses,
+    usageRowsWithoutId,
     firstUsefulTurnCacheCreationInputTokens: firstUsefulTurn?.usage.cacheCreationInputTokens || 0,
     turns: classifiedTurns,
     pullRequests: [...pullRequests].sort((a, b) => a - b),
@@ -312,6 +309,8 @@ function subagentFigures(agent) {
     cacheReadInputTokens: asNumber(usage.cacheReadInputTokens),
     jobTokens: asNumber(usage.inputTokens) + asNumber(usage.outputTokens),
     freshTokens: asNumber(usage.inputTokens) + asNumber(usage.outputTokens) + asNumber(usage.cacheCreationInputTokens),
+    usageResponses: asNumber(agent.usageResponses),
+    usageRowsWithoutId: asNumber(agent.usageRowsWithoutId),
   };
 }
 
@@ -361,6 +360,9 @@ function metricsForTranscript(transcript) {
     riskReviewerFreshTokens: risk.reduce((total, agent) => total + agent.freshTokens, 0),
     subagentsByType,
     subagentsWithoutMeta: agents.filter((agent) => !agent.hasMeta).map((agent) => ({ session: transcript.sessionId, agentId: agent.agentId, transcript: agent.sourcePath })),
+    // #201: model responses counted (one per response id) and the rows that carried no id.
+    usageResponses: asNumber(transcript.usageResponses) + agentSum('usageResponses'),
+    usageRowsWithoutId: asNumber(transcript.usageRowsWithoutId) + agentSum('usageRowsWithoutId'),
     firstUsefulTurnCacheCreationInputTokens: transcript.firstUsefulTurnCacheCreationInputTokens || 0,
     assistantMessages: transcript.assistantMessages,
     userMessages: transcript.userMessages,
@@ -649,10 +651,13 @@ function unitMetrics(units, roles, budgets) {
   const verdict = (value, limit, kind) => (value === null || limit === undefined || limit === null ? null : (kind === 'max' ? value <= limit : value < limit));
   const baseline = Number(b.baselineControlPlaneFreshPerCompletedUnit);
   const reductionTarget = Number(b.controlPlaneFreshReduction);
-  const reduction = Number.isFinite(baseline) && baseline > 0 && metrics.controlPlaneFreshPerCompletedUnit !== null ? 1 - metrics.controlPlaneFreshPerCompletedUnit / baseline : null;
+  // #201: the baseline was measured on the double-counted meter (and, before WS5 of the 09-17
+  // audit, undercounted control-plane sessions), so it is void: no reduction, no verdict.
+  const baselineVoid = b.baselineControlPlaneVoid === true;
+  const reduction = !baselineVoid && Number.isFinite(baseline) && baseline > 0 && metrics.controlPlaneFreshPerCompletedUnit !== null ? 1 - metrics.controlPlaneFreshPerCompletedUnit / baseline : null;
   metrics.controlPlaneFreshReductionVsBaseline = reduction === null ? null : Math.round(reduction * 1000) / 1000;
   metrics.budgets = {
-    controlPlaneFreshReduction: { target: Number.isFinite(reductionTarget) ? reductionTarget : null, actual: metrics.controlPlaneFreshReductionVsBaseline, pass: reduction === null || !Number.isFinite(reductionTarget) ? null : reduction >= reductionTarget },
+    controlPlaneFreshReduction: { target: Number.isFinite(reductionTarget) ? reductionTarget : null, actual: metrics.controlPlaneFreshReductionVsBaseline, void: baselineVoid, pass: reduction === null || !Number.isFinite(reductionTarget) ? null : reduction >= reductionTarget },
     projectLeadFreshPerMergedPr: { limit: b.projectLeadFreshPerMergedPr ?? null, actual: metrics.projectLeadFreshPerMergedPr, pass: verdict(metrics.projectLeadFreshPerMergedPr, b.projectLeadFreshPerMergedPr, 'lt') },
     icJobTokensMedian: { reference, actual: metrics.icJobTokensMedian, pass: null, judged: false },
   };
@@ -706,6 +711,8 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
     controlPlaneFreshTokens: sum(controlPlaneSessions, (session) => session.metrics.freshTokens),
     controlPlaneCacheReadTokens: sum(controlPlaneSessions, (session) => session.metrics.cacheReadInputTokens),
     icFreshTokens: sum(units, (record) => record.role === 'ic' || record.session?.startsWith('ic-') ? record.metrics.freshTokens : 0),
+    usageResponses: observedSum((metric) => metric.usageResponses),
+    usageRowsWithoutId: observedSum((metric) => metric.usageRowsWithoutId),
     assistantMessages: observedSum((metric) => metric.assistantMessages),
     userMessages: observedSum((metric) => metric.userMessages),
     toolCalls: observedSum((metric) => metric.toolCalls),
@@ -734,6 +741,7 @@ function buildReport(records, excluded, { generatedAt, since, until, sessionMetr
     period: { since: since || null, until: until || null },
     metricDefinitions: {
       freshTokens: 'input + output + cache-creation tokens; cache-read tokens are excluded',
+      usageResponses: 'model responses whose usage was counted, one per response id however many transcript rows repeat it (#201); a row with no id counts as one response and is also counted in usageRowsWithoutId',
       jobTokens: 'input + output tokens only, the session plus every subagent it hosted (#126); ownJobTokens is the session alone; cache fields are reported separately',
       controlPlaneFreshTokens: 'fresh tokens from Dispatcher, project-lead, Principal, Sentinel, and notifier sessions, live and rotated out (#125)',
       controlPlaneFreshPerCompletedUnit: 'control-plane fresh tokens divided by completed units in the window',
@@ -802,6 +810,8 @@ function renderSummary(report) {
     `control-plane fresh tokens: ${report.metrics.controlPlaneFreshTokens}`,
     `control-plane cache-read tokens: ${report.metrics.controlPlaneCacheReadTokens}`,
     `IC fresh tokens: ${report.metrics.icFreshTokens}`,
+    `model responses counted: ${report.metrics.usageResponses ?? 0} (each once, however many rows repeat it)`,
+    `usage rows with no response id (counted as rows): ${report.metrics.usageRowsWithoutId ?? 0}`,
     `polling-only model turns: ${report.metrics.pollingOnlyModelTurns}`,
     `forced-continuation turns: ${report.metrics.forcedContinuationTurns}`,
     `formal review passes: ${report.metrics.formalReviewPasses}`,
@@ -818,7 +828,9 @@ function renderSummary(report) {
   const show = (v) => (v === null || v === undefined ? 'n/a' : v);
   const pct = (v) => (v === null || v === undefined ? 'n/a' : `${Math.floor(v * 1000) / 10}%`);
   const mark = (p) => (p === null || p === undefined ? '' : (p ? ' PASS' : ' FAIL'));
-  lines.push(`control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (reduction vs baseline ${pct(u.controlPlaneFreshReductionVsBaseline)}, target ${pct(b.controlPlaneFreshReduction?.target)})${mark(b.controlPlaneFreshReduction?.pass)}`);
+  lines.push(b.controlPlaneFreshReduction?.void
+    ? `control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (baseline void: it was measured on double-counted tokens, so no reduction is judged until the 10-19 re-baseline, fleet #139)`
+    : `control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (reduction vs baseline ${pct(u.controlPlaneFreshReductionVsBaseline)}, target ${pct(b.controlPlaneFreshReduction?.target)})${mark(b.controlPlaneFreshReduction?.pass)}`);
   lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (limit ${show(b.projectLeadFreshPerMergedPr?.limit)}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
   lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; reference ${show(u.budgets?.icJobTokensMedian?.reference)}, not a verdict)`);
   const icFamilies = Object.entries(u.icByModel || {});
@@ -899,6 +911,8 @@ function readSubagents(sessionFile) {
       model: meta?.model || parsed.model || null,
       hasMeta: Boolean(meta),
       usage: parsed.usage,
+      usageResponses: parsed.usageResponses,
+      usageRowsWithoutId: parsed.usageRowsWithoutId,
       sourcePath: file,
     });
   }

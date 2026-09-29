@@ -822,3 +822,99 @@ test('#125 review: a unit whose earlier session retired before the window still 
   assert.equal(result.dailyReport.units[0].sessions, 2);
   assert.equal(result.dailyReport.units[0].metrics.jobTokens, 880);
 });
+
+// --- #201 (spec #191): count each model response once ---------------------------------
+// Claude Code writes one row per content block of a single model response (thinking, text,
+// tool_use), each repeating the response's usage and its `message.id`. Seen in a real
+// transcript: 671 assistant rows for 218 ids, every id's rows carrying identical usage in a
+// main-session transcript. In a subagent transcript a streamed response's earlier rows can
+// carry a smaller output_tokens (input and cache fields identical), the last row the final.
+function withMessageId(row, id) {
+  return { ...row, message: { ...row.message, id } };
+}
+
+function tripledResponseTranscript() {
+  const a = { input: 10, output: 5, creation: 100, read: 50 };
+  const b = { input: 20, output: 7, creation: 0, read: 60 };
+  return [
+    { type: 'custom-title', customTitle: 'dispatcher', sessionId: 'session-1' },
+    { type: 'agent-setting', agentSetting: 'dispatcher', sessionId: 'session-1' },
+    withMessageId(assistant({ uuid: 'a1', timestamp: '2026-09-01T00:00:00.000Z', content: [{ type: 'thinking', thinking: 'hm' }], usage: a }), 'msg_A'),
+    withMessageId(assistant({ uuid: 'a2', timestamp: '2026-09-01T00:00:00.100Z', content: [{ type: 'text', text: 'Looking.' }], usage: a }), 'msg_A'),
+    withMessageId(assistant({ uuid: 'a3', timestamp: '2026-09-01T00:00:00.200Z', content: [toolUse('t1', 'git status')], usage: a }), 'msg_A'),
+    withMessageId(assistant({ uuid: 'b1', timestamp: '2026-09-01T00:00:01.000Z', content: [{ type: 'text', text: 'Done.' }], usage: b }), 'msg_B'),
+  ].map(line).join('\n');
+}
+
+test('#201: one response written as three rows plus a second response counts exactly two responses in the collector output', () => {
+  const parsed = parseTranscript(tripledResponseTranscript(), 'fixture/session-1.jsonl');
+  assert.equal(parsed.usage.inputTokens, 30);
+  assert.equal(parsed.usage.outputTokens, 12);
+  assert.equal(parsed.usage.cacheCreationInputTokens, 100);
+  assert.equal(parsed.usage.cacheReadInputTokens, 110);
+  assert.equal(parsed.usageResponses, 2);
+  assert.equal(parsed.usageRowsWithoutId, 0);
+
+  const cycles = buildCycleRecords({
+    roster: { sessions: [] },
+    transcripts: [parsed],
+  });
+  const report = buildReport(cycles.records, cycles.excluded, { generatedAt: '2026-09-01T12:00:00.000Z', since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', sessionMetrics: cycles.sessionMetrics });
+  assert.equal(report.metrics.jobTokens, 42);
+  assert.equal(report.metrics.freshTokens, 142);
+  assert.equal(report.metrics.cacheReadTokens, 110);
+  assert.equal(report.metrics.usageResponses, 2);
+  assert.equal(report.metrics.usageRowsWithoutId, 0);
+});
+
+test('#201: a repeated response whose output grew while streaming counts once at its final usage', () => {
+  const rows = [
+    withMessageId(assistant({ uuid: 's1', timestamp: '2026-09-01T00:00:00.000Z', content: [{ type: 'text', text: 'a' }], usage: { input: 2, output: 3, creation: 3901, read: 49031 } }), 'msg_S'),
+    withMessageId(assistant({ uuid: 's2', timestamp: '2026-09-01T00:00:00.100Z', content: [{ type: 'text', text: 'b' }], usage: { input: 2, output: 600, creation: 3901, read: 49031 } }), 'msg_S'),
+  ].map(line).join('\n');
+  const parsed = parseTranscript(rows, 'fixture/agent-s.jsonl');
+  assert.equal(parsed.usage.outputTokens, 600);
+  assert.equal(parsed.usage.inputTokens, 2);
+  assert.equal(parsed.usage.cacheCreationInputTokens, 3901);
+  assert.equal(parsed.usageResponses, 1);
+});
+
+test('#201: rows with no response id are counted as before and flagged in the output', () => {
+  const rows = [
+    withMessageId(assistant({ uuid: 'k1', timestamp: '2026-09-01T00:00:00.000Z', content: [{ type: 'text', text: 'keyed' }], usage: { input: 10, output: 5 } }), 'msg_K'),
+    withMessageId(assistant({ uuid: 'k2', timestamp: '2026-09-01T00:00:00.100Z', content: [{ type: 'text', text: 'keyed' }], usage: { input: 10, output: 5 } }), 'msg_K'),
+    assistant({ uuid: 'n1', timestamp: '2026-09-01T00:00:01.000Z', content: [{ type: 'text', text: 'no id' }], usage: { input: 7, output: 1 } }),
+    assistant({ uuid: 'n2', timestamp: '2026-09-01T00:00:02.000Z', content: [{ type: 'text', text: 'no id' }], usage: { input: 7, output: 1 } }),
+  ].map(line).join('\n');
+  const parsed = parseTranscript(rows, 'fixture/noid.jsonl');
+  assert.equal(parsed.usage.inputTokens, 24);
+  assert.equal(parsed.usage.outputTokens, 7);
+  assert.equal(parsed.usageRowsWithoutId, 2);
+  assert.equal(parsed.usageResponses, 3);
+  const cycles = buildCycleRecords({ roster: { sessions: [] }, transcripts: [parsed] });
+  const report = buildReport(cycles.records, cycles.excluded, { generatedAt: '2026-09-01T12:00:00.000Z', sessionMetrics: [{ role: 'dispatcher', metrics: { usageRowsWithoutId: 2, toolCallsByCommandClass: {} } }] });
+  assert.equal(report.metrics.usageRowsWithoutId, 2);
+  assert.match(renderSummary(report), /usage rows with no response id \(counted as rows\): 2/);
+});
+
+test('#201: a void control-plane baseline reports no verdict, PASS or FAIL, against it', () => {
+  const unitOf = (issue) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: 100000, jobTokens: 40000, cacheReadInputTokens: 0 } });
+  const sessions = [{ sessionId: 'd', name: 'dispatcher', role: 'dispatcher', metrics: { freshTokens: 900000, cacheReadInputTokens: 5 } }];
+  const budgets = { baselineControlPlaneFreshPerCompletedUnit: 200000, controlPlaneFreshReduction: 0.7 };
+  const live = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets });
+  assert.equal(live.unitMetrics.budgets.controlPlaneFreshReduction.pass, false, 'control: without the void flag the same data fails');
+  const report = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets: { ...budgets, baselineControlPlaneVoid: true } });
+  const verdict = report.unitMetrics.budgets.controlPlaneFreshReduction;
+  assert.equal(verdict.void, true);
+  assert.equal(verdict.pass, null);
+  assert.equal(report.unitMetrics.controlPlaneFreshReductionVsBaseline, null);
+  const line = renderSummary(report).split('\n').find((l) => l.startsWith('control-plane fresh per completed unit'));
+  assert.match(line, /baseline void/);
+  assert.doesNotMatch(line, /PASS|FAIL/);
+});
+
+test('#201: the shipped config voids the control-plane baseline and dates the meter change', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  assert.equal(shipped.budgets.baselineControlPlaneVoid, true);
+  assert.equal(shipped.meterChange.date, '2026-09-30');
+});

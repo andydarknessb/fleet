@@ -29,6 +29,7 @@ const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
 const { inWeek, previousWeek } = require('./report-week');
 const { readHistory, reviewFinding, stateAfter } = require('./verify-events');
+const { meterChange } = require('./transcript-usage');
 
 class WeeklyScorecardError extends Error {
   constructor(code, message, details = {}) {
@@ -392,6 +393,8 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     schemaVersion: 1,
     generatedAt: at,
     week,
+    // #201: figures before this date count each model response once per transcript row.
+    meterChange: meterChange(readJson(path.join(base, 'config', 'cycle.json'), {})),
     rows,
     verifyHistory: verifyWeek(base, week),
     mergesBy: mergesBy(base, mergedUnits(events, week)),
@@ -435,6 +438,7 @@ function renderScorecard(card) {
     ...(card.mergesBy ? [mergesByLine(card.mergesBy), ''] : []),
     '## IC cost (two measures)',
     '',
+    ...(card.meterChange ? [card.meterChange.note, ''] : []),
     ...icCostLines(card.rows.find((row) => row.key === 'icCost')),
     '',
     `Headline: ${headlineOf(card)}`,
