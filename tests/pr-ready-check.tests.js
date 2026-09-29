@@ -14,6 +14,8 @@ const {
   checkPullRequest, closingDefects, criteriaDefects, acceptanceCriteria, removedIdentifiers, cli, PrReadyCheckError,
 } = require('../bin/pr-ready-check');
 
+const { CASES: CLOSING_CASES, ISSUE: CLOSING_ISSUE, REPO: CLOSING_REPO } = require('./closing-link.cases');
+
 const BIN = path.join(__dirname, '..', 'bin', 'pr-ready-check.js');
 
 const ISSUE = [
@@ -130,6 +132,17 @@ test('#119: closing keywords: Closes #12 for issue 11 is a defect; one Closes #1
   assert.equal(closingDefects('Closes #11 and closes #13', 11).length, 1);
   assert.match(closingDefects('Just a body.', 11)[0].detail, /no closing keyword/);
 });
+
+// #202: the shared parser cases (tests/closing-link.cases.js), the same table
+// pr-watch.tests.js runs: a body the watcher reads as closing or an explained Refs is
+// clean here, and a body the watcher would escalate is a defect here.
+for (const c of CLOSING_CASES) {
+  test(`#202 shared closing-link case: ${c.name} is ${c.expect}`, () => {
+    const defects = closingDefects(c.body, CLOSING_ISSUE, CLOSING_REPO);
+    if (c.expect === 'none') assert.ok(defects.length > 0, 'the watcher would escalate this body, so the pre-ready check must refuse it');
+    else assert.deepEqual(defects, []);
+  });
+}
 
 test('#119: the criteria table needs one row per acceptance criterion, and evidence in every row', () => {
   assert.deepEqual(acceptanceCriteria(ISSUE), ['`fooBaz` replaces `fooBar` everywhere', 'the README names the new helper']);

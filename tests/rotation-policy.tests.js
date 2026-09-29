@@ -142,7 +142,7 @@ test('a partial config entry keeps the spec fallbacks for unnamed thresholds', (
   const merged = policy.rotationConfig(root);
   assert.equal(merged['project-lead'].maxAgeHours, 48);
   assert.equal(merged['project-lead'].maxMerges, 5);
-  assert.equal(merged['project-lead'].maxJobTokens, 250000);
+  assert.equal(merged['project-lead'].maxJobTokens, 125000);
   assert.equal(merged.dispatcher.maxAgeHours, 24);
 });
 
@@ -237,4 +237,50 @@ test('cli: a correct invocation still works for both commands', async () => {
   const offsetViaCli = await policy.cli(['offset', '--root', root, '--now', NOW]);
   const offsetDirect = policy.captureOffset({ root, now: NOW });
   assert.deepEqual(offsetViaCli, offsetDirect);
+});
+
+// --- #201 (spec #191): count each model response once ---------------------------------
+function tripledResponseRows() {
+  const usage = { input_tokens: 40000, output_tokens: 20000, cache_read_input_tokens: 999999 };
+  const row = (id, u) => ({ type: 'assistant', message: { id, usage: u } });
+  return [
+    row('msg_A', usage), row('msg_A', usage), row('msg_A', usage),
+    row('msg_B', { input_tokens: 30000, output_tokens: 10000 }),
+  ];
+}
+
+test('#201: one response written as three rows plus a second response sums exactly two responses', async () => {
+  const root = rootDir();
+  const file = write(root, 'claude-home/projects/p/sess.jsonl', tripledResponseRows().map((r) => JSON.stringify(r)).join('\n'));
+  const totals = await policy.sumTranscriptTokens(file);
+  assert.equal(totals.inputTokens, 70000);
+  assert.equal(totals.outputTokens, 30000);
+  assert.equal(totals.jobTokens, 100000);
+  assert.equal(totals.usageResponses, 2);
+  assert.equal(totals.usageRowsWithoutId, 0);
+});
+
+test('#201: rows with no response id are counted as before and flagged', async () => {
+  const root = rootDir();
+  const rows = [
+    { type: 'assistant', message: { usage: { input_tokens: 100, output_tokens: 10 } } },
+    { type: 'assistant', message: { usage: { input_tokens: 100, output_tokens: 10 } } },
+    { type: 'assistant', message: { id: 'msg_A', usage: { input_tokens: 5, output_tokens: 1 } } },
+  ];
+  const file = write(root, 'claude-home/projects/p/sess.jsonl', rows.map((r) => JSON.stringify(r)).join('\n'));
+  const totals = await policy.sumTranscriptTokens(file);
+  assert.equal(totals.jobTokens, 226);
+  assert.equal(totals.usageRowsWithoutId, 2);
+  assert.equal(totals.usageResponses, 3);
+});
+
+test('#201: the Rotation policy trips on de-duplicated tokens, not on the repeated rows', async () => {
+  const root = rootDir();
+  seedFleet(root, { launchedAt: '2026-09-02T02:00:00.000Z', sessionId: 'sess-once' });
+  writeJson(root, 'config/cycle.json', { rotation: { 'project-lead': { maxJobTokens: 125000 } } });
+  write(root, 'claude-home/projects/p/sess-once.jsonl', tripledResponseRows().map((r) => JSON.stringify(r)).join('\n'));
+  const result = await policy.evaluate({ root, claudeHome: path.join(root, 'claude-home'), now: NOW });
+  const lead = result.sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal(lead.metrics.jobTokens, 100000, 'three repeated rows are one response: 100000, not the 220000 the rows sum to');
+  assert.equal(lead.due, false);
 });

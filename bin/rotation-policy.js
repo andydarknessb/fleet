@@ -5,7 +5,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const readline = require('node:readline');
+const { readTranscriptUsage } = require('./transcript-usage');
 const workState = require('./work-state');
 
 // fleet#4: refuse an unknown command or flag rather than silently ignore it.
@@ -26,7 +26,7 @@ const ROTATION_POLICY_FLAGS = {
 // Spec fallbacks ("Outcomes and budgets"); config/cycle.json overrides.
 const DEFAULT_ROTATION = Object.freeze({
   dispatcher: { maxAgeHours: 24 },
-  'project-lead': { maxAgeHours: 24, maxMerges: 5, maxJobTokens: 250000 },
+  'project-lead': { maxAgeHours: 24, maxMerges: 5, maxJobTokens: 125000 },
 });
 
 function asRoot(root) {
@@ -114,25 +114,18 @@ function findTranscript(claudeHome, sessionId) {
   return null;
 }
 
+// #201: one usage per model response id, via the shared reader (bin/transcript-usage.js),
+// so the Rotation token boundary and the IC Budget count what the API billed.
 async function sumTranscriptTokens(file) {
-  // Streamed: a long-lived project lead's transcript runs to tens of MB.
-  const totals = { inputTokens: 0, outputTokens: 0, jobTokens: 0, usageRows: 0 };
-  const reader = readline.createInterface({ input: fs.createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
-  for await (const line of reader) {
-    if (!line.includes('"usage"')) continue;
-    let row;
-    try { row = JSON.parse(line); } catch { continue; }
-    const usage = row && row.message && row.message.usage;
-    if (!usage) continue;
-    const input = Number(usage.input_tokens) || 0;
-    const output = Number(usage.output_tokens) || 0;
-    totals.inputTokens += input;
-    totals.outputTokens += output;
-    totals.usageRows += 1;
-  }
+  const usage = await readTranscriptUsage(file);
   // Job tokens per the measured-baseline definition (measure-cycle.js): input + output.
-  totals.jobTokens = totals.inputTokens + totals.outputTokens;
-  return totals;
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    jobTokens: usage.inputTokens + usage.outputTokens,
+    usageResponses: usage.usageResponses,
+    usageRowsWithoutId: usage.usageRowsWithoutId,
+  };
 }
 
 function countMerges(events, { tenant, since }) {
@@ -196,6 +189,7 @@ async function evaluate({ root, claudeHome, now } = {}) {
         try {
           const totals = await sumTranscriptTokens(transcript);
           entry.metrics.jobTokens = totals.jobTokens;
+          entry.metrics.usageRowsWithoutId = totals.usageRowsWithoutId;
           if (totals.jobTokens >= thresholds.maxJobTokens) {
             entry.reasons.push(`job tokens ${totals.jobTokens} >= ${thresholds.maxJobTokens}`);
           }
