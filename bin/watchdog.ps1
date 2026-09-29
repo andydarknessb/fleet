@@ -282,7 +282,18 @@ try {
     # lines that session wrote itself: a hold or Ruling ask the lead raised is
     # addressed to Cory, and waking the lead for it rotates away the session
     # that asked. A line with no actor (written before #141) still counts.
-    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '')
+    # #204: a `resolution` line (a record left escalated or hold) is addressed to the
+    # session that raised the decision: `raisedBy` names it. -Recipient lead (the
+    # default) takes every line but the Principal's own (`raisedBy` starting `pe-`);
+    # -Recipient principal takes only the resolution lines its own escalations earned
+    # (the Principal has no escalation door today, its ask is the Triage proposal,
+    # ADR 0011, so that branch serves a future door).
+    # The lead skips a resolution INTO ci-wait: the PR watcher's checks-settled
+    # follows and is the actionable wake, so both would rotate the lead twice.
+    # $SelfActor drops a resolution its own session performed. $Details, when
+    # given, collects one "<record> <from> -> <to>" per counted resolution so the
+    # wake reason can name them.
+    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '', [string]$Recipient = 'lead', $Details = $null)
     $kinds = @{}
     $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
     if (-not (Test-Path $outboxPath)) { return $kinds }
@@ -294,9 +305,13 @@ try {
       if (-not $atUtc) { continue }
       if ($Since -and $atUtc -le $Since) { continue }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
-      if (@('checks-settled', 'checks-failed', 'decision-needed') -notcontains "$($o.wake)") { continue }
-      if ($SelfActor -and "$($o.wake)" -eq 'decision-needed' -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
+      if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
+      $raisedBy = ''; if ($o.PSObject.Properties['raisedBy']) { $raisedBy = "$($o.raisedBy)" }
+      if ($Recipient -eq 'principal') { if ("$($o.wake)" -ne 'resolution' -or $raisedBy -notlike 'pe-*') { continue } }
+      elseif ("$($o.wake)" -eq 'resolution' -and ($raisedBy -like 'pe-*' -or ($o.PSObject.Properties['to'] -and "$($o.to)" -eq 'ci-wait'))) { continue }
+      if ($SelfActor -and @('decision-needed', 'resolution') -contains "$($o.wake)" -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
+      if ($null -ne $Details -and "$($o.wake)" -eq 'resolution') { [void]$Details.Add("$($o.recordId) $($o.from) -> $($o.to)") }
     }
     return $kinds
   }
@@ -939,8 +954,11 @@ try {
       if ($wakeSources -contains 'outbox') {
         $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
         $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
-        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName
+        $leadResolved = New-Object System.Collections.ArrayList
+        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName -Details $leadResolved
         if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
+        # #204: the wake reason names each record that left escalated or hold, so the lead resumes from what changed.
+        foreach ($r in $leadResolved) { $wake.evidence += "resolved $r" }
       }
       if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
       # Cooldown: the same evidence within the window means the last wake did not clear it; do not loop.
@@ -1019,6 +1037,14 @@ try {
         foreach ($item in @($frontier.eligible)) { $twake.evidence += "$($item.kind) #$($item.number)" }
         $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; counts = $frontier.counts; proposeNow = @($frontier.proposeNow); consumedThrough = $frontier.consumedThrough; eligible = @($frontier.eligible | ForEach-Object { [pscustomobject]@{ kind = "$($_.kind)"; number = $_.number; reason = "$($_.reason)" } }); skipped = @($frontier.skipped); premises = $frontier.premises }
       } else { $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; error = $twake.frontierError } }
+      # #204: a record the Principal escalated that has since left escalated or hold wakes the Principal, not the lead.
+      $pResolved = New-Object System.Collections.ArrayList
+      $pLaunchedAt = $null
+      $pRosterRow = $null; if ($liveRoster) { $pRosterRow = @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $principalName -and $_.status -eq 'active' -and $_.launchedAt } | Sort-Object { ConvertTo-UtcDateTime $_.launchedAt } -Descending)[0] }
+      if ($pRosterRow) { $pLaunchedAt = ConvertTo-UtcDateTime $pRosterRow.launchedAt }
+      $pConsumed = $null; if ($triageState.tenants.PSObject.Properties[$tenantName] -and $triageState.tenants.$tenantName.PSObject.Properties['outboxConsumedThrough']) { $pConsumed = ConvertTo-UtcDateTime $triageState.tenants.$tenantName.outboxConsumedThrough }
+      $null = Get-UnconsumedWakes -TenantName $tenantName -Since $pLaunchedAt -ConsumedThrough $pConsumed -SelfActor $principalName -Recipient principal -Details $pResolved
+      foreach ($r in $pResolved) { $twake.evidence += "resolved $r" }
       if (-not $principalLive) { $twake.decision = 'shadow'; $twake.reason = 'state/flags/principal-live absent: frontier recorded, nothing launched'; $triageWakes += [pscustomobject]$twake; continue }
       if ($mode -ne 'live') { $twake.reason = "supervision mode is $mode, not live"; $triageWakes += [pscustomobject]$twake; continue }
       if ($paused) { $twake.reason = 'PAUSE set'; $triageWakes += [pscustomobject]$twake; continue }
@@ -1046,7 +1072,7 @@ try {
       $twake.outcome = if ($tRotateOut -and $tRotateOut.PSObject.Properties['outcomes']) { @($tRotateOut.outcomes | Where-Object { $_.name -eq $principalName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $tRotateRaw 200 }
       if ($tRotated) {
         $twake.decision = 'woken'
-        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest }) -Force
+        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest; outboxConsumedThrough = (Now-Iso) }) -Force
         try { $twake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: triage wake' -Body "$principalName relaunched for $tdigest" -Detail ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $twake.decision = 'deferred'; if (-not $twake.reason) { $twake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($tRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $triageWakes += [pscustomobject]$twake

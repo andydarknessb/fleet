@@ -249,7 +249,12 @@ test('a watcher escalation self-resolves when linkage appears, then settles norm
   assert.equal(record(root).state, 'ci-wait');
   watch(root, fixed);
   assert.equal(record(root).state, 'review');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'checks-settled']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'checks-settled']);
+  // #204: the watcher's own self-resolve line says it raised and resolved the decision (the lead is still woken for it).
+  const selfResolved = outbox(root).find((w) => w.wake === 'resolution');
+  assert.equal(selfResolved.raisedBy, selfResolved.actor);
+  assert.equal(selfResolved.from, 'escalated');
+  assert.equal(selfResolved.to, 'ci-wait');
 });
 
 test('close, reopen, close again escalates twice - no permanent replay wedge', () => {
@@ -263,7 +268,7 @@ test('close, reopen, close again escalates twice - no permanent replay wedge', (
   assert.equal(record(root).state, 'ci-wait');
   watch(root, closed);
   assert.equal(record(root).state, 'escalated');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'decision-needed']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'decision-needed']);
 });
 
 test('an escalation with prior_state hold resolves to merged in a single legal hop', () => {
@@ -380,7 +385,7 @@ test('fleet#44: a lead-resolved closing-linkage escalation is not re-raised whil
     if (tick > 0) assert.deepEqual(health.actions, [], `tick ${tick}: steady state is silent`);
   }
   assert.equal(record(root).github.observation.closingVerified, false, 'the observation says what the body says');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed'], 'one page, not one per tick');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution'], 'one page and one resolution wake, not one of each per tick');
 });
 
 test('fleet#44: the ruling survives a re-ready: settled gates at a new head go to review with checks-settled, never back to escalated', () => {
@@ -397,7 +402,7 @@ test('fleet#44: the ruling survives a re-ready: settled gates at a new head go t
   watch(root, rereadied);
   const rec = record(root);
   assert.equal(rec.state, 'review', 'settled gates on a ruled body reach review');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'checks-settled']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'checks-settled']);
   const settledEvent = events(root).filter((e) => e.type === 'state-review').pop();
   assert.match(String(settledEvent.evidence), /ruled deliberate by the lead/);
 });
@@ -410,9 +415,10 @@ test('fleet#44: an edited body is a new fact and escalates again; a closing keyw
   watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'See #42 for the rest' }) }));
   assert.equal(record(root).state, 'escalated', 'a different body was never ruled on');
   assert.equal(record(root).prior_state, 'review');
-  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'decision-needed']);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'decision-needed']);
   watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
   assert.equal(record(root).state, 'review', 'linkage appearing still self-resolves the watcher own escalation');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['decision-needed', 'resolution', 'decision-needed', 'resolution']);
 });
 
 test('#202: an explained Refs is deliberate: settled gates go to review with checks-settled and no escalation, and later ticks stay silent', () => {

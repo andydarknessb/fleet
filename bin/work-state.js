@@ -768,11 +768,14 @@ function abandonRecord(options = {}) {
     if (!record) {
       const abandoned = readJson(abandonFile(p, options.id))?.record;
       const replay = abandoned && replayIfKnown(abandoned, key);
-      if (replay) return replay;
+      if (replay) return pageAbandon(p, root, abandoned, key, options, abandoned.abandonment?.from, replay);
       throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
     }
     const replay = replayIfKnown(record, key);
-    if (replay) return replay;
+    if (replay) {
+      const abandoned = readJson(abandonFile(p, options.id))?.record;
+      return pageAbandon(p, root, record, key, options, abandoned?.idempotency?.[key] ? abandoned.abandonment?.from : null, replay);
+    }
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
@@ -798,8 +801,16 @@ function abandonRecord(options = {}) {
       evidence: options.evidence, changes: { from: record.state, to: 'abandoned', reason },
     });
     const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, abandonedRecord: next, event, killPoint: options.killPoint });
-    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+    return pageAbandon(p, root, record, key, options, record.state, { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord });
   });
+}
+
+// #204 (ruling): an abandon out of `escalated` or `hold` leaves a decision state, so
+// it appends the same resolution line a transition does; `to` is `abandoned`.
+function pageAbandon(p, root, record, key, options, from, result) {
+  return from && DECISION_STATES.includes(from)
+    ? { ...result, resolved: appendResolutionWake({ root, p, record, key, options, from, to: 'abandoned', result }) }
+    : result;
 }
 
 function createRecord(options = {}) {
@@ -924,11 +935,25 @@ function transitionRecord(options = {}) {
     // wake read that cache and nothing else, and a lead's escalation of a
     // PR-less record used to reach every ledger but that one. A replay repairs
     // a missing line (a crash between commit and append) and never duplicates.
-    const pageDecision = (result) => (DECISION_STATES.includes(to)
-      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
-      : result);
+    //
+    // #204 (spec #192): leaving `escalated` or `hold` is the answer to a decision, and
+    // the session that asked ended its turn idle. The same door appends one
+    // `resolution` line under `<key>:resolution` (the decision-needed line owns `key`,
+    // and escalated -> hold writes both). `from` is the record's state before the
+    // transition; a replay reads it back from the transition's own idempotency entry.
+    // A replay takes both ends from the committed `transition:from->to`, never from the caller.
+    const pageDecision = (result, from, target = to) => {
+      let out = result;
+      if (from && DECISION_STATES.includes(from)) out = { ...out, resolved: appendResolutionWake({ root, p, record, key, options, from, to: target, result }) };
+      return DECISION_STATES.includes(target)
+        ? { ...out, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
+        : out;
+    };
     const replay = replayIfKnown(record, key);
-    if (replay) return pageDecision(replay);
+    if (replay) {
+      const committed = /^transition:([a-z-]+)->([a-z-]+)$/.exec(record.idempotency[key].type || '');
+      return pageDecision(replay, committed?.[1], committed?.[2] || to);
+    }
     if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
     if (Number(options.expectedRevision) !== record.revision) {
       throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
@@ -988,7 +1013,7 @@ function transitionRecord(options = {}) {
       event,
       killPoint: options.killPoint,
     });
-    return pageDecision({ replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord });
+    return pageDecision({ replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord }, record.state);
   });
 }
 
@@ -1118,20 +1143,40 @@ function outboxHasWake(root, recordId, idempotencyKey) {
   });
 }
 
+// #204: who raised the decision a resolution answers, read from the ledger (the
+// actor of the event that entered `from`, the latest one before this transition).
+// The Watchdog routes the wake on it: a `pe-` actor is a Principal's escalation,
+// anything else is the tenant lead's. Null when the ledger cannot say; the line is
+// still written and the Watchdog delivers it to the lead.
+function decisionRaisedBy(p, recordId, from, beforeSequence) {
+  try {
+    const entering = eventLines(p)
+      .filter((event) => event.recordId === recordId && event.type === `state-${from}` && event.sequence < beforeSequence)
+      .sort((a, b) => b.sequence - a.sequence)[0];
+    return entering && entering.actor && entering.actor !== 'unknown' ? String(entering.actor) : null;
+  } catch { return null; }
+}
+
+// The resolution line for a record leaving a decision state, by transition or by
+// abandon (#204): keyed `<key>:resolution`, so a replay repairs it and never doubles it.
+function appendResolutionWake({ root, p, record, key, options, from, to, result }) {
+  return appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
+}
+
 // Idempotent by (recordId, idempotencyKey): the door that commits a decision
 // transition writes the line, so a caller that also writes one (the watcher,
 // for its observe wakes) finds it and appends nothing. Returns whether a line
 // was written, which is the caller's cue to launch the page. `actor` is the
 // writer's provenance (fleet#141): the watchdog's frontier wake does not wake a
 // lead for a decision-needed line that lead wrote itself.
-function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, now } = {}) {
+function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, from, to, raisedBy, now } = {}) {
   if (outboxHasWake(root, recordId, idempotencyKey)) return false;
   const file = wakeOutboxFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
-  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), evidence: text };
+  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), ...(from ? { from, to } : {}), ...(raisedBy ? { raisedBy } : {}), evidence: text };
   fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
   return true;
 }
