@@ -3,8 +3,8 @@
 .DESCRIPTION
   Copies the checked-out fleet tree (tracked and untracked-but-not-ignored files; never
   state/ or .scratch/) to -Path, then gives it an empty state tree, a roster capped at
-  one session, the one tenant file named by -Tenant (unchanged: it points at the real
-  tenant checkout and GitHub repo), and a fleet-settings.json whose hooks run the
+  one session, the one tenant file named by -Tenant (it points at the real tenant
+  checkout and GitHub repo; only its readyLabel becomes haiku-rehearsal, fleet #182), and a fleet-settings.json whose hooks run the
   scratch root's own hooks and whose deny rules fence off the live root. Every door
   resolves its fleet home from its own location (_common.ps1), so anything launched
   from the scratch root reads and writes the scratch root.
@@ -77,6 +77,11 @@ foreach ($relative in @($listed | Select-Object -Unique)) {
 
 # --- one tenant, one session, empty state ---
 foreach ($other in @(Get-ChildItem -LiteralPath "$root\tenants" -Filter *.json -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "$Tenant.json" })) { Remove-Item -LiteralPath $other.FullName -Force }
+# fleet #182: the rehearsal ticket carries haiku-rehearsal and never the live ready label,
+# and the live planner excludes haiku-rehearsal; here it is the ready label instead.
+$scratchTenant = Get-Content -LiteralPath "$root\tenants\$Tenant.json" -Raw | ConvertFrom-Json
+$scratchTenant | Add-Member -NotePropertyName readyLabel -NotePropertyValue 'haiku-rehearsal' -Force
+Write-Utf8 "$root\tenants\$Tenant.json" (($scratchTenant | ConvertTo-Json -Depth 20) + "`n")
 Write-Utf8 "$root\roster.json" "{`n  `"cap`": 1,`n  `"sessions`": []`n}`n"
 foreach ($dir in 'sessions', 'work', 'events', 'archive', 'exclusions', 'status', 'notices', 'flags', 'manifests', 'rotation', 'watch', 'triage', 'skip', 'reviews', 'pages') {
   [IO.Directory]::CreateDirectory("$root\state\$dir") | Out-Null
@@ -118,7 +123,7 @@ $next = [ordered]@{
 }
 $remove = "Remove-Item -LiteralPath '$root' -Recurse -Force"
 $notes = @(
-  "The live fleet does not see this reservation: pick a ticket the live lead is not about to assign.",
+  "The live fleet does not see this reservation: pick a ticket the live lead is not about to assign, and label it haiku-rehearsal only (this root's readyLabel; the live planner skips it).",
   "A launch leaves a worktree and branch in the tenant repo: git -C $repoFwd worktree remove --force $repoFwd/.claude/worktrees/ic-$issueText-assignment",
   "The scratch root's own watchers run by hand: powershell -File $root\bin\run-pr-watch.ps1"
 )

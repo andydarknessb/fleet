@@ -290,6 +290,11 @@ function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3, tenan
 // excluding on it made an issue permanently invisible to the frontier (reviewed 2026-09-06,
 // ADR 0006). A genuinely foreign assignee still excludes. Leave it unset for a tenant whose
 // issues are really owned by several accounts.
+//
+// fleet #182: an issue labelled haiku-rehearsal belongs to the rehearsal's owner (spec #94)
+// even when it also carries the ready label, so the live frontier never offers it. A
+// scratch root runs with haiku-rehearsal as its own readyLabel; there it is the ready label.
+const REHEARSAL_LABEL = 'haiku-rehearsal';
 function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, tenant, now } = {}) {
   const foreign = (assignee) => !fleetIdentity || String(assignee).toLowerCase() !== String(fleetIdentity).toLowerCase();
   if (!Array.isArray(issues)) throw new WorkStateError('INVALID_GITHUB_FIXTURE', 'issues must be an array');
@@ -308,6 +313,7 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (issue.isSpecParent) reasons.push({ code: 'spec-parent', detail: 'sub-issues remain or issue is marked as a spec parent' });
     if (issue.commentsTruncated) reasons.push({ code: 'issue-comments-truncated', detail: 'the complete issue comment thread could not be pinned' });
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
+    if (readyLabel !== REHEARSAL_LABEL && issue.labels.includes(REHEARSAL_LABEL)) reasons.push({ code: 'haiku-rehearsal', detail: `${REHEARSAL_LABEL} label is present; the rehearsal owner holds it` });
     reasons.push(...localExclusionReasons(issue, skipIssues, exclusions));
     if (activeByIssue.has(issue.number)) reasons.push({ code: 'reserved', detail: `active Work record ${activeByIssue.get(issue.number).id}` });
     reasons.push(...reservationConflicts(issue, scoped));

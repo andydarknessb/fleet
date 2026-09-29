@@ -57,6 +57,7 @@ try {
   Assert-True (($tenantFiles -join ',') -eq 'endzone.json') "the scratch root carries one tenant file (got $($tenantFiles -join ','))"
   $scratchTenant = Get-Content "$scratch\tenants\endzone.json" -Raw | ConvertFrom-Json
   Assert-True ($scratchTenant.repo -eq $sourceTenant.repo -and $scratchTenant.github -eq $sourceTenant.github) 'the tenant file names the real tenant checkout and repo'
+  Assert-True ($scratchTenant.readyLabel -eq 'haiku-rehearsal') "the scratch tenant's ready label is haiku-rehearsal, which the live planner skips (got $($scratchTenant.readyLabel))"
   $staticRoster = Get-Content "$scratch\roster.json" -Raw | ConvertFrom-Json
   Assert-True ([int]$staticRoster.cap -eq 1 -and @($staticRoster.sessions).Count -eq 0) 'the scratch roster is capped at one session and lists none'
   $stateFiles = @(Get-ChildItem "$scratch\state" -Recurse -File -Force | Where-Object { $_.Name -ne '.gitkeep' -and $_.FullName -ne "$scratch\state\roster.json" })
