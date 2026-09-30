@@ -119,10 +119,12 @@ try {
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
+  # fleet #232: config-invalid (a pages.priority value that is not emergency|high|normal) is normal;
+  # a bad priority is reported, never paged louder than the thing it broke.
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
   # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -130,9 +132,9 @@ try {
     $default = 'normal'
     if ($PagesConfig) {
       if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
-        foreach ($p in $PagesConfig.priority.PSObject.Properties) { $map[$p.Name] = "$($p.Value)" }
+        foreach ($p in $PagesConfig.priority.PSObject.Properties) { if ($script:PagePriorityValues.ContainsKey("$($p.Value)")) { $map[$p.Name] = "$($p.Value)" } }
       }
-      if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority) { $default = "$($PagesConfig.defaultPriority)" }
+      if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority -and $script:PagePriorityValues.ContainsKey("$($PagesConfig.defaultPriority)")) { $default = "$($PagesConfig.defaultPriority)" }
     }
     $best = $null; $bestLen = -1
     foreach ($k in $map.Keys) {
@@ -140,6 +142,23 @@ try {
     }
     if ($best) { return $best }
     return $default
+  }
+  # fleet #232: Get-PagePriority never returns an invalid value (Send-FleetPage's ValidateSet would
+  # throw and lose the tick's writes; mirrors notify.js pagePriorityFor and fleetDeadRepeatPriority
+  # above). This reports what it skipped, so a typo is surfaced once instead of silently ignored.
+  function Get-InvalidPagePriorities {
+    param($PagesConfig)
+    if (-not $PagesConfig) { return }
+    if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
+      foreach ($p in $PagesConfig.priority.PSObject.Properties) {
+        if (-not $script:PagePriorityValues.ContainsKey("$($p.Value)")) {
+          [pscustomobject]@{ key = "pages.priority.$($p.Name)"; value = "$($p.Value)"; fallback = (Get-PagePriority -Kind $p.Name -PagesConfig $PagesConfig) }
+        }
+      }
+    }
+    if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority -and -not $script:PagePriorityValues.ContainsKey("$($PagesConfig.defaultPriority)")) {
+      [pscustomobject]@{ key = 'pages.defaultPriority'; value = "$($PagesConfig.defaultPriority)"; fallback = 'normal' }
+    }
   }
 
   # --- ticket 81 (ADR 0012): a passed date, in config or on a Notice, pages once
@@ -1191,6 +1210,11 @@ try {
   foreach ($d in $datedItems) {
     $conditions += [pscustomobject]@{ key = "dated:$($d.where)"; kind = 'dated'; detail = "$($d.where) passed ($($d.value)) and is still in place"; url = $null }
   }
+  # fleet #232: an invalid pages priority pages once (paged-state dedupe) and rides every tick line.
+  $invalidPagePriority = @(Get-InvalidPagePriorities -PagesConfig $pagesConfig)
+  foreach ($ip in $invalidPagePriority) {
+    $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not one of emergency|high|normal; pages of that kind go at $($ip.fallback) until it is fixed"; url = $null }
+  }
   # #113 (ADR 0013): the previous tick's deploy step refused to move `live`
   # (not on live, dirty, diverged, fetch or CI unreadable). One page per
   # reason at normal priority; the condition clears when the refusal ends.
@@ -1494,6 +1518,7 @@ try {
     deadMan = $deadMan
     # fleet #101: every bounded child that timed out this tick, by name - the tick's own and the check's.
     timeouts = @(@($script:BoundedTimeouts) + @(if ($check -and $check.PSObject.Properties['timeouts']) { $check.timeouts }) | Where-Object { $_ })
+    invalidPagePriority = @($invalidPagePriority)
     deploy = $(if ($deploy) { [pscustomobject]@{ from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome } } else { $null })
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

@@ -93,3 +93,7 @@ Took effect 2026-09-30 (fleet #206): with WS3 live on 2026-09-29 (#204, #205:
 a waiting ask is an escalation or a hold, and an answer wakes the session
 that asked), `config/cycle.json` `pages.fleetDeadRepeatPriority` is
 `emergency`. The first `fleet-dead` page stays high.
+
+## Amendment 2026-09-30 - an invalid page priority falls back, and is reported
+
+A `pages.priority.<kind>` or `pages.defaultPriority` that is not `emergency`, `high` or `normal` is ignored: the kind keeps its built-in priority (or `normal`), and the Watchdog pages once as `config-invalid:<key>` at normal priority. `bin/setup.ps1` refuses such a value up front. Source: fleet #232.

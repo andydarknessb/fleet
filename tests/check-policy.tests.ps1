@@ -54,4 +54,20 @@ Assert-True ($gatePending.GatePending -contains 'gate') 'existing pending-gate b
 $gateFailure = Get-CheckPolicyEvaluation $policy @([pscustomobject]@{ name = 'gate'; status = 'COMPLETED'; conclusion = 'FAILURE' })
 Assert-Count $gateFailure.GateFailures 1 'existing gate failures must remain gate failures'
 
+# fleet #232: config/cycle.json pages.priority.<kind> and pages.defaultPriority must
+# each be one of emergency|high|normal. Get-PagesPriorityFindings reports every value
+# that is not, by dotted key and value, so bin/setup.ps1 can name the typo before the
+# Watchdog ever meets it (the Watchdog itself falls back and pages; it never throws).
+$pagesFindings = @(Get-PagesPriorityFindings ([pscustomobject]@{
+  priority = [pscustomobject]@{ 'permission-wait' = 'hgih'; 'fleet-dead' = 'high'; 'dated' = 'normal' }
+  defaultPriority = 'loud'
+}))
+Assert-Count $pagesFindings 2 'one finding per invalid page priority value'
+Assert-True (@($pagesFindings | Where-Object { $_.Key -eq 'pages.priority.permission-wait' -and $_.Value -eq 'hgih' }).Count -eq 1) 'an invalid pages.priority.<kind> is reported by dotted key and value'
+Assert-True (@($pagesFindings | Where-Object { $_.Key -eq 'pages.defaultPriority' -and $_.Value -eq 'loud' }).Count -eq 1) 'an invalid pages.defaultPriority is reported by key and value'
+Assert-Count (Get-PagesPriorityFindings $null) 0 'an absent pages block is not a finding'
+Assert-Count (Get-PagesPriorityFindings ([pscustomobject]@{ priority = [pscustomobject]@{ 'fleet-dead' = 'high' } })) 0 'a valid value is not a finding'
+$shippedPages = (Get-Content "$PSScriptRoot\..\config\cycle.json" -Raw -Encoding UTF8 | ConvertFrom-Json).pages
+Assert-Count (Get-PagesPriorityFindings $shippedPages) 0 'the shipped config/cycle.json carries no invalid page priority'
+
 Write-Output 'check-policy tests passed'

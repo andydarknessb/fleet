@@ -26,4 +26,7 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
   $labelOk = 'MISSING'; if ($ok) { $labelOk = 'ok' }
   Write-Output "tenant $($tj.name): repo $repoOk, label '$($tj.readyLabel)' $labelOk"
 }
+# fleet #232: a bad pages priority would otherwise only surface as a config-invalid page at runtime.
+$cycleCfg = Read-Json "$FleetHome\config\cycle.json"
+foreach ($pf in (Get-PagesPriorityFindings $cycleCfg.pages)) { Write-Error "config/cycle.json: $($pf.Key) is '$($pf.Value)', not one of emergency|high|normal"; exit 1 }
 Write-Output "setup complete. Next: bin\pilot.ps1 to start the pilot, bin\status.ps1 to watch."
