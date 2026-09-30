@@ -155,7 +155,7 @@ function Test-RespawnVerified {
   # differs from $PreviousPid (or appears where there was none) proves a new process
   # replaced the old one. An unreadable listing during the wait is NOT "pid changed" -
   # it is respawn-failed, the same as a genuine no-op; it must never be read as success.
-  # With -JobId (an IC: claude respawn keeps the job id) the row is the one with that id, never newest-by-name: a
+  # With -JobId (an IC: a daemon respawn keeps the job id) the row is the one with that id, never newest-by-name: a
   # running same-name row would make a no-op respawn of the rostered job look verified.
   param([string]$Name, $PreviousPid, [string]$JobId = '')
   $deadline = (Get-Date).AddMilliseconds($script:RespawnVerifyBoundMs)
