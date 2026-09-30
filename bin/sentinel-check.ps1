@@ -78,15 +78,18 @@ if ($rosterUnreadable) { $report.ok += [pscustomobject]@{ name = 'roster-read'; 
 # is not any roster row's session, so a same-named orphan that started later must never be picked as the
 # IC's row by name (it would read as a healthy "working" IC and hide the real, dead one).
 $script:orphanJobIds = @{}
+$script:DeadRetireCount = 0
 function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name -and -not $script:orphanJobIds.ContainsKey("$($_.id)") } | Sort-Object startedAt -Descending | Select-Object -First 1 }
 # fleet #253 / #256: config/cycle.json watchdog knobs, read once. deadBeforeAckMinutes (default 60) is the
 # grace before a launched row with no ack and no heartbeat can read as dead; staleMinutes (default 45, the
 # watchdog's own) is how fresh a job state must be to count as a live job; strandedReservationHours
-# (default 6) is how long an assigned reservation may sit with nothing behind it.
-$script:DeadBeforeAckMinutes = 60; $script:JobStaleMinutes = 45; $script:StrandedReservationHours = 6
+# (default 6) is how long an assigned reservation may sit with nothing behind it; deadBeforeAckMaxPerTick (default 2)
+# caps the dead-before-ack retires one tick performs, the rest roll to the next tick.
+$script:DeadBeforeAckMinutes = 60; $script:DeadBeforeAckMaxPerTick = 2; $script:JobStaleMinutes = 45; $script:StrandedReservationHours = 6
 try {
   $wdCfg = (Read-Json "$FleetHome\config\cycle.json").watchdog
   if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMinutes']) { $script:DeadBeforeAckMinutes = [double]$wdCfg.deadBeforeAckMinutes }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMaxPerTick']) { $script:DeadBeforeAckMaxPerTick = [int]$wdCfg.deadBeforeAckMaxPerTick }
   if ($wdCfg -and $wdCfg.PSObject.Properties['staleMinutes']) { $script:JobStaleMinutes = [double]$wdCfg.staleMinutes }
   if ($wdCfg -and $wdCfg.PSObject.Properties['strandedReservationHours']) { $script:StrandedReservationHours = [double]$wdCfg.strandedReservationHours }
 } catch {}
@@ -322,6 +325,14 @@ function Test-DeadBeforeAck {
   }
   if (Test-Path -LiteralPath "$FleetHome\state\heartbeats\$($x.name).json") { return $null }
   if (Test-Path -LiteralPath "$($r.manifest).acknowledged.json") { return $null }
+  # The ledger's own proof of no ack: acknowledgeAssignment moves the Work record out of `assigned` BEFORE it writes
+  # the sidecar, so a missing sidecar alone is not proof. Anything but an `assigned` record (implementing, released,
+  # absent, an unreadable active.json) falls through to today's path.
+  try {
+    $activeForAck = Get-Content -LiteralPath "$FleetHome\state\work\active.json" -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $recProp = $activeForAck.records.PSObject.Properties["$($r.workRecordId)"]
+    if ($null -eq $recProp -or "$($recProp.Value.state)" -ne 'assigned') { return $null }
+  } catch { return $null }
   $launched = ConvertTo-UtcDateTime $r.launchedAt
   if ($null -eq $launched) { return $null }
   $sinceLaunch = ($now - $launched).TotalMinutes
@@ -480,6 +491,8 @@ foreach ($x in $expected) {
       $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-dead-before-ack'; detail = "$deadWhy; would retire the row and release Work record $($rr.workRecordId) ($whyNot)"; parent = $x.parent }
     } elseif (Test-Paused) {
       $report.ok += [pscustomobject]@{ name = $x.name; detail = "dead-before-ack retire and release deferred: PAUSE is set; $deadWhy" }
+    } elseif ($script:DeadRetireCount -ge $script:DeadBeforeAckMaxPerTick) {
+      $report.ok += [pscustomobject]@{ name = $x.name; detail = "dead-before-ack retire deferred to the next tick: $($script:DeadBeforeAckMaxPerTick) retires already done this tick (watchdog.deadBeforeAckMaxPerTick); $deadWhy" }
     } else {
       # Re-read the live roster right before acting (the Do-Respawn rule): the row must still be this active job's.
       $fresh = @((Get-LiveRoster).sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.status)" -eq 'active' -and "$($_.jobId)" -eq "$($rr.jobId)" })
@@ -489,16 +502,20 @@ foreach ($x in $expected) {
       }
       $retireOut = & "$PSScriptRoot\retire.ps1" -Name $x.name -Reason "dead before ack: $deadWhy" 2>&1 | Out-String
       $retireJson = ConvertFrom-LastJsonLine $retireOut
-      $report.retired += $x.name
+      $script:DeadRetireCount++
+      # Count the row retired only when retire.ps1 said so (its JSON line names it) and the roster agrees.
+      $retiredRow = @((Get-LiveRoster).sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.jobId)" -eq "$($rr.jobId)" } | Select-Object -Last 1)[0]
+      $retireOk = ($null -ne $retireJson) -and ("$($retireJson.retired)" -eq "$($x.name)") -and ($null -ne $retiredRow) -and ("$($retiredRow.status)" -eq 'retired')
+      if ($retireOk) { $report.retired += $x.name }
       # Release AFTER the retire: a claimed reservation (an active|retiring roster row) refuses release.
-      if ($null -eq $retireJson) {
+      if (-not $retireOk) {
         $release = [pscustomobject]@{ ok = $false; code = 'RETIRE_FAILED'; detail = (Get-OneLineText $retireOut); revision = $null; marker = $false }
       } else {
         $release = Invoke-ManifestRelease -Manifest "$($rr.manifest)" -WorkRecordId "$($rr.workRecordId)" -Reason "dead before ack: $deadWhy"
       }
       $report.deadRetired += [pscustomobject]@{ name = $x.name; jobId = "$($rr.jobId)"; workRecordId = "$($rr.workRecordId)"; manifest = "$($rr.manifest)"; reason = $deadWhy; retire = $retireJson; release = $release }
       $releaseNote = if ($release.ok) { "released Work record $($rr.workRecordId)" } else { "release of Work record $($rr.workRecordId) failed: $($release.code) ($($release.detail))" }
-      $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-dead-before-ack'; detail = "$deadWhy; retired the row; $releaseNote"; parent = $x.parent }
+      $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-dead-before-ack'; detail = "$deadWhy; $(if ($retireOk) { 'retired the row' } else { 'retire FAILED, the row stays on the roster and the release was skipped' }); $releaseNote"; parent = $x.parent }
       continue
     }
   }

@@ -78,26 +78,32 @@ exit 0
     Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
     Set-Agents @()
   }
-  function New-Reservation { param([int]$N)
-    $manifest = [ordered]@{ schemaVersion = 1; status = 'pending-ack'; id = "assignment-test-$N"; workRecordId = "test:issue-$N"; workRecordRevision = 1; tenant = 'test'; parent = 'pl-test' }
-    Write-Utf8 (Manifest-Path $N) ($manifest | ConvertTo-Json -Depth 6)
-    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "test:issue-$N" --tenant test --issue $N --manifest (Manifest-Path $N) --idempotency-key "reserve-$N"
+  # Reserve the way assignment.js does, including assignment.manifestId (the field Invoke-ManifestRelease checks).
+  function Reserve-Record { param([int]$N, [string]$ManifestFile, [string]$ManifestId, [string]$Key, [string]$Tenant = 'test')
+    $assignment = (@{ manifestId = $ManifestId } | ConvertTo-Json -Compress).Replace('"', '\"')
+    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "${Tenant}:issue-$N" --tenant $Tenant --issue $N --manifest $ManifestFile --assignment $assignment --idempotency-key $Key
     if ($LASTEXITCODE -ne 0) { throw "fixture reservation for issue $N failed" }
+  }
+  function New-Reservation { param([int]$N, [string]$Tenant = 'test')
+    $manifest = [ordered]@{ schemaVersion = 1; status = 'pending-ack'; id = "assignment-test-$N"; workRecordId = "${Tenant}:issue-$N"; workRecordRevision = 1; tenant = $Tenant; parent = 'pl-test' }
+    Write-Utf8 (Manifest-Path $N) ($manifest | ConvertTo-Json -Depth 6)
+    Reserve-Record $N (Manifest-Path $N) "assignment-test-$N" "reserve-$N" $Tenant
   }
   function Get-ActiveRecords { (Get-Content "$testRoot\state\work\active.json" -Raw | ConvertFrom-Json).records }
   # A roster row the way launch.ps1 writes it (manifest, workRecordId, launchedAt), its owned worktree, its
   # reservation and, unless told otherwise, nothing else: no heartbeat, no ack, no job, no daemon row.
-  function New-Case { param([int]$N, $LaunchedMinutesAgo = 90, [string]$LaunchedRaw = '', [switch]$Legacy)
-    Reset-Fixture
+  function New-Case { param([int]$N, $LaunchedMinutesAgo = 90, [string]$LaunchedRaw = '', [switch]$Legacy, [switch]$Append, [string]$Tenant = 'test')
+    $rowsBefore = @()
+    if ($Append) { $rowsBefore = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions) } else { Reset-Fixture }
     Invoke-Git @('-C', $hub, 'branch', "ic-$N-fix", 'main') | Out-Null
     Invoke-Git @('-C', $hub, 'worktree', 'add', '-q', "$hub\.claude\worktrees\ic-$N-fix", "ic-$N-fix") | Out-Null
-    $row = [ordered]@{ name = "ic-$N"; role = 'ic'; tenant = 'test'; parent = 'pl-test'; issue = $N; cwd = $hub; status = 'active'; jobId = "job-$N" }
+    $row = [ordered]@{ name = "ic-$N"; role = 'ic'; tenant = $Tenant; parent = 'pl-test'; issue = $N; cwd = $hub; status = 'active'; jobId = "job-$N" }
     if (-not $Legacy) {
-      New-Reservation $N
-      $row.manifest = Manifest-Path $N; $row.workRecordId = "test:issue-$N"
+      New-Reservation $N $Tenant
+      $row.manifest = Manifest-Path $N; $row.workRecordId = "${Tenant}:issue-$N"
       if ($LaunchedRaw) { $row.launchedAt = $LaunchedRaw } elseif ($null -ne $LaunchedMinutesAgo) { $row.launchedAt = Iso-Ago $LaunchedMinutesAgo }
     }
-    Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @([pscustomobject]$row) } | ConvertTo-Json -Depth 6)
+    Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @($rowsBefore) + @([pscustomobject]$row) } | ConvertTo-Json -Depth 6)
   }
   function Run-Check { param([switch]$Apply)
     # Production runs the check without Stop semantics: retire.ps1 drives git/claude whose stderr (a harmless
@@ -235,19 +241,56 @@ exit 0
   Assert-True (((Kinds-For $d8b 'ic-908') -contains 'ic-dead-before-ack') -and (Calls).Count -eq 0) 'D8b: read-only run pages and touches nothing'
   Write-Output 'sentinel-dead-before-ack D8 passed'
 
-  # ---- D9: the record cannot be released (already implementing): the retire stands, the failure is named, no marker.
+  # ---- D9 (QA #261): a missing ack sidecar alone is not proof of no ack - acknowledgeAssignment moves the record out of
+  # `assigned` BEFORE it writes the sidecar. A record already implementing is the ledger saying the IC acked: the row is
+  # not retired, today's path (ic-vanished) stands, and the record is untouched.
   New-Case 909
   Set-Flag
   $null = & node "$testRoot\bin\work-state.js" transition --root $testRoot --id test:issue-909 --to implementing --expected-revision 1 --idempotency-key t909 2>&1
   if ($LASTEXITCODE -ne 0) { throw 'D9 fixture: transition to implementing failed' }
   $d9 = Run-Check -Apply
-  Assert-True ((Roster-Status 'ic-909') -eq 'retired') 'D9: the row is still retired'
-  Assert-True ($d9.deadRetired[0].release.ok -eq $false -and $d9.deadRetired[0].release.code -eq 'INVALID_RELEASE') "D9: release.code INVALID_RELEASE (got: $($d9.deadRetired[0].release | ConvertTo-Json -Compress))"
-  $e9 = @($d9.escalate | Where-Object { $_.name -eq 'ic-909' -and $_.kind -eq 'ic-dead-before-ack' })[0]
-  Assert-True ("$($e9.detail)" -like '*INVALID_RELEASE*') 'D9: the page names the release failure'
-  Assert-True (-not (Test-Path ((Manifest-Path 909) + '.invalidated.json'))) 'D9: no marker when the release failed'
-  Assert-True ($null -ne (Get-ActiveRecords).PSObject.Properties['test:issue-909']) 'D9: the record is untouched'
+  Assert-NotRetired $d9 909 'D9'
+  $k9 = Kinds-For $d9 'ic-909'
+  Assert-True (($k9 -contains 'ic-vanished') -and ($k9 -notcontains 'ic-dead-before-ack')) "D9: today ic-vanished, no dead-before-ack page (got: $($k9 -join ','))"
+  # D9a: a record that is gone from active.json proves nothing either.
+  New-Case 919
+  Set-Flag
+  Remove-Item "$testRoot\state\work\active.json" -Force
+  $d9a = Run-Check -Apply
+  Assert-True ((Roster-Status 'ic-919') -eq 'active' -and @($d9a.deadRetired).Count -eq 0) 'D9a: no active Work record, no retire'
+  # D9b: the release is refused by another route (an assigned record that is no longer untouched, so INVALID_RELEASE):
+  # the retire stands, the failure is named, no marker.
+  New-Case 929
+  Set-Flag
+  $null = & node "$testRoot\bin\work-state.js" budget --root $testRoot --id test:issue-929 --expected-revision 1 --phase warn --tokens 5 --idempotency-key b929 2>&1
+  if ($LASTEXITCODE -ne 0) { throw 'D9b fixture: budget warn failed' }
+  $d9b = Run-Check -Apply
+  Assert-True ((Roster-Status 'ic-929') -eq 'retired') 'D9b: the row is still retired'
+  Assert-True ($d9b.deadRetired[0].release.ok -eq $false -and $d9b.deadRetired[0].release.code -eq 'INVALID_RELEASE') "D9b: release.code INVALID_RELEASE (got: $($d9b.deadRetired[0].release | ConvertTo-Json -Compress))"
+  $e9 = @($d9b.escalate | Where-Object { $_.name -eq 'ic-929' -and $_.kind -eq 'ic-dead-before-ack' })[0]
+  Assert-True ("$($e9.detail)" -like '*INVALID_RELEASE*') 'D9b: the page names the release failure'
+  Assert-True (-not (Test-Path ((Manifest-Path 929) + '.invalidated.json'))) 'D9b: no marker when the release failed'
+  Assert-True ($null -ne (Get-ActiveRecords).PSObject.Properties['test:issue-929']) 'D9b: the record is untouched'
   Write-Output 'sentinel-dead-before-ack D9 passed'
+
+  # ---- D16 (QA #261): Invoke-ManifestRelease refuses a manifest that is not the record's current one. Reserve M1, hand
+  # release, re-reserve M2 under the same Work record id: releasing "M1" must not release M2's reservation or mark M1.
+  New-Case 940
+  $m1 = Manifest-Path 940; $m2 = Manifest-Path 9401
+  Write-Utf8 $m2 '{"schemaVersion":1,"id":"assignment-test-9401","workRecordId":"test:issue-940","tenant":"test","parent":"pl-test"}'
+  $null = & node "$testRoot\bin\work-state.js" release --root $testRoot --id test:issue-940 --expected-revision 1 --idempotency-key hand-release-940 2>&1
+  if ($LASTEXITCODE -ne 0) { throw 'D16 fixture: hand release failed' }
+  Reserve-Record 940 $m2 'assignment-test-9401' 'reserve-940-again'
+  function Invoke-Release { param([string]$Manifest)
+    $cmd = ". '$testRoot\bin\_common.ps1'; Invoke-ManifestRelease -Manifest '$Manifest' -WorkRecordId 'test:issue-940' -Reason 'qa' | ConvertTo-Json -Compress"
+    (& powershell -NoProfile -ExecutionPolicy Bypass -Command $cmd | Out-String) | ConvertFrom-Json
+  }
+  $r16 = Invoke-Release $m1
+  Assert-True ($r16.ok -eq $false -and $r16.code -eq 'MANIFEST_MISMATCH') "D16: the stale manifest is refused (got: $($r16 | ConvertTo-Json -Compress))"
+  Assert-True ($null -ne (Get-ActiveRecords).PSObject.Properties['test:issue-940'] -and -not (Test-Path ($m1 + '.invalidated.json'))) 'D16: M2 stays reserved and M1 is not marked'
+  $r16b = Invoke-Release $m2
+  Assert-True ($r16b.ok -eq $true -and (Test-Path ($m2 + '.invalidated.json')) -and $null -eq (Get-ActiveRecords).PSObject.Properties['test:issue-940']) 'D16: the current manifest releases'
+  Write-Output 'sentinel-dead-before-ack D16 passed'
 
   # ---- D10 PAUSE: nothing is acted; an ok entry says deferred; today's ic-vanished stands.
   New-Case 910
@@ -343,6 +386,41 @@ exit 0
   $null = Run-Recover
   Assert-True ((Calls) -contains 'claude respawn job-932') 'D15c: a row without the marker is still respawned'
   Write-Output 'sentinel-dead-before-ack D15 passed'
+
+  # ---- D17 (QA #261): report.retired names the row only when retire.ps1 really retired it. A retire that fails (here a
+  # stub that prints nothing and exits 1) leaves the row active, skips the release and says so.
+  New-Case 950
+  Set-Flag
+  $realRetire = Get-Content "$testRoot\bin\retire.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\retire.ps1" 'exit 1'
+  try { $d17 = Run-Check -Apply } finally { Write-Utf8 "$testRoot\bin\retire.ps1" $realRetire }
+  Assert-True ((Roster-Status 'ic-950') -eq 'active' -and @($d17.retired) -notcontains 'ic-950') 'D17: a failed retire is not reported retired'
+  Assert-True ($d17.deadRetired[0].release.code -eq 'RETIRE_FAILED' -and $null -ne (Get-ActiveRecords).PSObject.Properties['test:issue-950'] -and -not (Test-Path ((Manifest-Path 950) + '.invalidated.json'))) 'D17: the release is skipped and the record stays reserved'
+  $e17 = @($d17.escalate | Where-Object { $_.name -eq 'ic-950' -and $_.kind -eq 'ic-dead-before-ack' })[0]
+  Assert-True ("$($e17.detail)" -like '*retire FAILED*') 'D17: the page says the retire failed'
+  Write-Output 'sentinel-dead-before-ack D17 passed'
+
+  # ---- D18 (QA #261): at most watchdog.deadBeforeAckMaxPerTick (default 2) retires per tick; the rest roll to the next tick
+  # with an ok entry and today's path, and the next tick takes them.
+  New-Case 960
+  New-Case 961 -Append
+  New-Case 962 -Append -Tenant 'other'   # a third assignment in one tenant needs an independence proof; another tenant does not
+  Set-Flag
+  $d18 = Run-Check -Apply
+  $retired18 = @(960, 961, 962 | Where-Object { (Roster-Status "ic-$_") -eq 'retired' })
+  Assert-True ($retired18.Count -eq 2 -and @($d18.retired).Count -eq 2) "D18: exactly two rows retired on the first tick (retired: $($retired18 -join ','))"
+  $left = @(960, 961, 962 | Where-Object { (Roster-Status "ic-$_") -eq 'active' })
+  Assert-True ($left.Count -eq 1 -and @($d18.ok | Where-Object { $_.name -eq "ic-$($left[0])" -and "$($_.detail)" -like '*deferred to the next tick*' }).Count -eq 1) 'D18: the third row has an ok entry saying it rolled to the next tick'
+  $d18b = Run-Check -Apply
+  Assert-True ((Roster-Status "ic-$($left[0])") -eq 'retired' -and @($d18b.retired).Count -eq 1) 'D18: the next tick retires the remaining row'
+  # the cap is configurable
+  New-Case 970
+  New-Case 971 -Append
+  Set-Flag
+  Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"deadBeforeAckMaxPerTick":1}}'
+  $d18c = Run-Check -Apply
+  Assert-True (@($d18c.retired).Count -eq 1) 'D18: watchdog.deadBeforeAckMaxPerTick moves the cap'
+  Write-Output 'sentinel-dead-before-ack D18 passed'
 
   Write-Output 'sentinel-dead-before-ack: all cases passed'
 } finally {

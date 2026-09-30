@@ -71,6 +71,7 @@
     "watchStaleMinutes": 20,
     "watchFailTicks": 3,
     "deadBeforeAckMinutes": 60,
+    "deadBeforeAckMaxPerTick": 2,
     "strandedReservationHours": 6
   },
   "pages": {
