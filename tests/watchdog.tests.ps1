@@ -992,8 +992,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     'ic-950' = [ordered]@{ jobId = 'job-ic950'; attempts = @($h6dSeed); lastReason = 'seeded' }
     'ic-951' = [ordered]@{ jobId = 'job-ic951'; attempts = @($h6dSeed); lastReason = 'seeded' }
   }) | ConvertTo-Json -Depth 6)
+  # Three active ICs fill the fixture tenant's maxIcs (2), so the frontier reports no slot; an in-flight Work record is the other
+  # kind of "work waiting" evidence and does not depend on a free slot.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-999":{"id":"test:issue-999","tenant":"test","issue":999,"state":"implementing"}}}'
   $script:KeepRespawnStreak = $true
-  try { $h6d = Run-Watchdog } finally { $script:KeepRespawnStreak = $false }
+  try { $h6d = Run-Watchdog } finally { $script:KeepRespawnStreak = $false; Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue }
   $h6dHeal = @($h6d.healed)
   Assert-True (@($h6dHeal | Where-Object { $_.name -in @('ic-950', 'ic-951') -and $_.refused -eq $true }).Count -eq 2) "the two held heal-respawns are recorded as refused (got $($h6dHeal | ConvertTo-Json -Compress -Depth 3))"
   Assert-True (@($h6dHeal | Where-Object { $_.name -eq 'ic-952' -and $_.action -eq 'respawn' -and $_.ok -eq $true -and -not $_.deferred }).Count -eq 1) "held heal-respawns must not starve ic-952 of its heal (got $($h6dHeal | ConvertTo-Json -Compress -Depth 3))"
