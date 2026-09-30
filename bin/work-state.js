@@ -794,6 +794,17 @@ function reserveRecord(options = {}) {
   });
 }
 
+// fleet#227: an attempt starts at an `assignment-reserved` event, and a record can hold
+// several (abandon or release, then reserve again). The current attempt is what came
+// after the last reservation; a record with no reservation event (created directly) is
+// all one attempt. `release` and `abandon` both read this, so an assigned record with
+// no events past its reservation is releasable and every other one is abandonable.
+function currentAttemptEvents(events, recordId) {
+  const lineage = events.filter((event) => event.recordId === recordId).sort((a, b) => a.sequence - b.sequence);
+  const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
+  return lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
+}
+
 function releaseRecord(options = {}) {
   const root = asRoot(options.root);
   const key = requireIdempotency(options.idempotencyKey);
@@ -810,7 +821,7 @@ function releaseRecord(options = {}) {
       && !record.budget?.extension
       && !record.github?.prNumber && !record.github?.prUrl && !record.github?.headSha
       && (!record.review?.progress || record.review.progress === 'not-started')
-      && events.filter((event) => event.recordId === record.id).every((event) => ['assignment-reserved', 'assignment-released'].includes(event.type));
+      && currentAttemptEvents(events, record.id).length === 0;
     if (!currentAttemptIsUntouched) throw new WorkStateError('INVALID_RELEASE', `record '${record.id}' does not prove an untouched reservation`);
     const now = isoNow(options.now);
     const next = { ...record, state: 'released', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
@@ -845,10 +856,7 @@ function abandonRecord(options = {}) {
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
     if (['merged', 'retiring'].includes(record.state)) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state} and must complete retirement`);
-    const lineage = eventLines(p).filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
-    const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
-    const currentAttemptEvents = lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
-    if (currentAttemptEvents.length === 0) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
+    if (currentAttemptEvents(eventLines(p), record.id).length === 0) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
     const now = isoNow(options.now);
     const actor = options.actor || 'fleet-operator';
     const next = {
