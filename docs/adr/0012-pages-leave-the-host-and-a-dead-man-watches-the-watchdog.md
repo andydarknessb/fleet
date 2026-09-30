@@ -88,3 +88,8 @@ on 09-23 and 09-24 that listed fresh `-1m` heartbeats; it has not recurred
 since.
 
 Source: the 2026-09-29 fleet audit (ruling R1) and its grill (Q1).
+
+Took effect 2026-09-30 (fleet #206): with WS3 live on 2026-09-29 (#204, #205:
+a waiting ask is an escalation or a hold, and an answer wakes the session
+that asked), `config/cycle.json` `pages.fleetDeadRepeatPriority` is
+`emergency`. The first `fleet-dead` page stays high.

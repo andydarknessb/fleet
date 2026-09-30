@@ -88,7 +88,7 @@
     },
     "defaultPriority": "normal",
     "fleetDeadRepeatMinutes": 120,
-    "fleetDeadRepeatPriority": "high",
+    "fleetDeadRepeatPriority": "emergency",
     "maxAttempts": 3,
     "retryAfterMinutes": 60
   },
