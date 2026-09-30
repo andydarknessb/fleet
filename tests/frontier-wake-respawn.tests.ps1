@@ -11,6 +11,7 @@ function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condi
 function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
 function Get-EpochMs { param([datetime]$D) ([DateTimeOffset][datetime]::SpecifyKind($D.ToUniversalTime(), [DateTimeKind]::Utc)).ToUnixTimeMilliseconds() }
 function Get-Iso { param([double]$MinutesAgo) (Get-Date).ToUniversalTime().AddMinutes(-$MinutesAgo).ToString('o') }
+function ConvertTo-UtcDateTimeTest { param([string]$Iso) [datetime]::Parse($Iso, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal) }
 
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-watchdog-test-" + [guid]::NewGuid().ToString('N'))
@@ -128,6 +129,95 @@ try {
   $r5 = Run-Watchdog
   $w5 = Get-TestWake $r5
   Assert-True ($w5.decision -eq 'woken') "R5: a decision-needed line with no actor must still wake (got $($w5.decision): $($w5.reason))"
+
+  # ===== fleet #231: the cooldown is keyed on the digest TEXT, so a second PR settling
+  # inside the hour reads as "already woken". Every case below runs with full IC slots
+  # (the frontier source reports `no slot` and contributes nothing) unless it says otherwise,
+  # so the digest is exactly the outbox kind counts.
+  function Get-WakeState { (Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw | ConvertFrom-Json).tenants.test }
+  function Set-WakeState { param([string]$Json) Write-Utf8 "$testRoot\state\watchdog\frontier-wake.json" ('{"tenants":{"test":' + $Json + '}}') }
+  function Get-WakeStateJson { param([double]$LastAtMinutesAgo, [string]$Digest, [double]$ConsumedMinutesAgo, [string]$Extra = '')
+    '{"lastAt":"' + (Get-Iso $LastAtMinutesAgo) + '","digest":' + ($Digest | ConvertTo-Json) + ',"outboxConsumedThrough":"' + (Get-Iso $ConsumedMinutesAgo) + '"' + $Extra + '}'
+  }
+
+  # Case C1 (#231 AC1, red today): PR A's checks-settled wakes the lead; PR B's checks-settled line,
+  # recorded 10 minutes after that wake, must wake the lead on the next tick. The digest text is the
+  # same (`outbox checks-settled x1`) but the line is new by identity (record id + event sequence),
+  # and by construction newer than outboxConsumedThrough.
+  Reset-Wake
+  Set-LiveRoster -LeadLaunchedMinutesAgo 240 -Ics 2
+  Set-LeadRow -StartedMinutesAgo 240
+  Set-Outbox @((New-OutboxLine 30 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'))
+  $c1a = Run-Watchdog
+  $w1a = Get-TestWake $c1a
+  Assert-True ($w1a.decision -eq 'woken' -and ((@($w1a.evidence) -join '; ') -eq 'outbox checks-settled x1')) "C1a: PR A's checks-settled must wake the lead (got $($w1a.decision): $(@($w1a.evidence) -join '; '))"
+  $s1a = Get-WakeState
+  Assert-True ("$($s1a.digest)" -eq 'outbox checks-settled x1' -and $s1a.lastAt -and $s1a.outboxConsumedThrough) "C1a: the wake state must record the wake (got $($s1a | ConvertTo-Json -Compress))"
+  # Move the clock: that wake was 10 minutes ago (inside the 60-minute window). The digest is the one
+  # the wake itself stored; only the two stamps are shifted. Then PR B settles 5 minutes ago.
+  Set-WakeState ((($s1a | ConvertTo-Json -Compress) | ConvertFrom-Json | ForEach-Object { $_.lastAt = (Get-Iso 10); $_.outboxConsumedThrough = (Get-Iso 10); $_ } | ConvertTo-Json -Compress))
+  Set-Outbox @(
+    (New-OutboxLine 30 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'),
+    (New-OutboxLine 5 'issue-21' 'checks-settled' 'watch:test:issue-21:r2:bb:review' 'pr-watch'))
+  $callsBeforeC1 = @(Get-RotateCalls).Count
+  $c1b = Run-Watchdog
+  $w1b = Get-TestWake $c1b
+  Assert-True ($w1b.decision -eq 'woken') "C1b: a checks-settled line for PR B, 10 minutes after PR A's wake, must wake the lead (got $($w1b.decision): '$($w1b.reason)')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeC1 + 1) "C1b: exactly one more rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count - $callsBeforeC1))"
+  $s1b = Get-WakeState
+  Assert-True ($s1b.outboxConsumedThrough -and ((ConvertTo-UtcDateTimeTest $s1b.outboxConsumedThrough) -gt (Get-Date).ToUniversalTime().AddMinutes(-6))) "C1b: the watermark must advance past PR B's line at T-5m (got $($s1b.outboxConsumedThrough))"
+
+  # Case C2 (#231 AC2, control, green today and after): the SAME unconsumed line seen again inside the
+  # window (the last wake did not clear it: the watermark predates the line) stays deferred as `cooldown`.
+  # C2a is a pre-#231 state (lastAt/digest/outboxConsumedThrough only): the fix must read it as before.
+  Reset-Wake
+  Set-Outbox @((New-OutboxLine 20 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'))
+  Set-WakeState (Get-WakeStateJson -LastAtMinutesAgo 10 -Digest 'outbox checks-settled x1' -ConsumedMinutesAgo 30)
+  $callsBeforeC2 = @(Get-RotateCalls).Count
+  $c2a = Run-Watchdog
+  $w2a = Get-TestWake $c2a
+  Assert-True ($w2a.decision -eq 'cooldown') "C2a: the same unconsumed line inside the window stays deferred under a pre-#231 state (got $($w2a.decision): '$($w2a.reason)')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeC2) 'C2a: no rotate.ps1 call inside the cooldown'
+  # C2b: the same line, with the state also naming what the last wake delivered by identity
+  # (the #231 shape: `delivered` = record id + event sequence of every outbox line it carried).
+  Set-WakeState (Get-WakeStateJson -LastAtMinutesAgo 10 -Digest 'outbox checks-settled x1' -ConsumedMinutesAgo 30 -Extra ',"delivered":["test:issue-20#3"],"frontierIssues":[]')
+  $c2b = Run-Watchdog
+  $w2b = Get-TestWake $c2b
+  Assert-True ($w2b.decision -eq 'cooldown') "C2b: a line the last wake delivered by identity stays deferred (got $($w2b.decision): '$($w2b.reason)')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeC2) 'C2b: no rotate.ps1 call inside the cooldown'
+
+  # Case C3 (#231, the live 2026-09-30T00:32Z shape, red today): a wake carried
+  # `frontier #501; outbox checks-settled x1`. The frontier issue is still eligible (the lead has not
+  # assigned it yet) and a DIFFERENT PR settles: same text, new evidence -> must wake.
+  Reset-Wake
+  Set-LiveRoster -LeadLaunchedMinutesAgo 240 -Ics 1
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Set-Outbox @((New-OutboxLine 30 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'))
+  $c3a = Run-Watchdog
+  $w3a = Get-TestWake $c3a
+  Assert-True ($w3a.decision -eq 'woken' -and ((@($w3a.evidence) -join '; ') -eq 'frontier #501; outbox checks-settled x1')) "C3a: the mixed wake must fire (got $($w3a.decision): $(@($w3a.evidence) -join '; '))"
+  $s3a = Get-WakeState
+  Set-WakeState ((($s3a | ConvertTo-Json -Compress) | ConvertFrom-Json | ForEach-Object { $_.lastAt = (Get-Iso 10); $_.outboxConsumedThrough = (Get-Iso 10); $_ } | ConvertTo-Json -Compress))
+  Set-Outbox @(
+    (New-OutboxLine 30 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'),
+    (New-OutboxLine 5 'issue-21' 'checks-settled' 'watch:test:issue-21:r2:bb:review' 'pr-watch'))
+  $callsBeforeC3 = @(Get-RotateCalls).Count
+  $c3b = Run-Watchdog
+  $w3b = Get-TestWake $c3b
+  Assert-True ($w3b.decision -eq 'woken') "C3b: a new PR's line beside an unchanged frontier issue must wake (got $($w3b.decision): '$($w3b.reason)')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeC3 + 1) 'C3b: exactly one more rotate.ps1 -Wake call'
+
+  # Case C4 (#231 ruling, the reverse of C3, red today): after that mixed wake the outbox part is
+  # consumed and the frontier part is unchanged. The digest text now differs (`frontier #501` alone),
+  # but every item of evidence was already carried by the last wake -> cooldown, not a second rotation.
+  Set-WakeState ((($s3a | ConvertTo-Json -Compress) | ConvertFrom-Json | ForEach-Object { $_.lastAt = (Get-Iso 10); $_.outboxConsumedThrough = (Get-Iso 10); $_ } | ConvertTo-Json -Compress))
+  Set-Outbox @((New-OutboxLine 30 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'))
+  $callsBeforeC4 = @(Get-RotateCalls).Count
+  $c4 = Run-Watchdog
+  $w4c = Get-TestWake $c4
+  Assert-True ($w4c.decision -eq 'cooldown') "C4: a frontier issue the last wake already carried must not wake again inside the window (got $($w4c.decision): evidence '$(@($w4c.evidence) -join '; ')')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeC4) 'C4: no rotate.ps1 call for already-carried frontier evidence'
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE '[]'
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
   Write-Output 'frontier-wake-respawn tests passed'

@@ -96,7 +96,7 @@ found zero findings and zero orphans.
   or the PR watcher recorded a checks-settled, checks-failed or decision-needed
   wake since the lead's session started), `rotate.ps1 -Wake` stops it at the
   boundary, reconciles, and relaunches it through the one door. Guards: one wake
-  per tenant per tick, never twice for the same evidence inside
+  per tenant per tick, never twice for evidence the last wake already carried (by identity, not digest text) inside
   `frontierWake.cooldownMinutes` (60), the boundary and PAUSE and
   `rotation-off` inside rotate.ps1, and `state/flags/frontier-wake-off` as the
   rollback. Every executed wake is a high-priority alert (`Send-FleetAlert`:
