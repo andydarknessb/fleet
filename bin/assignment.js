@@ -795,7 +795,24 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
   }
 }
 
-function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, actor = 'ic', evidence = 'assignment-started' } = {}) {
+// fleet#251: launch.ps1 invalidates (and releases) a manifest whose launch produced no session, and
+// a session that appears late still runs its first-turn ack. The release removed the record from
+// active state, so that ack answered NOT_FOUND and the session read it as a glitch. The manifest
+// sidecar says why: an invalidated, never-acknowledged manifest means this assignment was released.
+// The caller passes the manifest path (the ack CLI reads FLEET_ASSIGNMENT_MANIFEST or --manifest).
+function assertManifestNotInvalidated(manifestPath) {
+  if (!manifestPath) return;
+  if (fs.existsSync(`${manifestPath}.acknowledged.json`) || !fs.existsSync(`${manifestPath}.invalidated.json`)) return;
+  let reason = 'reason unreadable';
+  try {
+    const recorded = JSON.parse(fs.readFileSync(`${manifestPath}.invalidated.json`, 'utf8').replace(/^\uFEFF/, '')).reason;
+    reason = typeof recorded === 'string' ? recorded : JSON.stringify(recorded);
+  } catch { /* the invalidation itself is the fact; the reason is best effort */ }
+  throw new WorkStateError('MANIFEST_INVALIDATED', `manifest ${path.basename(manifestPath, '.json')} was invalidated (${reason}) before this session acknowledged it; stop, this assignment was released`, { reason });
+}
+
+function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, actor = 'ic', evidence = 'assignment-started', manifestPath } = {}) {
+  assertManifestNotInvalidated(manifestPath);
   const record = getRecord({ root, id: workRecordId });
   const result = transitionRecord({ root, id: workRecordId, expectedRevision, to: 'implementing', idempotencyKey: `assignment-started:${workRecordId}:${expectedRevision}`, evidence, actor, now });
   if (record.manifestPath) writeSidecar(`${record.manifestPath}.acknowledged.json`, { schemaVersion: 1, workRecordId, acknowledgedAt: now || new Date().toISOString(), actor, evidence });
@@ -822,7 +839,7 @@ const FLAGS = Object.freeze({
   ],
   validate: ['manifest', 'issue', 'base-sha'],
   launch: ['root', 'manifest', 'work-record-id', 'launch-script', 'repo-path', 'github-repo', 'dry-run'],
-  ack: ['root', 'work-record-id', 'expected-revision', 'now', 'evidence'],
+  ack: ['root', 'work-record-id', 'expected-revision', 'now', 'evidence', 'manifest'],
 });
 
 function usage(message) {
@@ -915,7 +932,7 @@ function cli(argv) {
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });
-  if (command === 'ack') return acknowledgeAssignment({ root: args.root, workRecordId: args['work-record-id'], expectedRevision: Number(args['expected-revision']), now: args.now, evidence: args.evidence });
+  if (command === 'ack') return acknowledgeAssignment({ root: args.root, workRecordId: args['work-record-id'], expectedRevision: Number(args['expected-revision']), now: args.now, evidence: args.evidence, manifestPath: args.manifest || process.env.FLEET_ASSIGNMENT_MANIFEST || undefined });
   throw new WorkStateError('USAGE', 'commands: frontier, assign, proof, validate, launch, ack');
 }
 
