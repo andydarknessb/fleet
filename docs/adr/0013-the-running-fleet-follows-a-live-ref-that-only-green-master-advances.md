@@ -44,6 +44,14 @@ tickets still go to Cory's sessions.
   Status note: #234 found the flake is a Windows lock race (EPERM on a delete-pending
   lock file) that reproduces serially, not only under load; the work-state lock now
   waits it out. The one-suite-at-a-time rule still stands.
+  #235: breaking a stale lock now takes a breaker mutex (`.lock.break`) and re-judges the
+  lock under it, because Windows lets rm take a lock another process holds open; a live
+  lock is never removed by anyone else and plain waiters remove nothing. Accepted
+  residual: a breaker that dies inside its brief break section leaves `.lock.break`; 60 s
+  later two contenders can both judge it stale and remove it, re-admitting two breakers,
+  and only then can the original check-then-remove race recur. The same holds for a
+  holder stalled 60 s between creating the lock and writing its pid (an empty lock reads
+  as ownerless).
 - `state/` stays outside all of this: it is not in the repository and no ref
   move touches it. A change that needs a state migration ships the migration
   as a script Cory runs, never as a side effect of the advance.

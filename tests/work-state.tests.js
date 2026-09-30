@@ -555,6 +555,51 @@ test('breaking a stale lock forgives a delete-pending removal that reports EPERM
   assert.equal(fs.existsSync(lock), false);
 });
 
+function breakMutex(root, content, ageMs) {
+  const file = path.join(root, 'state', 'work', '.lock.break');
+  fs.writeFileSync(file, content);
+  const when = new Date(Date.now() - ageMs);
+  fs.utimesSync(file, when, when);
+  return file;
+}
+
+test('#235: a stale breaker mutex left by a dead breaker is removed and the door completes', () => {
+  for (const content of ['', JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' })]) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const mutex = breakMutex(root, content, 10 * 60 * 1000);
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(fs.existsSync(lock), false);
+    assert.equal(fs.existsSync(mutex), false);
+  }
+});
+
+test('#235: a fresh breaker mutex is waited on until it disappears', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  const mutex = breakMutex(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 0);
+  withFsFault('openSync', () => null, (probe) => {
+    probe.onWait = () => { if (probe.waits === 5) fs.rmSync(mutex); return 'timed-out'; };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.ok(probe.waits >= 5, `waits: ${probe.waits}`);
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('#235: a break removal that keeps reporting EPERM throws after about five seconds', () => {
+  const root = rootDir();
+  makeRecord(root);
+  staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  withFsFault('rmSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
+    probe.onWait = () => { if (probe.waits > 2000) throw new Error('spun past the transient limit'); return 'timed-out'; };
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
+  });
+  assert.equal(fs.existsSync(path.join(root, 'state', 'work', '.lock.break')), false);
+});
+
 test('breaking a stale lock forgives a lock that reads as EPERM', () => {
   const root = rootDir();
   makeRecord(root);
@@ -1601,4 +1646,119 @@ test('#211: an escalation may carry the named reason criteria-defect with no pre
   const wake = fs.readFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).pop();
   assert.equal(wake.reason, 'criteria-defect');
   assert.ok(!('premise' in wake));
+});
+
+// #235: judging a lock stale and removing it are separate steps, and the bootstrap
+// active.json write runs before the lock. Both races live in windows a scheduler
+// can open at any time, so each child widens its own window by monkeypatching fs
+// (test-only, in the child; bin/work-state.js is untouched): a delay between the
+// stale judgement and the removal stands in for a descheduled contender, and a
+// hold on the active.json read stands in for a long critical section (a merge
+// transition reconciles GitHub under the lock, up to 15 s). A file barrier makes
+// every contender probe the lock in the same millisecond, so node startup jitter
+// does not decide the interleaving. WORK_STATE_RACE_ROUNDS repeats each scenario.
+const RACE_ROUNDS = Number(process.env.WORK_STATE_RACE_ROUNDS || 3);
+
+function contend(children) {
+  const barrier = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-work-state-barrier-'));
+  const preamble = (index) => `
+const fs=require('node:fs');const path=require('node:path');
+const wait=(ms)=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);
+const m=require(${JSON.stringify(path.resolve(__dirname, '..', 'bin', 'work-state.js'))});
+const barrier=${JSON.stringify(barrier)};
+const arrive=()=>{fs.writeFileSync(path.join(barrier,'ready-${index}'),'');while(fs.readdirSync(barrier).length<${children.length})wait(1);};
+const report=(fn)=>{try{fn();process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error');process.stderr.write(String(e.stack||e))}};
+`;
+  return Promise.all(children.map((body, index) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', preamble(index) + body], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', () => resolve({ output, stderr }));
+  })));
+}
+
+test('#235: two contenders breaking the same stale lock admit exactly one holder', async () => {
+  const contender = (root, index, breakDelayMs, holdMs) => `
+const rm=fs.rmSync;fs.rmSync=function(t,o={}){if(path.basename(String(t))==='.lock'&&!o.maxRetries)wait(${breakDelayMs});return rm.call(this,t,o);};
+const rn=fs.renameSync;fs.renameSync=function(f,t){if(path.basename(String(f))==='.lock')wait(${breakDelayMs});return rn.call(this,f,t);};
+const rf=fs.readFileSync;fs.readFileSync=function(t,...r){const out=rf.call(this,t,...r);if(path.basename(String(t))==='active.json')wait(${holdMs});return out;};
+arrive();
+report(()=>m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'stale-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'}));`;
+  const verdicts = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    makeRecord(root);
+    staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const runs = await contend([contender(root, 0, 50, 300), contender(root, 1, 150, 300)]);
+    assert.deepEqual(runs.filter((run) => run.output !== 'ok' && run.output !== 'STALE_REVISION'), [], 'a contender died instead of losing');
+    verdicts.push(runs.map((run) => run.output).sort().join(','));
+  }
+  const doubleHolders = verdicts.filter((verdict) => verdict === 'ok,ok').length;
+  assert.equal(doubleHolders, 0, `${doubleHolders}/${RACE_ROUNDS} rounds admitted two holders: both contenders committed revision 1 -> 2 (${verdicts.join(' | ')})`);
+  assert.deepEqual(verdicts, Array(RACE_ROUNDS).fill('STALE_REVISION,ok'));
+});
+
+test('#235: two bootstraps on a fresh root lose no commit', async () => {
+  const contender = (root, index, writeDelayMs) => `
+let bootstrapped=false;const wf=fs.writeFileSync;
+fs.writeFileSync=function(t,d,...r){if(!bootstrapped&&path.basename(String(t)).startsWith('active.json')&&/"records": \{\}/.test(String(d))){bootstrapped=true;wait(${writeDelayMs});}return wf.call(this,t,d,...r);};
+arrive();
+report(()=>m.createRecord({root:${JSON.stringify(root)},id:'endzone:issue-${index}',tenant:'endzone',issue:${index},state:'assigned',idempotencyKey:'create-${index}',now:'2026-09-01T00:00:0${index}.000Z'}));`;
+  const lost = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    const runs = await contend([contender(root, 1, 30), contender(root, 2, 300)]);
+    assert.deepEqual(runs.map((run) => run.output), ['ok', 'ok'], runs.map((run) => run.stderr).join('\n'));
+    const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+    const ids = Object.keys(active.records).sort();
+    if (ids.length !== 2) lost.push(ids.join(',') || '(none)');
+    assert.equal(readEvents(root).filter((event) => event.type === 'work-created').length, 2, 'both creates reached the ledger');
+  }
+  assert.equal(lost.length, 0, `${lost.length}/${RACE_ROUNDS} rounds lost a committed record: active.json kept only [${lost.join(' | ')}] after the second bootstrap overwrote it`);
+});
+
+test('#235: a stale lock and a stale breaker mutex whose removal keeps reporting EPERM throws after about five seconds', () => {
+  const root = rootDir();
+  makeRecord(root);
+  staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  breakMutex(root, '', 10 * 60 * 1000);
+  withFsFault('rmSync', (target) => (path.basename(target) === '.lock.break' ? 'EPERM' : null), (probe) => {
+    probe.onWait = () => { if (probe.waits > 2000) throw new Error('spun past the transient limit'); return 'timed-out'; };
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
+  });
+});
+
+test('#235: a lock whose owner pid reports EPERM to signal 0 is alive and not breakable', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 4, at: '2026-01-01T00:00:00.000Z' }));
+  const kill = process.kill;
+  process.kill = () => { throw Object.assign(new Error('EPERM: simulated'), { code: 'EPERM' }); };
+  try {
+    withFsFault('openSync', (target, probe) => (isLock(target) && probe.waits > 5 ? 'ENOSPC' : null), (probe) => {
+      assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'ENOSPC');
+      assert.ok(probe.waits > 5);
+    });
+  } finally { process.kill = kill; }
+  assert.equal(fs.existsSync(lock), true);
+});
+
+test('#235: a contender stalled after judging the lock stale re-judges it under the breaker mutex', async () => {
+  const contender = (root, index, mutexDelayMs, holdMs) => `
+const op=fs.openSync;let first=true;fs.openSync=function(t,...r){if(path.basename(String(t))==='.lock.break'&&first){first=false;wait(${mutexDelayMs});}return op.call(this,t,...r);};
+const rf=fs.readFileSync;fs.readFileSync=function(t,...r){const out=rf.call(this,t,...r);if(path.basename(String(t))==='active.json')wait(${holdMs});return out;};
+arrive();
+report(()=>m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'rejudge-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'}));`;
+  const verdicts = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    makeRecord(root);
+    staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const runs = await contend([contender(root, 0, 0, 800), contender(root, 1, 200, 0)]);
+    verdicts.push(runs.map((run) => run.output).sort().join(','));
+  }
+  assert.deepEqual(verdicts, Array(RACE_ROUNDS).fill('STALE_REVISION,ok'));
 });

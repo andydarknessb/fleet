@@ -7,6 +7,9 @@
   The intent file state/rotation/<name>.json makes a crash between stop and launch
   recoverable: the next run (-Auto or -Resume) completes the launch from roster
   intent and the saved event offset. Registered by install-rotation-task.ps1.
+  Phases: stopping -> stopped -> launching -> launched. `launching` is written just before
+  launch.ps1 runs (with launchingAt), because the replacement's SessionStart hook can fire
+  before launch.ps1 returns the session id (fleet #230).
 .EXAMPLE   rotate.ps1 -Auto            # scheduled: resume incomplete, rotate the due
 .EXAMPLE   rotate.ps1 -Name pl-endzone -Force   # Cory's hand: rotate now
 #>
@@ -123,8 +126,15 @@ function Complete-Rotation {
   # positional VALUE to the script, silently launching nothing that was asked for.
   $launchArgs = @{ FromRoster = $Intent.name }
   if ($Force) { $launchArgs.Force = $true }   # a forced rotation must not strand the role behind launch gates it was told to pass
-  $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
-  $launchExit = $LASTEXITCODE
+  # fleet #230: the replacement's SessionStart hook can run before launch.ps1 returns its
+  # session id, so `launched` + newSessionId (written after) is too late for it. Mark the
+  # launch as under way first; the hook accepts this phase for a same-name session that
+  # starts inside a short window after launchingAt.
+  $Intent.phase = 'launching'
+  $Intent | Add-Member -NotePropertyName launchingAt -NotePropertyValue (Now-Iso) -Force
+  Write-Json $intentPath $Intent
+  # fleet #230: a launch.ps1 that throws must reach the failure branch (phase back to `stopped`), not the top-level catch.
+  try { $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String; $launchExit = $LASTEXITCODE } catch { $out = "launch.ps1 threw: $($_.Exception.Message)"; $launchExit = 1 }
   $launch = ConvertFrom-LastJsonLine $out
   if ($launch -and "$($launch.reason)" -match 'already running') {
     # fleet #121: a session under the name is not always a hand relaunch. On 2026-09-23
@@ -145,9 +155,10 @@ function Complete-Rotation {
     if ($staleWhy) {
       & claude stop $runningRow.id 2>&1 | Out-Null
       $Intent | Add-Member -NotePropertyName staleRevival -NotePropertyValue ([pscustomobject]@{ at = (Now-Iso); jobId = "$($runningRow.id)"; why = $staleWhy }) -Force
+      $Intent | Add-Member -NotePropertyName launchingAt -NotePropertyValue (Now-Iso) -Force   # fleet #230: a fresh window for the retry launch
       Write-Json $intentPath $Intent
-      $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
-      $launchExit = $LASTEXITCODE
+      # fleet #230: a launch.ps1 that throws must reach the failure branch (phase back to `stopped`), not the top-level catch.
+      try { $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String; $launchExit = $LASTEXITCODE } catch { $out = "launch.ps1 threw: $($_.Exception.Message)"; $launchExit = 1 }
       $launch = ConvertFrom-LastJsonLine $out
       # Still "already running" after the stop: the stale job did not go down (a failed or
       # late stop). That is not a hand relaunch either; fail and keep the intent resumable.
@@ -173,6 +184,7 @@ function Complete-Rotation {
     return New-Outcome $Intent.name 'rotated' 'found live externally'
   }
   $reason = if ($launch) { "$($launch.reason)" } else { "launch.ps1 exit $launchExit : $(($out -replace '\s+', ' ').Trim())" }
+  $Intent.phase = 'stopped'   # fleet #230: never leave a failed launch marked `launching`
   $Intent | Add-Member -NotePropertyName launchError -NotePropertyValue ([pscustomobject]@{ at = (Now-Iso); reason = $reason }) -Force
   Write-Json $intentPath $Intent
   return New-Outcome $Intent.name 'failed' "replacement launch failed: $reason"

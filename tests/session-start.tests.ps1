@@ -90,6 +90,64 @@ try {
   $out5 = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement"}'
   Assert-True ($out5 -notmatch 'ROTATION:') 'an incomplete rotation must not claim a completed handoff'
 
+  # Case 5b (fleet #230): the race. rotate.ps1 writes `phase: launching` + `launchingAt`
+  # BEFORE calling launch.ps1, and launch.ps1 only learns the session id from the daemon
+  # list after `claude --bg` returns; the replacement's SessionStart hook can run before
+  # `launched` + `newSessionId` are written. The session the rotation launched (source
+  # `startup`, name match, started inside the launching window) must get the handoff.
+  $nowUtc = (Get-Date).ToUniversalTime()
+  $launchingAt = $nowUtc.AddSeconds(-5).ToString('o')
+  $launchingIntent = '{"schemaVersion":1,"name":"pl-endzone","phase":"launching","launchingAt":"' + $launchingAt + '","reasons":["age 25.0h >= 24h"],"savedAt":"' + $nowUtc.AddSeconds(-12).ToString('o') + '","oldSessionId":"sess-old","offset":{"totalEvents":41},"reconcile":{"at":"2026-09-02T10:01:00.000Z","ok":true}}'
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" $launchingIntent
+  $out5b = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement","source":"startup"}'
+  Assert-True ($out5b -match 'ROTATION: you replace a predecessor') 'the session a rotation launched must get the handoff while the intent is still in the pre-launch (launching) phase'
+  Assert-True ($out5b -match '41 events') 'the pre-launch handoff must carry the saved offset'
+  # 5c: the window is scoped by the name inside the intent too: pl-endzone's file that
+  # names another session is not pl-endzone's handoff, even inside the window.
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" ($launchingIntent.Replace('"name":"pl-endzone"', '"name":"pl-other"'))
+  $out5c = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement","source":"startup"}'
+  Assert-True ($out5c -notmatch 'ROTATION:') 'an intent naming another session must not hand off inside the launching window'
+  # 5c2: path scoping: a session with no intent file of its own gets nothing.
+  $out5c2 = Run-Hook 'dispatcher' 'dispatcher' '' '{"session_id":"sess-dispatcher","source":"startup"}'
+  Assert-True ($out5c2 -notmatch 'ROTATION:') 'another name starting inside the launching window must not see the handoff'
+  # 5d: a launching intent whose window has long passed (rotate.ps1 died mid-launch) is stale:
+  # a hand launch of the name minutes later must not inherit it.
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" ($launchingIntent.Replace($launchingAt, $nowUtc.AddMinutes(-10).ToString('o')))
+  $out5d = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-hand-launch","source":"startup"}'
+  Assert-True ($out5d -notmatch 'ROTATION:') 'a launching intent older than the window must not hand off to a later session of the name'
+  # 5e: only a session START is the replacement; a resume, clear or compact of some other
+  # session of the name inside the window is not.
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" $launchingIntent
+  foreach ($source in @('resume', 'compact', 'clear')) {
+    $out5e = Run-Hook 'pl-endzone' 'project-lead' 'endzone' ('{"session_id":"sess-other","source":"' + $source + '"}')
+    Assert-True ($out5e -notmatch 'ROTATION:') "a SessionStart of source '$source' inside the launching window must not claim the handoff"
+  }
+  # 5f: a failed launch is written back as `stopped` with launchError; the launchingAt it
+  # carries from the attempt must not make a later session of the name read it as its own.
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" ($launchingIntent.Replace('"phase":"launching"', '"phase":"stopped","launchError":{"at":"' + $nowUtc.ToString('o') + '","reason":"cap reached (6/6)"}'))
+  $out5f = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-after-failure","source":"startup"}'
+  Assert-True ($out5f -notmatch 'ROTATION:') 'a failed launch (phase stopped, launchError) must leave no handoff for a later session of the name'
+  # 5g: once rotate.ps1 has written `launched` + newSessionId, the exact-id match governs
+  # again: the launched session still gets it, a different id does not (as :75 and :86).
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" ($launchingIntent.Replace('"phase":"launching"', '"phase":"launched","newSessionId":"sess-replacement","newJobId":"job-new"'))
+  $out5g = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement","source":"startup"}'
+  Assert-True ($out5g -match 'ROTATION: you replace a predecessor') 'after the launched write the exact id still gets the handoff'
+  $out5g2 = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-later-respawn","source":"startup"}'
+  Assert-True ($out5g2 -notmatch 'ROTATION:') 'after the launched write a different id inside the window must not get the handoff'
+
+  # 5h (fleet #230 QA, residual 5a): launch.ps1 can accept a daemon row with an empty
+  # sessionId, so rotate.ps1 writes `launched` with an empty newSessionId. That intent
+  # matches no id, so the same window rules apply; outside them it hands off to nobody.
+  $emptyIdIntent = $launchingIntent.Replace('"phase":"launching"', '"phase":"launched","newSessionId":"","newJobId":"job-new"')
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" $emptyIdIntent
+  $out5h = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement","source":"startup"}'
+  Assert-True ($out5h -match 'ROTATION: you replace a predecessor') 'a launched intent with an empty newSessionId must still hand off inside the window'
+  $out5h2 = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-replacement","source":"resume"}'
+  Assert-True ($out5h2 -notmatch 'ROTATION:') 'an empty-id launched intent must not hand off to a resume'
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" ($emptyIdIntent.Replace($launchingAt, $nowUtc.AddMinutes(-10).ToString('o')))
+  $out5h3 = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-hand-launch","source":"startup"}'
+  Assert-True ($out5h3 -notmatch 'ROTATION:') 'an empty-id launched intent older than the window must not hand off'
+
   # Case 6 (#218): the weekly review-category notice (bin/review-categories.js) is an
   # ordinary IC-board paragraph. A newly launched IC sees it; a lead does not; and it
   # drops out once the week it carries has passed. The notice is rendered by the script's

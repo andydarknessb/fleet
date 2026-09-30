@@ -26,11 +26,11 @@ function Read-ActiveWork {
   # including a MISSING file, see below), or 'unreadable' (malformed, unparseable, or
   # shaped wrong - a real reason not to trust it).
   # A MISSING file is read as 'ok' with an empty map: bin/work-state.js's own
-  # ensureLayout creates state/work/active.json as {schemaVersion:1, records:{}} the
-  # first time any script touches the fleet, so "the file is not there yet" is that
-  # same empty shape, not corruption. A file that EXISTS but fails to parse, or parses
-  # to something without a .records object, is never assumed empty - that is corruption
-  # (a torn write, disk trouble) and must block every removal decision that depends on
+  # withLock creates state/work/active.json as {schemaVersion:1, records:{}} under the
+  # lock on the first door call (#235; ensureLayout only makes directories), so "the file is
+  # not there yet" is that same empty shape, not corruption. A file that EXISTS but
+  # fails to parse, or parses to something without a .records object, is never
+  # assumed empty - that is corruption (a torn write, disk trouble) and must block every removal decision that depends on
   # it, not just the one for the record it happened to be checking (fleet #88 review
   # finding 3: reading absence off a broken file let a CLOSED-issue check license
   # removing an `implementing` record's worktree).

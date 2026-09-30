@@ -270,7 +270,7 @@ try {
   function Test-FrontierWaiting {
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
     if ($script:frontierWaitingCache.ContainsKey($TenantName)) { return $script:frontierWaitingCache[$TenantName] }
-    $result = [pscustomobject]@{ evidence = @(); reason = ''; error = $null }
+    $result = [pscustomobject]@{ evidence = @(); issues = @(); reason = ''; error = $null }
     if (-not $NodeExe) { $result.error = 'node not found'; $script:frontierWaitingCache[$TenantName] = $result; return $result }
     $activeIcs = 0; if ($LiveRoster) { $activeIcs = @($LiveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $TenantName }).Count }
     $maxIcs = 0; try { $maxIcs = [int]$Tenant.maxIcs } catch {}
@@ -290,11 +290,20 @@ try {
       if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $bounded.stdout 200)" }
       else {
         $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
-        if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
+        if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')"; $result.issues = $eligible }
       }
     }
     $script:frontierWaitingCache[$TenantName] = $result
     return $result
+  }
+
+  function Get-WakeLineId {
+    # fleet #231: one spelling of an outbox line's identity, shared by the writer of
+    # the frontier-wake state and the cooldown compare. "<recordId>#<eventSequence>";
+    # a line with no eventSequence falls back to "<recordId>@<at>".
+    param($Line)
+    if ($Line.PSObject.Properties['eventSequence'] -and "$($Line.eventSequence)" -ne '') { return "$($Line.recordId)#$($Line.eventSequence)" }
+    return "$($Line.recordId)@$($Line.at)"
   }
 
   function Get-UnconsumedWakes {
@@ -316,8 +325,10 @@ try {
     # follows and is the actionable wake, so both would rotate the lead twice.
     # $SelfActor drops a resolution its own session performed. $Details, when
     # given, collects one "<record> <from> -> <to>" per counted resolution so the
-    # wake reason can name them.
-    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '', [string]$Recipient = 'lead', $Details = $null)
+    # wake reason can name them. $Lines (fleet #231), when given, collects one
+    # { id; at; wake } per counted line so the frontier wake can record by identity
+    # what it delivered.
+    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '', [string]$Recipient = 'lead', $Details = $null, $Lines = $null)
     $kinds = @{}
     $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
     if (-not (Test-Path $outboxPath)) { return $kinds }
@@ -335,6 +346,7 @@ try {
       elseif ("$($o.wake)" -eq 'resolution' -and ($raisedBy -like 'pe-*' -or ($o.PSObject.Properties['to'] -and "$($o.to)" -eq 'ci-wait'))) { continue }
       if ($SelfActor -and @('decision-needed', 'resolution') -contains "$($o.wake)" -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
+      if ($null -ne $Lines) { [void]$Lines.Add([pscustomobject]@{ id = (Get-WakeLineId $o); at = $atUtc; wake = "$($o.wake)" }) }
       if ($null -ne $Details -and "$($o.wake)" -eq 'resolution') { [void]$Details.Add("$($o.recordId) $($o.from) -> $($o.to)") }
     }
     return $kinds
@@ -928,7 +940,8 @@ try {
   # --- lead is rotated NOW through rotate.ps1 -Wake: stop at the boundary, reconcile,
   # --- relaunch through the one door, so the replacement reconstructs from state exactly as
   # --- a rotated lead does. This retires the lead's hourly polling cron. Loop guards: one
-  # --- wake per tenant per tick; never twice for the same evidence inside
+  # --- wake per tenant per tick; never twice for evidence the last wake already carried
+  # --- (by identity, fleet #231: issue numbers and outbox line ids, not digest text) inside
   # --- frontierWake.cooldownMinutes; the boundary, PAUSE and rotation-off still apply
   # --- inside rotate.ps1; state/flags/frontier-wake-off disables it. Every executed wake is
   # --- a log-only entry in state/alerts/alerts.jsonl (ticket 76, ADR 0012: a wake of a
@@ -970,25 +983,41 @@ try {
       $leadRosterRow = $null; if ($liveRoster) { $leadRosterRow = @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $leadName -and $_.status -eq 'active' -and $_.launchedAt } | Sort-Object { ConvertTo-UtcDateTime $_.launchedAt } -Descending)[0] }
       if ($leadRosterRow) { $leadLaunchedAt = ConvertTo-UtcDateTime $leadRosterRow.launchedAt }
       # Source 1: the planner's frontier, with an IC slot and a cap slot to launch into.
+      $fw = $null
       if ($wakeSources -contains 'frontier' -and $nodeExe) {
         $fw = Test-FrontierWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap
         if ($fw.evidence.Count -gt 0) { $wake.evidence += $fw.evidence } elseif ($fw.reason) { $wake.reason = $fw.reason }
       }
+      $leadLines = New-Object System.Collections.ArrayList
       # Source 2: PR-watcher wakes recorded since this lead was launched and not yet delivered.
       if ($wakeSources -contains 'outbox') {
         $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
         $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
         $leadResolved = New-Object System.Collections.ArrayList
-        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName -Details $leadResolved
+        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName -Details $leadResolved -Lines $leadLines
         if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
         # #204: the wake reason names each record that left escalated or hold, so the lead resumes from what changed.
         foreach ($r in $leadResolved) { $wake.evidence += "resolved $r" }
       }
       if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
-      # Cooldown: the same evidence within the window means the last wake did not clear it; do not loop.
+      # Cooldown (fleet #231): defer only when EVERY item of this tick's evidence was carried by the last
+      # wake, by identity: each current frontier issue is in its `frontierIssues` and each unconsumed outbox
+      # line id is in its `delivered`. The digest text carries kind counts only, so a new PR's line read as
+      # a repeat of the last one. A state written before #231 has no `delivered`: it keeps the old
+      # digest-equality rule and is upgraded by its next wake.
       $digest = ($wake.evidence -join '; ')
+      $frontierIssues = @(); if ($fw -and $fw.PSObject.Properties['issues']) { $frontierIssues = @($fw.issues) }
+      $lineIds = @($leadLines | ForEach-Object { $_.id })
       $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
-      if ($tenantState -and "$($tenantState.digest)" -eq $digest -and $tenantState.lastAt) {
+      $alreadyCarried = $false
+      if ($tenantState -and $tenantState.lastAt) {
+        if ($tenantState.PSObject.Properties['delivered']) {
+          $carriedLines = @($tenantState.delivered | ForEach-Object { "$_" })
+          $carriedIssues = @(); if ($tenantState.PSObject.Properties['frontierIssues']) { $carriedIssues = @($tenantState.frontierIssues | ForEach-Object { [int]$_ }) }
+          $alreadyCarried = (@($frontierIssues | Where-Object { $carriedIssues -notcontains $_ }).Count -eq 0) -and (@($lineIds | Where-Object { $carriedLines -notcontains $_ }).Count -eq 0)
+        } else { $alreadyCarried = ("$($tenantState.digest)" -eq $digest) }
+      }
+      if ($alreadyCarried) {
         $lastAt = ConvertTo-UtcDateTime $tenantState.lastAt
         if ($lastAt -and ($now - $lastAt).TotalMinutes -lt $wakeCooldown) {
           $wake.decision = 'cooldown'; $wake.reason = "same evidence woken at $($tenantState.lastAt); cooldown $wakeCooldown min"
@@ -1003,9 +1032,19 @@ try {
       $wake.outcome = if ($rotateOut -and $rotateOut.PSObject.Properties['outcomes']) { @($rotateOut.outcomes | Where-Object { $_.name -eq $leadName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $rotateRaw 200 }
       if ($rotated) {
         $wake.decision = 'woken'
-        $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = (Now-Iso) }) -Force
+        # fleet #231: the watermark is the newest DELIVERED line's `at` (a line written while rotate.ps1
+        # ran is no longer consumed undelivered); with no line delivered the prior watermark stands.
+        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, and
+        # fleet-dead/heal, which pass no -Since, would otherwise keep counting them) nor the prior watermark.
+        # Assumes Windows PowerShell 5.1: ConvertFrom-Json leaves ISO strings as strings; under pwsh 7 they become
+        # DateTime and sub-second precision would be lost.
+        $wmCandidates = @($leadLines | ForEach-Object { $_.at })
+        if ($leadLaunchedAt) { $wmCandidates += $leadLaunchedAt }
+        if ($tenantState -and $tenantState.outboxConsumedThrough) { $priorWm = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough; if ($priorWm) { $wmCandidates += $priorWm } }
+        $newWatermark = if ($wmCandidates.Count -gt 0) { (@($wmCandidates | Sort-Object -Descending)[0]).ToString('o') } else { Now-Iso }
+        $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = $newWatermark; delivered = @($lineIds); frontierIssues = @($frontierIssues) }) -Force
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
-        try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+        try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $frontierWakes += [pscustomobject]$wake
     }
