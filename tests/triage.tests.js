@@ -805,6 +805,28 @@ test('#233: a finalize that throws after the read is reported and the frontier s
   assert.throws(() => triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner: () => { throw Object.assign(new Error('x'), { stderr: 'rate limited' }); } }), { code: 'GITHUB_QUERY_FAILED' });
 });
 
+test('#233: a frontier that throws after a completed finalize returns the finalize with a frontierError, not a failure', () => {
+  const world = finalizeWorld();
+  fs.mkdirSync(path.join(world.root, 'state', 'work'), { recursive: true });
+  fs.writeFileSync(path.join(world.root, 'state', 'work', 'active.json'), '{not json');
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed);
+  assert.throws(() => computeFrontier({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, () => '') }), 'the standalone frontier does throw on that state');
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1);
+  assert.deepEqual(tick.finalize.finalized.map((row) => row.issue), [40], 'the finalize result survives');
+  assert.equal(tick.frontier, undefined);
+  assert.equal(typeof tick.frontierError, 'string');
+  assert.ok(tick.frontierError.length > 0);
+  // Through the CLI the same result is printed with exit 0 (cli returns rather than throws).
+  const world2 = finalizeWorld();
+  fs.mkdirSync(path.join(world2.root, 'state', 'work'), { recursive: true });
+  fs.writeFileSync(path.join(world2.root, 'state', 'work', 'active.json'), '{not json');
+  const out = cli(['tick', '--root', world2.root, '--tenant', 'endzone', '--fixture', world2.fixture, '--now', NOW]);
+  assert.deepEqual(out.finalize.finalized.map((row) => row.issue), [40]);
+  assert.ok(out.frontierError);
+});
+
 test('#233: the tick CLI runs against a fixture: the fixture is edited as finalize edits it and the frontier omits the finalized issue', () => {
   const world = finalizeWorld({ numbers: [40, 41], each: (n) => (n === 41 ? { thread: { approval: 'Approved with: tier haiku' } } : {}) });
   const out = cli(['tick', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', NOW]);

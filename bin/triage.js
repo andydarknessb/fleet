@@ -1067,8 +1067,14 @@ function triageTick({ root, tenant, tenantConfigPath, fixture, outboxPath, now, 
     finalize = { error: String(error.message || error) };
   }
   const issues = applyFinalizeMutations(read, mutations, { author: tenantConfig.fleetIdentity || 'fleet', at });
-  const frontier = computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, now: at, runner, issues });
-  return { tenant: String(tenant), finalize, frontier };
+  // The finalize's writes are already on GitHub and the ledger, so a frontier that throws here (local state
+  // unreadable) must not take the finalize result with it: report it beside the finalize, exit 0, and the
+  // caller records the finalize and treats the missing frontier as a frontier failure.
+  try {
+    return { tenant: String(tenant), finalize, frontier: computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, now: at, runner, issues }) };
+  } catch (error) {
+    return { tenant: String(tenant), finalize, frontierError: String(error.message || error) };
+  }
 }
 
 // ------------------------------------------------------------------ CLI ----
