@@ -885,8 +885,8 @@ function rosterClaims(p, rosterPath) {
   return new Map(rosterClaimRows(p, rosterPath).map(({ id, row }) => [id, row]));
 }
 
-function samePath(a, b) {
-  const [left, right] = [path.resolve(String(a)), path.resolve(String(b))];
+function samePath(a, b, base) {
+  const [left, right] = [path.resolve(base, String(a)), path.resolve(base, String(b))];
   return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
@@ -897,7 +897,7 @@ function samePath(a, b) {
 // with no manifest falls back to tenant plus issue. Shadow keeps the plain tenant+issue match.
 function releaseClaim(p, rosterPath, record) {
   return rosterClaimRows(p, rosterPath).find(({ id, row }) => id === record.id
-    && (!row.manifest || (record.manifestPath && samePath(row.manifest, record.manifestPath))))?.row || null;
+    && (!row.manifest || (record.manifestPath && samePath(row.manifest, record.manifestPath, p.base))))?.row || null;
 }
 
 function releaseRecord(options = {}) {

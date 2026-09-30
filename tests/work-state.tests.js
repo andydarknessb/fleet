@@ -2162,3 +2162,17 @@ test('#251 QA4: a second quarantined journal never overwrites the first', () => 
   assert.equal(kept.length, 2, `both quarantined journals survive: ${kept.join(',')}`);
   assert.ok(kept.every((name) => name.endsWith('.json')));
 });
+
+test('#251 QA: a relative roster manifest resolves against the fleet root, not the process cwd', () => {
+  const root = rootDir();
+  const reserved = reserveIssue(root, 2540);
+  const rosterPath = writeRoster(root, [icRow(2540, { manifest: 'state/manifests/assignment-2540.json' })]);
+  const previous = process.cwd();
+  process.chdir(os.tmpdir());
+  try {
+    assert.throws(
+      () => releaseRecord({ root, id: 'endzone:issue-2540', expectedRevision: reserved.revision, idempotencyKey: 'release-2540', rosterPath, now: '2026-09-30T00:00:01.000Z' }),
+      (error) => error.code === 'RELEASE_CLAIMED',
+    );
+  } finally { process.chdir(previous); }
+});

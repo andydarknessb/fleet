@@ -128,7 +128,7 @@ function Invalidate-Manifest {
   param([string]$Reason)
   $node = Get-Command node -ErrorAction SilentlyContinue
   if (-not $node) { throw 'node is required to release the assignment reservation' }
-  $releaseOutput = & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | Out-String
+  $releaseOutput = & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | ForEach-Object { "$_" } | Out-String
   # fleet#251: the door's error text (RELEASE_CLAIMED names bin\retire.ps1) reaches the operator.
   $releaseExit = $LASTEXITCODE
   if ($releaseExit -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId': $(($releaseOutput | Out-String).Trim())" }
@@ -594,6 +594,8 @@ if (-not $row) {
   # stays only if the assignment is demonstrably live: the record left `assigned` (a late
   # session acknowledged) or the session list now shows the job. Otherwise it goes as before:
   # a stranded worktree makes every relaunch exit 4 ("already exists") before it can release.
+  # An unreadable record and daemon list default to removing the worktree (the pre-#251
+  # behaviour): keeping it on no evidence is what strands every relaunch.
   $keepWorktree = $false
   if ($Manifest -and -not $released) {
     try {
@@ -611,10 +613,13 @@ if (-not $row) {
 }
 
 # --- record ---
+# The row carries the resolved manifest path (as FLEET_ASSIGNMENT_MANIFEST does), which
+# work-state release matches against the record's manifest to tell a live claim from a stale row.
+$rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } else { $Manifest }
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
   model = $Model; permissions = $Permissions; effort = $effort
-  jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $Manifest; workRecordId = $WorkRecordId
+  jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $rosterManifest; workRecordId = $WorkRecordId
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }
 $live.sessions = @($live.sessions | Where-Object { $_.name -ne $Name }) + @($entry)

@@ -53,3 +53,13 @@ Assert-True ($invalidateFn -notmatch 'release[^\n]*Out-Null') 'Invalidate-Manife
 Assert-True ($invalidateFn -match 'release failed[^\n]*\$releaseOutput|\$releaseOutput[^\n]*release failed') 'the thrown release failure carries the node error text'
 
 Write-Output 'launch-release-order (QA): ok'
+
+# fleet#251 QA follow-ups: the roster row records the resolved manifest path (release matches it
+# against the record's manifest), the release error is stripped of PS 5.1 NativeCommandError
+# noise, and the keep-worktree default is documented.
+$entryLine = ($lines | Where-Object { $_ -match 'settings = \$settingsPath; manifest =' } | Select-Object -First 1)
+Assert-True ($entryLine -match 'manifest = \(Resolve-Path -LiteralPath \$Manifest\)\.Path' -or ($entryLine -match 'manifest = \$rosterManifest' -and ($lines -join "`n") -match '\$rosterManifest = .*Resolve-Path -LiteralPath \$Manifest')) 'the roster row records the resolved manifest path'
+Assert-True (($invalidateFn -replace "`r", '') -match 'ForEach-Object \{ "\$_" \} \| Out-String') 'the captured release error is stringified per line, dropping NativeCommandError decoration'
+Assert-True ($block -match 'unreadable record and daemon list default to removing') 'the keep-worktree default is documented'
+
+Write-Output 'launch-release-order (follow-ups): ok'
