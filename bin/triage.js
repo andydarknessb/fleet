@@ -615,7 +615,12 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // the issue is closed or absent) so the Principal copies the hash into
     // `record --kind proposed` instead of hashing the body by hand and mismatching.
     const issue = issueByNumber.get(Number(parsed.issue)) || null;
-    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
+    // #268: an escalation is a decision the Principal must see, served even when the issue has an open
+    // proposal. `record --kind proposed` would be refused with TRIAGE_PROPOSAL_OPEN, so the item carries
+    // the proposal it replaces and the Principal records `superseded` first.
+    const openRow = projection.byIssue[parsed.issue] || null;
+    const openProposal = openRow && openRow.proposed && !openRow.outcome ? { commentUrl: openRow.proposed.commentUrl || null, bodyHash: openRow.proposed.bodyHash || null, at: openRow.proposed.at } : null;
+    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, ...(openProposal ? { openProposal } : {}), reason: 'decision-needed wake newer than the consumed marker' });
   }
 
   // Spec fleet #92 (#143): the backfill census. Open issues carrying the ready

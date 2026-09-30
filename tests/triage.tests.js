@@ -431,14 +431,15 @@ function openProposalWorld() {
   return { root, entries: readLedger(root, 'endzone') };
 }
 // What the Principal does with a frontier item, against a copy of the ledger (the real record path):
-// a ticket is `record --kind proposed`; a reproposal supersedes the open proposal first, then proposes.
+// a ticket is `record --kind proposed`; a reproposal, or an escalation carrying an openProposal (#268),
+// supersedes the open proposal first, then proposes.
 function principalCanRecord(world, item) {
   const copy = rootDir();
   fs.mkdirSync(path.dirname(triage.ledgerPath(copy, 'endzone')), { recursive: true });
   fs.copyFileSync(triage.ledgerPath(world.root, 'endzone'), triage.ledgerPath(copy, 'endzone'));
   const base = { root: copy, tenant: 'endzone', issue: item.number, now: '2026-09-25T00:00:00.000Z' };
   try {
-    if (item.kind === 'reproposal') recordEntry({ ...base, kind: 'superseded', bodyHash: item.bodyHash });
+    if (item.kind === 'reproposal' || item.openProposal) recordEntry({ ...base, kind: 'superseded', bodyHash: item.bodyHash });
     recordEntry({ ...base, kind: 'proposed', bodyHash: item.bodyHash, commentUrl: 'https://x/new', model: 'fable' });
     return true;
   } catch (error) {
@@ -519,16 +520,48 @@ test('#263: a changed body reopens an unmarked open proposal as a reproposal, as
   }
 });
 
-test('#263: no ticket or reproposal the frontier emits (no outbox) for an open-proposal issue is refused by record --kind proposed', () => {
+// #268: a decision-needed wake newer than the consumed marker is served as an escalation, open proposal or not
+// (it is a decision the Principal must see). It carries the open proposal so the Principal supersedes it first.
+const WAKE = { wake: 'decision-needed', recordId: 'endzone:issue-7', at: '2026-09-20T00:00:00.000Z', evidence: 'lead needs a ruling', reason: 'stale-premise', premise: 'src/a.js: x @abc1234' };
+
+test('#268: an escalation on an issue with an open proposal is served carrying that proposal, under the marker or a hold label', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET, outbox: [WAKE] };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const proposalHash = triage.normalizeIssue(issue(7, { body: OPEN_BODY })).bodyHash;
+  for (const labels of [['triage-proposed'], ['haiku-rehearsal'], ['fleet-escalation'], ['needs-triage'], []]) {
+    const result = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:escalation'], `labels [${labels}]`);
+    assert.deepEqual(result.eligible[0].openProposal, { commentUrl: 'https://x/7', bodyHash: proposalHash, at: OPEN_AT });
+    assert.equal(result.eligible[0].bodyHash, proposalHash);
+    assert.equal(principalCanRecord(world, result.eligible[0]), true, 'supersede then propose succeeds');
+  }
+  // A changed body: the item carries the live hash and the proposal's own, so superseding uses the live one.
+  const changed = frontier([issue(7, { body: `${OPEN_BODY}More.
+`, labels: ['haiku-rehearsal'], comments: [cross] })], at);
+  assert.notEqual(changed.eligible[0].bodyHash, changed.eligible[0].openProposal.bodyHash);
+  // No open proposal: no openProposal, and record --kind proposed is accepted as it stands.
+  const fresh = frontier([issue(7, { body: OPEN_BODY, labels: ['needs-triage'], comments: [cross] })], { ...at, entries: [] });
+  const escalation = fresh.eligible.find((row) => row.kind === 'escalation');
+  assert.equal('openProposal' in escalation, false);
+  // An outcome recorded (approved, awaiting finalize) is not an open proposal either.
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 7, by: OWNER, now: '2026-09-21T00:00:00.000Z' });
+  const decided = frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'], comments: [cross] })], { ...at, entries: readLedger(world.root, 'endzone') });
+  assert.equal('openProposal' in decided.eligible.find((row) => row.kind === 'escalation'), false);
+});
+
+test('#263/#268: no ticket, reproposal or escalation the frontier emits for an open-proposal issue is refused by record --kind proposed', () => {
   const world = openProposalWorld();
   const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
   const singles = [comment(OWNER, 'Re-propose: again.', '2026-09-12T00:00:00.000Z'), comment(FLEET, 'note', '2026-09-12T00:00:00.000Z'), comment(OWNER, 'Veto', '2026-09-12T00:00:00.000Z')];
   for (const labels of [['haiku-rehearsal'], ['held'], ['needs-triage'], ['question'], [], ['triage-proposed']]) {
     for (const comments of [[], ...singles.map((one) => [one]), [singles[0], singles[1]], [singles[2], singles[1]]]) {
-      const result = frontier([issue(7, { body: OPEN_BODY, labels, comments })], at);
+      for (const outbox of [[], [WAKE]]) {
+      const result = frontier([issue(7, { body: OPEN_BODY, labels, comments })], { ...at, outbox });
       for (const item of result.eligible) {
         if (item.kind === 'approval') continue;   // an approval is recorded as an outcome, not a proposal
-        assert.equal(principalCanRecord(world, item), true, `${item.kind} for labels [${labels}] comments [${comments.map((c) => c.body)}]`);
+        assert.equal(principalCanRecord(world, item), true, `${item.kind} for labels [${labels}] comments [${comments.map((c) => c.body)}] outbox ${outbox.length}`);
+      }
       }
     }
   }
