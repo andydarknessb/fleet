@@ -139,6 +139,8 @@ if ($Manifest) {
   $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
   # no release: the record is not `assigned` (absent, claimed by a live IC, released, or already past the reservation), so it is no longer this manifest's reservation. A release from this manifest's revision would be refused, or would pull a claim a session holds.
   if (-not $recordProperty -or $recordProperty.Value.state -ne 'assigned') { Write-Error "Work record '$WorkRecordId' is not assigned"; exit 4 }
+  # no release: the record is `assigned` but at another revision than this manifest reserved (fleet#264: a lead's escalate -> assigned round trip bumps it on the same manifest). The reservation is no longer this manifest's, and a release from its revision would be refused as stale. Refused here, before the gh check, fetch and worktree work.
+  if ([string]$recordProperty.Value.revision -ne [string]$assignment.workRecordRevision) { Write-Error "Work record '$WorkRecordId' is at revision $($recordProperty.Value.revision), but the manifest reserved revision $($assignment.workRecordRevision)"; exit 4 }
   # Per tenant, the way work-state.js's isForeignRecord scopes it: another tenant's ICs are
   # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
   # A record with no tenant is legacy and still counts, matching isForeignRecord.
@@ -547,6 +549,19 @@ function Remove-FailedAssignmentWorktree {
   $tip = (& git -C $t.repo rev-parse --verify --quiet "refs/heads/$branch" 2>$null | Out-String).Trim()
   if ($tip -and $expectedBase -and $tip -eq $expectedBase) { & git -C $t.repo branch -D $branch 2>$null | Out-Null }
 }
+# fleet#264: is this manifest still the owner of its reservation? Returns the reason it is not, or $null.
+# Reads the marker and the Work record the way the early checks near the top do (the .invalidated.json
+# sidecar, state\work\active.json), and also requires the record's revision to be the one the manifest
+# reserved: a release followed by a fresh reservation leaves the record `assigned` at a later revision.
+function Get-ReservationRecheckFailure {
+  if (Test-Path -LiteralPath "$Manifest.invalidated.json") { return "the manifest was invalidated while this launch was preparing" }
+  try { $freshState = Read-Json "$FleetHome\state\work\active.json" } catch { return "the Work record could not be re-read ($($_.Exception.Message))" }
+  $freshProperty = if ($freshState) { $freshState.records.PSObject.Properties[$WorkRecordId] } else { $null }
+  if (-not $freshProperty) { return "Work record '$WorkRecordId' is no longer active" }
+  if ($freshProperty.Value.state -ne 'assigned') { return "Work record '$WorkRecordId' is $($freshProperty.Value.state), not assigned" }
+  if ([string]$freshProperty.Value.revision -ne [string]$assignment.workRecordRevision) { return "Work record '$WorkRecordId' moved to revision $($freshProperty.Value.revision) (the manifest reserved revision $($assignment.workRecordRevision))" }
+  return $null
+}
 if ($Manifest) {
   $baseRemote = [string]$assignment.base.remote
   $baseRef = [string]$assignment.base.ref
@@ -586,6 +601,17 @@ if ($Manifest) {
 $before = @($daemon | ForEach-Object { $_.sessionId })
 $beforeJobIds = @(Get-DaemonSessions -All | ForEach-Object { $_.id })
 $locationPushed = $false
+# fleet#264: the gh check, fetch and worktree add above take 10-40 s with no job and no roster row, so a
+# release that lands in that window (the stranded-reservation sweep, #261) cannot see this launch. Look
+# again immediately before claude --bg; an IC started on a released record only fails its ack.
+if ($Manifest) {
+  $lateRefusal = Get-ReservationRecheckFailure
+  if ($lateRefusal) {
+    # no release: the reservation is already gone or no longer this manifest's; there is nothing to release. The worktree and branch are this launch's own and nothing can use them.
+    Remove-FailedAssignmentWorktree
+    Write-Error "launch refused right before claude --bg: $lateRefusal"; exit 4
+  }
+}
 try {
   Push-Location $cwd
   $locationPushed = $true
