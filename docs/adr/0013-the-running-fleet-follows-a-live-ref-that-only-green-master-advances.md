@@ -44,6 +44,9 @@ tickets still go to Cory's sessions.
   Status note: #234 found the flake is a Windows lock race (EPERM on a delete-pending
   lock file) that reproduces serially, not only under load; the work-state lock now
   waits it out. The one-suite-at-a-time rule still stands.
+  #235: breaking a stale lock is now a rename to a `.tombstone` name plus an identity
+  re-check (inode, mtime, size), with the name linked back if a fresh lock was moved,
+  because Windows lets rm and rename take a lock another process holds open.
 - `state/` stays outside all of this: it is not in the repository and no ref
   move touches it. A change that needs a state migration ships the migration
   as a script Cory runs, never as a side effect of the advance.
