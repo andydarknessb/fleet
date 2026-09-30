@@ -23,6 +23,16 @@
 #      lock (ADR 0011 amendment). The rule reads the command being invoked, not
 #      prose or heredoc text that quotes one, and a body it cannot inspect (stdin,
 #      --body-file -) is refused on its own terms with the fix named (fleet #70).
+#      (fleet#229) It reads every spelling gh accepts, with the tool's own quoting (a
+#      tokenizer, not a regex): -b/--body/--body=V/-b=V/-bV, --body-file/-F and their =
+#      forms, gh api -f/-F/--field/--raw-field body=V and body=@file, quote pieces that
+#      concatenate, gh.exe or a path, and a timeout/env/command/exec/nohup wrapper.
+#      Refused as uninspectable, never cleared: a body built by a command substitution,
+#      a variable or expression, or a PowerShell splat; --input; a gh api graphql
+#      mutation that adds a comment; a body file the guard cannot open. It reads
+#      tool_input.command of Bash/PowerShell only: a GitHub MCP tool is outside it until
+#      one is configured (none is on this host), which must arrive with a rule-set-2
+#      extension.
 #   2b. every fleet role (spec fleet #193, ruling on the QA of #209 to #211): the
 #      Bounded-authority flags are Cory's to create and remove, and the triage ledger is
 #      written by bin/triage.js, whose checks are the point. Edit/Write/NotebookEdit/
@@ -51,7 +61,9 @@
 # Rollback: state/flags/principal-guard-off. Output contract: a deny is JSON on stdout
 # with permissionDecision "deny"; anything else is silence + exit 0. Never exit nonzero.
 $ErrorActionPreference = 'SilentlyContinue'
-$raw = [Console]::In.ReadToEnd()
+# The payload is UTF-8 JSON: decode it as such (the console code page would turn a U+FEFF into
+# three garbage characters before the body regexes below ever saw it).
+try { $raw = (New-Object System.IO.StreamReader([Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding $false))).ReadToEnd() } catch { $raw = [Console]::In.ReadToEnd() }
 $inp = $null
 try { $inp = "$raw" | ConvertFrom-Json } catch {}
 if (-not $inp) { exit 0 }
@@ -76,64 +88,277 @@ function Normalize-Path {
 }
 function Escape-Rx { param([string]$Text) [regex]::Escape($Text) }
 
+# One template for every body this guard cannot read (fleet#70 stdin, fleet#229 the rest): it names the
+# cause and the one-step fix instead of asserting a first word the guard never saw.
+function Get-UninspectableReason {
+  param([string]$Cause)
+  return "the comment body is $Cause, which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**), 'Re-propose' or 'Veto' (the tenant owner's withdrawal of a Bounded-authority ready, CONTEXT.md **Veto**): those shapes are the owner's alone, bin/triage.js recognises them by shape and author, and this guard is the second lock. Write the body to a file (in a separate call) and pass --body-file <path>; the guard reads the file's first line $cite"
+}
+function Get-WordCause {
+  param($Word)
+  if ($Word.Text -match '^@\w+$') { return 'a splat' }
+  if ($Word.Text -match '\$\(|`') { return 'built by a command substitution or subshell' }
+  return 'a shell variable or expression'
+}
+
+# Quote-aware tokenizer (fleet#229). Returns the call as units (cut at an unquoted newline ; && || | &,
+# never at a metacharacter inside a quote), each unit a list of words { Text; Alt; Inspectable }.
+# Bash: '..' literal, ".." with \" \\ \$ \`, \x outside quotes, adjacent pieces concatenate.
+# PowerShell: '..' with '', ".." with `x and "", here-strings @'..'@ / @".."@, ` outside quotes.
+# Alt is Text with an unquoted Bash backslash kept (a Windows path written C:\dir\file).
+# A word is Inspectable only when every piece that is not single-quoted is free of an expansion:
+# $ or a Bash backtick anywhere outside '..', and ( or ) outside any quote; a bare @name on PowerShell
+# is a splat.
+function Read-ShellUnits {
+  param([string]$Text, [string]$Tool)
+  $ps = ($Tool -eq 'PowerShell')
+  $units = New-Object System.Collections.ArrayList
+  $words = New-Object System.Collections.ArrayList
+  $t = New-Object System.Text.StringBuilder
+  $a = New-Object System.Text.StringBuilder
+  $st = @{ has = $false; ok = $true; bare = $true }
+  $endWord = {
+    if ($st.has) {
+      $tx = $t.ToString()
+      if ($ps -and $st.bare -and $tx -match '^@\w+$') { $st.ok = $false }
+      [void]$words.Add([pscustomobject]@{ Text = $tx; Alt = $a.ToString(); Inspectable = $st.ok })
+    }
+    [void]$t.Clear(); [void]$a.Clear()
+    $st.has = $false; $st.ok = $true; $st.bare = $true
+  }
+  $endUnit = {
+    . $endWord
+    if ($words.Count) { [void]$units.Add($words); $words = New-Object System.Collections.ArrayList }
+  }
+  $n = $Text.Length
+  $i = 0
+  while ($i -lt $n) {
+    $c = [string]$Text[$i]
+    if ($c -eq '@' -and ($i + 2) -lt $n -and ($Text[$i + 1] -eq [char]39 -or $Text[$i + 1] -eq [char]34)) {
+      $m = [regex]::Match($Text.Substring($i), '^@([''"])\r?\n([\s\S]*?)\r?\n\1@')
+      if ($m.Success) {
+        $hb = $m.Groups[2].Value
+        [void]$t.Append($hb); [void]$a.Append($hb)
+        $st.has = $true; $st.bare = $false
+        if ($m.Groups[1].Value -eq '"' -and $hb -match '[$`]') { $st.ok = $false }
+        $i += $m.Length
+        continue
+      }
+    }
+    if ($c -eq ' ' -or $c -eq "`t" -or $c -eq "`r") { . $endWord; $i++ }
+    elseif ($c -eq "`n" -or $c -eq ';') { . $endUnit; $i++ }
+    elseif ($c -eq '&') { . $endUnit; if (($i + 1) -lt $n -and $Text[$i + 1] -eq [char]38) { $i += 2 } else { $i++ } }
+    elseif ($c -eq '|') { . $endUnit; if (($i + 1) -lt $n -and $Text[$i + 1] -eq [char]124) { $i += 2 } else { $i++ } }
+    elseif ($c -eq "'") {
+      $i++
+      while ($i -lt $n) {
+        $d = [string]$Text[$i]
+        if ($d -eq "'") {
+          if ($ps -and ($i + 1) -lt $n -and $Text[$i + 1] -eq [char]39) { [void]$t.Append("'"); [void]$a.Append("'"); $i += 2; continue }
+          break
+        }
+        [void]$t.Append($d); [void]$a.Append($d); $i++
+      }
+      $i++
+      $st.has = $true; $st.bare = $false
+    }
+    elseif ($c -eq '"') {
+      $i++
+      while ($i -lt $n) {
+        $d = [string]$Text[$i]
+        if ($ps) {
+          if ($d -eq '`') {
+            if (($i + 1) -lt $n) { $e = [string]$Text[$i + 1]; [void]$t.Append($e); [void]$a.Append($e) }
+            $i += 2; continue
+          }
+          if ($d -eq '"') {
+            if (($i + 1) -lt $n -and $Text[$i + 1] -eq [char]34) { [void]$t.Append('"'); [void]$a.Append('"'); $i += 2; continue }
+            break
+          }
+        } else {
+          if ($d -eq '\') {
+            if (($i + 1) -lt $n -and '"\$`'.Contains([string]$Text[$i + 1])) { $e = [string]$Text[$i + 1]; [void]$t.Append($e); [void]$a.Append($e); $i += 2; continue }
+          } elseif ($d -eq '"') { break }
+          elseif ($d -eq '`') { $st.ok = $false }
+        }
+        if ($d -eq '$') { $st.ok = $false }
+        [void]$t.Append($d); [void]$a.Append($d); $i++
+      }
+      $i++
+      $st.has = $true; $st.bare = $false
+    }
+    elseif ($c -eq '\' -and -not $ps) {
+      if (($i + 1) -lt $n) {
+        $e = [string]$Text[$i + 1]
+        [void]$t.Append($e)
+        if ($e -match '[\s"''\\]') { [void]$a.Append($e) } else { [void]$a.Append('\' + $e) }
+        $st.has = $true; $st.bare = $false
+      }
+      $i += 2
+    }
+    elseif ($c -eq '`' -and $ps) {
+      if (($i + 1) -lt $n) {
+        $e = [string]$Text[$i + 1]
+        if ($e -ne "`n" -and $e -ne "`r") { [void]$t.Append($e); [void]$a.Append($e); $st.has = $true; $st.bare = $false }
+      }
+      $i += 2
+    }
+    else {
+      if ($c -eq '$' -or $c -eq '(' -or $c -eq ')' -or ($c -eq '`' -and -not $ps)) { $st.ok = $false }
+      [void]$t.Append($c); [void]$a.Append($c); $st.has = $true
+      $i++
+    }
+  }
+  . $endUnit
+  return , $units
+}
+
 # --- rule set 2: no session posts an Approval (every fleet role, sub-agents included) ---
 if ($tool -in @('Bash', 'PowerShell')) {
   $cmd = "$($inp.tool_input.command)"
   # fleet#70: the rule reads the command being INVOKED, never prose that quotes one.
   # Bash heredoc bodies (a ticket written with cat, a fixture, documentation) are
-  # dropped first. Then every quoted string (PowerShell here-strings @'..'@ / @".."@,
-  # double and single quotes) is masked by a numbered token, so the call can be cut
-  # into shell segments on newline ; & && | || and subshell parentheses WITHOUT a
-  # metacharacter inside a body ever ending the body early. Only a segment whose
-  # command word is gh, after optional VAR=value prefixes, is a comment; its body and
-  # body-file arguments are read back through the mask. A `gh issue create -b "run
-  # gh issue comment ..."` is not a comment, and neither is a heredoc line that says
-  # so, while `-b "Approved (batch 41)"` is still the whole body it always was.
+  # dropped first. Then Read-ShellUnits (fleet#229, a quote-aware tokenizer for the
+  # tool's own quoting) cuts the call into units on an unquoted newline ; & && | ||
+  # WITHOUT a metacharacter inside a body ever ending the body early, and reads each
+  # unit as words. Only a unit whose command word is gh (after VAR=value prefixes and the
+  # timeout / env / command / exec / nohup wrappers, a path or .exe read as gh) and whose
+  # subcommand is issue|pr comment, or api on a comments endpoint, is a comment; its body
+  # and body-file arguments are read from the words in every spelling gh accepts (-b,
+  # --body, --body=V, -b=V, -bV, --body-file, -F, =-joined forms, gh api -f/-F/--field/
+  # --raw-field body=V and body=@file). A `gh issue create -b "run gh issue comment ..."`
+  # is not a comment, and neither is a heredoc line that says so, while
+  # `-b "Approved (batch 41)"` is still the whole body it always was. A body the guard
+  # cannot read (stdin, a command substitution, a variable, a splat, --input, a GraphQL
+  # addComment mutation, a file it cannot open) is refused on its own terms, never cleared.
   $stripped = [regex]::Replace($cmd, '<<-?\s*(["'']?)(\w+)\1[^\r\n]*\r?\n[\s\S]*?\r?\n[ \t]*\2[ \t]*(?=\r?\n|$)', '#heredoc-stripped')
-  $S = [string][char]1
-  $quoted = New-Object System.Collections.ArrayList
-  $masked = [regex]::Replace($stripped, '@''\r?\n[\s\S]*?\r?\n''@|@"\r?\n[\s\S]*?\r?\n"@|"(?:[^"\\]|\\.)*"|''[^'']*''',
-    [System.Text.RegularExpressions.MatchEvaluator]{ param($m) [void]$quoted.Add($m.Value); "$S$($quoted.Count - 1)$S" })
-  $unmask = {
-    param([string]$Token)
-    if ($Token -notmatch "^$S(\d+)$S$") { return $Token }
-    $q = "$($quoted[[int]$Matches[1]])"
-    if ($q -match '^@[''"]\r?\n([\s\S]*?)\r?\n[''"]@$') { return $Matches[1] }
-    return $q.Substring(1, $q.Length - 2)
-  }
-  $segments = [regex]::Split($masked, '\r?\n|;|&&|\|\||\||&|\(|\)')
-  $commentRx = '^\s*(?:\w+=\S*\s+)*gh\s+(?:(?:issue|pr)\s+comment\b|api\b.*\bcomments\b)'
-  foreach ($segment in $segments) {
+  $units = Read-ShellUnits $stripped $tool
+  foreach ($unit in $units) {
     if ($reason) { break }
-    if ($segment -notmatch $commentRx) { continue }
-    $bodies = @()
-    foreach ($m in [regex]::Matches($segment, '(?:-b|--body|(?:-f|-F|--field|--raw-field)\s+body=)\s*(\S+)')) {
-      $bodies += & $unmask $m.Groups[1].Value
-    }
-    foreach ($m in [regex]::Matches($segment, '(?:--body-file|-F\s+body=@)\s*(\S+)')) {
-      $file = & $unmask $m.Groups[1].Value
-      if ($file -eq '-') {
-        # fleet#70 case 1: a body on stdin cannot be inspected, so it cannot be cleared.
-        # Refused on its own terms: the message names the cause and the one-step fix
-        # instead of asserting a first word this guard never saw.
-        $reason = "the comment body is passed on stdin (--body-file - / body=@-), which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**), 'Re-propose' or 'Veto' (the tenant owner's withdrawal of a Bounded-authority ready, CONTEXT.md **Veto**): those shapes are the owner's alone, bin/triage.js recognises them by shape and author, and this guard is the second lock. Write the body to a file and pass --body-file <path>; the guard reads the file's first line $cite"
-        break
+    $w = @($unit)
+    $k = 0
+    while ($k -lt $w.Count -and $w[$k].Text -match '^[({&!]+$') { $k++ }
+    if ($k -ge $w.Count) { continue }
+    $w[$k] = [pscustomobject]@{ Text = ($w[$k].Text -replace '^[({&!]+', ''); Alt = $w[$k].Alt; Inspectable = $w[$k].Inspectable }
+    $g = -1
+    $j = $k
+    while ($j -lt $w.Count) {
+      $tx = $w[$j].Text
+      if ($tx -match '^[A-Za-z_]\w*=') { $j++; continue }
+      $nm = ($tx -replace '^.*[\\/]', '') -replace '\.exe$', ''
+      if ($nm -eq 'timeout') {
+        $j++
+        while ($j -lt $w.Count -and $w[$j].Text -match '^-') { if ($w[$j].Text -cmatch '^(-k|-s|--kill-after|--signal)$') { $j++ }; $j++ }
+        if ($j -lt $w.Count -and $w[$j].Text -match '^\d') { $j++ }
+        continue
       }
-      $filePath = Normalize-Path $file "$($inp.cwd)"
-      if ($filePath -and (Test-Path -LiteralPath $filePath)) { try { $bodies += ((Get-Content -LiteralPath $filePath -Raw) -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1) } catch {} }
+      if ($nm -eq 'env') {
+        $j++
+        while ($j -lt $w.Count -and $w[$j].Text -match '^(-|[A-Za-z_]\w*=)') { if ($w[$j].Text -cmatch '^(-u|--unset|-C|--chdir)$') { $j++ }; $j++ }
+        continue
+      }
+      if ($nm -eq 'command' -or $nm -eq 'exec' -or $nm -eq 'nohup') {
+        $j++
+        while ($j -lt $w.Count -and $w[$j].Text -match '^-') { $j++ }
+        continue
+      }
+      if ($nm -eq 'gh') { $g = $j }
+      break
+    }
+    if ($g -lt 0) { continue }
+    $args_ = @()
+    if (($g + 1) -lt $w.Count) { $args_ = @($w[($g + 1)..($w.Count - 1)]) }
+    if ($args_.Count -eq 0) { continue }
+    if (-not $args_[0].Inspectable) { $reason = Get-UninspectableReason (Get-WordCause $args_[0]); break }
+    $sub = $args_[0].Text
+    $kind = ''
+    $ai = 1
+    if ($sub -eq 'issue' -or $sub -eq 'pr') {
+      if ($args_.Count -ge 2 -and -not $args_[1].Inspectable) { $reason = Get-UninspectableReason (Get-WordCause $args_[1]); break }
+      if ($args_.Count -ge 2 -and $args_[1].Text -eq 'comment') { $kind = 'cmt'; $ai = 2 }
+    } elseif ($sub -eq 'api') {
+      $graphql = $false; $endpoint = $false
+      for ($x = 1; $x -lt $args_.Count; $x++) {
+        $tx = $args_[$x].Text
+        if ($tx -ceq 'graphql') { $graphql = $true }
+        if ($tx -notmatch '^-' -and $tx -notmatch '^\w+=' -and $tx -notmatch '\s' -and $tx -match '\bcomments\b') { $endpoint = $true }
+      }
+      if ($graphql) {
+        # Only a mutation that adds a comment is a comment; addSubIssue and the like pass.
+        foreach ($aw in $args_) { if ($aw.Text -match 'addComment|addPullRequestReviewComment|addDiscussionComment') { $reason = Get-UninspectableReason 'a GraphQL mutation'; break } }
+        continue
+      }
+      if ($endpoint) { $kind = 'api' }
+    }
+    if (-not $kind) { continue }
+    for ($x = $ai; $x -lt $args_.Count; $x++) { if (-not $args_[$x].Inspectable -and $args_[$x].Text -match '^@\w+$') { $reason = Get-UninspectableReason 'a splat'; break } }
+    if ($reason) { break }
+    # Arg walk: each hit is a literal body or a body file, with the word that carries it.
+    # A flag spelled inside a quoted body is that body's text: the value word is consumed whole.
+    $bodies = @()
+    $hits = @()
+    for ($x = $ai; $x -lt $args_.Count; $x++) {
+      $aw = $args_[$x]; $tx = $aw.Text
+      $val = $null; $valWord = $null; $isFile = $false
+      if ($kind -eq 'cmt') {
+        if ($tx -ceq '-b' -or $tx -ceq '--body' -or $tx -ceq '-F' -or $tx -ceq '--body-file') {
+          $isFile = ($tx -ceq '-F' -or $tx -ceq '--body-file')
+          if (($x + 1) -lt $args_.Count) { $x++; $valWord = $args_[$x]; $val = $valWord.Text }
+        } elseif ($tx -cmatch '(?s)^--body=(.*)$') { $val = $Matches[1]; $valWord = $aw }
+        elseif ($tx -cmatch '(?s)^--body-file=(.*)$') { $val = $Matches[1]; $valWord = $aw; $isFile = $true }
+        elseif ($tx -cmatch '(?s)^-b=?(.+)$') { $val = $Matches[1]; $valWord = $aw }
+        elseif ($tx -cmatch '(?s)^-F=?(.+)$') { $val = $Matches[1]; $valWord = $aw; $isFile = $true }
+        if ($null -ne $valWord) { $hits += , @($val, $valWord, $isFile) }
+      } else {
+        if ($tx -ceq '--input' -or $tx -cmatch '^--input=') { $reason = Get-UninspectableReason 'a JSON body passed through --input'; break }
+        $typed = $false
+        if ($tx -cmatch '^(-f|-F|--raw-field|--field)$') {
+          $typed = ($tx -ceq '-F' -or $tx -ceq '--field')
+          if (($x + 1) -lt $args_.Count) { $x++; $valWord = $args_[$x]; $val = $valWord.Text }
+        } elseif ($tx -cmatch '(?s)^(--raw-field|--field)=(.*)$') { $typed = ($Matches[1] -ceq '--field'); $val = $Matches[2]; $valWord = $aw }
+        elseif ($tx -cmatch '(?s)^(-f|-F)=?(.+)$') { $typed = ($Matches[1] -ceq '-F'); $val = $Matches[2]; $valWord = $aw }
+        if ($null -eq $valWord) { continue }
+        if ($val -match '(?s)^body=(.*)$') {
+          $bv = $Matches[1]
+          if ($typed -and $bv.StartsWith('@')) { $hits += , @($bv.Substring(1), $valWord, $true) } else { $hits += , @($bv, $valWord, $false) }
+        } elseif (-not $valWord.Inspectable -and $val -notmatch '^[\w\[\].-]+=') {
+          $reason = Get-UninspectableReason (Get-WordCause $valWord); break
+        }
+      }
+    }
+    if ($reason) { break }
+    foreach ($hit in $hits) {
+      $val = $hit[0]; $valWord = $hit[1]
+      if (-not $valWord.Inspectable) { $reason = Get-UninspectableReason (Get-WordCause $valWord); break }
+      if (-not $hit[2]) { $bodies += $val; continue }
+      if ($val -eq '-') { $reason = Get-UninspectableReason 'passed on stdin (--body-file - / -F - / body=@-)'; break }
+      $opened = $false
+      $pre = $valWord.Text.Length - $val.Length
+      $altVal = $val
+      if ($pre -ge 0 -and $valWord.Alt.Length -ge $pre) { $altVal = $valWord.Alt.Substring($pre) }
+      foreach ($cand in @($val, $altVal)) {
+        if ($opened) { break }
+        $filePath = Normalize-Path $cand "$($inp.cwd)"
+        if ($filePath -and (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+          try { $bodies += ((Get-Content -LiteralPath $filePath -Raw) -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1); $opened = $true } catch {}
+        }
+      }
+      if (-not $opened) { $reason = Get-UninspectableReason "in a file this guard could not open ($val)"; break }
     }
     if ($reason) { break }
     foreach ($body in $bodies) {
-      if ("$body" -match '^\s*(\\n|\s)*approved\b') {
+      # ﻿: JS \s admits a BOM and .NET \s does not, so the two locks must agree. \?: a transport that cannot
+      # carry a non-ASCII character degrades it to ? before this hook reads it, so a leading ? is skipped too.
+      if ("$body" -match '^(?:\s|﻿|\?|\\n)*approved\b') {
         $reason = "a comment that begins 'Approved' is the tenant owner's Approval of a Triage proposal (CONTEXT.md **Approval**) and no fleet session may post one under any role: an Approval is the owner's alone, bin/triage.js recognises it by shape and author, and this guard is the second lock. Say what you mean in other words ('the lead agrees', 'ruled: ...') or leave the decision to Cory $cite"
         break
       }
-      if ("$body" -match '^\s*(\\n|\s)*re-?propose\b') {
+      if ("$body" -match '^(?:\s|﻿|\?|\\n)*re-?propose\b') {
         $reason = "a comment that begins 'Re-propose' is the tenant owner's ask for a new Triage proposal and no fleet session may post one under any role (fleet#55): a re-proposal ask is the owner's alone, bin/triage.js recognises it by shape and author, and this guard is the second lock. Say what you mean in other words ('the scope changed; the Principal should look again') or leave the ask to Cory $cite"
         break
       }
       # fleet#208: matched exactly like Approved (case-insensitive, leading whitespace or a literal \n skipped, first word only).
-      if ("$body" -match '^\s*(\\n|\s)*veto\b') {
+      if ("$body" -match '^(?:\s|﻿|\?|\\n)*veto\b') {
         $reason = "a comment that begins 'Veto' is the tenant owner's withdrawal of a Bounded-authority ready (CONTEXT.md **Veto**) and no fleet session may post one under any role: a Veto is the owner's alone, bin/triage.js recognises it by shape and author, and this guard is the second lock. Say what you mean in other words ('the lead is holding this ticket', 'this ready is wrong because ...') or leave the Veto to Cory $cite"
         break
       }

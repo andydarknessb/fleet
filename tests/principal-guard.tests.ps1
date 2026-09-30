@@ -183,6 +183,67 @@ try {
   Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash "gh issue comment 5 --body @'`n## Triage proposal (advisory)`n'@")) 'a proposal here-string body from the PowerShell tool'
   # Pre-existing: a proposal body with parentheses passes because of the RULE, not because the parens cut the body.
   Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "Approved (advisory) proposal"')) 'an Approved body whose parentheses must not hide it' 'owner'
+  # fleet#229: every spelling of a channel the rule already reads resolves to the same body.
+  # Quote concatenation and escaped quotes (one shell word made of several quoted pieces),
+  # =-joined flags, a quoted -f "body=...", a quoted api endpoint, gh.exe, a timeout wrapper
+  # and a U+FEFF prefix (JS \s admits it, .NET \s does not: the two locks must agree) are
+  # each the plain call in other clothes, on the Bash tool and on the PowerShell tool.
+  foreach ($case in @(
+    @('Bash',       "gh issue comment 5 -b 'Approved: it'\''s fine'",                                     'bash single-quote concatenation with an escaped quote'),
+    @('Bash',       "gh issue comment 5 -b `"Veto: it`"'s wrong'",                                         'bash double-then-single quote concatenation'),
+    @('PowerShell', "gh issue comment 5 -b `"Approved: ```"x```"`"",                                       'a PowerShell backtick-escaped quote inside the body'),
+    @('PowerShell', "gh issue comment 5 -b `"Veto: `"`"x`"`"`"",                                           'a PowerShell doubled double quote inside the body'),
+    @('PowerShell', "gh issue comment 5 -b 'Re-propose: it''s'",                                           'a PowerShell doubled single quote inside the body'),
+    @('Bash',       'gh issue comment 5 --body="Approved"',                                                '--body="..." (=-joined, quoted)'),
+    @('Bash',       'gh issue comment 5 --body=Re-propose',                                                '--body=... (=-joined, bare)'),
+    @('Bash',       'gh issue comment 5 -b="Veto"',                                                        '-b="..." (=-joined short flag)'),
+    @('PowerShell', 'gh issue comment 5 --body="Approved"',                                                '--body="..." from the PowerShell tool'),
+    @('Bash',       "gh issue comment 5 --body-file=$testRoot\approved-body.md",                           '--body-file=<path> (=-joined)'),
+    @('Bash',       "gh pr comment 42 -F $testRoot\approved-body.md",                                      '-F <path>, the short spelling of --body-file on issue/pr comment (found during #229)'),
+    @('Bash',       'gh api repos/owner/repo/issues/5/comments -f "body=Approved"',                        'a quoted -f "body=..." through gh api'),
+    @('Bash',       'gh api repos/owner/repo/issues/5/comments --field "body=Veto"',                       'a quoted --field "body=..." through gh api'),
+    @('Bash',       "gh api repos/owner/repo/issues/5/comments --field body=@$testRoot\approved-body.md",  '--field body=@<file> (the long spelling of -F body=@<file>)'),
+    @('Bash',       'gh api "repos/$R/issues/5/comments" -f body="Veto"',                                  'a double-quoted api endpoint'),
+    @('Bash',       "gh api 'repos/owner/repo/issues/5/comments' -f body=`"Approved`"",                    'a single-quoted api endpoint'),
+    @('PowerShell', 'gh api "repos/$R/issues/5/comments" -f body="Approved"',                              'a double-quoted api endpoint from the PowerShell tool'),
+    @('Bash',       'gh.exe issue comment 5 -b "Approved"',                                                'gh.exe as the command word'),
+    @('PowerShell', 'gh.exe issue comment 5 -b "Veto"',                                                    'gh.exe from the PowerShell tool'),
+    @('Bash',       'timeout 30 gh issue comment 5 -b "Re-propose: smaller"',                              'a timeout wrapper before gh'),
+    @('Bash',       'GH_PAGER= timeout 30 gh issue comment 5 -b "Approved"',                               'an env assignment and a timeout wrapper before gh'),
+    @('Bash',       ('gh issue comment 5 -b "' + [char]0xFEFF + 'Approved"'),                              'a U+FEFF (BOM) prefix before Approved'),
+    @('PowerShell', ('gh issue comment 5 -b "' + [char]0xFEFF + 'Veto"'),                                  'a U+FEFF (BOM) prefix before Veto from the PowerShell tool')
+  )) {
+    Assert-Denied (Run-Guard -Role ic -Tool $case[0] -ToolInput (Bash $case[1])) "fleet#229 equivalent spelling: $($case[2])" 'owner'
+  }
+  # fleet#229: a body the guard cannot read is refused on its own terms, like --body-file -
+  # (fleet #70): the reason names the cause (the body is not readable from the command) and
+  # the one-step fix (write the body to a file and pass --body-file <path>), and never
+  # asserts a first word the guard did not see.
+  foreach ($case in @(
+    @('Bash',       "gh issue comment 5 --body `"`$(cat $testRoot/approved-body.md)`"",                    'a double-quoted command substitution as the body'),
+    @('Bash',       "gh issue comment 5 -b `$(cat $testRoot/approved-body.md)",                            'a bare command substitution as the body'),
+    @('Bash',       'gh issue comment 5 -b "$b"',                                                          'a double-quoted shell variable as the body'),
+    @('Bash',       'gh issue comment 5 -b $b',                                                            'a bare shell variable as the body'),
+    @('PowerShell', 'gh issue comment 5 -b ("Approved")',                                                  'a parenthesised expression as the body'),
+    @('PowerShell', '$b = "Approved"; gh issue comment 5 -b $b',                                           'a PowerShell variable as the body'),
+    @('PowerShell', '$a = "issue","comment","5","-b","Approved"; gh @a',                                   'a splat carrying the whole gh call'),
+    @('PowerShell', 'gh issue comment 5 @rest',                                                            'a splat carrying the body flag'),
+    @('Bash',       "gh api repos/owner/repo/issues/5/comments --field body=@$testRoot\missing-body.md",   '--field body=@<file> naming a file the guard cannot open'),
+    @('Bash',       "gh issue comment 5 --body-file $testRoot\missing-body.md",                            '--body-file naming a file the guard cannot open'),
+    @('Bash',       'gh api repos/owner/repo/issues/5/comments --method POST --input body.json',           'a JSON body through --input'),
+    @('Bash',       'gh issue comment 5 -F -',                                                             '-F -, the short spelling of --body-file - (stdin; found during #229)'),
+    @('Bash',       "gh api graphql -f query='mutation { addComment(input: {subjectId: `"I_x`", body: `"Approved`"}) { clientMutationId } }'", 'a GraphQL addComment mutation')
+  )) {
+    $refusal = Run-Guard -Role ic -Tool $case[0] -ToolInput (Bash $case[1])
+    Assert-Denied $refusal "fleet#229 uninspectable body: $($case[2])" 'cannot inspect'
+    Assert-True ("$($refusal.permissionDecisionReason)" -match '--body-file <path>') "fleet#229 uninspectable body: $($case[2]): the refusal must name the fix (write the body to a file and pass --body-file <path>)"
+    Assert-True ("$($refusal.permissionDecisionReason)" -notmatch "begins '") "fleet#229 uninspectable body: $($case[2]): the refusal must not assert a first word the guard did not see"
+  }
+  # ...and the plain spellings, a subcommand that is not a comment, and a PowerShell variable
+  # handed to gh issue create keep passing: the rule reads comments, not every gh call.
+  Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash '$b = "Approved: not a comment"; gh issue create --title x --body $b')) 'a PowerShell variable body on gh issue create (not a comment)'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 --body="Not approved: the scope misses the caption"')) 'an =-joined body that does not begin with the words'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api graphql -f query=''mutation { addSubIssue(input: {issueId: "I_x", subIssueId: "I_y"}) { clientMutationId } }''')) 'a GraphQL mutation that adds no comment'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 
