@@ -1265,6 +1265,51 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-TriageRotateCalls).Count -eq $t5rDelivered) 'a delivered Principal resolution must not wake again (watermark)'
   Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ''
 
+  # Case T6a (#233): the single `tick` call dies outright on the live principal-live path (a node shim
+  # refuses `tick` and runs every other command for real). The finalize failure is recorded and the
+  # plain `frontier` still runs once as a fallback, so the wake evidence is not lost: the frontier is
+  # produced, frontierError stays empty, and the finalize error is on the tick record.
+  Write-Utf8 $triageFixture '[{"number":601,"title":"Unrouted","url":"https://github.com/owner/repo/issues/601","body":"Something is off.","createdAt":"2026-09-02T00:00:00.000Z","labels":[],"assignees":[],"comments":[]}]'
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\mock-bin\fail-tick-node.cmd" ('@echo off' + "`r`n" + 'echo %* >> "%~dp0fail-tick-calls.log"' + "`r`n" + 'if "%~2"=="tick" goto fail' + "`r`n" + 'node %*' + "`r`n" + 'exit /b %ERRORLEVEL%' + "`r`n" + ':fail' + "`r`n" + 'echo tick refused 1>&2' + "`r`n" + 'exit /b 1' + "`r`n")
+  Remove-Item "$testRoot\mock-bin\fail-tick-calls.log" -ErrorAction SilentlyContinue
+  $oldNodePathT6a = $env:FLEET_NODE_PATH
+  $env:FLEET_NODE_PATH = "$testRoot\mock-bin\fail-tick-node.cmd"
+  try {
+    $t6a = Run-Watchdog
+    $tw6a = @($t6a.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+    $t6aCalls = @(Get-Content "$testRoot\mock-bin\fail-tick-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'triage\.js' } | ForEach-Object { if ($_ -match 'triage\.js"?\s+(\w+)') { $Matches[1] } })
+    Assert-True ($t6aCalls.Count -eq 2 -and $t6aCalls[0] -eq 'tick' -and $t6aCalls[1] -eq 'frontier') "a failed tick must fall back to one plain frontier call (calls: $($t6aCalls -join ','); tick record: $(($tw6a | ConvertTo-Json -Compress -Depth 5)); log: $((Get-Content "$testRoot\mock-bin\fail-tick-calls.log" -ErrorAction SilentlyContinue) -join ' | '))"
+    Assert-True ("$($tw6a.finalize.error)" -match 'did not complete' -and "$($tw6a.finalize.error)" -match 'exited 1') "the tick failure must be recorded as the finalize error (got $(($tw6a.finalize | ConvertTo-Json -Compress -Depth 4)))"
+    Assert-True (-not $tw6a.frontierError) "the fallback frontier must clear the frontier error (got $($tw6a.frontierError))"
+    Assert-True ((@($tw6a.evidence) -join '; ') -match 'ticket #601') "the frontier from the fallback must feed the wake evidence (got $(@($tw6a.evidence) -join '; '))"
+  } finally {
+    if ($oldNodePathT6a) { $env:FLEET_NODE_PATH = $oldNodePathT6a } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
+  }
+
+  # Case T6c (#233): a tick whose frontier threw AFTER the finalize completed prints the finalize result
+  # and a frontierError with exit 0. The finalize is recorded and audited, the frontier failure is
+  # recorded, no plain-frontier fallback runs (it would throw on the same local state), and nothing wakes.
+  Write-Utf8 "$testRoot\mock-bin\frontier-error-node.cmd" ('@echo off' + "`r`n" + 'echo %* >> "%~dp0frontier-error-calls.log"' + "`r`n" + 'if "%~2"=="tick" goto tick' + "`r`n" + 'node %*' + "`r`n" + 'exit /b %ERRORLEVEL%' + "`r`n" + ':tick' + "`r`n" + 'echo {"tenant":"test","finalize":{"finalized":[{"issue":777,"url":"https://x/777"}],"left":[],"errors":[]},"frontierError":"state/work/active.json is not valid JSON"}' + "`r`n" + 'exit /b 0' + "`r`n")
+  Remove-Item "$testRoot\mock-bin\frontier-error-calls.log" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  $callsBefore6c = @(Get-TriageRotateCalls).Count
+  $alertsBefore6c = @(Get-AlertLines).Count
+  $env:FLEET_NODE_PATH = "$testRoot\mock-bin\frontier-error-node.cmd"
+  try {
+    $t6c = Run-Watchdog
+    $tw6c = @($t6c.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+    $t6cCalls = @(Get-Content "$testRoot\mock-bin\frontier-error-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'triage\.js' } | ForEach-Object { if ($_ -match 'triage\.js"?\s+(\w+)') { $Matches[1] } })
+    Assert-True ($t6cCalls.Count -eq 1 -and $t6cCalls[0] -eq 'tick') "a frontierError from the tick must not trigger a fallback frontier call (calls: $($t6cCalls -join ','))"
+    Assert-True ((@($tw6c.finalize.finalized) | ForEach-Object { $_.issue }) -contains 777 -and -not $tw6c.finalize.error) "the finalize result must survive a frontier failure (got $(($tw6c.finalize | ConvertTo-Json -Compress -Depth 4)))"
+    Assert-True ("$($tw6c.frontierError)" -match 'after the finalize' -and $tw6c.decision -eq 'none' -and $tw6c.reason -match 'fail closed') "a frontierError must be recorded and wake nothing (got $($tw6c.decision): $($tw6c.reason); $($tw6c.frontierError))"
+    Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6c) 'a frontier failure after a finalize must not rotate'
+    Assert-True ((@(Get-AlertLines | Where-Object { ($_ | ConvertFrom-Json).kind -eq 'triage-finalize' }).Count) -ge 1 -and @(Get-AlertLines).Count -eq $alertsBefore6c + 1) 'the finalize audit line must survive a frontier failure'
+  } finally {
+    if ($oldNodePathT6a) { $env:FLEET_NODE_PATH = $oldNodePathT6a } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+
   # Case T6: an unreadable frontier wakes nothing and says so (fail closed).
   $env:FLEET_TRIAGE_ISSUES_FIXTURE = "$testRoot\missing-fixture.json"
   $callsBefore6 = @(Get-TriageRotateCalls).Count
@@ -1272,6 +1317,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $tw6 = @($t6.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ("$($tw6.frontierError)" -ne '' -and $tw6.decision -eq 'none' -and $tw6.reason -match 'fail closed') "an unreadable frontier must fail closed (got $($tw6.decision): $($tw6.reason); error=$($tw6.frontierError))"
   Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6) 'an unreadable frontier must not rotate'
+  Assert-True ("$($tw6.finalize.error)" -match 'did not complete') "the failed tick must be recorded as the finalize error (got $(($tw6.finalize | ConvertTo-Json -Compress -Depth 4)))"
   $env:FLEET_TRIAGE_ISSUES_FIXTURE = $triageFixture
 
   # Case T6b (2026-09-17 QA, fleet #81 review #2): the triage frontier call is
