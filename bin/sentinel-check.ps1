@@ -664,19 +664,51 @@ if ($capCounted.Count -gt [int]$static.cap) { $report.escalate += [pscustomobjec
 # written at reserve time, and unlike createdAt it is restamped when a released unit is reserved again); no
 # active|retiring roster row names its tenant and issue; no job (a daemon row or any job state under
 # ~/.claude/jobs) has an intent naming its manifest file; and neither <manifest>.invalidated.json nor
-# <manifest>.acknowledged.json exists. The page is raised in every mode; the release (Invoke-ManifestRelease, the
-# helper the dead-before-ack retire uses) needs -Apply AND state/flags/ic-cleanup-live and is deferred under PAUSE.
+# <manifest>.acknowledged.json exists. The page is raised in every mode and reads as information (a lead may be
+# holding the unit behind its cap). Releasing (Invoke-ManifestRelease, the helper the dead-before-ack retire uses)
+# needs -Apply AND state/flags/ic-cleanup-live, is deferred under PAUSE, and is guarded against a launch in flight:
+# the record must have been classified stranded on the PREVIOUS tick too (state/sentinel/stranded-seen.json keeps
+# first/last-seen per record id; a gap over an hour restarts the count), and every leg is re-read fresh (roster,
+# daemon list, job intents, markers, the record's state and revision) right before the release.
 # An unreadable state/work/active.json or roster classifies nothing.
-$activeWorkPath = Join-Path $FleetHome 'state\work\active.json'
-$activeWork = $null; $activeWorkUnreadable = $false
-if (Test-Path -LiteralPath $activeWorkPath) {
-  try {
-    $activeWork = Get-Content -LiteralPath $activeWorkPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-    if ($null -eq $activeWork) { throw 'empty active.json' }
-  } catch { $activeWorkUnreadable = $true; $activeWork = $null }
+function Get-AllJobIntents {
+  # Lower-cased intents of every job the daemon lists or ~/.claude/jobs holds; a state that will not read is skipped.
+  param($DaemonRows)
+  $intents = @()
+  $jobIds = @($DaemonRows | ForEach-Object { "$($_.id)" } | Where-Object { $_ })
+  $jobsDir = Join-Path $env:USERPROFILE '.claude\jobs'
+  if (Test-Path -LiteralPath $jobsDir) { $jobIds += @(Get-ChildItem -LiteralPath $jobsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
+  foreach ($jid in @($jobIds | Select-Object -Unique)) {
+    try { $jst = Get-JobState $jid; if ($jst -and $jst.PSObject.Properties['intent'] -and $jst.intent) { $intents += ("$($jst.intent)").ToLowerInvariant() } } catch {}
+  }
+  return ,@($intents)
 }
+function Test-StrandedLegs {
+  # The marker / roster / job legs of the stranded predicate against the given roster rows and job intents.
+  param($Rec, $RosterRows, $JobIntents)
+  $mp = "$($Rec.manifestPath)"
+  if ((Test-Path -LiteralPath "$mp.invalidated.json") -or (Test-Path -LiteralPath "$mp.acknowledged.json")) { return $false }
+  $claimed = @($RosterRows | Where-Object { "$($_.status)" -in @('active', 'retiring') -and "$($_.tenant)" -eq "$($Rec.tenant)" -and "$($_.issue)" -eq "$($Rec.issue)" })
+  if ($claimed.Count -gt 0) { return $false }
+  $leaf = (Split-Path -Leaf $mp).ToLowerInvariant()
+  if (@($JobIntents | Where-Object { $_.Contains($leaf) }).Count -gt 0) { return $false }
+  return $true
+}
+function Read-ActiveWorkStrict {
+  $path = Join-Path $FleetHome 'state\work\active.json'
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  $a = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+  if ($null -eq $a) { throw 'empty active.json' }
+  return $a
+}
+$strandedSeenPath = Join-Path $FleetHome 'state\sentinel\stranded-seen.json'
+$activeWork = $null; $activeWorkUnreadable = $false
+try { $activeWork = Read-ActiveWorkStrict } catch { $activeWorkUnreadable = $true; $activeWork = $null }
 if ($activeWorkUnreadable) { $report.ok += [pscustomobject]@{ name = 'work-state-read'; detail = 'state/work/active.json unreadable; stranded-reservation check skipped' } }
 elseif (-not $rosterUnreadable -and $null -ne $activeWork -and $activeWork.PSObject.Properties['records'] -and $null -ne $activeWork.records) {
+  $seenBefore = @{}
+  try { $sf = Read-Json $strandedSeenPath; if ($sf) { foreach ($p in $sf.PSObject.Properties) { $seenBefore[$p.Name] = $p.Value } } } catch {}
+  $seenNow = [ordered]@{}
   $jobIntents = $null   # loaded once, only when a record gets past the cheap tests
   foreach ($prop in @($activeWork.records.PSObject.Properties)) {
     $rec = $prop.Value
@@ -686,20 +718,17 @@ elseif (-not $rosterUnreadable -and $null -ne $activeWork -and $activeWork.PSObj
     $ageHours = ($now - $reservedAt).TotalHours
     if ($ageHours -le $script:StrandedReservationHours) { continue }
     $manifestPath = "$($rec.manifestPath)"
-    if ((Test-Path -LiteralPath "$manifestPath.invalidated.json") -or (Test-Path -LiteralPath "$manifestPath.acknowledged.json")) { continue }
-    $claimed = @($rosterRows | Where-Object { "$($_.status)" -in @('active', 'retiring') -and "$($_.tenant)" -eq "$($rec.tenant)" -and "$($_.issue)" -eq "$($rec.issue)" })
-    if ($claimed.Count -gt 0) { continue }
-    if ($null -eq $jobIntents) {
-      $jobIntents = @()
-      $jobIds = @($daemon | ForEach-Object { "$($_.id)" } | Where-Object { $_ })
-      $jobsDir = Join-Path $env:USERPROFILE '.claude\jobs'
-      if (Test-Path -LiteralPath $jobsDir) { $jobIds += @(Get-ChildItem -LiteralPath $jobsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
-      foreach ($jid in @($jobIds | Select-Object -Unique)) {
-        try { $jst = Get-JobState $jid; if ($jst -and $jst.PSObject.Properties['intent'] -and $jst.intent) { $jobIntents += ("$($jst.intent)").ToLowerInvariant() } } catch {}
-      }
+    if ($null -eq $jobIntents) { $jobIntents = Get-AllJobIntents $daemon }
+    if (-not (Test-StrandedLegs $rec $rosterRows $jobIntents)) { continue }
+    # Stranded this tick. Has the PREVIOUS tick classified it stranded too (same manifest and revision, within the last hour)?
+    $prior = $seenBefore["$($rec.id)"]
+    $seenPrev = $false
+    if ($prior -and "$($prior.manifest)" -eq $manifestPath -and "$($prior.revision)" -eq "$($rec.revision)") {
+      $lastSeen = ConvertTo-UtcDateTime $prior.lastSeen
+      if ($null -ne $lastSeen -and ($now - $lastSeen).TotalMinutes -le 60) { $seenPrev = $true }
     }
-    $manifestLeaf = (Split-Path -Leaf $manifestPath).ToLowerInvariant()
-    if (@($jobIntents | Where-Object { $_.Contains($manifestLeaf) }).Count -gt 0) { continue }
+    $firstSeen = if ($seenPrev -and $prior.firstSeen) { "$($prior.firstSeen)" } else { $now.ToString('o') }
+    $seenNow["$($rec.id)"] = [ordered]@{ firstSeen = $firstSeen; lastSeen = $now.ToString('o'); manifest = $manifestPath; revision = $rec.revision }
     $strandedParent = ''
     try { $mf = Read-Json $manifestPath; if ($mf -and $mf.PSObject.Properties['parent'] -and $mf.parent) { $strandedParent = "$($mf.parent)" } } catch {}
     $reason = "stranded reservation: assigned since $($reservedAt.ToString('o')) with no roster row, no job and no marker"
@@ -708,15 +737,36 @@ elseif (-not $rosterUnreadable -and $null -ne $activeWork -and $activeWork.PSObj
     if ($cleanupLive) {
       if (Test-Paused) {
         $outcome = 'release deferred: PAUSE is set'
+      } elseif (-not $seenPrev) {
+        $outcome = 'first sighting; releases on the next tick if it is still stranded'
       } else {
-        $release = Invoke-ManifestRelease -Manifest $manifestPath -WorkRecordId "$($rec.id)" -Reason $reason
-        $entry = [pscustomobject]@{ recordId = "$($rec.id)"; tenant = "$($rec.tenant)"; issue = $rec.issue; manifest = $manifestPath; reservedAt = $reservedAt.ToString('o'); ageHours = [math]::Round($ageHours, 1); release = $release }
-        if ($release.ok) { $outcome = 'released'; $report.strandedReleased += $entry }
-        else { $outcome = "release failed: $($release.code) ($($release.detail))"; $report.strandedReleaseFailed += $entry }
+        # Fresh re-read of every leg right before acting (the dead-before-ack rule): a launch in flight must win.
+        $still = $false
+        try {
+          $freshRoster = @((Get-Content -LiteralPath $rosterPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop).sessions)
+          $freshDaemon = Get-DaemonSessions -All -Strict
+          $freshActive = Read-ActiveWorkStrict
+          $freshRecProp = $freshActive.records.PSObject.Properties["$($rec.id)"]
+          if ($null -ne $freshRecProp -and "$($freshRecProp.Value.state)" -eq 'assigned' -and "$($freshRecProp.Value.revision)" -eq "$($rec.revision)" -and "$($freshRecProp.Value.manifestPath)" -eq $manifestPath) {
+            $still = Test-StrandedLegs $freshRecProp.Value $freshRoster (Get-AllJobIntents $freshDaemon)
+          }
+        } catch { $still = $false }
+        if (-not $still) {
+          $outcome = 'release cancelled: the fresh re-read no longer shows it stranded'
+        } else {
+          $release = Invoke-ManifestRelease -Manifest $manifestPath -WorkRecordId "$($rec.id)" -Reason $reason
+          $entry = [pscustomobject]@{ recordId = "$($rec.id)"; tenant = "$($rec.tenant)"; issue = $rec.issue; manifest = $manifestPath; reservedAt = $reservedAt.ToString('o'); firstSeenStranded = $firstSeen; ageHours = [math]::Round($ageHours, 1); release = $release }
+          if ($release.ok) { $outcome = 'released'; $report.strandedReleased += $entry; $seenNow.Remove("$($rec.id)") }
+          else { $outcome = "release failed: $($release.code) ($($release.detail))"; $report.strandedReleaseFailed += $entry }
+        }
       }
     }
-    $report.escalate += [pscustomobject]@{ name = "$($rec.id)"; kind = 'reservation-stranded'; detail = "Work record $($rec.id) has been assigned since $($reservedAt.ToString('o')) ($([int]$ageHours) h, limit $($script:StrandedReservationHours) h) with no roster row for $($rec.tenant) issue #$($rec.issue), no job naming $manifestLeaf and no invalidation or ack marker; $outcome"; parent = $strandedParent }
+    $report.escalate += [pscustomobject]@{ name = "$($rec.id)"; kind = 'reservation-stranded'; detail = "Work record $($rec.id) reserved $([int]$ageHours) h with no session (a lead may be holding it behind the cap): no roster row for $($rec.tenant) issue #$($rec.issue), no job naming $((Split-Path -Leaf $manifestPath)) and no invalidation or ack marker (assigned since $($reservedAt.ToString('o')), limit $($script:StrandedReservationHours) h); $outcome"; parent = $strandedParent }
   }
+  try {
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $strandedSeenPath)) | Out-Null
+    Write-Json $strandedSeenPath ([pscustomobject]$seenNow)
+  } catch { Write-Warning "stranded-seen write failed: $($_.Exception.Message)" }
 }
 
 # --- clear a PAUSE we set once its window passed ---

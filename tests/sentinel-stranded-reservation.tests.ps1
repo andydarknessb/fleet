@@ -29,6 +29,13 @@ try {
 param([string]$Verb, [string]$Arg1)
 $root = 'TESTROOT'
 if ($Verb -eq 'agents') {
+  $n = 0; if (Test-Path "$root\mock-bin\agents-count.txt") { $n = [int](Get-Content "$root\mock-bin\agents-count.txt" -Raw) }
+  $n++; Set-Content "$root\mock-bin\agents-count.txt" $n -Encoding ASCII
+  if ($n -ge 2 -and (Test-Path "$root\mock-bin\late-job-intent.txt")) {
+    New-Item -ItemType Directory -Force "$root\profile\.claude\jobs\job-late" | Out-Null
+    $late = @{ name = 'ic-late'; state = 'working'; intent = (Get-Content "$root\mock-bin\late-job-intent.txt" -Raw) } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText("$root\profile\.claude\jobs\job-late\state.json", $late)
+  }
   $rows = @((Get-Content "$root\mock-bin\agents.json" -Raw | ConvertFrom-Json) | Where-Object { $_ })
   if ($rows.Count -eq 0) { Write-Output '[]' } else { Write-Output (ConvertTo-Json -InputObject $rows -Compress) }
   exit 0
@@ -51,7 +58,7 @@ exit 0
   function Reset-Fixture {
     foreach ($d in 'state\manifests', 'state\flags', 'state\heartbeats') { Get-ChildItem "$testRoot\$d" -ErrorAction SilentlyContinue | Remove-Item -Force }
     Get-ChildItem "$testRoot\profile\.claude\jobs" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
-    foreach ($p in "$testRoot\calls.txt", "$testRoot\state\PAUSE", "$testRoot\config\cycle.json") { Remove-Item $p -Force -ErrorAction SilentlyContinue }
+    foreach ($p in "$testRoot\calls.txt", "$testRoot\state\PAUSE", "$testRoot\config\cycle.json", "$testRoot\state\sentinel\stranded-seen.json", "$testRoot\mock-bin\agents-count.txt", "$testRoot\mock-bin\late-job-intent.txt") { Remove-Item $p -Force -ErrorAction SilentlyContinue }
     foreach ($p in "$testRoot\state\sentinel\applied", "$testRoot\state\work", "$testRoot\state\escalations", "$testRoot\state\releases", "$testRoot\state\events", "$testRoot\state\archive", "$testRoot\state\abandons") { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
     Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
     Set-Agents @()
@@ -63,7 +70,8 @@ exit 0
     $manifest = [ordered]@{ schemaVersion = 1; status = 'pending-ack'; id = "assignment-$Tenant-issue-$N-e3ee808918ff"; workRecordId = "${Tenant}:issue-$N"; workRecordRevision = 1; tenant = $Tenant; parent = "pl-$Tenant" }
     Write-Utf8 $mp ($manifest | ConvertTo-Json -Depth 6)
     $when = (Get-Date).ToUniversalTime().AddHours(-$HoursAgo).ToString('o')
-    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "${Tenant}:issue-$N" --tenant $Tenant --issue $N --manifest $mp --idempotency-key "reserve-$Tenant-$N" --now $when
+    $assignment = (@{ manifestId = "assignment-$Tenant-issue-$N-e3ee808918ff" } | ConvertTo-Json -Compress).Replace('"', '\"')
+    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "${Tenant}:issue-$N" --tenant $Tenant --issue $N --manifest $mp --assignment $assignment --idempotency-key "reserve-$Tenant-$N" --now $when
     if ($LASTEXITCODE -ne 0) { throw "fixture reservation for ${Tenant}:issue-$N failed" }
   }
   function Get-ActiveRecords { (Get-Content "$testRoot\state\work\active.json" -Raw | ConvertFrom-Json).records }
@@ -75,6 +83,13 @@ exit 0
       $out = if ($Apply) { & "$testRoot\bin\sentinel-check.ps1" -Apply -ReportPath "$testRoot\state\sentinel\last-check.json" 2>$null | Out-String } else { & "$testRoot\bin\sentinel-check.ps1" -ReportPath "$testRoot\state\sentinel\last-check.json" 2>$null | Out-String }
     } finally { $ErrorActionPreference = $eap }
     $out | ConvertFrom-Json
+  }
+  # A release needs the record stranded on the PREVIOUS tick too: run the arming tick (asserting it released nothing and
+  # says so) and return the second tick's report.
+  function Run-Armed { param([string]$Id = 'nidus:issue-7')
+    $first = Run-Check -Apply
+    Assert-True (@($first.strandedReleased).Count -eq 0 -and (Is-Reserved $Id)) 'the arming tick must not release'
+    Run-Check -Apply
   }
   function Stranded-For { param($Report, [string]$Id) ,@($Report.escalate | Where-Object { $_.name -eq $Id -and $_.kind -eq 'reservation-stranded' }) }
   function Calls { if (Test-Path "$testRoot\calls.txt") { @(Get-Content "$testRoot\calls.txt") } else { @() } }
@@ -95,8 +110,13 @@ exit 0
   Assert-True ($e1[0].parent -eq 'pl-nidus') 'S1: the page names the manifest parent'
   Assert-True ("$($e1[0].detail)" -like '*nidus:issue-7*' -and "$($e1[0].detail)" -like '*would release*') "S1: the detail names the record and what it would do (got: $($e1[0].detail))"
   Assert-True ((Is-Reserved 'nidus:issue-7') -and (Calls).Count -eq 0) 'S1: a read-only run touches nothing'
+  Assert-True ("$($e1[0].detail)" -like '*reserved 7 h with no session*' -and "$($e1[0].detail)" -like '*a lead may be holding it behind the cap*') "S1: the page reads as information (got: $($e1[0].detail))"
   New-Stranded
   Set-Flag
+  $s1a = Run-Check -Apply
+  $e1a = Stranded-For $s1a 'nidus:issue-7'
+  Assert-True ($e1a.Count -eq 1 -and "$($e1a[0].detail)" -like '*first sighting*' -and @($s1a.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7')) 'S1: the first sighting pages and releases nothing'
+  Assert-True (Test-Path "$testRoot\state\sentinel\stranded-seen.json") 'S1: the first sighting is remembered'
   $s1b = Run-Check -Apply
   Assert-True (-not (Is-Reserved 'nidus:issue-7')) 'S1: with -Apply and the flag the reservation is released'
   $mk = (Manifest-Path 'nidus' 7) + '.invalidated.json'
@@ -118,8 +138,9 @@ exit 0
   New-Stranded -HoursAgo 5
   Set-Flag
   Assert-Untouched (Run-Check -Apply) 'nidus:issue-7' 'nidus' 7 'S2 (5h)'
+  Assert-Untouched (Run-Check -Apply) 'nidus:issue-7' 'nidus' 7 'S2 (5h, second tick)'
   Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"strandedReservationHours":4}}'
-  $s2b = Run-Check -Apply
+  $s2b = Run-Armed
   Assert-True ((Stranded-For $s2b 'nidus:issue-7').Count -eq 1 -and -not (Is-Reserved 'nidus:issue-7')) 'S2: a 4h configured limit catches a 5h old reservation'
   Write-Output 'sentinel-stranded-reservation S2 passed'
 
@@ -134,7 +155,7 @@ exit 0
   New-Stranded
   Set-Flag
   Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @([pscustomobject]@{ name = 'ic-7'; role = 'ic'; tenant = 'endzone'; issue = 7; status = 'active'; jobId = 'job-x' }, [pscustomobject]@{ name = 'ic-7'; role = 'ic'; tenant = 'nidus'; issue = 7; status = 'retired'; jobId = 'job-y' }) } | ConvertTo-Json -Depth 5)
-  $s3c = Run-Check -Apply
+  $s3c = Run-Armed
   Assert-True ((Stranded-For $s3c 'nidus:issue-7').Count -eq 1 -and -not (Is-Reserved 'nidus:issue-7')) 'S3: another tenant row and a retired row do not protect the reservation'
   Write-Output 'sentinel-stranded-reservation S3 passed'
 
@@ -149,7 +170,7 @@ exit 0
   # an unrelated job does not protect it
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-7a\state.json" (ConvertTo-Json @{ name = 'ic-9'; state = 'working'; intent = 'Read the assignment manifest at C:\elsewhere\assignment-nidus-issue-9-aaaaaaaaaaaa.json and go.' } -Compress)
   Set-Agents @()
-  $s4c = Run-Check -Apply
+  $s4c = Run-Armed
   Assert-True ((Stranded-For $s4c 'nidus:issue-7').Count -eq 1 -and -not (Is-Reserved 'nidus:issue-7')) 'S4: an unrelated job intent does not protect the reservation'
   Write-Output 'sentinel-stranded-reservation S4 passed'
 
@@ -202,7 +223,7 @@ exit 0
   New-Stranded
   Set-Flag
   Remove-Item ((Manifest-Path 'nidus' 7)) -Force
-  $s9 = Run-Check -Apply
+  $s9 = Run-Armed
   Assert-True ((Stranded-For $s9 'nidus:issue-7').Count -eq 1 -and @($s9.strandedReleaseFailed).Count -eq 1 -and $s9.strandedReleaseFailed[0].release.code -eq 'MANIFEST_UNREADABLE' -and (Is-Reserved 'nidus:issue-7')) "S9: a missing manifest cannot be released; the failure is recorded (got: $(($s9.strandedReleaseFailed | ConvertTo-Json -Compress -Depth 4)))"
   Assert-True ("$((Stranded-For $s9 'nidus:issue-7')[0].detail)" -like '*MANIFEST_UNREADABLE*') 'S9: the page names the failure'
   New-Stranded
@@ -211,6 +232,42 @@ exit 0
   $s9b = Run-Check -Apply
   Assert-True ((Stranded-For $s9b 'nidus:issue-7').Count -eq 0 -and (Is-Reserved 'nidus:issue-7')) 'S9: a record that is no longer assigned is not a stranded reservation'
   Write-Output 'sentinel-stranded-reservation S9 passed'
+
+  # ---- S10 (QA #261): a launch in flight between the two ticks wins. Tick 1 arms the record; before tick 2 a roster row
+  # (or a job naming the manifest) appears: tick 2 pages nothing, releases nothing, and the armed state is dropped, so a
+  # later genuine strand has to be seen on two ticks again.
+  New-Stranded
+  Set-Flag
+  $null = Run-Check -Apply
+  Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @([pscustomobject]@{ name = 'ic-7'; role = 'ic'; tenant = 'nidus'; issue = 7; status = 'active'; jobId = 'job-7' }) } | ConvertTo-Json -Depth 5)
+  Assert-Untouched (Run-Check -Apply) 'nidus:issue-7' 'nidus' 7 'S10 (roster row appeared)'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  $s10b = Run-Check -Apply
+  Assert-True (@($s10b.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7')) 'S10: the armed state was dropped when the record stopped looking stranded'
+  # a gap of more than an hour between sightings restarts the count
+  New-Stranded
+  Set-Flag
+  $null = Run-Check -Apply
+  $seen = Get-Content "$testRoot\state\sentinel\stranded-seen.json" -Raw | ConvertFrom-Json
+  $seen.'nidus:issue-7'.lastSeen = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o')
+  Write-Utf8 "$testRoot\state\sentinel\stranded-seen.json" ($seen | ConvertTo-Json -Depth 4)
+  $s10c = Run-Check -Apply
+  Assert-True (@($s10c.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7')) 'S10: a stale first sighting does not count as the previous tick'
+  Write-Output 'sentinel-stranded-reservation S10 passed'
+
+  # ---- S11 (QA #261): the fresh re-read right before the release. The record is armed and still stranded at the top of
+  # the tick, but a job naming the manifest appears between the classification and the release (the mock plants it on
+  # the second `claude agents` call, the re-read): the release is cancelled.
+  New-Stranded
+  Set-Flag
+  $null = Run-Check -Apply
+  Write-Utf8 "$testRoot\mock-bin\late-job-intent.txt" ('Read the assignment manifest at ' + (Manifest-Path 'nidus' 7) + ' and the GitHub issue body.')
+  Remove-Item "$testRoot\mock-bin\agents-count.txt" -Force -ErrorAction SilentlyContinue
+  $s11 = Run-Check -Apply
+  $e11 = Stranded-For $s11 'nidus:issue-7'
+  Assert-True (@($s11.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7') -and -not (Test-Path ((Manifest-Path 'nidus' 7) + '.invalidated.json'))) 'S11: nothing released when a job appears before the release'
+  Assert-True ($e11.Count -eq 1 -and "$($e11[0].detail)" -like '*release cancelled*') "S11: the page says the release was cancelled (got: $($e11 | ConvertTo-Json -Compress))"
+  Write-Output 'sentinel-stranded-reservation S11 passed'
 
   Write-Output 'sentinel-stranded-reservation: all cases passed'
 } finally {
