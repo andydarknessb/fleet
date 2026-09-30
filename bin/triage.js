@@ -562,6 +562,16 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
 
     // 3. A fresh candidate: unrouted or carrying a triage label.
     if (!hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
+    // Settled at this body: the triage is done, and a label the owner moves it to
+    // afterwards (a hold such as haiku-rehearsal, or none) is the owner's routing, not
+    // a new ask. Settled is a finalized row (the hash it restated, else the proposal's) or a
+    // standing bounded ready (bounded-ready writes no finalized row; a Veto cleared it at
+    // step 0). A changed body, a triage label or a Re-propose still reopens it. Live
+    // 2026-09-29: Endzone #1773, served to the Principal 30 times.
+    const settled = row && row.finalized
+      ? { hash: row.finalized.bodyHash || (row.proposed && row.proposed.bodyHash), what: 'finalized', at: row.finalized.at }
+      : (standing ? { hash: standing.bodyHash, what: 'bounded ready', at: standing.at } : null);
+    if (!hasTriageLabel && settled && settled.hash && settled.hash === issue.bodyHash && !ownerAsksAgain) { skipped.push({ number: issue.number, reason: `${settled.what} ${settled.at} at this body; a later label is the owner's routing` }); continue; }
     if (issue.openSubIssues > 0) { skipped.push({ number: issue.number, reason: 'spec parent (open sub-issues); cutting is the owner\'s' }); continue; }
     if (issue.assignees.includes(owner)) { skipped.push({ number: issue.number, reason: 'assigned to the owner' }); continue; }
     if (held.has(issue.number)) { skipped.push({ number: issue.number, reason: `held (${held.get(issue.number)})` }); continue; }
@@ -569,7 +579,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // having the newest comment means Cory is in conversation on it, and a fleet
     // session's cross-link comment no longer looks like him. A tenant that still
     // shares one login (refused by the loader since #154) never reaches this rule.
-    if (authorshipDecides && newest && newest.author === owner) { skipped.push({ number: issue.number, reason: 'owner has the newest comment; a conversation, not a triage item' }); continue; }
+    if (authorshipDecides && newest && newest.author === owner && !ownerAsksAgain) { skipped.push({ number: issue.number, reason: 'owner has the newest comment; a conversation, not a triage item' }); continue; }
     // fleet#55: before #154 there was no "owner has the newest comment" rule. Every fleet
     // session's comment carries the owner login, so that test dropped two
     // freshly filed companion tickets on the lead's own cross-links, with no
@@ -577,6 +587,8 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // infer the owner's involvement from authorship; since #154 the rule above
     // does, and an Approval and a re-proposal ask still also carry a shape no
     // fleet role may write (the guard hook), a second lock beside the login.
+    // A Re-propose on an issue the ledger already decided is a re-proposal, as it is under the marker.
+    if (ownerAsksAgain && settled) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
     tickets.push({ kind: 'ticket', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: hasTriageLabel ? `labelled ${[...labels].filter((label) => triageLabels.has(label)).join(', ')}` : 'unrouted' });
   }
 
