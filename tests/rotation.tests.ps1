@@ -74,6 +74,9 @@ param([string]$FromRoster, [switch]$Force)
 $root = Split-Path -Parent $PSScriptRoot
 $forceMark = if ($Force) { '|force' } else { '' }
 Add-Content "$root\launch-calls.log" "$FromRoster$forceMark"
+# fleet #230: snapshot the intent exactly as the replacement's SessionStart hook would
+# read it while `claude --bg` is starting the session (before launch.ps1 returns).
+Copy-Item "$root\state\rotation\$FromRoster.json" "$root\intent-at-launch.json" -ErrorAction SilentlyContinue
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"cap reached (6/6)"}'; exit 3 }
 # fleet #121: the first launch meets a session already running under the name (the
 # stale revival, or a hand relaunch), the next one goes through.
@@ -112,6 +115,28 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'dispatcher') 'the replacement must launch through launch.ps1 -FromRoster'
   Assert-True (Test-Path "$testRoot\reconcile-calls.log") 'active Work records must be reconciled before the replacement acts'
   Assert-True ($intent.newSessionId -eq 'sess-new') 'the intent must record the replacement session'
+
+  # Case 2e (fleet #230): the race window. While launch.ps1 is still running (the moment
+  # the new session's SessionStart hook fires), the intent on disk must already say this
+  # rotation is launching, and the real hook run against that snapshot for the session the
+  # rotation launched must print the handoff. Today the snapshot reads `stopped` with no
+  # newSessionId and the hook stays silent (62 of 332 rotated leads, QA on #216).
+  $atLaunch = Get-Content "$testRoot\intent-at-launch.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($atLaunch.phase)" -eq 'launching') "the intent must be in the launching phase while launch.ps1 runs (was '$($atLaunch.phase)')"
+  $launchingAtParsed = [DateTimeOffset]::MinValue
+  Assert-True ([bool]$atLaunch.launchingAt -and [DateTimeOffset]::TryParse("$($atLaunch.launchingAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$launchingAtParsed) -and ((Get-Date).ToUniversalTime() - $launchingAtParsed.UtcDateTime).TotalSeconds -lt 60) 'the launching intent must carry a parseable, current launchingAt'
+  Assert-True ($atLaunch.offset.totalEvents -eq 2 -and (Test-Path "$testRoot\reconcile-calls.log")) 'the launching intent must already carry the offset and follow the reconcile'
+  $hookHome = "$testRoot\hook-home"
+  [IO.Directory]::CreateDirectory("$hookHome\state\rotation") | Out-Null
+  Copy-Item "$testRoot\intent-at-launch.json" "$hookHome\state\rotation\dispatcher.json" -Force
+  $savedFleetEnv = @{}
+  foreach ($v in 'FLEET_HOME','FLEET_NAME','FLEET_ROLE','FLEET_TENANT','FLEET_PARENT') { $savedFleetEnv[$v] = [Environment]::GetEnvironmentVariable($v) }
+  $env:FLEET_HOME = $hookHome; $env:FLEET_NAME = 'dispatcher'; $env:FLEET_ROLE = 'dispatcher'; $env:FLEET_TENANT = ''; $env:FLEET_PARENT = 'cory'
+  $eapH = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $hookOut = ('{"session_id":"sess-new","source":"startup"}' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$sourceRoot\hooks\session-start.ps1" 2>&1 | Out-String) }
+  finally { $ErrorActionPreference = $eapH; foreach ($v in $savedFleetEnv.Keys) { [Environment]::SetEnvironmentVariable($v, $savedFleetEnv[$v]) } }
+  Assert-True ($hookOut -match 'ROTATION: you replace a predecessor') 'the SessionStart hook run against the intent as it stands during launch.ps1 must print the handoff to the session the rotation launched'
+  Assert-True ($hookOut -match '2 events') 'the pre-launch handoff must carry the rotation offset'
 
   # Case 2b: an age-due idle session with a pending permission prompt (job state
   # `needs` matching "approve ...") must defer, not rotate - the boundary check did
@@ -265,6 +290,11 @@ console.log(JSON.stringify({ ok: true }));
   $intent7 = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
   Assert-True ($intent7.phase -eq 'stopped') 'a failed launch must leave the intent stopped'
   Assert-True ("$($intent7.launchError.reason)" -match 'cap') 'the launch error must be recorded'
+  # fleet #230: the failed attempt was in the launching phase while launch.ps1 ran, and
+  # must be written back out of it so no later session of the name reads it as its own.
+  $atLaunch7 = Get-Content "$testRoot\intent-at-launch.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($atLaunch7.phase)" -eq 'launching') 'the failed attempt must have been in the launching phase while launch.ps1 ran'
+  Assert-True ("$($intent7.phase)" -ne 'launching') 'a failed launch must not leave the intent in the launching phase'
   Remove-Item Env:MOCK_LAUNCH_FAIL
   $r7b = Run-Rotate @('-Auto')
   Assert-True (@($r7b.rotated) -contains 'dispatcher') 'the next auto run must complete the interrupted rotation'
