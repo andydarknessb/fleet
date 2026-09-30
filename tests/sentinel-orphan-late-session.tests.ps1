@@ -38,15 +38,20 @@ if ($Verb -eq 'agents') {
   $obj = Get-Content "$root\mock-bin\agents.json" -Raw | ConvertFrom-Json
   $rows = @($obj)
   foreach ($r in $rows) { if (Test-Path "$root\mock-bin\stopped-$($r.id).txt") { $r.pid = $null; $r.state = 'stopped' } }
+  $rows = @($rows | Where-Object { -not (Test-Path "$root\mock-bin\removed-$($_.id).txt") })
   ConvertTo-Json -InputObject @($rows) -Compress
   exit 0
 }
 [IO.File]::AppendAllText("$root\calls.txt", "claude $Verb $Arg1`r`n")
 if ($Verb -eq 'stop' -and $env:MOCK_STOP_DROPS -eq '1') { Set-Content "$root\mock-bin\stopped-$Arg1.txt" 'x' -Encoding ASCII }
+if ($Verb -eq 'rm') {
+  if ($env:MOCK_RM_FAILS -eq '1') { [Console]::Error.WriteLine('cannot remove job: still referenced'); exit 1 }
+  Set-Content "$root\mock-bin\removed-$Arg1.txt" 'x' -Encoding ASCII
+}
 exit 0
 '@
   Write-Utf8 "$testRoot\mock-bin\mock-claude.ps1" ($mockClaude.Replace('TESTROOT', $testRoot))
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-claude.ps1" %1 %2' + "`r`n" + 'exit /b 0' + "`r`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-claude.ps1" %1 %2' + "`r`n" + 'exit /b %ERRORLEVEL%' + "`r`n")
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'echo []' + "`r`n" + 'exit /b 0' + "`r`n")
 
   $env:PATH = "$testRoot\mock-bin;$oldPath"
@@ -68,16 +73,18 @@ exit 0
     Write-Utf8 ((Manifest-Path $Issue) + '.invalidated.json') (ConvertTo-Json @{ schemaVersion = 1; manifestId = "assignment-test-$Issue"; invalidatedAt = (Get-Date).ToUniversalTime().ToString('o'); reason = $Reason } -Compress)
   }
   function Write-Ack { param([string]$Issue) Write-Utf8 ((Manifest-Path $Issue) + '.acknowledged.json') '{"schemaVersion":1}' }
-  function Set-Agents { param($Rows) Write-Utf8 "$testRoot\mock-bin\agents.json" (ConvertTo-Json -InputObject @($Rows | ForEach-Object { [pscustomobject]@{ id = $_.id; name = $_.name; state = 'working'; status = 'idle'; pid = $_.pid; startedAt = $(if ($_.startedAt) { $_.startedAt } else { '2026-09-30T03:44:00Z' }) } }) -Compress) }
+  function Set-Agents { param($Rows) Write-Utf8 "$testRoot\mock-bin\agents.json" (ConvertTo-Json -InputObject @($Rows | ForEach-Object { [pscustomobject]@{ id = $_.id; name = $_.name; state = $(if ($_.state) { $_.state } else { 'working' }); status = 'idle'; pid = $_.pid; startedAt = $(if ($_.startedAt) { $_.startedAt } else { '2026-09-30T03:44:00Z' }) } }) -Compress) }
   function Reset-Fixture {
     Get-ChildItem "$testRoot\state\manifests" -ErrorAction SilentlyContinue | Remove-Item -Force
     Get-ChildItem "$testRoot\state\flags" -ErrorAction SilentlyContinue | Remove-Item -Force
     Get-ChildItem "$testRoot\mock-bin" -Filter 'stopped-*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force
+    Get-ChildItem "$testRoot\mock-bin" -Filter 'removed-*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force
     Get-ChildItem "$testRoot\profile\.claude\jobs" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
     Remove-Item "$testRoot\calls.txt" -Force -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\sentinel\applied" -Recurse -Force -ErrorAction SilentlyContinue
     Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
     $env:MOCK_STOP_DROPS = '0'
+    $env:MOCK_RM_FAILS = '0'
   }
   function Run-Check { param([switch]$Apply)
     $out = if ($Apply) { & "$testRoot\bin\sentinel-check.ps1" -Apply -ReportPath "$testRoot\state\sentinel\last-check.json" | Out-String } else { & "$testRoot\bin\sentinel-check.ps1" -ReportPath "$testRoot\state\sentinel\last-check.json" | Out-String }
@@ -125,6 +132,7 @@ exit 0
   Assert-True ($calls3 -contains 'claude stop job-1001') "O3: claude stop job-1001 was called (calls: $($calls3 -join '; '))"
   Assert-True ($calls3 -contains 'claude rm job-1001') 'O3: the verified stop is followed by claude rm'
   Assert-True (@($o3.stopped).Count -eq 1 -and $o3.stopped[0].jobId -eq 'job-1001' -and $o3.stopped[0].name -eq 'ic-1001' -and $o3.stopped[0].verified -eq $true) 'O3: report.stopped names the job'
+  Assert-True ($o3.stopped[0].removed -eq $true -and "$($o3.stopped[0].rmError)" -eq '') 'O3: the row is confirmed gone (removed true, no rmError)'
   Assert-True (@($o3.stopFailed).Count -eq 0) 'O3: nothing failed'
   $e3 = @($o3.escalate | Where-Object { $_.name -eq 'ic-1001' -and $_.kind -eq 'orphan-late-session' })
   Assert-True ($e3.Count -eq 1 -and "$($e3[0].detail)" -like '*stopped') 'O3: the page still fires and says stopped'
@@ -236,6 +244,44 @@ exit 0
   $calls6 = Calls
   Assert-True (($calls6 -contains 'claude stop job-1001') -and ($calls6 -notcontains 'claude rm job-1001')) "O6: stop attempted, row not removed (calls: $($calls6 -join '; '))"
   Write-Output 'sentinel-orphan-late-session O6 passed'
+
+  # ---- O7: the stop works but claude rm is refused: the row stays listed, so removed is false, rmError says why,
+  # ---- and the page says "stopped, not removed" instead of claiming a clean removal.
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'test'
+  $env:MOCK_STOP_DROPS = '1'
+  $env:MOCK_RM_FAILS = '1'
+  Write-Job 'job-1001' 'ic-1001' (Manifest-Intent '1001'); Write-Marker '1001'
+  Set-Agents @(@{ id = 'job-1001'; name = 'ic-1001'; pid = 1001 })
+  $o7 = Run-Check -Apply
+  Assert-True (@($o7.stopped).Count -eq 1 -and $o7.stopped[0].jobId -eq 'job-1001' -and $o7.stopped[0].verified -eq $true) "O7: the job is still recorded as stopped (got: $(($o7.stopped | ConvertTo-Json -Compress)))"
+  Assert-True ($o7.stopped[0].removed -eq $false) 'O7: removed is false when rm failed'
+  Assert-True ("$($o7.stopped[0].rmError)" -like '*exit 1*' -and "$($o7.stopped[0].rmError)" -like '*cannot remove job*') "O7: rmError carries rm's exit code and output (got: $($o7.stopped[0].rmError))"
+  $e7 = @($o7.escalate | Where-Object { $_.name -eq 'ic-1001' -and $_.kind -eq 'orphan-late-session' })
+  Assert-True ($e7.Count -eq 1 -and "$($e7[0].detail)" -like '*stopped, not removed: *cannot remove job*') "O7: the page says stopped, not removed, with the reason (got: $($e7[0].detail))"
+  Assert-True (@($o7.stopFailed).Count -eq 0) 'O7: a failed rm is not a failed stop'
+  Write-Output 'sentinel-orphan-late-session O7 passed'
+
+  # ---- O8: expected loop. ic-1001 is rostered as job-A (live). A NEWER stopped row job-B carries the same name
+  # ---- (an orphan whose rm failed). The roster jobId picks job-A, so nothing respawns job-B.
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-A"}]}'
+  Write-Job 'job-A' 'ic-1001' (Manifest-Intent '1001')
+  Write-Job 'job-B' 'ic-1001' (Manifest-Intent '1002')
+  Set-Agents @(@{ id = 'job-A'; name = 'ic-1001'; pid = 11; startedAt = '2026-09-30T03:00:00Z' }, @{ id = 'job-B'; name = 'ic-1001'; pid = $null; state = 'stopped'; startedAt = '2026-09-30T04:00:00Z' })
+  $o8 = Run-Check -Apply
+  $calls8 = Calls
+  Assert-True (@($calls8 | Where-Object { $_ -like 'claude respawn*' }).Count -eq 0) "O8: the newer same-name stopped row is not respawned (calls: $($calls8 -join '; '))"
+  Assert-True (@($o8.respawned).Count -eq 0 -and @($o8.respawnFailed).Count -eq 0) 'O8: nothing respawned or failed'
+  # Fallbacks keep the old pick: a roster row with no jobId, and a jobId the daemon does not list.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active"}]}'
+  $o8b = Run-Check -Apply
+  Assert-True (@($o8b.respawned).Count + @($o8b.respawnFailed).Count -eq 1 -and (@($o8b.respawned) + @($o8b.respawnFailed))[0].jobId -eq 'job-B') 'O8b: with no roster jobId the newest-by-name row (job-B) is still the one judged'
+  Remove-Item "$testRoot\calls.txt" -Force -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-gone"}]}'
+  $o8c = Run-Check -Apply
+  Assert-True (@($o8c.respawned).Count + @($o8c.respawnFailed).Count -eq 1 -and (@($o8c.respawned) + @($o8c.respawnFailed))[0].jobId -eq 'job-B') 'O8c: a roster jobId the daemon does not list falls back to newest-by-name'
+  Write-Output 'sentinel-orphan-late-session O8 passed'
 
   Write-Output 'sentinel-orphan-late-session tests passed'
 } finally {
