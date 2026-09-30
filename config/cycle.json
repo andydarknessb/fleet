@@ -69,7 +69,8 @@
     "healCap": 2,
     "busyQuietMinutes": 60,
     "watchStaleMinutes": 20,
-    "watchFailTicks": 3
+    "watchFailTicks": 3,
+    "deadBeforeAckMinutes": 60
   },
   "pages": {
     "priority": {
