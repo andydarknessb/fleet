@@ -264,7 +264,11 @@ test('close, reopen, close again escalates twice - no permanent replay wedge', (
   const closed = fetchers({ open: [], viewResult: view({ state: 'CLOSED' }) });
   watch(root, closed);
   assert.equal(record(root).state, 'escalated');
-  watch(root, fetchers({ open: [pr()], viewResult: view({ body: 'Closes #42' }) }));   // reopened, linked -> resolves
+  // #221: a closed-without-merge escalation is not a linkage escalation, so a reopen with
+  // linkage does not resolve it; the lead's resolution does, and the next close escalates again.
+  watch(root, fetchers({ open: [pr()], viewResult: view({ body: 'Closes #42' }) }));   // reopened, linked -> still the lead's
+  assert.equal(record(root).state, 'escalated');
+  resolveAsLead(root, 'ci-wait', 'reopened on purpose; the closure was a mistake');
   assert.equal(record(root).state, 'ci-wait');
   watch(root, closed);
   assert.equal(record(root).state, 'escalated');
@@ -726,6 +730,35 @@ test('#118: a third return to draft escalates for a Ruling instead of failing ev
   assert.equal(outbox(root).filter((w) => w.wake === 'decision-needed').length, 1, 'one decision-needed wake');
   watch(root, third);
   assert.equal(record(root).state, 'escalated', 'the next tick does nothing more');
+});
+
+// #221: the escalated-state self-resolve was keyed on the bare watcher mark plus live
+// linkage, so it also resolved escalations that are not about linkage. A third
+// send-back is a Ruling for the lead: an IC re-readying the PR with linkage present
+// must not clear it. Only the watcher's closing-linkage escalation (its tag) does.
+test('#221: a third-send-back escalation is not resolved when the PR is re-readied with linkage', () => {
+  for (const body of ['Closes #42', 'Refs #42\n\nDeliberate: the lead closes the issue at the merge.']) {
+    const root = rootDir();
+    seed(root, { state: 'review' });
+    let head = 'abc123';
+    watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+    for (const next of ['def456', 'fed789']) {
+      watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: head, statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+      head = next;
+      const readied = fetchers({ open: [pr({ headRefOid: head, statusCheckRollup: GREEN })], viewResult: view({ headRefOid: head, statusCheckRollup: GREEN, body: 'Closes #42' }) });
+      for (let tick = 0; tick < 3; tick += 1) watch(root, readied);
+    }
+    watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: head, statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+    assert.equal(record(root).state, 'escalated');
+    assert.match(record(root).decisionEvidence, /third send-back/);
+    const wakesBefore = outbox(root).length;
+    const eventsBefore = events(root).length;
+    const reReadied = fetchers({ open: [pr({ headRefOid: 'aaa111', statusCheckRollup: GREEN })], viewResult: view({ headRefOid: 'aaa111', statusCheckRollup: GREEN, body }) });
+    for (let tick = 0; tick < 3; tick += 1) watch(root, reReadied);
+    assert.equal(record(root).state, 'escalated', `a Ruling escalation stays for the lead (body ${JSON.stringify(body.slice(0, 12))})`);
+    assert.equal(events(root).length, eventsBefore, 'the watcher appends nothing for it');
+    assert.equal(outbox(root).length, wakesBefore);
+  }
 });
 
 // run-pr-watch.ps1 (the scheduled tick, the only production caller) passes no
