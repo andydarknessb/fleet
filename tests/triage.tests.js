@@ -742,6 +742,81 @@ test('#207: the finalize CLI runs against a fixture and prints what it finalized
   assert.throws(() => cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixtrue', 'x']), (error) => /unknown flag/.test(error.message));
 });
 
+// #233: the triage block used to read a tenant's open issues twice per tick (finalize, then frontier).
+// `triageTick` reads once, finalizes over that read, patches the read with what the finalize wrote to
+// GitHub, and computes the frontier over the patched read.
+function countingRunner(seed, write) {
+  const counts = { queries: 0, writes: [] };
+  const runner = ghRunner(seed, (exe, args, options) => { counts.writes.push(args.slice(0, 2).join(' ')); return write ? write(exe, args, options) : ''; }, () => { counts.queries += 1; });
+  return { runner, counts };
+}
+
+test('#233: a tick reads the open issues once, and the frontier it returns shows the finalize (marker gone, ready label on, no approval)', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed);
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1, 'one GraphQL read for finalize and frontier together');
+  assert.deepEqual(counts.writes, ['issue comment', 'issue edit']);
+  assert.deepEqual(tick.finalize.finalized.map((row) => row.issue), [40]);
+  assert.equal(tick.finalize.error, undefined);
+  assert.deepEqual(tick.frontier.eligible, [], 'the finalized issue is neither an approval nor a ticket');
+  assert.deepEqual(tick.frontier.skipped, [{ number: 40, reason: 'routed (ready-for-agent)' }], 'it is routed, which only the patched labels can say (unpatched: marker still on)');
+  // What a second, standalone read after the finalize would say is the same.
+  const seedAfter = JSON.parse(JSON.stringify(seed));
+  seedAfter[0].labels = ['needs-triage', 'ready-for-agent', 'bug'];
+  assert.deepEqual(tick.frontier.skipped, computeFrontier({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seedAfter, () => '') }).skipped);
+});
+
+test('#233: a tick that finalizes nothing still reads once, and the frontier is the standalone frontier', () => {
+  const root = rootDir();
+  const seed = [issue(1, { labels: ['needs-triage'] }), issue(2, { labels: ['ready-for-agent'] })];
+  const { runner, counts } = countingRunner(seed);
+  const tick = triage.triageTick({ root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1);
+  assert.deepEqual(counts.writes, []);
+  assert.deepEqual(tick.finalize.finalized, []);
+  const alone = computeFrontier({ root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, () => '') });
+  assert.deepEqual(tick.frontier, alone);
+});
+
+test('#233: a finalize write that FAILED on GitHub is not applied to the frontier read', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed, (exe, args) => { if (args[1] === 'edit') throw Object.assign(new Error('gh: 502'), { stderr: 'HTTP 502' }); return ''; });
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1);
+  assert.deepEqual(tick.finalize.finalized, []);
+  assert.match(tick.finalize.errors[0].message, /502/);
+  // The claim stands on the ledger and the Ruling comment landed, but the labels did not change: the marker is still on.
+  assert.deepEqual(tick.frontier.eligible, []);
+  assert.deepEqual(tick.frontier.skipped, [{ number: 40, reason: 'outcome approved recorded, marker not yet removed' }]);
+});
+
+test('#233: a finalize that throws after the read is reported and the frontier still runs over the same read', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed);
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner, finalizeImpl: () => { throw new Error('finalize blew up'); } });
+  assert.equal(counts.queries, 1);
+  assert.match(tick.finalize.error, /finalize blew up/);
+  assert.deepEqual(tick.frontier.eligible.map((item) => [item.kind, item.number]), [['approval', 40]], 'the Principal still sees the approval');
+  // An unreadable GitHub fails the tick closed: there is no frontier to hand back.
+  assert.throws(() => triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner: () => { throw Object.assign(new Error('x'), { stderr: 'rate limited' }); } }), { code: 'GITHUB_QUERY_FAILED' });
+});
+
+test('#233: the tick CLI runs against a fixture: the fixture is edited as finalize edits it and the frontier omits the finalized issue', () => {
+  const world = finalizeWorld({ numbers: [40, 41], each: (n) => (n === 41 ? { thread: { approval: 'Approved with: tier haiku' } } : {}) });
+  const out = cli(['tick', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', NOW]);
+  assert.deepEqual(out.finalize.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(out.finalize.left, [{ issue: 41, reason: 'not-exact-approval' }]);
+  assert.deepEqual(out.frontier.eligible.map((item) => [item.kind, item.number]), [['approval', 41]]);
+  assert.equal(out.frontier.source, 'fixture');
+  assert.deepEqual([...world.fixtureIssue(40).labels].sort(), ['bug', 'needs-triage', 'ready-for-agent']);
+  assert.ok(TRIAGE_FLAGS.tick.includes('fixture'));
+  assert.deepEqual(TRIAGE_FLAGS.tick, TRIAGE_FLAGS.finalize);
+});
+
 test('#207: a trailing full stop is allowed on an exact field, and a Premises heading may carry a parenthesis and a blank-separated verified block', () => {
   const dotted = PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none.').replace('Blocked_by: none', 'Blocked_by: none.').replace('Tier: sonnet', 'Tier: sonnet.').replace('Classification: bug', 'Classification: bug.')
     .replace('  src/list.js: slices one short @abcdef1 verified @abcdef2', '  src/list.js: slices one short @abcdef1 verified @abcdef2\n\n  src/util.js: exports pad @abcdef1 verified @abcdef2');
