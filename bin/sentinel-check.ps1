@@ -6,7 +6,8 @@
   Same flag (fleet #253): retire an IC roster row that died before ack (no heartbeat, no ack, job gone) and release its reservation.
   Same flag (fleet #256 AC2): release an assigned reservation stranded with no roster row, no job and no marker.
   Bounded (fleet #257 Gap B): a verified respawn (or launched relaunch) is counted in state/sentinel/respawn-streak.json; the (watchdog.respawnLoopCap+1)th for one job inside
-  watchdog.respawnLoopWindowHours, with no heartbeat in between, is held (respawnHeld) and escalated as respawn-loop.
+  watchdog.respawnLoopWindowHours, with no heartbeat in between, is held (respawnHeld) and escalated as respawn-loop when the row has a live pid; a row
+  with no pid is always respawned (and counted), with respawn-loop-down raised beside it once the cap is reached.
   Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack / reservation-stranded / respawn-loop). The Sentinel session acts on those.
 #>
 param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel', [string]$HealRespawn = '')
@@ -124,7 +125,12 @@ if (Test-Path -LiteralPath $script:RespawnStreakPath) {
       $rsReason = ''; if ($rsEntry.PSObject.Properties['lastReason']) { $rsReason = "$($rsEntry.lastReason)" }
       $script:RespawnStreak[$rsProp.Name] = @{ jobId = "$($rsEntry.jobId)"; attempts = @($rsAttempts); lastReason = $rsReason }
     }
-  } catch { $script:RespawnStreakUnreadable = $true; $script:RespawnStreakError = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim();$script:RespawnStreak = @{} }
+  } catch {
+    $script:RespawnStreakUnreadable = $true; $script:RespawnStreakError = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim(); $script:RespawnStreak = @{}
+    # Raised on the read itself, every tick the file stays corrupt, whether or not a respawn is pending.
+    $report.ok += [pscustomobject]@{ name = 'respawn-streak-read'; detail = "state/sentinel/respawn-streak.json unreadable ($($script:RespawnStreakError)); a respawn or relaunch of a session that still has a process is deferred until the file is deleted or fixed" }
+    $report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'respawn-loop'; detail = "state/sentinel/respawn-streak.json unreadable ($($script:RespawnStreakError)); the bound on repeated respawns cannot be checked, so respawns of sessions that still have a process are held. Fix: delete state/sentinel/respawn-streak.json (safe: it only resets the counts)" }
+  }
 }
 # (Get-ForeignRosterRoot is defined here, above Get-ExpectedRow and the -HealRespawn call site, because the stand-in rules use it.)
 # `claude agents --all` lists every job on the machine, not only this root's. A scratch
@@ -358,15 +364,15 @@ function Add-RespawnStreakAttempt {
 function Test-RespawnStreakHold {
   # $true when this respawn / relaunch must not run. Evaluated in read-only runs too; it writes nothing.
   param($row, $entry, [string]$reason, [string]$via = '')
+  # Liveness first: only a row WITH a live pid can be in the "respawn verified, no turn follows" loop this bound exists for.
+  # A row with no pid (reaped, stopped, failed) is always respawned / relaunched as before, and still counted; once it has
+  # gone down cap times with no heartbeat in between, respawn-loop-down says the session keeps going down.
+  $hasPid = [bool]$row.pid
   if ($script:RespawnStreakUnreadable) {
+    if (-not $hasPid) { return $false }   # the file is left as found and this respawn is not counted; the read already escalated
     $deferred = [ordered]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "state/sentinel/respawn-streak.json unreadable; respawns held until it is fixed or removed: $reason" }
     if ($via) { $deferred.via = $via }
     $script:report.respawnDeferred += [pscustomobject]$deferred
-    if (-not $script:RespawnStreakReported) {
-      $script:RespawnStreakReported = $true
-      $script:report.ok += [pscustomobject]@{ name = 'respawn-streak-read'; detail = "state/sentinel/respawn-streak.json unreadable ($($script:RespawnStreakError)); every respawn and relaunch is deferred until it is fixed or removed" }
-      $script:report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'respawn-loop'; detail = "state/sentinel/respawn-streak.json unreadable ($($script:RespawnStreakError)); respawns and relaunches are held until it is fixed or removed (the bound on repeated respawns cannot be checked without it)" }
-    }
     return $true
   }
   $live = @(Get-LiveRespawnAttempts "$($entry.name)" "$($row.id)")
@@ -374,10 +380,14 @@ function Test-RespawnStreakHold {
   $firstAt = "$($live[0])"; $lastAt = "$($live[$live.Count - 1])"
   $hbAt = Get-HeartbeatAt "$($entry.name)"
   $hbText = if ($null -eq $hbAt) { 'never' } else { "last at $($hbAt.ToString('o')), before the first respawn" }
+  if (-not $hasPid) {
+    $script:report.escalate += [pscustomobject]@{ name = $row.name; kind = 'respawn-loop-down'; detail = "job $($row.id) has been respawned $($live.Count) times since $firstAt with no turn completed after any of them (heartbeat: $hbText) and has no process again: the session keeps going down; respawning anyway because a session with no process is always respawned. Check why it dies (claude agents --all; bin\status.ps1; the job's state.json), relaunch it by hand (rotate.ps1 / launch.ps1), or retire it; $reason"; parent = $entry.parent }
+    return $false
+  }
   $held = [ordered]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; attempts = $live.Count; firstAt = $firstAt; lastAt = $lastAt; reason = $reason }
   if ($via) { $held.via = $via }
   $script:report.respawnHeld += [pscustomobject]$held
-  $script:report.escalate += [pscustomobject]@{ name = $row.name; kind = 'respawn-loop'; detail = "job $($row.id) respawned $($live.Count) times since $firstAt (pid changed each time) and no turn completed after any of them (heartbeat: $hbText); respawn held until a heartbeat newer than $lastAt, a new job id, or the window ($($script:RespawnLoopWindowHours) h) passes: check the session (claude agents --all; bin\status.ps1), relaunch it by hand (rotate.ps1 / launch.ps1), or delete the entry in state/sentinel/respawn-streak.json; $reason"; parent = $entry.parent }
+  $script:report.escalate += [pscustomobject]@{ name = $row.name; kind = 'respawn-loop'; detail = "job $($row.id) respawned $($live.Count) times since $firstAt (pid changed each time) and no turn completed after any of them (heartbeat: $hbText); respawn held until a heartbeat newer than $lastAt, a new job id, or the window ($($script:RespawnLoopWindowHours) h) passes: check the session (claude agents --all; bin\status.ps1), relaunch it by hand (rotate.ps1 / launch.ps1), or delete state/sentinel/respawn-streak.json (safe: it only resets the counts); $reason"; parent = $entry.parent }
   return $true
 }
 function Do-Relaunch {
