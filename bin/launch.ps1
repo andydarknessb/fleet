@@ -128,8 +128,10 @@ function Invalidate-Manifest {
   param([string]$Reason)
   $node = Get-Command node -ErrorAction SilentlyContinue
   if (-not $node) { throw 'node is required to release the assignment reservation' }
-  & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId'" }
+  $releaseOutput = & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | Out-String
+  # fleet#251: the door's error text (RELEASE_CLAIMED names bin\retire.ps1) reaches the operator.
+  $releaseExit = $LASTEXITCODE
+  if ($releaseExit -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId': $(($releaseOutput | Out-String).Trim())" }
   Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = $assignment.id; invalidatedAt = (Now-Iso); reason = $Reason })
 }
 # Fleet #28 (2026-09-11): the installed Claude Code CLI keeps a per-model auto-mode
@@ -584,13 +586,28 @@ if (-not $row) {
   # planner would exclude the issue as `reserved` and a fresh assign would hit
   # RESERVATION_CONFLICT. Release it so the next decision can reserve again.
   $released = $false
-  if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($why)"; $released = $true } catch {} }
-  # fleet#251: the worktree goes after the release, and only when the release worked. A session
-  # that appears late still finds its assignment worktree until the reservation is actually
-  # released; the invalidated manifest then tells its ack to stop (MANIFEST_INVALIDATED). A
-  # release that threw leaves the reservation live, so the worktree stays with it.
-  if (-not $Manifest -or $released) { Remove-FailedAssignmentWorktree }
-  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released } | ConvertTo-Json -Compress); exit 5
+  $releaseError = $null
+  if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($why)"; $released = $true } catch { $releaseError = "$($_.Exception.Message)" } }
+  # fleet#251: the worktree goes after the release. A session that appears late still finds its
+  # assignment worktree until the reservation is actually released; the invalidated manifest
+  # then tells its ack to stop (MANIFEST_INVALIDATED). When the release failed, the worktree
+  # stays only if the assignment is demonstrably live: the record left `assigned` (a late
+  # session acknowledged) or the session list now shows the job. Otherwise it goes as before:
+  # a stranded worktree makes every relaunch exit 4 ("already exists") before it can release.
+  $keepWorktree = $false
+  if ($Manifest -and -not $released) {
+    try {
+      $node = Get-NodeExe
+      $currentRecord = (& $node "$PSScriptRoot\work-state.js" get --root $FleetHome --id $WorkRecordId 2>$null | Out-String | ConvertFrom-Json)
+      if ($currentRecord -and $currentRecord.state -and "$($currentRecord.state)" -notin @('assigned', 'released')) { $keepWorktree = $true }
+    } catch {}
+    try {
+      $lateRow = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+      if ($lateRow) { $keepWorktree = $true }
+    } catch {}
+  }
+  if (-not $keepWorktree) { Remove-FailedAssignmentWorktree }
+  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released; releaseError = $releaseError; worktreeKept = $keepWorktree } | ConvertTo-Json -Compress); exit 5
 }
 
 # --- record ---

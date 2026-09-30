@@ -36,6 +36,20 @@ $invalidateAt = $block.IndexOf('Invalidate-Manifest')
 $removeAt = $block.IndexOf('Remove-FailedAssignmentWorktree')
 Assert-True ($invalidateAt -ge 0 -and $removeAt -ge 0) 'the no-session block both releases the reservation and removes the worktree'
 Assert-True ($invalidateAt -lt $removeAt) 'the no-session block releases the reservation before it removes the worktree'
-Assert-True ($block -match 'if \(\$released[^)]*\)\s*\{\s*Remove-FailedAssignmentWorktree|if \(-not \$Manifest -or \$released\)\s*\{\s*Remove-FailedAssignmentWorktree') 'the worktree is removed only when the release succeeded (a thrown release leaves it alone)'
+Assert-True ($block -match 'if \(-not \$keepWorktree\)\s*\{\s*Remove-FailedAssignmentWorktree') 'the worktree is removed unless the keep decision (a failed release on a live assignment) says otherwise'
 
-Write-Output 'launch-release-order: ok'
+# fleet#251 QA: a failed release must not strand the worktree forever (a kept worktree makes
+# every relaunch exit 4 "assignment worktree already exists" before it can release), and the
+# release error must reach the operator (it names bin\retire.ps1 when the record is claimed).
+Assert-True ($block -match 'work-state\.js"\s+get\b') 'after a failed release the no-session block re-reads the Work record'
+Assert-True ($block -match "-notin @\('assigned', 'released'\)") 'the worktree is kept only when the record is no longer assigned (a late session acknowledged)'
+Assert-True ($block -match 'Get-DaemonSessions') 'the no-session block re-reads the session list before giving up on the worktree'
+$keepAt = $block.IndexOf('$keepWorktree')
+$removeCallAt = $block.IndexOf('Remove-FailedAssignmentWorktree')
+Assert-True ($keepAt -ge 0 -and $keepAt -lt $removeCallAt) 'the keep decision is made before the worktree removal'
+
+$invalidateFn = ($lines | Select-String -Pattern '^function Invalidate-Manifest' -Context 0,8 | Select-Object -First 1).Context.PostContext -join "`n"
+Assert-True ($invalidateFn -notmatch 'release[^\n]*Out-Null') 'Invalidate-Manifest must not discard the release command output'
+Assert-True ($invalidateFn -match 'release failed[^\n]*\$releaseOutput|\$releaseOutput[^\n]*release failed') 'the thrown release failure carries the node error text'
+
+Write-Output 'launch-release-order (QA): ok'
