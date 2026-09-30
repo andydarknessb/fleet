@@ -918,8 +918,9 @@ try {
         $healOutcome = if ($healOut) { $healOut } else { Get-OneLine $healRaw 200 }
         $healActuallyRan = $true   # the call was issued regardless of outcome (a no-op still counts, ticket 85)
         # fleet #257 Gap B: a respawn the respawn-loop bound HELD ran nothing (no claude respawn, no attempt): like a refused
-        # rotate it must not burn the 24h heal budget.
-        if ($healOut -and $healOut.PSObject.Properties['respawnHeld'] -and @($healOut.respawnHeld | Where-Object { "$($_.name)" -eq $healName }).Count -gt 0) { $healActuallyRan = $false }
+        # rotate it must not burn the 24h heal budget, and it must not use up the per-tick heal-respawn cap either, so held
+        # names cannot starve other ICs' heals.
+        if ($healOut -and $healOut.PSObject.Properties['respawnHeld'] -and @($healOut.respawnHeld | Where-Object { "$($_.name)" -eq $healName }).Count -gt 0) { $healActuallyRan = $false; $healRespawnInvocations-- }
       }
       if (-not $healActuallyRan) {
         # review #4: a refusal is recorded, with its reason, and never counted.

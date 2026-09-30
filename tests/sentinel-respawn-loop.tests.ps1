@@ -33,9 +33,14 @@ function Run-Check { param([switch]$Apply, [string]$Actor = '', [string]$Heal = 
   $a = @{}; if ($Apply) { $a.Apply = $true }; if ($Actor) { $a.Actor = $Actor }; if ($Heal) { $a.HealRespawn = $Heal }
   (& "$testRoot\bin\sentinel-check.ps1" @a | Out-String) | ConvertFrom-Json
 }
-function Write-Streak { param([string]$JobId, [double[]]$MinutesAgo)
-  $attempts = @($MinutesAgo | ForEach-Object { (Get-Date).ToUniversalTime().AddMinutes(-$_).ToString('o') })
-  Write-Utf8 $streakPath (([ordered]@{ 'ic-900' = [ordered]@{ jobId = $JobId; attempts = @($attempts); lastReason = 'seeded' } }) | ConvertTo-Json -Depth 6)
+function Write-Streak { param([string]$JobId, [double[]]$MinutesAgo, [double[]]$Down = @())
+  # -Down names the attempts (by minutes ago) that were deaths (the row had no pid); the rest were live-pid respawns.
+  # Without it the entry has no downAttempts list at all, the shape an older check wrote.
+  $now = (Get-Date).ToUniversalTime()
+  $attempts = @($MinutesAgo | ForEach-Object { $now.AddMinutes(-$_).ToString('o') })
+  $entry = [ordered]@{ jobId = $JobId; attempts = @($attempts); lastReason = 'seeded' }
+  if ($Down.Count -gt 0) { $entry.downAttempts = @($Down | ForEach-Object { $now.AddMinutes(-$_).ToString('o') }) }
+  Write-Utf8 $streakPath (([ordered]@{ 'ic-900' = $entry }) | ConvertTo-Json -Depth 6)
 }
 function Read-Streak { if (Test-Path $streakPath) { Get-Content $streakPath -Raw | ConvertFrom-Json } else { $null } }
 
@@ -163,7 +168,7 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   $b6b = Run-Check
   Assert-True (@($b6b.respawned).Count -eq 0 -and @($b6b.respawnDeferred).Count -eq 1) 'B6: a read-only run defers too'
   # A structurally wrong file (an array, an entry with no attempts list) is unreadable as well.
-  foreach ($bad in '[]', 'null', '{"ic-900":{"jobId":"job-900"}}', '{"ic-900":{"jobId":"job-900","attempts":["not a date"]}}') {
+  foreach ($bad in '[]', 'null', '{"ic-900":{"jobId":"job-900"}}', '{"ic-900":{"jobId":"job-900","attempts":["not a date"]}}', '{"ic-900":{"jobId":"job-900","attempts":[],"downAttempts":["not a date"]}}', '{"ic-900":{"jobId":"job-900","attempts":[],"downAttempts":"x"}}') {
     Write-Utf8 $streakPath $bad
     $b6c = Run-Check -Apply
     Assert-True (@($b6c.respawned).Count -eq 0 -and @($b6c.respawnDeferred).Count -eq 1 -and (Get-Content $streakPath -Raw) -eq $bad) "B6: '$bad' is unreadable, fails closed and stays untouched"
@@ -188,7 +193,7 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   # B10 liveness first: the hold is for a row WITH a live pid (respawn verified, no turn follows). A held job that is later
   # reaped (no pid) is respawned as on master, counted, and raises respawn-loop-down beside it.
   Reset-Case
-  Write-Streak 'job-900' @(30, 20, 10)
+  Write-Streak 'job-900' @(30, 20, 10) -Down @(30, 20, 10)
   $b10held = Run-Check -Apply
   Assert-True (@($b10held.respawnHeld).Count -eq 1 -and @($b10held.respawned).Count -eq 0) 'B10: control, the live-idle row is held'
   $env:MOCK_ROW_DOWN = '1'
@@ -199,7 +204,27 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   $e10 = @($b10.escalate | Where-Object { $_.name -eq 'ic-900' -and $_.kind -eq 'respawn-loop-down' })
   Assert-True ($e10.Count -eq 1 -and $e10[0].parent -eq 'pl-test' -and $e10[0].detail -match '3 times' -and $e10[0].detail -match 'keeps going down' -and $e10[0].detail -match 'respawning anyway') "B10: respawn-loop-down names the attempts and that the session keeps going down (got: $($e10 | ForEach-Object { $_.detail }))"
   Assert-True (@($b10.escalate | Where-Object { $_.kind -eq 'respawn-loop' }).Count -eq 0) 'B10: and it is not also reported as the live-idle respawn-loop'
-  Assert-True (@((Read-Streak).'ic-900'.attempts).Count -eq 4) 'B10: the no-pid respawn is still counted in the streak'
+  Assert-True (@((Read-Streak).'ic-900'.attempts).Count -eq 4 -and @((Read-Streak).'ic-900'.downAttempts).Count -eq 4) 'B10: the no-pid respawn is still counted in the streak, as a death'
+
+  # B10b respawn-loop-down counts DEATHS only: three idle live-pid respawn attempts followed by one death is one death, not a down loop.
+  Reset-Case
+  Write-Streak 'job-900' @(30, 20, 10)
+  $env:MOCK_ROW_DOWN = '1'
+  $b10b = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_DOWN
+  Assert-True (@($b10b.respawned).Count -eq 1 -and @($b10b.escalate | Where-Object { $_.kind -like 'respawn-loop*' }).Count -eq 0) "B10b: three idle attempts then one death raises no respawn-loop-down (got: $(@($b10b.escalate | ForEach-Object { $_.kind }) -join ','))"
+  $s10b = (Read-Streak).'ic-900'
+  Assert-True (@($s10b.attempts).Count -eq 4 -and @($s10b.downAttempts).Count -eq 1) 'B10b: the streak counts four attempts, one of them a death'
+  # ... and the page needs the deaths themselves to reach the cap: two more deaths (three in all) and the next one pages.
+  foreach ($k in 1..2) {
+    $env:MOCK_ROW_DOWN = '1'; Remove-Item "$testRoot\mock-respawn-counter.txt" -ErrorAction SilentlyContinue
+    $null = Run-Check -Apply
+    Remove-Item Env:MOCK_ROW_DOWN
+  }
+  $env:MOCK_ROW_DOWN = '1'; Remove-Item "$testRoot\mock-respawn-counter.txt" -ErrorAction SilentlyContinue
+  $b10c = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_DOWN
+  Assert-True (@($b10c.escalate | Where-Object { $_.kind -eq 'respawn-loop-down' -and $_.detail -match '3 times' }).Count -eq 1 -and @($b10c.respawned).Count -eq 1) "B10b: the fourth death, with three deaths already in the window, pages (got: $(@($b10c.escalate | ForEach-Object { $_.kind }) -join ','))"
 
   # B11 under the cap: a no-pid respawn with fewer than cap attempts raises nothing.
   Reset-Case
@@ -212,7 +237,7 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
 
   # B12 read-only: the no-pid respawn is proposed, respawn-loop-down is reported, nothing is written.
   Reset-Case
-  Write-Streak 'job-900' @(30, 20, 10)
+  Write-Streak 'job-900' @(30, 20, 10) -Down @(30, 20, 10)
   $before12 = Get-Content $streakPath -Raw
   $env:MOCK_ROW_DOWN = '1'
   $b12 = Run-Check

@@ -106,8 +106,10 @@ try {
   if ($wdCfg -and $wdCfg.PSObject.Properties['respawnLoopWindowHours']) { $script:RespawnLoopWindowHours = [double]$wdCfg.respawnLoopWindowHours }
   if ($wdCfg -and $wdCfg.PSObject.Properties['firstTurnStaleMinutes']) { $script:FirstTurnStaleMinutes = [double]$wdCfg.firstTurnStaleMinutes }
 } catch {}
-# fleet #257 Gap B: state/sentinel/respawn-streak.json, { "<name>": { "jobId", "attempts": [iso...], "lastReason" } }, one strict
-# read per tick. Corrupt is unreadable and never reset: Test-RespawnStreakHold then defers every respawn and relaunch.
+# fleet #257 Gap B: state/sentinel/respawn-streak.json, { "<name>": { "jobId", "attempts": [iso...], "downAttempts": [iso...], "lastReason" } }, one
+# strict read per tick. downAttempts is the subset of attempts made when the row had NO pid (a death); an entry without it (an older file) has
+# none. Corrupt is unreadable and never reset: Test-RespawnStreakHold then defers every respawn and relaunch of a row that still has a pid
+# (a row with no pid is always respawned, uncounted while the file is unreadable).
 $script:RespawnStreakPath = Join-Path $FleetHome 'state\sentinel\respawn-streak.json'
 $script:RespawnStreak = @{}
 $script:RespawnStreakUnreadable = $false
@@ -127,8 +129,17 @@ if (Test-Path -LiteralPath $script:RespawnStreakPath) {
         if ($null -eq $rsWhen) { throw "entry '$($rsProp.Name)' has an unparseable attempt '$rsAt'" }
         $rsAttempts += $rsWhen.ToString('o')
       }
+      $rsDowns = @()
+      if ($rsEntry.PSObject.Properties['downAttempts']) {
+        if ($rsEntry.downAttempts -isnot [array]) { throw "entry '$($rsProp.Name)' has a downAttempts that is not a list" }
+        foreach ($rsDown in $rsEntry.downAttempts) {
+          $rsDownWhen = if ($rsDown -is [datetime]) { $rsDown.ToUniversalTime() } else { ConvertTo-UtcDateTime $rsDown }
+          if ($null -eq $rsDownWhen) { throw "entry '$($rsProp.Name)' has an unparseable downAttempt '$rsDown'" }
+          $rsDowns += $rsDownWhen.ToString('o')
+        }
+      }
       $rsReason = ''; if ($rsEntry.PSObject.Properties['lastReason']) { $rsReason = "$($rsEntry.lastReason)" }
-      $script:RespawnStreak[$rsProp.Name] = @{ jobId = "$($rsEntry.jobId)"; attempts = @($rsAttempts); lastReason = $rsReason }
+      $script:RespawnStreak[$rsProp.Name] = @{ jobId = "$($rsEntry.jobId)"; attempts = @($rsAttempts); downAttempts = @($rsDowns); lastReason = $rsReason }
     }
   } catch {
     $script:RespawnStreakUnreadable = $true; $script:RespawnStreakError = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim(); $script:RespawnStreak = @{}
@@ -335,12 +346,14 @@ function Get-HeartbeatAt {
 function Get-LiveRespawnAttempts {
   # The entry's attempts that still count: the entry is for this job id, the attempt is inside the window, and no heartbeat
   # is newer than it (a heartbeat after a respawn proves the respawned session ended a turn, so the loop is over).
-  param([string]$name, [string]$jobId)
+  param([string]$name, [string]$jobId, [switch]$DownOnly)
   $e = $script:RespawnStreak[$name]
   if ($null -eq $e -or "$($e.jobId)" -ne $jobId) { return @() }
   $windowStart = $now.AddHours(-$script:RespawnLoopWindowHours)
   $hbAt = Get-HeartbeatAt $name
-  return @($e.attempts | Where-Object { $t = ConvertTo-UtcDateTime $_; $null -ne $t -and $t -ge $windowStart -and ($null -eq $hbAt -or $t -gt $hbAt) } | Sort-Object { ConvertTo-UtcDateTime $_ })
+  # -DownOnly: only the attempts made when the row had no pid (a death), for respawn-loop-down.
+  $list = if ($DownOnly) { @($e.downAttempts) } else { @($e.attempts) }
+  return @($list | Where-Object { $t = ConvertTo-UtcDateTime $_; $null -ne $t -and $t -ge $windowStart -and ($null -eq $hbAt -or $t -gt $hbAt) } | Sort-Object { ConvertTo-UtcDateTime $_ })
 }
 function Save-RespawnStreak {
   # Written only by an applying run, pruned by the callers; a hand read-only run never changes the file.
@@ -350,7 +363,7 @@ function Save-RespawnStreak {
     $out = [ordered]@{}
     foreach ($k in @($script:RespawnStreak.Keys | Sort-Object)) {
       $e = $script:RespawnStreak[$k]
-      $out[$k] = [ordered]@{ jobId = "$($e.jobId)"; attempts = @($e.attempts); lastReason = "$($e.lastReason)" }
+      $out[$k] = [ordered]@{ jobId = "$($e.jobId)"; attempts = @($e.attempts); downAttempts = @($e.downAttempts); lastReason = "$($e.lastReason)" }
     }
     $tmp = "$($script:RespawnStreakPath).tmp"
     Write-Json $tmp ([pscustomobject]$out)
@@ -360,9 +373,13 @@ function Save-RespawnStreak {
 function Add-RespawnStreakAttempt {
   # Count one verified respawn / launched relaunch. -FromJobId is the job id the running attempts were recorded under (the
   # row this tick saw); -JobId is the id the next tick will see (the same id for a respawn, the new job for a relaunch).
-  param([string]$name, [string]$FromJobId, [string]$JobId, [string]$reason)
-  $attempts = @(Get-LiveRespawnAttempts $name $FromJobId) + @(Now-Iso)
-  $script:RespawnStreak[$name] = @{ jobId = $JobId; attempts = @($attempts); lastReason = (("$reason" -replace '\s+', ' ').Trim()) }
+  # -Down marks the attempt as a death (the row had no pid), which is what respawn-loop-down counts.
+  param([string]$name, [string]$FromJobId, [string]$JobId, [string]$reason, [switch]$Down)
+  $at = Now-Iso
+  $attempts = @(Get-LiveRespawnAttempts $name $FromJobId) + @($at)
+  $downs = @(Get-LiveRespawnAttempts $name $FromJobId -DownOnly)
+  if ($Down) { $downs += $at }
+  $script:RespawnStreak[$name] = @{ jobId = $JobId; attempts = @($attempts); downAttempts = @($downs); lastReason = (("$reason" -replace '\s+', ' ').Trim()) }
   $script:RespawnStreakTouched[$name] = $true
   Save-RespawnStreak
 }
@@ -386,7 +403,12 @@ function Test-RespawnStreakHold {
   $hbAt = Get-HeartbeatAt "$($entry.name)"
   $hbText = if ($null -eq $hbAt) { 'never' } else { "last at $($hbAt.ToString('o')), before the first respawn" }
   if (-not $hasPid) {
-    $script:report.escalate += [pscustomobject]@{ name = $row.name; kind = 'respawn-loop-down'; detail = "job $($row.id) has been respawned $($live.Count) times since $firstAt with no turn completed after any of them (heartbeat: $hbText) and has no process again: the session keeps going down; respawning anyway because a session with no process is always respawned. Check why it dies (claude agents --all; bin\status.ps1; the job's state.json), relaunch it by hand (rotate.ps1 / launch.ps1), or retire it; $reason"; parent = $entry.parent }
+    # respawn-loop-down counts DEATHS (attempts made with no pid), not idle live-pid respawns: a session respawned live-idle three times that
+    # then dies once has died once.
+    $liveDown = @(Get-LiveRespawnAttempts "$($entry.name)" "$($row.id)" -DownOnly)
+    if ($liveDown.Count -lt $script:RespawnLoopCap) { return $false }
+    $firstAt = "$($liveDown[0])"
+    $script:report.escalate += [pscustomobject]@{ name = $row.name; kind = 'respawn-loop-down'; detail = "job $($row.id) has died and been respawned $($liveDown.Count) times since $firstAt with no turn completed after any of them (heartbeat: $hbText) and has no process again: the session keeps going down; respawning anyway because a session with no process is always respawned. Check why it dies (claude agents --all; bin\status.ps1; the job's state.json), relaunch it by hand (rotate.ps1 / launch.ps1), or retire it; $reason"; parent = $entry.parent }
     return $false
   }
   $held = [ordered]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; attempts = $live.Count; firstAt = $firstAt; lastAt = $lastAt; reason = $reason }
@@ -430,7 +452,7 @@ function Do-Relaunch {
   $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
   $launch = ConvertFrom-LastJsonLine $out
   if ($launch -and $launch.launched) {
-    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($launch.jobId)" $reason
+    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($launch.jobId)" $reason -Down:(-not $row.pid)
     $script:report.respawned +=[pscustomobject]@{ name = $row.name; jobId = "$($launch.jobId)"; previousJobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
   } else {
     $why = if ($launch -and $launch.reason) { "$($launch.reason)" } else { Get-OneLineText $out }
@@ -470,7 +492,7 @@ function Do-Respawn {
   & claude respawn $row.id 2>&1 | Out-Null
   $verifyId = if ($entry.static) { '' } else { "$($row.id)" }
   if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid -JobId $verifyId) {
-    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($row.id)" $reason
+    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($row.id)" $reason -Down:(-not $row.pid)
     $script:report.respawned +=[pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
   } else {
     # Feeds the existing launch-retry cap exactly as a failed launch would: this
@@ -865,7 +887,7 @@ if ($Apply -and -not $script:RespawnStreakUnreadable -and $script:RespawnStreak.
       if ($streakRow -and "$($streakRow.id)" -eq "$($streakEntry.jobId)") { $streakLive = @(Get-LiveRespawnAttempts $streakName "$($streakEntry.jobId)") }
     }
     if ($streakLive.Count -eq 0) { $script:RespawnStreak.Remove($streakName); $streakChanged = $true }
-    elseif ($streakLive.Count -ne @($streakEntry.attempts).Count) { $streakEntry.attempts = @($streakLive); $streakChanged = $true }
+    elseif ($streakLive.Count -ne @($streakEntry.attempts).Count) { $streakEntry.attempts = @($streakLive); $streakEntry.downAttempts = @(@($streakEntry.downAttempts) | Where-Object { $streakLive -contains $_ }); $streakChanged = $true }
   }
   if ($streakChanged) { Save-RespawnStreak }
 }

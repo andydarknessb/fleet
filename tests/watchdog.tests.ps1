@@ -983,6 +983,31 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $h6cReport = Get-Content "$testRoot\state\watchdog\last-heal-respawn.json" -Raw | ConvertFrom-Json
   Assert-True (@($h6cReport.respawnHeld | Where-Object { $_.name -eq 'ic-950' }).Count -eq 1 -and @($h6cReport.respawned).Count -eq 0) 'the heal-respawn child held ic-950 and respawned nothing'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\heal.json") -or $null -eq ((Get-Content "$testRoot\state\watchdog\heal.json" -Raw | ConvertFrom-Json).PSObject.Properties['ic-950'])) 'a held heal-respawn must not count against the heal budget'
+
+  # Case H6d: held heal-respawns must not use up the per-tick heal-respawn cap (2) either: with ic-950 and ic-951 held, ic-952
+  # (listed after them) is still healed this tick instead of deferred.
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-950","role":"ic","tenant":"test","parent":"pl-test","issue":950,"status":"active"},{"name":"ic-951","role":"ic","tenant":"test","parent":"pl-test","issue":951,"status":"active"},{"name":"ic-952","role":"ic","tenant":"test","parent":"pl-test","issue":952,"status":"active"}]}'
+  $h6dRows = @($icRow)
+  foreach ($n6d in 951, 952) {
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic$n6d") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-ic$n6d\state.json" '{"needs":"","updatedAt":"2026-01-01T00:00:00Z"}'
+    $h6dRows += ('{"id":"job-ic' + $n6d + '","name":"ic-' + $n6d + '","state":"blocked","status":"idle","pid":' + $n6d + ',"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-3)) + '}')
+  }
+  Set-AgentsRows ("[$dispRow,$plRow," + ($h6dRows -join ',') + "]")
+  foreach ($n6d in 950, 951, 952) { Set-Heartbeat "ic-$n6d" 61 }
+  $h6dSeed = @(3, 2, 1 | ForEach-Object { (Get-Date).ToUniversalTime().AddMinutes(-$_).ToString('o') })
+  Write-Utf8 "$testRoot\state\sentinel\respawn-streak.json" (([ordered]@{
+    'ic-950' = [ordered]@{ jobId = 'job-ic950'; attempts = @($h6dSeed); lastReason = 'seeded' }
+    'ic-951' = [ordered]@{ jobId = 'job-ic951'; attempts = @($h6dSeed); lastReason = 'seeded' }
+  }) | ConvertTo-Json -Depth 6)
+  $script:KeepRespawnStreak = $true
+  try { $h6d = Run-Watchdog } finally { $script:KeepRespawnStreak = $false }
+  $h6dHeal = @($h6d.healed)
+  Assert-True (@($h6dHeal | Where-Object { $_.name -in @('ic-950', 'ic-951') -and $_.refused -eq $true }).Count -eq 2) "the two held heal-respawns are recorded as refused (got $($h6dHeal | ConvertTo-Json -Compress -Depth 3))"
+  Assert-True (@($h6dHeal | Where-Object { $_.name -eq 'ic-952' -and $_.action -eq 'respawn' -and $_.ok -eq $true -and -not $_.deferred }).Count -eq 1) "held heal-respawns must not starve ic-952 of its heal (got $($h6dHeal | ConvertTo-Json -Compress -Depth 3))"
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # ===== Cory's ruling 2026-09-18 (fleet #84): the daemon DELETES `needs` =====

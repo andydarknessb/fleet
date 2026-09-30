@@ -217,20 +217,27 @@ exit 0
   Assert-True (@($b9held.escalate | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawn-loop' }).Count -eq 1) 'B9: and escalated as respawn-loop'
   Assert-True (@(Get-Calls).Count -eq 0) "B9: a held relaunch stops and launches nothing (calls: $(@(Get-Calls) -join '; '))"
 
-  # B10 (liveness first): the same job, later reaped (no pid), is relaunched despite the streak, counted, and respawn-loop-down
-  # is raised beside it. No stop call: there is no process to stop.
-  $env:MOCK_ROW_ID = 'job-a3'
+  # B10 (liveness first): the same job, later reaped (no pid), is relaunched despite the streak and counted as a DEATH. No stop
+  # call: there is no process to stop. respawn-loop-down needs the deaths themselves (not the three idle live-pid relaunches
+  # above) to reach the cap: deaths 1-3 page nothing, the fourth does.
   $env:MOCK_ROW_NOPID = '1'
   $env:MOCK_ROW_STATE = 'stopped'
-  $env:MOCK_LAUNCH_JOBID = 'job-a5'
-  Reset-CallsOnly
-  $b10 = Run-Check -Apply
+  $prevJob = 'job-a3'
+  foreach ($k in 1..4) {
+    $env:MOCK_ROW_ID = $prevJob
+    $env:MOCK_LAUNCH_JOBID = "job-d$k"
+    Reset-CallsOnly
+    $b10 = Run-Check -Apply
+    Assert-True (@($b10.respawned | Where-Object { $_.name -eq 'pl-test' -and "$($_.via)" -eq 'launch' -and "$($_.jobId)" -eq "job-d$k" }).Count -eq 1 -and @($b10.respawnHeld).Count -eq 0) "B10: death $k of a no-pid static is relaunched despite the streak (got $($b10 | ConvertTo-Json -Compress -Depth 4))"
+    $downPages = @($b10.escalate | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawn-loop-down' -and $_.detail -match 'keeps going down' })
+    if ($k -lt 4) { Assert-True ($downPages.Count -eq 0) "B10: death $k is under the cap of deaths and pages nothing" }
+    else { Assert-True ($downPages.Count -eq 1) 'B10: the fourth death, with three deaths already in the window, raises respawn-loop-down' }
+    Assert-True ((Get-Calls) -contains 'launch pl-test' -and -not (@(Get-Calls) -match 'claude stop')) "B10: the launch door ran and nothing was stopped (calls: $(@(Get-Calls) -join '; '))"
+    $prevJob = "job-d$k"
+  }
   Remove-Item Env:MOCK_ROW_NOPID, Env:MOCK_ROW_STATE
-  Assert-True (@($b10.respawned | Where-Object { $_.name -eq 'pl-test' -and "$($_.via)" -eq 'launch' -and "$($_.jobId)" -eq 'job-a5' }).Count -eq 1 -and @($b10.respawnHeld).Count -eq 0) "B10: a no-pid static is relaunched despite three attempts (got $($b10 | ConvertTo-Json -Compress -Depth 4))"
-  Assert-True (@($b10.escalate | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawn-loop-down' -and $_.detail -match 'keeps going down' }).Count -eq 1) 'B10: and respawn-loop-down is raised'
-  Assert-True ((Get-Calls) -contains 'launch pl-test' -and -not (@(Get-Calls) -match 'claude stop')) "B10: the launch door ran and nothing was stopped (calls: $(@(Get-Calls) -join '; '))"
   $streak10 = Get-Content $streakFile -Raw | ConvertFrom-Json
-  Assert-True ("$($streak10.'pl-test'.jobId)" -eq 'job-a5' -and @($streak10.'pl-test'.attempts).Count -eq 4) 'B10: the relaunch is counted under the new job id'
+  Assert-True ("$($streak10.'pl-test'.jobId)" -eq 'job-d4' -and @($streak10.'pl-test'.attempts).Count -eq 7 -and @($streak10.'pl-test'.downAttempts).Count -eq 4) "B10: the relaunches are counted under the newest job id, four of them deaths (got $(Get-Content $streakFile -Raw))"
   Remove-Item Env:MOCK_LAUNCH_JOBID
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) static-respawn assertion(s) failed" }
