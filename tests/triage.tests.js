@@ -349,8 +349,67 @@ test('a finalized issue whose body is unchanged is not re-proposed when the owne
   assert.deepEqual(frontier([issue(7, { body, labels: ['needs-triage'] })], at).eligible.map((row) => row.number), [7]);
   const ask = comment(OWNER, 'Re-propose: scope moved.', '2026-09-24T02:30:00.000Z');
   assert.deepEqual(frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [ask] })], at).eligible.map((row) => row.number), [7]);
+  // Production config: the fleet has its own login, so the owner's newest comment normally reads as
+  // a conversation. A Re-propose is the one such comment that still reopens a settled issue, and it
+  // is a re-proposal, as it is under the marker.
+  const split = frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [ask] })], { ...at, fleetIdentity: FLEET });
+  assert.deepEqual(split.eligible.map((row) => `${row.number}:${row.kind}`), ['7:reproposal']);
+  const chat = comment(OWNER, 'Let us park this for now.', '2026-09-24T02:30:00.000Z');
+  const parked = frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [chat] })], { ...at, fleetIdentity: FLEET });
+  assert.deepEqual(parked.eligible, [], 'any other owner comment is not an ask');
   // Never triaged at all: an unrouted label is still a fresh candidate.
   assert.deepEqual(frontier([issue(8, { labels: ['haiku-rehearsal'] })], at).eligible.map((row) => row.number), [8]);
+});
+
+test('a finalized row with no bodyHash (the finalize script) settles at the proposal hash; a restated body settles at the restated hash', () => {
+  const root = rootDir();
+  const body = '## What to build\n\nThe thing.\n';
+  const restated = `${body}\n## Premises\n\nsrc/a.js: exports b @1234567\n`;
+  const hash = triage.normalizeIssue(issue(7, { body })).bodyHash;
+  const restatedHash = triage.normalizeIssue(issue(7, { body: restated })).bodyHash;
+  const at = (entries) => ({ entries, now: '2026-09-24T03:00:00.000Z', fleetIdentity: FLEET });
+  // Script finalize: the row carries no bodyHash, so the proposal's hash settles it.
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/7', model: 'fable', now: '2026-09-24T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 7, by: OWNER, actor: 'finalize-script', now: '2026-09-24T01:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 7, labels: 'ready-for-agent', actor: 'finalize-script', now: '2026-09-24T02:00:00.000Z' });
+  const scripted = readLedger(root, 'endzone');
+  assert.equal(scripted.find((entry) => entry.kind === 'finalized').bodyHash, undefined, 'the script-shaped row has no bodyHash');
+  assert.deepEqual(frontier([issue(7, { body, labels: ['haiku-rehearsal'] })], at(scripted)).eligible, []);
+  assert.deepEqual(frontier([issue(7, { body: restated, labels: ['haiku-rehearsal'] })], at(scripted)).eligible.map((row) => row.number), [7], 'a body that is not the proposal\'s is a change');
+  // Hand finalize that restated the body: --body-hash names the body the issue now has.
+  const other = rootDir();
+  recordEntry({ root: other, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/7', model: 'fable', now: '2026-09-24T00:00:00.000Z' });
+  recordEntry({ root: other, tenant: 'endzone', kind: 'approved', issue: 7, by: OWNER, now: '2026-09-24T01:00:00.000Z' });
+  cli(['record', '--root', other, '--tenant', 'endzone', '--kind', 'finalized', '--issue', '7', '--labels', 'ready-for-agent', '--body-hash', restatedHash, '--now', '2026-09-24T02:00:00.000Z']);
+  const hand = readLedger(other, 'endzone');
+  assert.deepEqual(frontier([issue(7, { body: restated, labels: ['haiku-rehearsal'] })], at(hand)).eligible, []);
+  assert.deepEqual(frontier([issue(7, { body, labels: ['haiku-rehearsal'] })], at(hand)).eligible.map((row) => row.number), [7], 'the pre-restatement body no longer matches');
+});
+
+test('a standing bounded ready settles the issue like a finalized row; a Veto still wins', () => {
+  // bounded-ready writes no finalized row, so the same hold-label loop would follow it.
+  const root = rootDir();
+  const body = '## What to build\n\nThe thing.\n';
+  const hash = triage.normalizeIssue(issue(7, { body })).bodyHash;
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/7', model: 'fable', now: '2026-09-24T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'bounded-ready', issue: 7, bodyHash: hash, commentUrl: 'https://x/7', fields: { paged: true }, now: '2026-09-24T00:05:00.000Z' });
+  const entries = readLedger(root, 'endzone');
+  const at = { entries, now: '2026-09-24T03:00:00.000Z', fleetIdentity: FLEET };
+  for (const labels of [['bug', 'haiku-rehearsal'], ['haiku-rehearsal']]) {
+    const result = frontier([issue(7, { body, labels })], at);
+    assert.deepEqual(result.eligible, [], `labels [${labels}] must not be re-proposed`);
+    assert.match(result.skipped.find((row) => row.number === 7).reason, /bounded ready/);
+  }
+  // No label at all is the failed label edit the repair item exists for (step 0b), not a hold.
+  assert.deepEqual(frontier([issue(7, { body, labels: [] })], at).eligible.map((row) => row.kind), ['bounded-repair']);
+  assert.deepEqual(frontier([issue(7, { body: `${body}More.\n`, labels: ['haiku-rehearsal'] })], at).eligible.map((row) => row.number), [7], 'a changed body reopens it');
+  assert.deepEqual(frontier([issue(7, { body, labels: ['needs-triage'] })], at).eligible.map((row) => row.number), [7], 'a triage label reopens it');
+  const veto = comment(OWNER, 'Veto: not like this.', '2026-09-24T00:30:00.000Z');
+  assert.deepEqual(frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [veto] })], at).eligible.map((row) => `${row.number}:${row.kind}`), ['7:veto']);
+  // After the veto row is recorded the row is an open proposal again, not a settled one.
+  recordEntry({ root, tenant: 'endzone', kind: 'veto', issue: 7, by: OWNER, now: '2026-09-24T00:31:00.000Z' });
+  const vetoed = frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [veto] })], { ...at, entries: readLedger(root, 'endzone') });
+  assert.deepEqual(vetoed.eligible.map((row) => row.number), [], 'the vetoed proposal awaits Approval; it is not re-proposed under a hold label');
 });
 
 test('#145: hash prints the live body hash exactly as the frontier computes it', () => {
