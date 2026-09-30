@@ -31,6 +31,29 @@ param(
 . "$PSScriptRoot\_common.ps1"
 $static = Get-StaticRoster
 $live = Get-LiveRoster
+function Invalidate-Manifest {
+  param([string]$Reason)
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) { throw 'node is required to release the assignment reservation' }
+  $releaseOutput = & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | ForEach-Object { "$_" } | Out-String
+  # fleet#251: the door's error text (RELEASE_CLAIMED names bin\retire.ps1) reaches the operator.
+  $releaseExit = $LASTEXITCODE
+  if ($releaseExit -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId': $(($releaseOutput | Out-String).Trim())" }
+  Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = $assignment.id; invalidatedAt = (Now-Iso); reason = $Reason })
+}
+# fleet#256: a refusal after the reservation exists must not leave it `assigned` with no session (the
+# planner keeps excluding the issue as reserved and nothing else sees it). This releases it for a
+# refusal and NEVER throws, so the refusal the operator reads stays the refusal even when the release
+# itself fails (Invalidate-Manifest throws the node error, fleet#251). A dry run and a launch with no
+# -Manifest release nothing. released/error feed the JSON refusals; note is appended to Write-Error text.
+function Release-ReservationOnRefusal {
+  param([string]$Reason)
+  $result = [pscustomobject]@{ released = $false; error = $null; note = '' }
+  if (-not $Manifest -or $DryRun) { return $result }
+  try { $null = Invalidate-Manifest $Reason; $result.released = $true }
+  catch { $result.error = "$($_.Exception.Message)"; $result.note = " (the reservation release also failed: $($result.error))" }
+  return $result
+}
 $cwd = $null
 $t = $null
 $worktreePath = $null
@@ -40,9 +63,12 @@ if ($Recover -and -not $Manifest -and ($Role -eq 'ic' -or ($Name -and $Name -mat
   $recoverValidated = [bool]$recoverableRow
 }
 if ($Manifest) {
+  # no release: a manifest that cannot be read names no Work record, so there is nothing this script can release.
   if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Write-Error "manifest '$Manifest' was not found"; exit 4 }
   $assignment = Read-Json $Manifest
+  # no release: a manifest that is not pending-ack was already acknowledged (a session owns the record), already invalidated (released) or is unreadable; none of those is ours to release.
   if (-not $assignment -or $assignment.status -ne 'pending-ack') { Write-Error "manifest '$Manifest' is not pending acknowledgment"; exit 4 }
+  # no release: -WorkRecordId names a different record than this manifest reserved. That is the caller's mistake, a release on it would be a guess, and the reservation stays valid for a correct launch.
   if ($WorkRecordId -and $assignment.workRecordId -ne $WorkRecordId) { Write-Error "manifest Work record does not match -WorkRecordId"; exit 4 }
   $WorkRecordId = $assignment.workRecordId
   $Role = 'ic'
@@ -61,24 +87,29 @@ if ($Manifest) {
   $fleetHomeFwd = $FleetHome -replace '\\', '/'
   $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest and the GitHub issue body and comments. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $fleetHomeFwd/bin/assignment.js ack), then follow the manifest pointers without restating the issue criteria."
   $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
-  if (-not $tenantConfig) { Write-Error "no tenant file for '$Tenant'"; exit 4 }
+  if (-not $tenantConfig) { $r = Release-ReservationOnRefusal "launch refused: no tenant file for '$Tenant'"; Write-Error "no tenant file for '$Tenant'$($r.note)"; exit 4 }
   $cwd = $tenantConfig.repo
+  # no release: the invalidation marker is the record of an earlier release; there is nothing left to release.
   if (Test-Path -LiteralPath "$Manifest.invalidated.json") { Write-Error "manifest '$Manifest' was invalidated"; exit 4 }
 }
 if ($FromRoster) {
   $e = $static.sessions | Where-Object { $_.name -eq $FromRoster }
+  # no release: -FromRoster is not a manifest launch; a caller mixing it into one made a mistake and the reservation stays valid for a correct launch.
   if (-not $e) { Write-Error "no static roster entry named '$FromRoster'"; exit 4 }
   $Role = $e.role; $Name = $e.name; $Tenant = $e.tenant; $Parent = $e.parent; $Prompt = $e.prompt; $cwd = $e.cwd
 }
-foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req -ValueOnly)) { Write-Error "missing -$req"; exit 4 } }
-if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$') { Write-Error "name '$Name' does not match the fleet naming scheme"; exit 4 }
+foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req -ValueOnly)) { $r = Release-ReservationOnRefusal "launch refused: the manifest gives no $req"; Write-Error "missing -$req$($r.note)"; exit 4 } }
+if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$') { $r = Release-ReservationOnRefusal "launch refused: name '$Name' does not match the fleet naming scheme"; Write-Error "name '$Name' does not match the fleet naming scheme$($r.note)"; exit 4 }
+# no release: a manifest launch is always Role ic, so the two principal checks below are reachable only by mixing -FromRoster into a manifest launch (caller mistake; the reservation stays valid for a correct launch).
 if ($Role -eq 'principal' -and $Name -notmatch '^pe-') { Write-Error "a principal session is named pe-<tenant> (ADR 0011)"; exit 4 }
+# no release: same -FromRoster mix-up as the principal name check above.
 if ($Role -eq 'principal' -and -not $Tenant) { Write-Error "a principal needs -Tenant (one per tenant, ADR 0011)"; exit 4 }
 # Ticket 08b: while the rostered Sentinel is cut over (permanent since ticket 89 retired
 # its roster entry, role file and rollback script), the one door refuses to start a
 # second supervisor (not even with -Force: two actors is the failure cutover exists to
 # prevent). A dry run still evaluates the other gates.
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
+  # no release: the same -FromRoster mix-up as the principal checks above; a manifest launch is Role ic and never reaches this.
   Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live): bin\watchdog.ps1 is the supervisor now' } | ConvertTo-Json -Compress); exit 3
 }
 # Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
@@ -91,13 +122,14 @@ if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and
 # refused exactly like a bare -Prompt launch (QA fix, fleet #89: -Recover used to exempt
 # any name unconditionally).
 if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $recoverValidated -and -not $DryRun) {
+  # no release: this refusal is for a launch with no -Manifest, so no reservation stands behind it.
   $legacyRefusal = 'IC sessions launch only from a reserved manifest: reserve one with bin\assignment.js assign and launch it with assignment.js launch; the legacy prompt path was retired for good (fleet #89) and there is no flag to bring it back'
   if ($Recover) { $legacyRefusal = "-Recover found no active IC named '$Name' with a recorded manifest on the live roster; there is nothing to recover, and -Recover carries no exemption of its own (fleet #89)" }
   Write-Output (@{ launched = $false; reason = $legacyRefusal } | ConvertTo-Json -Compress); exit 3
 }
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"
-  if (-not $t) { Write-Error "no tenant file for '$Tenant'"; exit 4 }
+  if (-not $t) { $r = Release-ReservationOnRefusal "launch refused: no tenant file for '$Tenant'"; Write-Error "no tenant file for '$Tenant'$($r.note)"; exit 4 }
   if (-not $cwd) { $cwd = $t.repo }
 }
 if (-not $cwd) { $cwd = $FleetHome }
@@ -105,12 +137,13 @@ if (-not $cwd) { $cwd = $FleetHome }
 if ($Manifest) {
   $activeState = Read-Json "$FleetHome\state\work\active.json"
   $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
+  # no release: the record is not `assigned` (absent, claimed by a live IC, released, or already past the reservation), so it is no longer this manifest's reservation. A release from this manifest's revision would be refused, or would pull a claim a session holds.
   if (-not $recordProperty -or $recordProperty.Value.state -ne 'assigned') { Write-Error "Work record '$WorkRecordId' is not assigned"; exit 4 }
   # Per tenant, the way work-state.js's isForeignRecord scopes it: another tenant's ICs are
   # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
   # A record with no tenant is legacy and still counts, matching isForeignRecord.
   $activeAssignments = @($activeState.records.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.manifestPath -and $_.state -ne 'retired' -and $_.id -ne $WorkRecordId -and (-not $_.tenant -or [string]$_.tenant -eq [string]$Tenant) })
-  if ($activeAssignments.Count -ge 3) { Write-Error 'a fourth assignment is not permitted'; exit 4 }
+  if ($activeAssignments.Count -ge 3) { $r = Release-ReservationOnRefusal 'launch refused: a fourth assignment is not permitted'; Write-Error "a fourth assignment is not permitted$($r.note)"; exit 4 }
   if ($activeAssignments.Count -ge 2) {
     $proof = $assignment.independenceProof
     $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
@@ -120,20 +153,10 @@ if ($Manifest) {
     $missingReservationIssues = @($proof.missingReservations)
     $proofHasMissingReservations = $proof -and $proof.PSObject.Properties.Name -contains 'missingReservations'
     $proofValid = $proof -and $proofHasMissingReservations -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and $missingReservationIssues.Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
-    if (-not $proofValid) { Write-Error 'a third assignment requires a verified independent machine-readable proof'; exit 4 }
+    if (-not $proofValid) { $r = Release-ReservationOnRefusal 'launch refused: a third assignment requires a verified independent machine-readable proof'; Write-Error "a third assignment requires a verified independent machine-readable proof$($r.note)"; exit 4 }
   }
 }
 
-function Invalidate-Manifest {
-  param([string]$Reason)
-  $node = Get-Command node -ErrorAction SilentlyContinue
-  if (-not $node) { throw 'node is required to release the assignment reservation' }
-  $releaseOutput = & $node.Source "$FleetHome\bin\work-state.js" release --root $FleetHome --id $WorkRecordId --expected-revision $assignment.workRecordRevision --idempotency-key "assignment-invalidated:$($assignment.id)" --evidence $Reason 2>&1 | ForEach-Object { "$_" } | Out-String
-  # fleet#251: the door's error text (RELEASE_CLAIMED names bin\retire.ps1) reaches the operator.
-  $releaseExit = $LASTEXITCODE
-  if ($releaseExit -ne 0) { throw "assignment reservation release failed for Work record '$WorkRecordId': $(($releaseOutput | Out-String).Trim())" }
-  Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = $assignment.id; invalidatedAt = (Now-Iso); reason = $Reason })
-}
 # Fleet #28 (2026-09-11): the installed Claude Code CLI keeps a per-model auto-mode
 # list and claude-haiku-4-5 is not on it (verified on 2.1.267, both 2.1.268 builds and
 # 2.1.282; an explicit --permission-mode auto is downgraded the same way). A haiku --bg
@@ -194,14 +217,14 @@ if ($Manifest -and -not $DryRun) {
   } finally {
     [Console]::OutputEncoding = $previousOutputEncoding
   }
-  if ($LASTEXITCODE -ne 0) { Write-Error "could not reconcile issue #$Issue before launch"; exit 4 }
-  try { $currentIssue = $issueRaw | ConvertFrom-Json } catch { Write-Error "GitHub issue reconciliation returned invalid JSON"; exit 4 }
-  if ([string]$currentIssue.state -ne 'OPEN') { Invalidate-Manifest "issue #$Issue is no longer open"; Write-Error "issue #$Issue is no longer open"; exit 4 }
+  if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch refused: could not reconcile issue #$Issue with GitHub before launch"; Write-Error "could not reconcile issue #$Issue before launch$($r.note)"; exit 4 }
+  try { $currentIssue = $issueRaw | ConvertFrom-Json } catch { $r = Release-ReservationOnRefusal "launch refused: GitHub issue reconciliation for #$Issue returned invalid JSON"; Write-Error "GitHub issue reconciliation returned invalid JSON$($r.note)"; exit 4 }
+  if ([string]$currentIssue.state -ne 'OPEN') { $r = Release-ReservationOnRefusal "issue #$Issue is no longer open"; Write-Error "issue #$Issue is no longer open$($r.note)"; exit 4 }
   $hash = [Security.Cryptography.SHA256]::Create()
   $actualBodyHash = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes([string]$currentIssue.body))).Replace('-', '').ToLowerInvariant()
   if ($actualBodyHash -ne [string]$assignment.issue.bodyHash) {
-    Invalidate-Manifest 'issue body hash changed before acknowledgment'
-    Write-Error "issue #$Issue changed after the manifest was created; assignment invalidated"
+    $r = Release-ReservationOnRefusal 'issue body hash changed before acknowledgment'
+    Write-Error "issue #$Issue changed after the manifest was created; assignment invalidated$($r.note)"
     exit 4
   }
   $criteriaParts = @([string]$currentIssue.body)
@@ -212,8 +235,8 @@ if ($Manifest -and -not $DryRun) {
   $criteriaHash = [Security.Cryptography.SHA256]::Create()
   $actualCriteriaHash = [BitConverter]::ToString($criteriaHash.ComputeHash([Text.Encoding]::UTF8.GetBytes($criteriaText))).Replace('-', '').ToLowerInvariant()
   if (-not $assignment.issue.criteriaHash -or $actualCriteriaHash -ne [string]$assignment.issue.criteriaHash) {
-    Invalidate-Manifest 'issue criteria changed before acknowledgment'
-    Write-Error "issue #$Issue criteria changed after the manifest was created; assignment invalidated"
+    $r = Release-ReservationOnRefusal 'issue criteria changed before acknowledgment'
+    Write-Error "issue #$Issue criteria changed after the manifest was created; assignment invalidated$($r.note)"
     exit 4
   }
 }
@@ -221,17 +244,21 @@ if ($Manifest -and -not $DryRun) {
 # --- gates ---
 if ((Test-Paused) -and -not $Force) {
   $p = Get-Content "$FleetHome\state\PAUSE" -Raw
-  Write-Output (@{ launched = $false; reason = "PAUSE set: $p" } | ConvertTo-Json -Compress); exit 3
+  $r = Release-ReservationOnRefusal "launch refused: PAUSE set: $("$p".Trim())"
+  Write-Output (@{ launched = $false; reason = "PAUSE set: $p"; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
 }
 # The duplicate-name guard and the cap read the same daemon list the caller may have
 # acted on; a glitched read must refuse the launch, never pass the guards empty.
 $daemon = $null
 try { $daemon = Get-DaemonSessions -Strict } catch {
-  Write-Output (@{ launched = $false; reason = "refusing to launch, fail closed: $($_.Exception.Message)" } | ConvertTo-Json -Compress); exit 3
+  $failClosedReason = "refusing to launch, fail closed: $($_.Exception.Message)"
+  $r = Release-ReservationOnRefusal "launch refused: $failClosedReason"
+  Write-Output (@{ launched = $false; reason = $failClosedReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
 }
 $fleetNames = Get-FleetNames -Live $live -Static $static
 $liveFleet = @($daemon | Where-Object { $fleetNames -contains $_.name })
 if (@($liveFleet | ForEach-Object { $_.name }) -contains $Name) {
+  # no release: a live session already holds this name and may be the one that acknowledges this very reservation in its first turn; a release would pull the assignment from under it. If no session ever acknowledges, the stranded-reservation sweep (fleet#253) finds it.
   Write-Output (@{ launched = $false; reason = "a session named '$Name' is already running; use claude respawn" } | ConvertTo-Json -Compress); exit 3
 }
 # The list can also read WRONG (empty or partial) while the CLI exits 0. The roster's
@@ -247,6 +274,7 @@ if ($rosterEntry -and $rosterEntry.jobId) {
     $updatedAge = $null
     try { $updatedAge = ((Get-Date).ToUniversalTime() - ([DateTimeOffset]::Parse("$($jobState.updatedAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)).UtcDateTime).TotalMinutes } catch {}
     if ($null -ne $updatedAge -and $updatedAge -le 45) {
+      # no release: the job for this name is working per its on-disk state, so a live session may own this reservation (same reasoning as the duplicate-name refusal above).
       Write-Output (@{ launched = $false; reason = "job $($rosterEntry.jobId) for '$Name' is working per its on-disk state (updated $([int]$updatedAge) min ago) though the daemon list omits it; suspected bad read, refusing a duplicate launch" } | ConvertTo-Json -Compress); exit 3
     }
   }
@@ -257,14 +285,18 @@ if ($rosterEntry -and $rosterEntry.jobId) {
 # toward the cap nor are refused by it. Absent config = nothing is exempt.
 $capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
 if (-not $Force -and -not (Test-CapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
-  Write-Output (@{ launched = $false; reason = "cap reached ($($capCounted.Count)/$($static.cap))" } | ConvertTo-Json -Compress); exit 3
+  $capReason = "cap reached ($($capCounted.Count)/$($static.cap))"
+  $r = Release-ReservationOnRefusal "launch refused: $capReason"
+  Write-Output (@{ launched = $false; reason = $capReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
 }
 if ($Role -eq 'ic') {
-  if (-not $Issue) { Write-Error "ICs need -Issue"; exit 4 }
+  if (-not $Issue) { $r = Release-ReservationOnRefusal 'launch refused: the manifest gives no issue number'; Write-Error "ICs need -Issue$($r.note)"; exit 4 }
   $liveNames = @($liveFleet | ForEach-Object { $_.name })
   $icsHere = @($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $Tenant -and ($liveNames -contains $_.name) })
   if (-not $Force -and $icsHere.Count -ge [int]$t.maxIcs) {
-    Write-Output (@{ launched = $false; reason = "tenant maxIcs reached ($($icsHere.Count)/$($t.maxIcs))" } | ConvertTo-Json -Compress); exit 3
+    $maxIcsReason = "tenant maxIcs reached ($($icsHere.Count)/$($t.maxIcs))"
+    $r = Release-ReservationOnRefusal "launch refused: $maxIcsReason"
+    Write-Output (@{ launched = $false; reason = $maxIcsReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
   }
 }
 
@@ -379,7 +411,7 @@ if ($Permissions -eq 'allowlist') {
   $profilePath = "$FleetHome\config\permissions-allowlist.json"
   $permissionProfile = $null
   try { $permissionProfile = Read-Json $profilePath } catch {}
-  if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable"; exit 4 }
+  if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { $r = Release-ReservationOnRefusal "launch refused: the allowlist permission profile '$profilePath' is missing or unreadable"; Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable$($r.note)"; exit 4 }
   $profileTokens = @{ '<fleet>' = $fleetFwd; '<repo>' = "$($t.repo)".Replace('\', '/').TrimEnd('/'); '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
   $resolveProfileRule = {
     param([string]$Text)
@@ -394,7 +426,7 @@ if ($Permissions -eq 'allowlist') {
     if ($permissionProfile.PSObject.Properties['repoDeny'] -and $permissionProfile.repoDeny) {
       $profileDeny += @(Get-RepoDenyRules -Repo "$($t.repo)" -Keep "$($permissionProfile.repoDeny.keep)" -Tools @($permissionProfile.repoDeny.tools))
     }
-  } catch { Write-Error "$($_.Exception.Message)"; exit 4 }
+  } catch { $profileMessage = "$($_.Exception.Message)"; $r = Release-ReservationOnRefusal "launch refused: $profileMessage"; Write-Error "$profileMessage$($r.note)"; exit 4 }
   if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
   $existingDeny = @()
   if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
@@ -476,7 +508,9 @@ if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-o
   foreach ($sourceTokens in $sources.Values) { $estimate += $sourceTokens }
   $budget = [pscustomobject]@{ role = $Role; ceiling = $ceiling; estimatedTokens = $estimate; sources = [pscustomobject]$sources }
   if ($estimate -gt $ceiling -and -not $Force) {
-    Write-Output (@{ launched = $false; reason = "first-turn ceiling exceeded for role '$Role': $estimate estimated tokens > $ceiling (see budget.sources)"; budget = $budget } | ConvertTo-Json -Compress -Depth 6); exit 6
+    $ceilingReason = "first-turn ceiling exceeded for role '$Role': $estimate estimated tokens > $ceiling (see budget.sources)"
+    $r = Release-ReservationOnRefusal "launch refused: $ceilingReason"
+    Write-Output (@{ launched = $false; reason = $ceilingReason; budget = $budget; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress -Depth 6); exit 6
   }
 }
 
@@ -517,17 +551,18 @@ if ($Manifest) {
   $baseRemote = [string]$assignment.base.remote
   $baseRef = [string]$assignment.base.ref
   $expectedBase = [string]$assignment.base.sha
-  if (-not $baseRemote -or -not $baseRef -or $expectedBase -notmatch '^[0-9a-fA-F]{40}$') { Write-Error "manifest '$Manifest' has an invalid base precondition"; exit 4 }
+  if (-not $baseRemote -or -not $baseRef -or $expectedBase -notmatch '^[0-9a-fA-F]{40}$') { $r = Release-ReservationOnRefusal "launch refused: manifest has an invalid base precondition"; Write-Error "manifest '$Manifest' has an invalid base precondition$($r.note)"; exit 4 }
   & git -C $cwd fetch $baseRemote $baseRef --prune 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { Write-Error "could not fetch $baseRemote/$baseRef for manifest '$Manifest'"; exit 4 }
+  if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch refused: could not fetch $baseRemote/$baseRef"; Write-Error "could not fetch $baseRemote/$baseRef for manifest '$Manifest'$($r.note)"; exit 4 }
   $resolvedBase = (& git -C $cwd rev-parse "refs/remotes/$baseRemote/$baseRef" 2>$null | Out-String).Trim()
-  if ($LASTEXITCODE -ne 0 -or $resolvedBase -ne $expectedBase) { Invalidate-Manifest "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; Write-Error "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; exit 4 }
+  if ($LASTEXITCODE -ne 0 -or $resolvedBase -ne $expectedBase) { $r = Release-ReservationOnRefusal "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; Write-Error "manifest base precondition changed (expected $expectedBase, found $resolvedBase)$($r.note)"; exit 4 }
   $worktreeParent = Join-Path $cwd '.claude\worktrees'
   $worktreePath = Join-Path $worktreeParent "$Name-assignment"
+  # no release: a worktree already at this path is an earlier launch's, and its session may still be about to acknowledge; the operator or the janitor removes it. Releasing here would only re-offer the issue into an assign, launch, refuse loop that fails at this line every time (the reservation is what keeps the planner from doing that).
   if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
   New-Item -ItemType Directory -Force $worktreeParent | Out-Null
   & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { Remove-FailedAssignmentWorktree; try { Invalidate-Manifest "launch failed: could not create the assignment worktree from $expectedBase" } catch {}; Write-Error "could not create assignment worktree from $expectedBase"; exit 4 }
+  if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch failed: could not create the assignment worktree from $expectedBase"; Remove-FailedAssignmentWorktree; Write-Error "could not create assignment worktree from $expectedBase$($r.note)"; exit 4 }
   # ic.md step 6: the PR body file is .fleet-pr-body.md in the worktree root, written with
   # the Write tool, not a heredoc into a temp directory outside the allowed directories
   # (fleet #171, rehearsal wait 4). The repo's info/exclude, shared by every worktree,
@@ -562,6 +597,8 @@ try {
   $out = $Prompt | & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
 } catch {
   if ($locationPushed) { Pop-Location; $locationPushed = $false }
+  # fleet#256: claude itself failing to run (not on PATH, spawn error) is a refusal too. Release first, then remove the worktree (fleet#251 order); the helper never throws, so the original error is what surfaces.
+  [void](Release-ReservationOnRefusal "launch failed: claude --bg threw: $($_.Exception.Message)")
   Remove-FailedAssignmentWorktree
   throw
 } finally {
