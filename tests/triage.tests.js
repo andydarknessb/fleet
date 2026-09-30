@@ -471,6 +471,7 @@ test('#263: an open proposal whose marker became a hold label waits for Approval
     const reason = result.skipped.find((row) => row.number === 7).reason;
     assert.match(reason, /awaiting approval/, what);
     assert.ok(reason.includes(OPEN_AT), `${what}: the reason names the proposal time`);
+    assert.match(reason, /until Cory comments Approved or Re-propose, or the body changes/, `${what}: the reason names the releasing events`);
     assert.ok(labels.every((label) => reason.includes(label)), `${what}: the reason names the labels it sits under`);
   }
   // Control: with no open proposal the same issue is a ticket, and with one open, record refuses it.
@@ -500,7 +501,25 @@ test('#263: the owner\'s Re-propose as the newest comment yields a reproposal un
   for (const item of emitted) assert.equal(principalCanRecord(world, item), true, 'supersede then propose succeeds');
 });
 
-test('#263: nothing the frontier emits for an open-proposal issue is refused by record --kind proposed', () => {
+test('#263: a changed body reopens an unmarked open proposal as a reproposal, as it does under the marker; an unchanged body waits', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const changedBody = `${OPEN_BODY}More.
+`;
+  const marked = frontier([issue(7, { body: changedBody, labels: ['triage-proposed'], comments: [cross] })], at);
+  assert.deepEqual(marked.eligible.map((row) => `${row.number}:${row.kind}`), ['7:reproposal']);
+  assert.match(marked.eligible[0].reason, /body changed since the proposal/);
+  for (const labels of [['haiku-rehearsal'], ['bug', 'haiku-rehearsal'], ['needs-triage'], []]) {
+    const changed = frontier([issue(7, { body: changedBody, labels, comments: [cross] })], at);
+    assert.deepEqual(changed.eligible, marked.eligible, `labels [${labels}]: the same item the marker path yields`);
+    assert.equal(principalCanRecord(world, changed.eligible[0]), true, 'supersede then propose succeeds');
+    const same = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross] })], at);
+    assert.deepEqual(same.eligible, [], `labels [${labels}]: an unchanged body waits`);
+  }
+});
+
+test('#263: no ticket or reproposal the frontier emits (no outbox) for an open-proposal issue is refused by record --kind proposed', () => {
   const world = openProposalWorld();
   const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
   const singles = [comment(OWNER, 'Re-propose: again.', '2026-09-12T00:00:00.000Z'), comment(FLEET, 'note', '2026-09-12T00:00:00.000Z'), comment(OWNER, 'Veto', '2026-09-12T00:00:00.000Z')];
@@ -517,8 +536,10 @@ test('#263: nothing the frontier emits for an open-proposal issue is refused by 
 
 test('#263: an exact Approved on a proposal parked under a hold label is left by the finalize script (labels) and shown to the Principal as an approval', () => {
   // Decision: no frontier change is needed. Step 1 of the frontier surfaces an owner Approved newer than
-  // an open proposal before any label is read, and the finalize script's clause 9 refuses the issue
-  // (`labels`: no triage-proposed marker), so the Principal, not the script, finalizes it.
+  // an open proposal before any label is read, and the finalize script refuses the issue on clause 9
+  // (`labels`: the hold label itself is a blocking label for haiku-rehearsal and held; with a non-blocking
+  // label the same clause fires on the missing triage-proposed marker), so the Principal, not the script,
+  // finalizes it.
   for (const labels of [['haiku-rehearsal'], ['held']]) {
     const world = finalizeWorld({ each: () => ({ labels, thread: { extraComments: [comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z')] } }) });
     const before = JSON.stringify(world.fixtureIssue());

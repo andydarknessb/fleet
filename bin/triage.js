@@ -563,10 +563,11 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // 2b. (#263) An open proposal whose marker is gone is still awaiting the owner's Approval: Cory
     // swapped the marker for a hold such as haiku-rehearsal, or removed it. It is not a fresh
     // candidate: served as a ticket, `record --kind proposed` is refused with TRIAGE_PROPOSAL_OPEN
-    // and the Stop hook loops. Only the owner's Re-propose reopens it, as under the marker.
+    // and the Stop hook loops. As under the marker, a changed body or the owner's Re-propose reopens it.
     if (proposed) {
+      if (issue.bodyHash !== proposed.bodyHash) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'body changed since the proposal' }); continue; }
       if (ownerAsksAgain) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
-      skipped.push({ number: issue.number, reason: `proposed ${proposed.at}, awaiting approval (${marker} replaced by ${labels.size ? [...labels].join(', ') : 'no label'})` });
+      skipped.push({ number: issue.number, reason: `proposed ${proposed.at}, awaiting approval (${marker} replaced by ${labels.size ? [...labels].join(', ') : 'no label'}) until Cory comments Approved or Re-propose, or the body changes` });
       continue;
     }
 

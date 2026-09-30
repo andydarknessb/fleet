@@ -42,7 +42,7 @@ function Continue-With {
   if ($key -eq $script:lastKey) { $script:count++ } else { $script:count = 1 }
   $script:total++
   [IO.File]::WriteAllText($counterPath, (@{ count = $script:count; total = $script:total; lastAt = $now; continuedBecause = $key } | ConvertTo-Json -Compress), $utf8)
-  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
+  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner, unless it carries Cory's own Re-propose, which you answer." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
   [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (same-reason continuation $script:count/30, total $script:total/100 since last natural stop). $hint")
   exit 2
 }
