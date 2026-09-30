@@ -327,6 +327,33 @@ try {
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api graphql -f query=''query { viewer { login } }''')) 'a single-quoted GraphQL read query'
   $missing = Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body-file $testRoot\missing-body.md")
   Assert-True ("$($missing.permissionDecisionReason)".Contains("$testRoot\missing-body.md")) 'fleet#229 QA: the could-not-open refusal shows the path with its backslashes'
+  # fleet#229 re-QA: script blocks and function bodies, gh inside a double-quoted substitution, Bash expansions in a body.
+  foreach ($case in @(
+    @('PowerShell', 'foreach ($n in 12,13) { gh issue comment $n -b "Approved" }',                'a foreach body'),
+    @('PowerShell', '12,13 | ForEach-Object { gh issue comment $_ -b "Approved" }',               'a ForEach-Object script block'),
+    @('PowerShell', '12 | % { gh issue comment $_ -b "Veto" }',                                   'a % script block'),
+    @('PowerShell', 'if ($true) { gh issue comment 5 -b "Approved" }',                            'an if body'),
+    @('PowerShell', 'try { gh issue comment 5 -b "Approved" } catch {}',                          'a try body'),
+    @('PowerShell', 'Invoke-Command -ScriptBlock { gh issue comment 5 -b "Approved" }',           'an Invoke-Command script block'),
+    @('Bash',       'f() { gh issue comment 5 -b Approved; }; f',                                 'a Bash function body'),
+    @('Bash',       'url="$(gh issue comment 5 --body "Approved")"',                              'gh inside a double-quoted substitution'),
+    @('PowerShell', '$u = "$(gh issue comment 5 --body "Approved")"',                             'gh inside a double-quoted PowerShell subexpression'),
+    @('Bash',       'gh issue comment 5 -b {Approved,}',                                          'a Bash brace list body'),
+    @('Bash',       'gh issue comment 5 -b <(echo Approved)',                                     'a Bash process substitution body'),
+    @('Bash',       'gh issue comment 5 -F <(echo Approved)',                                     'a Bash process substitution body file')
+  )) {
+    Assert-Denied (Run-Guard -Role ic -Tool $case[0] -ToolInput (Bash $case[1])) "fleet#229 re-QA: $($case[2])"
+  }
+  foreach ($cmdText in @('gh issue comment 5 -b App?oved', 'gh issue comment 5 -b *', 'gh issue comment 5 -b ~')) {
+    Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash $cmdText)) "fleet#229 re-QA: an unquoted expansion in a body: $cmdText" 'cannot inspect'
+  }
+  Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash 'foreach ($n in 12,13) { gh issue comment $n -b "Ruling: the lead agrees" }')) 'a foreach body that is not an Approval'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'url="$(gh issue comment 5 --body "Ruling: fine")"')) 'a quoted substitution comment that is not an Approval'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "Ruling: 2 * 3 [ok] {a,b} ~ fine?"')) 'a quoted body with glob characters'
+  Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash 'gh issue comment 5 -b "Ruling: *ok*"; $h = @{ a = 1 }')) 'a PowerShell hashtable after a comment'
+  $unreadable = Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api graphql -f query="$Q"')
+  Assert-True ("$($unreadable.permissionDecisionReason)" -match 'a GraphQL query this guard cannot read') 'fleet#229 re-QA: an unreadable GraphQL query says so'
+  Assert-True ("$($unreadable.permissionDecisionReason)" -notmatch 'is a GraphQL mutation') 'fleet#229 re-QA: an unreadable GraphQL query is not called a mutation'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 

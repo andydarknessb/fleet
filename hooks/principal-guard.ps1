@@ -27,8 +27,10 @@
 #      tokenizer, not a regex): -b/--body/--body=V/-b=V/-bV, --body-file/-F and their =
 #      forms, gh api -f/-F/--field/--raw-field body=V and body=@file, quote pieces that
 #      concatenate, gh.exe or a path, and a timeout/env/nice/time/xargs/winpty/command/
-#      exec/nohup wrapper (env -S included); a call inside $( ), ( ) or backticks or after
-#      a `$x =` assignment is still read.
+#      exec/nohup wrapper (env -S included); a call inside $( ), "$( )", ( ), { } (a
+#      script block, a loop body, a Bash function), backticks or after a `$x =`
+#      assignment is still read. A Bash body word with an unquoted brace list, glob or
+#      leading ~ is refused (the shell would rewrite it).
 #      Refused as uninspectable, never cleared: a body built by a command substitution,
 #      a variable or expression, or a PowerShell splat or --% list; --input; a gh api
 #      graphql mutation that adds or edits a comment, or a query it cannot read; a body
@@ -38,8 +40,8 @@
 #      it until one is configured (none is on this host), which must arrive with a
 #      rule-set-2 extension. Named residue, not seen by a rule that reads the command
 #      line: a nested interpreter (sh -c, bash -c, pwsh -c, powershell -Command, cmd //c,
-#      iex, Start-Process), a gh alias (gh alias set ... then the alias), a gh call inside
-#      a double-quoted $( ), a pull-request review or gh pr review -c / pulls/N/reviews
+#      iex, Start-Process), a gh alias (gh alias set ... then the alias), a pull-request
+#      review or gh pr review -c / pulls/N/reviews
 #      (triage reads issue comments only), and a command longer than the hook's 15 s
 #      budget can tokenize (about 100 KB takes 2.5 s). This file stays pure ASCII: a
 #      BOM-less script is read in the ANSI code page by Windows PowerShell 5.1.
@@ -107,7 +109,7 @@ function Get-UninspectableReason {
 function Get-WordCause {
   param($Word)
   if ($Word.Text -match '^@\w+$') { return 'a splat' }
-  if ($Word.Text -match '\$\(|`') { return 'built by a command substitution or subshell' }
+  if ($Word.Text -match '\$\(|`|^[<>]\($') { return 'built by a command substitution or subshell' }
   return 'a shell variable or expression'
 }
 # A PowerShell backtick escape inside "..." or bare: `n `t `r `0 `a `b `f `v are control characters, any other is itself.
@@ -167,16 +169,18 @@ function Read-ShellUnits {
   $stack = New-Object System.Collections.ArrayList
   $t = New-Object System.Text.StringBuilder
   $a = New-Object System.Text.StringBuilder
-  $st = @{ has = $false; ok = $true; bare = $true; sent = ''; kind = '' }
+  $st = @{ has = $false; ok = $true; bare = $true; sent = ''; kind = ''; tilde = $false }
   $expRx = '^[A-Za-z0-9_{(@*#?!$-]$'
+  $ghRx = '^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:[^\s"''`|;&()]*[\\/])?gh(?:\.exe)?(?=\s|$)'
+  $extra = New-Object System.Collections.ArrayList
   $endWord = {
     if ($st.has) {
       $tx = $t.ToString()
       if ($ps -and $st.bare -and $tx -match '^@\w+$') { $st.ok = $false }
-      [void]$words.Add([pscustomobject]@{ Text = $tx; Alt = $a.ToString(); Inspectable = $st.ok; Sentinel = $false })
+      [void]$words.Add([pscustomobject]@{ Text = $tx; Alt = $a.ToString(); Inspectable = $st.ok; Sentinel = $false; Tilde = $st.tilde })
     }
     [void]$t.Clear(); [void]$a.Clear()
-    $st.has = $false; $st.ok = $true; $st.bare = $true
+    $st.has = $false; $st.ok = $true; $st.bare = $true; $st.tilde = $false
   }
   $endUnit = {
     . $endWord
@@ -218,7 +222,20 @@ function Read-ShellUnits {
       $close = $Text.IndexOf('#>', $i + 2)
       if ($close -lt 0) { $i = $n } else { $i = $close + 2 }
     }
-    elseif ($c -eq '(') { $st.sent = '('; $st.kind = 'paren'; . $pushFrame; $i++ }
+    elseif ($c -eq '{' -and -not $st.has -and ($ps -or ($i + 1) -ge $n -or [char]::IsWhiteSpace($Text[$i + 1]))) {
+      # A script block (PowerShell) or a group / function body (Bash): its commands are units of their own.
+      $st.sent = '{'; $st.kind = 'brace'; . $pushFrame; $i++
+    }
+    elseif ($c -eq '}' -and -not $st.has) {
+      if ($stack.Count -and $stack[$stack.Count - 1].Kind -eq 'brace') { . $popFrame } else { . $endUnit }
+      $i++
+    }
+    elseif ($c -eq '(') {
+      $st.sent = '('
+      # Bash process substitution <( ) / >( ): the < or > is not a word of its own.
+      if (-not $ps -and $st.has -and ($t.ToString() -eq '<' -or $t.ToString() -eq '>')) { $st.sent = $t.ToString() + '('; [void]$t.Clear(); [void]$a.Clear(); $st.has = $false }
+      $st.kind = 'paren'; . $pushFrame; $i++
+    }
     elseif ($c -eq ')') {
       if ($stack.Count -and $stack[$stack.Count - 1].Kind -eq 'paren') { . $popFrame } else { . $endUnit }
       $i++
@@ -267,6 +284,12 @@ function Read-ShellUnits {
           $nx = ''
           if (($i + 1) -lt $n) { $nx = [string]$Text[$i + 1] }
           if ($nx -match $expRx) { $st.ok = $false }
+          # "$(gh ...)": a gh call inside a double-quoted substitution is a unit of its own (the tail after the
+          # $( is over-read, which is harmless).
+          if ($nx -eq '(') {
+            $tail = $Text.Substring($i + 2)
+            if ($tail -match $ghRx) { foreach ($su in (Read-ShellUnits $tail $Tool)) { [void]$extra.Add($su) } }
+          }
         }
         [void]$t.Append($d); [void]$a.Append($d); $i++
       }
@@ -305,12 +328,18 @@ function Read-ShellUnits {
       }
     }
     else {
+      # Bash expands an unquoted brace list, glob or ~ before gh sees it: -b {Approved,} posts "Approved".
+      if (-not $ps) {
+        if ($c -eq '*' -or $c -eq '?' -or $c -eq '[' -or $c -eq '{') { $st.ok = $false }
+        elseif ($c -eq '~' -and -not $st.has) { $st.tilde = $true }
+      }
       [void]$t.Append($c); [void]$a.Append($c); $st.has = $true
       $i++
     }
   }
   while ($stack.Count) { . $popFrame }
   . $endUnit
+  foreach ($su in $extra) { [void]$units.Add($su) }
   return , $units
 }
 
@@ -457,7 +486,7 @@ if ($tool -in @('Bash', 'PowerShell')) {
           foreach ($f in $fields) {
             if ($f.InputFlag) { $reason = Get-UninspectableReason 'a JSON body passed through --input'; break }
             if ($f.Name -ceq 'query') {
-              if (-not $f.Word.Inspectable) { $reason = Get-UninspectableReason 'a GraphQL mutation'; break }
+              if (-not $f.Word.Inspectable) { $reason = Get-UninspectableReason 'a GraphQL query this guard cannot read'; break }
               if ($f.Typed -and $f.Value.StartsWith('@')) {
                 $qf = Read-GuardFile $f.Value.Substring(1) $f.Word $tool "$($inp.cwd)"
                 if (-not $qf.Opened) { $reason = Get-UninspectableReason "in a file this guard could not open ($($qf.Shown))"; break }
@@ -507,7 +536,10 @@ if ($tool -in @('Bash', 'PowerShell')) {
     foreach ($hit in $hits) {
       $val = $hit[0]; $valWord = $hit[1]
       if (-not $valWord.Inspectable) { $reason = Get-UninspectableReason (Get-WordCause $valWord); break }
-      if (-not $hit[2]) { $bodies += $val; continue }
+      if (-not $hit[2]) {
+        if ($valWord.Tilde) { $reason = Get-UninspectableReason 'a shell variable or expression'; break }
+        $bodies += $val; continue
+      }
       if ($val -eq '-') { $reason = Get-UninspectableReason 'passed on stdin (--body-file - / -F - / body=@-)'; break }
       $bf = Read-GuardFile $val $valWord $tool "$($inp.cwd)"
       if (-not $bf.Opened) { $reason = Get-UninspectableReason "in a file this guard could not open ($($bf.Shown))"; break }
