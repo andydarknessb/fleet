@@ -84,6 +84,30 @@ function Test-BranchMergedPr {
 # --- worktree sweep: remove only when the Work record is settled AND the tree is
 # --- clean AND the branch is merged or gone on the remote; else list with the reason. ---
 $activeWork = Read-ActiveWork
+
+# fleet#251 condition 0 input: the live IC roster rows, read once. A release removes a
+# record from active.json while a late session (or a session the launch door has not yet
+# recorded as failed) can still be working in its assignment worktree, so the Work record
+# alone cannot say "nobody lives here". Tri-state like the heartbeat sweep below: an absent
+# roster.json is a fresh install with no rows; one that exists but does not parse (or has no
+# sessions list) is UNKNOWN and lists every worktree rather than reading as "nobody is live".
+$liveIcRows = @()
+$liveRosterUnreadable = $false
+$liveRosterFile = "$FleetHome\state\roster.json"
+if (Test-Path -LiteralPath $liveRosterFile) {
+  try {
+    $liveRosterObj = Get-Content -LiteralPath $liveRosterFile -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($liveRosterObj -and $liveRosterObj.PSObject.Properties['sessions']) {
+      $liveIcRows = @($liveRosterObj.sessions | Where-Object { "$($_.role)" -eq 'ic' -and @('active', 'retiring') -contains "$($_.status)".ToLowerInvariant() })
+    } else { $liveRosterUnreadable = $true }
+  } catch { $liveRosterUnreadable = $true }
+}
+function Get-NormalPath {
+  param([string]$Path)
+  if (-not $Path) { return $null }
+  try { return [IO.Path]::GetFullPath($Path).TrimEnd([char]92, [char]47) } catch { return $Path }
+}
+
 foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
   $t = Read-Json $tf.FullName
   if (-not $t -or -not (Test-Path $t.repo)) { continue }
@@ -102,6 +126,26 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
     elseif ($br -match '(\d+)(-|$)') { $issue = [int]$Matches[1] }
 
     $reasons = @()
+    $rosterOk = $true
+
+    # Condition 0 (fleet#251): a live IC roster row (active or retiring) that owns this
+    # worktree - by its assignment-worktree name or by its cwd - blocks removal whatever the
+    # Work record, tree and branch say: the record may be gone only because the reservation
+    # was released under a session that is still running. An unreadable roster blocks every
+    # worktree for the same reason.
+    if ($liveRosterUnreadable) {
+      $rosterOk = $false
+      $reasons += 'state/roster.json unreadable; a live IC may own this worktree'
+    } else {
+      $normalPath = Get-NormalPath $path
+      foreach ($liveRow in $liveIcRows) {
+        $rowCwd = Get-NormalPath "$($liveRow.cwd)"
+        if ("$($liveRow.name)-assignment" -eq $leaf -or ($rowCwd -and $normalPath -and $rowCwd -eq $normalPath)) {
+          $rosterOk = $false
+          $reasons += "worktree belongs to live roster row '$($liveRow.name)' (status $($liveRow.status))"
+        }
+      }
+    }
 
     # Condition 1: the issue's Work record is merged, retired or released, OR the
     # issue is closed with no active record. A torn/unparseable active.json is neither
@@ -114,6 +158,9 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
       if ($lookup.status -eq 'unreadable') {
         $reasons += 'state/work/active.json could not be read; issue record status unknown'
       } elseif ($lookup.status -eq 'found') {
+        # 'released' is not a state an active.json record ever holds (release deletes the
+        # record from active.json and keeps a snapshot under state/releases); it stays in the
+        # list as a harmless guard for a hand-edited or legacy file, never as a live path.
         if (@('merged', 'retired', 'released') -contains "$($lookup.record.state)") { $recordOk = $true }
         else { $reasons += "issue #$issue`'s Work record is '$($lookup.record.state)', not merged/retired/released" }
       } else {
@@ -182,7 +229,7 @@ foreach ($tf in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction
 
     $entry = [ordered]@{ tenant = $tenantName; path = $path; branch = $br; issue = $issue }
     if ($mergeLeg) { $entry.mergeLeg = $mergeLeg }
-    if ($recordOk -and $clean -and $branchOk) {
+    if ($rosterOk -and $recordOk -and $clean -and $branchOk) {
       if ($Apply) {
         & git -C $t.repo worktree remove $path 2>$null   # never --force: a refusal here means our own checks missed something
         if ($LASTEXITCODE -eq 0) {

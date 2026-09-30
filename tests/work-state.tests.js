@@ -9,10 +9,13 @@ const {
   FLAGS,
   WorkStateError,
   abandonRecord,
+  appendEvent,
   cli,
+  commitMutation,
   createRecord,
   getRecord,
   notifyRecord,
+  paths,
   projectStatus,
   proofFor,
   readEvents,
@@ -1856,4 +1859,320 @@ report(()=>m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42
     verdicts.push(runs.map((run) => run.output).sort().join(','));
   }
   assert.deepEqual(verdicts, Array(RACE_ROUNDS).fill('STALE_REVISION,ok'));
+});
+
+// ---- fleet#251: release refuses a claimed record; shadow, events and janitor respect it ----
+
+function writeRoster(root, sessions) {
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions }));
+  return rosterPath;
+}
+
+function icRow(issue, overrides = {}) {
+  return { name: `ic-${issue}`, role: 'ic', tenant: 'endzone', issue, status: 'active', sessionId: `s${issue}`, jobId: `j${issue}`, ...overrides };
+}
+
+function reserveIssue(root, issue, key = `reserve-${issue}`, now = '2026-09-30T00:00:00.000Z') {
+  return reserveRecord({ root, id: `endzone:issue-${issue}`, tenant: 'endzone', issue, manifestPath: path.join(root, 'state', 'manifests', `assignment-${issue}.json`), idempotencyKey: key, now });
+}
+
+function pendingJournals(p) {
+  return fs.readdirSync(p.pending).filter((name) => name.endsWith('.json'));
+}
+
+test('#251 AC1: release refuses a record a live roster row claims, and changes nothing', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-2510';
+  const reserved = reserveIssue(root, 2510);
+  const rosterPath = writeRoster(root, [icRow(2510)]);
+  const eventsBefore = readEvents(root).length;
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-2510', rosterPath, now: '2026-09-30T00:00:01.000Z' }),
+    (error) => error.code === 'RELEASE_CLAIMED'
+      && /retire\.ps1 -Name ic-2510/.test(error.message)
+      && /sessionId s2510/.test(error.message)
+      && error.rosterRow.name === 'ic-2510' && error.rosterRow.jobId === 'j2510',
+  );
+  assert.equal(getRecord({ root, id }).state, 'assigned');
+  assert.equal(getRecord({ root, id }).revision, reserved.revision);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-2510.json')), false);
+  assert.equal(readEvents(root).length, eventsBefore);
+});
+
+test('#251 AC1: a retiring row claims too; retired, non-ic, other-issue and absent rosters do not', () => {
+  const refuses = { retiring: [icRow(2510, { status: 'retiring' })] };
+  const allows = {
+    retired: [icRow(2510, { status: 'retired' })],
+    'project-lead': [icRow(2510, { role: 'project-lead' })],
+    'other issue': [icRow(2511)],
+    'other tenant': [icRow(2510, { tenant: 'nidus' })],
+  };
+  const attempt = (sessions) => {
+    const root = rootDir();
+    const reserved = reserveIssue(root, 2510);
+    const rosterPath = sessions ? writeRoster(root, sessions) : path.join(root, 'state', 'roster.json');
+    return () => releaseRecord({ root, id: 'endzone:issue-2510', expectedRevision: reserved.revision, idempotencyKey: 'release-2510', rosterPath, now: '2026-09-30T00:00:01.000Z' });
+  };
+  for (const [label, sessions] of Object.entries(refuses)) assert.throws(attempt(sessions), (error) => error.code === 'RELEASE_CLAIMED', label);
+  for (const [label, sessions] of Object.entries(allows)) assert.equal(attempt(sessions)().record.state, 'released', label);
+  assert.equal(attempt(null)().record.state, 'released', 'an absent roster is no claim');
+});
+
+test('#251 AC1: an unreadable roster is no claim (the guard does not fail closed)', () => {
+  const root = rootDir();
+  const reserved = reserveIssue(root, 2510);
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  fs.writeFileSync(rosterPath, '{ not json');
+  const released = releaseRecord({ root, id: 'endzone:issue-2510', expectedRevision: reserved.revision, idempotencyKey: 'release-2510', rosterPath, now: '2026-09-30T00:00:01.000Z' });
+  assert.equal(released.record.state, 'released');
+});
+
+test('#251 AC1: the roster defaults to state/roster.json under the root, and the CLI takes --roster', () => {
+  const root = rootDir();
+  const reserved = reserveIssue(root, 2510);
+  writeRoster(root, [icRow(2510)]);
+  assert.throws(
+    () => releaseRecord({ root, id: 'endzone:issue-2510', expectedRevision: reserved.revision, idempotencyKey: 'release-2510', now: '2026-09-30T00:00:01.000Z' }),
+    (error) => error.code === 'RELEASE_CLAIMED',
+  );
+  assert.ok(FLAGS.release.includes('roster'));
+  const elsewhere = path.join(rootDir(), 'roster.json');
+  fs.writeFileSync(elsewhere, JSON.stringify({ sessions: [] }));
+  const out = cli(['release', '--root', root, '--id', 'endzone:issue-2510', '--expected-revision', String(reserved.revision), '--idempotency-key', 'release-2510', '--roster', elsewhere]);
+  assert.equal(out.record.state, 'released');
+});
+
+test('#251 AC1: a replay of an earlier release still replays after a claiming row appears', () => {
+  const root = rootDir();
+  const reserved = reserveIssue(root, 2510);
+  const release = (rosterPath) => releaseRecord({ root, id: 'endzone:issue-2510', expectedRevision: reserved.revision, idempotencyKey: 'release-2510', rosterPath, now: '2026-09-30T00:00:01.000Z' });
+  const first = release(path.join(root, 'state', 'roster.json'));
+  assert.equal(first.replayed, false);
+  const rosterPath = writeRoster(root, [icRow(2510)]);
+  const again = release(rosterPath);
+  assert.equal(again.replayed, true);
+});
+
+test('#251 AC2: shadow skips a released record, reports it, and does not resurrect the reservation', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-2511';
+  const reserved = reserveIssue(root, 2511);
+  releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-2511', now: '2026-09-30T00:00:01.000Z' });
+  const rosterPath = writeRoster(root, [icRow(2511)]);
+  const result = shadowProject({ root, rosterPath, now: '2026-09-30T00:00:02.000Z' });
+  assert.deepEqual(result.projected, []);
+  assert.deepEqual(result.skipped, [{ id, name: 'ic-2511', reason: 'release-snapshot' }]);
+  const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+  assert.equal(active.records[id], undefined);
+  const events = readEvents(root).filter((event) => event.recordId === id);
+  assert.deepEqual(events.map((event) => event.sequence), [1, 2]);
+  assert.equal(events.some((event) => event.type === 'shadow-projected'), false);
+
+  const again = reserveRecord({ root, id, tenant: 'endzone', issue: 2511, manifestPath: path.join(root, 'state', 'manifests', 'assignment-2511-b.json'), idempotencyKey: 'reserve-2511-b', now: '2026-09-30T00:00:03.000Z' });
+  assert.equal(again.record.state, 'assigned');
+  const second = shadowProject({ root, rosterPath, now: '2026-09-30T00:00:04.000Z' });
+  assert.equal(second.skipped.length, 0);
+  assert.equal(second.projected.length, 1);
+  assert.equal(second.projected[0].state, 'assigned', 'the live record is left as the reservation made it');
+  assert.equal(readEvents(root).filter((event) => event.recordId === id && event.type === 'shadow-projected').length, 0);
+});
+
+test('#251 AC2: an abandoned record is reported as skipped with its own reason', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-2514';
+  const reserved = reserveIssue(root, 2514);
+  move(root, id, reserved.revision, 'escalated', 'esc-2514', 'x', '2026-09-30T00:00:01.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-2514', reason: 'ruled', now: '2026-09-30T00:00:02.000Z' });
+  const rosterPath = writeRoster(root, [icRow(2514)]);
+  const result = shadowProject({ root, rosterPath, now: '2026-09-30T00:00:03.000Z' });
+  assert.deepEqual(result.skipped, [{ id, name: 'ic-2514', reason: 'abandon-snapshot' }]);
+  assert.deepEqual(result.projected, []);
+});
+
+test('#251 AC4: a release replayed with the same key returns the first result; a new key is NOT_FOUND', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-2512';
+  const reserved = reserveIssue(root, 2512);
+  const first = releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'k', now: '2026-09-30T00:00:01.000Z' });
+  assert.equal(first.replayed, false);
+  const replay = releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'k', now: '2026-09-30T00:00:02.000Z' });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.revision, first.revision);
+  assert.equal(replay.eventSequence, first.eventSequence);
+  assert.deepEqual(replay.record, first.record);
+  assert.throws(() => releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'k2', now: '2026-09-30T00:00:03.000Z' }), (error) => error.code === 'NOT_FOUND');
+});
+
+function seedReleasedLineage(root, issue) {
+  const id = `endzone:issue-${issue}`;
+  const reserved = reserveIssue(root, issue);
+  releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: `release-${issue}`, now: '2026-09-30T00:00:01.000Z' });
+  return id;
+}
+
+function collidingEvent(id) {
+  return {
+    schemaVersion: 1, recordId: id, sequence: 1, revision: 1, type: 'shadow-projected', actor: 'shadow-projector',
+    at: '2026-09-30T00:00:02.000Z', evidence: null, idempotencyKey: `shadow:${id}:s2513`, changes: {},
+  };
+}
+
+test('#251 AC3: appendEvent refuses a different event at an occupied (recordId, sequence)', () => {
+  const root = rootDir();
+  const id = seedReleasedLineage(root, 2513);
+  const before = readEvents(root).length;
+  assert.throws(
+    () => appendEvent(paths(root), collidingEvent(id)),
+    (error) => error.code === 'EVENT_SEQUENCE_COLLISION'
+      && error.existing.type === 'assignment-reserved' && error.attempted.type === 'shadow-projected'
+      && error.sequence === 1 && error.recordId === id,
+  );
+  assert.equal(readEvents(root).length, before);
+  // the identical event is a journal replay: no throw, no duplicate
+  const stored = readEvents(root).find((event) => event.recordId === id && event.sequence === 1);
+  appendEvent(paths(root), stored);
+  assert.equal(readEvents(root).length, before);
+});
+
+test('#251 AC3: a colliding mutation is refused before anything is written', () => {
+  const root = rootDir();
+  const id = seedReleasedLineage(root, 2513);
+  const p = paths(root);
+  const activeBefore = fs.readFileSync(p.active, 'utf8');
+  assert.throws(
+    () => commitMutation(p, { recordId: id, beforeRecord: null, afterRecord: { id, revision: 1 }, event: collidingEvent(id) }),
+    (error) => error.code === 'EVENT_SEQUENCE_COLLISION',
+  );
+  assert.equal(pendingJournals(p).length, 0, 'no journal');
+  assert.equal(fs.readFileSync(p.active, 'utf8'), activeBefore, 'active.json untouched');
+});
+
+test('#251 AC3: a crash between appendEvent and journal removal recovers as a replay', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-2515';
+  const reserved = reserveIssue(root, 2515);
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-2515', now: '2026-09-30T00:00:01.000Z', killPoint: 'after-event' }),
+    (error) => error.code === 'KILL_POINT',
+  );
+  const p = paths(root);
+  assert.equal(pendingJournals(p).length, 1);
+  assert.equal(getRecord({ root, id }).state, 'released', 'recovery completes the release without throwing a collision');
+  assert.equal(readEvents(root).filter((event) => event.recordId === id && event.type === 'assignment-released').length, 1);
+  assert.equal(pendingJournals(p).length, 0);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-2515.json')), true);
+});
+
+test('#251 AC3: a pending journal whose event collides is quarantined once, loudly, and does not wedge the door', () => {
+  const root = rootDir();
+  const id = seedReleasedLineage(root, 2513);
+  const p = paths(root);
+  const event = collidingEvent(id);
+  fs.writeFileSync(path.join(p.pending, 'hand-written-collision.json'), JSON.stringify({
+    recordId: id, beforeRecord: null, afterRecord: null, event, archiveRecord: null, releasedRecord: null, abandonedRecord: null, supersedeReusable: null,
+  }));
+  assert.throws(
+    () => getRecord({ root, id }),
+    (error) => error.code === 'EVENT_SEQUENCE_COLLISION' && /pending[\\/]collided[\\/]hand-written-collision\.\d+\..*\.json/.test(error.message),
+  );
+  assert.equal(pendingJournals(p).length, 0);
+  assert.equal(fs.readdirSync(path.join(p.pending, 'collided')).filter((name) => name.startsWith('hand-written-collision.')).length, 1);
+  // the second door call is past the wedge
+  assert.equal(getRecord({ root, id }).state, 'released');
+  const next = reserveRecord({ root, id, tenant: 'endzone', issue: 2513, manifestPath: 'm2513-b', idempotencyKey: 'reserve-2513-b', now: '2026-09-30T00:00:05.000Z' });
+  assert.equal(next.record.state, 'assigned');
+});
+
+// ---- fleet#251 QA round ----
+
+test('#251 QA1: a stale roster row for an earlier manifest does not block releasing the new reservation', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-900';
+  const t = (n) => `2026-09-30T10:0${n}:00.000Z`;
+  const manifest = (k) => path.join(root, 'state', 'manifests', `m${k}.json`);
+  const reserve = (k, n) => reserveRecord({ root, id, tenant: 'endzone', issue: 900, manifestPath: manifest(k), reservations: { components: ['a'] }, idempotencyKey: `assignment-reserved:m${k}`, now: t(n) });
+  let reserved = reserve(1, 0);
+  const rosterPath = writeRoster(root, [icRow(900, { manifest: manifest(1) })]);
+  move(root, id, reserved.revision, 'implementing', 'assignment-started:x:1', 'e', t(1));
+  abandonRecord({ root, id, expectedRevision: getRecord({ root, id }).revision, reason: 'ic died', idempotencyKey: 'abandon-1', now: t(2) });
+  reserved = reserve(2, 3);
+  const released = releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'assignment-invalidated:m2', rosterPath, now: t(4) });
+  assert.equal(released.record.state, 'released');
+});
+
+test('#251 QA1: a row whose manifest is the record\'s manifest, or that names no manifest, still claims it', () => {
+  for (const manifestOf of [(record) => record.manifestPath, (record) => record.manifestPath.toUpperCase(), () => undefined]) {
+    const root = rootDir();
+    const reserved = reserveIssue(root, 2530);
+    const row = icRow(2530);
+    const manifest = manifestOf(reserved.record);
+    if (manifest !== undefined && (process.platform === 'win32' || manifest === reserved.record.manifestPath)) row.manifest = manifest;
+    const rosterPath = writeRoster(root, [row]);
+    assert.throws(
+      () => releaseRecord({ root, id: 'endzone:issue-2530', expectedRevision: reserved.revision, idempotencyKey: 'release-2530', rosterPath, now: '2026-09-30T00:00:01.000Z' }),
+      (error) => error.code === 'RELEASE_CLAIMED',
+      String(manifest),
+    );
+  }
+});
+
+test('#251 QA1: a stale row and a current row for the same issue: the current one claims', () => {
+  const root = rootDir();
+  const reserved = reserveIssue(root, 2531);
+  const rosterPath = writeRoster(root, [icRow(2531, { name: 'ic-old', manifest: path.join(root, 'state', 'manifests', 'old.json') }), icRow(2531, { manifest: reserved.record.manifestPath })]);
+  assert.throws(
+    () => releaseRecord({ root, id: 'endzone:issue-2531', expectedRevision: reserved.revision, idempotencyKey: 'release-2531', rosterPath, now: '2026-09-30T00:00:01.000Z' }),
+    (error) => error.code === 'RELEASE_CLAIMED' && error.rosterRow.name === 'ic-2531',
+  );
+});
+
+test('#251 QA3: shadow skips a record that was archived and reports it', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-2532';
+  makeRecord(root, { id, issue: 2532, github: { issueNumber: 2532 }, idempotencyKey: 'create-2532' });
+  move(root, id, 1, 'implementing', 't-1', 'ack', '2026-09-01T00:00:01.000Z');
+  move(root, id, 2, 'pr-open', 't-2', 'pr', '2026-09-01T00:00:02.000Z');
+  move(root, id, 3, 'ci-wait', 't-3', 'ci', '2026-09-01T00:00:03.000Z');
+  move(root, id, 4, 'review', 't-4', 'r', '2026-09-01T00:00:04.000Z');
+  move(root, id, 5, 'merged', 't-5', 'm', '2026-09-01T00:00:05.000Z');
+  move(root, id, 6, 'retiring', 't-6', 'r', '2026-09-01T00:00:06.000Z');
+  move(root, id, 7, 'retired', 't-7', 'done', '2026-09-01T00:00:07.000Z');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-2532.json')), true);
+  const rosterPath = writeRoster(root, [icRow(2532), icRow(2533)]);
+  const result = shadowProject({ root, rosterPath, now: '2026-09-30T00:00:00.000Z' });
+  assert.deepEqual(result.skipped, [{ id, name: 'ic-2532', reason: 'archive' }]);
+  assert.deepEqual(result.projected.map((record) => record.issue), [2533], 'the rest of the tick still projects');
+});
+
+test('#251 QA4: a second quarantined journal never overwrites the first', () => {
+  const root = rootDir();
+  const id = seedReleasedLineage(root, 2513);
+  const p = paths(root);
+  const journal = () => fs.writeFileSync(path.join(p.pending, 'same-name.json'), JSON.stringify({
+    recordId: id, beforeRecord: null, afterRecord: null, event: collidingEvent(id), archiveRecord: null, releasedRecord: null, abandonedRecord: null, supersedeReusable: null,
+  }));
+  for (let round = 0; round < 2; round += 1) {
+    journal();
+    assert.throws(() => getRecord({ root, id }), (error) => error.code === 'EVENT_SEQUENCE_COLLISION');
+  }
+  const kept = fs.readdirSync(path.join(p.pending, 'collided'));
+  assert.equal(kept.length, 2, `both quarantined journals survive: ${kept.join(',')}`);
+  assert.ok(kept.every((name) => name.endsWith('.json')));
+});
+
+test('#251 QA: a relative roster manifest resolves against the fleet root, not the process cwd', () => {
+  const root = rootDir();
+  const reserved = reserveIssue(root, 2540);
+  const rosterPath = writeRoster(root, [icRow(2540, { manifest: 'state/manifests/assignment-2540.json' })]);
+  const previous = process.cwd();
+  process.chdir(os.tmpdir());
+  try {
+    assert.throws(
+      () => releaseRecord({ root, id: 'endzone:issue-2540', expectedRevision: reserved.revision, idempotencyKey: 'release-2540', rosterPath, now: '2026-09-30T00:00:01.000Z' }),
+      (error) => error.code === 'RELEASE_CLAIMED',
+    );
+  } finally { process.chdir(previous); }
 });

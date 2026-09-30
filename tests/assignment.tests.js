@@ -145,6 +145,59 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
 });
 
+test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 90 s (fleet#256)', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root,
+    issue: issue(44),
+    tenant: 'endzone',
+    tenantConfig: { branchPrefix: 'fleet/', defaultBranch: 'integration' },
+    readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) },
+    parent: 'pl-endzone',
+    model: 'sonnet',
+    risk: 'standard',
+    tokenBudget: 25000,
+    contextHeadings: [],
+    adrPaths: [],
+    testPlan: [],
+    ciGates: [],
+    now: '2026-09-01T00:00:00.000Z',
+  });
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'));
+  // A stub launcher that refuses the way launch.ps1 does: JSON refusal on stdout, noise on stderr, exit 3.
+  const stub = path.join(root, 'stub-launch.js');
+  fs.writeFileSync(stub, [
+    "const nl = String.fromCharCode(10);",
+    "process.stdout.write('some chatter' + nl + JSON.stringify({ launched: false, reason: 'cap reached (6/6)', reservationReleased: false, releaseError: 'release failed for Work record x' }) + nl);",
+    "process.stderr.write('stub stderr');",
+    "process.exit(3);",
+  ].join(String.fromCharCode(10)));
+  let seen = null;
+  const { execFileSync } = require('node:child_process');
+  const runner = (cmd, args, opts) => { seen = opts; return execFileSync(process.execPath, [stub], opts); };
+  assert.throws(
+    () => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner }),
+    (error) => {
+      assert.equal(error.code, 'LAUNCH_FAILED');
+      assert.match(error.message, /launch refused: cap reached \(6\/6\)/);
+      assert.match(error.message, /reservationReleased=false/);
+      assert.match(error.message, /releaseError=release failed for Work record x/);
+      assert.match(error.message, /stub stderr/);
+      assert.equal(error.refusal.reason, 'cap reached (6/6)');
+      assert.equal(error.exitCode, 3);
+      return true;
+    },
+  );
+  assert.equal(seen.timeout, 90000, 'a timeout kill between claude --bg and the roster write strands a session, so the budget covers the no-session poll, gh, fetch and worktree add, yet stays under the 2-minute lead Bash limit');
+  // A timeout kill says so even when the killed child left stderr text.
+  const killed = () => { const e = new Error('spawnSync powershell ETIMEDOUT'); e.code = 'ETIMEDOUT'; e.killed = true; e.status = null; e.stdout = ''; e.stderr = 'partial stderr'; throw e; };
+  assert.throws(() => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner: killed }), (error) => error.code === 'LAUNCH_FAILED' && /timed out after 90 s/.test(error.message) && /partial stderr/.test(error.message) && error.timedOut === true);
+  // With no JSON on stdout the error still says something (the exec error), never an empty message.
+  const bare = () => { const e = new Error('Command failed: stub'); e.status = 1; e.stdout = ''; e.stderr = ''; throw e; };
+  assert.throws(() => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner: bare }), (error) => error.code === 'LAUNCH_FAILED' && /Command failed: stub/.test(error.message));
+});
+
 test('changed criteria invalidate the manifest and release reservations', () => {
   const root = rootDir();
   const result = reserveAssignment({
@@ -1081,4 +1134,52 @@ test('#209 m7: plannerInputs throws on a missing tenant instead of answering "no
   const { plannerInputs } = require('../bin/assignment');
   assert.throws(() => plannerInputs({ root: plannerRoot([]), tenantConfig: {} }), (error) => error.code === 'USAGE');
   assert.deepEqual(plannerInputs({ root: plannerRoot([]), tenant: 'endzone', tenantConfig: {} }).boundedReadies, []);
+});
+
+// fleet#251: a late session acknowledging a manifest launch.ps1 already invalidated used to
+// get NOT_FOUND (the record left active state with the release) and read it as a glitch.
+test('#251: acknowledging an invalidated manifest says so instead of NOT_FOUND', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(2520), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  invalidateManifest({ root, manifest: result.manifest, currentRevision: 1, reason: 'launch failed: claude --bg produced no session', now: '2026-09-30T00:01:00.000Z' });
+  assert.throws(
+    () => acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:02:00.000Z' }),
+    (error) => error.code === 'MANIFEST_INVALIDATED'
+      && /launch failed: claude --bg produced no session/.test(error.message)
+      && /this assignment was released/.test(error.message)
+      && error.reason === 'launch failed: claude --bg produced no session',
+  );
+});
+
+test('#251: the ack CLI reads the manifest from --manifest or FLEET_ASSIGNMENT_MANIFEST', () => {
+  assert.ok(FLAGS.ack.includes('manifest'));
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(2521), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  invalidateManifest({ root, manifest: result.manifest, currentRevision: 1, reason: 'issue body hash changed before acknowledgment', now: '2026-09-30T00:01:00.000Z' });
+  const ackArgs = ['--root', root, '--work-record-id', result.manifest.workRecordId, '--expected-revision', '1'];
+  assert.throws(() => cli(['ack', ...ackArgs, '--manifest', result.manifestPath]), (error) => error.code === 'MANIFEST_INVALIDATED');
+  const previous = process.env.FLEET_ASSIGNMENT_MANIFEST;
+  process.env.FLEET_ASSIGNMENT_MANIFEST = result.manifestPath;
+  try {
+    assert.throws(() => cli(['ack', ...ackArgs]), (error) => error.code === 'MANIFEST_INVALIDATED');
+  } finally {
+    if (previous === undefined) delete process.env.FLEET_ASSIGNMENT_MANIFEST; else process.env.FLEET_ASSIGNMENT_MANIFEST = previous;
+  }
+});
+
+test('#251: acknowledging a live manifest still works when the manifest path is given', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(2522), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  const acknowledged = acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:01:00.000Z' });
+  assert.equal(acknowledged.record.state, 'implementing');
+  assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
 });
