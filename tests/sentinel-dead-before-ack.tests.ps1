@@ -79,9 +79,9 @@ exit 0
     Set-Agents @()
   }
   # Reserve the way assignment.js does, including assignment.manifestId (the field Invoke-ManifestRelease checks).
-  function Reserve-Record { param([int]$N, [string]$ManifestFile, [string]$ManifestId, [string]$Key, [string]$Tenant = 'test')
+  function Reserve-Record { param([int]$N, [string]$ManifestFile, [string]$ManifestId, [string]$Key, [string]$Tenant = 'test', [switch]$NoAssignment)
     $assignment = (@{ manifestId = $ManifestId } | ConvertTo-Json -Compress).Replace('"', '\"')
-    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "${Tenant}:issue-$N" --tenant $Tenant --issue $N --manifest $ManifestFile --assignment $assignment --idempotency-key $Key
+    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "${Tenant}:issue-$N" --tenant $Tenant --issue $N --manifest $ManifestFile @(if (-not $NoAssignment) { '--assignment'; $assignment }) --idempotency-key $Key
     if ($LASTEXITCODE -ne 0) { throw "fixture reservation for issue $N failed" }
   }
   function New-Reservation { param([int]$N, [string]$Tenant = 'test')
@@ -281,8 +281,8 @@ exit 0
   $null = & node "$testRoot\bin\work-state.js" release --root $testRoot --id test:issue-940 --expected-revision 1 --idempotency-key hand-release-940 2>&1
   if ($LASTEXITCODE -ne 0) { throw 'D16 fixture: hand release failed' }
   Reserve-Record 940 $m2 'assignment-test-9401' 'reserve-940-again'
-  function Invoke-Release { param([string]$Manifest)
-    $cmd = ". '$testRoot\bin\_common.ps1'; Invoke-ManifestRelease -Manifest '$Manifest' -WorkRecordId 'test:issue-940' -Reason 'qa' | ConvertTo-Json -Compress"
+  function Invoke-Release { param([string]$Manifest, [string]$Id = 'test:issue-940')
+    $cmd = ". '$testRoot\bin\_common.ps1'; Invoke-ManifestRelease -Manifest '$Manifest' -WorkRecordId '$Id' -Reason 'qa' | ConvertTo-Json -Compress"
     (& powershell -NoProfile -ExecutionPolicy Bypass -Command $cmd | Out-String) | ConvertFrom-Json
   }
   $r16 = Invoke-Release $m1
@@ -290,6 +290,16 @@ exit 0
   Assert-True ($null -ne (Get-ActiveRecords).PSObject.Properties['test:issue-940'] -and -not (Test-Path ($m1 + '.invalidated.json'))) 'D16: M2 stays reserved and M1 is not marked'
   $r16b = Invoke-Release $m2
   Assert-True ($r16b.ok -eq $true -and (Test-Path ($m2 + '.invalidated.json')) -and $null -eq (Get-ActiveRecords).PSObject.Properties['test:issue-940']) 'D16: the current manifest releases'
+  # D16b (#261 re-QA): a record with no assignment.manifestId falls back to comparing its manifestPath with the manifest.
+  New-Case 941
+  $m941b = Manifest-Path 9411
+  Write-Utf8 $m941b '{"schemaVersion":1,"id":"assignment-test-9411","workRecordId":"test:issue-941","tenant":"test","parent":"pl-test"}'
+  $null = & node "$testRoot\bin\work-state.js" release --root $testRoot --id test:issue-941 --expected-revision 1 --idempotency-key hand-release-941 2>&1
+  Reserve-Record 941 $m941b 'assignment-test-9411' 'reserve-941-again' -NoAssignment
+  $r16c = Invoke-Release (Manifest-Path 941) 'test:issue-941'
+  Assert-True ($r16c.ok -eq $false -and $r16c.code -eq 'MANIFEST_MISMATCH' -and $null -ne (Get-ActiveRecords).PSObject.Properties['test:issue-941']) "D16b: no assignment.manifestId, a different manifestPath is refused (got: $($r16c | ConvertTo-Json -Compress))"
+  $r16d = Invoke-Release $m941b.ToUpperInvariant().Replace('STATE', 'state') 'test:issue-941'
+  Assert-True ($r16d.ok -eq $true -and $null -eq (Get-ActiveRecords).PSObject.Properties['test:issue-941']) "D16b: the record's own manifestPath (compared case-insensitively) releases (got: $($r16d | ConvertTo-Json -Compress))"
   Write-Output 'sentinel-dead-before-ack D16 passed'
 
   # ---- D10 PAUSE: nothing is acted; an ok entry says deferred; today's ic-vanished stands.

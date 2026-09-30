@@ -319,6 +319,31 @@ exit 0
   Assert-True (@($o10b.respawned).Count -eq 1 -and $o10b.respawned[0].jobId -eq 'job-A') 'O10b: a newer running ORPHAN does not stand in for the rostered job'
   Write-Output 'sentinel-orphan-late-session O10 passed'
 
+  # ---- O11 (#261 re-QA): a running same-name row that ANOTHER fleet root rosters (a scratch root's session) is never a
+  # stand-in for this root's rostered job. job-F is such a row; it is newer than the rostered job-A.
+  function Set-ForeignFixture {
+    $fs = "$foreignRoot\state\sessions\ic-1001.settings.json"
+    Write-Job 'job-F' 'ic-1001' $null $fs
+    Write-Utf8 "$foreignRoot\state\roster.json" ('{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"cory","issue":1001,"status":"active","jobId":"job-F","settings":"' + (Json-Path $fs) + '"}]}')
+  }
+  # (a) the rostered job-A is stopped; the newer running job-F is foreign: job-A is judged (and respawned), not job-F.
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-A"}]}'
+  Write-Job 'job-A' 'ic-1001' (Manifest-Intent '1001')
+  Set-ForeignFixture
+  Set-Agents @(@{ id = 'job-A'; name = 'ic-1001'; pid = $null; state = 'stopped'; startedAt = '2026-09-30T03:00:00Z' }, @{ id = 'job-F'; name = 'ic-1001'; pid = 66; startedAt = '2026-09-30T04:00:00Z' })
+  $o11a = Run-Check -Apply
+  Assert-True ((Calls) -contains 'claude respawn job-A') "O11a: a foreign-root row does not stand in for the rostered job (calls: $((Calls) -join '; '))"
+  # (b) the roster jobId is not listed; the only running same-name row is foreign: no row (ic-vanished), not job-F.
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-gone"}]}'
+  Set-ForeignFixture
+  Set-Agents @(@{ id = 'job-F'; name = 'ic-1001'; pid = 66; startedAt = '2026-09-30T04:00:00Z' })
+  $o11b = Run-Check -Apply
+  Assert-True ((Kinds-For $o11b 'ic-1001') -contains 'ic-vanished') "O11b: the foreign row is not the fallback; ic-vanished (kinds: $((Kinds-For $o11b 'ic-1001') -join ','))"
+  Remove-Item "$foreignRoot\state\roster.json" -Force -ErrorAction SilentlyContinue
+  Write-Output 'sentinel-orphan-late-session O11 passed'
+
   Write-Output 'sentinel-orphan-late-session tests passed'
 } finally {
   $env:PATH = $oldPath

@@ -86,9 +86,19 @@ exit 0
   }
   # A release needs the record stranded on the PREVIOUS tick too: run the arming tick (asserting it released nothing and
   # says so) and return the second tick's report.
+  # Move the remembered first/last sighting back in time (the tick cadence is 15 min; a test cannot wait).
+  function Age-Seen { param([double]$Minutes = 15)
+    $seen = Get-Content "$testRoot\state\sentinel\stranded-seen.json" -Raw | ConvertFrom-Json
+    foreach ($prop in $seen.PSObject.Properties) {
+      $prop.Value.firstSeen = (Get-Date).ToUniversalTime().AddMinutes(-$Minutes).ToString('o')
+      $prop.Value.lastSeen = (Get-Date).ToUniversalTime().AddMinutes(-$Minutes).ToString('o')
+    }
+    Write-Utf8 "$testRoot\state\sentinel\stranded-seen.json" ($seen | ConvertTo-Json -Depth 4)
+  }
   function Run-Armed { param([string]$Id = 'nidus:issue-7')
     $first = Run-Check -Apply
     Assert-True (@($first.strandedReleased).Count -eq 0 -and (Is-Reserved $Id)) 'the arming tick must not release'
+    Age-Seen 15
     Run-Check -Apply
   }
   function Stranded-For { param($Report, [string]$Id) ,@($Report.escalate | Where-Object { $_.name -eq $Id -and $_.kind -eq 'reservation-stranded' }) }
@@ -117,6 +127,7 @@ exit 0
   $e1a = Stranded-For $s1a 'nidus:issue-7'
   Assert-True ($e1a.Count -eq 1 -and "$($e1a[0].detail)" -like '*first sighting*' -and @($s1a.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7')) 'S1: the first sighting pages and releases nothing'
   Assert-True (Test-Path "$testRoot\state\sentinel\stranded-seen.json") 'S1: the first sighting is remembered'
+  Age-Seen 15
   $s1b = Run-Check -Apply
   Assert-True (-not (Is-Reserved 'nidus:issue-7')) 'S1: with -Apply and the flag the reservation is released'
   $mk = (Manifest-Path 'nidus' 7) + '.invalidated.json'
@@ -261,6 +272,7 @@ exit 0
   New-Stranded
   Set-Flag
   $null = Run-Check -Apply
+  Age-Seen 15
   Write-Utf8 "$testRoot\mock-bin\late-job-intent.txt" ('Read the assignment manifest at ' + (Manifest-Path 'nidus' 7) + ' and the GitHub issue body.')
   Remove-Item "$testRoot\mock-bin\agents-count.txt" -Force -ErrorAction SilentlyContinue
   $s11 = Run-Check -Apply
@@ -268,6 +280,23 @@ exit 0
   Assert-True (@($s11.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7') -and -not (Test-Path ((Manifest-Path 'nidus' 7) + '.invalidated.json'))) 'S11: nothing released when a job appears before the release'
   Assert-True ($e11.Count -eq 1 -and "$($e11[0].detail)" -like '*release cancelled*') "S11: the page says the release was cancelled (got: $($e11 | ConvertTo-Json -Compress))"
   Write-Output 'sentinel-stranded-reservation S11 passed'
+
+  # ---- S12 (#261 re-QA): two -Apply runs a minute apart cannot arm a release; a prior sighting 15 min old does; and a
+  # read-only run leaves no remembered sighting (so a hand read-only run cannot arm anything).
+  New-Stranded
+  Set-Flag
+  $null = Run-Check
+  Assert-True (-not (Test-Path "$testRoot\state\sentinel\stranded-seen.json")) 'S12: a read-only run writes no stranded-seen.json'
+  $null = Run-Check -Apply
+  $first12 = (Get-Content "$testRoot\state\sentinel\stranded-seen.json" -Raw | ConvertFrom-Json).'nidus:issue-7'.firstSeen
+  Age-Seen 1
+  $s12 = Run-Check -Apply
+  $e12 = Stranded-For $s12 'nidus:issue-7'
+  Assert-True (@($s12.strandedReleased).Count -eq 0 -and (Is-Reserved 'nidus:issue-7') -and $e12.Count -eq 1 -and "$($e12[0].detail)" -like '*first sighting*') 'S12: a prior sighting one minute old does not arm the release'
+  Age-Seen 15
+  $s12b = Run-Check -Apply
+  Assert-True (@($s12b.strandedReleased).Count -eq 1 -and -not (Is-Reserved 'nidus:issue-7')) 'S12: with the prior sighting 15 min old the release goes ahead'
+  Write-Output 'sentinel-stranded-reservation S12 passed'
 
   Write-Output 'sentinel-stranded-reservation: all cases passed'
 } finally {

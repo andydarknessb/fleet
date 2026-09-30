@@ -600,6 +600,13 @@ function Invoke-ManifestRelease {
   $recordManifestId = ''
   if ($record.PSObject.Properties['assignment'] -and $record.assignment -and $record.assignment.PSObject.Properties['manifestId']) { $recordManifestId = "$($record.assignment.manifestId)" }
   if ($recordManifestId -and $recordManifestId -ne "$($mf.id)") { $result.code = 'MANIFEST_MISMATCH'; $result.detail = "Work record '$WorkRecordId' is now reserved under manifest $recordManifestId, not $($mf.id)"; return $result }
+  # No assignment.manifestId on the record (reserved without the assignment block): fall back to the record's
+  # manifestPath against this manifest's path, resolved and case-insensitive.
+  if (-not $recordManifestId -and $record.PSObject.Properties['manifestPath'] -and "$($record.manifestPath)") {
+    $samePath = $false
+    try { $samePath = [IO.Path]::GetFullPath("$($record.manifestPath)").Equals([IO.Path]::GetFullPath($Manifest), [StringComparison]::OrdinalIgnoreCase) } catch {}
+    if (-not $samePath) { $result.code = 'MANIFEST_MISMATCH'; $result.detail = "Work record '$WorkRecordId' is reserved under manifest file $($record.manifestPath), not $Manifest"; return $result }
+  }
   $node = $null
   try { $node = Get-NodeExe } catch { $result.code = 'NODE_MISSING'; $result.detail = "$($_.Exception.Message)"; return $result }
   $run = Invoke-BoundedExe -FilePath $node -ArgumentList @("$FleetHome\bin\work-state.js", 'release', '--root', $FleetHome, '--id', $WorkRecordId, '--expected-revision', "$($record.revision)", '--idempotency-key', "assignment-invalidated:$($mf.id)", '--evidence', $Reason) -TimeoutSec 15 -Name "work-state release $WorkRecordId"
