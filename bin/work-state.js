@@ -80,6 +80,7 @@ function paths(root) {
     active: path.join(base, 'state', 'work', 'active.json'),
     pending: path.join(base, 'state', 'work', 'pending'),
     lock: path.join(base, 'state', 'work', '.lock'),
+    breakLock: path.join(base, 'state', 'work', '.lock.break'),
     events: path.join(base, 'state', 'events'),
     archive: path.join(base, 'state', 'archive'),
     releases: path.join(base, 'state', 'releases'),
@@ -136,19 +137,38 @@ function sleepBriefly() {
   Atomics.wait(new Int32Array(buffer), 0, 0, LOCK_WAIT_MS);
 }
 
-// #235: only remove the lock if it is still the file this holder created; a mis-broken holder must not
-// delete the next holder's lock.
-function releaseLock(p, handle) {
+// #235: only remove a lock file if it is still the file this holder created. Under the breaker mutex a live
+// lock is never moved or removed by anyone else, so the stat-then-rm gap here has no actor.
+function releaseLock(file, handle) {
   let mine = false;
-  try { mine = fs.fstatSync(handle, { bigint: true }).ino === fs.statSync(p.lock, { bigint: true }).ino; } catch {}
+  try { mine = fs.fstatSync(handle, { bigint: true }).ino === fs.statSync(file, { bigint: true }).ino; } catch {}
   try { fs.closeSync(handle); } catch {}
-  if (mine) fs.rmSync(p.lock, { force: true, maxRetries: 5, retryDelay: 10 });
+  if (mine) fs.rmSync(file, { force: true, maxRetries: 5, retryDelay: 10 });
+}
+
+// A lock (or breaker lock) is breakable when it is older than LOCK_STALE_MS and its owner is gone.
+function breakable(file) {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    if (Date.now() - Number(stat.mtimeMs) <= LOCK_STALE_MS) return false;
+    // #234: an empty or partial lock file has no owner to find; treat it as ownerless.
+    let owner = {};
+    // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
+    try { owner = readJson(file, {}) || {}; } catch (readError) { if (!(readError instanceof SyntaxError)) throw readError; }
+    let alive = true;
+    try { process.kill(Number(owner.pid), 0); } catch { alive = false; }
+    return !owner.pid || !alive;
+  } catch (error) {
+    if (['ENOENT', 'EPERM', 'EBUSY'].includes(error.code)) return false;
+    throw error;
+  }
 }
 
 function withLock(root, callback) {
   const p = ensureLayout(root);
   let handle;
   let transientSince;
+  let breakTransientSince;
   for (;;) {
     try {
       handle = fs.openSync(p.lock, 'wx');
@@ -161,51 +181,52 @@ function withLock(root, callback) {
       } else {
         transientSince = undefined;
       }
+      if (!breakable(p.lock)) {
+        breakTransientSince = undefined;
+        sleepBriefly();
+        continue;
+      }
+      // #235: judging a lock stale and removing it were separate steps, and Windows lets rm take a lock another
+      // process holds open, so two breakers could both remove and both enter. Removal now happens only while
+      // holding the breaker mutex, after a fresh re-judgement. Plain waiters never remove anything.
+      let breakHandle;
       try {
-        const stat = fs.statSync(p.lock, { bigint: true });
-        if (Date.now() - Number(stat.mtimeMs) > LOCK_STALE_MS) {
-          // #234: an empty or partial lock file has no owner to find; treat it as ownerless.
-          let owner = {};
-          // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
-          try { owner = readJson(p.lock, {}) || {}; } catch (readError) { if (!(readError instanceof SyntaxError)) throw readError; }
-          let alive = true;
-          try { process.kill(Number(owner.pid), 0); } catch { alive = false; }
-          if (!owner.pid || !alive) {
-            // #235: check-then-remove was two steps and Windows lets rm/rename take an open lock, so two
-            // breakers could both enter. Move the lock aside, then confirm we moved the stale file we judged.
-            const tombstone = `${p.lock}.${process.pid}.${crypto.randomUUID()}.tombstone`;
-            try {
-              fs.renameSync(p.lock, tombstone);
-            } catch (renameError) {
-              if (renameError.code === 'ENOENT') continue;
-              if (!TRANSIENT_FS_CODES.has(renameError.code)) throw renameError;
-              transientSince ??= Date.now();
-              if (Date.now() - transientSince > LOCK_TRANSIENT_MAX_MS) throw renameError;
-              sleepBriefly();
-              continue;
+        breakHandle = fs.openSync(p.breakLock, 'wx');
+      } catch (breakError) {
+        if (breakError.code === 'EEXIST') {
+          // Another breaker is at work; a breaker that died leaves a stale mutex behind.
+          if (breakable(p.breakLock)) {
+            try { fs.rmSync(p.breakLock, { force: true }); } catch (removeError) {
+              if (!['ENOENT', ...TRANSIENT_FS_CODES].includes(removeError.code)) throw removeError;
             }
-            const moved = fs.statSync(tombstone, { bigint: true });
-            const same = moved.ino === stat.ino && moved.mtimeMs === stat.mtimeMs && moved.size === stat.size
-              && Date.now() - Number(moved.mtimeMs) > LOCK_STALE_MS;
-            if (same) {
-              try { fs.rmSync(tombstone, { force: true }); } catch {}
-              continue;
-            }
-            // We moved a fresh lock. Give the name back with link (rename would silently replace a newer lock).
-            try {
-              fs.linkSync(tombstone, p.lock);
-            } catch (linkError) {
-              if (linkError.code === 'EEXIST') {
-                throw new WorkStateError('LOCK_COMPROMISED', `moved a live lock aside but ${p.lock} was retaken; evidence left at ${tombstone}`, { tombstone });
-              }
-              throw linkError;
-            }
-            try { fs.rmSync(tombstone, { force: true }); } catch {}
           }
+        } else if (TRANSIENT_FS_CODES.has(breakError.code)) {
+          breakTransientSince ??= Date.now();
+          if (Date.now() - breakTransientSince > LOCK_TRANSIENT_MAX_MS) throw breakError;
+        } else {
+          throw breakError;
         }
-      } catch (statError) {
-        if (statError instanceof WorkStateError) throw statError;
-        if (!['ENOENT', 'EPERM', 'EBUSY'].includes(statError.code)) throw statError;
+        sleepBriefly();
+        continue;
+      }
+      let removed = false;
+      try {
+        fs.writeFileSync(breakHandle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+        if (breakable(p.lock)) {
+          fs.rmSync(p.lock, { force: true });
+          removed = true;
+        }
+      } catch (removeError) {
+        if (!TRANSIENT_FS_CODES.has(removeError.code)) throw removeError;
+        // A delete-pending lock reports EPERM/EBUSY (#236); forgive it and retry next pass, time bounded.
+        breakTransientSince ??= Date.now();
+        if (Date.now() - breakTransientSince > LOCK_TRANSIENT_MAX_MS) throw removeError;
+      } finally {
+        releaseLock(p.breakLock, breakHandle);
+      }
+      if (removed) {
+        breakTransientSince = undefined;
+        continue;
       }
       sleepBriefly();
       continue;
@@ -213,7 +234,7 @@ function withLock(root, callback) {
     try {
       fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
     } catch (error) {
-      releaseLock(p, handle);
+      releaseLock(p.lock, handle);
       throw error;
     }
     break;
@@ -224,7 +245,7 @@ function withLock(root, callback) {
     archiveExpiredEvents(p, new Date().toISOString());
     return callback(p);
   } finally {
-    releaseLock(p, handle);
+    releaseLock(p.lock, handle);
   }
 }
 

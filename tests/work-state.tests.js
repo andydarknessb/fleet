@@ -544,74 +544,59 @@ test('a stale lock with empty or partial content is broken instead of wedging ev
   }
 });
 
-test('breaking a stale lock forgives a delete-pending move that reports EPERM or EBUSY', () => {
+test('breaking a stale lock forgives a delete-pending removal that reports EPERM', () => {
   const root = rootDir();
   makeRecord(root);
   const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
-  withFsFault('renameSync', (target, probe) => (isLock(target) && probe.failures < 3 ? (probe.failures < 2 ? 'EPERM' : 'EBUSY') : null), (probe) => {
+  withFsFault('rmSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
     assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
-    assert.equal(probe.failures, 3);
+    assert.equal(probe.failures, 2);
   });
   assert.equal(fs.existsSync(lock), false);
 });
 
-test('a stale lock another breaker already moved (ENOENT) does not stop the door', () => {
-  const root = rootDir();
-  makeRecord(root);
-  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
-  withFsFault('renameSync', (target, probe) => (isLock(target) && probe.failures < 1 ? 'ENOENT' : null), (probe) => {
-    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
-    assert.equal(probe.failures, 1);
-  });
-  assert.equal(fs.existsSync(lock), false);
-});
-
-// #235: simulate a breaker that moves aside a lock which was replaced by a fresh holder after the stale check.
-function withFreshLockMovedAside(linkFault, body) {
-  const rename = fs.renameSync;
-  const link = fs.linkSync;
-  const state = { links: 0, tombstones: [] };
-  let touched = false;
-  fs.renameSync = function stub(from, to) {
-    if (isLock(String(from)) && !touched) {
-      touched = true;
-      const now = new Date();
-      fs.utimesSync(from, now, now);
-      state.tombstones.push(String(to));
-    }
-    return rename.call(this, from, to);
-  };
-  fs.linkSync = function stub(from, to) {
-    state.links += 1;
-    if (linkFault) throw Object.assign(new Error('EEXIST: simulated'), { code: 'EEXIST' });
-    const result = link.call(this, from, to);
-    const old = new Date(Date.now() - 10 * 60 * 1000);
-    fs.utimesSync(to, old, old);
-    return result;
-  };
-  try { return body(state); } finally { fs.renameSync = rename; fs.linkSync = link; }
+function breakMutex(root, content, ageMs) {
+  const file = path.join(root, 'state', 'work', '.lock.break');
+  fs.writeFileSync(file, content);
+  const when = new Date(Date.now() - ageMs);
+  fs.utimesSync(file, when, when);
+  return file;
 }
 
-test('a breaker that moved a fresh lock aside links the name back and carries on', () => {
+test('#235: a stale breaker mutex left by a dead breaker is removed and the door completes', () => {
+  for (const content of ['', JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' })]) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const mutex = breakMutex(root, content, 10 * 60 * 1000);
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(fs.existsSync(lock), false);
+    assert.equal(fs.existsSync(mutex), false);
+  }
+});
+
+test('#235: a fresh breaker mutex is waited on until it disappears', () => {
   const root = rootDir();
   makeRecord(root);
   const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
-  withFreshLockMovedAside(false, (state) => {
+  const mutex = breakMutex(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 0);
+  withFsFault('openSync', () => null, (probe) => {
+    probe.onWait = () => { if (probe.waits === 5) fs.rmSync(mutex); return 'timed-out'; };
     assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
-    assert.equal(state.links, 1);
-    assert.equal(fs.existsSync(state.tombstones[0]), false);
+    assert.ok(probe.waits >= 5, `waits: ${probe.waits}`);
   });
   assert.equal(fs.existsSync(lock), false);
 });
 
-test('a breaker that cannot give a fresh lock its name back throws LOCK_COMPROMISED and keeps the evidence', () => {
+test('#235: a break removal that keeps reporting EPERM throws after about five seconds', () => {
   const root = rootDir();
   makeRecord(root);
   staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
-  withFreshLockMovedAside(true, (state) => {
-    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'LOCK_COMPROMISED');
-    assert.equal(fs.existsSync(state.tombstones[0]), true);
+  withFsFault('rmSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
   });
+  assert.equal(fs.existsSync(path.join(root, 'state', 'work', '.lock.break')), false);
 });
 
 test('breaking a stale lock forgives a lock that reads as EPERM', () => {
