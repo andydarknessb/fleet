@@ -2289,6 +2289,104 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Set-AgentsRows $noSentinelRows
   $null = Run-Watchdog
 
+  # ===== fleet #274: sync-unattested pages at normal only after pages.minAgeMinutes of it standing =====
+  # ===== (carried forward with deliveredAt null, no Send-FleetPage, no pages.jsonl row until then); =====
+  # ===== sync-blocked pages at high at once; a bad minAgeMinutes value is a config-invalid page. =====
+  $key274 = 'escalation:pl-test:sync-unattested'
+  $pushLog274 = Join-Path $testRoot 'pushover-requests-274.log'
+  [IO.File]::WriteAllText($pushLog274, '')
+  $pushMock274 = Start-MockPushover -LogPath $pushLog274 -Count 4
+  $oldPushoverUrl274 = $env:FLEET_PUSHOVER_URL
+  $env:FLEET_PUSHOVER_URL = $pushMock274.Prefix
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\state\pages") | Out-Null
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-274","user":"usr-274"}'
+  function Set-ReleaseBranch274 { param([string]$Branch)
+    (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName releaseBranch -NotePropertyValue $Branch -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
+  }
+  function Set-SyncStub274 { param([string]$Kind, [string]$Reason)
+    Write-Utf8 "$testRoot\bin\sync-integration.ps1" ('param([string]$Tenant,[switch]$Apply)' + "`r`n" + 'Write-Output (@{ synced = $false; escalate = $true; kind = "' + $Kind + '"; reason = "' + $Reason + '" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 2' + "`r`n")
+  }
+  function Set-PagedSeen274 { param([string]$Key, [int]$MinutesAgo)
+    $seen = (Get-Date).ToUniversalTime().AddMinutes(-$MinutesAgo).ToString('o')
+    $entry = [ordered]@{ firstSeen = $seen; lastSeen = $seen; detail = 'seeded'; deliveredAt = $null; attempts = 0; lastAttemptAt = $null; lastError = $null; gaveUpAt = $null; url = $null }
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ((@{ $Key = $entry } | ConvertTo-Json -Depth 5))
+  }
+  function Get-PagesLineCount274 { $f = "$testRoot\state\pages\pages.jsonl"; if (Test-Path $f) { @(Get-Content $f | Where-Object { $_ }).Count } else { 0 } }
+  try {
+    Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+    Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+    Write-Utf8 "$testRoot\state\flags\sentinel-off" 'fleet #274'
+    foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
+    Set-AgentsRows $noSentinelRows
+    Remove-Item "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\banner.txt", "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"minAgeMinutes":{"sync-unattested":60}}}'
+    Set-ReleaseBranch274 'release'
+    Set-SyncStub274 'sync-unattested' 'integration tip abc carries no fleet-review status; attest it: node bin/review-policy.js attest --tenant test --pr 7 --head abc'
+
+    # G1: first seen 10 minutes ago, inside the 60-minute grace: the condition stands, nothing is
+    # sent, no pages.jsonl row is written, and the entry stays undelivered with its firstSeen kept.
+    Set-PagedSeen274 $key274 10
+    $seen10 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw | ConvertFrom-Json).$key274.firstSeen
+    $pagesBefore = Get-PagesLineCount274
+    $g1 = Run-WatchdogCaptured
+    Assert-True (-not $g1.crashed) "the grace tick must not crash (exit $($g1.exitCode): $($g1.error))"
+    Assert-True (@($g1.line.conditions) -contains $key274) 'the sync-unattested condition must stand while inside the grace'
+    Assert-True (@($g1.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0) "nothing is sent inside the grace (got $($g1.line.newlyPaged | ConvertTo-Json -Compress))"
+    Assert-True (@(Get-PostedBodies $pushLog274).Count -eq 0) 'no Pushover POST inside the grace'
+    Assert-True ((Get-PagesLineCount274) -eq $pagesBefore) 'no pages.jsonl row inside the grace'
+    $pg1 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw | ConvertFrom-Json).$key274
+    Assert-True ($null -ne $pg1 -and $null -eq $pg1.deliveredAt -and "$($pg1.firstSeen)" -eq "$seen10" -and [int]$pg1.attempts -eq 0) 'the condition is carried forward undelivered with its firstSeen kept and no attempt counted'
+
+    # G2: first seen 61 minutes ago: it pages once, at normal (Pushover 0).
+    Set-PagedSeen274 $key274 61
+    $g2 = Run-WatchdogCaptured
+    Assert-True (-not $g2.crashed) "the post-grace tick must not crash (exit $($g2.exitCode): $($g2.error))"
+    $g2Entry = @($g2.line.newlyPaged | Where-Object { $_.key -eq $key274 })[0]
+    Assert-True ($null -ne $g2Entry -and $g2Entry.priority -eq 'normal' -and $g2Entry.page.pushover -eq $true) "past the grace it pages once at normal (got $($g2Entry | ConvertTo-Json -Compress))"
+    $g2Posts = @(Get-PostedBodies $pushLog274 | ForEach-Object { ConvertFrom-FormBody $_ })
+    Assert-True ($g2Posts.Count -eq 1 -and $g2Posts[0].priority -eq '0' -and $g2Posts[0].message -like '*review-policy.js*attest*') "exactly one Pushover POST at priority 0 carrying the attest command (got $($g2Posts.Count))"
+    # G3: the next tick sends nothing.
+    $g3 = Run-WatchdogCaptured
+    Assert-True (-not $g3.crashed -and @($g3.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0 -and @(Get-PostedBodies $pushLog274).Count -eq 1) 'a second tick past the grace sends nothing more'
+
+    # G4: a bad minAgeMinutes value is reported (config-invalid, once, normal) and the built-in grace
+    # applies instead: a condition first seen 10 minutes ago still waits.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"minAgeMinutes":{"sync-unattested":"soon"}}}'
+    Set-PagedSeen274 $key274 10
+    $g4 = Run-WatchdogCaptured
+    Assert-True (-not $g4.crashed) "a bad minAgeMinutes must not crash the tick (exit $($g4.exitCode): $($g4.error))"
+    Assert-True (@($g4.line.invalidPagePriority | Where-Object { $_.key -eq 'pages.minAgeMinutes.sync-unattested' -and $_.value -eq 'soon' }).Count -eq 1) "the tick line must name the invalid minAgeMinutes key and value (got $($g4.line.invalidPagePriority | ConvertTo-Json -Compress))"
+    Assert-True (@($g4.line.conditions) -contains 'config-invalid:pages.minAgeMinutes.sync-unattested') 'the bad value must stand as a config-invalid condition'
+    Assert-True (@($g4.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0) 'a bad minAgeMinutes falls back to the built-in grace, not to no grace'
+    Assert-True (@($g4.line.newlyPaged | Where-Object { $_.key -eq 'config-invalid:pages.minAgeMinutes.sync-unattested' -and $_.priority -eq 'normal' }).Count -eq 1) 'the config-invalid page goes once at normal'
+
+    # G5: sync-blocked pages at high at once (no grace), and a bare fixture (no config) still knows it.
+    Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Set-SyncStub274 'sync-blocked' 'integration tip abc cannot be fast-forwarded into main: required check(s) failed on it: guards'
+    $g5 = Run-WatchdogCaptured
+    $g5Entry = @($g5.line.newlyPaged | Where-Object { $_.key -eq 'escalation:pl-test:sync-blocked' })[0]
+    Assert-True ($null -ne $g5Entry -and $g5Entry.priority -eq 'high' -and $g5Entry.page.pushover -eq $true) "sync-blocked pages at high immediately (got $($g5Entry | ConvertTo-Json -Compress))"
+
+    # G6: a bare fixture's built-in default map and page kinds carry sync-unattested: seen 61 min ago
+    # with no config at all it pages at normal; seen 10 min ago it waits.
+    Set-SyncStub274 'sync-unattested' 'tip abc has no fleet-review status'
+    Set-PagedSeen274 $key274 10
+    $g6 = Run-WatchdogCaptured
+    Assert-True (@($g6.line.conditions) -contains $key274 -and @($g6.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0) 'the bare default waits out the 60-minute grace'
+  } finally {
+    Stop-MockPushover232 $pushMock274
+    if ($oldPushoverUrl274) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl274 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Set-ReleaseBranch274 'master'
+  Remove-Item "$testRoot\bin\sync-integration.ps1" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  $null = Run-Watchdog
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath

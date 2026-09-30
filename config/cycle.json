@@ -83,6 +83,8 @@
       "merge-review-wake": "high",
       "branch-diverged": "high",
       "sync-refused": "high",
+      "sync-unattested": "normal",
+      "sync-blocked": "high",
       "watcher-stale": "high",
       "state-escalated": "normal",
       "state-hold": "normal",
@@ -93,6 +95,7 @@
       "reservation-stranded": "normal"
     },
     "defaultPriority": "normal",
+    "minAgeMinutes": { "sync-unattested": 60 },
     "fleetDeadRepeatMinutes": 120,
     "fleetDeadRepeatPriority": "emergency",
     "maxAttempts": 3,
@@ -103,7 +106,7 @@
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded"]
   },
   "assignment": {
     "parityEvaluations": 20,

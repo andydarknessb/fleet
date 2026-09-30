@@ -72,4 +72,12 @@ Assert-Count @(Get-PagesPriorityFindings $shippedPages) 0 'the shipped config/cy
 $strPri = @(Get-PagesPriorityFindings ([pscustomobject]@{ priority = 'high' }))
 Assert-True ($strPri.Count -eq 1 -and $strPri[0].Key -eq 'pages.priority' -and $strPri[0].Value -eq 'high') 'a pages.priority that is not a map is reported as pages.priority itself'
 
+# fleet #274: pages.minAgeMinutes.<kind> must be a number of minutes, 0 or more.
+Assert-Count @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = 60; 'x' = 0 } })) 0 'a non-negative number of minutes is not a finding'
+$badAge = @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = 'soon'; 'sync-blocked' = -5 } }))
+Assert-Count $badAge 2 'a string and a negative number are each a finding'
+Assert-True (@($badAge | Where-Object { $_.Key -eq 'pages.minAgeMinutes.sync-unattested' -and $_.Value -eq 'soon' }).Count -eq 1) 'an invalid minAgeMinutes value is reported by dotted key and value'
+$strAge = @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = 60 }))
+Assert-True ($strAge.Count -eq 1 -and $strAge[0].Key -eq 'pages.minAgeMinutes') 'a pages.minAgeMinutes that is not a map is reported as itself'
+
 Write-Output 'check-policy tests passed'
