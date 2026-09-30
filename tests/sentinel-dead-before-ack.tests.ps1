@@ -298,6 +298,22 @@ exit 0
   Assert-True ((Calls) -contains 'claude respawn job-914') "D14: the IC own dead row was picked for the expected loop, not the orphan (calls: $((Calls) -join '; '))"
   Write-Output 'sentinel-dead-before-ack D14 passed'
 
+  # ---- D14b: the fallback path. Get-ExpectedRow judges a rostered IC by the daemon row with its jobId, and falls back
+  # to the newest row by name when there is none. The IC own job is gone (no row, no job state); a same-named orphan
+  # (job-918b, invalidated manifest) is running. Without the orphan-id exclusion the orphan would stand in for the IC
+  # row and hide the dead one: the IC row must still read dead before ack and be retired.
+  New-Case 918
+  Set-Flag
+  Write-Utf8 (Manifest-Path 9180) '{"id":"assignment-test-9180","parent":"pl-test"}'
+  Write-Utf8 ((Manifest-Path 9180) + '.invalidated.json') (ConvertTo-Json @{ schemaVersion = 1; manifestId = 'assignment-test-9180'; invalidatedAt = Iso-Ago 100; reason = 'no session appeared within 15s' } -Compress)
+  Write-Job 'job-918b' 'ic-918' 'working' 1 (([string][char]0xFEFF) + 'Read the assignment manifest at ' + (Manifest-Path 9180) + ' and the GitHub issue body.')
+  Set-Agents @(@{ id = 'job-918b'; name = 'ic-918'; state = 'working'; pid = 99; startedAt = '2026-09-30T09:00:00Z' })
+  $d14b = Run-Check -Apply
+  $k14b = Kinds-For $d14b 'ic-918'
+  Assert-True ($k14b -contains 'orphan-late-session') 'D14b: the same-named job is classified an orphan'
+  Assert-True ((Roster-Status 'ic-918') -eq 'retired' -and @($d14b.retired) -contains 'ic-918' -and $k14b -contains 'ic-dead-before-ack') "D14b: the IC dead row is retired, not masked by the orphan (kinds: $($k14b -join ','))"
+  Write-Output 'sentinel-dead-before-ack D14b passed'
+
   # ---- D15 (#253 coordinator item): recover.ps1 must not bring back a row whose manifest was invalidated. The
   # sentinel retires the row and then invalidates the manifest; a recovery pass that read the roster before the
   # retire would respawn or relaunch it over a released record. Real recover.ps1; launch.ps1 is deliberately not
