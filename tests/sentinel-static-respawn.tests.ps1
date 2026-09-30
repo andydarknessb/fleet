@@ -24,7 +24,8 @@ function Set-Job { param([string]$Id, [string[]]$Flags)
 }
 function Set-LiveRoster { param([string]$Json) Write-Utf8 "$testRoot\state\roster.json" $Json }
 function Get-Calls { if (Test-Path "$testRoot\calls.txt") { @(Get-Content "$testRoot\calls.txt" | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) } else { @() } }
-function Reset-Calls { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt" -ErrorAction SilentlyContinue }
+function Reset-CallsOnly { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt" -ErrorAction SilentlyContinue }
+function Reset-Calls { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt", "$testRoot\state\sentinel\respawn-streak.json" -ErrorAction SilentlyContinue }   # fleet #257: the respawn streak is per case, not per suite
 function Run-Check { param([switch]$Apply) $out = if ($Apply) { & "$testRoot\bin\sentinel-check.ps1" -Apply | Out-String } else { & "$testRoot\bin\sentinel-check.ps1" | Out-String }; $out | ConvertFrom-Json }
 
 try {
@@ -66,7 +67,8 @@ param([string]$FromRoster, [string]$Model, [switch]$Force)
 $modelMark = if ($Model) { "|$Model" } else { '' }
 [IO.File]::AppendAllText('TESTROOT\calls.txt', "launch $FromRoster$modelMark`r`n")
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"workspace not trusted"}'; exit 7 }
-Write-Output ('{"launched":true,"name":"' + $FromRoster + '","jobId":"job-new","sessionId":"sess-new"}')
+$launchedId = if ($env:MOCK_LAUNCH_JOBID) { $env:MOCK_LAUNCH_JOBID } else { 'job-new' }
+Write-Output ('{"launched":true,"name":"' + $FromRoster + '","jobId":"' + $launchedId + '","sessionId":"sess-new"}')
 exit 0
 '@
   Write-Utf8 "$testRoot\bin\launch.ps1" ($mockLaunch.Replace('TESTROOT', $testRoot))
@@ -187,6 +189,33 @@ exit 0
   Reset-Calls
   $s11b = Run-Check -Apply
   Assert-True (@(Get-Calls).Count -eq 0 -and @($s11b.respawnDeferred | Where-Object { "$($_.reason)" -match 'trust' }).Count -eq 1) "S11: an untrusted workspace defers the relaunch before any stop (calls: $(@(Get-Calls) -join '; '))"
+
+
+  # B9 (fleet #257 Gap B): every relaunch starts a NEW job, so the streak follows the id the launch returned. Three relaunches
+  # through the door, each seen next tick under the id the last one created, are counted; the fourth is held, nothing stopped.
+  Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":' + ("$testRoot\repo" | ConvertTo-Json) + ',"prompt":"lead"}]}')
+  Set-LiveRoster $activeRow
+  Reset-Calls
+  $streakFile = "$testRoot\state\sentinel\respawn-streak.json"
+  [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))   # S11b left the workspace untrusted
+  Remove-Item Env:MOCK_ROW_NAME -ErrorAction SilentlyContinue
+  $env:MOCK_ROW_ID = 'job-a0'
+  $lastB9 = $null
+  foreach ($i in 1..3) {
+    $env:MOCK_LAUNCH_JOBID = "job-a$i"
+    $lastB9 = Run-Check -Apply
+    Assert-True (@($lastB9.respawned | Where-Object { $_.name -eq 'pl-test' -and "$($_.via)" -eq 'launch' -and "$($_.jobId)" -eq "job-a$i" }).Count -eq 1) "B9: relaunch $i goes through the door and reports job-a$i (got $($lastB9.respawned | ConvertTo-Json -Compress))"
+    $env:MOCK_ROW_ID = "job-a$i"
+  }
+  $streak9 = Get-Content $streakFile -Raw | ConvertFrom-Json
+  Assert-True ("$($streak9.'pl-test'.jobId)" -eq 'job-a3' -and @($streak9.'pl-test'.attempts).Count -eq 3) "B9: the entry follows the newest launched job id with three attempts (got $(Get-Content $streakFile -Raw))"
+  Reset-CallsOnly
+  $env:MOCK_LAUNCH_JOBID = 'job-a4'
+  $b9held = Run-Check -Apply
+  Assert-True (@($b9held.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0 -and @($b9held.respawnHeld | Where-Object { $_.name -eq 'pl-test' -and $_.jobId -eq 'job-a3' -and [int]$_.attempts -eq 3 }).Count -eq 1) "B9: the fourth relaunch is held (got $($b9held | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True (@($b9held.escalate | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawn-loop' }).Count -eq 1) 'B9: and escalated as respawn-loop'
+  Assert-True (@(Get-Calls).Count -eq 0) "B9: a held relaunch stops and launches nothing (calls: $(@(Get-Calls) -join '; '))"
+  Remove-Item Env:MOCK_LAUNCH_JOBID
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) static-respawn assertion(s) failed" }
   Write-Output 'sentinel static respawn tests passed'

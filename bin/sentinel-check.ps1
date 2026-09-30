@@ -5,7 +5,9 @@
   Also applied, only under state/flags/ic-cleanup-live (fleet #252): stop + rm an orphan late IC session (its manifest was invalidated, no roster row claims it).
   Same flag (fleet #253): retire an IC roster row that died before ack (no heartbeat, no ack, job gone) and release its reservation.
   Same flag (fleet #256 AC2): release an assigned reservation stranded with no roster row, no job and no marker.
-  Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack / reservation-stranded). The Sentinel session acts on those.
+  Bounded (fleet #257 Gap B): a verified respawn (or launched relaunch) is counted in state/sentinel/respawn-streak.json; the (watchdog.respawnLoopCap+1)th for one job inside
+  watchdog.respawnLoopWindowHours, with no heartbeat in between, is held (respawnHeld) and escalated as respawn-loop.
+  Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack / reservation-stranded / respawn-loop). The Sentinel session acts on those.
 #>
 param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel', [string]$HealRespawn = '')
 . "$PSScriptRoot\_common.ps1"
@@ -21,7 +23,7 @@ function Write-AppliedLedger {
     $okCount = 0; if ($Report.ok) { $okCount = @($Report.ok).Count }
     $line = [ordered]@{
       at = $Report.at; actor = $Actor; applied = $true
-      respawned = @($Report.respawned); respawnFailed = @($Report.respawnFailed); respawnDeferred = @($Report.respawnDeferred); launchNeeded = @($Report.launchNeeded); escalate = @($Report.escalate)
+      respawned = @($Report.respawned); respawnFailed = @($Report.respawnFailed); respawnDeferred = @($Report.respawnDeferred); respawnHeld = @($Report.respawnHeld); launchNeeded = @($Report.launchNeeded); escalate = @($Report.escalate)
       retired = @($Report.retired); stopped = @($Report.stopped); stopFailed = @($Report.stopFailed); deadRetired = @($Report.deadRetired); strandedReleased = @($Report.strandedReleased); strandedReleaseFailed = @($Report.strandedReleaseFailed); worktrees = @($Report.worktrees); sync = @($Report.sync); pause = $Report.pause; okCount = $okCount
     }
     if ($Report.daemonReadError) { $line.daemonReadError = $Report.daemonReadError }
@@ -37,7 +39,7 @@ $now = (Get-Date).ToUniversalTime()
 if ($Apply -and $Actor -eq 'sentinel' -and (Test-SentinelOff)) {
   $refused = [ordered]@{
     at = (Now-Iso); applied = $false; refused = 'state/flags/sentinel-off stands: the rostered Sentinel is retired and the watchdog task supervises; nothing applied'
-    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
+    respawned = @(); respawnFailed = @(); respawnDeferred = @(); respawnHeld = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
   }
   [pscustomobject]$refused | ConvertTo-Json -Depth 6
   exit 0
@@ -50,7 +52,7 @@ $daemon = $null
 try { $daemon = Get-DaemonSessions -All -Strict } catch {
   $errorReport = [ordered]@{
     at = (Now-Iso); applied = [bool]$Apply; daemonReadError = "$($_.Exception.Message)"
-    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null
+    respawned = @(); respawnFailed = @(); respawnDeferred = @(); respawnHeld = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null
     ok = @([pscustomobject]@{ name = 'daemon-read'; detail = 'session list unreadable; proposing nothing this tick (a bad read must not look like an empty fleet)' })
   }
   if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
@@ -59,7 +61,7 @@ try { $daemon = Get-DaemonSessions -All -Strict } catch {
   [pscustomobject]$errorReport | ConvertTo-Json -Depth 6
   exit 0
 }
-$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
+$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); respawnHeld = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
 
 # fleet #252: one strict read of state/roster.json for the orphan pass. Get-LiveRoster above folds an
 # unparseable file into an empty roster, and "no row claims this job" off an empty roster would let
@@ -86,13 +88,44 @@ function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name -a
 # (default 6) is how long an assigned reservation may sit with nothing behind it; deadBeforeAckMaxPerTick (default 2)
 # caps the dead-before-ack retires one tick performs, the rest roll to the next tick.
 $script:DeadBeforeAckMinutes = 60; $script:DeadBeforeAckMaxPerTick = 2; $script:JobStaleMinutes = 45; $script:StrandedReservationHours = 6
+# fleet #257 Gap B: respawnLoopCap (default 3) verified respawns of one job inside respawnLoopWindowHours (default 24)
+# are allowed; the next is held (Test-RespawnStreakHold).
+$script:RespawnLoopCap = 3; $script:RespawnLoopWindowHours = 24
 try {
   $wdCfg = (Read-Json "$FleetHome\config\cycle.json").watchdog
   if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMinutes']) { $script:DeadBeforeAckMinutes = [double]$wdCfg.deadBeforeAckMinutes }
   if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMaxPerTick']) { $script:DeadBeforeAckMaxPerTick = [int]$wdCfg.deadBeforeAckMaxPerTick }
   if ($wdCfg -and $wdCfg.PSObject.Properties['staleMinutes']) { $script:JobStaleMinutes = [double]$wdCfg.staleMinutes }
   if ($wdCfg -and $wdCfg.PSObject.Properties['strandedReservationHours']) { $script:StrandedReservationHours = [double]$wdCfg.strandedReservationHours }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['respawnLoopCap']) { $script:RespawnLoopCap = [int]$wdCfg.respawnLoopCap }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['respawnLoopWindowHours']) { $script:RespawnLoopWindowHours = [double]$wdCfg.respawnLoopWindowHours }
 } catch {}
+# fleet #257 Gap B: state/sentinel/respawn-streak.json, { "<name>": { "jobId", "attempts": [iso...], "lastReason" } }, one strict
+# read per tick. Corrupt is unreadable and never reset: Test-RespawnStreakHold then defers every respawn and relaunch.
+$script:RespawnStreakPath = Join-Path $FleetHome 'state\sentinel\respawn-streak.json'
+$script:RespawnStreak = @{}
+$script:RespawnStreakUnreadable = $false
+$script:RespawnStreakError = ''
+$script:RespawnStreakReported = $false
+$script:RespawnStreakTouched = @{}
+if (Test-Path -LiteralPath $script:RespawnStreakPath) {
+  try {
+    $rsRaw = Get-Content -LiteralPath $script:RespawnStreakPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $rsRaw -or $rsRaw -isnot [pscustomobject]) { throw 'not a JSON object' }
+    foreach ($rsProp in $rsRaw.PSObject.Properties) {
+      $rsEntry = $rsProp.Value
+      if ($rsEntry -isnot [pscustomobject] -or -not $rsEntry.PSObject.Properties['jobId'] -or -not $rsEntry.PSObject.Properties['attempts'] -or $rsEntry.attempts -isnot [array]) { throw "entry '$($rsProp.Name)' has no jobId and attempts list" }
+      $rsAttempts = @()
+      foreach ($rsAt in $rsEntry.attempts) {
+        $rsWhen = if ($rsAt -is [datetime]) { $rsAt.ToUniversalTime() } else { ConvertTo-UtcDateTime $rsAt }
+        if ($null -eq $rsWhen) { throw "entry '$($rsProp.Name)' has an unparseable attempt '$rsAt'" }
+        $rsAttempts += $rsWhen.ToString('o')
+      }
+      $rsReason = ''; if ($rsEntry.PSObject.Properties['lastReason']) { $rsReason = "$($rsEntry.lastReason)" }
+      $script:RespawnStreak[$rsProp.Name] = @{ jobId = "$($rsEntry.jobId)"; attempts = @($rsAttempts); lastReason = $rsReason }
+    }
+  } catch { $script:RespawnStreakUnreadable = $true; $script:RespawnStreakError = ("$($_.Exception.Message)" -replace '\s+', ' ').Trim();$script:RespawnStreak = @{} }
+}
 # (Get-ForeignRosterRoot is defined here, above Get-ExpectedRow and the -HealRespawn call site, because the stand-in rules use it.)
 # `claude agents --all` lists every job on the machine, not only this root's. A scratch
 # root (bin/scratch-root.ps1) launches through its own doors under the same fleet names,
@@ -279,8 +312,78 @@ function Get-StaticRespawnRefusal {
   }
   return $null
 }
+# fleet #257 Gap B (live 2026-09-30: pl-nidus respawned 72 times in a day, each one verified by a pid change, none followed by a
+# turn): respawn-failed.json and the retry-storm scan only count failures, and a verified respawn clears the failure count, so
+# nothing bounded a respawn that "worked" and woke nothing. Every verified respawn (Do-Respawn) and launched relaunch
+# (Do-Relaunch) is counted per name in state/sentinel/respawn-streak.json; the (cap+1)th inside the window is held.
+function Get-HeartbeatAt {
+  param($name)
+  try { $hb = Read-Json "$FleetHome\state\heartbeats\$name.json"; if ($hb -and $hb.PSObject.Properties['at']) { return (ConvertTo-UtcDateTime $hb.at) } } catch {}
+  return $null
+}
+function Get-LiveRespawnAttempts {
+  # The entry's attempts that still count: the entry is for this job id, the attempt is inside the window, and no heartbeat
+  # is newer than it (a heartbeat after a respawn proves the respawned session ended a turn, so the loop is over).
+  param([string]$name, [string]$jobId)
+  $e = $script:RespawnStreak[$name]
+  if ($null -eq $e -or "$($e.jobId)" -ne $jobId) { return @() }
+  $windowStart = $now.AddHours(-$script:RespawnLoopWindowHours)
+  $hbAt = Get-HeartbeatAt $name
+  return @($e.attempts | Where-Object { $t = ConvertTo-UtcDateTime $_; $null -ne $t -and $t -ge $windowStart -and ($null -eq $hbAt -or $t -gt $hbAt) } | Sort-Object { ConvertTo-UtcDateTime $_ })
+}
+function Save-RespawnStreak {
+  # Written only by an applying run, pruned by the callers; a hand read-only run never changes the file.
+  if (-not $Apply -or $script:RespawnStreakUnreadable) { return }
+  try {
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $script:RespawnStreakPath)) | Out-Null
+    $out = [ordered]@{}
+    foreach ($k in @($script:RespawnStreak.Keys | Sort-Object)) {
+      $e = $script:RespawnStreak[$k]
+      $out[$k] = [ordered]@{ jobId = "$($e.jobId)"; attempts = @($e.attempts); lastReason = "$($e.lastReason)" }
+    }
+    $tmp = "$($script:RespawnStreakPath).tmp"
+    Write-Json $tmp ([pscustomobject]$out)
+    Move-Item -LiteralPath $tmp -Destination $script:RespawnStreakPath -Force
+  } catch { Write-Warning "respawn-streak write failed: $($_.Exception.Message)" }
+}
+function Add-RespawnStreakAttempt {
+  # Count one verified respawn / launched relaunch. -FromJobId is the job id the running attempts were recorded under (the
+  # row this tick saw); -JobId is the id the next tick will see (the same id for a respawn, the new job for a relaunch).
+  param([string]$name, [string]$FromJobId, [string]$JobId, [string]$reason)
+  $attempts = @(Get-LiveRespawnAttempts $name $FromJobId) + @(Now-Iso)
+  $script:RespawnStreak[$name] = @{ jobId = $JobId; attempts = @($attempts); lastReason = (("$reason" -replace '\s+', ' ').Trim()) }
+  $script:RespawnStreakTouched[$name] = $true
+  Save-RespawnStreak
+}
+function Test-RespawnStreakHold {
+  # $true when this respawn / relaunch must not run. Evaluated in read-only runs too; it writes nothing.
+  param($row, $entry, [string]$reason, [string]$via = '')
+  if ($script:RespawnStreakUnreadable) {
+    $deferred = [ordered]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "state/sentinel/respawn-streak.json unreadable; respawns held until it is fixed or removed: $reason" }
+    if ($via) { $deferred.via = $via }
+    $script:report.respawnDeferred += [pscustomobject]$deferred
+    if (-not $script:RespawnStreakReported) {
+      $script:RespawnStreakReported = $true
+      $script:report.ok += [pscustomobject]@{ name = 'respawn-streak-read'; detail = "state/sentinel/respawn-streak.json unreadable ($($script:RespawnStreakError)); every respawn and relaunch is deferred until it is fixed or removed" }
+      $script:report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'respawn-loop'; detail = "state/sentinel/respawn-streak.json unreadable ($($script:RespawnStreakError)); respawns and relaunches are held until it is fixed or removed (the bound on repeated respawns cannot be checked without it)" }
+    }
+    return $true
+  }
+  $live = @(Get-LiveRespawnAttempts "$($entry.name)" "$($row.id)")
+  if ($live.Count -lt $script:RespawnLoopCap) { return $false }
+  $firstAt = "$($live[0])"; $lastAt = "$($live[$live.Count - 1])"
+  $hbAt = Get-HeartbeatAt "$($entry.name)"
+  $hbText = if ($null -eq $hbAt) { 'never' } else { "last at $($hbAt.ToString('o')), before the first respawn" }
+  $held = [ordered]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; attempts = $live.Count; firstAt = $firstAt; lastAt = $lastAt; reason = $reason }
+  if ($via) { $held.via = $via }
+  $script:report.respawnHeld += [pscustomobject]$held
+  $script:report.escalate += [pscustomobject]@{ name = $row.name; kind = 'respawn-loop'; detail = "job $($row.id) respawned $($live.Count) times since $firstAt (pid changed each time) and no turn completed after any of them (heartbeat: $hbText); respawn held until a heartbeat newer than $lastAt, a new job id, or the window ($($script:RespawnLoopWindowHours) h) passes: check the session (claude agents --all; bin\status.ps1), relaunch it by hand (rotate.ps1 / launch.ps1), or delete the entry in state/sentinel/respawn-streak.json; $reason"; parent = $entry.parent }
+  return $true
+}
 function Do-Relaunch {
   param($row, $entry, $reason)
+  # fleet #257 Gap B: bounded like a respawn. Checked first so a read-only run reports the hold too.
+  if (Test-RespawnStreakHold $row $entry $reason 'launch') { return }
   if (-not $Apply) {
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
     return
@@ -312,7 +415,8 @@ function Do-Relaunch {
   $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
   $launch = ConvertFrom-LastJsonLine $out
   if ($launch -and $launch.launched) {
-    $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = "$($launch.jobId)"; previousJobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
+    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($launch.jobId)" $reason
+    $script:report.respawned +=[pscustomobject]@{ name = $row.name; jobId = "$($launch.jobId)"; previousJobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
   } else {
     $why = if ($launch -and $launch.reason) { "$($launch.reason)" } else { Get-OneLineText $out }
     $script:report.respawnFailed += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "relaunch through launch.ps1 -FromRoster failed ($why): $reason"; via = 'launch' }
@@ -333,6 +437,8 @@ function Do-Respawn {
     $refusal = Get-StaticRespawnRefusal $row $entry
     if ($refusal) { Do-Relaunch $row $entry "$reason; not respawned because $refusal"; return }
   }
+  # fleet #257 Gap B: the (cap+1)th verified respawn of one job with no heartbeat in between is held (read-only runs report it too).
+  if (Test-RespawnStreakHold $row $entry $reason) { return }
   if (-not $Apply) {
     # Shadow: nothing to verify against, since nothing was run.
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
@@ -349,7 +455,8 @@ function Do-Respawn {
   & claude respawn $row.id 2>&1 | Out-Null
   $verifyId = if ($entry.static) { '' } else { "$($row.id)" }
   if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid -JobId $verifyId) {
-    $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
+    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($row.id)" $reason
+    $script:report.respawned +=[pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
   } else {
     # Feeds the existing launch-retry cap exactly as a failed launch would: this
     # session's next daemon row is what the watchdog's retry-storm scan reads, and a
@@ -663,6 +770,27 @@ foreach ($x in $expected) {
     continue
   }
   $report.ok += $x.name
+}
+
+# --- fleet #257 Gap B: clear the respawn streak of a name that has recovered or moved on (applying runs only) ---
+# An entry goes when the name has no active expected row, its current row is a different job than the entry's (relaunched
+# by hand), a heartbeat is newer than its last attempt, or every attempt is outside the window. A name that recorded an
+# attempt this tick is left alone (its Get-ExpectedRow still reads the pre-relaunch snapshot). Written only if changed.
+if ($Apply -and -not $script:RespawnStreakUnreadable -and $script:RespawnStreak.Count -gt 0) {
+  $streakChanged = $false
+  foreach ($streakName in @($script:RespawnStreak.Keys)) {
+    if ($script:RespawnStreakTouched.ContainsKey($streakName)) { continue }
+    $streakEntry = $script:RespawnStreak[$streakName]
+    $streakLive = @()
+    $streakX = @($expected | Where-Object { $_.name -eq $streakName })[0]
+    if ($null -ne $streakX) {
+      $streakRow = Get-ExpectedRow $streakX
+      if ($streakRow -and "$($streakRow.id)" -eq "$($streakEntry.jobId)") { $streakLive = @(Get-LiveRespawnAttempts $streakName "$($streakEntry.jobId)") }
+    }
+    if ($streakLive.Count -eq 0) { $script:RespawnStreak.Remove($streakName); $streakChanged = $true }
+    elseif ($streakLive.Count -ne @($streakEntry.attempts).Count) { $streakEntry.attempts = @($streakLive); $streakChanged = $true }
+  }
+  if ($streakChanged) { Save-RespawnStreak }
 }
 
 # --- strays and cap ---

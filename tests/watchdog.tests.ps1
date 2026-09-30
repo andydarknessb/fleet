@@ -25,6 +25,9 @@ function Set-Heartbeat { param([string]$Name, [double]$AgeMinutes)
 function Set-AgentsRows { param([string]$Json) Write-Utf8 "$testRoot\mock-agents.json" $Json }
 function Run-Watchdog {
   param([switch]$Verify)
+  # fleet #257 Gap B: every tick in this suite starts with no respawn streak (the suite respawns the same wedged job
+  # many times across cases; the cap is not under test here except where a case sets $script:KeepRespawnStreak).
+  if (-not $script:KeepRespawnStreak) { Remove-Item "$testRoot\state\sentinel\respawn-streak.json" -ErrorAction SilentlyContinue }
   $out = ''
   if ($Verify) { $out = & "$testRoot\bin\watchdog.ps1" -NoToast -Verify | Out-String }
   else { $out = & "$testRoot\bin\watchdog.ps1" -NoToast | Out-String }
@@ -399,6 +402,18 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-EscalationFiles '*-supervisor-nidus_issue-7-reservation-stranded.json').Count -eq 1) 'reservation-stranded leaves one escalation file'
   $r10rs2 = Run-Watchdog
   Assert-True (-not (@($r10rs2.conditions) -contains 'escalation:nidus:issue-7:reservation-stranded')) 'the reservation-stranded escalation clears once the check stops raising it'
+  # respawn-loop (#257 Gap B) is a paging kind at HIGH through the hardcoded default map (this fixture has no
+  # config/cycle.json): a session respawned over and over with no turn in between needs a human. The canned check
+  # report also carries respawnHeld, as the real one does.
+  $origCheckRl = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); respawnHeld = @(@{ name = "ic-1003"; jobId = "job-x"; attempts = 3 }); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1003"; kind = "respawn-loop"; detail = "canned"; parent = "pl-test" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
+  try { $r10rl = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckRl }
+  Assert-True (@($r10rl.conditions) -contains 'escalation:ic-1003:respawn-loop') 'respawn-loop must become an escalation condition'
+  Assert-True ((@($r10rl.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1003:respawn-loop' })[0]).priority -eq 'high') 'respawn-loop pages at high priority via the default map'
+  Assert-True (@($r10rl.conditions | Where-Object { "$_" -like 'config-invalid*' }).Count -eq 0) 'the respawn-loop case raises no config-invalid condition'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1003-respawn-loop.json').Count -eq 1) 'respawn-loop leaves one escalation file'
+  $r10rl2 = Run-Watchdog
+  Assert-True (-not (@($r10rl2.conditions) -contains 'escalation:ic-1003:respawn-loop')) 'the respawn-loop escalation clears once the check stops raising it'
 
   # Case 10e: `blocked` is recorded as waiting, never paged, never filed.
   $blockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
@@ -443,6 +458,18 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Set-AgentsRows "[$dispRow,$stoppedPl]"
   $r10g3 = Run-Watchdog
   Assert-True (@($r10g3.notified | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'a respawn after a clean tick is a new event and notifies again'
+  # fleet #257 Gap B, end to end through the applying tick: the ticks above are respawns #1-#3 of this suite's pl-test
+  # (Run-Watchdog resets the respawn streak before every tick, so the bound is not under test elsewhere in this
+  # suite; tests/sentinel-respawn-loop.tests.ps1 owns it). Seed three recent attempts on the same job and keep them.
+  $loopSeed = @(3, 2, 1 | ForEach-Object { (Get-Date).ToUniversalTime().AddMinutes(-$_).ToString('o') })
+  Write-Utf8 "$testRoot\state\sentinel\respawn-streak.json" (([ordered]@{ 'pl-test' = [ordered]@{ jobId = 'job-p'; attempts = @($loopSeed); lastReason = 'seeded' } }) | ConvertTo-Json -Depth 6)
+  Set-Heartbeat 'pl-test' 60
+  $script:KeepRespawnStreak = $true
+  try { $r10gl = Run-Watchdog } finally { $script:KeepRespawnStreak = $false }
+  $loopCheck = Get-Content "$testRoot\state\sentinel\last-check.json" -Raw | ConvertFrom-Json
+  Assert-True (@($loopCheck.respawnHeld | Where-Object { $_.name -eq 'pl-test' -and [int]$_.attempts -eq 3 }).Count -eq 1 -and @($loopCheck.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0) 'the fourth verified respawn of the same job is held by the applying tick, not run'
+  Assert-True (@($r10gl.conditions) -contains 'escalation:pl-test:respawn-loop') 'a held respawn must become a respawn-loop escalation condition'
+  Assert-True ((@($r10gl.newlyPaged | Where-Object { $_.key -eq 'escalation:pl-test:respawn-loop' })[0]).priority -eq 'high') 'a held respawn pages at high priority through the real config-free default'
   Set-AgentsRows $noSentinelRows
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   Remove-Item "$testRoot\profile\.claude\jobs\job-p\state.json" -ErrorAction SilentlyContinue
@@ -1789,6 +1816,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session (#252) is deliberately normal'
   Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack (#253) is deliberately normal'
   Assert-True ((@($r10rs.newlyPaged | Where-Object { $_.key -eq 'escalation:nidus:issue-7:reservation-stranded' })[0]).priority -eq 'normal') 'reservation-stranded (#256) is deliberately normal'
+  Assert-True ((@($r10rl.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1003:respawn-loop' })[0]).priority -eq 'high') 'respawn-loop (#257) is deliberately high'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
   Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'
@@ -2021,6 +2049,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@($realConfig.pages.priority.PSObject.Properties.Name) -contains 'dated') "config/cycle.json pages.priority must name 'dated'"
   Assert-True (-not (@($realConfig.pages.priority.PSObject.Properties.Name) -contains 'passed-date')) 'the passed-date placeholder must not remain now that dated: is real'
   Assert-True ("$($realConfig.pages.priority.dated)" -eq 'normal') "the real config's dated priority must be normal"
+  Assert-True ("$($realConfig.pages.priority.'respawn-loop')" -eq 'high' -and @($realConfig.supervisor.pageKinds) -contains 'respawn-loop') "the real config must page respawn-loop at high (#257)"
+  Assert-True ([int]$realConfig.watchdog.respawnLoopCap -eq 3 -and [double]$realConfig.watchdog.respawnLoopWindowHours -eq 24) "the real config's respawn loop bound is 3 per 24 h (#257)"
 
   # ===== #113 (ADR 0013): the deploy step =====
   # The fixture home is not a git checkout, so the step is `unmanaged` and spawns
