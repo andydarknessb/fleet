@@ -593,6 +593,7 @@ test('#235: a break removal that keeps reporting EPERM throws after about five s
   makeRecord(root);
   staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
   withFsFault('rmSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
+    probe.onWait = () => { if (probe.waits > 2000) throw new Error('spun past the transient limit'); return 'timed-out'; };
     assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
     assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
   });
@@ -1716,4 +1717,48 @@ report(()=>m.createRecord({root:${JSON.stringify(root)},id:'endzone:issue-${inde
     assert.equal(readEvents(root).filter((event) => event.type === 'work-created').length, 2, 'both creates reached the ledger');
   }
   assert.equal(lost.length, 0, `${lost.length}/${RACE_ROUNDS} rounds lost a committed record: active.json kept only [${lost.join(' | ')}] after the second bootstrap overwrote it`);
+});
+
+test('#235: a stale lock and a stale breaker mutex whose removal keeps reporting EPERM throws after about five seconds', () => {
+  const root = rootDir();
+  makeRecord(root);
+  staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  breakMutex(root, '', 10 * 60 * 1000);
+  withFsFault('rmSync', (target) => (path.basename(target) === '.lock.break' ? 'EPERM' : null), (probe) => {
+    probe.onWait = () => { if (probe.waits > 2000) throw new Error('spun past the transient limit'); return 'timed-out'; };
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
+  });
+});
+
+test('#235: a lock whose owner pid reports EPERM to signal 0 is alive and not breakable', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 4, at: '2026-01-01T00:00:00.000Z' }));
+  const kill = process.kill;
+  process.kill = () => { throw Object.assign(new Error('EPERM: simulated'), { code: 'EPERM' }); };
+  try {
+    withFsFault('openSync', (target, probe) => (isLock(target) && probe.waits > 5 ? 'ENOSPC' : null), (probe) => {
+      assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'ENOSPC');
+      assert.ok(probe.waits > 5);
+    });
+  } finally { process.kill = kill; }
+  assert.equal(fs.existsSync(lock), true);
+});
+
+test('#235: a contender stalled after judging the lock stale re-judges it under the breaker mutex', async () => {
+  const contender = (root, index, mutexDelayMs, holdMs) => `
+const op=fs.openSync;let first=true;fs.openSync=function(t,...r){if(path.basename(String(t))==='.lock.break'&&first){first=false;wait(${mutexDelayMs});}return op.call(this,t,...r);};
+const rf=fs.readFileSync;fs.readFileSync=function(t,...r){const out=rf.call(this,t,...r);if(path.basename(String(t))==='active.json')wait(${holdMs});return out;};
+arrive();
+report(()=>m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'rejudge-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'}));`;
+  const verdicts = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    makeRecord(root);
+    staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const runs = await contend([contender(root, 0, 0, 800), contender(root, 1, 200, 0)]);
+    verdicts.push(runs.map((run) => run.output).sort().join(','));
+  }
+  assert.deepEqual(verdicts, Array(RACE_ROUNDS).fill('STALE_REVISION,ok'));
 });

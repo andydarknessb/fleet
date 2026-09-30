@@ -156,7 +156,8 @@ function breakable(file) {
     // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
     try { owner = readJson(file, {}) || {}; } catch (readError) { if (!(readError instanceof SyntaxError)) throw readError; }
     let alive = true;
-    try { process.kill(Number(owner.pid), 0); } catch { alive = false; }
+    // EPERM means the process exists but cannot be signalled (Windows SYSTEM processes): alive, not dead.
+    try { process.kill(Number(owner.pid), 0); } catch (killError) { alive = killError.code === 'EPERM'; }
     return !owner.pid || !alive;
   } catch (error) {
     if (['ENOENT', 'EPERM', 'EBUSY'].includes(error.code)) return false;
@@ -197,7 +198,11 @@ function withLock(root, callback) {
           // Another breaker is at work; a breaker that died leaves a stale mutex behind.
           if (breakable(p.breakLock)) {
             try { fs.rmSync(p.breakLock, { force: true }); } catch (removeError) {
-              if (!['ENOENT', ...TRANSIENT_FS_CODES].includes(removeError.code)) throw removeError;
+              if (removeError.code !== 'ENOENT') {
+                if (!TRANSIENT_FS_CODES.has(removeError.code)) throw removeError;
+                breakTransientSince ??= Date.now();
+                if (Date.now() - breakTransientSince > LOCK_TRANSIENT_MAX_MS) throw removeError;
+              }
             }
           }
         } else if (TRANSIENT_FS_CODES.has(breakError.code)) {
