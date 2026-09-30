@@ -278,6 +278,9 @@ exit 0
   New-Case 940
   $m1 = Manifest-Path 940; $m2 = Manifest-Path 9401
   Write-Utf8 $m2 '{"schemaVersion":1,"id":"assignment-test-9401","workRecordId":"test:issue-940","tenant":"test","parent":"pl-test"}'
+  # Drop the roster row first: the release guard (#251/#262, RELEASE_CLAIMED) refuses a hand release while an active or
+  # retiring roster row claims the record, and this case only needs the record free to be reserved again under M2.
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   $null = & node "$testRoot\bin\work-state.js" release --root $testRoot --id test:issue-940 --expected-revision 1 --idempotency-key hand-release-940 2>&1
   if ($LASTEXITCODE -ne 0) { throw 'D16 fixture: hand release failed' }
   Reserve-Record 940 $m2 'assignment-test-9401' 'reserve-940-again'
@@ -294,6 +297,7 @@ exit 0
   New-Case 941
   $m941b = Manifest-Path 9411
   Write-Utf8 $m941b '{"schemaVersion":1,"id":"assignment-test-9411","workRecordId":"test:issue-941","tenant":"test","parent":"pl-test"}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'   # the release guard (#251/#262): no live roster row may claim the record
   $null = & node "$testRoot\bin\work-state.js" release --root $testRoot --id test:issue-941 --expected-revision 1 --idempotency-key hand-release-941 2>&1
   Reserve-Record 941 $m941b 'assignment-test-9411' 'reserve-941-again' -NoAssignment
   $r16c = Invoke-Release (Manifest-Path 941) 'test:issue-941'
