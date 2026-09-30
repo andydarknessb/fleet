@@ -89,6 +89,21 @@ try {
   if ($wdCfg -and $wdCfg.PSObject.Properties['staleMinutes']) { $script:JobStaleMinutes = [double]$wdCfg.staleMinutes }
   if ($wdCfg -and $wdCfg.PSObject.Properties['strandedReservationHours']) { $script:StrandedReservationHours = [double]$wdCfg.strandedReservationHours }
 } catch {}
+# fleet #252 QA: Latest-Row is newest-by-name, which picks a stopped or orphaned same-name row over the
+# rostered job when it is newer (Do-Respawn would then respawn the orphan). An IC whose active live-roster
+# row records a jobId is judged by the daemon row with that id; Latest-Row stays the fallback when the
+# roster has no jobId or the daemon has no such row. Statics keep Latest-Row.
+function Get-ExpectedRow {
+  param($x)
+  if (-not $x.static) {
+    $rr = @($live.sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.status)" -eq 'active' }) | Select-Object -Last 1
+    if ($rr -and $rr.PSObject.Properties['jobId'] -and $rr.jobId) {
+      $byId = $daemon | Where-Object { "$($_.id)" -eq "$($rr.jobId)" } | Select-Object -First 1
+      if ($byId) { return $byId }
+    }
+  }
+  return (Latest-Row $x.name)
+}
 function Heartbeat-Age {
   param($name)
   $hb = Read-Json "$FleetHome\state\heartbeats\$name.json"
@@ -144,6 +159,22 @@ function Test-JobStopped {
       if (-not $row -or -not $row.pid) { return $true }
     } catch {
       # unreadable this poll: fall through to the bound, never treated as stopped
+    }
+    if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds $script:RespawnVerifyPollMs }
+  } while ((Get-Date) -lt $deadline)
+  return $false
+}
+function Test-JobRemoved {
+  # fleet #252 QA: after `claude rm`, a bounded strict re-read must show no row with this id. An
+  # unreadable listing proves nothing and is never read as removed.
+  param([string]$Id)
+  $deadline = (Get-Date).AddMilliseconds($script:RespawnVerifyBoundMs)
+  do {
+    try {
+      $after = Get-DaemonSessions -All -Strict
+      if (-not ($after | Where-Object { "$($_.id)" -eq $Id } | Select-Object -First 1)) { return $true }
+    } catch {
+      # unreadable this poll: fall through to the bound, never treated as removed
     }
     if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds $script:RespawnVerifyPollMs }
   } while ((Get-Date) -lt $deadline)
@@ -333,7 +364,7 @@ if ($HealRespawn) {
   } elseif (-not $target) {
     $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = ''; reason = 'heal-respawn: not an expected session (roster changed underfoot)' }
   } else {
-    $row = Latest-Row $HealRespawn
+    $row = Get-ExpectedRow $target
     if (-not $row) {
       $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = $target.parent; reason = 'heal-respawn: no job known to the daemon' }
     } else {
@@ -413,9 +444,20 @@ if (-not $rosterUnreadable) {
     if ($cleanupLive) {
       & claude stop $jobId 2>&1 | Out-Null
       if (Test-JobStopped -Id $jobId) {
-        & claude rm $jobId 2>&1 | Out-Null
-        $outcome = 'stopped'
-        $report.stopped += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = "orphan late session: manifest invalidated ($markerReason)"; verified = $true }
+        # rm's own result is not trusted: a refused rm leaves the stopped row listed, and a stopped row
+        # newer than the rostered job of the same name is what Latest-Row used to respawn. Confirm by a
+        # strict re-read that the row is gone, and say so when it is not.
+        # Continue while rm runs: a native stderr line under a Stop preference would throw before the exit code is read.
+        $rmEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $rmOut = ''; $rmExit = $null
+        try { $rmOut = "$(& claude rm $jobId 2>&1 | Out-String)"; $rmExit = $LASTEXITCODE } catch { $rmOut = "$($_.Exception.Message)"; $rmExit = -1 } finally { $ErrorActionPreference = $rmEap }
+        $removed = Test-JobRemoved -Id $jobId
+        $rmError = ''
+        if (-not $removed) {
+          $rmError = if ($rmExit -ne 0) { "claude rm exit ${rmExit}: $(Get-OneLineText $rmOut)" } else { "row $jobId still listed after claude rm (exit 0)" }
+        }
+        $outcome = if ($removed) { 'stopped' } else { "stopped, not removed: $rmError" }
+        $report.stopped += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = "orphan late session: manifest invalidated ($markerReason)"; verified = $true; removed = $removed; rmError = $rmError }
       } else {
         $failReason = "job $jobId still had a pid after claude stop (waited $($script:RespawnVerifyBoundMs) ms)"
         $outcome = "stop failed: $failReason"
@@ -426,7 +468,7 @@ if (-not $rosterUnreadable) {
   }
 }
 foreach ($x in $expected) {
-  $row = Latest-Row $x.name
+  $row = Get-ExpectedRow $x
   # fleet #253: shadow-first like #252. Acting needs -Apply AND state/flags/ic-cleanup-live; the page is raised in
   # every mode and the shadow falls through to today's ic-vanished / respawn branch.
   $deadWhy = Test-DeadBeforeAck $x $row
