@@ -106,14 +106,13 @@ if ($env:FLEET_ASSIGNMENT_MANIFEST -and $env:FLEET_WORK_RECORD_ID) {
   $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $homeFwd + '/bin/work-state.js get --root ' + $homeFwd + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
   Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $homeFwd/bin/assignment.js ack --root $homeFwd --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
 }
-# The handoff goes only to the session the rotation itself launched. Two rules: the
-# intent is `launched` and its newSessionId matches this session's id, or the intent is
-# `launching` and this is a same-name `startup` hook inside 120 s of launchingAt. Either
-# way a later respawn or manual launch of the same name never inherits a stale offset
-# (the expired-context class): `launched` needs the id, `launching` expires after 120 s.
-# fleet #230: the hook can run before launch.ps1 returns the session id, so a second rule
-# covers that gap: phase `launching`, this same roster name, a `startup` hook (never
-# resume/compact/clear/fork), and now inside [launchingAt, launchingAt + 120 s].
+# The handoff goes only to the session the rotation itself launched. Two rules. Exact: the
+# intent is `launched` and its newSessionId matches this session's id. Window (fleet #230:
+# the hook can run before launch.ps1 returns the session id, or the id came back empty):
+# the intent is `launching`, or `launched` with an empty newSessionId, and this is a
+# same-name `startup` hook (never resume/compact/clear/fork) inside [launchingAt,
+# launchingAt + 120 s]. Either way a later respawn or manual launch of the same name never
+# inherits a stale offset (the expired-context class): the window expires after 120 s.
 $rotation = $null
 $rotationPath = "$home_\state\rotation\$name.json"
 if (Test-Path $rotationPath) {
@@ -125,7 +124,9 @@ if (Test-Path $rotationPath) {
 }
 $rotationExact = $rotation -and "$($rotation.phase)" -eq 'launched' -and $hookSessionId -and "$($rotation.newSessionId)" -eq "$hookSessionId"
 $rotationWindow = $false
-if ($rotation -and "$($rotation.phase)" -eq 'launching' -and "$($rotation.name)" -eq "$name" -and "$hookSource" -eq 'startup') {
+$phaseNow = if ($rotation) { "$($rotation.phase)" } else { '' }
+$windowPhase = $phaseNow -eq 'launching' -or ($phaseNow -eq 'launched' -and -not "$($rotation.newSessionId)")
+if ($rotation -and $windowPhase -and "$($rotation.name)" -eq "$name" -and "$hookSource" -eq 'startup') {
   $launchingAt = [DateTimeOffset]::MinValue
   if ([DateTimeOffset]::TryParse("$($rotation.launchingAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$launchingAt)) {
     $ageSeconds = ([DateTimeOffset]::UtcNow - $launchingAt).TotalSeconds

@@ -151,8 +151,10 @@ The bounded lifetime of a control-plane session: at a set boundary (merges
 delivered, hours alive, or cumulative job tokens) it retires and a replacement
 launches through the one door, reconstructing its position from canonical
 state - the roster, Work records, issues, and the skip file - never from its
-predecessor's transcript. The handoff reaches the replacement by its session id, or, because its start hook can run before the launch returns that id, by a same-name startup within 120 s of the launch beginning. A respawn is not a rotation: it re-pins the old
-flags and keeps the old transcript.
+predecessor's transcript. The handoff reaches the replacement by its session
+id, or, because its start hook can run before the launch returns that id, by a
+same-name startup within 120 s of the launch beginning. A respawn is not a
+rotation: it re-pins the old flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
 
 **Watchdog**:

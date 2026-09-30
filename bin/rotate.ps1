@@ -10,7 +10,7 @@
   Phases: stopping -> stopped -> launching -> launched. `launching` is written just before
   launch.ps1 runs (with launchingAt), because the replacement's SessionStart hook can fire
   before launch.ps1 returns the session id (fleet #230).
-.EXAMPLE  rotate.ps1 -Auto            # scheduled: resume incomplete, rotate the due
+.EXAMPLE   rotate.ps1 -Auto            # scheduled: resume incomplete, rotate the due
 .EXAMPLE   rotate.ps1 -Name pl-endzone -Force   # Cory's hand: rotate now
 #>
 [CmdletBinding()]
@@ -133,8 +133,8 @@ function Complete-Rotation {
   $Intent.phase = 'launching'
   $Intent | Add-Member -NotePropertyName launchingAt -NotePropertyValue (Now-Iso) -Force
   Write-Json $intentPath $Intent
-  $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
-  $launchExit = $LASTEXITCODE
+  # fleet #230: a launch.ps1 that throws must reach the failure branch (phase back to `stopped`), not the top-level catch.
+  try { $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String; $launchExit = $LASTEXITCODE } catch { $out = "launch.ps1 threw: $($_.Exception.Message)"; $launchExit = 1 }
   $launch = ConvertFrom-LastJsonLine $out
   if ($launch -and "$($launch.reason)" -match 'already running') {
     # fleet #121: a session under the name is not always a hand relaunch. On 2026-09-23
@@ -157,8 +157,8 @@ function Complete-Rotation {
       $Intent | Add-Member -NotePropertyName staleRevival -NotePropertyValue ([pscustomobject]@{ at = (Now-Iso); jobId = "$($runningRow.id)"; why = $staleWhy }) -Force
       $Intent | Add-Member -NotePropertyName launchingAt -NotePropertyValue (Now-Iso) -Force   # fleet #230: a fresh window for the retry launch
       Write-Json $intentPath $Intent
-      $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String
-      $launchExit = $LASTEXITCODE
+      # fleet #230: a launch.ps1 that throws must reach the failure branch (phase back to `stopped`), not the top-level catch.
+      try { $out = & "$PSScriptRoot\launch.ps1" @launchArgs 2>&1 | Out-String; $launchExit = $LASTEXITCODE } catch { $out = "launch.ps1 threw: $($_.Exception.Message)"; $launchExit = 1 }
       $launch = ConvertFrom-LastJsonLine $out
       # Still "already running" after the stop: the stale job did not go down (a failed or
       # late stop). That is not a hand relaunch either; fail and keep the intent resumable.

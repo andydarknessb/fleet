@@ -77,6 +77,9 @@ Add-Content "$root\launch-calls.log" "$FromRoster$forceMark"
 # fleet #230: snapshot the intent exactly as the replacement's SessionStart hook would
 # read it while `claude --bg` is starting the session (before launch.ps1 returns).
 Copy-Item "$root\state\rotation\$FromRoster.json" "$root\intent-at-launch.json" -ErrorAction SilentlyContinue
+$callNo = @(Get-Content "$root\launch-calls.log").Count
+Copy-Item "$root\state\rotation\$FromRoster.json" "$root\intent-at-launch-$callNo.json" -ErrorAction SilentlyContinue
+if ($env:MOCK_LAUNCH_THROW -eq '1') { throw 'mock launch.ps1 blew up (claude --bg pipeline threw)' }
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"cap reached (6/6)"}'; exit 3 }
 # fleet #121: the first launch meets a session already running under the name (the
 # stale revival, or a hand relaunch), the next one goes through.
@@ -255,6 +258,12 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True (@(Get-Content "$testRoot\launch-calls.log").Count -eq 2 -and $intent6c.phase -eq 'launched' -and "$($intent6c.newJobId)" -eq 'job-new') "the replacement must launch through launch.ps1 after the stop (intent: $($intent6c | ConvertTo-Json -Compress -Depth 4))"
   Assert-True ("$($intent6c.staleRevival.jobId)" -eq 'job-stale') 'the intent records the stale revival it replaced'
   Assert-True (@($r6c.rotated) -contains 'dispatcher') 'the rotation completes'
+  # fleet #230 QA: the stale-revival retry starts a fresh window: its snapshot is `launching`
+  # with a launchingAt later than the first attempt's.
+  $snap1 = Get-Content "$testRoot\intent-at-launch-1.json" -Raw | ConvertFrom-Json
+  $snap2 = Get-Content "$testRoot\intent-at-launch-2.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($snap2.phase)" -eq 'launching' -and "$($snap1.phase)" -eq 'launching') 'both launch attempts run in the launching phase'
+  Assert-True ([DateTimeOffset]::Parse("$($snap2.launchingAt)") -gt [DateTimeOffset]::Parse("$($snap1.launchingAt)")) 'the retry launch must refresh launchingAt'
 
   # Case 6d (control): a session started AFTER the rotation began is a genuine hand relaunch.
   Set-LiveRoster $old 'retired'; Reset-Markers
@@ -298,6 +307,17 @@ console.log(JSON.stringify({ ok: true }));
   Remove-Item Env:MOCK_LAUNCH_FAIL
   $r7b = Run-Rotate @('-Auto')
   Assert-True (@($r7b.rotated) -contains 'dispatcher') 'the next auto run must complete the interrupted rotation'
+
+  # Case 7a (fleet #230 QA): a launch.ps1 that THROWS must not strand the intent in
+  # `launching`; it lands in the failure branch: `stopped` + launchError.
+  Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
+  $env:MOCK_LAUNCH_THROW = '1'
+  $r7a = Run-Rotate @('-Auto')
+  Remove-Item Env:MOCK_LAUNCH_THROW
+  $intent7a = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($intent7a.phase)" -eq 'stopped') "a launch.ps1 that throws must leave the intent stopped, not launching (intent: $($intent7a | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True ("$($intent7a.launchError.reason)" -match 'threw') 'the throw is recorded as the launch error'
+  Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
 
   # Case 7b: an unreadable daemon list defers the rotation (a bad read must not
   # look like an idle boundary).
