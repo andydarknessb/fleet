@@ -759,8 +759,10 @@ function writeSidecar(file, value) {
 }
 
 // launch.ps1's no-session poll alone is ~15 s, plus the gh read, fetch and worktree add. A timeout kill
-// between `claude --bg` and the roster write leaves a session with no roster row, so the budget is generous.
-const LAUNCH_TIMEOUT_MS = 120000;
+// between `claude --bg` and the roster write leaves a session with no roster row, so the budget is generous,
+// but it stays under the lead's 2-minute Bash tool limit: this process spends time on its own gh query and
+// up to two git fetches before it launches.
+const LAUNCH_TIMEOUT_MS = 90000;
 function launchReservedAssignment({ manifestPath, workRecordId, root, launchScript, repoPath, githubRepo, powershell = 'powershell', dryRun = false, runner = execFileSync } = {}) {
   if (!manifestPath || !workRecordId) throw new WorkStateError('INVALID_LAUNCH', 'manifestPath and workRecordId are required');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
@@ -802,13 +804,15 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
       try { refusal = JSON.parse(line); break; } catch { /* not the JSON line */ }
     }
     const stderr = String(error.stderr || '').trim();
+    const timedOut = error.code === 'ETIMEDOUT' || error.killed === true;
     const parts = [];
+    if (timedOut) parts.push(`timed out after ${LAUNCH_TIMEOUT_MS / 1000} s`);
     if (refusal && refusal.reason) parts.push(`launch refused: ${refusal.reason}`);
     if (refusal && 'reservationReleased' in refusal) parts.push(`reservationReleased=${refusal.reservationReleased}`);
     if (refusal && refusal.releaseError) parts.push(`releaseError=${refusal.releaseError}`);
     if (stderr) parts.push(stderr);
     if (!parts.length) parts.push(String(error.message || error));
-    throw new WorkStateError('LAUNCH_FAILED', parts.join('; '), { exitCode: error.status ?? null, refusal, stderr, timedOut: error.code === 'ETIMEDOUT' || error.killed === true });
+    throw new WorkStateError('LAUNCH_FAILED', parts.join('; '), { exitCode: error.status ?? null, refusal, stderr, timedOut });
   }
 }
 

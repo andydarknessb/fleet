@@ -145,7 +145,7 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
 });
 
-test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 120 s (fleet#256)', () => {
+test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 90 s (fleet#256)', () => {
   const root = rootDir();
   const result = reserveAssignment({
     root,
@@ -189,7 +189,10 @@ test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and
       return true;
     },
   );
-  assert.equal(seen.timeout, 120000, 'a timeout kill between claude --bg and the roster write strands a session, so the budget covers the no-session poll, gh, fetch and worktree add');
+  assert.equal(seen.timeout, 90000, 'a timeout kill between claude --bg and the roster write strands a session, so the budget covers the no-session poll, gh, fetch and worktree add, yet stays under the 2-minute lead Bash limit');
+  // A timeout kill says so even when the killed child left stderr text.
+  const killed = () => { const e = new Error('spawnSync powershell ETIMEDOUT'); e.code = 'ETIMEDOUT'; e.killed = true; e.status = null; e.stdout = ''; e.stderr = 'partial stderr'; throw e; };
+  assert.throws(() => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner: killed }), (error) => error.code === 'LAUNCH_FAILED' && /timed out after 90 s/.test(error.message) && /partial stderr/.test(error.message) && error.timedOut === true);
   // With no JSON on stdout the error still says something (the exec error), never an empty message.
   const bare = () => { const e = new Error('Command failed: stub'); e.status = 1; e.stdout = ''; e.stderr = ''; throw e; };
   assert.throws(() => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner: bare }), (error) => error.code === 'LAUNCH_FAILED' && /Command failed: stub/.test(error.message));
