@@ -150,9 +150,14 @@ try {
     param($PagesConfig)
     if (-not $PagesConfig) { return }
     if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
-      foreach ($p in $PagesConfig.priority.PSObject.Properties) {
-        if (-not $script:PagePriorityValues.ContainsKey("$($p.Value)")) {
-          [pscustomobject]@{ key = "pages.priority.$($p.Name)"; value = "$($p.Value)"; fallback = (Get-PagePriority -Kind $p.Name -PagesConfig $PagesConfig) }
+      if ($PagesConfig.priority -isnot [pscustomobject]) {
+        # not a map (a bare string, say): the block itself is the finding, not its .Length
+        [pscustomobject]@{ key = 'pages.priority'; value = "$($PagesConfig.priority)"; fallback = 'normal' }
+      } else {
+        foreach ($p in $PagesConfig.priority.PSObject.Properties) {
+          if (-not $script:PagePriorityValues.ContainsKey("$($p.Value)")) {
+            [pscustomobject]@{ key = "pages.priority.$($p.Name)"; value = "$($p.Value)"; fallback = (Get-PagePriority -Kind $p.Name -PagesConfig $PagesConfig) }
+          }
         }
       }
     }
@@ -1213,7 +1218,7 @@ try {
   # fleet #232: an invalid pages priority pages once (paged-state dedupe) and rides every tick line.
   $invalidPagePriority = @(Get-InvalidPagePriorities -PagesConfig $pagesConfig)
   foreach ($ip in $invalidPagePriority) {
-    $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not one of emergency|high|normal; pages of that kind go at $($ip.fallback) until it is fixed"; url = $null }
+    $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not one of emergency|high|normal; pages of that kind fall back to their built-in default until it is fixed"; url = $null }
   }
   # #113 (ADR 0013): the previous tick's deploy step refused to move `live`
   # (not on live, dirty, diverged, fetch or CI unreadable). One page per

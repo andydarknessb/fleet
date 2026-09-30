@@ -96,4 +96,4 @@ that asked), `config/cycle.json` `pages.fleetDeadRepeatPriority` is
 
 ## Amendment 2026-09-30 - an invalid page priority falls back, and is reported
 
-A `pages.priority.<kind>` or `pages.defaultPriority` that is not `emergency`, `high` or `normal` is ignored: the kind keeps its built-in priority (or `normal`), and the Watchdog pages once as `config-invalid:<key>` at normal priority. `bin/setup.ps1` refuses such a value up front. Source: fleet #232.
+A `pages.priority.<kind>` or `pages.defaultPriority` that is not `emergency`, `high` or `normal` is ignored: the kind keeps its built-in priority (a kind with no built-in falls back to a valid `pages.defaultPriority`, else `normal`), and the Watchdog pages once as `config-invalid:<key>` at normal priority. `bin/setup.ps1` refuses such a value up front. Source: fleet #232.

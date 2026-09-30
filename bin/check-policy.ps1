@@ -108,16 +108,20 @@ function Get-CheckPolicyEvaluation {
 function Get-PagesPriorityFindings {
   param($Pages)
   $valid = @('emergency', 'high', 'normal')
-  if (-not $Pages) { return ,@() }
+  if (-not $Pages) { return }
   $found = @()
   if ($Pages.PSObject.Properties['priority'] -and $Pages.priority) {
-    foreach ($p in $Pages.priority.PSObject.Properties) {
-      if ($valid -notcontains "$($p.Value)") { $found += [pscustomobject]@{ Key = "pages.priority.$($p.Name)"; Value = "$($p.Value)" } }
+    if ($Pages.priority -isnot [pscustomobject]) {
+      # not a map (a bare string, say): the block itself is the finding, not its .Length
+      $found += [pscustomobject]@{ Key = 'pages.priority'; Value = "$($Pages.priority)" }
+    } else {
+      foreach ($p in $Pages.priority.PSObject.Properties) {
+        if ($valid -notcontains "$($p.Value)") { $found += [pscustomobject]@{ Key = "pages.priority.$($p.Name)"; Value = "$($p.Value)" } }
+      }
     }
   }
   if ($Pages.PSObject.Properties['defaultPriority'] -and $Pages.defaultPriority -and $valid -notcontains "$($Pages.defaultPriority)") {
     $found += [pscustomobject]@{ Key = 'pages.defaultPriority'; Value = "$($Pages.defaultPriority)" }
   }
-  if ($found.Count -eq 0) { return ,@() }
-  return $found
+  $found
 }

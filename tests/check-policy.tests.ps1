@@ -65,9 +65,11 @@ $pagesFindings = @(Get-PagesPriorityFindings ([pscustomobject]@{
 Assert-Count $pagesFindings 2 'one finding per invalid page priority value'
 Assert-True (@($pagesFindings | Where-Object { $_.Key -eq 'pages.priority.permission-wait' -and $_.Value -eq 'hgih' }).Count -eq 1) 'an invalid pages.priority.<kind> is reported by dotted key and value'
 Assert-True (@($pagesFindings | Where-Object { $_.Key -eq 'pages.defaultPriority' -and $_.Value -eq 'loud' }).Count -eq 1) 'an invalid pages.defaultPriority is reported by key and value'
-Assert-Count (Get-PagesPriorityFindings $null) 0 'an absent pages block is not a finding'
-Assert-Count (Get-PagesPriorityFindings ([pscustomobject]@{ priority = [pscustomobject]@{ 'fleet-dead' = 'high' } })) 0 'a valid value is not a finding'
+Assert-Count @(Get-PagesPriorityFindings $null) 0 'an absent pages block is not a finding'
+Assert-Count @(Get-PagesPriorityFindings ([pscustomobject]@{ priority = [pscustomobject]@{ 'fleet-dead' = 'high' } })) 0 'a valid value is not a finding'
 $shippedPages = (Get-Content "$PSScriptRoot\..\config\cycle.json" -Raw -Encoding UTF8 | ConvertFrom-Json).pages
-Assert-Count (Get-PagesPriorityFindings $shippedPages) 0 'the shipped config/cycle.json carries no invalid page priority'
+Assert-Count @(Get-PagesPriorityFindings $shippedPages) 0 'the shipped config/cycle.json carries no invalid page priority'
+$strPri = @(Get-PagesPriorityFindings ([pscustomobject]@{ priority = 'high' }))
+Assert-True ($strPri.Count -eq 1 -and $strPri[0].Key -eq 'pages.priority' -and $strPri[0].Value -eq 'high') 'a pages.priority that is not a map is reported as pages.priority itself'
 
 Write-Output 'check-policy tests passed'
