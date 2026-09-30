@@ -805,7 +805,7 @@ function assertManifestNotInvalidated(manifestPath) {
   if (fs.existsSync(`${manifestPath}.acknowledged.json`) || !fs.existsSync(`${manifestPath}.invalidated.json`)) return;
   let reason = 'reason unreadable';
   try {
-    const recorded = JSON.parse(fs.readFileSync(`${manifestPath}.invalidated.json`, 'utf8').replace(/^﻿/, '')).reason;
+    const recorded = JSON.parse(fs.readFileSync(`${manifestPath}.invalidated.json`, 'utf8').replace(/^\uFEFF/, '')).reason;
     reason = typeof recorded === 'string' ? recorded : JSON.stringify(recorded);
   } catch { /* the invalidation itself is the fact; the reason is best effort */ }
   throw new WorkStateError('MANIFEST_INVALIDATED', `manifest ${path.basename(manifestPath, '.json')} was invalidated (${reason}) before this session acknowledged it; stop, this assignment was released`, { reason });

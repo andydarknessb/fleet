@@ -540,7 +540,8 @@ function recoverPendingUnlocked(p) {
       if (error.code !== 'EVENT_SEQUENCE_COLLISION') throw error;
       const collidedDir = path.join(p.pending, 'collided');
       fs.mkdirSync(collidedDir, { recursive: true });
-      const quarantined = path.join(collidedDir, file);
+      // A unique name: an earlier quarantined journal of the same file name is evidence too.
+      const quarantined = path.join(collidedDir, `${file.replace(/\.json$/, '')}.${Date.now()}.${process.pid}.${fs.readdirSync(collidedDir).length}.json`);
       fs.renameSync(journalPath, quarantined);
       throw new WorkStateError('EVENT_SEQUENCE_COLLISION', `${error.message}; the pending journal was moved to ${quarantined}`, { recordId: error.recordId, sequence: error.sequence, existing: error.existing, attempted: error.attempted, quarantined });
     }
@@ -872,16 +873,31 @@ function rosterPathFor(p, rosterPath) {
   return path.resolve(rosterPath || path.join(p.state, 'roster.json'));
 }
 
-function rosterClaims(p, rosterPath) {
+function rosterClaimRows(p, rosterPath) {
   const roster = readJson(rosterPathFor(p, rosterPath), { sessions: [] });
   const rows = Array.isArray(roster) ? roster : (roster.sessions || []);
-  const claims = new Map();
-  for (const row of rows) {
-    const status = String(row.status).toLowerCase();
-    if (String(row.role).toLowerCase() !== 'ic' || !['active', 'retiring'].includes(status) || !Number(row.issue)) continue;
-    claims.set(`${row.tenant}:issue-${Number(row.issue)}`, row);
-  }
-  return claims;
+  return rows
+    .filter((row) => String(row.role).toLowerCase() === 'ic' && ['active', 'retiring'].includes(String(row.status).toLowerCase()) && Number(row.issue))
+    .map((row) => ({ id: `${row.tenant}:issue-${Number(row.issue)}`, row }));
+}
+
+function rosterClaims(p, rosterPath) {
+  return new Map(rosterClaimRows(p, rosterPath).map(({ id, row }) => [id, row]));
+}
+
+function samePath(a, b) {
+  const [left, right] = [path.resolve(String(a)), path.resolve(String(b))];
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+// Release's narrower claim (fleet#251 QA): an IC that died and was abandoned without its row
+// being retired leaves a stale row for the same issue, and a later reservation of that issue
+// must still be releasable when its own pre-launch gate refuses. A row that names the manifest
+// it was launched from claims the record only when that is the record's current manifest; a row
+// with no manifest falls back to tenant plus issue. Shadow keeps the plain tenant+issue match.
+function releaseClaim(p, rosterPath, record) {
+  return rosterClaimRows(p, rosterPath).find(({ id, row }) => id === record.id
+    && (!row.manifest || (record.manifestPath && samePath(row.manifest, record.manifestPath))))?.row || null;
 }
 
 function releaseRecord(options = {}) {
@@ -910,7 +926,7 @@ function releaseRecord(options = {}) {
     // working an unreserved issue. An absent or unreadable roster is no claim: this guard
     // must not wedge a release on a bad file.
     let claim = null;
-    try { claim = rosterClaims(p, options.rosterPath).get(record.id) || null; } catch { claim = null; }
+    try { claim = releaseClaim(p, options.rosterPath, record); } catch { claim = null; }
     if (claim) {
       throw new WorkStateError('RELEASE_CLAIMED', `record '${record.id}' is claimed by roster row '${claim.name}' (status ${claim.status}, sessionId ${claim.sessionId || 'none'}); retire the session (bin\\retire.ps1 -Name ${claim.name}) before releasing, or let it acknowledge`, {
         rosterRow: { name: claim.name, status: claim.status, sessionId: claim.sessionId || null, jobId: claim.jobId || null },
@@ -1654,6 +1670,9 @@ function shadowProject(options = {}) {
       // the release had already used; the skip is reported so a caller can see it.
       if (fs.existsSync(abandonFile(p, id))) { skipped.push({ id, name: row.name, reason: 'abandon-snapshot' }); continue; }
       if (fs.existsSync(releaseFile(p, id))) { skipped.push({ id, name: row.name, reason: 'release-snapshot' }); continue; }
+      // A record that finished and was archived is ended too: its lineage already holds
+      // sequence 1, so building a fresh record from a lingering row would collide.
+      if (fs.existsSync(archiveFile(p, id))) { skipped.push({ id, name: row.name, reason: 'archive' }); continue; }
       const now = isoNow(options.now);
       const key = `shadow:${id}:${row.sessionId || row.name || 'unknown'}`;
       const record = baseRecord({
