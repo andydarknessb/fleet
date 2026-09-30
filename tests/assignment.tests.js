@@ -1082,3 +1082,51 @@ test('#209 m7: plannerInputs throws on a missing tenant instead of answering "no
   assert.throws(() => plannerInputs({ root: plannerRoot([]), tenantConfig: {} }), (error) => error.code === 'USAGE');
   assert.deepEqual(plannerInputs({ root: plannerRoot([]), tenant: 'endzone', tenantConfig: {} }).boundedReadies, []);
 });
+
+// fleet#251: a late session acknowledging a manifest launch.ps1 already invalidated used to
+// get NOT_FOUND (the record left active state with the release) and read it as a glitch.
+test('#251: acknowledging an invalidated manifest says so instead of NOT_FOUND', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(2520), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  invalidateManifest({ root, manifest: result.manifest, currentRevision: 1, reason: 'launch failed: claude --bg produced no session', now: '2026-09-30T00:01:00.000Z' });
+  assert.throws(
+    () => acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:02:00.000Z' }),
+    (error) => error.code === 'MANIFEST_INVALIDATED'
+      && /launch failed: claude --bg produced no session/.test(error.message)
+      && /this assignment was released/.test(error.message)
+      && error.reason === 'launch failed: claude --bg produced no session',
+  );
+});
+
+test('#251: the ack CLI reads the manifest from --manifest or FLEET_ASSIGNMENT_MANIFEST', () => {
+  assert.ok(FLAGS.ack.includes('manifest'));
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(2521), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  invalidateManifest({ root, manifest: result.manifest, currentRevision: 1, reason: 'issue body hash changed before acknowledgment', now: '2026-09-30T00:01:00.000Z' });
+  const ackArgs = ['--root', root, '--work-record-id', result.manifest.workRecordId, '--expected-revision', '1'];
+  assert.throws(() => cli(['ack', ...ackArgs, '--manifest', result.manifestPath]), (error) => error.code === 'MANIFEST_INVALIDATED');
+  const previous = process.env.FLEET_ASSIGNMENT_MANIFEST;
+  process.env.FLEET_ASSIGNMENT_MANIFEST = result.manifestPath;
+  try {
+    assert.throws(() => cli(['ack', ...ackArgs]), (error) => error.code === 'MANIFEST_INVALIDATED');
+  } finally {
+    if (previous === undefined) delete process.env.FLEET_ASSIGNMENT_MANIFEST; else process.env.FLEET_ASSIGNMENT_MANIFEST = previous;
+  }
+});
+
+test('#251: acknowledging a live manifest still works when the manifest path is given', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(2522), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  const acknowledged = acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:01:00.000Z' });
+  assert.equal(acknowledged.record.state, 'implementing');
+  assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
+});
