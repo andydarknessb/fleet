@@ -356,6 +356,40 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (-not (@($r10d3.conditions) -contains 'escalation:ic-777:stray')) 'a cleared escalation leaves the conditions'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\banner.txt")) 'a cleared escalation clears the banner'
 
+  # Case 10d-orphan (fleet #252): a late IC whose manifest launch.ps1 already invalidated is an
+  # orphan-late-session, not a stray: it is a paging kind (normal), files one escalation, and,
+  # with state/flags/ic-cleanup-live absent, nothing is stopped even though this tick applies.
+  [IO.Directory]::CreateDirectory("$testRoot\state\manifests") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-o1") | Out-Null
+  $orphanManifest = "$testRoot\state\manifests\assignment-test-1001.json"
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-o1\state.json" (ConvertTo-Json @{ name = 'ic-1001'; detail = ''; waitingFor = ''; intent = ('/mattpocock-skills:implement Read the assignment manifest at ' + $orphanManifest + ' and the GitHub issue body and comments.') } -Compress)
+  Write-Utf8 "$orphanManifest.invalidated.json" '{"schemaVersion":1,"manifestId":"assignment-test-1001","reason":"no session appeared within 15s"}'
+  $orphanRow = '{"id":"job-o1","name":"ic-1001","state":"working","status":"idle","pid":1001,"startedAt":' + (Get-EpochMs $oldStart) + '}'
+  Set-AgentsRows "[$dispRow,$plRow,$orphanRow]"
+  $r10o = Run-Watchdog
+  Assert-True (@($r10o.conditions) -contains 'escalation:ic-1001:orphan-late-session') 'an orphan late session must become an escalation condition'
+  Assert-True (-not (@($r10o.conditions) -contains 'escalation:ic-1001:stray')) 'an orphan late session must not also be a stray'
+  Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session pages at normal priority'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1001-orphan-late-session.json').Count -eq 1) 'an orphan late session leaves one escalation file'
+  $orphanApplied = @(Get-AppliedLines)[-1] | ConvertFrom-Json
+  Assert-True (@($orphanApplied.stopped).Count -eq 0 -and @($orphanApplied.stopFailed).Count -eq 0) 'without state/flags/ic-cleanup-live the live tick stops nothing'
+  $r10o2 = Run-Watchdog
+  Assert-True (@($r10o2.newlyPaged).Count -eq 0) 'a standing orphan escalation must not page again'
+  Set-AgentsRows $noSentinelRows
+  $r10o3 = Run-Watchdog
+  Assert-True (-not (@($r10o3.conditions) -contains 'escalation:ic-1001:orphan-late-session')) 'the orphan escalation clears once the row goes'
+  Remove-Item "$orphanManifest.invalidated.json" -Force
+  # ic-dead-before-ack (#253) is a paging kind too, wired here with #252 so the two land together. The
+  # check that raises it arrives with #253, so a canned check report stands in for it.
+  $origCheckDba = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1002"; kind = "ic-dead-before-ack"; detail = "canned"; parent = "pl-test" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
+  try { $r10dba = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckDba }
+  Assert-True (@($r10dba.conditions) -contains 'escalation:ic-1002:ic-dead-before-ack') 'ic-dead-before-ack must become an escalation condition'
+  Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack pages at normal priority'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1002-ic-dead-before-ack.json').Count -eq 1) 'ic-dead-before-ack leaves one escalation file'
+  $r10dba2 = Run-Watchdog
+  Assert-True (-not (@($r10dba2.conditions) -contains 'escalation:ic-1002:ic-dead-before-ack')) 'the ic-dead-before-ack escalation clears once the check stops raising it'
+
   # Case 10e: `blocked` is recorded as waiting, never paged, never filed.
   $blockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
   Set-AgentsRows "[$blockedDisp,$plRow]"
@@ -1788,6 +1822,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r7.newlyPaged | Where-Object { $_.key -eq 'check-failed' })[0]).priority -eq 'normal') 'check-failed is deliberately normal'
   Assert-True ((@($r9.newlyPaged | Where-Object { $_.key -eq 'double-actor' })[0]).priority -eq 'normal') 'double-actor is deliberately normal'
   Assert-True ((@($r10d.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-777:stray' })[0]).priority -eq 'normal') 'stray is deliberately normal'
+  Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session (#252) is deliberately normal'
+  Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack (#253) is deliberately normal'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
   Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'

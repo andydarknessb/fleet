@@ -24,7 +24,7 @@ const {
   sha256,
   validateManifest,
 } = require('../bin/assignment');
-const { WorkStateError, getRecord, reserveRecord } = require('../bin/work-state');
+const { WorkStateError, abandonRecord, createRecord, getRecord, reserveRecord, transitionRecord } = require('../bin/work-state');
 
 function rootDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-assignment-'));
@@ -166,6 +166,27 @@ test('changed criteria invalidate the manifest and release reservations', () => 
   assert.match(retry.manifest.id, /-r3$/);
   assert.equal(retry.reservation.revision, 3);
   assert.equal(getRecord({ root, id: 'endzone:issue-43' }).state, 'assigned');
+});
+
+// fleet#227: the automatic release path (invalidateManifest) on a re-reserved record whose
+// earlier attempt was touched and abandoned must release, and the id must be assignable again.
+test('an invalidated re-reserved manifest releases and the record reserves again', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-45';
+  createRecord({ root, id, tenant: 'endzone', issue: 45, state: 'assigned', idempotencyKey: 'create-45', now: '2026-09-01T00:00:00.000Z' });
+  transitionRecord({ root, id, expectedRevision: 1, to: 'escalated', idempotencyKey: 'escalate-45', evidence: 'stale', actor: 'test', now: '2026-09-01T00:00:01.000Z' });
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-45', reason: 'ruled', now: '2026-09-01T00:00:02.000Z' });
+  const args = {
+    root, issue: issue(45), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) },
+  };
+  const first = reserveAssignment({ ...args, now: '2026-09-01T00:01:00.000Z' });
+  assert.equal(first.reservation.revision, 4);
+  const released = invalidateManifest({ root, manifest: first.manifest, currentRevision: first.reservation.revision, reason: 'changed', now: '2026-09-01T00:02:00.000Z' });
+  assert.equal(released.released.record.state, 'released');
+  const retry = reserveAssignment({ ...args, now: '2026-09-01T00:03:00.000Z' });
+  assert.equal(retry.reservation.revision, 6);
+  assert.equal(getRecord({ root, id }).state, 'assigned');
 });
 
 test('a comment-only correction invalidates the manifest criteria', () => {
