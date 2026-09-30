@@ -219,6 +219,25 @@ try {
   Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeC4) 'C4: no rotate.ps1 call for already-carried frontier evidence'
   Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE '[]'
 
+  # Case C5 (#231 QA): a frontier-only wake leaves the watermark where it was, so an outbox line written before
+  # the lead's launch (which the wake's -Since excludes) stays "unconsumed" for fleet-dead's Test-WorkWaiting.
+  # The watermark must also advance to the lead's launch: with all heartbeats stale and nothing else waiting,
+  # the tick reads idle, not fleet-dead.
+  Reset-Wake
+  Set-LiveRoster -LeadLaunchedMinutesAgo 60 -Ics 1
+  Set-LeadRow -StartedMinutesAgo 60
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Set-Outbox @((New-OutboxLine 120 'issue-20' 'checks-settled' 'watch:test:issue-20:r2:aa:review' 'pr-watch'))
+  Set-WakeState (Get-WakeStateJson -LastAtMinutesAgo 240 -Digest 'older' -ConsumedMinutesAgo 180)
+  $c5a = Run-Watchdog
+  $w5a = Get-TestWake $c5a
+  Assert-True ($w5a.decision -eq 'woken' -and ((@($w5a.evidence) -join '; ') -eq 'frontier #501')) "C5a: the frontier-only wake must fire (got $($w5a.decision): $(@($w5a.evidence) -join '; '))"
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE '[]'
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 300 }
+  $c5b = Run-Watchdog
+  Assert-True ($c5b.idle -eq $true -and -not (@($c5b.conditions) -contains 'fleet-dead')) "C5b: a pre-launch outbox line must not read as work waiting after a frontier-only wake (idle=$($c5b.idle) conditions=$(@($c5b.conditions) -join ','))"
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 2 }
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
   Write-Output 'frontier-wake-respawn tests passed'
 } finally {

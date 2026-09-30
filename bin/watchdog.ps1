@@ -916,8 +916,8 @@ try {
   # --- lead is rotated NOW through rotate.ps1 -Wake: stop at the boundary, reconcile,
   # --- relaunch through the one door, so the replacement reconstructs from state exactly as
   # --- a rotated lead does. This retires the lead's hourly polling cron. Loop guards: one
-  # --- wake per tenant per tick; never twice for evidence the last wake
-  # --- already carried (by identity: issue numbers and outbox line ids, fleet #231, not digest text) inside
+  # --- wake per tenant per tick; never twice for evidence the last wake already carried
+  # --- (by identity, fleet #231: issue numbers and outbox line ids, not digest text) inside
   # --- frontierWake.cooldownMinutes; the boundary, PAUSE and rotation-off still apply
   # --- inside rotate.ps1; state/flags/frontier-wake-off disables it. Every executed wake is
   # --- a log-only entry in state/alerts/alerts.jsonl (ticket 76, ADR 0012: a wake of a
@@ -1010,10 +1010,14 @@ try {
         $wake.decision = 'woken'
         # fleet #231: the watermark is the newest DELIVERED line's `at` (a line written while rotate.ps1
         # ran is no longer consumed undelivered); with no line delivered the prior watermark stands.
-        $newWatermark = $null
-        if ($leadLines.Count -gt 0) { $newWatermark = ($leadLines | Sort-Object { $_.at } -Descending | Select-Object -First 1).at.ToString('o') }
-        elseif ($tenantState -and $tenantState.outboxConsumedThrough) { $newWatermark = "$($tenantState.outboxConsumedThrough)" }
-        else { $newWatermark = Now-Iso }
+        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, and
+        # fleet-dead/heal, which pass no -Since, would otherwise keep counting them) nor the prior watermark.
+        # Assumes Windows PowerShell 5.1: ConvertFrom-Json leaves ISO strings as strings; under pwsh 7 they become
+        # DateTime and sub-second precision would be lost.
+        $wmCandidates = @($leadLines | ForEach-Object { $_.at })
+        if ($leadLaunchedAt) { $wmCandidates += $leadLaunchedAt }
+        if ($tenantState -and $tenantState.outboxConsumedThrough) { $priorWm = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough; if ($priorWm) { $wmCandidates += $priorWm } }
+        $newWatermark = if ($wmCandidates.Count -gt 0) { (@($wmCandidates | Sort-Object -Descending)[0]).ToString('o') } else { Now-Iso }
         $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = $newWatermark; delivered = @($lineIds); frontierIssues = @($frontierIssues) }) -Force
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
         try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
