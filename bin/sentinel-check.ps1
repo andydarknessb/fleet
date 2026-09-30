@@ -4,7 +4,8 @@
   worktree sweep (merged fleet branches, >7 days, unlocked), PAUSE on a rate-limit signal, clear a PAUSE it set once its window passes.
   Also applied, only under state/flags/ic-cleanup-live (fleet #252): stop + rm an orphan late IC session (its manifest was invalidated, no roster row claims it).
   Same flag (fleet #253): retire an IC roster row that died before ack (no heartbeat, no ack, job gone) and release its reservation.
-  Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack). The Sentinel session acts on those.
+  Same flag (fleet #256 AC2): release an assigned reservation stranded with no roster row, no job and no marker.
+  Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack / reservation-stranded). The Sentinel session acts on those.
 #>
 param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel', [string]$HealRespawn = '')
 . "$PSScriptRoot\_common.ps1"
@@ -636,6 +637,70 @@ $liveFleet = @($daemon | Where-Object { $_.pid -and ($known -contains $_.name) }
 # The cap counts what the door counts: cap-exempt names (config/cycle.json cap.exemptNamePrefixes, the Principal) are outside it.
 $capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
 if ($capCounted.Count -gt [int]$static.cap) { $report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'cap-exceeded'; detail = "$($capCounted.Count) live fleet sessions, cap $($static.cap)" } }
+
+# --- fleet #256 AC2: a stranded reservation ---
+# launch.ps1 leaves an `assigned` Work record behind on several pre-launch refusals (a gh failure, a fetch failure,
+# an assignment-count refusal): no roster row, no job, no invalidation marker, and the planner keeps excluding
+# the issue as reserved (live 2026-09-30: nidus:issue-7, assigned rev 1 since 09-29T18:55Z). A record is stranded
+# when ALL of these hold: state assigned with a manifestPath; its reservation is older than
+# watchdog.strandedReservationHours (default 6), measured from the record's updatedAt (an assigned record is only
+# written at reserve time, and unlike createdAt it is restamped when a released unit is reserved again); no
+# active|retiring roster row names its tenant and issue; no job (a daemon row or any job state under
+# ~/.claude/jobs) has an intent naming its manifest file; and neither <manifest>.invalidated.json nor
+# <manifest>.acknowledged.json exists. The page is raised in every mode; the release (Invoke-ManifestRelease, the
+# helper the dead-before-ack retire uses) needs -Apply AND state/flags/ic-cleanup-live and is deferred under PAUSE.
+# An unreadable state/work/active.json or roster classifies nothing.
+$activeWorkPath = Join-Path $FleetHome 'state\work\active.json'
+$activeWork = $null; $activeWorkUnreadable = $false
+if (Test-Path -LiteralPath $activeWorkPath) {
+  try {
+    $activeWork = Get-Content -LiteralPath $activeWorkPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $activeWork) { throw 'empty active.json' }
+  } catch { $activeWorkUnreadable = $true; $activeWork = $null }
+}
+if ($activeWorkUnreadable) { $report.ok += [pscustomobject]@{ name = 'work-state-read'; detail = 'state/work/active.json unreadable; stranded-reservation check skipped' } }
+elseif (-not $rosterUnreadable -and $null -ne $activeWork -and $activeWork.PSObject.Properties['records'] -and $null -ne $activeWork.records) {
+  $jobIntents = $null   # loaded once, only when a record gets past the cheap tests
+  foreach ($prop in @($activeWork.records.PSObject.Properties)) {
+    $rec = $prop.Value
+    if ("$($rec.state)" -ne 'assigned' -or -not "$($rec.manifestPath)") { continue }
+    $reservedAt = ConvertTo-UtcDateTime $(if ($rec.PSObject.Properties['updatedAt'] -and $rec.updatedAt) { $rec.updatedAt } else { $rec.createdAt })
+    if ($null -eq $reservedAt) { continue }
+    $ageHours = ($now - $reservedAt).TotalHours
+    if ($ageHours -le $script:StrandedReservationHours) { continue }
+    $manifestPath = "$($rec.manifestPath)"
+    if ((Test-Path -LiteralPath "$manifestPath.invalidated.json") -or (Test-Path -LiteralPath "$manifestPath.acknowledged.json")) { continue }
+    $claimed = @($rosterRows | Where-Object { "$($_.status)" -in @('active', 'retiring') -and "$($_.tenant)" -eq "$($rec.tenant)" -and "$($_.issue)" -eq "$($rec.issue)" })
+    if ($claimed.Count -gt 0) { continue }
+    if ($null -eq $jobIntents) {
+      $jobIntents = @()
+      $jobIds = @($daemon | ForEach-Object { "$($_.id)" } | Where-Object { $_ })
+      $jobsDir = Join-Path $env:USERPROFILE '.claude\jobs'
+      if (Test-Path -LiteralPath $jobsDir) { $jobIds += @(Get-ChildItem -LiteralPath $jobsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
+      foreach ($jid in @($jobIds | Select-Object -Unique)) {
+        try { $jst = Get-JobState $jid; if ($jst -and $jst.PSObject.Properties['intent'] -and $jst.intent) { $jobIntents += ("$($jst.intent)").ToLowerInvariant() } } catch {}
+      }
+    }
+    $manifestLeaf = (Split-Path -Leaf $manifestPath).ToLowerInvariant()
+    if (@($jobIntents | Where-Object { $_.Contains($manifestLeaf) }).Count -gt 0) { continue }
+    $strandedParent = ''
+    try { $mf = Read-Json $manifestPath; if ($mf -and $mf.PSObject.Properties['parent'] -and $mf.parent) { $strandedParent = "$($mf.parent)" } } catch {}
+    $reason = "stranded reservation: assigned since $($reservedAt.ToString('o')) with no roster row, no job and no marker"
+    $outcome = 'would release (state/flags/ic-cleanup-live absent)'
+    if (-not $Apply -and (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")) { $outcome = 'would release (read-only run)' }
+    if ($cleanupLive) {
+      if (Test-Paused) {
+        $outcome = 'release deferred: PAUSE is set'
+      } else {
+        $release = Invoke-ManifestRelease -Manifest $manifestPath -WorkRecordId "$($rec.id)" -Reason $reason
+        $entry = [pscustomobject]@{ recordId = "$($rec.id)"; tenant = "$($rec.tenant)"; issue = $rec.issue; manifest = $manifestPath; reservedAt = $reservedAt.ToString('o'); ageHours = [math]::Round($ageHours, 1); release = $release }
+        if ($release.ok) { $outcome = 'released'; $report.strandedReleased += $entry }
+        else { $outcome = "release failed: $($release.code) ($($release.detail))"; $report.strandedReleaseFailed += $entry }
+      }
+    }
+    $report.escalate += [pscustomobject]@{ name = "$($rec.id)"; kind = 'reservation-stranded'; detail = "Work record $($rec.id) has been assigned since $($reservedAt.ToString('o')) ($([int]$ageHours) h, limit $($script:StrandedReservationHours) h) with no roster row for $($rec.tenant) issue #$($rec.issue), no job naming $manifestLeaf and no invalidation or ack marker; $outcome"; parent = $strandedParent }
+  }
+}
 
 # --- clear a PAUSE we set once its window passed ---
 if (Test-Paused) {

@@ -379,8 +379,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $r10o3 = Run-Watchdog
   Assert-True (-not (@($r10o3.conditions) -contains 'escalation:ic-1001:orphan-late-session')) 'the orphan escalation clears once the row goes'
   Remove-Item "$orphanManifest.invalidated.json" -Force
-  # ic-dead-before-ack (#253) is a paging kind too, wired here with #252 so the two land together. The
-  # check that raises it arrives with #253, so a canned check report stands in for it.
+  # ic-dead-before-ack (#253) is a paging kind too, wired here with #252 so the two land together. A canned
+  # check report stands in for the real check (tests/sentinel-dead-before-ack.tests.ps1 covers that).
   $origCheckDba = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
   Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1002"; kind = "ic-dead-before-ack"; detail = "canned"; parent = "pl-test" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
   try { $r10dba = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckDba }
@@ -389,6 +389,16 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1002-ic-dead-before-ack.json').Count -eq 1) 'ic-dead-before-ack leaves one escalation file'
   $r10dba2 = Run-Watchdog
   Assert-True (-not (@($r10dba2.conditions) -contains 'escalation:ic-1002:ic-dead-before-ack')) 'the ic-dead-before-ack escalation clears once the check stops raising it'
+  # reservation-stranded (#256 AC2) is a paging kind too (normal). The Work record id is the escalation name, so the
+  # key carries the tenant:issue-N colon; the escalation file name sanitizes it.
+  $origCheckRs = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "nidus:issue-7"; kind = "reservation-stranded"; detail = "canned"; parent = "pl-nidus" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
+  try { $r10rs = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckRs }
+  Assert-True (@($r10rs.conditions) -contains 'escalation:nidus:issue-7:reservation-stranded') 'reservation-stranded must become an escalation condition'
+  Assert-True ((@($r10rs.newlyPaged | Where-Object { $_.key -eq 'escalation:nidus:issue-7:reservation-stranded' })[0]).priority -eq 'normal') 'reservation-stranded pages at normal priority'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-nidus_issue-7-reservation-stranded.json').Count -eq 1) 'reservation-stranded leaves one escalation file'
+  $r10rs2 = Run-Watchdog
+  Assert-True (-not (@($r10rs2.conditions) -contains 'escalation:nidus:issue-7:reservation-stranded')) 'the reservation-stranded escalation clears once the check stops raising it'
 
   # Case 10e: `blocked` is recorded as waiting, never paged, never filed.
   $blockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
@@ -1778,6 +1788,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r10d.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-777:stray' })[0]).priority -eq 'normal') 'stray is deliberately normal'
   Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session (#252) is deliberately normal'
   Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack (#253) is deliberately normal'
+  Assert-True ((@($r10rs.newlyPaged | Where-Object { $_.key -eq 'escalation:nidus:issue-7:reservation-stranded' })[0]).priority -eq 'normal') 'reservation-stranded (#256) is deliberately normal'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
   Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'
