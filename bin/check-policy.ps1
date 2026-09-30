@@ -101,3 +101,27 @@ function Get-CheckPolicyEvaluation {
     Unclassified = @($unclassified | Sort-Object)
   }
 }
+
+# fleet #232: pages.priority.<kind> and pages.defaultPriority must be emergency|high|normal; the
+# Watchdog falls back to a built-in for anything else, and setup.ps1 refuses it up front.
+# Standalone on purpose (no _common.ps1): the set is repeated here.
+function Get-PagesPriorityFindings {
+  param($Pages)
+  $valid = @('emergency', 'high', 'normal')
+  if (-not $Pages) { return }
+  $found = @()
+  if ($Pages.PSObject.Properties['priority'] -and $Pages.priority) {
+    if ($Pages.priority -isnot [pscustomobject]) {
+      # not a map (a bare string, say): the block itself is the finding, not its .Length
+      $found += [pscustomobject]@{ Key = 'pages.priority'; Value = "$($Pages.priority)" }
+    } else {
+      foreach ($p in $Pages.priority.PSObject.Properties) {
+        if ($valid -notcontains "$($p.Value)") { $found += [pscustomobject]@{ Key = "pages.priority.$($p.Name)"; Value = "$($p.Value)" } }
+      }
+    }
+  }
+  if ($Pages.PSObject.Properties['defaultPriority'] -and $Pages.defaultPriority -and $valid -notcontains "$($Pages.defaultPriority)") {
+    $found += [pscustomobject]@{ Key = 'pages.defaultPriority'; Value = "$($Pages.defaultPriority)" }
+  }
+  $found
+}

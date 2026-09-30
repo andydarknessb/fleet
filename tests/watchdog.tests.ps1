@@ -2047,6 +2047,155 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\profile\.claude\jobs\job-d-wedge" -Recurse -ErrorAction SilentlyContinue
   Set-AgentsRows $noSentinelRows
 
+  # ===== fleet #232: an invalid pages.priority.<kind> / pages.defaultPriority value =====
+  # ===== never reaches Send-FleetPage's ValidateSet. The page goes at the kind's =====
+  # ===== built-in default, the tick completes (shadow line, last-run.json, paged =====
+  # ===== state), and the bad value is reported: a tick-line field every tick, and =====
+  # ===== one config-invalid:<key> condition that pages once (paged.json dedupe, =====
+  # ===== the same once-per-key rule dated:<where> uses) and clears when fixed. =====
+  function Run-WatchdogCaptured {
+    # Run-Watchdog returns $null for a crashed tick (its only stdout line is the
+    # final JSON entry; the outer catch writes the error and exits 1). This variant
+    # merges the error stream so the assertion can name the crash.
+    $raw = & "$testRoot\bin\watchdog.ps1" -NoToast 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $lines = @($raw -split "`n" | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    $jsonLine = @($lines | Where-Object { $_.StartsWith('{') })
+    $line = $null
+    if ($jsonLine.Count -gt 0) { try { $line = $jsonLine[-1] | ConvertFrom-Json } catch {} }
+    $errText = (@($lines | Where-Object { -not $_.StartsWith('{') }) -join ' | ')
+    if ($errText.Length -gt 400) { $errText = $errText.Substring(0, 400) + '...' }
+    return [pscustomobject]@{ crashed = (($code -ne 0) -or ($null -eq $line)); exitCode = $code; error = $errText; line = $line }
+  }
+  function Stop-MockPushover232 {
+    # Stop-Job on a listener blocked in GetContext() waits ~120s; serving its
+    # remaining request budget first lets the job end on its own.
+    param($Mock)
+    if (-not ($Mock -and $Mock.Job)) { return }
+    for ($i = 0; $i -lt 20; $i++) { try { Invoke-WebRequest -Uri $Mock.Prefix -Method Post -Body 'drain=1' -TimeoutSec 2 -UseBasicParsing | Out-Null } catch { break } }
+    Stop-Job $Mock.Job -ErrorAction SilentlyContinue; Remove-Job $Mock.Job -Force -ErrorAction SilentlyContinue
+  }
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  $pushLog232 = Join-Path $testRoot 'pushover-requests-232.log'
+  [IO.File]::WriteAllText($pushLog232, '')
+  $pushMock232 = Start-MockPushover -LogPath $pushLog232 -Count 6
+  $oldPushoverUrl232 = $env:FLEET_PUSHOVER_URL
+  $env:FLEET_PUSHOVER_URL = $pushMock232.Prefix
+  [IO.Directory]::CreateDirectory("$testRoot\state\pages") | Out-Null
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-232","user":"usr-232"}'
+  function Get-ShadowLineCount232 {
+    # Today's (UTC-dated) shadow log; the settle tick below guarantees one exists.
+    $f = @(Get-ChildItem "$testRoot\state\sentinel\shadow" -Filter *.jsonl | Sort-Object Name)[-1].FullName
+    @(Get-Content $f | Where-Object { $_ }).Count
+  }
+  try {
+    # Clean baseline: the ticket-77 permission-wait fixture (ic-950 on the live roster,
+    # its daemon row present, its job state toggling `needs`), sentinel-off standing,
+    # fresh static heartbeats, no config, no paged state. Settled and asserted clean so
+    # every condition below is attributable to the case that raised it.
+    Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+    Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-950","role":"ic","tenant":"test","parent":"pl-test","issue":950,"status":"active"}]}'
+    Write-Utf8 "$testRoot\state\flags\sentinel-off" 'fleet #232'
+    Remove-Item "$testRoot\state\heartbeats\sentinel.json" -ErrorAction SilentlyContinue
+    foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic-950") | Out-Null
+    $jobStatePath232 = "$testRoot\profile\.claude\jobs\job-ic-950\state.json"
+    Write-Utf8 $jobStatePath232 ('{"needs":"","updatedAt":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}')
+    $pwRow232 = '{"id":"job-ic-950","name":"ic-950","state":"working","status":"idle","pid":88,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-1)) + '}'
+    Set-AgentsRows ($noSentinelRows.TrimEnd(']') + ',' + $pwRow232 + ']')
+    Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
+    $iv0 = Run-WatchdogCaptured
+    Assert-True (-not $iv0.crashed -and @($iv0.line.conditions).Count -eq 0) "the #232 baseline must be a clean tick (crashed=$($iv0.crashed) conditions=$(@($iv0.line.conditions) -join ','))"
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+    # Case IV1 (red-tell, AC1): pages.priority.permission-wait carries a typo and a
+    # permission-wait condition stands. Today: Send-FleetPage's ValidateSet rejects
+    # 'hgih', the throw lands in the outer catch, exit 1, no page, no paged.json, no
+    # shadow line, no last-run.json. Expected: the page goes at permission-wait's
+    # built-in default (high, Pushover 1) and the tick completes.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"priority":{"permission-wait":"hgih"}}}'
+    Write-Utf8 $jobStatePath232 ('{"needs":"approve Read: something","updatedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '"}')
+    $shadowBefore232 = Get-ShadowLineCount232
+    $iv1 = Run-WatchdogCaptured
+    Assert-True (-not $iv1.crashed) "a typo in pages.priority.permission-wait must not crash the tick (exit $($iv1.exitCode): $($iv1.error))"
+    $iv1Entry = @($iv1.line.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]
+    Assert-True ($null -ne $iv1Entry -and $iv1Entry.priority -eq 'high') "the permission-wait page must go at the kind's built-in default, high (got $($iv1Entry | ConvertTo-Json -Compress))"
+    Assert-True ($iv1Entry.page.pushover -eq $true) 'the permission-wait page must be delivered'
+    $iv1Posts = @(Get-PostedBodies $pushLog232 | ForEach-Object { ConvertFrom-FormBody $_ })
+    Assert-True (@($iv1Posts | Where-Object { $_.priority -eq '1' -and $_.message -like 'ic-950*permission*prompt*' }).Count -eq 1) "exactly one permission-wait page must reach Pushover at priority 1 (got $(@($iv1Posts | ForEach-Object { $_.priority }) -join ','))"
+    Assert-True ((Get-ShadowLineCount232) -eq $shadowBefore232 + 1) 'the tick must write its shadow line'
+    $lastRun232 = (Get-Content "$testRoot\state\watchdog\last-run.json" -Raw) | ConvertFrom-Json
+    Assert-True ("$($lastRun232.at)" -eq "$($iv1.line.at)") 'the tick must write last-run.json'
+    $paged232 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -ne $paged232.'permission-wait:ic-950:job-ic-950' -and "$($paged232.'permission-wait:ic-950:job-ic-950'.deliveredAt)" -ne '') 'the paged state must record the delivered permission-wait'
+    # AC3: the invalid value is visible - a tick-line field naming key and value, and
+    # a normal-priority config-invalid condition that pages once.
+    Assert-True (@($iv1.line.invalidPagePriority | Where-Object { $_.key -eq 'pages.priority.permission-wait' -and $_.value -eq 'hgih' }).Count -eq 1) "the tick line must name the invalid key and value (got $($iv1.line.invalidPagePriority | ConvertTo-Json -Compress))"
+    Assert-True (@($iv1.line.conditions) -contains 'config-invalid:pages.priority.permission-wait') 'the invalid value must stand as a config-invalid:<key> condition'
+    $iv1Cfg = @($iv1.line.newlyPaged | Where-Object { $_.key -eq 'config-invalid:pages.priority.permission-wait' })[0]
+    Assert-True ($null -ne $iv1Cfg -and $iv1Cfg.priority -eq 'normal') 'the config-invalid condition pages at normal'
+    Assert-True (@($iv1Posts | Where-Object { $_.priority -eq '0' -and $_.message -like '*pages.priority.permission-wait*hgih*' }).Count -eq 1) 'the config-invalid page must reach Pushover once at priority 0, naming key and value'
+
+    # Case IV2: the same standing typo pages nothing on the next tick (once, not every
+    # tick); the tick-line field may repeat, the page may not.
+    $iv2 = Run-WatchdogCaptured
+    Assert-True (-not $iv2.crashed) "a standing typo must not crash the next tick (exit $($iv2.exitCode): $($iv2.error))"
+    Assert-True (@($iv2.line.newlyPaged).Count -eq 0) "a standing typo and a standing permission-wait must page nothing new (got $($iv2.line.newlyPaged | ConvertTo-Json -Compress))"
+    Assert-True (@(Get-PostedBodies $pushLog232).Count -eq 2) 'no third POST on the second tick'
+    Assert-True (@($iv2.line.conditions) -contains 'config-invalid:pages.priority.permission-wait') 'config-invalid stays a condition while the typo stands'
+
+    # Case IV3: fixing the value clears the condition; the permission-wait stays deduped.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"priority":{"permission-wait":"high"}}}'
+    $iv3 = Run-WatchdogCaptured
+    Assert-True (-not $iv3.crashed) "the fixed config must tick cleanly (exit $($iv3.exitCode): $($iv3.error))"
+    Assert-True (-not (@($iv3.line.conditions) -contains 'config-invalid:pages.priority.permission-wait')) 'fixing the value must clear the config-invalid condition'
+    Assert-True (@($iv3.line.invalidPagePriority).Count -eq 0) 'a valid config reports no invalid priority'
+    Assert-True (@($iv3.line.newlyPaged).Count -eq 0) 'the already-delivered permission-wait must not page again after the fix'
+
+    # Reset: answer the prompt, settle, drop paged state.
+    Write-Utf8 $jobStatePath232 ('{"needs":"","updatedAt":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}')
+    Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+    $null = Run-WatchdogCaptured
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog232, '')
+
+    # Case IV4 (red-tell, AC2): pages.defaultPriority is invalid and a condition of a
+    # kind with no built-in default stands (dated:<where>, raised by the same config
+    # file's expired *Until key). Today: 'loud' reaches the ValidateSet and the tick
+    # crashes. Expected: the dated page goes at normal (Pushover 0), the tick completes,
+    # and pages.defaultPriority is reported as invalid, once.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"defaultPriority":"loud"},"ic":{"soakUntil":"2026-09-16T00:00:00Z"}}'
+    $shadowBefore232b = Get-ShadowLineCount232
+    $iv4 = Run-WatchdogCaptured
+    Assert-True (-not $iv4.crashed) "an invalid pages.defaultPriority must not crash the tick (exit $($iv4.exitCode): $($iv4.error))"
+    Assert-True (@($iv4.line.conditions) -contains 'dated:config.ic.soakUntil') 'the dated condition (an unmapped kind) must stand'
+    $iv4Entry = @($iv4.line.newlyPaged | Where-Object { $_.key -eq 'dated:config.ic.soakUntil' })[0]
+    Assert-True ($null -ne $iv4Entry -and $iv4Entry.priority -eq 'normal' -and $iv4Entry.page.pushover -eq $true) "an unmapped kind under an invalid default must page at normal (got $($iv4Entry | ConvertTo-Json -Compress))"
+    $iv4Posts = @(Get-PostedBodies $pushLog232 | ForEach-Object { ConvertFrom-FormBody $_ })
+    Assert-True (@($iv4Posts | Where-Object { $_.priority -eq '0' -and $_.message -like '*soakUntil*' }).Count -eq 1) 'the dated page must reach Pushover once at priority 0'
+    Assert-True ((Get-ShadowLineCount232) -eq $shadowBefore232b + 1) 'the tick must write its shadow line under an invalid default'
+    Assert-True ("$(((Get-Content "$testRoot\state\watchdog\last-run.json" -Raw) | ConvertFrom-Json).at)" -eq "$($iv4.line.at)") 'the tick must write last-run.json under an invalid default'
+    Assert-True (@($iv4.line.invalidPagePriority | Where-Object { $_.key -eq 'pages.defaultPriority' -and $_.value -eq 'loud' }).Count -eq 1) "the tick line must name pages.defaultPriority and its value (got $($iv4.line.invalidPagePriority | ConvertTo-Json -Compress))"
+    Assert-True (@($iv4.line.conditions) -contains 'config-invalid:pages.defaultPriority') 'the invalid default must stand as a config-invalid condition'
+    Assert-True (@($iv4Posts | Where-Object { $_.priority -eq '0' -and $_.message -like '*pages.defaultPriority*loud*' }).Count -eq 1) 'the config-invalid page for the default must reach Pushover once at priority 0'
+    $iv5 = Run-WatchdogCaptured
+    Assert-True (-not $iv5.crashed -and @($iv5.line.newlyPaged).Count -eq 0 -and @(Get-PostedBodies $pushLog232).Count -eq 2) 'a standing invalid default pages nothing new on the next tick'
+  } finally {
+    Stop-MockPushover232 $pushMock232
+    if ($oldPushoverUrl232) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl232 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Set-AgentsRows $noSentinelRows
+  $null = Run-Watchdog
+
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath
