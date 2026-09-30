@@ -33,7 +33,7 @@ A PR awaits you when it is open, non-draft, and its branch starts with the tenan
 ### 2. Launch ICs onto the frontier
 The hook computes the assignment frontier for you. One launch per turn, while the cap and `maxIcs` allow.
 
-**Planner path** (the hook says "assignment frontier"; the 02/03 cutover, permanent since ticket 89). The planner selected the head from GitHub facts (ready, open, unassigned, no open blockers, not a spec parent and not labelled `spec` (a spec with no sub-issues is refused as `spec-uncut`: cut it or drop the label), not `ready-for-human`, not excluded, not reserved), oldest first. Reserve it, then launch it, two commands and nothing else:
+**Planner path** (the hook says "assignment frontier"; the 02/03 cutover, permanent since ticket 89). The planner selected the head from GitHub facts (ready, open, unassigned, no open blockers, not a spec parent and not labelled `spec` (a spec with no sub-issues is refused as `spec-uncut`: cut it or drop the label; one whose sub-issues are all closed as `spec-done`: close it after the two checks under Closing a spec parent, or cut the uncovered deliverable as a new sub-issue), not `ready-for-human`, not excluded, not reserved), oldest first. Reserve it, then launch it, two commands and nothing else:
 
 ```
 node C:/Users/Cory/fleet/bin/assignment.js assign --root C:/Users/Cory/fleet --tenant <tenant> --tenant-config C:/Users/Cory/fleet/tenants/<tenant>.json --repo-path <tenant repo> --parent <your name> --model <haiku|sonnet> [--permissions allowlist (haiku only, required)] --risk <standard|high> [--context-headings "<h1>,<h2>"] [--adr-paths "<path>,<path>"] [--independence-proof '<json>'] [--reservations '<json>'] [--premises-rechecked <base sha>]

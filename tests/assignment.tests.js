@@ -87,7 +87,9 @@ test('a spec-labelled issue is never launchable, even with no sub-issues, and sa
   assert.deepEqual(reasons.get(20).map((reason) => reason.code), ['spec-uncut']);
   assert.match(reasons.get(20)[0].detail, /spec label with no sub-issues; cut it into tickets or remove the spec label to build it as one ticket/);
   assert.deepEqual(reasons.get(21).map((reason) => reason.code), ['spec-parent'], 'open sub-issues keep the distinct spec-parent code');
-  assert.deepEqual(reasons.get(22).map((reason) => reason.code), ['spec-uncut'], 'every child closed is still a spec, not a ticket');
+  assert.deepEqual(reasons.get(22).map((reason) => reason.code), ['spec-done'], 'every child closed is still a spec, not a ticket, and not one to unlabel');
+  assert.match(reasons.get(22)[0].detail, /every sub-issue is closed; close the spec after the two checks in project-lead.md, or cut the uncovered deliverable as a new sub-issue/);
+  assert.doesNotMatch(reasons.get(22)[0].detail, /remove the spec label/);
 });
 
 test('a haiku-rehearsal issue is off the live frontier even when it carries the ready label (fleet #182)', () => {

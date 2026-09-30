@@ -194,6 +194,7 @@ function normalizeIssue(issue) {
     return !['CLOSED', 'MERGED', 'RESOLVED'].includes(String(dependency.state || '').toUpperCase());
   });
   const subIssues = issue.subIssuesSummary || issue.sub_issues_summary || {};
+  const subIssueTotal = Number(subIssues.total) || 0;
   const isSpecParent = Boolean(issue.isSpecParent || issue.specParent || (Number(subIssues.total) > Number(subIssues.completed || 0)));
   return {
     ...issue,
@@ -203,6 +204,7 @@ function normalizeIssue(issue) {
     assignees: (issue.assignees || []).map((assignee) => typeof assignee === 'string' ? assignee : assignee.login || assignee.name).filter(Boolean),
     unresolvedDependencies,
     isSpecParent,
+    subIssueTotal,
     bodyHash: issue.bodyHash || sha256(issue.body || ''),
     criteriaHash: issue.criteriaHash || criteriaHash({ ...issue, comments }),
     comments,
@@ -473,8 +475,12 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (issue.unresolvedDependencies.length) reasons.push({ code: 'dependency-blocked', detail: issue.unresolvedDependencies.map((dependency) => dependency.number || dependency.id || dependency).join(', ') });
     if (issue.isSpecParent) reasons.push({ code: 'spec-parent', detail: 'sub-issues remain or issue is marked as a spec parent' });
     // fleet #260: the label is evidence on its own. Sub-issue counts say a spec has been cut; they
-    // never say an issue is not a spec. A spec with nothing open under it is not one ticket either.
-    else if (issue.labels.includes(SPEC_LABEL)) reasons.push({ code: 'spec-uncut', detail: 'spec label with no sub-issues; cut it into tickets or remove the spec label to build it as one ticket' });
+    // never say an issue is not a spec. A spec with nothing open under it is not one ticket either:
+    // uncut (no sub-issues at all) or done (every sub-issue closed), each with its own way forward.
+    else if (issue.labels.includes(SPEC_LABEL)) {
+      if (issue.subIssueTotal > 0) reasons.push({ code: 'spec-done', detail: 'every sub-issue is closed; close the spec after the two checks in project-lead.md, or cut the uncovered deliverable as a new sub-issue' });
+      else reasons.push({ code: 'spec-uncut', detail: 'spec label with no sub-issues; cut it into tickets or remove the spec label to build it as one ticket' });
+    }
     if (issue.commentsTruncated) reasons.push({ code: 'issue-comments-truncated', detail: 'the complete issue comment thread could not be pinned' });
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
     if (readyLabel !== REHEARSAL_LABEL && issue.labels.includes(REHEARSAL_LABEL)) reasons.push({ code: 'haiku-rehearsal', detail: `${REHEARSAL_LABEL} label is present; the rehearsal owner holds it` });
