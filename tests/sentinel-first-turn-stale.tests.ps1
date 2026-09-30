@@ -155,13 +155,14 @@ Write-Output ('[{"id":"job-900","name":"ic-900","state":"working","status":"' + 
   Assert-True ((First-Turn-Escalations $a7b).Count -eq 1) 'A7b: busy with only a background task in flight and a quiet job reads as stale'
   Remove-Item Env:MOCK_STATUS
 
-  # A8: a firstTerminalAt means the first turn DID end: not respawned; the stop hook is what is not writing.
+  # A8: a firstTerminalAt is the job's FIRST TERMINAL STATE (done), not proof that a turn ended: the job is not a hung first turn,
+  # so it is not respawned; the diagnosis named is narrow - a stop hook that failed after the job went done.
   Reset-Case
   Write-Job -UpdatedMinutesAgo 90 -FirstTerminalAt (Iso-Ago 150)
   Write-Utf8 $flagPath 'shadow week passed'
   $a8 = Run-Check -Apply
-  Assert-True ((First-Turn-Escalations $a8).Count -eq 0 -and @($a8.respawned).Count -eq 0 -and (Get-Calls).Count -eq 0) 'A8: a finished first turn is not respawned'
-  Assert-True (@($a8.ok | Where-Object { $_.name -eq 'ic-900' -and "$($_.detail)" -match 'first turn ended at' -and "$($_.detail)" -match 'stop hook is not writing' }).Count -eq 1) "A8: ok names the stop hook (got: $((Names-In-Ok $a8) -join '; '))"
+  Assert-True ((First-Turn-Escalations $a8).Count -eq 0 -and @($a8.respawned).Count -eq 0 -and (Get-Calls).Count -eq 0) 'A8: a job that reached its first terminal state is not respawned'
+  Assert-True (@($a8.ok | Where-Object { $_.name -eq 'ic-900' -and "$($_.detail)" -match 'first terminal state \(done\) at' -and "$($_.detail)" -match 'stop hook failed after done' -and "$($_.detail)" -notmatch 'first turn ended' }).Count -eq 1) "A8: ok names the first terminal state and only a stop hook failure after done (got: $((Names-In-Ok $a8) -join '; '))"
 
   # A9: no launchedAt on the row: startedAt stands in. Both unparseable: nothing.
   Reset-Case

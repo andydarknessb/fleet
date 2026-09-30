@@ -65,6 +65,11 @@ if ($Mode -eq 'respawn') {
   exit 0
 }
 $id = if ($env:MOCK_ROW_ID) { $env:MOCK_ROW_ID } else { 'job-900' }
+if ($env:MOCK_ROW_DOWN -eq '1' -and $n -eq 0) {
+  # reaped: no process until the first respawn brings one back
+  Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"stopped","status":"idle","pid":null,"startedAt":"2026-08-28T00:00:00Z"}]')
+  exit 0
+}
 Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"idle","pid":' + (900 + $n) + ',"startedAt":"2026-08-28T00:00:00Z"}]')
 '@
   Write-Utf8 "$testRoot\mock-bin\mock-claude.ps1" ($mockClaude.Replace('TESTROOT', $testRoot))
@@ -88,7 +93,7 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   Assert-True ($e1.Count -eq 1) 'B1: one respawn-loop escalation for ic-900'
   if ($e1.Count -eq 1) {
     Assert-True ($e1[0].parent -eq 'pl-test') 'B1: the escalation carries the parent'
-    Assert-True ($e1[0].detail -match 'job job-900 respawned 3 times since' -and $e1[0].detail -match 'heartbeat: last at' -and $e1[0].detail -match 'respawn held until a heartbeat newer than' -and $e1[0].detail -match 'rotate\.ps1' -and $e1[0].detail -match 'respawn-streak\.json' -and $e1[0].detail -match 'heartbeat stale') "B1: the escalation explains the loop and the ways out (got: $($e1[0].detail))"
+    Assert-True ($e1[0].detail -match 'job job-900 respawned 3 times since' -and $e1[0].detail -match 'heartbeat: last at' -and $e1[0].detail -match 'respawn held until a heartbeat newer than' -and $e1[0].detail -match 'rotate\.ps1' -and $e1[0].detail -match 'respawn-streak\.json' -and $e1[0].detail -match [regex]::Escape('delete state/sentinel/respawn-streak.json (safe: it only resets the counts)') -and $e1[0].detail -notmatch 'delete the entry' -and $e1[0].detail -match 'heartbeat stale') "B1: the escalation explains the loop and the ways out (got: $($e1[0].detail))"
   }
   $c1 = @(Get-Calls)
   Assert-True ($c1.Count -eq 3 -and @($c1 | Where-Object { $_ -eq 'claude respawn job-900' }).Count -eq 3) "B1: exactly three claude respawn job-900 calls (calls: $($c1 -join '; '))"
@@ -148,6 +153,13 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   Assert-True ((Get-Content $streakPath -Raw) -eq '{oops') 'B6: the corrupt file is left exactly as found'
   Assert-True (@($b6.escalate | Where-Object { $_.name -eq 'fleet' -and $_.kind -eq 'respawn-loop' }).Count -eq 1) 'B6: one respawn-loop escalation for fleet'
   Assert-True (@($b6.ok | Where-Object { $_.name -eq 'respawn-streak-read' }).Count -eq 1) 'B6: the read failure is named under ok'
+  $e6 = @($b6.escalate | Where-Object { $_.name -eq 'fleet' -and $_.kind -eq 'respawn-loop' })
+  Assert-True ($e6.Count -eq 1 -and $e6[0].detail -match [regex]::Escape('delete state/sentinel/respawn-streak.json (safe: it only resets the counts)')) "B6: the escalation says to delete the file, not to hand-edit it (got: $($e6 | ForEach-Object { $_.detail }))"
+  # B6 (b): raised on the read itself, every tick while the file is corrupt, even when nothing needs a respawn.
+  Set-Heartbeat 0
+  $b6fresh = Run-Check
+  Assert-True (@($b6fresh.respawned).Count -eq 0 -and @($b6fresh.respawnDeferred).Count -eq 0 -and @($b6fresh.escalate | Where-Object { $_.name -eq 'fleet' -and $_.kind -eq 'respawn-loop' }).Count -eq 1 -and @($b6fresh.ok | Where-Object { $_.name -eq 'respawn-streak-read' }).Count -eq 1) 'B6: a corrupt file is escalated on the read, with no respawn pending'
+  Set-Heartbeat 3
   $b6b = Run-Check
   Assert-True (@($b6b.respawned).Count -eq 0 -and @($b6b.respawnDeferred).Count -eq 1) 'B6: a read-only run defers too'
   # A structurally wrong file (an array, an entry with no attempts list) is unreadable as well.
@@ -173,12 +185,54 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   $b8 = Run-Check -Apply -Actor watchdog -Heal 'ic-900'
   Assert-True (@($b8.respawnHeld).Count -eq 1 -and @($b8.respawnHeld)[0].name -eq 'ic-900' -and @($b8.respawned).Count -eq 0 -and (Get-Calls).Count -eq 0) 'B8: a heal respawn of a held name is held, no respawn call'
 
+  # B10 liveness first: the hold is for a row WITH a live pid (respawn verified, no turn follows). A held job that is later
+  # reaped (no pid) is respawned as on master, counted, and raises respawn-loop-down beside it.
+  Reset-Case
+  Write-Streak 'job-900' @(30, 20, 10)
+  $b10held = Run-Check -Apply
+  Assert-True (@($b10held.respawnHeld).Count -eq 1 -and @($b10held.respawned).Count -eq 0) 'B10: control, the live-idle row is held'
+  $env:MOCK_ROW_DOWN = '1'
+  Remove-Item "$testRoot\mock-respawn-counter.txt", "$testRoot\calls.txt" -ErrorAction SilentlyContinue
+  $b10 = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_DOWN
+  Assert-True (@($b10.respawned).Count -eq 1 -and @($b10.respawnHeld).Count -eq 0 -and (Get-Calls).Count -eq 1) "B10: a row with no pid is respawned despite the streak (respawned $(@($b10.respawned).Count), held $(@($b10.respawnHeld).Count))"
+  $e10 = @($b10.escalate | Where-Object { $_.name -eq 'ic-900' -and $_.kind -eq 'respawn-loop-down' })
+  Assert-True ($e10.Count -eq 1 -and $e10[0].parent -eq 'pl-test' -and $e10[0].detail -match '3 times' -and $e10[0].detail -match 'keeps going down' -and $e10[0].detail -match 'respawning anyway') "B10: respawn-loop-down names the attempts and that the session keeps going down (got: $($e10 | ForEach-Object { $_.detail }))"
+  Assert-True (@($b10.escalate | Where-Object { $_.kind -eq 'respawn-loop' }).Count -eq 0) 'B10: and it is not also reported as the live-idle respawn-loop'
+  Assert-True (@((Read-Streak).'ic-900'.attempts).Count -eq 4) 'B10: the no-pid respawn is still counted in the streak'
+
+  # B11 under the cap: a no-pid respawn with fewer than cap attempts raises nothing.
+  Reset-Case
+  Write-Streak 'job-900' @(30, 20)
+  $env:MOCK_ROW_DOWN = '1'
+  $b11 = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_DOWN
+  Assert-True (@($b11.respawned).Count -eq 1 -and @($b11.escalate | Where-Object { $_.kind -like 'respawn-loop*' }).Count -eq 0) 'B11: a no-pid respawn under the cap raises no page'
+  Assert-True (@((Read-Streak).'ic-900'.attempts).Count -eq 3) 'B11: and is counted'
+
+  # B12 read-only: the no-pid respawn is proposed, respawn-loop-down is reported, nothing is written.
+  Reset-Case
+  Write-Streak 'job-900' @(30, 20, 10)
+  $before12 = Get-Content $streakPath -Raw
+  $env:MOCK_ROW_DOWN = '1'
+  $b12 = Run-Check
+  Remove-Item Env:MOCK_ROW_DOWN
+  Assert-True (@($b12.respawned).Count -eq 1 -and @($b12.escalate | Where-Object { $_.kind -eq 'respawn-loop-down' }).Count -eq 1 -and (Get-Content $streakPath -Raw) -eq $before12 -and (Get-Calls).Count -eq 0) 'B12: a read-only run proposes the no-pid respawn, reports respawn-loop-down and writes nothing'
+
+  # B13 liveness first also when the streak file is corrupt: a row with no pid is still respawned (the file stays untouched).
+  Reset-Case
+  Write-Utf8 $streakPath '{oops'
+  $env:MOCK_ROW_DOWN = '1'
+  $b13 = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_DOWN
+  Assert-True (@($b13.respawned).Count -eq 1 -and @($b13.respawnDeferred).Count -eq 0 -and (Get-Content $streakPath -Raw) -eq '{oops' -and @($b13.escalate | Where-Object { $_.name -eq 'fleet' -and $_.kind -eq 'respawn-loop' }).Count -eq 1) 'B13: a no-pid row is respawned even with an unreadable streak file, which is left as found'
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) respawn-loop assertion(s) failed" }
   Write-Output 'sentinel respawn-loop tests passed'
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
-  foreach ($v in 'FLEET_RESPAWN_VERIFY_MS', 'FLEET_RESPAWN_VERIFY_POLL_MS', 'MOCK_ROW_ID', 'MOCK_RESPAWN_NOOP') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  foreach ($v in 'FLEET_RESPAWN_VERIFY_MS', 'FLEET_RESPAWN_VERIFY_POLL_MS', 'MOCK_ROW_ID', 'MOCK_RESPAWN_NOOP', 'MOCK_ROW_DOWN') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-sentinel-loop-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

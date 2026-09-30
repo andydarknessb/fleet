@@ -51,7 +51,8 @@ if ($Verb -eq 'agents') {
   $n = 0; if (Test-Path "$root\pid-counter.txt") { $n = [int]((Get-Content "$root\pid-counter.txt" -Raw).Trim()) }
   $state = if ($env:MOCK_ROW_STATE) { $env:MOCK_ROW_STATE } else { 'working' }
   $rowName = if ($env:MOCK_ROW_NAME) { $env:MOCK_ROW_NAME } else { 'pl-test' }
-  Write-Output ('[{"id":"' + $env:MOCK_ROW_ID + '","name":"' + $rowName + '","state":"' + $state + '","status":"idle","pid":' + (500 + $n) + ',"startedAt":"2026-09-24T00:00:00Z"}]')
+  $pidText = if ($env:MOCK_ROW_NOPID -eq '1') { 'null' } else { "$(500 + $n)" }
+  Write-Output ('[{"id":"' + $env:MOCK_ROW_ID + '","name":"' + $rowName + '","state":"' + $state + '","status":"idle","pid":' + $pidText + ',"startedAt":"2026-09-24T00:00:00Z"}]')
   exit 0
 }
 [IO.File]::AppendAllText("$root\calls.txt", "claude $Verb $Arg1`r`n")
@@ -215,6 +216,21 @@ exit 0
   Assert-True (@($b9held.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0 -and @($b9held.respawnHeld | Where-Object { $_.name -eq 'pl-test' -and $_.jobId -eq 'job-a3' -and [int]$_.attempts -eq 3 }).Count -eq 1) "B9: the fourth relaunch is held (got $($b9held | ConvertTo-Json -Compress -Depth 4))"
   Assert-True (@($b9held.escalate | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawn-loop' }).Count -eq 1) 'B9: and escalated as respawn-loop'
   Assert-True (@(Get-Calls).Count -eq 0) "B9: a held relaunch stops and launches nothing (calls: $(@(Get-Calls) -join '; '))"
+
+  # B10 (liveness first): the same job, later reaped (no pid), is relaunched despite the streak, counted, and respawn-loop-down
+  # is raised beside it. No stop call: there is no process to stop.
+  $env:MOCK_ROW_ID = 'job-a3'
+  $env:MOCK_ROW_NOPID = '1'
+  $env:MOCK_ROW_STATE = 'stopped'
+  $env:MOCK_LAUNCH_JOBID = 'job-a5'
+  Reset-CallsOnly
+  $b10 = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_NOPID, Env:MOCK_ROW_STATE
+  Assert-True (@($b10.respawned | Where-Object { $_.name -eq 'pl-test' -and "$($_.via)" -eq 'launch' -and "$($_.jobId)" -eq 'job-a5' }).Count -eq 1 -and @($b10.respawnHeld).Count -eq 0) "B10: a no-pid static is relaunched despite three attempts (got $($b10 | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True (@($b10.escalate | Where-Object { $_.name -eq 'pl-test' -and $_.kind -eq 'respawn-loop-down' -and $_.detail -match 'keeps going down' }).Count -eq 1) 'B10: and respawn-loop-down is raised'
+  Assert-True ((Get-Calls) -contains 'launch pl-test' -and -not (@(Get-Calls) -match 'claude stop')) "B10: the launch door ran and nothing was stopped (calls: $(@(Get-Calls) -join '; '))"
+  $streak10 = Get-Content $streakFile -Raw | ConvertFrom-Json
+  Assert-True ("$($streak10.'pl-test'.jobId)" -eq 'job-a5' -and @($streak10.'pl-test'.attempts).Count -eq 4) 'B10: the relaunch is counted under the new job id'
   Remove-Item Env:MOCK_LAUNCH_JOBID
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) static-respawn assertion(s) failed" }
