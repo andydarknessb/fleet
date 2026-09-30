@@ -59,6 +59,9 @@ try {
   $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
   $fleetDeadRepeatMinutes = 120   # ticket 78: pages.fleetDeadRepeatMinutes, default 120 (two hours)
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatMinutes'] -and $pagesConfig.fleetDeadRepeatMinutes) { $fleetDeadRepeatMinutes = [int]$pagesConfig.fleetDeadRepeatMinutes }
+  # #197: pages.fleetDeadRepeatPriority (emergency|high|normal), default high; anything else falls back to high so a typo never throws a tick.
+  $fleetDeadRepeatPriority = 'high'
+  if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatPriority'] -and @('emergency', 'high', 'normal') -contains "$($pagesConfig.fleetDeadRepeatPriority)") { $fleetDeadRepeatPriority = "$($pagesConfig.fleetDeadRepeatPriority)" }
   $fullCycleConfig = $null; try { $fullCycleConfig = Read-Json "$FleetHome\config\cycle.json" } catch {}   # ticket 81: recursive scan for keys ending in Until
   $retryCap = 2
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
@@ -100,11 +103,12 @@ try {
   # --- specific kind is never shadowed by a shorter one.
   # ---
   # --- Every kind the Watchdog can build today, on purpose (tests/watchdog.tests.ps1
-  # --- walks this list): fleet-dead=emergency, permission-wait=high, launch-retry=high,
+  # --- walks this list): fleet-dead=high (#197), permission-wait=high, launch-retry=high,
   # --- branch-diverged=high, human-wait=normal (all ADR 0012-ruled, human-wait by
   # --- Cory's 2026-09-18 heal ruling); sentinel-stale, check-failed,
   # --- state-unreadable, double-actor, and the check-escalation kinds stray,
-  # --- cap-exceeded, ic-vanished, pr-lookup-failed, blocked default to normal - none
+  # --- cap-exceeded, ic-vanished, pr-lookup-failed, blocked, orphan-late-session (#252) and
+  # --- ic-dead-before-ack (#253) default to normal - none
   # --- of these is a Cory decision the ADR names, so falling to pages.defaultPriority
   # --- is the reasoned choice, not a silent gap. state-escalated, state-hold and
   # --- merge-review-wake belong to the Notifier (#79) and never reach this function
@@ -116,7 +120,12 @@ try {
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'emergency'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal' }
+  # fleet #232: config-invalid (a pages.priority value that is not emergency|high|normal) is normal;
+  # a bad priority is reported, never paged louder than the thing it broke.
+  # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
+  # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
+  # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -124,9 +133,9 @@ try {
     $default = 'normal'
     if ($PagesConfig) {
       if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
-        foreach ($p in $PagesConfig.priority.PSObject.Properties) { $map[$p.Name] = "$($p.Value)" }
+        foreach ($p in $PagesConfig.priority.PSObject.Properties) { if ($script:PagePriorityValues.ContainsKey("$($p.Value)")) { $map[$p.Name] = "$($p.Value)" } }
       }
-      if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority) { $default = "$($PagesConfig.defaultPriority)" }
+      if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority -and $script:PagePriorityValues.ContainsKey("$($PagesConfig.defaultPriority)")) { $default = "$($PagesConfig.defaultPriority)" }
     }
     $best = $null; $bestLen = -1
     foreach ($k in $map.Keys) {
@@ -134,6 +143,28 @@ try {
     }
     if ($best) { return $best }
     return $default
+  }
+  # fleet #232: Get-PagePriority never returns an invalid value (Send-FleetPage's ValidateSet would
+  # throw and lose the tick's writes; mirrors notify.js pagePriorityFor and fleetDeadRepeatPriority
+  # above). This reports what it skipped, so a typo is surfaced once instead of silently ignored.
+  function Get-InvalidPagePriorities {
+    param($PagesConfig)
+    if (-not $PagesConfig) { return }
+    if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
+      if ($PagesConfig.priority -isnot [pscustomobject]) {
+        # not a map (a bare string, say): the block itself is the finding, not its .Length
+        [pscustomobject]@{ key = 'pages.priority'; value = "$($PagesConfig.priority)"; fallback = 'normal' }
+      } else {
+        foreach ($p in $PagesConfig.priority.PSObject.Properties) {
+          if (-not $script:PagePriorityValues.ContainsKey("$($p.Value)")) {
+            [pscustomobject]@{ key = "pages.priority.$($p.Name)"; value = "$($p.Value)"; fallback = (Get-PagePriority -Kind $p.Name -PagesConfig $PagesConfig) }
+          }
+        }
+      }
+    }
+    if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority -and -not $script:PagePriorityValues.ContainsKey("$($PagesConfig.defaultPriority)")) {
+      [pscustomobject]@{ key = 'pages.defaultPriority'; value = "$($PagesConfig.defaultPriority)"; fallback = 'normal' }
+    }
   }
 
   # --- ticket 81 (ADR 0012): a passed date, in config or on a Notice, pages once
@@ -240,7 +271,7 @@ try {
   function Test-FrontierWaiting {
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
     if ($script:frontierWaitingCache.ContainsKey($TenantName)) { return $script:frontierWaitingCache[$TenantName] }
-    $result = [pscustomobject]@{ evidence = @(); reason = ''; error = $null }
+    $result = [pscustomobject]@{ evidence = @(); issues = @(); reason = ''; error = $null }
     if (-not $NodeExe) { $result.error = 'node not found'; $script:frontierWaitingCache[$TenantName] = $result; return $result }
     $activeIcs = 0; if ($LiveRoster) { $activeIcs = @($LiveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $TenantName }).Count }
     $maxIcs = 0; try { $maxIcs = [int]$Tenant.maxIcs } catch {}
@@ -260,11 +291,20 @@ try {
       if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $bounded.stdout 200)" }
       else {
         $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
-        if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')" }
+        if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')"; $result.issues = $eligible }
       }
     }
     $script:frontierWaitingCache[$TenantName] = $result
     return $result
+  }
+
+  function Get-WakeLineId {
+    # fleet #231: one spelling of an outbox line's identity, shared by the writer of
+    # the frontier-wake state and the cooldown compare. "<recordId>#<eventSequence>";
+    # a line with no eventSequence falls back to "<recordId>@<at>".
+    param($Line)
+    if ($Line.PSObject.Properties['eventSequence'] -and "$($Line.eventSequence)" -ne '') { return "$($Line.recordId)#$($Line.eventSequence)" }
+    return "$($Line.recordId)@$($Line.at)"
   }
 
   function Get-UnconsumedWakes {
@@ -276,7 +316,20 @@ try {
     # lines that session wrote itself: a hold or Ruling ask the lead raised is
     # addressed to Cory, and waking the lead for it rotates away the session
     # that asked. A line with no actor (written before #141) still counts.
-    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '')
+    # #204: a `resolution` line (a record left escalated or hold) is addressed to the
+    # session that raised the decision: `raisedBy` names it. -Recipient lead (the
+    # default) takes every line but the Principal's own (`raisedBy` starting `pe-`);
+    # -Recipient principal takes only the resolution lines its own escalations earned
+    # (the Principal has no escalation door today, its ask is the Triage proposal,
+    # ADR 0011, so that branch serves a future door).
+    # The lead skips a resolution INTO ci-wait: the PR watcher's checks-settled
+    # follows and is the actionable wake, so both would rotate the lead twice.
+    # $SelfActor drops a resolution its own session performed. $Details, when
+    # given, collects one "<record> <from> -> <to>" per counted resolution so the
+    # wake reason can name them. $Lines (fleet #231), when given, collects one
+    # { id; at; wake } per counted line so the frontier wake can record by identity
+    # what it delivered.
+    param($TenantName, [Nullable[datetime]]$Since = $null, [Nullable[datetime]]$ConsumedThrough = $null, [string]$SelfActor = '', [string]$Recipient = 'lead', $Details = $null, $Lines = $null)
     $kinds = @{}
     $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
     if (-not (Test-Path $outboxPath)) { return $kinds }
@@ -288,9 +341,14 @@ try {
       if (-not $atUtc) { continue }
       if ($Since -and $atUtc -le $Since) { continue }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
-      if (@('checks-settled', 'checks-failed', 'decision-needed') -notcontains "$($o.wake)") { continue }
-      if ($SelfActor -and "$($o.wake)" -eq 'decision-needed' -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
+      if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
+      $raisedBy = ''; if ($o.PSObject.Properties['raisedBy']) { $raisedBy = "$($o.raisedBy)" }
+      if ($Recipient -eq 'principal') { if ("$($o.wake)" -ne 'resolution' -or $raisedBy -notlike 'pe-*') { continue } }
+      elseif ("$($o.wake)" -eq 'resolution' -and ($raisedBy -like 'pe-*' -or ($o.PSObject.Properties['to'] -and "$($o.to)" -eq 'ci-wait'))) { continue }
+      if ($SelfActor -and @('decision-needed', 'resolution') -contains "$($o.wake)" -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
+      if ($null -ne $Lines) { [void]$Lines.Add([pscustomobject]@{ id = (Get-WakeLineId $o); at = $atUtc; wake = "$($o.wake)" }) }
+      if ($null -ne $Details -and "$($o.wake)" -eq 'resolution') { [void]$Details.Add("$($o.recordId) $($o.from) -> $($o.to)") }
     }
     return $kinds
   }
@@ -366,7 +424,7 @@ try {
   # so a bare fixture with no config/cycle.json supervisor.pageKinds override
   # still pages a refused push, the same reasoning ticket 77's Get-PagePriority
   # default already documents for its own hardcoded map.
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'human-wait')
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
@@ -883,7 +941,8 @@ try {
   # --- lead is rotated NOW through rotate.ps1 -Wake: stop at the boundary, reconcile,
   # --- relaunch through the one door, so the replacement reconstructs from state exactly as
   # --- a rotated lead does. This retires the lead's hourly polling cron. Loop guards: one
-  # --- wake per tenant per tick; never twice for the same evidence inside
+  # --- wake per tenant per tick; never twice for evidence the last wake already carried
+  # --- (by identity, fleet #231: issue numbers and outbox line ids, not digest text) inside
   # --- frontierWake.cooldownMinutes; the boundary, PAUSE and rotation-off still apply
   # --- inside rotate.ps1; state/flags/frontier-wake-off disables it. Every executed wake is
   # --- a log-only entry in state/alerts/alerts.jsonl (ticket 76, ADR 0012: a wake of a
@@ -925,22 +984,41 @@ try {
       $leadRosterRow = $null; if ($liveRoster) { $leadRosterRow = @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $leadName -and $_.status -eq 'active' -and $_.launchedAt } | Sort-Object { ConvertTo-UtcDateTime $_.launchedAt } -Descending)[0] }
       if ($leadRosterRow) { $leadLaunchedAt = ConvertTo-UtcDateTime $leadRosterRow.launchedAt }
       # Source 1: the planner's frontier, with an IC slot and a cap slot to launch into.
+      $fw = $null
       if ($wakeSources -contains 'frontier' -and $nodeExe) {
         $fw = Test-FrontierWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap
         if ($fw.evidence.Count -gt 0) { $wake.evidence += $fw.evidence } elseif ($fw.reason) { $wake.reason = $fw.reason }
       }
+      $leadLines = New-Object System.Collections.ArrayList
       # Source 2: PR-watcher wakes recorded since this lead was launched and not yet delivered.
       if ($wakeSources -contains 'outbox') {
         $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
         $consumedThrough = $null; if ($tenantState -and $tenantState.outboxConsumedThrough) { $consumedThrough = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough }
-        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName
+        $leadResolved = New-Object System.Collections.ArrayList
+        $kinds = Get-UnconsumedWakes -TenantName $tenantName -Since $leadLaunchedAt -ConsumedThrough $consumedThrough -SelfActor $leadName -Details $leadResolved -Lines $leadLines
         if ($kinds.Count -gt 0) { $wake.evidence += "outbox $(@($kinds.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')" }
+        # #204: the wake reason names each record that left escalated or hold, so the lead resumes from what changed.
+        foreach ($r in $leadResolved) { $wake.evidence += "resolved $r" }
       }
       if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
-      # Cooldown: the same evidence within the window means the last wake did not clear it; do not loop.
+      # Cooldown (fleet #231): defer only when EVERY item of this tick's evidence was carried by the last
+      # wake, by identity: each current frontier issue is in its `frontierIssues` and each unconsumed outbox
+      # line id is in its `delivered`. The digest text carries kind counts only, so a new PR's line read as
+      # a repeat of the last one. A state written before #231 has no `delivered`: it keeps the old
+      # digest-equality rule and is upgraded by its next wake.
       $digest = ($wake.evidence -join '; ')
+      $frontierIssues = @(); if ($fw -and $fw.PSObject.Properties['issues']) { $frontierIssues = @($fw.issues) }
+      $lineIds = @($leadLines | ForEach-Object { $_.id })
       $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
-      if ($tenantState -and "$($tenantState.digest)" -eq $digest -and $tenantState.lastAt) {
+      $alreadyCarried = $false
+      if ($tenantState -and $tenantState.lastAt) {
+        if ($tenantState.PSObject.Properties['delivered']) {
+          $carriedLines = @($tenantState.delivered | ForEach-Object { "$_" })
+          $carriedIssues = @(); if ($tenantState.PSObject.Properties['frontierIssues']) { $carriedIssues = @($tenantState.frontierIssues | ForEach-Object { [int]$_ }) }
+          $alreadyCarried = (@($frontierIssues | Where-Object { $carriedIssues -notcontains $_ }).Count -eq 0) -and (@($lineIds | Where-Object { $carriedLines -notcontains $_ }).Count -eq 0)
+        } else { $alreadyCarried = ("$($tenantState.digest)" -eq $digest) }
+      }
+      if ($alreadyCarried) {
         $lastAt = ConvertTo-UtcDateTime $tenantState.lastAt
         if ($lastAt -and ($now - $lastAt).TotalMinutes -lt $wakeCooldown) {
           $wake.decision = 'cooldown'; $wake.reason = "same evidence woken at $($tenantState.lastAt); cooldown $wakeCooldown min"
@@ -955,9 +1033,19 @@ try {
       $wake.outcome = if ($rotateOut -and $rotateOut.PSObject.Properties['outcomes']) { @($rotateOut.outcomes | Where-Object { $_.name -eq $leadName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $rotateRaw 200 }
       if ($rotated) {
         $wake.decision = 'woken'
-        $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = (Now-Iso) }) -Force
+        # fleet #231: the watermark is the newest DELIVERED line's `at` (a line written while rotate.ps1
+        # ran is no longer consumed undelivered); with no line delivered the prior watermark stands.
+        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, and
+        # fleet-dead/heal, which pass no -Since, would otherwise keep counting them) nor the prior watermark.
+        # Assumes Windows PowerShell 5.1: ConvertFrom-Json leaves ISO strings as strings; under pwsh 7 they become
+        # DateTime and sub-second precision would be lost.
+        $wmCandidates = @($leadLines | ForEach-Object { $_.at })
+        if ($leadLaunchedAt) { $wmCandidates += $leadLaunchedAt }
+        if ($tenantState -and $tenantState.outboxConsumedThrough) { $priorWm = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough; if ($priorWm) { $wmCandidates += $priorWm } }
+        $newWatermark = if ($wmCandidates.Count -gt 0) { (@($wmCandidates | Sort-Object -Descending)[0]).ToString('o') } else { Now-Iso }
+        $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = $newWatermark; delivered = @($lineIds); frontierIssues = @($frontierIssues) }) -Force
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
-        try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+        try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $frontierWakes += [pscustomobject]$wake
     }
@@ -988,7 +1076,35 @@ try {
       if (-not $tenant) { continue }
       $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
       $principalName = "pe-$tenantName"
-      $twake = [ordered]@{ tenant = $tenantName; principal = $principalName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null; frontierError = $null; counts = $null }
+      $twake = [ordered]@{ tenant = $tenantName; principal = $principalName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null; frontierError = $null; counts = $null; finalize = $null }
+      # #207 (spec #193): an exact `Approved` is finalized by script BEFORE the frontier is read, so
+      # the Principal is never woken for it: the Ruling comment, the ready label, the marker gone, the
+      # ledger. It writes to GitHub, so it runs only where a wake would (principal-live, live mode,
+      # no PAUSE) and inside this block's triage-wake-off rollback. A failed or timed-out finalize
+      # is recorded and changes nothing else. A finalize that failed BEFORE its claim leaves the
+      # approval on the frontier, so the Principal is woken for it as before. One that failed AFTER
+      # its claim is off the frontier for 30 minutes (the next tick finishes it; finalize is
+      # idempotent) and returns to the Principal as an expiry item if it is still unfinished.
+      if ($triageNode -and $principalLive -and $mode -eq 'live' -and -not $paused) {
+        $finArgs = @('finalize', '--root', $FleetHome, '--tenant', $tenantName)
+        if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $finArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
+        $finBounded = Invoke-BoundedExe -FilePath $triageNode -ArgumentList (@("$PSScriptRoot\triage.js") + $finArgs) -TimeoutSec ($frontierTimeoutSec * 3) -Name "node triage.js finalize $tenantName"
+        $finResult = $null
+        if ($finBounded.startError) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize could not start: $(Get-OneLine $finBounded.startError 200)" } }
+        elseif ($finBounded.timedOut) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize timed out and was killed" } }
+        elseif ($finBounded.exitCode -ne 0) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize exited $($finBounded.exitCode)`: $(Get-OneLine (($finBounded.stdout + ' ' + $finBounded.stderr)) 200)" } }
+        else {
+          $finResult = ConvertFrom-LastJsonLine $finBounded.stdout
+          if (-not $finResult) { $twake.finalize = [pscustomobject]@{ error = "triage.js finalize returned no JSON: $(Get-OneLine $finBounded.stdout 200)" } }
+          else {
+            $twake.finalize = [pscustomobject]@{ finalized = @($finResult.finalized | ForEach-Object { [pscustomobject]@{ issue = $_.issue; url = "$($_.url)" } }); left = @($finResult.left); errors = @($finResult.errors); error = $null }
+            if (@($finResult.finalized).Count -gt 0) {
+              $finNumbers = (@($finResult.finalized | ForEach-Object { "#$($_.issue)" }) -join ', ')
+              try { $null = Write-FleetWakeAudit -Kind 'triage-finalize' -Title 'Fleet watchdog: exact approval finalized' -Body "$tenantName finalized $finNumbers by script (exact Approved)" -Detail ([pscustomobject]@{ tenant = $tenantName; finalized = @($finResult.finalized) }) } catch {}
+            }
+          }
+        }
+      }
       $frontier = $null
       if (-not $triageNode) { $twake.frontierError = 'node not found (FLEET_NODE_PATH or PATH)' }
       else {
@@ -1013,6 +1129,14 @@ try {
         foreach ($item in @($frontier.eligible)) { $twake.evidence += "$($item.kind) #$($item.number)" }
         $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; counts = $frontier.counts; proposeNow = @($frontier.proposeNow); consumedThrough = $frontier.consumedThrough; eligible = @($frontier.eligible | ForEach-Object { [pscustomobject]@{ kind = "$($_.kind)"; number = $_.number; reason = "$($_.reason)" } }); skipped = @($frontier.skipped); premises = $frontier.premises }
       } else { $triageShadow.tenants += [pscustomobject]@{ tenant = $tenantName; error = $twake.frontierError } }
+      # #204: a record the Principal escalated that has since left escalated or hold wakes the Principal, not the lead.
+      $pResolved = New-Object System.Collections.ArrayList
+      $pLaunchedAt = $null
+      $pRosterRow = $null; if ($liveRoster) { $pRosterRow = @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $principalName -and $_.status -eq 'active' -and $_.launchedAt } | Sort-Object { ConvertTo-UtcDateTime $_.launchedAt } -Descending)[0] }
+      if ($pRosterRow) { $pLaunchedAt = ConvertTo-UtcDateTime $pRosterRow.launchedAt }
+      $pConsumed = $null; if ($triageState.tenants.PSObject.Properties[$tenantName] -and $triageState.tenants.$tenantName.PSObject.Properties['outboxConsumedThrough']) { $pConsumed = ConvertTo-UtcDateTime $triageState.tenants.$tenantName.outboxConsumedThrough }
+      $null = Get-UnconsumedWakes -TenantName $tenantName -Since $pLaunchedAt -ConsumedThrough $pConsumed -SelfActor $principalName -Recipient principal -Details $pResolved
+      foreach ($r in $pResolved) { $twake.evidence += "resolved $r" }
       if (-not $principalLive) { $twake.decision = 'shadow'; $twake.reason = 'state/flags/principal-live absent: frontier recorded, nothing launched'; $triageWakes += [pscustomobject]$twake; continue }
       if ($mode -ne 'live') { $twake.reason = "supervision mode is $mode, not live"; $triageWakes += [pscustomobject]$twake; continue }
       if ($paused) { $twake.reason = 'PAUSE set'; $triageWakes += [pscustomobject]$twake; continue }
@@ -1040,7 +1164,7 @@ try {
       $twake.outcome = if ($tRotateOut -and $tRotateOut.PSObject.Properties['outcomes']) { @($tRotateOut.outcomes | Where-Object { $_.name -eq $principalName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $tRotateRaw 200 }
       if ($tRotated) {
         $twake.decision = 'woken'
-        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest }) -Force
+        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest; outboxConsumedThrough = (Now-Iso) }) -Force
         try { $twake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: triage wake' -Body "$principalName relaunched for $tdigest" -Detail ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $twake.decision = 'deferred'; if (-not $twake.reason) { $twake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($tRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $triageWakes += [pscustomobject]$twake
@@ -1130,6 +1254,11 @@ try {
   $datedItems += (Find-ExpiredNoticeDates)
   foreach ($d in $datedItems) {
     $conditions += [pscustomobject]@{ key = "dated:$($d.where)"; kind = 'dated'; detail = "$($d.where) passed ($($d.value)) and is still in place"; url = $null }
+  }
+  # fleet #232: an invalid pages priority pages once (paged-state dedupe) and rides every tick line.
+  $invalidPagePriority = @(Get-InvalidPagePriorities -PagesConfig $pagesConfig)
+  foreach ($ip in $invalidPagePriority) {
+    $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not one of emergency|high|normal; pages of that kind fall back to their built-in default until it is fixed"; url = $null }
   }
   # #113 (ADR 0013): the previous tick's deploy step refused to move `live`
   # (not on live, dirty, diverged, fetch or CI unreadable). One page per
@@ -1329,6 +1458,7 @@ try {
         }
       }
 
+      $deliveredThisTick = $false   # #197: a page delivered in THIS tick has no repeat clock to run yet
       if (-not $entry.deliveredAt -and -not $entry.gaveUpAt) {
         $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
         $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $entry.url -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
@@ -1338,6 +1468,7 @@ try {
         $countsAsAttempt = ($pageResult.pushover -is [bool])
         if ($pageResult.pushover -eq $true) {
           $entry.deliveredAt = Now-Iso
+          $deliveredThisTick = $true
         } elseif ($countsAsAttempt) {
           $entry.attempts++
           $entry.lastAttemptAt = Now-Iso
@@ -1358,15 +1489,17 @@ try {
       # once, at +fleetDeadRepeatMinutes past its DELIVERY time (an undelivered page
       # has no repeat clock to run), never a third time. An unparseable or
       # future-dated deliveredAt fails toward repeating NOW rather than silently
-      # losing the one repeat the ADR grants.
-      if ($c.key -eq 'fleet-dead' -and $entry.deliveredAt -and -not $entry.repeatedAt) {
+      # losing the one repeat the ADR grants. #197: never in the tick that delivered the first
+      # page - that deliveredAt is later than this tick's $now, reads as future-dated, and would
+      # page the repeat back to back with the first.
+      if ($c.key -eq 'fleet-dead' -and $entry.deliveredAt -and -not $entry.repeatedAt -and -not $deliveredThisTick) {
         $deliveredAtUtc = ConvertTo-UtcDateTime $entry.deliveredAt
         $dueNow = (-not $deliveredAtUtc) -or ($deliveredAtUtc -gt $now) -or ((New-TimeSpan -Start $deliveredAtUtc -End $now).TotalMinutes -ge $fleetDeadRepeatMinutes)
         if ($dueNow) {
           $entry.repeatedAt = Now-Iso
           $repeatBody = "$($c.detail) (repeat: fleet-dead has stood over $fleetDeadRepeatMinutes min with no third page to follow)"
-          $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority 'emergency' -Detail ([pscustomobject]@{ key = $c.key; repeat = $true }) -NoToast:$NoToast
-          $repeatPaged = [pscustomobject]@{ key = $c.key; priority = 'emergency'; page = $repeatResult }
+          $repeatResult = Send-FleetPage -Kind 'fleet-dead' -Title 'Fleet watchdog' -Body $repeatBody -Priority $fleetDeadRepeatPriority -Detail ([pscustomobject]@{ key = $c.key; repeat = $true }) -NoToast:$NoToast
+          $repeatPaged = [pscustomobject]@{ key = $c.key; priority = $fleetDeadRepeatPriority; page = $repeatResult }
         }
       }
     }
@@ -1430,6 +1563,7 @@ try {
     deadMan = $deadMan
     # fleet #101: every bounded child that timed out this tick, by name - the tick's own and the check's.
     timeouts = @(@($script:BoundedTimeouts) + @(if ($check -and $check.PSObject.Properties['timeouts']) { $check.timeouts }) | Where-Object { $_ })
+    invalidPagePriority = @($invalidPagePriority)
     deploy = $(if ($deploy) { [pscustomobject]@{ from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome } } else { $null })
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

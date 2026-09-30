@@ -273,6 +273,101 @@ test('release refuses an assigned record that is not an untouched assignment res
   );
 });
 
+// fleet#227 (endzone #1749): a record abandoned and then re-reserved holds a new
+// attempt that is only a reservation, but the old lineage (work-created, escalation,
+// abandonment) used to disqualify it, so neither door could end it. Release reads the
+// current attempt, the events after the last assignment-reserved, exactly as abandon does.
+test('release accepts a re-reserved record whose earlier attempt was touched and abandoned', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1749';
+  const first = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-a', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-a', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, first.revision, 'escalated', 'escalate-1749', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1749', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-b', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-b', now: '2026-09-28T11:00:00.000Z' });
+  assert.equal(second.record.state, 'assigned');
+
+  assert.throws(
+    () => abandonRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'abandon-1749-b', reason: 'no work ran' }),
+    (error) => error.code === 'INVALID_ABANDON' && /must be released/.test(error.message),
+    'the untouched re-reservation is releasable, not abandonable',
+  );
+  const released = releaseRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'release-1749', now: '2026-09-28T11:00:05.000Z' });
+  assert.equal(released.record.state, 'released');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-1749.json')), true);
+});
+
+test('release refuses a re-reserved record once its current attempt is touched, and abandon accepts it', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1750';
+  const first = reserveRecord({ root, id, tenant: 'endzone', issue: 1750, manifestPath: 'm1750-a', reservations: { components: ['src/a'] }, idempotencyKey: 'reserve-1750-a', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, first.revision, 'escalated', 'escalate-1750-a', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1750-a', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1750, manifestPath: 'm1750-b', reservations: { components: ['src/a'] }, idempotencyKey: 'reserve-1750-b', now: '2026-09-28T11:00:00.000Z' });
+  // Touch the current attempt while leaving the record `assigned`: escalate, then resolve back.
+  const escalated = move(root, id, second.revision, 'escalated', 'escalate-1750-b', 'needs a ruling', '2026-09-28T11:00:05.000Z');
+  const back = move(root, id, escalated.revision, 'assigned', 'resolve-1750-b', 'ruled', '2026-09-28T11:00:10.000Z');
+  assert.equal(back.record.state, 'assigned');
+
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: back.revision, idempotencyKey: 'release-1750' }),
+    (error) => error.code === 'INVALID_RELEASE' && /untouched reservation/.test(error.message),
+  );
+  const abandoned = abandonRecord({ root, id, expectedRevision: back.revision, idempotencyKey: 'abandon-1750-b', reason: 'worker ended', now: '2026-09-28T12:00:00.000Z' });
+  assert.equal(abandoned.record.state, 'abandoned');
+});
+
+test('a first-attempt reservation still releases, and a touched first attempt still refuses release', () => {
+  const root = rootDir();
+  const untouched = reserveRecord({ root, id: 'endzone:issue-1751', tenant: 'endzone', issue: 1751, manifestPath: 'm1751', reservations: { components: ['src/b'] }, idempotencyKey: 'reserve-1751', now: '2026-09-28T10:00:00.000Z' });
+  assert.equal(releaseRecord({ root, id: 'endzone:issue-1751', expectedRevision: untouched.revision, idempotencyKey: 'release-1751', now: '2026-09-28T10:00:05.000Z' }).record.state, 'released');
+
+  const id = 'endzone:issue-1752';
+  const touched = reserveRecord({ root, id, tenant: 'endzone', issue: 1752, manifestPath: 'm1752', reservations: { components: ['src/c'] }, idempotencyKey: 'reserve-1752', now: '2026-09-28T10:01:00.000Z' });
+  const escalated = move(root, id, touched.revision, 'escalated', 'escalate-1752', 'needs a ruling', '2026-09-28T10:01:05.000Z');
+  const back = move(root, id, escalated.revision, 'assigned', 'resolve-1752', 'ruled', '2026-09-28T10:01:10.000Z');
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: back.revision, idempotencyKey: 'release-1752' }),
+    (error) => error.code === 'INVALID_RELEASE' && /untouched reservation/.test(error.message),
+  );
+});
+
+// fleet#227 (QA on PR #250): the reuse proof for a released record had the same
+// whole-lineage flaw, so a re-reserved record released through the new door could
+// never be reserved again (RELEASE_NOT_REUSABLE / RECORD_RELEASED). The real #1749
+// lineage: 1 work-created, 2 state-escalated, 3 assignment-abandoned, 4 assignment-reserved.
+test('a re-reserved record released after an earlier touched attempt can be reserved again', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1749';
+  createRecord({ root, id, tenant: 'endzone', issue: 1749, state: 'assigned', idempotencyKey: 'create-1749', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, 1, 'escalated', 'escalate-1749', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1749', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-b', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-b', now: '2026-09-28T11:00:00.000Z' });
+  assert.equal(second.eventSequence, 4);
+  const released = releaseRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'release-1749', now: '2026-09-28T11:00:05.000Z' });
+  assert.equal(released.eventSequence, 5);
+
+  assert.deepEqual(reservationBaseline({ root, id }), { revision: released.revision + 1, eventSequence: released.eventSequence + 1, reused: true });
+  const third = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-c', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-c', now: '2026-09-28T12:00:00.000Z' });
+  assert.equal(third.record.state, 'assigned');
+  assert.equal(third.revision, released.revision + 1);
+  assert.deepEqual(readEvents(root).filter((event) => event.recordId === id).map((event) => event.sequence), [1, 2, 3, 4, 5, 6]);
+});
+
+// fleet#227 (QA on PR #250, low): release and abandon are exact complements. A record
+// reserved with github.prNumber set is not an untouched reservation, so release refuses
+// it; abandon must then accept it instead of also refusing "must be released".
+test('an assigned reservation that carries a PR number is abandonable when it cannot be released', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1754';
+  const reserved = reserveRecord({ root, id, tenant: 'endzone', issue: 1754, manifestPath: 'm1754', github: { issueNumber: 1754, prNumber: 9 }, reservations: { components: ['src/e'] }, idempotencyKey: 'reserve-1754', now: '2026-09-28T10:00:00.000Z' });
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-1754' }),
+    (error) => error.code === 'INVALID_RELEASE',
+  );
+  const abandoned = abandonRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'abandon-1754', reason: 'carries a PR', now: '2026-09-28T10:05:00.000Z' });
+  assert.equal(abandoned.record.state, 'abandoned');
+});
+
 test('an escalated touched assignment can be abandoned and reserved again with a fresh lineage step', () => {
   const root = rootDir();
   const id = 'endzone:issue-1136';
@@ -418,19 +513,246 @@ test('cross-process mutex serializes concurrent compare-and-swap attempts', asyn
   const root = rootDir();
   makeRecord(root);
   const modulePath = path.resolve(__dirname, '..', 'bin', 'work-state.js');
-  const script = (index) => `const m=require(${JSON.stringify(modulePath)});try{m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'proc-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'});process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error')}`;
-  const results = await Promise.all(Array.from({ length: 20 }, (_, index) => new Promise((resolve) => {
+  const script = (index) => `const m=require(${JSON.stringify(modulePath)});try{m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'proc-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'});process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error');process.stderr.write(String(e.stack||e))}`;
+  const runs = await Promise.all(Array.from({ length: 20 }, (_, index) => new Promise((resolve) => {
     setTimeout(() => {
-      const child = spawn(process.execPath, ['-e', script(index)], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const child = spawn(process.execPath, ['-e', script(index)], { stdio: ['ignore', 'pipe', 'pipe'] });
       let output = '';
+      let stderr = '';
       child.stdout.on('data', (chunk) => { output += chunk; });
-      child.on('close', () => resolve(output));
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.on('close', () => resolve({ output, stderr }));
     }, index * 2);
   })));
+  const results = runs.map((run) => run.output);
+  // #234: a contender that dies on a Windows EPERM shows its code and stack here, not just a count mismatch.
+  assert.deepEqual(runs.filter((run) => run.output !== 'ok' && run.output !== 'STALE_REVISION'), []);
   assert.equal(results.filter((result) => result === 'ok').length, 1);
   assert.equal(results.filter((result) => result === 'STALE_REVISION').length, 19);
   const events = fs.readFileSync(path.join(root, 'state', 'events', '2026-09-01.jsonl'), 'utf8').trim().split(/\r?\n/);
   assert.equal(events.length, 2);
+});
+
+// #234: Windows reports a delete-pending lock or a replaced target as EPERM/EBUSY. The state door
+// waits those out like a held lock and never spins forever on a genuine permission failure.
+// These run in-process: fs methods and Atomics.wait are swapped for the body, so no real waiting.
+function withFsFault(method, faultFor, body) {
+  const original = fs[method];
+  const originalWait = Atomics.wait;
+  const originalNow = Date.now;
+  let skew = 0;
+  const probe = { failures: 0, waits: 0 };
+  // Each stubbed wait advances the clock the way a real ~16 ms Windows wait would.
+  Date.now = () => originalNow() + skew;
+  fs[method] = function faulty(target, ...rest) {
+    const code = faultFor(String(target), probe);
+    if (code) {
+      probe.failures += 1;
+      throw Object.assign(new Error(`${code}: simulated`), { code });
+    }
+    return original.call(this, target, ...rest);
+  };
+  Atomics.wait = (...args) => {
+    probe.waits += 1;
+    skew += 16;
+    return probe.onWait ? probe.onWait() : 'timed-out';
+  };
+  try {
+    return body(probe);
+  } finally {
+    fs[method] = original;
+    Atomics.wait = originalWait;
+    Date.now = originalNow;
+  }
+}
+
+const isLock = (target) => path.basename(target) === '.lock';
+
+test('lock open retries EPERM, EACCES and EBUSY like a held lock', () => {
+  for (const code of ['EPERM', 'EACCES', 'EBUSY']) {
+    const root = rootDir();
+    withFsFault('openSync', (target, probe) => (isLock(target) && probe.failures < 5 ? code : null), (probe) => {
+      makeRecord(root);
+      assert.equal(probe.failures, 5);
+      assert.ok(probe.waits >= 5);
+    });
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+  }
+});
+
+test('lock open throws a genuine permission failure after about five seconds of waiting', () => {
+  const root = rootDir();
+  withFsFault('openSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
+    assert.throws(() => makeRecord(root), (error) => error.code === 'EPERM');
+    // 16 ms per wait: 5 s is about 312 waits, far below the old 6000-wait bound (~94 s on Windows).
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
+  });
+});
+
+test('a held lock is waited on however long, only transient errors are time bounded', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = path.join(root, 'state', 'work', '.lock');
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  withFsFault('statSync', () => null, (probe) => {
+    probe.onWait = () => {
+      if (probe.waits >= 1000) fs.rmSync(lock, { force: true });
+      return 'timed-out';
+    };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.ok(probe.waits >= 1000);
+  });
+});
+
+test('lock probe forgives a delete-pending lock that stats as EPERM or EBUSY', () => {
+  for (const code of ['EPERM', 'EBUSY']) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = path.join(root, 'state', 'work', '.lock');
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+    withFsFault('statSync', (target, probe) => (isLock(target) && probe.failures < 3 ? code : null), (probe) => {
+      probe.onWait = () => {
+        if (probe.failures >= 3) fs.rmSync(lock, { force: true });
+        return 'timed-out';
+      };
+      assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+      assert.equal(probe.failures, 3);
+    });
+  }
+});
+
+function staleLock(root, content) {
+  const lock = path.join(root, 'state', 'work', '.lock');
+  fs.writeFileSync(lock, content);
+  const old = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(lock, old, old);
+  return lock;
+}
+
+test('a stale lock with empty or partial content is broken instead of wedging every call', () => {
+  for (const content of ['', '{"pid":']) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = staleLock(root, content);
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(fs.existsSync(lock), false);
+  }
+});
+
+test('breaking a stale lock forgives a delete-pending removal that reports EPERM', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  withFsFault('rmSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.failures, 2);
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+function breakMutex(root, content, ageMs) {
+  const file = path.join(root, 'state', 'work', '.lock.break');
+  fs.writeFileSync(file, content);
+  const when = new Date(Date.now() - ageMs);
+  fs.utimesSync(file, when, when);
+  return file;
+}
+
+test('#235: a stale breaker mutex left by a dead breaker is removed and the door completes', () => {
+  for (const content of ['', JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' })]) {
+    const root = rootDir();
+    makeRecord(root);
+    const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const mutex = breakMutex(root, content, 10 * 60 * 1000);
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(fs.existsSync(lock), false);
+    assert.equal(fs.existsSync(mutex), false);
+  }
+});
+
+test('#235: a fresh breaker mutex is waited on until it disappears', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  const mutex = breakMutex(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 0);
+  withFsFault('openSync', () => null, (probe) => {
+    probe.onWait = () => { if (probe.waits === 5) fs.rmSync(mutex); return 'timed-out'; };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.ok(probe.waits >= 5, `waits: ${probe.waits}`);
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('#235: a break removal that keeps reporting EPERM throws after about five seconds', () => {
+  const root = rootDir();
+  makeRecord(root);
+  staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  withFsFault('rmSync', (target) => (isLock(target) ? 'EPERM' : null), (probe) => {
+    probe.onWait = () => { if (probe.waits > 2000) throw new Error('spun past the transient limit'); return 'timed-out'; };
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
+  });
+  assert.equal(fs.existsSync(path.join(root, 'state', 'work', '.lock.break')), false);
+});
+
+test('breaking a stale lock forgives a lock that reads as EPERM', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  withFsFault('readFileSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.failures, 2);
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('a failed write of the lock owner releases the lock and throws', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = path.join(root, 'state', 'work', '.lock');
+  withFsFault('writeFileSync', (target, probe) => (/^\d+$/.test(target) && probe.failures < 1 ? 'ENOSPC' : null), (probe) => {
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'ENOSPC');
+    assert.equal(probe.failures, 1);
+  });
+  assert.equal(fs.existsSync(lock), false);
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+});
+
+test('releasing the lock retries a transient EBUSY so a committed write does not surface an error', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const original = fs.rmSync;
+  // Stand-in for Windows: the lock is busy for a moment unless the caller asks rmSync to retry.
+  fs.rmSync = function busy(target, options = {}) {
+    if (isLock(String(target)) && !options.maxRetries) throw Object.assign(new Error('EBUSY: simulated'), { code: 'EBUSY' });
+    return original.call(this, target, options);
+  };
+  try {
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+  } finally {
+    fs.rmSync = original;
+  }
+  assert.equal(fs.existsSync(path.join(root, 'state', 'work', '.lock')), false);
+});
+
+test('atomic write retries a rename that reports EPERM or EBUSY', () => {
+  for (const code of ['EPERM', 'EBUSY']) {
+    const root = rootDir();
+    withFsFault('renameSync', (target, probe) => (probe.failures < 2 ? code : null), (probe) => {
+      makeRecord(root);
+      assert.equal(probe.failures, 2);
+    });
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+  }
+});
+
+test('atomic write throws when a rename keeps failing and leaves no temporary file behind', () => {
+  const root = rootDir();
+  withFsFault('renameSync', () => 'EPERM', () => {
+    assert.throws(() => makeRecord(root), (error) => error.code === 'EPERM');
+  });
+  const leftovers = fs.readdirSync(path.join(root, 'state', 'work')).filter((name) => name.endsWith('.tmp'));
+  assert.deepEqual(leftovers, []);
 });
 
 test('pending journals recover kill points between replacement and append', () => {
@@ -1099,9 +1421,72 @@ test('fleet#56: a CLI transition to escalated appends a decision-needed wake onc
   assert.equal(repaired.replayed, true);
   assert.equal(lines().length, 1, 'a replay that finds no line repairs the cache');
 
-  // A non-decision transition writes no line.
-  move(root, 'endzone:issue-42', repaired.revision, 'implementing', 'back', 'restated by Cory', '2026-09-12T18:00:00.000Z');
-  assert.equal(lines().length, 1);
+  // A transition between two non-decision states writes no line (leaving a decision state is #204's resolution wake).
+  const back = move(root, 'endzone:issue-42', repaired.revision, 'implementing', 'back', 'restated by Cory', '2026-09-12T18:00:00.000Z');
+  assert.deepEqual(lines().map((l) => l.wake), ['decision-needed', 'resolution']);
+  move(root, 'endzone:issue-42', back.revision, 'pr-open', 'pr-open', 'PR opened', '2026-09-12T19:00:00.000Z');
+  assert.equal(lines().length, 2);
+});
+
+// #204 (spec #192): a lead or Principal that asked Cory something ends its turn idle, so
+// the door that commits the answer wakes it. Any transition out of `escalated` or `hold`,
+// whoever calls it, appends one `resolution` line naming the record, the state left and
+// the state entered, and who raised the decision (the Watchdog routes on that).
+test('#204: leaving escalated or hold appends one resolution wake line; a replay appends none and repairs a missing one', () => {
+  const root = rootDir();
+  makeRecord(root, { github: { issueNumber: 42, prNumber: 77 } });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const lines = () => (fs.existsSync(outboxFile) ? fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)) : []);
+  const go = (revision, to, key, actor, evidence) => transitionRecord({ root, id: 'endzone:issue-42', expectedRevision: revision, to, idempotencyKey: key, actor, evidence, now: '2026-09-29T10:00:00.000Z', githubState: to === 'merged' ? 'MERGED' : undefined, githubMergedAt: to === 'merged' ? '2026-09-29T10:00:00.000Z' : undefined, testOnly: to === 'merged' });
+
+  // escalated -> ci-wait, raised by a lead, resolved by Cory.
+  let r = go(1, 'implementing', 'r-1', 'pl-endzone', 'launched');
+  r = go(r.revision, 'pr-open', 'r-2', 'pl-endzone', 'PR opened');
+  r = go(r.revision, 'ci-wait', 'r-3', 'pl-endzone', 'CI running');
+  const escalated = go(r.revision, 'escalated', 'r-4', 'pl-endzone', 'wake:decision-needed; needs a Ruling');
+  assert.deepEqual(lines().map((l) => l.wake), ['decision-needed']);
+  const resolved = go(escalated.revision, 'ci-wait', 'r-5', 'cory', 'Cory ruled: proceed');
+  const resolutions = lines().filter((l) => l.wake === 'resolution');
+  assert.equal(resolutions.length, 1);
+  assert.equal(resolutions[0].recordId, 'endzone:issue-42');
+  assert.equal(resolutions[0].from, 'escalated');
+  assert.equal(resolutions[0].to, 'ci-wait');
+  assert.equal(resolutions[0].raisedBy, 'pl-endzone');
+  assert.equal(resolutions[0].actor, 'cory');
+  assert.equal(resolutions[0].idempotencyKey, 'r-5:resolution');
+  assert.equal(resolutions[0].eventSequence, resolved.eventSequence);
+  assert.equal(resolutions[0].evidence, 'Cory ruled: proceed');
+
+  // A replay appends nothing; a replay that finds the line missing repairs it once.
+  assert.equal(go(escalated.revision, 'ci-wait', 'r-5', 'cory', 'Cory ruled: proceed').replayed, true);
+  assert.equal(lines().filter((l) => l.wake === 'resolution').length, 1);
+  const kept = lines().filter((l) => l.wake !== 'resolution');
+  fs.writeFileSync(outboxFile, `${kept.map((l) => JSON.stringify(l)).join('\n')}\n`);
+  assert.equal(go(escalated.revision, 'ci-wait', 'r-5', 'cory', 'Cory ruled: proceed').replayed, true);
+  assert.equal(lines().filter((l) => l.wake === 'resolution').length, 1);
+  assert.equal(lines().filter((l) => l.wake === 'resolution')[0].from, 'escalated');
+
+  // hold -> merged, by whoever merges; raised by the lead's hold.
+  r = go(resolved.revision, 'review', 'r-6', 'pl-endzone', 'checks settled');
+  const held = go(r.revision, 'hold', 'r-7', 'pl-endzone', 'wake:decision-needed; clean PR waits on Cory merge');
+  const merged = go(held.revision, 'merged', 'r-8', 'pr-watch', 'merged by Cory');
+  const holdResolution = lines().filter((l) => l.wake === 'resolution').pop();
+  assert.equal(holdResolution.from, 'hold');
+  assert.equal(holdResolution.to, 'merged');
+  assert.equal(holdResolution.raisedBy, 'pl-endzone');
+  assert.equal(holdResolution.actor, 'pr-watch');
+  assert.equal(holdResolution.eventSequence, merged.eventSequence);
+
+  // Leaving any other state writes no resolution line, and a Principal's escalation says who raised it.
+  assert.equal(lines().filter((l) => l.wake === 'resolution').length, 2);
+  const root2 = rootDir();
+  makeRecord(root2, { github: { issueNumber: 42 } });
+  const pe = transitionRecord({ root: root2, id: 'endzone:issue-42', expectedRevision: 1, to: 'escalated', idempotencyKey: 'pe-1', actor: 'pe-endzone', evidence: 'wake:decision-needed; proposal needs approval', now: '2026-09-29T10:00:00.000Z' });
+  transitionRecord({ root: root2, id: 'endzone:issue-42', expectedRevision: pe.revision, to: 'implementing', idempotencyKey: 'pe-2', actor: 'cory', evidence: 'approved', now: '2026-09-29T11:00:00.000Z' });
+  const [, peResolution] = fs.readFileSync(path.join(root2, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(peResolution.wake, 'resolution');
+  assert.equal(peResolution.raisedBy, 'pe-endzone');
+  assert.equal(peResolution.to, 'implementing');
 });
 
 // fleet#141: the watchdog's frontier wake woke and rotated pl-endzone for two
@@ -1127,6 +1512,87 @@ test('fleet#141: a CLI decision transition stamps its actor on the outbox line, 
   execFileSync(process.execPath, [bin, 'transition', '--root', root2, '--id', 'endzone:issue-42', '--to', 'escalated', '--expected-revision', '1', '--idempotency-key', 'esc-141', '--actor', 'cory', '--evidence', 'x', '--no-notifier'], { encoding: 'utf8', env });
   const [explicit] = fs.readFileSync(path.join(root2, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
   assert.equal(explicit.actor, 'cory', '--actor still wins over FLEET_NAME');
+});
+
+// #204 QA: escalated -> hold is a leave and an entry at once: both lines, under distinct keys.
+test('#204: escalated -> hold writes a decision-needed line and a resolution line', () => {
+  const root = rootDir();
+  makeRecord(root, { github: { issueNumber: 42, prNumber: 77 } });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const lines = () => fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  const go = (revision, to, key, actor, evidence) => transitionRecord({ root, id: 'endzone:issue-42', expectedRevision: revision, to, idempotencyKey: key, actor, evidence, now: '2026-09-29T10:00:00.000Z' });
+  let r = go(1, 'implementing', 'h-0a', 'pl-endzone', 'launched');
+  r = go(r.revision, 'pr-open', 'h-0b', 'pl-endzone', 'PR opened');
+  r = go(r.revision, 'review', 'h-0c', 'pl-endzone', 'checks settled');
+  const escalated = go(r.revision, 'escalated', 'h-1', 'pl-endzone', 'wake:decision-needed; needs a call');
+  const held = go(escalated.revision, 'hold', 'h-2', 'pl-endzone', 'wake:decision-needed; clean PR waits on Cory');
+  assert.deepEqual(lines().map((l) => [l.wake, l.idempotencyKey]), [['decision-needed', 'h-1'], ['resolution', 'h-2:resolution'], ['decision-needed', 'h-2']]);
+  const resolution = lines()[1];
+  assert.equal(resolution.from, 'escalated');
+  assert.equal(resolution.to, 'hold');
+  assert.equal(held.record.state, 'hold');
+  assert.equal(go(escalated.revision, 'hold', 'h-2', 'pl-endzone', 'x').replayed, true);
+  assert.equal(lines().length, 3, 'a replay adds nothing');
+});
+
+// #204 QA: raisedBy is the LATEST entering event, and a replay takes from/to from the committed transition.
+test('#204: raisedBy names the latest escalation across two cycles, and a replay reads from/to from the committed transition', () => {
+  const root = rootDir();
+  makeRecord(root, { github: { issueNumber: 42, prNumber: 77 } });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const lines = () => fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
+  const go = (revision, to, key, actor, evidence) => transitionRecord({ root, id: 'endzone:issue-42', expectedRevision: revision, to, idempotencyKey: key, actor, evidence, now: '2026-09-29T10:00:00.000Z' });
+  let r = go(1, 'escalated', 'c-1', 'pe-endzone', 'wake:decision-needed; first');
+  r = go(r.revision, 'implementing', 'c-2', 'cory', 'ruled');
+  r = go(r.revision, 'escalated', 'c-3', 'pl-endzone', 'wake:decision-needed; second');
+  const back = go(r.revision, 'pr-open', 'c-4', 'cory', 'ruled again');
+  const resolutions = lines().filter((l) => l.wake === 'resolution');
+  assert.deepEqual(resolutions.map((l) => l.raisedBy), ['pe-endzone', 'pl-endzone']);
+  // Drop the second resolution line and replay the same key with a different caller `to`: the line is repaired from the committed transition.
+  fs.writeFileSync(outboxFile, `${lines().filter((l) => l.idempotencyKey !== 'c-4:resolution').map((l) => JSON.stringify(l)).join('\n')}\n`);
+  const replay = go(r.revision, 'review', 'c-4', 'cory', 'ruled again');
+  assert.equal(replay.replayed, true);
+  const repaired = lines().filter((l) => l.wake === 'resolution').pop();
+  assert.equal(repaired.from, 'escalated');
+  assert.equal(repaired.to, 'pr-open');
+  assert.equal(repaired.raisedBy, 'pl-endzone');
+  assert.equal(repaired.eventSequence, back.eventSequence);
+});
+
+// #204 QA (ruling): abandon leaves `escalated` or `hold` too, so it writes the same resolution line.
+test('#204: abandoning a record out of escalated appends one resolution line to abandoned; a replay repairs a missing line and never doubles one', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1136';
+  const first = reserveRecord({ root, id, tenant: 'endzone', issue: 1136, manifestPath: 'assignment-1136-a.json', reservations: { components: ['src/game-center'] }, idempotencyKey: 'reserve-1136-a', now: '2026-09-10T04:58:36.000Z' });
+  const impl = move(root, id, first.revision, 'implementing', 'ack-1136', 'assignment acknowledged', '2026-09-10T04:58:52.000Z');
+  const esc = transitionRecord({ root, id, expectedRevision: impl.revision, to: 'escalated', idempotencyKey: 'escalate-1136', actor: 'pl-endzone', evidence: 'wake:decision-needed; account usage limit', now: '2026-09-10T04:59:54.000Z' });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const resolutions = () => fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l)).filter((l) => l.wake === 'resolution');
+  const abandon = () => abandonRecord({ root, id, expectedRevision: esc.revision, idempotencyKey: 'abandon-1136', actor: 'cory', reason: 'IC stopped on a usage limit', evidence: 'endzone#1136 ruling', now: '2026-09-10T14:07:41.000Z' });
+  const done = abandon();
+  assert.equal(resolutions().length, 1);
+  assert.equal(resolutions()[0].from, 'escalated');
+  assert.equal(resolutions()[0].to, 'abandoned');
+  assert.equal(resolutions()[0].raisedBy, 'pl-endzone');
+  assert.equal(resolutions()[0].actor, 'cory');
+  assert.equal(resolutions()[0].idempotencyKey, 'abandon-1136:resolution');
+  assert.equal(resolutions()[0].eventSequence, done.eventSequence);
+  assert.equal(resolutions()[0].evidence, 'endzone#1136 ruling');
+  assert.equal(abandon().replayed, true);
+  assert.equal(resolutions().length, 1, 'a replay appends none');
+  fs.writeFileSync(outboxFile, `${fs.readFileSync(outboxFile, 'utf8').split(/\r?\n/).filter(Boolean).filter((l) => JSON.parse(l).wake !== 'resolution').join('\n')}\n`);
+  assert.equal(abandon().replayed, true);
+  assert.equal(resolutions().length, 1, 'a replay repairs a missing line once');
+});
+
+test('#204: abandoning a record out of implementing appends no resolution line', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1137';
+  const first = reserveRecord({ root, id, tenant: 'endzone', issue: 1137, manifestPath: 'assignment-1137-a.json', reservations: { components: ['src/x'] }, idempotencyKey: 'reserve-1137-a', now: '2026-09-10T04:58:36.000Z' });
+  const impl = move(root, id, first.revision, 'implementing', 'ack-1137', 'assignment acknowledged', '2026-09-10T04:58:52.000Z');
+  abandonRecord({ root, id, expectedRevision: impl.revision, idempotencyKey: 'abandon-1137', actor: 'cory', reason: 'dropped', evidence: 'ruling', now: '2026-09-10T14:07:41.000Z' });
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  assert.equal(fs.existsSync(outboxFile) ? fs.readFileSync(outboxFile, 'utf8').trim() : '', '');
 });
 
 test('fleet#56: the Principal sees a lead escalation on a PR-less record', () => {
@@ -1260,4 +1726,134 @@ test('reserve scopes the conflict set and the third-assignment count to the reco
     (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF',
     'endzone\'s own count is unchanged by nidus joining',
   );
+});
+
+// Spec fleet #193 (#211): an escalation can name that the ticket's criteria were wrong
+// or ambiguous, by the reason `criteria-defect`; unlike stale-premise it carries no premise.
+test('#211: an escalation may carry the named reason criteria-defect with no premise; the wake and the event carry it, and free text still is not a reason', () => {
+  const root = rootDir();
+  const record = makeRecord(root);
+  assert.throws(() => transitionRecord({ root, id: record.record.id, to: 'escalated', expectedRevision: 1, evidence: 'the criteria were ambiguous', reason: 'criteria are ambiguous', idempotencyKey: 'esc-free', now: '2026-09-01T01:00:00.000Z' }), (error) => error.code === 'USAGE');
+  transitionRecord({ root, id: record.record.id, to: 'escalated', expectedRevision: 1, evidence: 'the criteria contradict each other', reason: 'criteria-defect', idempotencyKey: 'esc-named', actor: 'pl-endzone', now: '2026-09-01T01:00:00.000Z' });
+  const event = readEvents(root).find((entry) => entry.type === 'state-escalated');
+  assert.equal(event.changes.reason, 'criteria-defect');
+  assert.ok(!('premise' in event.changes) || event.changes.premise === undefined);
+  const wake = fs.readFileSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).pop();
+  assert.equal(wake.reason, 'criteria-defect');
+  assert.ok(!('premise' in wake));
+});
+
+// #235: judging a lock stale and removing it are separate steps, and the bootstrap
+// active.json write runs before the lock. Both races live in windows a scheduler
+// can open at any time, so each child widens its own window by monkeypatching fs
+// (test-only, in the child; bin/work-state.js is untouched): a delay between the
+// stale judgement and the removal stands in for a descheduled contender, and a
+// hold on the active.json read stands in for a long critical section (a merge
+// transition reconciles GitHub under the lock, up to 15 s). A file barrier makes
+// every contender probe the lock in the same millisecond, so node startup jitter
+// does not decide the interleaving. WORK_STATE_RACE_ROUNDS repeats each scenario.
+const RACE_ROUNDS = Number(process.env.WORK_STATE_RACE_ROUNDS || 3);
+
+function contend(children) {
+  const barrier = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-work-state-barrier-'));
+  const preamble = (index) => `
+const fs=require('node:fs');const path=require('node:path');
+const wait=(ms)=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);
+const m=require(${JSON.stringify(path.resolve(__dirname, '..', 'bin', 'work-state.js'))});
+const barrier=${JSON.stringify(barrier)};
+const arrive=()=>{fs.writeFileSync(path.join(barrier,'ready-${index}'),'');while(fs.readdirSync(barrier).length<${children.length})wait(1);};
+const report=(fn)=>{try{fn();process.stdout.write('ok')}catch(e){process.stdout.write(e.code||'error');process.stderr.write(String(e.stack||e))}};
+`;
+  return Promise.all(children.map((body, index) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', preamble(index) + body], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', () => resolve({ output, stderr }));
+  })));
+}
+
+test('#235: two contenders breaking the same stale lock admit exactly one holder', async () => {
+  const contender = (root, index, breakDelayMs, holdMs) => `
+const rm=fs.rmSync;fs.rmSync=function(t,o={}){if(path.basename(String(t))==='.lock'&&!o.maxRetries)wait(${breakDelayMs});return rm.call(this,t,o);};
+const rn=fs.renameSync;fs.renameSync=function(f,t){if(path.basename(String(f))==='.lock')wait(${breakDelayMs});return rn.call(this,f,t);};
+const rf=fs.readFileSync;fs.readFileSync=function(t,...r){const out=rf.call(this,t,...r);if(path.basename(String(t))==='active.json')wait(${holdMs});return out;};
+arrive();
+report(()=>m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'stale-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'}));`;
+  const verdicts = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    makeRecord(root);
+    staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const runs = await contend([contender(root, 0, 50, 300), contender(root, 1, 150, 300)]);
+    assert.deepEqual(runs.filter((run) => run.output !== 'ok' && run.output !== 'STALE_REVISION'), [], 'a contender died instead of losing');
+    verdicts.push(runs.map((run) => run.output).sort().join(','));
+  }
+  const doubleHolders = verdicts.filter((verdict) => verdict === 'ok,ok').length;
+  assert.equal(doubleHolders, 0, `${doubleHolders}/${RACE_ROUNDS} rounds admitted two holders: both contenders committed revision 1 -> 2 (${verdicts.join(' | ')})`);
+  assert.deepEqual(verdicts, Array(RACE_ROUNDS).fill('STALE_REVISION,ok'));
+});
+
+test('#235: two bootstraps on a fresh root lose no commit', async () => {
+  const contender = (root, index, writeDelayMs) => `
+let bootstrapped=false;const wf=fs.writeFileSync;
+fs.writeFileSync=function(t,d,...r){if(!bootstrapped&&path.basename(String(t)).startsWith('active.json')&&/"records": \{\}/.test(String(d))){bootstrapped=true;wait(${writeDelayMs});}return wf.call(this,t,d,...r);};
+arrive();
+report(()=>m.createRecord({root:${JSON.stringify(root)},id:'endzone:issue-${index}',tenant:'endzone',issue:${index},state:'assigned',idempotencyKey:'create-${index}',now:'2026-09-01T00:00:0${index}.000Z'}));`;
+  const lost = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    const runs = await contend([contender(root, 1, 30), contender(root, 2, 300)]);
+    assert.deepEqual(runs.map((run) => run.output), ['ok', 'ok'], runs.map((run) => run.stderr).join('\n'));
+    const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+    const ids = Object.keys(active.records).sort();
+    if (ids.length !== 2) lost.push(ids.join(',') || '(none)');
+    assert.equal(readEvents(root).filter((event) => event.type === 'work-created').length, 2, 'both creates reached the ledger');
+  }
+  assert.equal(lost.length, 0, `${lost.length}/${RACE_ROUNDS} rounds lost a committed record: active.json kept only [${lost.join(' | ')}] after the second bootstrap overwrote it`);
+});
+
+test('#235: a stale lock and a stale breaker mutex whose removal keeps reporting EPERM throws after about five seconds', () => {
+  const root = rootDir();
+  makeRecord(root);
+  staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  breakMutex(root, '', 10 * 60 * 1000);
+  withFsFault('rmSync', (target) => (path.basename(target) === '.lock.break' ? 'EPERM' : null), (probe) => {
+    probe.onWait = () => { if (probe.waits > 2000) throw new Error('spun past the transient limit'); return 'timed-out'; };
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'EPERM');
+    assert.ok(probe.waits > 100 && probe.waits < 700, `waits: ${probe.waits}`);
+  });
+});
+
+test('#235: a lock whose owner pid reports EPERM to signal 0 is alive and not breakable', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 4, at: '2026-01-01T00:00:00.000Z' }));
+  const kill = process.kill;
+  process.kill = () => { throw Object.assign(new Error('EPERM: simulated'), { code: 'EPERM' }); };
+  try {
+    withFsFault('openSync', (target, probe) => (isLock(target) && probe.waits > 5 ? 'ENOSPC' : null), (probe) => {
+      assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'ENOSPC');
+      assert.ok(probe.waits > 5);
+    });
+  } finally { process.kill = kill; }
+  assert.equal(fs.existsSync(lock), true);
+});
+
+test('#235: a contender stalled after judging the lock stale re-judges it under the breaker mutex', async () => {
+  const contender = (root, index, mutexDelayMs, holdMs) => `
+const op=fs.openSync;let first=true;fs.openSync=function(t,...r){if(path.basename(String(t))==='.lock.break'&&first){first=false;wait(${mutexDelayMs});}return op.call(this,t,...r);};
+const rf=fs.readFileSync;fs.readFileSync=function(t,...r){const out=rf.call(this,t,...r);if(path.basename(String(t))==='active.json')wait(${holdMs});return out;};
+arrive();
+report(()=>m.transitionRecord({root:${JSON.stringify(root)},id:'endzone:issue-42',expectedRevision:1,to:'implementing',idempotencyKey:'rejudge-${index}',evidence:'ack',actor:'test',now:'2026-09-01T00:00:01.000Z'}));`;
+  const verdicts = [];
+  for (let round = 0; round < RACE_ROUNDS; round += 1) {
+    const root = rootDir();
+    makeRecord(root);
+    staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    const runs = await contend([contender(root, 0, 0, 800), contender(root, 1, 200, 0)]);
+    verdicts.push(runs.map((run) => run.output).sort().join(','));
+  }
+  assert.deepEqual(verdicts, Array(RACE_ROUNDS).fill('STALE_REVISION,ok'));
 });

@@ -16,7 +16,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { WorkStateError, parseArgs } = require('./work-state');
-const { sha256 } = require('./assignment');
+const { sha256, VETO_RE } = require('./assignment');
 const { readPremises } = require('./premises');
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -28,10 +28,19 @@ const DEFAULT_CONFIG = Object.freeze({
   graduation: { minProposals: 30, minDays: 14, minUnchangedRatio: 0.9 },
 });
 
-const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed']);
+// Spec fleet #193 (#210, #211): the bounded kinds are written only by their doors
+// (bin/bounded-authority.js: bounded-ready, veto, and the suspension scan), never by
+// `record`, and none of them is an outcome the unchanged ratio counts.
+const BOUNDED_KINDS = Object.freeze(['bounded-ready', 'veto', 'suspended']);
+const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed', ...BOUNDED_KINDS]);
 const OUTCOME_KINDS = Object.freeze(['approved', 'approved-with-edits', 'rejected', 'superseded']);
 const APPROVAL_RE = /^\s*approved(\s+with\s*:|\b)/i;
 const APPROVAL_WITH_EDITS_RE = /^\s*approved\s+with\s*:/i;
+// #207 (spec #193): the exact approval is the one word `Approved`, whitespace aside. Anything
+// else that APPROVAL_RE admits ("Approved with: ...", "Approved, but skip X") is an approval
+// WITH edits and stays with the Principal.
+const EXACT_APPROVAL_RE = /^\s*approved\s*$/i;
+function isExactApproval(body) { return EXACT_APPROVAL_RE.test(String(body || '')); }
 // fleet#55: the fleet posts under the tenant's ownerLogin, so authorship cannot
 // tell Cory from a session. A re-proposal ask is therefore a comment that BEGINS
 // "Re-propose", a wording hooks/principal-guard.ps1 refuses to every fleet role
@@ -131,7 +140,7 @@ function appendEntry(root, tenant, entry) {
   return entry;
 }
 
-function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, now } = {}) {
+function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, fields, now } = {}) {
   if (!LEDGER_KINDS.includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `kind must be one of ${LEDGER_KINDS.join(', ')}`);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : 'principal' };
@@ -159,6 +168,16 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     if (kind === 'approved-with-edits') entry.edits = requireText(edits, 'edits');
   }
   if (kind === 'superseded') entry.bodyHash = requireText(bodyHash, 'body-hash');
+  if (kind === 'bounded-ready') {
+    entry.bodyHash = requireText(bodyHash, 'body-hash');
+    if (commentUrl) entry.commentUrl = String(commentUrl);
+  }
+  if (kind === 'veto') {
+    entry.by = requireText(by, 'by');
+    if (commentUrl) entry.commentUrl = String(commentUrl);
+  }
+  // `fields` is the door's own detail (scope, tier, cause...); it never overrides a core key.
+  if (fields && BOUNDED_KINDS.includes(kind)) for (const [key, value] of Object.entries(fields)) if (!(key in entry)) entry[key] = value;
   if (kind === 'finalized') {
     const applied = String(labels || '').split(',').map((label) => label.trim()).filter(Boolean);
     entry.labels = applied;
@@ -183,10 +202,12 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
   if (kind === 'proposed') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
     if (open && open.proposed && !open.outcome) throw new WorkStateError('TRIAGE_PROPOSAL_OPEN', `issue #${entry.issue} already has an open proposal at ${open.proposed.at}; record its outcome first`);
-  } else if (kind !== 'consumed') {
+  } else if (kind !== 'consumed' && kind !== 'suspended') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
     if (!open || !open.proposed) throw new WorkStateError('TRIAGE_NO_PROPOSAL', `issue #${entry.issue} has no proposal to ${kind}`);
-    if (OUTCOME_KINDS.includes(kind) && open.outcome) throw new WorkStateError('TRIAGE_OUTCOME_RECORDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at}`);
+    // #207: the outcome row is a first-writer-wins claim (the finalize script and the Principal both take it before posting a Ruling).
+    if ((OUTCOME_KINDS.includes(kind) || kind === 'bounded-ready') && open.outcome) throw new WorkStateError('TRIAGE_ALREADY_DECIDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at} by ${open.outcome.actor || 'principal'}`, { decidedBy: open.outcome.actor || 'principal' });
+    if (kind === 'veto' && !(open.outcome && open.outcome.kind === 'bounded-ready')) throw new WorkStateError('TRIAGE_NO_BOUNDED_READY', `issue #${entry.issue} has no standing bounded ready to veto`);
     if (kind === 'finalized' && !open.outcome) throw new WorkStateError('TRIAGE_NOT_APPROVED', `issue #${entry.issue} has no approval to finalize`);
   }
   appendEntry(root, tenant, entry);
@@ -298,6 +319,11 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     row.history.push(entry);
     if (entry.kind === 'proposed') { row.proposed = entry; row.outcome = null; row.finalized = null; if (!firstProposedAt) firstProposedAt = entry.at; }
     else if (OUTCOME_KINDS.includes(entry.kind)) { if (row.proposed && !row.outcome) { row.outcome = entry; outcomes.push(entry); } }
+    // Spec fleet #193: a bounded ready routes the proposal without an Approval, so it is
+    // the row's outcome but never one of `outcomes`, which is what the ratio tallies; a veto
+    // takes it back and the proposal is awaiting Approval again.
+    else if (entry.kind === 'bounded-ready') { if (row.proposed && !row.outcome) row.outcome = entry; }
+    else if (entry.kind === 'veto') { if (row.outcome && row.outcome.kind === 'bounded-ready') { row.outcome = null; row.finalized = null; } }
     else if (entry.kind === 'finalized') { if (row.outcome) row.finalized = entry; }
   }
   const rows = Object.values(byIssue).sort((left, right) => left.issue - right.issue);
@@ -357,6 +383,7 @@ function normalizeComments(comments) {
     id: String(comment.id || ''),
     url: String(comment.url || ''),
     createdAt: String(comment.createdAt || ''),
+    lastEditedAt: String(comment.lastEditedAt || ''),
     author: String(typeof comment.author === 'string' ? comment.author : comment.author?.login || ''),
     body: String(comment.body || ''),
   })).sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
@@ -379,10 +406,14 @@ function normalizeIssue(issue) {
     openSubIssues,
     comments: normalizeComments(issue.comments),
     commentsTruncated: Boolean(issue.commentsTruncated || issue.comments?.pageInfo?.hasPreviousPage),
+    // Spec fleet #193 (M4): GitHub's own blocked-by edges. The bounded door refuses an OPEN one; a
+    // truncated list counts as one, since an edge it did not see may be open.
+    blockedBy: (Array.isArray(issue.blockedBy) ? issue.blockedBy : issue.blockedBy?.nodes || []).map((node) => ({ number: Number(node.number), state: String(node.state || 'OPEN').toUpperCase() })),
+    blockedByTruncated: Boolean(issue.blockedByTruncated || issue.blockedBy?.pageInfo?.hasNextPage),
   };
 }
 
-const ISSUE_QUERY = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,lastEditedAt,author{login},labels(first:20){nodes{name}},assignees(first:20){nodes{login}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(last:100){nodes{id,url,body,createdAt,author{login}} pageInfo{hasPreviousPage}}} pageInfo{hasNextPage,endCursor}}}}';
+const ISSUE_QUERY = 'query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){issues(first:100,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:ASC}){nodes{number,title,url,body,createdAt,lastEditedAt,author{login},labels(first:20){nodes{name}},assignees(first:20){nodes{login}},subIssues(first:100){nodes{number,state} pageInfo{hasNextPage}},blockedBy(first:100){nodes{number,state} pageInfo{hasNextPage}},comments(last:100){nodes{id,url,body,createdAt,lastEditedAt,author{login}} pageInfo{hasPreviousPage}}} pageInfo{hasNextPage,endCursor}}}}';
 
 function queryGithubIssues({ repo, executable = 'gh', runner = execFileSync } = {}) {
   const [owner, name] = String(repo || '').split('/');
@@ -451,7 +482,7 @@ function readHeldIssues(root, tenant, now) {
 
 // ------------------------------------------------------------- frontier ----
 
-function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, readyLabel = 'ready-for-agent', config = DEFAULT_CONFIG, entries = [], outbox = [], held = new Map(), tenant, now } = {}) {
+function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, readyLabel = 'ready-for-agent', config = DEFAULT_CONFIG, entries = [], outbox = [], held = new Map(), tenant, now, escalationLabel = null, workIssues = null } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const owner = requireText(ownerLogin, 'ownerLogin');
   // #154: authorship decides only when the owner and the fleet are two logins.
@@ -461,6 +492,8 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   const marker = config.markerLabel;
   const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
   const approvals = [];
+  const vetoes = [];
+  const repairs = [];
   const tickets = [];
   const skipped = [];
 
@@ -473,11 +506,42 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     const ownerComments = issue.comments.filter((comment) => comment.author === owner);
     const newest = issue.comments[issue.comments.length - 1] || null;
 
+    // 0. (#210) A standing bounded ready with the owner's Veto after it: withdraw the ready.
+    const standing = row && row.outcome && row.outcome.kind === 'bounded-ready' ? row.outcome : null;
+    if (standing) {
+      const veto = ownerComments.filter((comment) => Date.parse(comment.createdAt) > Date.parse(standing.at) && VETO_RE.test(comment.body)).pop();
+      if (veto) {
+        vetoes.push({ kind: 'veto', number: issue.number, title: issue.title, url: issue.url, commentUrl: veto.url, at: veto.createdAt, by: veto.author, readyAt: standing.at, reason: 'owner Veto newer than the bounded ready' });
+        continue;
+      }
+    }
+
+    // 0. #207: an outcome (any actor's) with no finalized row is an unfinished claim. The finalize
+    // script finishes its own on its next run; past CLAIM_EXPIRY_MINUTES it returns here for the
+    // Principal, who resumes at step 1 of Approval and finalizing (a Ruling only if none is newer
+    // than the approval). A Principal's claim counts only while the marker stands, so an issue ruled
+    // by hand and never given a finalized row does not come back forever.
+    if (row && row.outcome && ['approved', 'approved-with-edits'].includes(row.outcome.kind) && !row.finalized
+      && (row.outcome.actor === FINALIZE_ACTOR || labels.has(marker))
+      && new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000) {
+      const who = row.outcome.actor === FINALIZE_ACTOR ? 'finalize-script' : (row.outcome.actor || 'principal');
+      approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: row.outcome.commentUrl || null, at: row.outcome.at, withEdits: row.outcome.kind === 'approved-with-edits', edits: row.outcome.edits || null, by: row.outcome.by || owner, reason: `${who} claim older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row` });
+      continue;
+    }
+
+    // 0b. (#210, ruling m2) A standing bounded ready whose ready label is missing and that the owner
+    // has not spoken on since: the label edit after the ledger row failed. Re-running
+    // `bounded-ready --issue <n>` re-applies the label, records nothing and pages nothing.
+    if (standing && !repairBlockers({ standing, issue, entries, owner, readyLabel, config, escalationLabel, held, workIssues }).length) {
+      repairs.push({ kind: 'bounded-repair', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, readyAt: standing.at, reason: `bounded ready recorded at ${standing.at}, but ${readyLabel} is not on the issue` });
+      continue;
+    }
+
     // 1. An open proposal with the owner's Approved comment after it: finalize first.
     if (proposed) {
-      const approval = ownerComments.filter((comment) => comment.createdAt > proposed.at && APPROVAL_RE.test(comment.body)).pop();
+      const approval = ownerComments.filter((comment) => comment.createdAt > approvalFloor(row) && APPROVAL_RE.test(comment.body)).pop();
       if (approval) {
-        approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: APPROVAL_WITH_EDITS_RE.test(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
+        approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: !isExactApproval(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
         continue;
       }
     }
@@ -549,15 +613,16 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   }
 
   approvals.sort((left, right) => left.at.localeCompare(right.at));
+  vetoes.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
-    eligible: [...approvals, ...escalationList, ...tickets],
+    eligible: [...vetoes, ...repairs, ...approvals, ...escalationList, ...tickets],
     proposeNow,
     skipped,
     premises,
-    counts: { issues: issues.length, eligible: approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length },
+    counts: { issues: issues.length, eligible: vetoes.length + repairs.length + approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length, vetoes: vetoes.length, repairs: repairs.length },
   };
 }
 
@@ -570,7 +635,7 @@ function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, 
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
   const entries = readLedger(root, tenant);
   const held = readHeldIssues(root, tenant, at);
-  const frontier = selectTriageFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, readyLabel: tenantConfig.readyLabel || 'ready-for-agent', config, entries, outbox, held, tenant, now: at });
+  const frontier = selectTriageFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, readyLabel: tenantConfig.readyLabel || 'ready-for-agent', config, entries, outbox, held, tenant, now: at, escalationLabel: tenantConfig.escalationLabel || null, workIssues: activeWorkIssues(root, tenant) });
   return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', ...frontier };
 }
 
@@ -595,6 +660,369 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
   return { tenant: String(tenant), issue: number, bodyHash: sha256(body || '') };
 }
 
+// Spec fleet #193 (m4): an Approval counts only when newer than the proposal AND newer than the
+// newest `veto` row of the issue. A Veto puts a proposal back to awaiting Approval, so an
+// `Approved` that came before it (said of the bounded ready, or of the proposal it replaced)
+// must not finalize what the owner then withdrew.
+function approvalFloor(row) {
+  const proposedAt = row && row.proposed ? String(row.proposed.at) : '';
+  const veto = ((row && row.history) || []).filter((entry) => entry.kind === 'veto' && String(entry.at) >= proposedAt).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  return veto > proposedAt ? veto : proposedAt;
+}
+
+// Spec fleet #193 (final QA, minor 6): ONE predicate for "this standing bounded ready may have its
+// ready label re-applied". The frontier's bounded-repair item (an item exists only when this returns
+// nothing) and the door's repair (bin/bounded-authority.js refuses on whatever it returns) both read it,
+// so they cannot disagree. [{ code, detail }] in the order the checks bind: a newer proposal, a changed
+// body, the ready label already on, a row that never paged Cory, an owner comment since (any case of
+// the login), a barred label, a hold, a Work record.
+function repairBlockers({ standing, issue, entries = [], owner, readyLabel, config = DEFAULT_CONFIG, escalationLabel = null, held = null, workIssues = null } = {}) {
+  const failures = [];
+  const fail = (code, detail) => failures.push({ code, detail });
+  if (entries.some((entry) => entry.kind === 'proposed' && Number(entry.issue) === issue.number && String(entry.at) > String(standing.at))) fail('bounded-once', `a newer proposal than the bounded ready at ${standing.at} exists; an issue is readied under Bounded authority once`);
+  if (issue.bodyHash !== standing.bodyHash) fail('body-changed', `the issue body changed since the bounded ready at ${standing.at}`);
+  if (issue.labels.includes(readyLabel)) fail('bounded-once', `issue #${issue.number} already has its bounded ready (${standing.at}) and carries ${readyLabel}`);
+  if (standing.paged !== true) fail('unpaged-ready', `the bounded-ready row at ${standing.at} does not record that Cory was paged, so it is not repaired into a ready label`);
+  const login = String(owner || '').toLowerCase();
+  if (issue.comments.some((comment) => String(comment.author).toLowerCase() === login && Date.parse(comment.createdAt) > Date.parse(standing.at))) fail('owner-spoke', `${owner} commented after the bounded ready at ${standing.at}; the repair is left`);
+  const barred = issue.labels.filter((label) => [...config.routingLabels, ...NEVER_FINALIZED_LABELS, escalationLabel].filter(Boolean).includes(label));
+  if (barred.length) fail('labels', `issue #${issue.number} carries ${barred.join(', ')}, so the ready label is not re-applied`);
+  const hold = heldIn(held, issue.number);
+  if (hold) fail('held', hold);
+  if (workIssues && workIssues.has(issue.number)) fail('live-work', `a Work record for issue #${issue.number} exists`);
+  return failures;
+}
+
+// The issue numbers of a tenant's Work records (state/work/active.json), any state: what a bounded ready must not be made over.
+function activeWorkIssues(root, tenant) {
+  const file = path.join(baseOf(root), 'state', 'work', 'active.json');
+  if (!fs.existsSync(file)) return new Set();
+  const active = readJsonFile(file, {});
+  const records = Array.isArray(active) ? active : Object.values((active && active.records) || active || {});
+  const numbers = new Set();
+  for (const record of records) {
+    const parsed = record && parseRecordIssue(record.id);
+    if (parsed && parsed.tenant === String(tenant)) numbers.add(parsed.issue);
+  }
+  return numbers;
+}
+
+// ------------------------------------------------------------- finalize ----
+// #207 (spec #193, scope ruled 2026-09-29 after QA): an exact `Approved` from the owner
+// turns a SELF-CONTAINED proposal into a Ruling and a ready ticket within one tick, with
+// no Principal session. Self-contained means the proposal leaves the Principal nothing to
+// fold in, edit, link or route by judgment; every clause below must hold, and a failing
+// clause leaves the issue to the Principal with the clause name as its `reason` in `left`.
+// No prose regex: every check is on a structured field, an exact word, a label or a ledger row.
+//
+//   1  ledger: an open proposal (proposed, no outcome, no standing bounded-ready row)
+//   2  approval: the owner's newest approval-shaped comment after it is exactly `Approved`
+//   3  no `## Ruling` and no owner comment newer than that approval
+//   4  the proposal comment is the ledger's and the newest `## Triage proposal` before the approval
+//   5  neither the proposal nor the approval comment was edited after the approval
+//   6  the issue body hash is unchanged and the body has a `## Premises` heading
+//   7  not an escalation ruling (fail closed, three independent checks)
+//   8  proposal fields, each a whole FIELD (its line plus any continuation lines) that is
+//      exactly the word: Classification bug|feature, Open for Cory none, Blocked_by none,
+//      Tier haiku|sonnet; a Ruling field; and every premise line verified (none false)
+//   9  labels: no routing or escalation label, `held` or `haiku-rehearsal`, and no hold;
+//      the marker present
+//   10 cap: at most FINALIZE_CAP new finalizes per run
+//
+// Clauses 1 and 4 to 9 are proposalGate(), one pure function the bounded-ready door
+// (#209-#211) shares; 2, 3 and 10 belong to finalizeApprovals. A conversation between the
+// proposal and the approval is ACCEPTED: the owner said `Approved` last, and clause 3
+// refuses anything the owner said after it. A claim on an issue that is then closed before
+// its finalized row is not chased (only open issues are read): the digest's "approved
+// awaiting finalizing" count is its trace, and closing the issue was the owner's hand.
+
+const PROPOSAL_HEADING_RE = /^\s*##\s*Triage proposal\b/i;
+const RULING_HEADING_RE = /^\s*##\s*Ruling\b/i;
+// `## Premises`, optionally `## Premises (...)`, on its own line (no newline inside the heading).
+const PREMISES_HEADING_RE = /^[ \t]{0,3}##[ \t]+premises[ \t]*(?:\([^\n]*\))?[ \t]*#*[ \t]*\r?$/im;
+// The verified-premise line as the Principal writes it (agents/principal.md, `Premises:`),
+// matched after trimming the block's indent: `<path>: <claim> @<sha> verified @<sha>`, and
+// nothing after the second sha.
+const VERIFIED_PREMISE_RE = /^\S.*: .+ @[0-9a-f]{7,40} verified @[0-9a-f]{7,40}$/;
+const FINALIZE_ACTOR = 'finalize-script';
+const FINALIZE_CAP = 5;
+const CLAIM_EXPIRY_MINUTES = 30;
+const NEVER_FINALIZED_LABELS = Object.freeze(['held', 'haiku-rehearsal']);
+const FIELD_KEY_RE = /^([A-Z][A-Za-z_ -]*?):[ \t]*(.*?)[ \t]*$/;   // the hyphen is for `Red-tell`
+
+// The one proposal parser. A field is a `Name:` line at column 0; its value is the text after
+// the colon plus every continuation line (indented, blank lines between them skipped), joined
+// by newlines. A repeated name joins its values, so an exact-valued field stops being exact.
+// `premises` is the trimmed continuation lines under a bare `Premises:` line, null for any
+// other shape (`Premises: none stated`, a repeated block, no block).
+function parseProposal(body) {
+  const lines = String(body || '').replace(/\r\n/g, '\n').split('\n');
+  const fields = {};
+  let premises = null;
+  let premisesSeen = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const key = FIELD_KEY_RE.exec(lines[index]);
+    if (!key) continue;
+    const parts = key[2] ? [key[2]] : [];
+    const continuation = [];
+    for (;;) {
+      let next = index + 1;
+      while (next < lines.length && !lines[next].trim()) next += 1;
+      if (next < lines.length && /^[ \t]+\S/.test(lines[next])) { continuation.push(lines[next].trim()); index = next; } else break;
+    }
+    const value = [...parts, ...continuation].join('\n');
+    fields[key[1]] = Object.prototype.hasOwnProperty.call(fields, key[1]) ? `${fields[key[1]]}\n${value}` : value;
+    if (key[1] === 'Premises') { premisesSeen += 1; premises = premisesSeen === 1 && !key[2] ? continuation : null; }
+  }
+  return { fields, premises };
+}
+
+// A field that must be exactly one word: the whole field, one trailing full stop allowed.
+function exactField(parsed, name) {
+  return Object.prototype.hasOwnProperty.call(parsed.fields, name) ? parsed.fields[name].replace(/\.$/, '') : null;
+}
+
+function proposalClassification(text) {
+  return exactField(parseProposal(text), 'Classification');
+}
+
+// The Ruling: the proposal under its own heading (its first `## Triage proposal` line
+// removed, otherwise verbatim, CRLF normalised), with the approval named above and the
+// labels applied below.
+function rulingBodyFor({ proposalBody, approvalUrl, labels, marker }) {
+  const lines = String(proposalBody || '').replace(/\r\n/g, '\n').split('\n');
+  const first = lines.findIndex((line) => line.trim());
+  if (first >= 0 && PROPOSAL_HEADING_RE.test(lines[first])) lines.splice(first, 1);
+  const proposal = lines.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
+  const approved = approvalUrl ? `Approved without edits: ${approvalUrl}.` : 'Approved without edits.';
+  return `## Ruling\n${approved} Finalized by script (fleet #207).\n\n${proposal}\n\nLabels: ${labels.join(', ')}; ${marker} removed.`;
+}
+
+// Clause 8: the codes of every proposal field that is not self-contained, in field order.
+function proposalRefusals(text) {
+  const parsed = parseProposal(text);
+  const codes = [];
+  const classification = exactField(parsed, 'Classification');
+  if (classification !== 'bug' && classification !== 'feature') codes.push('classification');
+  if (exactField(parsed, 'Open for Cory') !== 'none') codes.push('open-for-cory');
+  if (exactField(parsed, 'Blocked_by') !== 'none') codes.push('blocked-by');
+  const tier = exactField(parsed, 'Tier');
+  if (tier !== 'haiku' && tier !== 'sonnet') codes.push('tier');
+  if (!Object.prototype.hasOwnProperty.call(parsed.fields, 'Ruling')) codes.push('no-ruling-line');
+  if (!parsed.premises || !parsed.premises.length || !parsed.premises.every((line) => !/ false:/.test(line) && VERIFIED_PREMISE_RE.test(line))) codes.push('premises');
+  return codes;
+}
+
+// Clause 7, fail closed. An escalation ruling is one whose proposal carries a wake record
+// id; or one a lead's `decision-needed` wake reached in the window before the proposal
+// (after the issue's previous approved or finalized row, up to the proposal), consumed or
+// not; or one whose wake is still past the consumed-up-to marker. The Principal not
+// recording `--record-id` is why the second and third checks exist: the first is never the
+// only one. A superseded or rejected proposal answered no wake, so it does not bound the window.
+function escalationReason({ proposed, issueNumber, tenant, outbox, consumedThrough, history }) {
+  if (proposed.recordId) return `proposal was recorded against wake ${proposed.recordId}`;
+  const previous = history
+    .filter((entry) => ['approved', 'approved-with-edits', 'finalized'].includes(entry.kind) && String(entry.at) < String(proposed.at))
+    .reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  for (const record of outbox) {
+    if (!record || record.wake !== 'decision-needed' || !record.at) continue;
+    const parsed = parseRecordIssue(record.recordId);
+    if (parsed.tenant !== String(tenant) || parsed.issue !== issueNumber) continue;
+    const at = String(record.at);
+    if (at > previous && at <= String(proposed.at)) return `decision-needed wake ${record.recordId} at ${at} preceded the proposal`;
+    if (!consumedThrough || at > consumedThrough) return `decision-needed wake ${record.recordId} at ${at} is not consumed`;
+  }
+  return null;
+}
+
+function editedAfter(comment, moment) {
+  return Boolean(comment.lastEditedAt) && String(comment.lastEditedAt) > String(moment);
+}
+
+function heldIn(holds, number) {
+  if (!holds) return null;
+  if (holds instanceof Map) return holds.has(number) ? String(holds.get(number)) : null;
+  if (typeof holds.has === 'function') return holds.has(number) ? 'held' : null;
+  return Array.isArray(holds) && holds.includes(number) ? 'held' : null;
+}
+
+// Clauses 1 and 4 to 9 as one pure predicate: [{ code, detail }] for every clause that fails,
+// [] when the proposal is self-contained. `issue` is a normalized issue, `row` its projection
+// row, `proposal` the ledger's proposal comment. `approval` (the owner's comment) anchors clauses
+// 4 and 5; without one, the proposal must be the newest in the thread and never edited.
+// `holds` (a Map, Set or array of issue numbers: skip-file and exclusion holds) is optional.
+function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_CONFIG, tenantConfig = {}, tenant, outbox = [], consumedThrough = null, holds = null } = {}) {
+  const failures = [];
+  const fail = (code, detail) => failures.push(detail ? { code, detail } : { code });
+  const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
+  if (!proposed) { fail('no-open-proposal', row && row.outcome ? `outcome ${row.outcome.kind} recorded` : 'no open proposal'); return failures; }
+  const history = row.history || [];
+  // A bounded-ready row stands until a later veto row (a vetoed proposal is back to awaiting Approval).
+  const lastAt = (kind) => history.filter((entry) => entry.kind === kind && String(entry.at) >= String(proposed.at)).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  if (lastAt('bounded-ready') && lastAt('bounded-ready') > lastAt('veto')) { fail('no-open-proposal', 'a bounded-ready row stands'); return failures; }
+  const before = approval ? approval.createdAt : null;
+  const headed = issue.comments.filter((comment) => PROPOSAL_HEADING_RE.test(comment.body) && (before === null || comment.createdAt < before));
+  const newest = headed[headed.length - 1];   // clause 4
+  const identified = Boolean(proposal) && Boolean(proposal.url) && proposal.url === proposed.commentUrl && PROPOSAL_HEADING_RE.test(proposal.body) && Boolean(newest) && newest.url === proposal.url;
+  if (!identified) fail('stale-proposal', issue.commentsTruncated ? 'thread truncated' : undefined);
+  if (identified) {   // clause 5
+    const edited = approval ? editedAfter(proposal, approval.createdAt) || editedAfter(approval, approval.createdAt) : editedAfter(proposal, proposal.createdAt);
+    if (edited) fail('edited-after-approval');
+  }
+  if (issue.bodyHash !== proposed.bodyHash) fail('body-changed');   // clause 6
+  else if (!PREMISES_HEADING_RE.test(issue.body)) fail('no-premises-heading');
+  const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant: tenant || tenantConfig.name, outbox, consumedThrough, history });   // clause 7
+  if (escalation) fail('escalation', escalation);
+  if (identified) for (const code of proposalRefusals(proposal.body)) fail(code);   // clause 8
+  const blocking = new Set([tenantConfig.readyLabel || 'ready-for-agent', ...config.routingLabels, ...NEVER_FINALIZED_LABELS, ...(tenantConfig.escalationLabel ? [tenantConfig.escalationLabel] : [])]);   // clause 9
+  const labels = new Set(issue.labels);
+  const blocked = [...labels].filter((label) => blocking.has(label));
+  if (blocked.length) fail('labels', `carries ${blocked.join(', ')}`);
+  else if (!labels.has(config.markerLabel)) fail('labels', `no ${config.markerLabel}`);
+  const hold = heldIn(holds, issue.number);
+  if (hold) fail('held', hold);
+  return failures;
+}
+
+function ghIssueWriter({ repo, runner }) {
+  const run = (args, input) => {
+    try {
+      runner('gh', args, { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
+    } catch (error) {
+      throw new WorkStateError('GITHUB_WRITE_FAILED', String(error.stderr || error.message || error).trim());
+    }
+  };
+  return {
+    comment(number, body) { run(['issue', 'comment', String(number), '-R', repo, '--body-file', '-'], body); },
+    relabel(number, { add, remove }) {
+      const args = ['issue', 'edit', String(number), '-R', repo];
+      for (const label of add) args.push('--add-label', label);
+      if (remove) args.push('--remove-label', remove);
+      run(args);
+    },
+  };
+}
+
+// The fixture stands in for GitHub in tests and in the watchdog test: a finalize against
+// it edits the fixture file, so the next frontier read sees what GitHub would show.
+function fixtureIssueWriter({ file, author, at }) {
+  const edit = (number, change) => {
+    const issues = readJsonFile(path.resolve(file), null);
+    const target = issues.find((entry) => Number(entry.number) === Number(number));
+    if (!target) throw new WorkStateError('TRIAGE_INVALID', `issue #${number} is not in the fixture ${file}`);
+    change(target);
+    fs.writeFileSync(path.resolve(file), JSON.stringify(issues), 'utf8');
+  };
+  return {
+    comment(number, body) {
+      edit(number, (target) => {
+        const comments = normalizeComments(target.comments);
+        const id = `finalize-${number}-${comments.length + 1}`;
+        comments.push({ id, url: `${target.url || ''}#issuecomment-${id}`, createdAt: at, author, body });
+        target.comments = comments;
+      });
+    },
+    relabel(number, { add, remove }) {
+      edit(number, (target) => {
+        const labels = normalizeLabels(target.labels).filter((label) => label !== remove);
+        for (const label of add) if (!labels.includes(label)) labels.push(label);
+        target.labels = labels;
+      });
+    },
+  };
+}
+
+function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner = execFileSync } = {}) {
+  const config = readTriageConfig(root);
+  const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
+  const owner = ownerLoginOf(tenantConfig);
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  // The ledger is read before GitHub, so a claim recorded while the issues load is what the
+  // claim below collides with (TRIAGE_ALREADY_DECIDED), not something this run already saw.
+  const entries = readLedger(root, tenant);
+  const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
+  const issues = fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner });
+  const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
+  const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
+  const marker = config.markerLabel;
+  const writer = fixture
+    ? fixtureIssueWriter({ file: fixture, author: tenantConfig.fleetIdentity || 'fleet', at })
+    : ghIssueWriter({ repo: tenantConfig.github, runner });
+  const finalized = [];
+  const left = [];
+  const errors = [];
+  const sorted = [...issues].sort((a, b) => a.number - b.number);
+
+  // Steps b to d of the effect, all idempotent: the Ruling unless one newer than the approval
+  // stands, the labels, then the finalized row. The claim (step a) is what made this run the owner of it.
+  const complete = (issue, proposalComment, approvalUrl, approvalAt) => {
+    const applied = proposalClassification(proposalComment.body) === 'bug' ? [readyLabel, 'bug'] : [readyLabel];
+    const posted = issue.comments.some((comment) => comment.createdAt > approvalAt && RULING_HEADING_RE.test(comment.body));
+    if (!posted) writer.comment(issue.number, rulingBodyFor({ proposalBody: proposalComment.body, approvalUrl, labels: applied, marker }));
+    const have = new Set(issue.labels);
+    if (applied.some((label) => !have.has(label)) || have.has(marker)) writer.relabel(issue.number, { add: applied.filter((label) => !have.has(label)), remove: have.has(marker) ? marker : null });
+    recordEntry({ root, tenant, kind: 'finalized', issue: issue.number, labels: applied.join(','), actor: FINALIZE_ACTOR, now: at });
+    finalized.push({ issue: issue.number, url: issue.url, commentUrl: approvalUrl, labels: applied });
+  };
+
+  // Recovery (section 5): a claim of ours with no finalized row is a run cut short. Finish it.
+  for (const issue of sorted) {
+    const row = projection.byIssue[issue.number] || null;
+    if (!row || !row.proposed || !row.outcome || row.finalized) continue;
+    if (row.outcome.kind !== 'approved' || row.outcome.actor !== FINALIZE_ACTOR) continue;
+    try {
+      const proposalComment = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
+      if (!proposalComment) { left.push({ issue: issue.number, reason: 'stale-proposal', detail: 'recovery: proposal comment not found' }); continue; }
+      const approvalComment = issue.comments.find((comment) => comment.url && comment.url === row.outcome.commentUrl);
+      complete(issue, proposalComment, row.outcome.commentUrl || '', approvalComment ? approvalComment.createdAt : row.outcome.at);
+    } catch (error) {
+      errors.push({ issue: issue.number, message: String(error.message || error) });
+    }
+  }
+
+  let claims = 0;
+  for (const issue of sorted) {
+    const row = projection.byIssue[issue.number] || null;
+    // Spec fleet #193: a standing bounded ready is a decision already taken; an Approval after it is left to the frontier's rules, never finalized here.
+    if (row && row.proposed && row.outcome && row.outcome.kind === 'bounded-ready') {
+      if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > row.proposed.at && APPROVAL_RE.test(comment.body))) left.push({ issue: issue.number, reason: 'decided', detail: 'a bounded ready stands' });
+      continue;
+    }
+    const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
+    if (!proposed) continue;
+    // The same rule the frontier uses for "an approval": the owner's newest approval-shaped comment after the proposal.
+    const approval = issue.comments.filter((comment) => comment.author === owner && comment.createdAt > approvalFloor(row) && APPROVAL_RE.test(comment.body)).pop();
+    if (!approval) continue;
+    const leave = (reason, detail) => left.push(detail ? { issue: issue.number, reason, detail } : { issue: issue.number, reason });
+
+    if (!isExactApproval(approval.body)) { leave('not-exact-approval'); continue; }   // clause 2
+    if (issue.comments.some((comment) => comment.createdAt > approval.createdAt && RULING_HEADING_RE.test(comment.body))) { leave('ruling-already-posted'); continue; }   // clause 3
+    if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > approval.createdAt)) { leave('owner-commented-after-approval'); continue; }
+    const proposal = issue.comments.find((comment) => comment.url && comment.url === proposed.commentUrl);
+    const failures = proposalGate({ issue, row, proposal, approval, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });   // clauses 1, 4-9
+    if (failures.length) { leave(failures[0].code, failures[0].detail); continue; }
+    if (claims >= FINALIZE_CAP) { leave('cap'); continue; }   // clause 10
+
+    try {
+      // a. CLAIM. The ledger's outcome row is a first-writer-wins claim (TRIAGE_ALREADY_DECIDED
+      // for the second): the script claims before any GitHub write, and the Principal records its
+      // own outcome before posting a Ruling by hand, so at most one of them posts. What stays is a
+      // millisecond race between two reads of the ledger, accepted.
+      try {
+        recordEntry({ root, tenant, kind: 'approved', issue: issue.number, by: owner, commentUrl: approval.url, actor: FINALIZE_ACTOR, now: at });
+      } catch (error) {
+        if (error.code === 'TRIAGE_ALREADY_DECIDED') { leave(`claimed by ${error.decidedBy || 'another actor'}`); continue; }
+        throw error;
+      }
+      claims += 1;
+      complete(issue, proposal, approval.url, approval.createdAt);
+    } catch (error) {
+      errors.push({ issue: issue.number, message: String(error.message || error) });
+    }
+  }
+  return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', at, finalized, left, errors };
+}
+
 // ------------------------------------------------------------------ CLI ----
 
 const TRIAGE_FLAGS = Object.freeze({
@@ -602,8 +1030,13 @@ const TRIAGE_FLAGS = Object.freeze({
   record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'reason', 'premise', 'now'],
   state: ['root', 'tenant', 'now', 'days'],
   hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
+  finalize: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
+  // Spec fleet #193 (#210): the Bounded-authority doors (bin/bounded-authority.js).
+  'bounded-ready': ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
+  veto: ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
+  'bounded-scan': ['root', 'tenant', 'tenant-config', 'fixture', 'now'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), bounded-scan (--tenant [--fixture <issues.json>] [--now <iso>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -612,12 +1045,23 @@ function cli(argv) {
   const args = parseArgs(rest, flags);
   const tenant = requireText(args.tenant, '--tenant');
   if (command === 'frontier') return computeFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
+  if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.now && !args.fixture) throw new WorkStateError('USAGE', `--now is for a fixture run only: the ledger's \`at\` and the Veto window are the wall clock in production (${command})`);
+  if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.fixture && path.resolve(args.root || path.resolve(__dirname, '..')).toLowerCase() === path.resolve(__dirname, '..').toLowerCase()) throw new WorkStateError('USAGE', `--fixture is for a temp --root: on the fleet's own root a rehearsal would write state a live run acts on (${command})`);
+  if (command === 'bounded-scan') return require('./bounded-authority').boundedScan({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now });
+  if (command === 'bounded-ready' || command === 'veto') {
+    const door = require('./bounded-authority');
+    const options = { root: args.root, tenant, issue: args.issue, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now, effects: !args.fixture };
+    return command === 'veto' ? door.vetoReady(options) : door.boundedReady(options);
+  }
   if (command === 'record') {
+    if (args.now && Date.parse(args.now) > Date.now() + 5 * 60000) throw new WorkStateError('USAGE', 'record --now is in the future: the ledger\'s time is the wall clock, and a later time would put a proposal after the comments it should answer to');
+    if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto, bounded-scan), which checks what it records`);
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
       by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
     });
   }
+  if (command === 'finalize') return finalizeApprovals({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
   const config = readTriageConfig(args.root);
   const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation });
@@ -638,17 +1082,31 @@ if (require.main === module) {
 
 module.exports = {
   APPROVAL_RE,
+  BOUNDED_KINDS,
+  VERIFIED_PREMISE_RE,
   DEFAULT_CONFIG,
   LEDGER_KINDS,
   TRIAGE_FLAGS,
   cli,
   computeFrontier,
+  exactField,
+  finalizeApprovals,
+  parseProposal,
+  proposalGate,
+  repairBlockers,
+  activeWorkIssues,
+  isExactApproval,
   issueBodyHash,
   ledgerPath,
   normalizeIssue,
+  ownerLoginOf,
   projectTriage,
   queryGithubIssues,
+  readFixtureIssues,
+  readHeldIssues,
   readLedger,
+  readOutbox,
+  readTenantConfig,
   readTriageConfig,
   recordEntry,
   runStalePremiseNotice,

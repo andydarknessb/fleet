@@ -44,6 +44,13 @@ function isMergeReviewEvent(event) {
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
 const LOCK_STALE_MS = 60 * 1000;
+// #234: Windows answers EPERM/EACCES/EBUSY for a lock or rename target that is delete-pending.
+// The lock treats them as contended, but throws once they have persisted for LOCK_TRANSIENT_MAX_MS of
+// wall time (a Windows wait is ~16 ms, so a wait count would stall every door call for over a minute),
+// so a genuine ACL failure fails fast instead of spinning.
+const TRANSIENT_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const LOCK_TRANSIENT_MAX_MS = 5 * 1000;
+const RENAME_RETRIES = 5;
 
 class WorkStateError extends Error {
   constructor(code, message, details = {}) {
@@ -73,6 +80,7 @@ function paths(root) {
     active: path.join(base, 'state', 'work', 'active.json'),
     pending: path.join(base, 'state', 'work', 'pending'),
     lock: path.join(base, 'state', 'work', '.lock'),
+    breakLock: path.join(base, 'state', 'work', '.lock.break'),
     events: path.join(base, 'state', 'events'),
     archive: path.join(base, 'state', 'archive'),
     releases: path.join(base, 'state', 'releases'),
@@ -86,7 +94,6 @@ function ensureLayout(root) {
   for (const directory of [p.state, p.work, p.pending, p.events, p.archive, p.releases, p.abandons, p.status]) {
     fs.mkdirSync(directory, { recursive: true });
   }
-  if (!fs.existsSync(p.active)) writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
   return p;
 }
 
@@ -99,14 +106,30 @@ function writeAtomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(temporary, file);
+  renameWithRetry(temporary, file);
 }
 
 function writeAtomicText(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, value, 'utf8');
-  fs.renameSync(temporary, file);
+  renameWithRetry(temporary, file);
+}
+
+// #234: a rename onto a file another process just opened or replaced can report EPERM/EBUSY on Windows.
+function renameWithRetry(from, to) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(from, to);
+      return;
+    } catch (error) {
+      if (!['EPERM', 'EBUSY'].includes(error.code) || attempt >= RENAME_RETRIES) {
+        try { fs.rmSync(from, { force: true }); } catch {}
+        throw error;
+      }
+      sleepBriefly();
+    }
+  }
 }
 
 function sleepBriefly() {
@@ -114,37 +137,120 @@ function sleepBriefly() {
   Atomics.wait(new Int32Array(buffer), 0, 0, LOCK_WAIT_MS);
 }
 
+// #235: only remove a lock file if it is still the file this holder created. Under the breaker mutex a live
+// lock is never moved or removed by anyone else, so the stat-then-rm gap here has no actor.
+function releaseLock(file, handle) {
+  let mine = false;
+  try { mine = fs.fstatSync(handle, { bigint: true }).ino === fs.statSync(file, { bigint: true }).ino; } catch {}
+  try { fs.closeSync(handle); } catch {}
+  if (mine) fs.rmSync(file, { force: true, maxRetries: 5, retryDelay: 10 });
+}
+
+// A lock (or breaker lock) is breakable when it is older than LOCK_STALE_MS and its owner is gone.
+function breakable(file) {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    if (Date.now() - Number(stat.mtimeMs) <= LOCK_STALE_MS) return false;
+    // #234: an empty or partial lock file has no owner to find; treat it as ownerless.
+    let owner = {};
+    // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
+    try { owner = readJson(file, {}) || {}; } catch (readError) { if (!(readError instanceof SyntaxError)) throw readError; }
+    let alive = true;
+    // EPERM means the process exists but cannot be signalled (Windows SYSTEM processes): alive, not dead.
+    try { process.kill(Number(owner.pid), 0); } catch (killError) { alive = killError.code === 'EPERM'; }
+    return !owner.pid || !alive;
+  } catch (error) {
+    if (['ENOENT', 'EPERM', 'EBUSY'].includes(error.code)) return false;
+    throw error;
+  }
+}
+
 function withLock(root, callback) {
   const p = ensureLayout(root);
   let handle;
+  let transientSince;
+  let breakTransientSince;
   for (;;) {
     try {
       handle = fs.openSync(p.lock, 'wx');
-      fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
-      break;
     } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      const transient = TRANSIENT_FS_CODES.has(error.code);
+      if (error.code !== 'EEXIST' && !transient) throw error;
+      if (transient) {
+        transientSince ??= Date.now();
+        if (Date.now() - transientSince > LOCK_TRANSIENT_MAX_MS) throw error;
+      } else {
+        transientSince = undefined;
+      }
+      if (!breakable(p.lock)) {
+        breakTransientSince = undefined;
+        sleepBriefly();
+        continue;
+      }
+      // #235: judging a lock stale and removing it were separate steps, and Windows lets rm take a lock another
+      // process holds open, so two breakers could both remove and both enter. Removal now happens only while
+      // holding the breaker mutex, after a fresh re-judgement. Plain waiters never remove anything.
+      let breakHandle;
       try {
-        const stat = fs.statSync(p.lock);
-        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
-          const owner = readJson(p.lock, {});
-          let alive = true;
-          try { process.kill(Number(owner.pid), 0); } catch { alive = false; }
-          if (!owner.pid || !alive) fs.rmSync(p.lock, { force: true });
+        breakHandle = fs.openSync(p.breakLock, 'wx');
+      } catch (breakError) {
+        if (breakError.code === 'EEXIST') {
+          // Another breaker is at work; a breaker that died leaves a stale mutex behind.
+          if (breakable(p.breakLock)) {
+            try { fs.rmSync(p.breakLock, { force: true }); } catch (removeError) {
+              if (removeError.code !== 'ENOENT') {
+                if (!TRANSIENT_FS_CODES.has(removeError.code)) throw removeError;
+                breakTransientSince ??= Date.now();
+                if (Date.now() - breakTransientSince > LOCK_TRANSIENT_MAX_MS) throw removeError;
+              }
+            }
+          }
+        } else if (TRANSIENT_FS_CODES.has(breakError.code)) {
+          breakTransientSince ??= Date.now();
+          if (Date.now() - breakTransientSince > LOCK_TRANSIENT_MAX_MS) throw breakError;
+        } else {
+          throw breakError;
         }
-      } catch (statError) {
-        if (statError.code !== 'ENOENT') throw statError;
+        sleepBriefly();
+        continue;
+      }
+      let removed = false;
+      try {
+        fs.writeFileSync(breakHandle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+        if (breakable(p.lock)) {
+          fs.rmSync(p.lock, { force: true });
+          removed = true;
+        }
+      } catch (removeError) {
+        if (!TRANSIENT_FS_CODES.has(removeError.code)) throw removeError;
+        // A delete-pending lock reports EPERM/EBUSY (#236); forgive it and retry next pass, time bounded.
+        breakTransientSince ??= Date.now();
+        if (Date.now() - breakTransientSince > LOCK_TRANSIENT_MAX_MS) throw removeError;
+      } finally {
+        releaseLock(p.breakLock, breakHandle);
+      }
+      if (removed) {
+        breakTransientSince = undefined;
+        continue;
       }
       sleepBriefly();
+      continue;
     }
+    try {
+      fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+    } catch (error) {
+      releaseLock(p.lock, handle);
+      throw error;
+    }
+    break;
   }
   try {
+    if (!fs.existsSync(p.active)) writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
     recoverPendingUnlocked(p);
     archiveExpiredEvents(p, new Date().toISOString());
     return callback(p);
   } finally {
-    if (handle !== undefined) fs.closeSync(handle);
-    fs.rmSync(p.lock, { force: true });
+    releaseLock(p.lock, handle);
   }
 }
 
@@ -338,16 +444,40 @@ function preserveReusableSnapshot(p, reusable) {
   fs.renameSync(source, destination);
 }
 
-function untouchedReservation(record, events, { legacy = false } = {}) {
-  if (!record || !['released', ...(legacy ? ['retired'] : [])].includes(record.state)) return false;
-  if (legacy && Number(record.eventSequence) > 2) return false;
+// fleet#227: the record-level half of "untouched reservation", shared by release, abandon
+// and the reuse proof, so the three cannot drift apart.
+function reservationFieldsUntouched(record) {
   if (Number(record.budget?.cumulativeTokens || 0) !== 0 || record.budget?.extension) return false;
   if (record.github?.prNumber || record.github?.prUrl || record.github?.headSha) return false;
   if (record.review?.progress && record.review.progress !== 'not-started') return false;
+  return true;
+}
+
+// The one predicate behind the two doors: an assigned record with an untouched reservation
+// and nothing recorded past its last `assignment-reserved`. `release` accepts exactly
+// these and `abandon` refuses exactly these, so every assigned record has one door.
+function isUntouchedReservation(record, events) {
+  return record.state === 'assigned'
+    && reservationFieldsUntouched(record)
+    && currentAttemptEvents(events, record.id).length === 0;
+}
+
+function untouchedReservation(record, events, { legacy = false } = {}) {
+  if (!record || !['released', ...(legacy ? ['retired'] : [])].includes(record.state)) return false;
+  if (legacy && Number(record.eventSequence) > 2) return false;
+  if (!reservationFieldsUntouched(record)) return false;
   const lineage = events.filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
   if (lineage.length !== Number(record.eventSequence) || lineage.length < 2) return false;
-  if (lineage.some((event) => !['assignment-reserved', 'assignment-released'].includes(event.type))) return false;
-  return lineage[lineage.length - 1].type === 'assignment-released';
+  if (legacy) {
+    if (lineage.some((event) => !['assignment-reserved', 'assignment-released'].includes(event.type))) return false;
+    return lineage[lineage.length - 1].type === 'assignment-released';
+  }
+  // fleet#227: only the current attempt counts. It must be exactly the release that
+  // closed it; earlier attempts (work-created, escalations, abandonments) are history.
+  const attempt = currentAttemptEvents(events, record.id);
+  return attempt.length === 1
+    && attempt[0].type === 'assignment-released'
+    && Number(attempt[0].sequence) === Number(record.eventSequence);
 }
 
 function reusableReleasedRecord(p, recordId) {
@@ -688,6 +818,17 @@ function reserveRecord(options = {}) {
   });
 }
 
+// fleet#227: an attempt starts at an `assignment-reserved` event, and a record can hold
+// several (abandon or release, then reserve again). The current attempt is what came
+// after the last reservation; a record with no reservation event (created directly) is
+// all one attempt. `release` and `abandon` both read this, so an assigned record with
+// no events past its reservation is releasable and every other one is abandonable.
+function currentAttemptEvents(events, recordId) {
+  const lineage = events.filter((event) => event.recordId === recordId).sort((a, b) => a.sequence - b.sequence);
+  const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
+  return lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
+}
+
 function releaseRecord(options = {}) {
   const root = asRoot(options.root);
   const key = requireIdempotency(options.idempotencyKey);
@@ -700,11 +841,7 @@ function releaseRecord(options = {}) {
     if (record.state !== 'assigned') throw new WorkStateError('INVALID_RELEASE', `only assigned records can release reservations (was ${record.state})`);
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const events = eventLines(p);
-    const currentAttemptIsUntouched = Number(record.budget?.cumulativeTokens || 0) === 0
-      && !record.budget?.extension
-      && !record.github?.prNumber && !record.github?.prUrl && !record.github?.headSha
-      && (!record.review?.progress || record.review.progress === 'not-started')
-      && events.filter((event) => event.recordId === record.id).every((event) => ['assignment-reserved', 'assignment-released'].includes(event.type));
+    const currentAttemptIsUntouched = isUntouchedReservation(record, events);
     if (!currentAttemptIsUntouched) throw new WorkStateError('INVALID_RELEASE', `record '${record.id}' does not prove an untouched reservation`);
     const now = isoNow(options.now);
     const next = { ...record, state: 'released', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
@@ -727,19 +864,19 @@ function abandonRecord(options = {}) {
     if (!record) {
       const abandoned = readJson(abandonFile(p, options.id))?.record;
       const replay = abandoned && replayIfKnown(abandoned, key);
-      if (replay) return replay;
+      if (replay) return pageAbandon(p, root, abandoned, key, options, abandoned.abandonment?.from, replay);
       throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
     }
     const replay = replayIfKnown(record, key);
-    if (replay) return replay;
+    if (replay) {
+      const abandoned = readJson(abandonFile(p, options.id))?.record;
+      return pageAbandon(p, root, record, key, options, abandoned?.idempotency?.[key] ? abandoned.abandonment?.from : null, replay);
+    }
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
     if (['merged', 'retiring'].includes(record.state)) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state} and must complete retirement`);
-    const lineage = eventLines(p).filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
-    const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
-    const currentAttemptEvents = lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
-    if (currentAttemptEvents.length === 0) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
+    if (isUntouchedReservation(record, eventLines(p))) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
     const now = isoNow(options.now);
     const actor = options.actor || 'fleet-operator';
     const next = {
@@ -757,8 +894,16 @@ function abandonRecord(options = {}) {
       evidence: options.evidence, changes: { from: record.state, to: 'abandoned', reason },
     });
     const resultRecord = commitMutation(p, { recordId: record.id, beforeRecord: record, afterRecord: null, abandonedRecord: next, event, killPoint: options.killPoint });
-    return { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord };
+    return pageAbandon(p, root, record, key, options, record.state, { replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord });
   });
+}
+
+// #204 (ruling): an abandon out of `escalated` or `hold` leaves a decision state, so
+// it appends the same resolution line a transition does; `to` is `abandoned`.
+function pageAbandon(p, root, record, key, options, from, result) {
+  return from && DECISION_STATES.includes(from)
+    ? { ...result, resolved: appendResolutionWake({ root, p, record, key, options, from, to: 'abandoned', result }) }
+    : result;
 }
 
 function createRecord(options = {}) {
@@ -811,7 +956,10 @@ function sendBackCount(record) {
   return Object.values(record?.idempotency || {}).filter((entry) => entry && (entry.type === 'transition:review->revision' || entry.sendBack === true)).length;
 }
 
-const ESCALATION_REASONS = Object.freeze(['stale-premise']);
+// Spec fleet #193 (#211): `criteria-defect` marks an escalation as caused by the ticket's own
+// criteria being wrong or ambiguous; it carries no premise. On a ticket the Principal readied
+// under Bounded authority the mark suspends that authority (bin/bounded-authority.js).
+const ESCALATION_REASONS = Object.freeze(['stale-premise', 'criteria-defect']);
 
 function validateTransition(record, to, options) {
   if (!STATES.includes(to)) throw new WorkStateError('INVALID_STATE', `unknown state '${to}'`);
@@ -838,12 +986,13 @@ function validateTransition(record, to, options) {
     }
   }
   if (to === 'escalated' && !options.evidence) throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'escalated requires decision evidence');
-  // Spec fleet #92 (#144): an escalation may name its reason; the one reason so far
-  // is a stale premise, and it carries the premise line verbatim to the Principal.
+  // Spec fleet #92 (#144): an escalation may name its reason. A stale premise carries the
+  // premise line verbatim to the Principal; criteria-defect (#211) carries none.
   if (options.reason !== undefined || options.premise !== undefined) {
     if (to !== 'escalated') throw new WorkStateError('USAGE', '--reason and --premise belong to an escalation (--to escalated)');
     if (!ESCALATION_REASONS.includes(options.reason)) throw new WorkStateError('USAGE', `--reason must be one of ${ESCALATION_REASONS.join(', ')}`);
-    if (!options.premise || !String(options.premise).trim()) throw new WorkStateError('USAGE', '--reason stale-premise needs --premise "<the premise line verbatim>"');
+    if (options.reason === 'stale-premise' && (!options.premise || !String(options.premise).trim())) throw new WorkStateError('USAGE', '--reason stale-premise needs --premise "<the premise line verbatim>"');
+    if (options.reason === 'criteria-defect' && options.premise !== undefined) throw new WorkStateError('USAGE', '--reason criteria-defect takes no --premise');
   }
   if (fromEscalated && (!options.evidence || !record.prior_state)) {
     throw new WorkStateError('MISSING_DECISION_EVIDENCE', 'escalation resolution requires prior_state and decision evidence');
@@ -883,11 +1032,25 @@ function transitionRecord(options = {}) {
     // wake read that cache and nothing else, and a lead's escalation of a
     // PR-less record used to reach every ledger but that one. A replay repairs
     // a missing line (a crash between commit and append) and never duplicates.
-    const pageDecision = (result) => (DECISION_STATES.includes(to)
-      ? { ...result, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
-      : result);
+    //
+    // #204 (spec #192): leaving `escalated` or `hold` is the answer to a decision, and
+    // the session that asked ended its turn idle. The same door appends one
+    // `resolution` line under `<key>:resolution` (the decision-needed line owns `key`,
+    // and escalated -> hold writes both). `from` is the record's state before the
+    // transition; a replay reads it back from the transition's own idempotency entry.
+    // A replay takes both ends from the committed `transition:from->to`, never from the caller.
+    const pageDecision = (result, from, target = to) => {
+      let out = result;
+      if (from && DECISION_STATES.includes(from)) out = { ...out, resolved: appendResolutionWake({ root, p, record, key, options, from, to: target, result }) };
+      return DECISION_STATES.includes(target)
+        ? { ...out, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
+        : out;
+    };
     const replay = replayIfKnown(record, key);
-    if (replay) return pageDecision(replay);
+    if (replay) {
+      const committed = /^transition:([a-z-]+)->([a-z-]+)$/.exec(record.idempotency[key].type || '');
+      return pageDecision(replay, committed?.[1], committed?.[2] || to);
+    }
     if (!Number.isInteger(Number(options.expectedRevision))) throw new WorkStateError('MISSING_REVISION', 'expected revision is required');
     if (Number(options.expectedRevision) !== record.revision) {
       throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
@@ -932,7 +1095,7 @@ function transitionRecord(options = {}) {
       evidence: options.evidence,
       changes: {
         from: record.state, to, prior_state: next.prior_state || null, prNumber: next.github?.prNumber || null,
-        ...(options.reason ? { reason: options.reason, premise: String(options.premise) } : {}),
+        ...(options.reason ? { reason: options.reason, ...(options.premise !== undefined ? { premise: String(options.premise) } : {}) } : {}),
         // #155: who merged, from GitHub's mergedBy; null when the observation did not say.
         ...(to === 'merged' ? { mergedBy: githubObservation?.mergedBy ? String(githubObservation.mergedBy) : null } : {}),
         ...(to === 'revision' ? { sendBack, ...(options.ruling ? { ruling: String(options.ruling) } : {}) } : {}),
@@ -947,7 +1110,7 @@ function transitionRecord(options = {}) {
       event,
       killPoint: options.killPoint,
     });
-    return pageDecision({ replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord });
+    return pageDecision({ replayed: false, revision: next.revision, eventSequence: next.eventSequence, record: resultRecord }, record.state);
   });
 }
 
@@ -1077,20 +1240,40 @@ function outboxHasWake(root, recordId, idempotencyKey) {
   });
 }
 
+// #204: who raised the decision a resolution answers, read from the ledger (the
+// actor of the event that entered `from`, the latest one before this transition).
+// The Watchdog routes the wake on it: a `pe-` actor is a Principal's escalation,
+// anything else is the tenant lead's. Null when the ledger cannot say; the line is
+// still written and the Watchdog delivers it to the lead.
+function decisionRaisedBy(p, recordId, from, beforeSequence) {
+  try {
+    const entering = eventLines(p)
+      .filter((event) => event.recordId === recordId && event.type === `state-${from}` && event.sequence < beforeSequence)
+      .sort((a, b) => b.sequence - a.sequence)[0];
+    return entering && entering.actor && entering.actor !== 'unknown' ? String(entering.actor) : null;
+  } catch { return null; }
+}
+
+// The resolution line for a record leaving a decision state, by transition or by
+// abandon (#204): keyed `<key>:resolution`, so a replay repairs it and never doubles it.
+function appendResolutionWake({ root, p, record, key, options, from, to, result }) {
+  return appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
+}
+
 // Idempotent by (recordId, idempotencyKey): the door that commits a decision
 // transition writes the line, so a caller that also writes one (the watcher,
 // for its observe wakes) finds it and appends nothing. Returns whether a line
 // was written, which is the caller's cue to launch the page. `actor` is the
 // writer's provenance (fleet#141): the watchdog's frontier wake does not wake a
 // lead for a decision-needed line that lead wrote itself.
-function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, now } = {}) {
+function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, from, to, raisedBy, now } = {}) {
   if (outboxHasWake(root, recordId, idempotencyKey)) return false;
   const file = wakeOutboxFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
-  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), evidence: text };
+  const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), ...(from ? { from, to } : {}), ...(raisedBy ? { raisedBy } : {}), evidence: text };
   fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
   return true;
 }

@@ -41,7 +41,9 @@ function New-ReconciliationPr {
   $errFile = [IO.Path]::GetTempFileName()
   try {
     [IO.File]::WriteAllText($bodyFile, $body, $script:Utf8)
-    $ghArgs = @('pr', 'create', '-R', $Repo, '--base', $Base, '--head', $Head, '--title', "Reconcile $Head into $Base", '--body-file', $bodyFile)
+    # Windows PowerShell's Start-Process joins -ArgumentList with spaces and quotes nothing, so an
+    # element holding a space (the title; a body-file path under a spaced TEMP) must carry its own quotes.
+    $ghArgs = @('pr', 'create', '-R', $Repo, '--base', $Base, '--head', $Head, '--title', "`"Reconcile $Head into $Base`"", '--body-file', "`"$bodyFile`"")
     $p = Start-Process -FilePath 'gh' -ArgumentList $ghArgs -NoNewWindow -PassThru -Wait -RedirectStandardOutput $outFile -RedirectStandardError $errFile
     $exit = $p.ExitCode
     $stdout = ''; try { $stdout = Get-Content $outFile -Raw -ErrorAction SilentlyContinue } catch {}

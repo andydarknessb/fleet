@@ -356,6 +356,40 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (-not (@($r10d3.conditions) -contains 'escalation:ic-777:stray')) 'a cleared escalation leaves the conditions'
   Assert-True (-not (Test-Path "$testRoot\state\watchdog\banner.txt")) 'a cleared escalation clears the banner'
 
+  # Case 10d-orphan (fleet #252): a late IC whose manifest launch.ps1 already invalidated is an
+  # orphan-late-session, not a stray: it is a paging kind (normal), files one escalation, and,
+  # with state/flags/ic-cleanup-live absent, nothing is stopped even though this tick applies.
+  [IO.Directory]::CreateDirectory("$testRoot\state\manifests") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-o1") | Out-Null
+  $orphanManifest = "$testRoot\state\manifests\assignment-test-1001.json"
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-o1\state.json" (ConvertTo-Json @{ name = 'ic-1001'; detail = ''; waitingFor = ''; intent = ('/mattpocock-skills:implement Read the assignment manifest at ' + $orphanManifest + ' and the GitHub issue body and comments.') } -Compress)
+  Write-Utf8 "$orphanManifest.invalidated.json" '{"schemaVersion":1,"manifestId":"assignment-test-1001","reason":"no session appeared within 15s"}'
+  $orphanRow = '{"id":"job-o1","name":"ic-1001","state":"working","status":"idle","pid":1001,"startedAt":' + (Get-EpochMs $oldStart) + '}'
+  Set-AgentsRows "[$dispRow,$plRow,$orphanRow]"
+  $r10o = Run-Watchdog
+  Assert-True (@($r10o.conditions) -contains 'escalation:ic-1001:orphan-late-session') 'an orphan late session must become an escalation condition'
+  Assert-True (-not (@($r10o.conditions) -contains 'escalation:ic-1001:stray')) 'an orphan late session must not also be a stray'
+  Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session pages at normal priority'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1001-orphan-late-session.json').Count -eq 1) 'an orphan late session leaves one escalation file'
+  $orphanApplied = @(Get-AppliedLines)[-1] | ConvertFrom-Json
+  Assert-True (@($orphanApplied.stopped).Count -eq 0 -and @($orphanApplied.stopFailed).Count -eq 0) 'without state/flags/ic-cleanup-live the live tick stops nothing'
+  $r10o2 = Run-Watchdog
+  Assert-True (@($r10o2.newlyPaged).Count -eq 0) 'a standing orphan escalation must not page again'
+  Set-AgentsRows $noSentinelRows
+  $r10o3 = Run-Watchdog
+  Assert-True (-not (@($r10o3.conditions) -contains 'escalation:ic-1001:orphan-late-session')) 'the orphan escalation clears once the row goes'
+  Remove-Item "$orphanManifest.invalidated.json" -Force
+  # ic-dead-before-ack (#253) is a paging kind too, wired here with #252 so the two land together. The
+  # check that raises it arrives with #253, so a canned check report stands in for it.
+  $origCheckDba = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1002"; kind = "ic-dead-before-ack"; detail = "canned"; parent = "pl-test" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
+  try { $r10dba = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckDba }
+  Assert-True (@($r10dba.conditions) -contains 'escalation:ic-1002:ic-dead-before-ack') 'ic-dead-before-ack must become an escalation condition'
+  Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack pages at normal priority'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1002-ic-dead-before-ack.json').Count -eq 1) 'ic-dead-before-ack leaves one escalation file'
+  $r10dba2 = Run-Watchdog
+  Assert-True (-not (@($r10dba2.conditions) -contains 'escalation:ic-1002:ic-dead-before-ack')) 'the ic-dead-before-ack escalation clears once the check stops raising it'
+
   # Case 10e: `blocked` is recorded as waiting, never paged, never filed.
   $blockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
   Set-AgentsRows "[$blockedDisp,$plRow]"
@@ -507,6 +541,41 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $w6b = Run-Watchdog
   $wake6b = @($w6b.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($wake6b.decision -eq 'none') 'a consumed outbox wake must not wake again'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  # Case W6r (#204): a resolution wake (a record left escalated or hold) wakes the idle lead that raised it, and the
+  # reason names the record and both states. One the lead performed itself, or one the Principal raised, does not.
+  function New-ResolutionLine { param([double]$MinutesAgo, [string]$Record, [string]$From, [string]$To, [string]$RaisedBy, [string]$Actor)
+    ([ordered]@{ at = (Get-Date).ToUniversalTime().AddMinutes(-$MinutesAgo).ToString('o'); recordId = "test:$Record"; revision = 6; eventSequence = 6; wake = 'resolution'; idempotencyKey = "k-$Record:resolution"; actor = $Actor; from = $From; to = $To; raisedBy = $RaisedBy; evidence = 'Cory ruled' } | ConvertTo-Json -Compress)
+  }
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","launchedAt":"' + (Get-Date).ToUniversalTime().AddHours(-2).ToString('o') + '"}]}')
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((@((New-ResolutionLine 20 'issue-30' 'escalated' 'revision' 'pe-test' 'cory'), (New-ResolutionLine 15 'issue-31' 'hold' 'merged' 'pl-test' 'pl-test'), (New-ResolutionLine 14 'issue-35' 'escalated' 'ci-wait' 'pl-test' 'cory')) -join "`n") + "`n")
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  $callsBeforeR = @(Get-RotateCalls).Count
+  $w6r0 = Run-Watchdog
+  $wake6r0 = @($w6r0.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake6r0.decision -eq 'none' -and @(Get-RotateCalls).Count -eq $callsBeforeR) "a Principal's resolution, the lead's own, and one into ci-wait (checks-settled follows) must not wake the lead (got $($wake6r0.decision): $(@($wake6r0.evidence) -join ' '))"
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((@((New-ResolutionLine 10 'issue-32' 'escalated' 'review' 'pl-test' 'cory'), (New-ResolutionLine 9 'issue-33' 'hold' 'merged' 'pl-test' 'pr-watch')) -join "`n") + "`n")
+  $w6r = Run-Watchdog
+  $wake6r = @($w6r.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  $wake6rText = (@($wake6r.evidence) -join '; ')
+  Assert-True ($wake6r.decision -eq 'woken' -and $wake6rText -match 'outbox resolution x2') "an idle lead must be woken by resolution wakes (got $($wake6r.decision): $wake6rText)"
+  Assert-True ($wake6rText -match 'resolved test:issue-32 escalated -> review' -and $wake6rText -match 'resolved test:issue-33 hold -> merged') "the wake reason must name each record and both states (got $wake6rText)"
+  Assert-True (@(Get-RotateCalls) -contains "pl-test|$wake6rText") 'the resolution wake must go through rotate.ps1 -Wake carrying that reason'
+  $w6rb = Run-Watchdog
+  Assert-True (@($w6rb.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0].decision -eq 'none') 'a delivered resolution wake must not wake again'
+  # PAUSE still stops it. The line is stamped after any watermark and the wake state is reset, so only PAUSE can be why nothing rotates;
+  # the unpaused control run over the same line then wakes.
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((New-ResolutionLine 0 'issue-34' 'escalated' 'implementing' 'pl-test' 'cory') + "`n")
+  Write-Utf8 "$testRoot\state\PAUSE" 'paused for the resolution wake case'
+  $callsBeforeP = @(Get-RotateCalls).Count
+  [void](Run-Watchdog)
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeP) 'PAUSE must stop a resolution wake'
+  Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  $w6rc = Run-Watchdog
+  Assert-True (@($w6rc.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0].decision -eq 'woken' -and @(Get-RotateCalls).Count -eq $callsBeforeP + 1) 'without PAUSE the same resolution wakes the lead (control)'
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ''
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # Case W7: state/flags/frontier-wake-off disables the wake entirely.
@@ -1134,6 +1203,58 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $tw5 = @($t5.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($tw5.decision -eq 'none' -and $tw5.reason -match 'nothing to wake for') "a routed-only board must not wake (got $($tw5.decision): $($tw5.reason))"
 
+  # Case T5b (#207): an exact `Approved` is finalized by the script before the frontier is read,
+  # so the principal is not woken for it; a qualified approval still wakes the principal.
+  $t5bHash = & node -e "process.stdout.write(require(process.argv[1]).normalizeIssue({ number: 1, body: 'Body of the ticket\n\n## Premises\n\na.js: x @abcdef1' }).bodyHash)" "$testRoot\bin\triage.js"
+  $t5bProposal = "## Triage proposal (advisory)`nClassification: bug`nRoot cause: x`nRuling: none needed`nScope: lists exactly a.js`nPremises:`n  a.js: x @abcdef1 verified @abcdef2`nBlocked_by: none`nTier: sonnet`nOpen for Cory: none"
+  $t5bIssue = { param($n, $approval) '{"number":' + $n + ',"title":"T","url":"https://github.com/owner/repo/issues/' + $n + '","body":"Body of the ticket\n\n## Premises\n\na.js: x @abcdef1","createdAt":"2026-09-02T00:00:00.000Z","labels":["triage-proposed"],"assignees":[],"comments":[{"id":"p' + $n + '","url":"https://x/p' + $n + '","author":"fleet-bot","body":"' + ($t5bProposal -replace "`n", '\n') + '","createdAt":"2026-09-10T00:00:00.000Z"},{"id":"a' + $n + '","url":"https://x/a' + $n + '","author":"cory-owner","body":"' + $approval + '","createdAt":"2026-09-11T00:00:00.000Z"}]}' }
+  Write-Utf8 $triageFixture ('[' + (& $t5bIssue 610 'Approved') + ',' + (& $t5bIssue 611 'Approved, but skip the second premise') + ']')
+  New-Item -ItemType Directory -Force "$testRoot\state\triage" | Out-Null
+  Write-Utf8 "$testRoot\state\triage\test.jsonl" (((@(610, 611) | ForEach-Object { '{"schemaVersion":1,"kind":"proposed","tenant":"test","at":"2026-09-10T00:00:00.000Z","actor":"principal","issue":' + $_ + ',"bodyHash":"' + $t5bHash + '","commentUrl":"https://x/p' + $_ + '","model":"fable"}' }) -join "`n") + "`n")
+  $callsBefore5b = @(Get-TriageRotateCalls).Count
+  $alertsBefore5b = @(Get-AlertLines).Count
+  $t5b = Run-Watchdog
+  $tw5b = @($t5b.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  $fixture5b = Get-Content $triageFixture -Raw | ConvertFrom-Json
+  $issue610 = @($fixture5b | Where-Object { $_.number -eq 610 })[0]
+  $issue611 = @($fixture5b | Where-Object { $_.number -eq 611 })[0]
+  Assert-True (@($issue610.labels) -contains 'ready-for-agent' -and @($issue610.labels) -notcontains 'triage-proposed') "an exact Approved must be finalized by the tick (labels: $(@($issue610.labels) -join ','); error=$($tw5b.frontierError) finalize=$(($tw5b.finalize | ConvertTo-Json -Compress -Depth 5)))"
+  Assert-True (@($issue610.comments).Count -eq 3 -and "$(@($issue610.comments)[2].body)".StartsWith('## Ruling')) 'the Ruling comment must be posted'
+  Assert-True (@($issue611.labels) -contains 'triage-proposed' -and @($issue611.comments).Count -eq 2) 'a qualified approval must be left untouched by the script'
+  Assert-True ((Get-Content "$testRoot\state\triage\test.jsonl" -Raw) -match '"kind":"finalized","tenant":"test","at":"[^"]+","actor":"finalize-script","issue":610') 'the finalize must be on the ledger'
+  Assert-True ((@($tw5b.finalize.finalized) | ForEach-Object { $_.issue }) -contains 610) 'the tick record must name what the script finalized'
+  Assert-True ($tw5b.decision -eq 'woken' -and @($tw5b.evidence).Count -eq 1 -and "$($tw5b.evidence[0])" -eq 'approval #611') "the principal must be woken only for the qualified approval (got $($tw5b.decision): $(@($tw5b.evidence) -join '; '))"
+  Assert-True (@(Get-TriageRotateCalls)[-1] -eq 'pe-test|approval #611') 'the wake digest must not name the finalized approval'
+  Assert-True (@(Get-AlertLines).Count -eq $alertsBefore5b + 2 -and (@(Get-AlertLines) | Where-Object { ($_ | ConvertFrom-Json).kind -eq 'triage-finalize' }).Count -eq 1) 'a finalize must leave one triage-finalize audit line (beside the wake alert)'
+  # A tick with the principal not live or PAUSE set finalizes nothing.
+  Write-Utf8 $triageFixture ('[' + (& $t5bIssue 612 'Approved') + ']')
+  Write-Utf8 "$testRoot\state\triage\test.jsonl" ('{"schemaVersion":1,"kind":"proposed","tenant":"test","at":"2026-09-10T00:00:00.000Z","actor":"principal","issue":612,"bodyHash":"' + $t5bHash + '","commentUrl":"https://x/p612","model":"fable"}' + "`n")
+  Write-Utf8 "$testRoot\state\PAUSE" 'reason=test; setAt=now; until='
+  $null = Run-Watchdog
+  Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  Assert-True (@((Get-Content $triageFixture -Raw | ConvertFrom-Json)[0].labels) -contains 'triage-proposed') 'PAUSE must stop the finalize (it writes to GitHub)'
+  Remove-Item "$testRoot\state\triage\test.jsonl" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 $triageFixture '[{"number":602,"title":"Ready","url":"https://github.com/owner/repo/issues/602","body":"x","createdAt":"2026-09-02T00:00:00.000Z","labels":["ready-for-agent"],"assignees":[],"comments":[]}]'
+  # Case T5r (#204): a record the Principal escalated that left escalated wakes the Principal, naming it; a lead's
+  # escalation resolving does not, and the Principal's resolution does not wake the lead.
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json", "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((New-ResolutionLine 12 'issue-40' 'escalated' 'ci-wait' 'pl-test' 'cory') + "`n")
+  $callsBeforeT5r = @(Get-TriageRotateCalls).Count
+  $t5r0 = Run-Watchdog
+  Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBeforeT5r) "a lead's resolution must not wake the Principal (got $((@($t5r0.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]).decision))"
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((New-ResolutionLine 12 'issue-41' 'escalated' 'implementing' 'pe-test' 'cory') + "`n")
+  $leadCallsBeforeT5r = @(Get-RotateCalls | Where-Object { $_ -like 'pl-test|*' }).Count
+  $t5r = Run-Watchdog
+  $tw5r = @($t5r.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw5r.decision -eq 'woken' -and ((@($tw5r.evidence) -join '; ') -match 'resolved test:issue-41 escalated -> implementing')) "an idle principal must be woken for a resolved escalation it raised (got $($tw5r.decision): $($tw5r.reason); $(@($tw5r.evidence) -join '; '))"
+  Assert-True (@(Get-TriageRotateCalls) -contains ('pe-test|' + (@($tw5r.evidence) -join '; '))) 'the Principal wake must carry the resolution as its reason'
+  Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pl-test|*' }).Count -eq $leadCallsBeforeT5r) "the Principal's resolution must not wake the lead"
+  $t5rDelivered = @(Get-TriageRotateCalls).Count
+  [void](Run-Watchdog)
+  Assert-True (@(Get-TriageRotateCalls).Count -eq $t5rDelivered) 'a delivered Principal resolution must not wake again (watermark)'
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ''
+
   # Case T6: an unreadable frontier wakes nothing and says so (fail closed).
   $env:FLEET_TRIAGE_ISSUES_FIXTURE = "$testRoot\missing-fixture.json"
   $callsBefore6 = @(Get-TriageRotateCalls).Count
@@ -1496,7 +1617,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   $null = Run-Watchdog
 
-  # ===== Ticket 78 (ADR 0012): fleet-dead repeats once, two hours on, at emergency =====
+  # ===== Ticket 78 (ADR 0012): fleet-dead repeats once, two hours on (#197: at high, priority from config) =====
   Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watch\wake-outbox.jsonl" -ErrorAction SilentlyContinue
   Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-901":{"tenant":"test","issue":901,"state":"implementing"}}}'
@@ -1509,23 +1630,36 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $fleetDeadRepeatMinutes = 120
   $pushLog78 = Join-Path $testRoot 'pushover-requests-78.log'
   [IO.File]::WriteAllText($pushLog78, '')
-  $pushMock78 = Start-MockPushover -LogPath $pushLog78 -Count 10
+  $pushMock78 = Start-MockPushover -LogPath $pushLog78 -Count 20
   $oldPushoverUrl78 = $env:FLEET_PUSHOVER_URL
   $env:FLEET_PUSHOVER_URL = $pushMock78.Prefix
   Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-78","user":"usr-78"}'
 
   try {
+    # Case RP0 (#197): with no config at all, the FIRST fleet-dead page is written
+    # at high (the Watchdog's built-in default), which Pushover receives as 1.
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    $rp0 = Run-Watchdog
+    $rp0Entry = @($rp0.newlyPaged | Where-Object { $_.key -eq 'fleet-dead' })[0]
+    Assert-True ($null -ne $rp0Entry -and $rp0Entry.priority -eq 'high') "the first fleet-dead page must be high by the built-in default (got $($rp0Entry.priority))"
+    $rp0Dead = @(Get-PostedBodies $pushLog78 | Where-Object { (ConvertFrom-FormBody $_).message -like 'every*static*heartbeat*stale*' })
+    Assert-True ($rp0Dead.Count -eq 1 -and (ConvertFrom-FormBody $rp0Dead[0]).priority -eq '1') "the first fleet-dead page must reach Pushover once, at priority 1 (high); got $($rp0Dead.Count) fleet-dead post(s)"
+    Assert-True ($null -eq $rp0.repeatPaged) 'the tick that delivers the first fleet-dead page must not also send its repeat'
+    [IO.File]::WriteAllText($pushLog78, '')
+
     # Case RP1 (red-tell): a fixture paged.json with fleet-dead first paged 121
-    # minutes ago pages once more at emergency, and repeatedAt is recorded.
+    # minutes ago pages once more, at high by default (#197: the repeat priority is
+    # config, pages.fleetDeadRepeatPriority, no longer a hard-coded emergency), and
+    # repeatedAt is recorded.
     $firstPagedAt121 = (Get-Date).ToUniversalTime().AddMinutes(-121).ToString('o')
     Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $firstPagedAt121 + '","lastSeen":"' + $firstPagedAt121 + '","detail":"stale"}}')
     $rp1 = Run-Watchdog
     Assert-True (@($rp1.conditions) -contains 'fleet-dead') 'fleet-dead must still be the active condition'
-    Assert-True ($null -ne $rp1.repeatPaged -and $rp1.repeatPaged.key -eq 'fleet-dead' -and $rp1.repeatPaged.priority -eq 'emergency') "a fleet-dead standing over $fleetDeadRepeatMinutes min must repeat-page at emergency (got $($rp1.repeatPaged | ConvertTo-Json -Compress))"
+    Assert-True ($null -ne $rp1.repeatPaged -and $rp1.repeatPaged.key -eq 'fleet-dead' -and $rp1.repeatPaged.priority -eq 'high') "a fleet-dead standing over $fleetDeadRepeatMinutes min must repeat-page at high by default (got $($rp1.repeatPaged | ConvertTo-Json -Compress))"
     $rpBodies = @(Get-PostedBodies $pushLog78)
     Assert-True ($rpBodies.Count -eq 1) 'exactly one repeat page must reach Pushover'
     $rpForm = ConvertFrom-FormBody $rpBodies[0]
-    Assert-True ($rpForm.priority -eq '2') 'emergency must map to Pushover priority 2'
+    Assert-True ($rpForm.priority -eq '1') 'the default repeat must map to Pushover priority 1 (high)'
     $pagedAfterRp1 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
     Assert-True ($null -ne $pagedAfterRp1.'fleet-dead'.repeatedAt -and "$($pagedAfterRp1.'fleet-dead'.repeatedAt)" -ne '') 'repeatedAt must be recorded after the repeat page'
 
@@ -1579,6 +1713,44 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $futureAt + '","lastSeen":"' + $futureAt + '","detail":"stale","deliveredAt":"' + $futureAt + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
     $rp6 = Run-Watchdog
     Assert-True ($null -ne $rp6.repeatPaged -and $rp6.repeatPaged.key -eq 'fleet-dead') 'a future-dated deliveredAt must repeat now, not lose the repeat silently'
+
+    # Case RP7 (#197): configuring pages.fleetDeadRepeatPriority as emergency makes
+    # the repeat emergency with no code change (ticket #206 flips it this way),
+    # while the first page stays high.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"priority":{"fleet-dead":"high"},"fleetDeadRepeatPriority":"emergency"}}'
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog78, '')
+    $rp7a = Run-Watchdog
+    Assert-True ((@($rp7a.newlyPaged | Where-Object { $_.key -eq 'fleet-dead' })[0]).priority -eq 'high') 'a configured emergency repeat must not change the first page, which stays high'
+    $rp7Delivered = (Get-Date).ToUniversalTime().AddMinutes(-121).ToString('o')
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $rp7Delivered + '","lastSeen":"' + $rp7Delivered + '","detail":"stale","deliveredAt":"' + $rp7Delivered + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
+    [IO.File]::WriteAllText($pushLog78, '')
+    $rp7 = Run-Watchdog
+    Assert-True ($null -ne $rp7.repeatPaged -and $rp7.repeatPaged.priority -eq 'emergency') "a configured repeat priority of emergency must make the repeat emergency (got $($rp7.repeatPaged | ConvertTo-Json -Compress))"
+    $rp7Bodies = @(Get-PostedBodies $pushLog78)
+    Assert-True ($rp7Bodies.Count -eq 1 -and (ConvertFrom-FormBody $rp7Bodies[0]).priority -eq '2') 'the configured emergency repeat must reach Pushover at priority 2'
+
+    # Case RP8: an unrecognized configured repeat priority falls back to high, never
+    # a thrown tick (Send-FleetPage validates emergency/high/normal).
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"fleetDeadRepeatPriority":"urgent"}}'
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $rp7Delivered + '","lastSeen":"' + $rp7Delivered + '","detail":"stale","deliveredAt":"' + $rp7Delivered + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
+    $rp8 = Run-Watchdog
+    Assert-True ($null -ne $rp8.repeatPaged -and $rp8.repeatPaged.priority -eq 'high') "an unrecognized repeat priority must fall back to high (got $($rp8.repeatPaged | ConvertTo-Json -Compress))"
+
+    # Case RP9: the shipped config's own pages block (config/cycle.json) yields a
+    # high first page and, since #206, an emergency repeat, and names both keys explicitly.
+    $rp9Pages = (Get-Content "$sourceRoot\config\cycle.json" -Raw | ConvertFrom-Json).pages
+    Assert-True ("$($rp9Pages.priority.'fleet-dead')" -eq 'high') "the real config's fleet-dead priority must be high"
+    Assert-True ("$($rp9Pages.fleetDeadRepeatPriority)" -eq 'emergency') "the real config's pages.fleetDeadRepeatPriority must be emergency (#206)"
+    Assert-True ("$($rp9Pages.priority.'dead-man-silence')" -eq 'emergency') 'dead-man silence must stay emergency in the real config'
+    Write-Utf8 "$testRoot\config\cycle.json" (@{ pages = $rp9Pages } | ConvertTo-Json -Depth 6)
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    $rp9a = Run-Watchdog
+    Assert-True ((@($rp9a.newlyPaged | Where-Object { $_.key -eq 'fleet-dead' })[0]).priority -eq 'high') 'the first fleet-dead page under the real config must be high'
+    Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $rp7Delivered + '","lastSeen":"' + $rp7Delivered + '","detail":"stale","deliveredAt":"' + $rp7Delivered + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
+    $rp9 = Run-Watchdog
+    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'emergency') 'the repeat under the real config must be emergency (#206)'
+    Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   } finally {
     if ($pushMock78 -and $pushMock78.Job) { Stop-Job $pushMock78.Job -ErrorAction SilentlyContinue; Remove-Job $pushMock78.Job -Force -ErrorAction SilentlyContinue }
@@ -1604,10 +1776,12 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r7.newlyPaged | Where-Object { $_.key -eq 'check-failed' })[0]).priority -eq 'normal') 'check-failed is deliberately normal'
   Assert-True ((@($r9.newlyPaged | Where-Object { $_.key -eq 'double-actor' })[0]).priority -eq 'normal') 'double-actor is deliberately normal'
   Assert-True ((@($r10d.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-777:stray' })[0]).priority -eq 'normal') 'stray is deliberately normal'
+  Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session (#252) is deliberately normal'
+  Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack (#253) is deliberately normal'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
   Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'
-  Assert-True ($rp1.repeatPaged.priority -eq 'emergency') 'the fleet-dead repeat is ADR-ruled emergency'
+  Assert-True ($rp1.repeatPaged.priority -eq 'high') 'the fleet-dead repeat is high by default (#197; ADR 0012 as amended)'
 
   # --- ic-vanished: an active IC on the live roster with no matching daemon row.
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-971","role":"ic","tenant":"test","parent":"pl-test","issue":971,"status":"active"}]}'
@@ -1908,6 +2082,155 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Write-Utf8 "$testRoot\state\roster.json" $savedLiveRoster85
   Remove-Item "$testRoot\profile\.claude\jobs\job-d-wedge" -Recurse -ErrorAction SilentlyContinue
   Set-AgentsRows $noSentinelRows
+
+  # ===== fleet #232: an invalid pages.priority.<kind> / pages.defaultPriority value =====
+  # ===== never reaches Send-FleetPage's ValidateSet. The page goes at the kind's =====
+  # ===== built-in default, the tick completes (shadow line, last-run.json, paged =====
+  # ===== state), and the bad value is reported: a tick-line field every tick, and =====
+  # ===== one config-invalid:<key> condition that pages once (paged.json dedupe, =====
+  # ===== the same once-per-key rule dated:<where> uses) and clears when fixed. =====
+  function Run-WatchdogCaptured {
+    # Run-Watchdog returns $null for a crashed tick (its only stdout line is the
+    # final JSON entry; the outer catch writes the error and exits 1). This variant
+    # merges the error stream so the assertion can name the crash.
+    $raw = & "$testRoot\bin\watchdog.ps1" -NoToast 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    $lines = @($raw -split "`n" | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    $jsonLine = @($lines | Where-Object { $_.StartsWith('{') })
+    $line = $null
+    if ($jsonLine.Count -gt 0) { try { $line = $jsonLine[-1] | ConvertFrom-Json } catch {} }
+    $errText = (@($lines | Where-Object { -not $_.StartsWith('{') }) -join ' | ')
+    if ($errText.Length -gt 400) { $errText = $errText.Substring(0, 400) + '...' }
+    return [pscustomobject]@{ crashed = (($code -ne 0) -or ($null -eq $line)); exitCode = $code; error = $errText; line = $line }
+  }
+  function Stop-MockPushover232 {
+    # Stop-Job on a listener blocked in GetContext() waits ~120s; serving its
+    # remaining request budget first lets the job end on its own.
+    param($Mock)
+    if (-not ($Mock -and $Mock.Job)) { return }
+    for ($i = 0; $i -lt 20; $i++) { try { Invoke-WebRequest -Uri $Mock.Prefix -Method Post -Body 'drain=1' -TimeoutSec 2 -UseBasicParsing | Out-Null } catch { break } }
+    Stop-Job $Mock.Job -ErrorAction SilentlyContinue; Remove-Job $Mock.Job -Force -ErrorAction SilentlyContinue
+  }
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  $pushLog232 = Join-Path $testRoot 'pushover-requests-232.log'
+  [IO.File]::WriteAllText($pushLog232, '')
+  $pushMock232 = Start-MockPushover -LogPath $pushLog232 -Count 6
+  $oldPushoverUrl232 = $env:FLEET_PUSHOVER_URL
+  $env:FLEET_PUSHOVER_URL = $pushMock232.Prefix
+  [IO.Directory]::CreateDirectory("$testRoot\state\pages") | Out-Null
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-232","user":"usr-232"}'
+  function Get-ShadowLineCount232 {
+    # Today's (UTC-dated) shadow log; the settle tick below guarantees one exists.
+    $f = @(Get-ChildItem "$testRoot\state\sentinel\shadow" -Filter *.jsonl | Sort-Object Name)[-1].FullName
+    @(Get-Content $f | Where-Object { $_ }).Count
+  }
+  try {
+    # Clean baseline: the ticket-77 permission-wait fixture (ic-950 on the live roster,
+    # its daemon row present, its job state toggling `needs`), sentinel-off standing,
+    # fresh static heartbeats, no config, no paged state. Settled and asserted clean so
+    # every condition below is attributable to the case that raised it.
+    Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"}]}'
+    Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-950","role":"ic","tenant":"test","parent":"pl-test","issue":950,"status":"active"}]}'
+    Write-Utf8 "$testRoot\state\flags\sentinel-off" 'fleet #232'
+    Remove-Item "$testRoot\state\heartbeats\sentinel.json" -ErrorAction SilentlyContinue
+    foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 5 }
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic-950") | Out-Null
+    $jobStatePath232 = "$testRoot\profile\.claude\jobs\job-ic-950\state.json"
+    Write-Utf8 $jobStatePath232 ('{"needs":"","updatedAt":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}')
+    $pwRow232 = '{"id":"job-ic-950","name":"ic-950","state":"working","status":"idle","pid":88,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-1)) + '}'
+    Set-AgentsRows ($noSentinelRows.TrimEnd(']') + ',' + $pwRow232 + ']')
+    Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
+    $iv0 = Run-WatchdogCaptured
+    Assert-True (-not $iv0.crashed -and @($iv0.line.conditions).Count -eq 0) "the #232 baseline must be a clean tick (crashed=$($iv0.crashed) conditions=$(@($iv0.line.conditions) -join ','))"
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+    # Case IV1 (red-tell, AC1): pages.priority.permission-wait carries a typo and a
+    # permission-wait condition stands. Today: Send-FleetPage's ValidateSet rejects
+    # 'hgih', the throw lands in the outer catch, exit 1, no page, no paged.json, no
+    # shadow line, no last-run.json. Expected: the page goes at permission-wait's
+    # built-in default (high, Pushover 1) and the tick completes.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"priority":{"permission-wait":"hgih"}}}'
+    Write-Utf8 $jobStatePath232 ('{"needs":"approve Read: something","updatedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '"}')
+    $shadowBefore232 = Get-ShadowLineCount232
+    $iv1 = Run-WatchdogCaptured
+    Assert-True (-not $iv1.crashed) "a typo in pages.priority.permission-wait must not crash the tick (exit $($iv1.exitCode): $($iv1.error))"
+    $iv1Entry = @($iv1.line.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]
+    Assert-True ($null -ne $iv1Entry -and $iv1Entry.priority -eq 'high') "the permission-wait page must go at the kind's built-in default, high (got $($iv1Entry | ConvertTo-Json -Compress))"
+    Assert-True ($iv1Entry.page.pushover -eq $true) 'the permission-wait page must be delivered'
+    $iv1Posts = @(Get-PostedBodies $pushLog232 | ForEach-Object { ConvertFrom-FormBody $_ })
+    Assert-True (@($iv1Posts | Where-Object { $_.priority -eq '1' -and $_.message -like 'ic-950*permission*prompt*' }).Count -eq 1) "exactly one permission-wait page must reach Pushover at priority 1 (got $(@($iv1Posts | ForEach-Object { $_.priority }) -join ','))"
+    Assert-True ((Get-ShadowLineCount232) -eq $shadowBefore232 + 1) 'the tick must write its shadow line'
+    $lastRun232 = (Get-Content "$testRoot\state\watchdog\last-run.json" -Raw) | ConvertFrom-Json
+    Assert-True ("$($lastRun232.at)" -eq "$($iv1.line.at)") 'the tick must write last-run.json'
+    $paged232 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+    Assert-True ($null -ne $paged232.'permission-wait:ic-950:job-ic-950' -and "$($paged232.'permission-wait:ic-950:job-ic-950'.deliveredAt)" -ne '') 'the paged state must record the delivered permission-wait'
+    # AC3: the invalid value is visible - a tick-line field naming key and value, and
+    # a normal-priority config-invalid condition that pages once.
+    Assert-True (@($iv1.line.invalidPagePriority | Where-Object { $_.key -eq 'pages.priority.permission-wait' -and $_.value -eq 'hgih' }).Count -eq 1) "the tick line must name the invalid key and value (got $($iv1.line.invalidPagePriority | ConvertTo-Json -Compress))"
+    Assert-True (@($iv1.line.conditions) -contains 'config-invalid:pages.priority.permission-wait') 'the invalid value must stand as a config-invalid:<key> condition'
+    $iv1Cfg = @($iv1.line.newlyPaged | Where-Object { $_.key -eq 'config-invalid:pages.priority.permission-wait' })[0]
+    Assert-True ($null -ne $iv1Cfg -and $iv1Cfg.priority -eq 'normal') 'the config-invalid condition pages at normal'
+    Assert-True (@($iv1Posts | Where-Object { $_.priority -eq '0' -and $_.message -like '*pages.priority.permission-wait*hgih*' }).Count -eq 1) 'the config-invalid page must reach Pushover once at priority 0, naming key and value'
+
+    # Case IV2: the same standing typo pages nothing on the next tick (once, not every
+    # tick); the tick-line field may repeat, the page may not.
+    $iv2 = Run-WatchdogCaptured
+    Assert-True (-not $iv2.crashed) "a standing typo must not crash the next tick (exit $($iv2.exitCode): $($iv2.error))"
+    Assert-True (@($iv2.line.newlyPaged).Count -eq 0) "a standing typo and a standing permission-wait must page nothing new (got $($iv2.line.newlyPaged | ConvertTo-Json -Compress))"
+    Assert-True (@(Get-PostedBodies $pushLog232).Count -eq 2) 'no third POST on the second tick'
+    Assert-True (@($iv2.line.conditions) -contains 'config-invalid:pages.priority.permission-wait') 'config-invalid stays a condition while the typo stands'
+
+    # Case IV3: fixing the value clears the condition; the permission-wait stays deduped.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"priority":{"permission-wait":"high"}}}'
+    $iv3 = Run-WatchdogCaptured
+    Assert-True (-not $iv3.crashed) "the fixed config must tick cleanly (exit $($iv3.exitCode): $($iv3.error))"
+    Assert-True (-not (@($iv3.line.conditions) -contains 'config-invalid:pages.priority.permission-wait')) 'fixing the value must clear the config-invalid condition'
+    Assert-True (@($iv3.line.invalidPagePriority).Count -eq 0) 'a valid config reports no invalid priority'
+    Assert-True (@($iv3.line.newlyPaged).Count -eq 0) 'the already-delivered permission-wait must not page again after the fix'
+
+    # Reset: answer the prompt, settle, drop paged state.
+    Write-Utf8 $jobStatePath232 ('{"needs":"","updatedAt":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}')
+    Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+    $null = Run-WatchdogCaptured
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+    [IO.File]::WriteAllText($pushLog232, '')
+
+    # Case IV4 (red-tell, AC2): pages.defaultPriority is invalid and a condition of a
+    # kind with no built-in default stands (dated:<where>, raised by the same config
+    # file's expired *Until key). Today: 'loud' reaches the ValidateSet and the tick
+    # crashes. Expected: the dated page goes at normal (Pushover 0), the tick completes,
+    # and pages.defaultPriority is reported as invalid, once.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"defaultPriority":"loud"},"ic":{"soakUntil":"2026-09-16T00:00:00Z"}}'
+    $shadowBefore232b = Get-ShadowLineCount232
+    $iv4 = Run-WatchdogCaptured
+    Assert-True (-not $iv4.crashed) "an invalid pages.defaultPriority must not crash the tick (exit $($iv4.exitCode): $($iv4.error))"
+    Assert-True (@($iv4.line.conditions) -contains 'dated:config.ic.soakUntil') 'the dated condition (an unmapped kind) must stand'
+    $iv4Entry = @($iv4.line.newlyPaged | Where-Object { $_.key -eq 'dated:config.ic.soakUntil' })[0]
+    Assert-True ($null -ne $iv4Entry -and $iv4Entry.priority -eq 'normal' -and $iv4Entry.page.pushover -eq $true) "an unmapped kind under an invalid default must page at normal (got $($iv4Entry | ConvertTo-Json -Compress))"
+    $iv4Posts = @(Get-PostedBodies $pushLog232 | ForEach-Object { ConvertFrom-FormBody $_ })
+    Assert-True (@($iv4Posts | Where-Object { $_.priority -eq '0' -and $_.message -like '*soakUntil*' }).Count -eq 1) 'the dated page must reach Pushover once at priority 0'
+    Assert-True ((Get-ShadowLineCount232) -eq $shadowBefore232b + 1) 'the tick must write its shadow line under an invalid default'
+    Assert-True ("$(((Get-Content "$testRoot\state\watchdog\last-run.json" -Raw) | ConvertFrom-Json).at)" -eq "$($iv4.line.at)") 'the tick must write last-run.json under an invalid default'
+    Assert-True (@($iv4.line.invalidPagePriority | Where-Object { $_.key -eq 'pages.defaultPriority' -and $_.value -eq 'loud' }).Count -eq 1) "the tick line must name pages.defaultPriority and its value (got $($iv4.line.invalidPagePriority | ConvertTo-Json -Compress))"
+    Assert-True (@($iv4.line.conditions) -contains 'config-invalid:pages.defaultPriority') 'the invalid default must stand as a config-invalid condition'
+    Assert-True (@($iv4Posts | Where-Object { $_.priority -eq '0' -and $_.message -like '*pages.defaultPriority*loud*' }).Count -eq 1) 'the config-invalid page for the default must reach Pushover once at priority 0'
+    $iv5 = Run-WatchdogCaptured
+    Assert-True (-not $iv5.crashed -and @($iv5.line.newlyPaged).Count -eq 0 -and @(Get-PostedBodies $pushLog232).Count -eq 2) 'a standing invalid default pages nothing new on the next tick'
+  } finally {
+    Stop-MockPushover232 $pushMock232
+    if ($oldPushoverUrl232) { $env:FLEET_PUSHOVER_URL = $oldPushoverUrl232 } else { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue }
+  }
+  Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Set-AgentsRows $noSentinelRows
+  $null = Run-Watchdog
 
   Write-Output 'watchdog tests passed'
 } finally {

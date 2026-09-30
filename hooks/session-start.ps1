@@ -10,6 +10,8 @@ $ErrorActionPreference = 'SilentlyContinue'
 $hookInputRaw = [Console]::In.ReadToEnd()
 $hookSessionId = $null
 try { $hookSessionId = ("$hookInputRaw" | ConvertFrom-Json).session_id } catch {}
+$hookSource = $null
+try { $hookSource = ("$hookInputRaw" | ConvertFrom-Json).source } catch {}
 $home_ = $env:FLEET_HOME; if (-not $home_) { exit 0 }
 $name = $env:FLEET_NAME; $role = $env:FLEET_ROLE; $tenant = $env:FLEET_TENANT; $parent = $env:FLEET_PARENT
 if (-not $name) { exit 0 }
@@ -104,12 +106,34 @@ if ($env:FLEET_ASSIGNMENT_MANIFEST -and $env:FLEET_WORK_RECORD_ID) {
   $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $homeFwd + '/bin/work-state.js get --root ' + $homeFwd + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
   Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $homeFwd/bin/assignment.js ack --root $homeFwd --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
 }
-# The handoff goes only to the session the rotation itself launched: the intent's
-# newSessionId must match this session's id, so a later respawn or manual launch of
-# the same name never inherits a stale offset (the expired-context class).
+# The handoff goes only to the session the rotation itself launched. Two rules. Exact: the
+# intent is `launched` and its newSessionId matches this session's id. Window (fleet #230:
+# the hook can run before launch.ps1 returns the session id, or the id came back empty):
+# the intent is `launching`, or `launched` with an empty newSessionId, and this is a
+# same-name `startup` hook (never resume/compact/clear/fork) inside [launchingAt,
+# launchingAt + 120 s]. Either way a later respawn or manual launch of the same name never
+# inherits a stale offset (the expired-context class): the window expires after 120 s.
 $rotation = $null
-try { $rotation = Get-Content "$home_\state\rotation\$name.json" -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-if ($rotation -and "$($rotation.phase)" -eq 'launched' -and $hookSessionId -and "$($rotation.newSessionId)" -eq "$hookSessionId") {
+$rotationPath = "$home_\state\rotation\$name.json"
+if (Test-Path $rotationPath) {
+  # rotate.ps1 rewrites the intent with a non-atomic truncate+write; retry a torn read.
+  for ($try = 0; $try -lt 3 -and -not $rotation; $try++) {
+    if ($try -gt 0) { Start-Sleep -Milliseconds 200 }
+    try { $rotation = Get-Content $rotationPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+  }
+}
+$rotationExact = $rotation -and "$($rotation.phase)" -eq 'launched' -and $hookSessionId -and "$($rotation.newSessionId)" -eq "$hookSessionId"
+$rotationWindow = $false
+$phaseNow = if ($rotation) { "$($rotation.phase)" } else { '' }
+$windowPhase = $phaseNow -eq 'launching' -or ($phaseNow -eq 'launched' -and -not "$($rotation.newSessionId)")
+if ($rotation -and $windowPhase -and "$($rotation.name)" -eq "$name" -and "$hookSource" -eq 'startup') {
+  $launchingAt = [DateTimeOffset]::MinValue
+  if ([DateTimeOffset]::TryParse("$($rotation.launchingAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$launchingAt)) {
+    $ageSeconds = ([DateTimeOffset]::UtcNow - $launchingAt).TotalSeconds
+    $rotationWindow = ($ageSeconds -ge 0 -and $ageSeconds -le 120)
+  }
+}
+if ($rotationExact -or $rotationWindow) {
   $why = (@($rotation.reasons) -join '; ')
   $reconciledAt = if ($rotation.reconcile) { $rotation.reconcile.at } else { 'not run; the scheduled pr-watch tick covers it' }
   Write-Output "ROTATION: you replace a predecessor rotated at $($rotation.savedAt) ($why). Its transcript is gone by design; reconstruct from canonical state only - Work records (node $homeFwd/bin/work-state.js get/project), state/status/, the roster, and the skip file. Active records were reconciled against GitHub at: $reconciledAt. Event offset at rotation: $($rotation.offset.totalEvents) events. Re-read live GitHub state before your first action."
