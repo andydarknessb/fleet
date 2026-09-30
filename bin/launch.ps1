@@ -139,6 +139,8 @@ if ($Manifest) {
   $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
   # no release: the record is not `assigned` (absent, claimed by a live IC, released, or already past the reservation), so it is no longer this manifest's reservation. A release from this manifest's revision would be refused, or would pull a claim a session holds.
   if (-not $recordProperty -or $recordProperty.Value.state -ne 'assigned') { Write-Error "Work record '$WorkRecordId' is not assigned"; exit 4 }
+  # no release: the record is `assigned` but at another revision than this manifest reserved (fleet#264: a lead's escalate -> assigned round trip bumps it on the same manifest). The reservation is no longer this manifest's, and a release from its revision would be refused as stale. Refused here, before the gh check, fetch and worktree work.
+  if ([string]$recordProperty.Value.revision -ne [string]$assignment.workRecordRevision) { Write-Error "Work record '$WorkRecordId' is at revision $($recordProperty.Value.revision), but the manifest reserved revision $($assignment.workRecordRevision)"; exit 4 }
   # Per tenant, the way work-state.js's isForeignRecord scopes it: another tenant's ICs are
   # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
   # A record with no tenant is legacy and still counts, matching isForeignRecord.

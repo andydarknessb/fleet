@@ -90,34 +90,63 @@ try {
   Invoke-Git @('remote', 'add', 'origin', $repoPath)
   Invoke-Git @('fetch', '-q', 'origin', 'integration')
 
-  # gh: the issue read returns the body the planner hashed, or fails when MOCK_GH_FAIL=1.
-  # The issue read sits between launch.ps1's early marker/record checks and its claude --bg, so
-  # MOCK_GH_MUTATE makes it the stand-in for fleet#264's window (a release landing while the launch has no
-  # job and no roster row yet):
+  # gh: the issue read returns the body the planner hashed, or fails when MOCK_GH_FAIL=1. Every call is
+  # logged to gh-calls.log. fleet#264's window (a release landing while the launch has no job and no
+  # roster row yet) is simulated by MOCK_GH_MUTATE, applied by mock-mutate.js from one of two places:
+  # the gh issue read (before the base fetch and the worktree add) or, with MOCK_MUTATE_AT=agents, the
+  # `claude agents --json --all` call that is the last step before `claude --bg` (after the worktree exists).
   #   marker       = write the invalidation marker at MOCK_GH_MARKER_PATH (what a stranded-reservation release leaves)
   #   state:<s>    = move the Work record MOCK_GH_RECORD_ID to state <s> in MOCK_GH_ACTIVE_PATH
   #   revision:<n> = keep it `assigned` but at revision <n>
-  $ghLines = @(
+  #   missing      = delete the record from active.json (the shape after a release that archived it)
+  $mutateLines = @(
     "'use strict';",
     "const fs = require('fs');",
+    "module.exports = function applyMutation() {",
+    "  const mutate = process.env.MOCK_GH_MUTATE || '';",
+    "  if (mutate === 'marker') fs.writeFileSync(process.env.MOCK_GH_MARKER_PATH, JSON.stringify({ schemaVersion: 1, manifestId: 'mock', invalidatedAt: '2026-09-30T00:00:00.000Z', reason: 'mock release in the window' }));",
+    "  if (/^(state|revision):/.test(mutate) || mutate === 'missing') {",
+    "    const file = process.env.MOCK_GH_ACTIVE_PATH;",
+    "    const active = JSON.parse(fs.readFileSync(file, 'utf8'));",
+    "    const id = process.env.MOCK_GH_RECORD_ID;",
+    "    const [kind, value] = mutate.split(':');",
+    "    if (kind === 'missing') delete active.records[id];",
+    "    else if (kind === 'state') active.records[id].state = value;",
+    "    else active.records[id].revision = Number(value);",
+    "    fs.writeFileSync(file, JSON.stringify(active));",
+    "  }",
+    "};"
+  )
+  Write-Utf8 "$testRoot\mock-bin\mock-mutate.js" (($mutateLines -join "`n") + "`n")
+  $ghLines = @(
+    "'use strict';",
+    "const fs = require('fs'); const path = require('path');",
+    "fs.appendFileSync(path.join(__dirname, '..', 'gh-calls.log'), process.argv.slice(2).join(' ') + '\n');",
+    "if ((process.env.MOCK_MUTATE_AT || 'gh') === 'gh') require('./mock-mutate.js')();",
     "if (process.env.MOCK_GH_FAIL === '1') { process.stderr.write('gh: HTTP 502'); process.exit(1); }",
-    "const mutate = process.env.MOCK_GH_MUTATE || '';",
-    "if (mutate === 'marker') fs.writeFileSync(process.env.MOCK_GH_MARKER_PATH, JSON.stringify({ schemaVersion: 1, manifestId: 'mock', invalidatedAt: '2026-09-30T00:00:00.000Z', reason: 'mock release in the window' }));",
-    "if (/^(state|revision):/.test(mutate)) {",
-    "  const file = process.env.MOCK_GH_ACTIVE_PATH;",
-    "  const active = JSON.parse(fs.readFileSync(file, 'utf8'));",
-    "  const rec = active.records[process.env.MOCK_GH_RECORD_ID];",
-    "  const [kind, value] = mutate.split(':');",
-    "  if (kind === 'state') rec.state = value; else rec.revision = Number(value);",
-    "  fs.writeFileSync(file, JSON.stringify(active));",
-    "}",
     "const n = process.argv.find((a) => /^\d+$/.test(a)) || '0';",
     "process.stdout.write(JSON.stringify({ state: 'OPEN', body: 'Change ``src/fixture-' + n + '.js``.' }));"
   )
   Write-Utf8 "$testRoot\mock-bin\mock-gh.js" (($ghLines -join "`n") + "`n")
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ("@echo off`r`nnode `"%~dp0mock-gh.js`" %*`r`nexit /b %errorlevel%`r`n")
-  # claude logs every call to claude-calls.log (the #264 cases ask whether `--bg` was ever called).
-  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'echo %* >> "%~dp0..\claude-calls.log"' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+  # claude logs every call to claude-calls.log (the #264 cases ask whether `--bg` was ever called). `agents` lists no
+  # sessions. With MOCK_MUTATE_AT=agents the `agents --json --all` call applies the mutation and records whether the
+  # assignment worktree (MOCK_WORKTREE_PATH) existed at that moment in mutate-saw-worktree.log.
+  $claudeLines = @(
+    "'use strict';",
+    "const fs = require('fs'); const path = require('path');",
+    "const args = process.argv.slice(2);",
+    "fs.appendFileSync(path.join(__dirname, '..', 'claude-calls.log'), args.join(' ') + '\n');",
+    "if (args[0] === 'agents') {",
+    "  if (process.env.MOCK_MUTATE_AT === 'agents' && args.includes('--all')) {",
+    "    fs.appendFileSync(path.join(__dirname, '..', 'mutate-saw-worktree.log'), String(fs.existsSync(process.env.MOCK_WORKTREE_PATH)) + '\n');",
+    "    require('./mock-mutate.js')();",
+    "  }",
+    "  process.stdout.write('[]');",
+    "}"
+  )
+  Write-Utf8 "$testRoot\mock-bin\mock-claude.js" (($claudeLines -join "`n") + "`n")
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ("@echo off`r`nnode `"%~dp0mock-claude.js`" %*`r`nexit /b %errorlevel%`r`n")
   Write-Utf8 "$testRoot\mock-agents.json" '[]'
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
@@ -146,10 +175,10 @@ try {
   # Case 3: the release itself fails (the manifest's revision is stale), and the refusal still reads
   # as the gh failure with the release failure appended; the record stays assigned, no marker.
   $m22 = Reserve-Manifest 22 $baseSha
-  $doc = (Get-Content $m22 -Raw) | ConvertFrom-Json
-  $doc.workRecordRevision = 99
-  Write-Utf8 $m22 ($doc | ConvertTo-Json -Depth 20)
-  [void](Run-Launch @('-Manifest', $m22, '-WorkRecordId', 'test:issue-22'))
+  # The record's revision moves after the early check (during the gh read), so the release from the manifest's
+  # revision is refused as stale. (An already-moved revision is refused before gh; see the #264 early-check case.)
+  $env:MOCK_GH_MUTATE = 'revision:99'; $env:MOCK_GH_RECORD_ID = 'test:issue-22'
+  try { [void](Run-Launch @('-Manifest', $m22, '-WorkRecordId', 'test:issue-22')) } finally { Remove-Item Env:MOCK_GH_MUTATE, Env:MOCK_GH_RECORD_ID -ErrorAction SilentlyContinue }
   Assert-True ($lastExit -eq 4 -and $lastFlat -match 'couldnotreconcileissue#22beforelaunch') "a failed release must not mask the refusal reason: exit $lastExit $lastOut"
   Assert-True ($lastFlat -match 'reservationreleasealsofailed') "the failed release is appended to the refusal: $lastOut"
   Assert-True ((Get-RecordState 22) -eq 'assigned' -and -not (Get-Marker $m22)) 'a failed release leaves the record assigned and writes no marker'
@@ -196,44 +225,78 @@ try {
     $active.records = [pscustomobject]@{}
     Write-Utf8 $path ($active | ConvertTo-Json -Depth 20)
   }
+  # -At gh: the change lands during the gh issue read, before the base fetch and the worktree add.
+  # -At agents: it lands in the `claude agents --json --all` call that is the last step before `claude --bg`,
+  # after the worktree exists. The agents cases pin the PLACEMENT of the late re-check: a re-check hoisted above
+  # the worktree add (or removed) would not see the change, and they prove the worktree was really created first.
   function Test-LateRefusal {
-    param([int]$Issue, [string]$Mutate, [string]$ReasonPattern, [string]$Label)
+    param([int]$Issue, [string]$Mutate, [string]$At, [string]$ReasonPattern, [string]$Label)
     Clear-ActiveRecords
     $manifest = Reserve-Manifest $Issue $baseSha
     $recordBefore = Get-Record $Issue
-    Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\claude-calls.log", "$testRoot\mutate-saw-worktree.log" -ErrorAction SilentlyContinue
     $env:MOCK_GH_MUTATE = $Mutate
+    $env:MOCK_MUTATE_AT = $At
     $env:MOCK_GH_MARKER_PATH = "$manifest.invalidated.json"
     $env:MOCK_GH_RECORD_ID = "test:issue-$Issue"
+    $env:MOCK_WORKTREE_PATH = "$repoPath\.claude\worktrees\ic-$Issue-assignment"
     try { [void](Run-Launch @('-Manifest', $manifest, '-WorkRecordId', "test:issue-$Issue")) }
-    finally { Remove-Item Env:MOCK_GH_MUTATE, Env:MOCK_GH_MARKER_PATH, Env:MOCK_GH_RECORD_ID -ErrorAction SilentlyContinue }
+    finally { Remove-Item Env:MOCK_GH_MUTATE, Env:MOCK_MUTATE_AT, Env:MOCK_GH_MARKER_PATH, Env:MOCK_GH_RECORD_ID, Env:MOCK_WORKTREE_PATH -ErrorAction SilentlyContinue }
     Assert-True ($lastExit -eq 4 -and $lastFlat -match $ReasonPattern) "${Label}: the launch refuses (exit 4) naming the failed re-check: exit $lastExit $lastOut"
     Assert-True ((Get-BgCalls) -eq 0) "${Label}: no claude --bg call may happen after the reservation is gone"
+    if ($At -eq 'agents') {
+      $sawWorktree = if (Test-Path "$testRoot\mutate-saw-worktree.log") { (Get-Content "$testRoot\mutate-saw-worktree.log" -Raw).Trim() } else { 'the agents call never ran' }
+      Assert-True ($sawWorktree -eq 'true') "${Label}: the change landed after the worktree was created (saw: $sawWorktree), so the re-check sits after the worktree add"
+    }
     Assert-True (-not (Test-Path "$repoPath\.claude\worktrees\ic-$Issue-assignment")) "${Label}: the worktree this launch created is removed"
     Assert-True (-not (Invoke-Git @('branch', '--list', "fleet/*$Issue*"))) "${Label}: the assignment branch this launch created is removed"
     return @{ Manifest = $manifest; Before = $recordBefore }
   }
 
-  # Case 7: a release marker lands in the window (a stranded-reservation release wrote it). Nothing is
-  # left to release: the marker the release wrote is not overwritten and the record is untouched.
-  $c7 = Test-LateRefusal 26 'marker' 'invalidated' 'marker case'
+  # Case 7: a release marker lands just before claude --bg (a stranded-reservation release wrote it). Nothing
+  # is left to release: the marker the release wrote is not overwritten and the record is untouched.
+  $c7 = Test-LateRefusal 26 'marker' 'agents' 'invalidated' 'marker case'
   $m7 = Get-Marker $c7.Manifest
   Assert-True ($m7 -and "$($m7.reason)" -eq 'mock release in the window') "marker case: the marker written in the window is left exactly as it was: $($m7 | ConvertTo-Json -Compress)"
   Assert-True ((Get-RecordState 26) -eq 'assigned' -and (Get-Record 26).revision -eq $c7.Before.revision) 'marker case: the launch itself releases nothing (record untouched)'
+  # The same marker written earlier (during the gh read) is caught by the same re-check.
+  $c7g = Test-LateRefusal 32 'marker' 'gh' 'invalidated' 'marker case (gh read)'
 
-  # Case 8: the record was released in the window (no marker on disk). Refused on the record check; the
-  # launch writes no marker of its own and does not touch the record.
-  $c8 = Test-LateRefusal 27 'state:released' 'isreleased' 'released case'
+  # Case 8: the record was released during the gh read (no marker on disk). Refused on the record check;
+  # the launch writes no marker of its own and does not touch the record.
+  $c8 = Test-LateRefusal 27 'state:released' 'gh' 'isreleased' 'released case'
   Assert-True ((Get-RecordState 27) -eq 'released' -and -not (Get-Marker $c8.Manifest) -and (Get-Record 27).revision -eq $c8.Before.revision) 'released case: the launch wrote no marker and left the record alone'
 
-  # Case 9: the record moved to another state in the window.
-  $c9 = Test-LateRefusal 28 'state:implementing' 'isimplementing' 'other-state case'
+  # Case 8b: the record is missing from active.json just before claude --bg (the shape after a release that
+  # archived it).
+  $c8b = Test-LateRefusal 33 'missing' 'agents' 'isnolongeractive' 'missing-record case'
+  Assert-True (-not (Get-RecordState 33) -and -not (Get-Marker $c8b.Manifest)) 'missing-record case: the launch wrote no marker and put nothing back'
+
+  # Case 9: the record moved to another state during the gh read.
+  $c9 = Test-LateRefusal 28 'state:implementing' 'gh' 'isimplementing' 'other-state case'
   Assert-True ((Get-RecordState 28) -eq 'implementing' -and -not (Get-Marker $c9.Manifest)) 'other-state case: record untouched, no marker written by the launch'
 
   # Case 10: still `assigned` but at a different revision than the manifest reserved (a release and a
-  # re-reservation landed in the window): this manifest no longer owns it.
-  $c10 = Test-LateRefusal 29 'revision:7' 'revision' 'revision case'
+  # re-reservation landed just before claude --bg): this manifest no longer owns it.
+  $c10 = Test-LateRefusal 29 'revision:7' 'agents' 'movedtorevision7' 'revision case'
   Assert-True ((Get-RecordState 29) -eq 'assigned' -and (Get-Record 29).revision -eq 7 -and -not (Get-Marker $c10.Manifest)) 'revision case: record untouched, no marker written by the launch'
+
+  # Case 12 (the early check): the record is already `assigned` at another revision than the manifest reserved
+  # (a lead's escalate -> assigned round trip bumps it on the same manifest). Refused before any gh call, fetch or
+  # worktree work, with no release.
+  Clear-ActiveRecords
+  $m34 = Reserve-Manifest 34 $baseSha
+  $manifestRevision = [int]((Get-Content $m34 -Raw) | ConvertFrom-Json).workRecordRevision
+  $activePath = "$testRoot\state\work\active.json"
+  $activeDoc = (Get-Content $activePath -Raw) | ConvertFrom-Json
+  $activeDoc.records.PSObject.Properties['test:issue-34'].Value.revision = $manifestRevision + 2
+  Write-Utf8 $activePath ($activeDoc | ConvertTo-Json -Depth 20)
+  Remove-Item "$testRoot\claude-calls.log", "$testRoot\gh-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $m34, '-WorkRecordId', 'test:issue-34'))
+  Assert-True ($lastExit -eq 4 -and $lastFlat -match "isatrevision$($manifestRevision + 2),butthemanifestreservedrevision$manifestRevision") "a record at another revision is refused early, naming both revisions: exit $lastExit $lastOut"
+  Assert-True (-not (Test-Path "$testRoot\gh-calls.log")) 'the early revision check refuses before any gh call'
+  Assert-True ((Get-BgCalls) -eq 0 -and -not (Test-Path "$repoPath\.claude\worktrees\ic-34-assignment") -and -not (Invoke-Git @('branch', '--list', 'fleet/*34*'))) 'the early revision check creates no worktree and calls no claude --bg'
+  Assert-True ((Get-RecordState 34) -eq 'assigned' -and (Get-Record 34).revision -eq ($manifestRevision + 2) -and -not (Get-Marker $m34)) 'the early revision check releases nothing and writes no marker'
 
   # Case 11: the control. With nothing changed in the window the same launch reaches `claude --bg` (the
   # mock claude starts no session, so it then fails as it always did): the re-check does not refuse every launch.
@@ -247,7 +310,7 @@ try {
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
-  Remove-Item Env:MOCK_GH_FAIL, Env:MOCK_GH_ACTIVE_PATH, Env:MOCK_GH_MUTATE, Env:MOCK_GH_MARKER_PATH, Env:MOCK_GH_RECORD_ID -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_GH_FAIL, Env:MOCK_GH_ACTIVE_PATH, Env:MOCK_GH_MUTATE, Env:MOCK_GH_MARKER_PATH, Env:MOCK_GH_RECORD_ID, Env:MOCK_MUTATE_AT, Env:MOCK_WORKTREE_PATH -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-launch-refusal-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

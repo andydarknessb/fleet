@@ -91,6 +91,7 @@ $exitRows = @(
   @{ Anchor = 'reason = \$legacyRefusal'; Decision = 'keep' }                   # no manifest on this path
   @{ Anchor = 'no tenant file for'; Nth = 2; Decision = 'release' }
   @{ Anchor = 'is not assigned'; Decision = 'keep' }                            # the record is not ours to release
+  @{ Anchor = 'but the manifest reserved revision'; Decision = 'keep' }         # fleet#264: assigned at another revision (escalate -> assigned round trip): not this manifest's reservation
   @{ Anchor = 'a fourth assignment'; Decision = 'release' }
   @{ Anchor = 'third assignment requires'; Decision = 'release' }
   @{ Anchor = 'reason = \$haikuReason'; Decision = 'release' }
