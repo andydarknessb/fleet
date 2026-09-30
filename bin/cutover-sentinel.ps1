@@ -100,10 +100,11 @@ if ($entry) {
   $retireResult = ConvertFrom-LastJsonLine $retireRaw
   $retired = [ordered]@{ path = 'retire.ps1'; jobId = $entry.jobId; result = $retireResult; raw = $(if ($retireResult) { $null } else { ($retireRaw -replace '\s+', ' ').Trim() }) }
 } elseif ($sentinelRow) {
-  & claude stop $sentinelRow.id 2>&1 | Out-Null
-  & claude rm $sentinelRow.id 2>&1 | Out-Null
+  # fleet #265: through the resolver; a missing CLI is recorded, never reported as a clean removal.
+  $directError = $null
+  try { $null = Invoke-ClaudeCli -Arguments @('stop', "$($sentinelRow.id)"); $null = Invoke-ClaudeCli -Arguments @('rm', "$($sentinelRow.id)") } catch { $directError = "$($_.Exception.Message)" }
   Remove-Item "$FleetHome\state\heartbeats\sentinel.json" -ErrorAction SilentlyContinue
-  $retired = [ordered]@{ path = 'claude stop/rm'; jobId = $sentinelRow.id; detail = 'session had no active live-roster entry; stopped and removed directly' }
+  $retired = [ordered]@{ path = 'claude stop/rm'; jobId = $sentinelRow.id; detail = $(if ($directError) { "session had no active live-roster entry; claude stop/rm did NOT run ($directError): stop job $($sentinelRow.id) by hand" } else { 'session had no active live-roster entry; stopped and removed directly' }) }
 }
 
 $record = [ordered]@{

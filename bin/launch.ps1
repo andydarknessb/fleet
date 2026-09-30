@@ -171,7 +171,7 @@ if ($Manifest) {
 # reservation time.
 if (-not $Permissions) { $Permissions = 'auto' }
 if ($Model -eq 'haiku' -and $Permissions -ne 'allowlist') {
-  $haikuReason = "the installed Claude Code CLI ($(try { (& claude --version 2>$null | Out-String).Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
+  $haikuReason = "the installed Claude Code CLI ($(try { "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
   $released = $false
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $haikuReason; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $haikuReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
@@ -197,7 +197,7 @@ if ($Model -eq 'haiku' -and $Permissions -eq 'allowlist') {
   if (-not ($haikuProfile -and $haikuProfile.rehearsalRoot -eq $true)) {
     $verifiedCli = if ($haikuProfile) { "$($haikuProfile.verifiedCliVersion)".Trim() } else { '' }
     $installedCli = ''
-    try { $installedCli = "$((& claude --version 2>$null | Out-String))".Trim() } catch {}
+    try { $installedCli = "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch {}
     $installedVersion = if ($installedCli -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { $installedCli }
     $rehearsalHow = "(bin\scratch-root.ps1 -Path <dir> -Issue <n>, then its printed assign and launch); a clean verdict writes verifiedCliVersion in config\permissions-allowlist.json. Launch this ticket on sonnet meanwhile"
     $versionReason = $null
@@ -620,12 +620,15 @@ try {
   # so argv delivery silently truncated every measured IC prompt. stdin is the
   # CLI's prompt input as well, and preserves the exact string without another
   # command-line parse.
-  $out = $Prompt | & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
+  # fleet #265: resolved once (waiting out an npm reinstall); the prompt still goes over stdin.
+  $claudeCli = Resolve-ClaudeCli
+  $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
 } catch {
   if ($locationPushed) { Pop-Location; $locationPushed = $false }
   # fleet#256: claude itself failing to run (not on PATH, spawn error) is a refusal too. Release first, then remove the worktree (fleet#251 order); the helper never throws, so the original error is what surfaces.
   [void](Release-ReservationOnRefusal "launch failed: claude --bg threw: $($_.Exception.Message)")
   Remove-FailedAssignmentWorktree
+  if ("$($_.Exception.Message)" -match '^(claude CLI not found|FLEET_CLAUDE_CLI does not point)') { Write-Output (Get-ClaudeCliMissingJson @{ launched = $false; reason = "$($_.Exception.Message)" }); exit 6 }   # fleet #265: a CLI still missing after the bounded wait is reported as such, not as a bare exception
   throw
 } finally {
   if ($locationPushed) { Pop-Location }

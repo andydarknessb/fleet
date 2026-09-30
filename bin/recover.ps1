@@ -1,6 +1,8 @@
 # Reboot recovery: bring the roster back. Run at logon (install-recovery-task.ps1) or by hand.
 . "$PSScriptRoot\_common.ps1"
-& claude daemon status 2>$null | Out-Null
+# fleet #265: the claude CLI is resolved (and an npm reinstall waited out), never assumed; a miss says so and exits 6.
+
+try { $null = Invoke-ClaudeCli -Arguments @('daemon', 'status') } catch { Write-Output (Get-ClaudeCliMissingJson @{ detail = "$($_.Exception.Message)" }); exit 6 }
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 $out = @()
 # Ticket 08b: a cut-over Sentinel (state/flags/sentinel-off) is not recovered; the watchdog task supervises.
@@ -17,7 +19,10 @@ foreach ($w in $wanted) {
     $out += "$($w.name): skipped, its assignment manifest was invalidated ($($w.entry.manifest).invalidated.json) and the reservation released; not respawned or relaunched"
     continue
   }
-  if ($row) { & claude respawn $row.id 2>&1 | Out-Null; $out += "$($w.name): respawned $($row.id)"; continue }
+  if ($row) {
+    try { $null = Invoke-ClaudeCli -Arguments @('respawn', "$($row.id)"); $out += "$($w.name): respawned $($row.id)" } catch { $out += "$($w.name): respawn of $($row.id) did not run: $($_.Exception.Message)" }
+    continue
+  }
   if ($w.fromRoster) {
     $r = (& "$PSScriptRoot\launch.ps1" -FromRoster $w.name | Out-String).Trim()
     $out += "$($w.name): launched -> $r"

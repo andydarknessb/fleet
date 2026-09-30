@@ -24,11 +24,11 @@ Assert-Match $sentinel 'pr-lookup-failed' 'Sentinel must fail safe when the PR l
 Assert-Match $sentinel 'state=\$state status=\$\(\$row\.status\), no open PR' 'Stale-heartbeat reasons must report measured state and status'
 
 $reread = $sentinel.IndexOf('$current = Get-LiveRoster')
-$respawn = $sentinel.IndexOf('claude respawn')
+$respawn = $sentinel.IndexOf("@('respawn'")   # fleet #265: the call goes through Invoke-ClaudeCli
 Assert-True ($reread -ge 0 -and $respawn -gt $reread) 'Sentinel must re-read the live roster before an IC respawn'
 
 $retiring = $retire.IndexOf("`$e.status = 'retiring'")
-$stop = $retire.IndexOf('claude stop')
+$stop = $retire.IndexOf("@('stop'")   # fleet #265: the call goes through Invoke-ClaudeCli
 Assert-True ($retiring -ge 0 -and $stop -gt $retiring) 'Retirement must publish the retiring marker before stopping the job'
 Assert-Match $retire 'worktreesRemaining' 'Retirement output must report still-registered owned worktrees'
 Assert-Match $retire "worktreeCleanup = if .*'none-owned'.*'removed'.*'remaining'" 'Retirement output must distinguish no worktree, removed worktree, and remaining worktree'

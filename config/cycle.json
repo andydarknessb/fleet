@@ -90,7 +90,8 @@
       "human-wait": "normal",
       "orphan-late-session": "normal",
       "ic-dead-before-ack": "normal",
-      "reservation-stranded": "normal"
+      "reservation-stranded": "normal",
+      "cleanup-pending": "normal"
     },
     "defaultPriority": "normal",
     "fleetDeadRepeatMinutes": 120,
@@ -103,7 +104,7 @@
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded", "cleanup-pending"]
   },
   "assignment": {
     "parityEvaluations": 20,

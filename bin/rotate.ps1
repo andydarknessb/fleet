@@ -82,7 +82,8 @@ function Test-SafeBoundary {
 
 function Invoke-RetireSession {
   # retire.ps1 reports success as a JSON line naming the retired session; its exit
-  # code is not the signal (claude/git inside it leave theirs in $LASTEXITCODE).
+  # code is not the signal (claude/git inside it leave theirs in $LASTEXITCODE, and
+  # fleet #265: it exits 6 after retiring the roster row when the claude CLI was missing).
   param([string]$SessionName, [string]$Reason)
   $out = & "$PSScriptRoot\retire.ps1" -Name $SessionName -Reason $Reason 2>&1 | Out-String
   $parsed = ConvertFrom-LastJsonLine $out
@@ -152,8 +153,14 @@ function Complete-Rotation {
       $launch = [pscustomobject]@{ launched = $false; reason = "a session named '$($Intent.name)' is running, and the daemon list could not be read to tell a hand relaunch from a stale revival ($daemonReadError); the intent stays open for the next run" }
     }
     $staleWhy = if ($daemonReadError) { $null } else { Get-StaleRevival -Intent $Intent -Row $runningRow }
+    $staleStopError = $null
     if ($staleWhy) {
-      & claude stop $runningRow.id 2>&1 | Out-Null
+      # fleet #265: a missing claude CLI is a named failure; the stale job stays up and the intent stays open.
+      try { $null = Invoke-ClaudeCli -Arguments @('stop', "$($runningRow.id)") } catch { $staleStopError = "$($_.Exception.Message)" }
+    }
+    if ($staleStopError) {
+      $launch = [pscustomobject]@{ launched = $false; reason = "the stale revival of job $($runningRow.id) could not be stopped ($staleStopError); the intent stays open for the next run" }
+    } elseif ($staleWhy) {
       $Intent | Add-Member -NotePropertyName staleRevival -NotePropertyValue ([pscustomobject]@{ at = (Now-Iso); jobId = "$($runningRow.id)"; why = $staleWhy }) -Force
       $Intent | Add-Member -NotePropertyName launchingAt -NotePropertyValue (Now-Iso) -Force   # fleet #230: a fresh window for the retry launch
       Write-Json $intentPath $Intent

@@ -400,6 +400,15 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $r10rs2 = Run-Watchdog
   Assert-True (-not (@($r10rs2.conditions) -contains 'escalation:nidus:issue-7:reservation-stranded')) 'the reservation-stranded escalation clears once the check stops raising it'
 
+  # cleanup-pending (#265): the Sentinel's cleanup-pending pass escalates once a retire's job/worktree cleanup has failed 3 times. Normal priority.
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1003"; kind = "cleanup-pending"; detail = "canned"; parent = "dispatcher" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
+  try { $r10cp = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckRs }
+  Assert-True (@($r10cp.conditions) -contains 'escalation:ic-1003:cleanup-pending') 'cleanup-pending must become an escalation condition'
+  Assert-True ((@($r10cp.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1003:cleanup-pending' })[0]).priority -eq 'normal') 'cleanup-pending pages at normal priority'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1003-cleanup-pending.json').Count -eq 1) 'cleanup-pending leaves one escalation file'
+  $r10cp2 = Run-Watchdog
+  Assert-True (-not (@($r10cp2.conditions) -contains 'escalation:ic-1003:cleanup-pending')) 'the cleanup-pending escalation clears once the check stops raising it'
+
   # Case 10e: `blocked` is recorded as waiting, never paged, never filed.
   $blockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
   Set-AgentsRows "[$blockedDisp,$plRow]"
@@ -1835,6 +1844,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r10o.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1001:orphan-late-session' })[0]).priority -eq 'normal') 'orphan-late-session (#252) is deliberately normal'
   Assert-True ((@($r10dba.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1002:ic-dead-before-ack' })[0]).priority -eq 'normal') 'ic-dead-before-ack (#253) is deliberately normal'
   Assert-True ((@($r10rs.newlyPaged | Where-Object { $_.key -eq 'escalation:nidus:issue-7:reservation-stranded' })[0]).priority -eq 'normal') 'reservation-stranded (#256) is deliberately normal'
+  Assert-True ((@($r10cp.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1003:cleanup-pending' })[0]).priority -eq 'normal') 'cleanup-pending (#265) is deliberately normal'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
   Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'

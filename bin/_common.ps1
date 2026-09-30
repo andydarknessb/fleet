@@ -211,11 +211,22 @@ function Get-DaemonSessions {
   # 2026-09-01 near-miss: one glitched read told the Sentinel every session was
   # missing while the same source disarmed launch.ps1's duplicate and cap guards.
   param([switch]$All, [switch]$Strict)
-  $raw = if ($All) { & claude agents --json --all 2>$null } else { & claude agents --json 2>$null }
-  $exit = $LASTEXITCODE
-  $text = ($raw | Out-String).Trim()
-  if ($exit -ne 0 -or -not $text) {
-    if ($Strict) { $shape = if ($text) { 'nonempty' } else { 'empty' }; throw "daemon session list unreadable (claude agents exit $exit, output $shape)" }
+  $cliArgs = @('agents', '--json'); if ($All) { $cliArgs += '--all' }
+  $run = $null
+  try { $run = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec 60 -Name "claude $($cliArgs -join ' ')" }
+  catch {
+    # fleet #265: a missing CLI is not an empty fleet. Strict callers fail closed with the
+    # resolver's text; tolerant ones still get @() but the cause is on the warning stream.
+    if ($Strict) { throw "daemon session list unreadable: $($_.Exception.Message)" }
+    Write-Warning "daemon session list unavailable: $($_.Exception.Message)"
+    return @()
+  }
+  $text = ($run.stdout | Out-String).Trim()
+  if ($run.startError -or $run.timedOut -or $run.exitCode -ne 0 -or -not $text) {
+    if ($Strict) {
+      $why = if ($run.startError) { "$($run.startError)" } elseif ($run.timedOut) { 'timed out' } elseif ($run.exitCode -ne 0) { "exit $($run.exitCode)" } else { 'empty' }
+      throw "daemon session list unreadable: $why ($($run.cli) agents --json$(if ($All) { ' --all' }))"
+    }
     return @()
   }
   # PS 5.1 quirk: ConvertFrom-Json emits a JSON array as ONE object; assign first so @() doesn't nest it.
@@ -380,12 +391,17 @@ function ConvertTo-ProcessArgument {
   return '"' + $escaped + '"'
 }
 function Invoke-BoundedExe {
-  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '')
+  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '', [string]$StdinText = $null)
   $result = [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = $null }
-  $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
+  $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName(); $childIn = $null
   try {
     $argLine = (@($ArgumentList) | Where-Object { $null -ne $_ } | ForEach-Object { ConvertTo-ProcessArgument "$_" }) -join ' '
     $startArgs = @{ FilePath = $FilePath; NoNewWindow = $true; PassThru = $true; RedirectStandardOutput = $childOut; RedirectStandardError = $childErr }
+    if ($null -ne $StdinText) {
+      $childIn = [IO.Path]::GetTempFileName()
+      [IO.File]::WriteAllText($childIn, $StdinText, (New-Object Text.UTF8Encoding($false)))
+      $startArgs.RedirectStandardInput = $childIn
+    }
     if ($argLine) { $startArgs.ArgumentList = $argLine }
     $p = Start-Process @startArgs
     # 2026-09-17 QA repro: .NET only latches the exit-code plumbing once something
@@ -407,9 +423,10 @@ function Invoke-BoundedExe {
     # 2026-09-18 QA (review 2, NIT): on the timeout path the just-killed process
     # can still hold its redirect handles for a moment; one short-delay retry,
     # then give up silently (never fail the tick over two leaked temp files).
-    try { Remove-Item $childOut, $childErr -ErrorAction Stop } catch {
+    $tempFiles = @($childOut, $childErr, $childIn | Where-Object { $_ })
+    try { Remove-Item $tempFiles -ErrorAction Stop } catch {
       Start-Sleep -Milliseconds 200
-      try { Remove-Item $childOut, $childErr -ErrorAction SilentlyContinue } catch {}
+      try { Remove-Item $tempFiles -ErrorAction SilentlyContinue } catch {}
     }
   }
   return $result
@@ -430,6 +447,83 @@ function Invoke-BoundedCommand {
   if (-not $exe) { return [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = "$Command not found on PATH" } }
   if (-not $Name) { $Name = "$Command $((@($ArgumentList) | Select-Object -First 2) -join ' ')" }
   return Invoke-BoundedExe -FilePath $exe -ArgumentList $ArgumentList -TimeoutSec $TimeoutSec -Name $Name
+}
+# fleet #265: the claude CLI is resolved once per process, never by a bare `& claude`.
+# The CLI auto-updates itself through `npm install -g` about twice an hour (daemon.log:
+# "binary changed, self-restarting for upgrade"), and npm deletes the package dir and the
+# bin shims before it relinks, so for some seconds `claude` exists nowhere. A bare call in
+# that window threw CommandNotFound under `2>$null` and the caller read it as an empty
+# fleet or a finished job. Resolve-ClaudeCli waits that window out and, when the CLI is
+# still absent, throws a message that names every place it looked.
+function Get-ClaudeCliKnownPaths {
+  $known = @()
+  if ($env:APPDATA) {
+    $known += "$env:APPDATA\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe"
+    $known += "$env:APPDATA\npm\claude.cmd"
+  }
+  if ($env:USERPROFILE) { $known += "$env:USERPROFILE\.local\bin\claude.exe" }
+  return @($known)
+}
+function Test-ClaudeCliCandidate {
+  param([string]$Path)
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  # A package dir half-written by npm has a claude.exe before (or after) its package.json.
+  if ($Path -match '[\\/]node_modules[\\/]') {
+    $pkgRoot = Split-Path -Parent (Split-Path -Parent $Path)
+    if (-not (Test-Path -LiteralPath (Join-Path $pkgRoot 'package.json') -PathType Leaf)) { return $false }
+  }
+  return $true
+}
+function Resolve-ClaudeCli {
+  param([switch]$NoRetry)
+  $override = $env:FLEET_CLAUDE_CLI
+  if ($override) {
+    # Never a silent fallback: a wrong override is a wrong override.
+    if (-not (Test-Path -LiteralPath $override -PathType Leaf)) {
+      $script:ClaudeCliMissing = [pscustomobject]@{ tried = @($override); waitedSec = 0 }
+      throw "FLEET_CLAUDE_CLI does not point to a claude executable: $override"
+    }
+    return $override
+  }
+  $tries = 6; $pollMs = 5000
+  if ($env:FLEET_CLAUDE_RESOLVE_TRIES -match '^\d+$') { $tries = [Math]::Max(1, [int]$env:FLEET_CLAUDE_RESOLVE_TRIES) }
+  if ($env:FLEET_CLAUDE_RESOLVE_POLL_MS -match '^\d+$') { $pollMs = [int]$env:FLEET_CLAUDE_RESOLVE_POLL_MS }
+  if ($NoRetry) { $tries = 1 }
+  $started = Get-Date
+  $known = @(Get-ClaudeCliKnownPaths)
+  for ($attempt = 1; $attempt -le $tries; $attempt++) {
+    $hit = Resolve-ExePath 'claude'
+    if ($hit) { return $hit }
+    foreach ($k in $known) { if (Test-ClaudeCliCandidate $k) { return $k } }
+    if ($attempt -lt $tries) { Start-Sleep -Milliseconds $pollMs }
+  }
+  $waited = [int][Math]::Round(((Get-Date) - $started).TotalSeconds)
+  $tried = @('PATH (claude.exe/.cmd/.bat)') + $known
+  $script:ClaudeCliMissing = [pscustomobject]@{ tried = @($tried); waitedSec = $waited }
+  $waitNote = if ($NoRetry) { 'no wait' } else { "waited ${waited}s for an in-flight npm reinstall" }
+  throw "claude CLI not found (tried: $($tried -join '; '); FLEET_CLAUDE_CLI=unset; $waitNote)"
+}
+function Get-ClaudeCliMissingJson {
+  # The JSON a script prints (exit 6) when it gives up because the CLI is absent.
+  param($Extra = $null)
+  $m = $script:ClaudeCliMissing
+  $tried = if ($m) { @($m.tried) } else { @() }
+  $waited = if ($m) { [int]$m.waitedSec } else { 0 }
+  $o = [ordered]@{ ok = $false; error = 'claude-cli-missing'; tried = $tried; envOverride = $(if ($env:FLEET_CLAUDE_CLI) { "$env:FLEET_CLAUDE_CLI" } else { $null }); waitedSec = $waited }
+  if ($Extra) { foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] } }
+  return ($o | ConvertTo-Json -Compress -Depth 6)
+}
+function Invoke-ClaudeCli {
+  # Run the claude CLI through the resolver, bounded, with stdout and stderr captured
+  # (never `2>$null`). Throws only when the CLI cannot be found; a run that fails comes
+  # back as { exitCode, stderr, timedOut, startError } for the caller to judge.
+  param([string[]]$Arguments, [int]$TimeoutSec = 60, [string]$Name = '', [string]$StdinText = $null)
+  $cli = $null
+  if ($script:ClaudeCli -and "$script:ClaudeCliOverride" -eq "$env:FLEET_CLAUDE_CLI" -and (Test-Path -LiteralPath $script:ClaudeCli -PathType Leaf)) { $cli = $script:ClaudeCli }
+  if (-not $cli) { $cli = Resolve-ClaudeCli; $script:ClaudeCli = $cli; $script:ClaudeCliOverride = "$env:FLEET_CLAUDE_CLI" }
+  if (-not $Name) { $Name = "claude $((@($Arguments) | Select-Object -First 2) -join ' ')" }
+  $r = Invoke-BoundedExe -FilePath $cli -ArgumentList $Arguments -TimeoutSec $TimeoutSec -Name $Name -StdinText $StdinText
+  return [pscustomobject]@{ cli = $cli; exitCode = $r.exitCode; stdout = "$($r.stdout)"; stderr = "$($r.stderr)"; timedOut = $r.timedOut; startError = $r.startError }
 }
 function ConvertFrom-LastJsonLine {
   param($Text)
