@@ -560,6 +560,16 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       continue;
     }
 
+    // 2b. (#263) An open proposal whose marker is gone is still awaiting the owner's Approval: Cory
+    // swapped the marker for a hold such as haiku-rehearsal, or removed it. It is not a fresh
+    // candidate: served as a ticket, `record --kind proposed` is refused with TRIAGE_PROPOSAL_OPEN
+    // and the Stop hook loops. Only the owner's Re-propose reopens it, as under the marker.
+    if (proposed) {
+      if (ownerAsksAgain) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
+      skipped.push({ number: issue.number, reason: `proposed ${proposed.at}, awaiting approval (${marker} replaced by ${labels.size ? [...labels].join(', ') : 'no label'})` });
+      continue;
+    }
+
     // 3. A fresh candidate: unrouted or carrying a triage label.
     if (!hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
     // Settled at this body: the triage is done, and a label the owner moves it to
