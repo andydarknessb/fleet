@@ -16,17 +16,25 @@ $oldProfile = $env:USERPROFILE
 
 function Run-Launch {
   param([string[]]$Arguments)
+  # A wrapper runs launch.ps1 and prints each error record's bare message, so neither PS 5.1's
+  # ErrorRecord decoration ("At <path>:..." lines, CategoryInfo) nor its console-width wrapping of
+  # those lines can split or hide the text under test. Stdout lines (the JSON refusals) pass through.
+  $wrapper = Join-Path $testRoot 'run-launch.ps1'
+  $wrapperLines = @(
+    'param([string]$Manifest, [string]$WorkRecordId, [switch]$DryRun)',
+    '$ErrorActionPreference = "Continue"',
+    '$splat = @{ Manifest = $Manifest; WorkRecordId = $WorkRecordId }; if ($DryRun) { $splat.DryRun = $true }',
+    ('& "' + $testRoot + '\bin\launch.ps1" @splat 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { "ERR: " + $_.Exception.Message } else { "$_" } }'),
+    'exit $LASTEXITCODE'
+  )
+  Write-Utf8 $wrapper ($wrapperLines -join "`r`n")
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   Push-Location $testRoot
-  # stderr goes to a file so PS 5.1 does not wrap each line in an ErrorRecord with its own decoration.
-  $errFile = Join-Path $testRoot 'launch.stderr.txt'
-  try { $out = (& powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\bin\launch.ps1" @Arguments 2> $errFile | Out-String) + ((Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue) | Out-String) }
+  try { $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $wrapper @Arguments 2>&1 | Out-String }
   finally { $script:lastExit = $LASTEXITCODE; $ErrorActionPreference = $eap; Pop-Location }
   $script:lastOut = $out
-  # PS 5.1 wraps Write-Error text at console width: compare with all whitespace removed.
-  # ...and the ErrorRecord decoration lines (CategoryInfo, At line, + ...) are dropped so a message
-  # split across two of them reads whole.
-  $script:lastFlat = (($out -split "`r?`n" | Where-Object { $_ -notmatch 'CategoryInfo|FullyQualifiedErrorId|^\s*At [A-Za-z]:|^\s*\+ |powershell\.exe :' }) -join '') -replace '\s+', ''
+  # Long lines can still wrap in the captured text: compare with whitespace removed.
+  $script:lastFlat = $out -replace '\s+', ''
   $jsonLine = ($out -split "`n" | Where-Object { $_.Trim().StartsWith('{') } | Select-Object -Last 1)
   try { return $jsonLine | ConvertFrom-Json } catch { return $null }
 }
@@ -105,8 +113,10 @@ try {
   Assert-True ($lastFlat -notmatch 'releasealsofailed') 'a release that worked adds no failure note'
 
   # Case 2: relaunching the released manifest is refused as invalidated (the marker), never a second release.
+  $markerBefore = Get-Content "$m21.invalidated.json" -Raw
   [void](Run-Launch @('-Manifest', $m21, '-WorkRecordId', 'test:issue-21'))
   Assert-True ($lastExit -eq 4 -and $lastFlat -match 'wasinvalidated') "a released manifest is refused as invalidated: $lastOut"
+  Assert-True ((Get-Content "$m21.invalidated.json" -Raw) -eq $markerBefore) 'a replayed launch must not overwrite the original invalidation marker'
 
   # Case 3: the release itself fails (the manifest's revision is stale), and the refusal still reads
   # as the gh failure with the release failure appended; the record stays assigned, no marker.
@@ -142,8 +152,9 @@ try {
   # Case 6: a dry run never releases, even when it refuses.
   $m25 = Reserve-Manifest 25 $baseSha
   Write-Utf8 "$testRoot\state\PAUSE" 'test pause'
-  [void](Run-Launch @('-Manifest', $m25, '-WorkRecordId', 'test:issue-25', '-DryRun'))
+  $r6 = Run-Launch @('-Manifest', $m25, '-WorkRecordId', 'test:issue-25', '-DryRun')
   Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  Assert-True ($lastExit -eq 3 -and $r6 -and $r6.launched -eq $false -and "$($r6.reason)" -match 'PAUSE set') "the dry run must still be refused by PAUSE (exit 3, PAUSE reason), so the no-release check is not vacuous: exit $lastExit $lastOut"
   Assert-True ((Get-RecordState 25) -eq 'assigned' -and -not (Get-Marker $m25)) 'a dry run must not release the reservation'
 
   Write-Output 'launch refusal release tests passed'

@@ -80,8 +80,8 @@ $exitRows = @(
   @{ Anchor = 'was not found'; Decision = 'keep' }                              # manifest unreadable: no record id to release
   @{ Anchor = 'is not pending acknowledgment'; Decision = 'keep' }              # acknowledged, invalidated or unreadable: not ours
   @{ Anchor = 'does not match -WorkRecordId'; Decision = 'keep' }               # caller named another record
+  @{ Anchor = 'was invalidated'; Decision = 'keep' }                            # already released (checked first so a replayed release never overwrites the marker)
   @{ Anchor = 'no tenant file for'; Nth = 1; Decision = 'release' }             # the manifest's tenant has no file
-  @{ Anchor = 'was invalidated'; Decision = 'keep' }                            # already released
   @{ Anchor = 'no static roster entry'; Decision = 'keep' }                     # -FromRoster is not a manifest launch
   @{ Anchor = 'missing -\$req'; Decision = 'release' }
   @{ Anchor = 'does not match the fleet naming scheme'; Decision = 'release' }
@@ -102,7 +102,7 @@ $exitRows = @(
   @{ Anchor = 'issue #\$Issue changed after'; Decision = 'release' }
   @{ Anchor = 'criteria changed after'; Decision = 'release' }
   @{ Anchor = 'PAUSE set'; Decision = 'release' }
-  @{ Anchor = 'refusing to launch, fail closed'; Decision = 'release' }
+  @{ Anchor = 'refusing to launch, fail closed'; Decision = 'keep' }            # a failed daemon read cannot tell whether a session exists
   @{ Anchor = 'is already running; use claude respawn'; Decision = 'keep' }     # a live session may own this reservation
   @{ Anchor = 'suspected bad read'; Decision = 'keep' }
   @{ Anchor = 'cap reached'; Decision = 'release' }

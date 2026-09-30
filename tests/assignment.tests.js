@@ -145,6 +145,56 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
 });
 
+test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 120 s (fleet#256)', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root,
+    issue: issue(44),
+    tenant: 'endzone',
+    tenantConfig: { branchPrefix: 'fleet/', defaultBranch: 'integration' },
+    readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) },
+    parent: 'pl-endzone',
+    model: 'sonnet',
+    risk: 'standard',
+    tokenBudget: 25000,
+    contextHeadings: [],
+    adrPaths: [],
+    testPlan: [],
+    ciGates: [],
+    now: '2026-09-01T00:00:00.000Z',
+  });
+  const manifest = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'));
+  // A stub launcher that refuses the way launch.ps1 does: JSON refusal on stdout, noise on stderr, exit 3.
+  const stub = path.join(root, 'stub-launch.js');
+  fs.writeFileSync(stub, [
+    "const nl = String.fromCharCode(10);",
+    "process.stdout.write('some chatter' + nl + JSON.stringify({ launched: false, reason: 'cap reached (6/6)', reservationReleased: false, releaseError: 'release failed for Work record x' }) + nl);",
+    "process.stderr.write('stub stderr');",
+    "process.exit(3);",
+  ].join(String.fromCharCode(10)));
+  let seen = null;
+  const { execFileSync } = require('node:child_process');
+  const runner = (cmd, args, opts) => { seen = opts; return execFileSync(process.execPath, [stub], opts); };
+  assert.throws(
+    () => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner }),
+    (error) => {
+      assert.equal(error.code, 'LAUNCH_FAILED');
+      assert.match(error.message, /launch refused: cap reached \(6\/6\)/);
+      assert.match(error.message, /reservationReleased=false/);
+      assert.match(error.message, /releaseError=release failed for Work record x/);
+      assert.match(error.message, /stub stderr/);
+      assert.equal(error.refusal.reason, 'cap reached (6/6)');
+      assert.equal(error.exitCode, 3);
+      return true;
+    },
+  );
+  assert.equal(seen.timeout, 120000, 'a timeout kill between claude --bg and the roster write strands a session, so the budget covers the no-session poll, gh, fetch and worktree add');
+  // With no JSON on stdout the error still says something (the exec error), never an empty message.
+  const bare = () => { const e = new Error('Command failed: stub'); e.status = 1; e.stdout = ''; e.stderr = ''; throw e; };
+  assert.throws(() => launchReservedAssignment({ manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, runner: bare }), (error) => error.code === 'LAUNCH_FAILED' && /Command failed: stub/.test(error.message));
+});
+
 test('changed criteria invalidate the manifest and release reservations', () => {
   const root = rootDir();
   const result = reserveAssignment({

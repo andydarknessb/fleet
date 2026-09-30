@@ -66,7 +66,7 @@ if ($Manifest) {
   # no release: a manifest that cannot be read names no Work record, so there is nothing this script can release.
   if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Write-Error "manifest '$Manifest' was not found"; exit 4 }
   $assignment = Read-Json $Manifest
-  # no release: a manifest that is not pending-ack was already acknowledged (a session owns the record), already invalidated (released) or is unreadable; none of those is ours to release.
+  # no release: the manifest's status is immutable 'pending-ack' (acknowledgment and invalidation are sidecar files, checked below), so this only catches an unreadable or malformed manifest, which names no record we could release.
   if (-not $assignment -or $assignment.status -ne 'pending-ack') { Write-Error "manifest '$Manifest' is not pending acknowledgment"; exit 4 }
   # no release: -WorkRecordId names a different record than this manifest reserved. That is the caller's mistake, a release on it would be a guess, and the reservation stays valid for a correct launch.
   if ($WorkRecordId -and $assignment.workRecordId -ne $WorkRecordId) { Write-Error "manifest Work record does not match -WorkRecordId"; exit 4 }
@@ -86,11 +86,11 @@ if ($Manifest) {
   # MODULE_NOT_FOUND and retried through PowerShell). node accepts either separator on Windows.
   $fleetHomeFwd = $FleetHome -replace '\\', '/'
   $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest and the GitHub issue body and comments. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $fleetHomeFwd/bin/assignment.js ack), then follow the manifest pointers without restating the issue criteria."
+  # no release: the invalidation marker is the record of an earlier release; there is nothing left to release. Checked before the tenant file so a replayed release never overwrites the original marker.
+  if (Test-Path -LiteralPath "$Manifest.invalidated.json") { Write-Error "manifest '$Manifest' was invalidated"; exit 4 }
   $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $tenantConfig) { $r = Release-ReservationOnRefusal "launch refused: no tenant file for '$Tenant'"; Write-Error "no tenant file for '$Tenant'$($r.note)"; exit 4 }
   $cwd = $tenantConfig.repo
-  # no release: the invalidation marker is the record of an earlier release; there is nothing left to release.
-  if (Test-Path -LiteralPath "$Manifest.invalidated.json") { Write-Error "manifest '$Manifest' was invalidated"; exit 4 }
 }
 if ($FromRoster) {
   $e = $static.sessions | Where-Object { $_.name -eq $FromRoster }
@@ -252,8 +252,8 @@ if ((Test-Paused) -and -not $Force) {
 $daemon = $null
 try { $daemon = Get-DaemonSessions -Strict } catch {
   $failClosedReason = "refusing to launch, fail closed: $($_.Exception.Message)"
-  $r = Release-ReservationOnRefusal "launch refused: $failClosedReason"
-  Write-Output (@{ launched = $false; reason = $failClosedReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
+  # no release: a failed daemon read cannot tell whether a session named for this reservation exists, so it is the same unknown as the suspected-bad-read guard below and keeps the reservation; the stranded-reservation sweep (fleet#253) releases it later if no session ever acknowledges.
+  Write-Output (@{ launched = $false; reason = $failClosedReason } | ConvertTo-Json -Compress); exit 3
 }
 $fleetNames = Get-FleetNames -Live $live -Static $static
 $liveFleet = @($daemon | Where-Object { $fleetNames -contains $_.name })
@@ -558,7 +558,7 @@ if ($Manifest) {
   if ($LASTEXITCODE -ne 0 -or $resolvedBase -ne $expectedBase) { $r = Release-ReservationOnRefusal "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; Write-Error "manifest base precondition changed (expected $expectedBase, found $resolvedBase)$($r.note)"; exit 4 }
   $worktreeParent = Join-Path $cwd '.claude\worktrees'
   $worktreePath = Join-Path $worktreeParent "$Name-assignment"
-  # no release: a worktree already at this path is an earlier launch's, and its session may still be about to acknowledge; the operator or the janitor removes it. Releasing here would only re-offer the issue into an assign, launch, refuse loop that fails at this line every time (the reservation is what keeps the planner from doing that).
+  # no release: a worktree already at this path is an earlier launch's. The duplicate-name and job-state guards above already said no ic-N session is live, so nothing is about to acknowledge and nothing here removes it: the janitor never removes the worktree of an open issue whose record is assigned or absent, so an operator must remove it. Releasing here would only re-offer the issue into an assign, launch, refuse loop that fails at this line every time (the reservation is what keeps the planner from doing that).
   if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
   New-Item -ItemType Directory -Force $worktreeParent | Out-Null
   & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
