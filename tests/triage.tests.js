@@ -550,6 +550,46 @@ test('#268: an escalation on an issue with an open proposal is served carrying t
   assert.equal('openProposal' in decided.eligible.find((row) => row.kind === 'escalation'), false);
 });
 
+test('#268: an escalation the open proposal already answers is marked answered, not openProposal; the wake it never reached still carries openProposal', () => {
+  const root = rootDir();
+  const hash = triage.normalizeIssue(issue(7, { body: OPEN_BODY })).bodyHash;
+  // Proposed after the wake (20th), recorded against it: the proposal IS the answer.
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/answer', model: 'fable', recordId: WAKE.recordId, now: '2026-09-21T00:00:00.000Z' });
+  const at = { entries: readLedger(root, 'endzone'), now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET, outbox: [WAKE] };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-22T00:00:00.000Z');
+  for (const labels of [['triage-proposed'], ['haiku-rehearsal'], []]) {
+    const result = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:escalation'], `labels [${labels}]`);
+    assert.deepEqual(result.eligible[0].answered, { commentUrl: 'https://x/answer', at: '2026-09-21T00:00:00.000Z' });
+    assert.equal('openProposal' in result.eligible[0], false);
+  }
+  // What the Principal does with an answered item: consumed through the wake, nothing else.
+  recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: WAKE.at, recordId: WAKE.recordId, now: '2026-09-25T00:00:00.000Z' });
+  assert.deepEqual(frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'], comments: [cross] })], { ...at, entries: readLedger(root, 'endzone') }).eligible, []);
+  // An older proposal with the same constant recordId (the id is per issue) is not the answer to a newer wake.
+  const old = rootDir();
+  recordEntry({ root: old, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/old', model: 'fable', recordId: WAKE.recordId, now: '2026-09-10T00:00:00.000Z' });
+  const older = frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'] })], { ...at, entries: readLedger(old, 'endzone') });
+  assert.equal(older.eligible[0].openProposal.commentUrl, 'https://x/old');
+  assert.equal('answered' in older.eligible[0], false);
+});
+
+test('#268: an escalation for an issue replaces any ticket or reproposal for the same issue on the frontier', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET, outbox: [WAKE] };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const ask = comment(OWNER, 'Re-propose: scope moved.', '2026-09-13T00:00:00.000Z');
+  for (const [labels, body, comments] of [[['triage-proposed'], `${OPEN_BODY}More.
+`, [cross]], [['haiku-rehearsal'], `${OPEN_BODY}More.
+`, [cross]], [['haiku-rehearsal'], OPEN_BODY, [cross, ask]]]) {
+    const result = frontier([issue(7, { body, labels, comments }), issue(8, { labels: ['needs-triage'] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:escalation', '8:ticket'], `labels [${labels}]`);
+    assert.deepEqual(result.proposeNow, [8], 'the dropped item does not spend the proposal cap');
+    assert.equal(result.counts.tickets, 1);
+    assert.equal(principalCanRecord(world, result.eligible[0]), true);
+  }
+});
+
 test('#263/#268: no ticket, reproposal or escalation the frontier emits for an open-proposal issue is refused by record --kind proposed', () => {
   const world = openProposalWorld();
   const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };

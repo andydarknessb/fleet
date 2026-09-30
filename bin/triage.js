@@ -617,10 +617,15 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     const issue = issueByNumber.get(Number(parsed.issue)) || null;
     // #268: an escalation is a decision the Principal must see, served even when the issue has an open
     // proposal. `record --kind proposed` would be refused with TRIAGE_PROPOSAL_OPEN, so the item carries
-    // the proposal it replaces and the Principal records `superseded` first.
+    // the proposal it replaces and the Principal records `superseded` first. A proposal made AFTER the
+    // wake and recorded against it (the recordId is per issue, so the time decides) already answers it:
+    // the item says `answered` and the Principal only records `consumed`.
     const openRow = projection.byIssue[parsed.issue] || null;
-    const openProposal = openRow && openRow.proposed && !openRow.outcome ? { commentUrl: openRow.proposed.commentUrl || null, bodyHash: openRow.proposed.bodyHash || null, at: openRow.proposed.at } : null;
-    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, ...(openProposal ? { openProposal } : {}), reason: 'decision-needed wake newer than the consumed marker' });
+    const open = openRow && openRow.proposed && !openRow.outcome ? openRow.proposed : null;
+    const answers = open && String(open.at) > String(record.at) && open.recordId && open.recordId === String(record.recordId);
+    const openProposal = open && !answers ? { commentUrl: open.commentUrl || null, bodyHash: open.bodyHash || null, at: open.at } : null;
+    const answered = answers ? { commentUrl: open.commentUrl || null, at: open.at } : null;
+    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, ...(openProposal ? { openProposal } : {}), ...(answered ? { answered } : {}), reason: 'decision-needed wake newer than the consumed marker' });
   }
 
   // Spec fleet #92 (#143): the backfill census. Open issues carrying the ready
@@ -637,6 +642,9 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   approvals.sort((left, right) => left.at.localeCompare(right.at));
   vetoes.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
+  // #268: an escalation carries the issue's proposal context, so a ticket or reproposal for the same issue is not also served.
+  const escalated = new Set(escalationList.map((item) => Number(item.number)));
+  for (let index = tickets.length - 1; index >= 0; index -= 1) if (escalated.has(Number(tickets[index].number))) tickets.splice(index, 1);
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
