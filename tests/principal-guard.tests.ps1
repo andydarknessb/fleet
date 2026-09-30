@@ -12,6 +12,9 @@ $sourceRoot = Split-Path -Parent $PSScriptRoot
 $hook = "$sourceRoot\hooks\principal-guard.ps1"
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-principal-guard-test-" + [guid]::NewGuid().ToString('N'))
 $saved = @{}
+# Claude Code writes the payload as UTF-8; the harness must too (the default pipe encoding is ASCII, which turns
+# a BOM or an accented letter into a ?).
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 foreach ($v in 'FLEET_HOME','FLEET_ROLE','FLEET_TENANT','USERPROFILE') { $saved[$v] = [Environment]::GetEnvironmentVariable($v) }
 
 function Run-Guard {
@@ -244,6 +247,86 @@ try {
   Assert-Allowed (Run-Guard -Role ic -Tool PowerShell -ToolInput (Bash '$b = "Approved: not a comment"; gh issue create --title x --body $b')) 'a PowerShell variable body on gh issue create (not a comment)'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 --body="Not approved: the scope misses the caption"')) 'an =-joined body that does not begin with the words'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api graphql -f query=''mutation { addSubIssue(input: {issueId: "I_x", subIssueId: "I_y"}) { clientMutationId } }''')) 'a GraphQL mutation that adds no comment'
+  # fleet#229, Opus QA round. The hook must stay pure ASCII: Windows PowerShell 5.1 reads a BOM-less script in the
+  # ANSI code page, so a literal U+FEFF in a regex would silently become three other characters (the BOM cases
+  # above then pass only because the harness degraded the BOM to a ?).
+  Assert-True (@([IO.File]::ReadAllBytes($hook) | Where-Object { $_ -gt 127 }).Count -eq 0) 'hooks/principal-guard.ps1 must be pure ASCII (use the regex escape for the BOM, never the character)'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "?Approved: a literal question mark is not an Approval"')) 'a literal ? before Approved is not an Approval'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 -b `"$([char]0xE9)t$([char]0xE9): Approved later`"")) 'an accented body that does not begin with the words'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 -b `"Approved $([char]0x2014) caf$([char]0xE9)`"")) 'a non-ASCII body that begins with Approved' 'owner'
+  # A comment call nested in a substitution, subshell, backticks or an assignment is still a comment (the old
+  # splitter cut at parentheses; the tokenizer opens a nested unit instead).
+  $bt = [string][char]96
+  foreach ($case in @(
+    @('Bash',       'out=$(gh issue comment 5 -b "Approved")',                       'a command substitution'),
+    @('Bash',       'echo $(gh issue comment 5 -b "Approved")',                      'a command substitution as an argument'),
+    @('Bash',       ('url=' + $bt + 'gh issue comment 5 -b "Approved"' + $bt),       'backticks'),
+    @('Bash',       'echo x; (gh issue comment 5 -b "Approved")',                    'a subshell'),
+    @('PowerShell', '[void](gh issue comment 5 -b "Approved")',                      'a [void] cast'),
+    @('PowerShell', 'Write-Output (gh issue comment 5 -b "Approved")',               'a parenthesised argument'),
+    @('PowerShell', '$url = gh issue comment 5 -b "Approved"',                       'an assignment'),
+    @('PowerShell', '$null = gh issue comment 5 -b "Approved"',                      'a $null assignment'),
+    @('PowerShell', 'gh issue comment 5 --title (Get-Date) -b "Approved"',           'a parenthesised argument before the body flag'),
+    @('Bash',       "ls # it's fine`ngh issue comment 5 -b `"Approved`"",            'an apostrophe inside a Bash # comment'),
+    @('Bash',       "# don't forget`ngh issue comment 5 -b `"Approved`"",            'an apostrophe in a leading # comment'),
+    @('PowerShell', "# don't forget`ngh issue comment 5 -b `"Approved`"",            'an apostrophe in a PowerShell # comment'),
+    @('PowerShell', "<# it's a block #> gh issue comment 5 -b `"Approved`"",         'an apostrophe in a PowerShell block comment'),
+    @('Bash',       "gh issue comment 5 -b \`n  `"Approved`"",                       'a Bash backslash-newline between the flag and the value'),
+    @('Bash',       "gh issue comment 5 \`n  --body `"Approved`"",                   'a Bash backslash-newline between arguments'),
+    @('Bash',       "gh issue comm\`nent 5 -b `"Approved`"",                         'a Bash backslash-newline inside the subcommand'),
+    @('Bash',       "gh issue comment 5 \`r`n  -b `"Approved`"",                     'a Bash backslash-CRLF'),
+    @('PowerShell', "gh issue comment 5 $bt`n  -b `"Approved`"",                     'a PowerShell backtick continuation'),
+    @('PowerShell', 'gh issue comment 5 -b "`nApproved"',                            'a PowerShell `n escape before the word'),
+    @('PowerShell', 'gh issue comment 5 -b "`t`rVeto"',                              'PowerShell `t and `r escapes before the word'),
+    @('Bash',       'time gh issue comment 5 -b "Approved"',                         'a time wrapper'),
+    @('Bash',       'nice -n 5 gh issue comment 5 -b "Approved"',                    'a nice wrapper'),
+    @('Bash',       'winpty gh issue comment 5 -b "Approved"',                       'a winpty wrapper'),
+    @('Bash',       'echo 5 | xargs gh issue comment 5 -b "Approved"',               'an xargs wrapper'),
+    @('Bash',       'env -S "gh issue comment 5 -b Approved"',                       'env -S with a command line'),
+    @('Bash',       'env FOO=1 -S ''gh issue comment 5 -b Veto''',                   'env -S after an assignment')
+  )) {
+    Assert-Denied (Run-Guard -Role ic -Tool $case[0] -ToolInput (Bash $case[1])) "fleet#229 QA: $($case[2])" 'owner'
+  }
+  # A body file the Bash tool names the way Bash does (/tmp/x, /c/Users/x) is opened; a body with a lone $ is inspectable.
+  $tmpName = "fleet229-$([guid]::NewGuid().ToString('N')).md"
+  $tmpFile = Join-Path ([IO.Path]::GetTempPath()) $tmpName
+  $posix = '/' + $tmpFile.Substring(0, 1).ToLower() + ($tmpFile.Substring(2) -replace '\\', '/')
+  Write-Utf8 $tmpFile "Approved: from the temp directory`n"
+  foreach ($spelling in @("--body-file /tmp/$tmpName", "--body-file=/tmp/$tmpName", "-F /tmp/$tmpName", "--body-file $posix")) {
+    Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 $spelling")) "fleet#229 QA: a Bash-style path is read: $spelling" 'owner'
+  }
+  Write-Utf8 $tmpFile "Ruling: the lead agrees`n"
+  foreach ($spelling in @("--body-file /tmp/$tmpName", "--body-file=/tmp/$tmpName", "--body-file $posix")) {
+    Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 $spelling")) "fleet#229 QA: a readable Bash-style path that is not an Approval passes: $spelling"
+  }
+  Remove-Item -LiteralPath $tmpFile -Force
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "Price is 5$ flat"')) 'a lone $ is not an expansion'
+  # A BOM-less UTF-8 body file that starts with NBSP or U+3000 is read as UTF-8 and matched.
+  Write-Utf8 "$testRoot\nbsp-body.md" ([string][char]0xA0 + "Approved: x`n")
+  Write-Utf8 "$testRoot\ideo-body.md" ([string][char]0x3000 + "Veto: x`n")
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body-file $testRoot\nbsp-body.md")) 'fleet#229 QA: an NBSP-prefixed body file' 'owner'
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body-file $testRoot\ideo-body.md")) 'fleet#229 QA: a U+3000-prefixed body file' 'owner'
+  # More uninspectable shapes, and the cosmetic: the could-not-open refusal shows the path as written.
+  Write-Utf8 "$testRoot\query-add.graphql" 'mutation { addComment(input: {subjectId: "I_x", body: "Approved"}) { clientMutationId } }'
+  Write-Utf8 "$testRoot\query-read.graphql" 'query { viewer { login } }'
+  foreach ($case in @(
+    @('Bash',       'gh api "$EP" -f body=Approved',                                                      'a body field on an api call whose endpoint is a variable'),
+    @('Bash',       'gh api $(printf repos/o/r/issues/5/comm; echo ents) -f body=Approved',               'a body field on an api call whose endpoint is a substitution'),
+    @('Bash',       'gh api graphql -f query="$Q"',                                                       'a GraphQL query held in a variable'),
+    @('Bash',       "gh api graphql -F query=@$testRoot\query-add.graphql",                               'a GraphQL query file that adds a comment'),
+    @('Bash',       "gh api graphql -F query=@$testRoot\missing.graphql",                                 'a GraphQL query file the guard cannot open'),
+    @('Bash',       'gh api graphql -f query=''mutation { updateIssueComment(input: {id: "x", body: "Approved"}) { clientMutationId } }''', 'a GraphQL updateIssueComment mutation'),
+    @('Bash',       'gh api graphql -f query=''mutation { addPullRequestReview(input: {pullRequestId: "x", body: "Approved"}) { clientMutationId } }''', 'a GraphQL addPullRequestReview mutation'),
+    @('PowerShell', 'gh --% issue comment 5 -b Approved',                                                 'the PowerShell stop-parsing token')
+  )) {
+    $refusal = Run-Guard -Role ic -Tool $case[0] -ToolInput (Bash $case[1])
+    Assert-Denied $refusal "fleet#229 QA uninspectable: $($case[2])" 'cannot inspect'
+    Assert-True ("$($refusal.permissionDecisionReason)" -match '--body-file <path>') "fleet#229 QA uninspectable: $($case[2]): the refusal must name the fix"
+  }
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh api graphql -F query=@$testRoot\query-read.graphql")) 'a GraphQL query file that reads only'
+  Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api graphql -f query=''query { viewer { login } }''')) 'a single-quoted GraphQL read query'
+  $missing = Run-Guard -Role ic -Tool Bash -ToolInput (Bash "gh issue comment 5 --body-file $testRoot\missing-body.md")
+  Assert-True ("$($missing.permissionDecisionReason)".Contains("$testRoot\missing-body.md")) 'fleet#229 QA: the could-not-open refusal shows the path with its backslashes'
   Assert-Allowed (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite for an IC (not the Principal''s rule)'
   Assert-Allowed (Run-Guard -Role project-lead -Tool Write -ToolInput (WriteTo "$repo\src\x.js")) 'a lead Write (the door denies it, not this hook)'
 
