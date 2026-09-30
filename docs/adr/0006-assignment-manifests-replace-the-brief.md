@@ -95,7 +95,11 @@ Mechanism landed; the flag flip is Cory's hand after the gate, as for 08b.
   (fail closed) and files one `assignment-planner-failed` escalation;
   `launch.ps1` refuses an IC launch without `-Manifest` (`-Force` and
   `-DryRun` still pass) and releases a manifest's reservation when its launch
-  produces no session, so a failed launch never pins the issue as `reserved`. The session-start hook prints the
+  produces no session, so a failed launch never pins the issue as `reserved`. The same holds for
+  every refusal after the reservation exists (fleet#256): a gh or fetch failure, a gate (PAUSE, cap, maxIcs),
+  a changed issue or base. The exits that keep the reservation say why in a `# no release:` comment (the
+  record is not `assigned`, a live session may own it, the manifest is already invalidated), and a release
+  that fails never replaces the refusal reason. The session-start hook prints the
   manifest, Work record, and the acknowledgment command with the record's
   current revision. Manifest launches prompt with
   `/mattpocock-skills:implement` so the IC runs the real `/implement`.
