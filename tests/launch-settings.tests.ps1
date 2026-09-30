@@ -181,7 +181,7 @@ exit $LASTEXITCODE
   [IO.Directory]::CreateDirectory("$testRoot\state\manifests") | Out-Null
   $manifestPath = "$testRoot\state\manifests\assignment-test-issue-77.json"
   Write-Utf8 $manifestPath ('{"schemaVersion":1,"id":"assignment-test-issue-77","status":"pending-ack","workRecordId":"test:issue-77","workRecordRevision":1,"issue":{"number":77,"bodyHash":"x","criteriaHash":"y"},"base":{"remote":"origin","ref":"integration","sha":"' + ('a' * 40) + '"},"branch":"fleet/77-x","tenant":"test","parent":"pl-test","model":"haiku","permissions":"allowlist"}')
-  Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-77":{"id":"test:issue-77","state":"assigned","issue":77,"manifestPath":"m77"}}}'
+  Write-Utf8 "$testRoot\state\work\active.json" '{"records":{"test:issue-77":{"id":"test:issue-77","state":"assigned","revision":1,"issue":77,"manifestPath":"m77"}}}'
   $profile = Get-Content "$sourceRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
   # #165: this root stands in for the fleet after a clean verdict on 2.1.282, whatever
   # version the checked-in profile records.
