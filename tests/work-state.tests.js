@@ -273,6 +273,101 @@ test('release refuses an assigned record that is not an untouched assignment res
   );
 });
 
+// fleet#227 (endzone #1749): a record abandoned and then re-reserved holds a new
+// attempt that is only a reservation, but the old lineage (work-created, escalation,
+// abandonment) used to disqualify it, so neither door could end it. Release reads the
+// current attempt, the events after the last assignment-reserved, exactly as abandon does.
+test('release accepts a re-reserved record whose earlier attempt was touched and abandoned', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1749';
+  const first = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-a', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-a', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, first.revision, 'escalated', 'escalate-1749', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1749', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-b', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-b', now: '2026-09-28T11:00:00.000Z' });
+  assert.equal(second.record.state, 'assigned');
+
+  assert.throws(
+    () => abandonRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'abandon-1749-b', reason: 'no work ran' }),
+    (error) => error.code === 'INVALID_ABANDON' && /must be released/.test(error.message),
+    'the untouched re-reservation is releasable, not abandonable',
+  );
+  const released = releaseRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'release-1749', now: '2026-09-28T11:00:05.000Z' });
+  assert.equal(released.record.state, 'released');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'releases', 'work-endzone_issue-1749.json')), true);
+});
+
+test('release refuses a re-reserved record once its current attempt is touched, and abandon accepts it', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1750';
+  const first = reserveRecord({ root, id, tenant: 'endzone', issue: 1750, manifestPath: 'm1750-a', reservations: { components: ['src/a'] }, idempotencyKey: 'reserve-1750-a', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, first.revision, 'escalated', 'escalate-1750-a', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1750-a', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1750, manifestPath: 'm1750-b', reservations: { components: ['src/a'] }, idempotencyKey: 'reserve-1750-b', now: '2026-09-28T11:00:00.000Z' });
+  // Touch the current attempt while leaving the record `assigned`: escalate, then resolve back.
+  const escalated = move(root, id, second.revision, 'escalated', 'escalate-1750-b', 'needs a ruling', '2026-09-28T11:00:05.000Z');
+  const back = move(root, id, escalated.revision, 'assigned', 'resolve-1750-b', 'ruled', '2026-09-28T11:00:10.000Z');
+  assert.equal(back.record.state, 'assigned');
+
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: back.revision, idempotencyKey: 'release-1750' }),
+    (error) => error.code === 'INVALID_RELEASE' && /untouched reservation/.test(error.message),
+  );
+  const abandoned = abandonRecord({ root, id, expectedRevision: back.revision, idempotencyKey: 'abandon-1750-b', reason: 'worker ended', now: '2026-09-28T12:00:00.000Z' });
+  assert.equal(abandoned.record.state, 'abandoned');
+});
+
+test('a first-attempt reservation still releases, and a touched first attempt still refuses release', () => {
+  const root = rootDir();
+  const untouched = reserveRecord({ root, id: 'endzone:issue-1751', tenant: 'endzone', issue: 1751, manifestPath: 'm1751', reservations: { components: ['src/b'] }, idempotencyKey: 'reserve-1751', now: '2026-09-28T10:00:00.000Z' });
+  assert.equal(releaseRecord({ root, id: 'endzone:issue-1751', expectedRevision: untouched.revision, idempotencyKey: 'release-1751', now: '2026-09-28T10:00:05.000Z' }).record.state, 'released');
+
+  const id = 'endzone:issue-1752';
+  const touched = reserveRecord({ root, id, tenant: 'endzone', issue: 1752, manifestPath: 'm1752', reservations: { components: ['src/c'] }, idempotencyKey: 'reserve-1752', now: '2026-09-28T10:01:00.000Z' });
+  const escalated = move(root, id, touched.revision, 'escalated', 'escalate-1752', 'needs a ruling', '2026-09-28T10:01:05.000Z');
+  const back = move(root, id, escalated.revision, 'assigned', 'resolve-1752', 'ruled', '2026-09-28T10:01:10.000Z');
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: back.revision, idempotencyKey: 'release-1752' }),
+    (error) => error.code === 'INVALID_RELEASE' && /untouched reservation/.test(error.message),
+  );
+});
+
+// fleet#227 (QA on PR #250): the reuse proof for a released record had the same
+// whole-lineage flaw, so a re-reserved record released through the new door could
+// never be reserved again (RELEASE_NOT_REUSABLE / RECORD_RELEASED). The real #1749
+// lineage: 1 work-created, 2 state-escalated, 3 assignment-abandoned, 4 assignment-reserved.
+test('a re-reserved record released after an earlier touched attempt can be reserved again', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1749';
+  createRecord({ root, id, tenant: 'endzone', issue: 1749, state: 'assigned', idempotencyKey: 'create-1749', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, 1, 'escalated', 'escalate-1749', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1749', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-b', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-b', now: '2026-09-28T11:00:00.000Z' });
+  assert.equal(second.eventSequence, 4);
+  const released = releaseRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'release-1749', now: '2026-09-28T11:00:05.000Z' });
+  assert.equal(released.eventSequence, 5);
+
+  assert.deepEqual(reservationBaseline({ root, id }), { revision: released.revision + 1, eventSequence: released.eventSequence + 1, reused: true });
+  const third = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-c', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-c', now: '2026-09-28T12:00:00.000Z' });
+  assert.equal(third.record.state, 'assigned');
+  assert.equal(third.revision, released.revision + 1);
+  assert.deepEqual(readEvents(root).filter((event) => event.recordId === id).map((event) => event.sequence), [1, 2, 3, 4, 5, 6]);
+});
+
+// fleet#227 (QA on PR #250, low): release and abandon are exact complements. A record
+// reserved with github.prNumber set is not an untouched reservation, so release refuses
+// it; abandon must then accept it instead of also refusing "must be released".
+test('an assigned reservation that carries a PR number is abandonable when it cannot be released', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1754';
+  const reserved = reserveRecord({ root, id, tenant: 'endzone', issue: 1754, manifestPath: 'm1754', github: { issueNumber: 1754, prNumber: 9 }, reservations: { components: ['src/e'] }, idempotencyKey: 'reserve-1754', now: '2026-09-28T10:00:00.000Z' });
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-1754' }),
+    (error) => error.code === 'INVALID_RELEASE',
+  );
+  const abandoned = abandonRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'abandon-1754', reason: 'carries a PR', now: '2026-09-28T10:05:00.000Z' });
+  assert.equal(abandoned.record.state, 'abandoned');
+});
+
 test('an escalated touched assignment can be abandoned and reserved again with a fresh lineage step', () => {
   const root = rootDir();
   const id = 'endzone:issue-1136';

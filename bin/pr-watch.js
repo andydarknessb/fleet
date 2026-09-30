@@ -102,8 +102,21 @@ function bodyDigest(body) {
   return crypto.createHash('sha1').update(String(body || '')).digest('hex').slice(0, 12);
 }
 
+// The one definition of the closing-linkage tag prefix: the escalation writer
+// (closingLinkageTag) and the escalated-state resolve check (isClosingLinkageEscalation)
+// both build on it, so the resolve keys on exactly what the watcher wrote (#221).
+const CLOSING_LINKAGE_TAG_PREFIX = `${WATCHER_MARK} closing-linkage body=`;
+
 function closingLinkageTag(viewPr) {
-  return `${WATCHER_MARK} closing-linkage body=${bodyDigest(viewPr?.body)}`;
+  return `${CLOSING_LINKAGE_TAG_PREFIX}${bodyDigest(viewPr?.body)}`;
+}
+
+// #221: only a closing-linkage escalation is resolved by linkage appearing. A third
+// send-back (#118), a closed-without-merge, or any other watcher-marked escalation is
+// the lead's or owner's decision and stands. Containment, not prefix: transition
+// evidence carries a `wake:<kind>; ` prefix.
+function isClosingLinkageEscalation(record) {
+  return String(record?.decisionEvidence || '').includes(CLOSING_LINKAGE_TAG_PREFIX);
 }
 
 function closingLinkageRuled(record, viewPr) {
@@ -221,7 +234,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
     if (!openPr && String(viewPr.state).toUpperCase() === 'MERGED') {
       return { actions: mergedChain(escalatedHopsTo(record.prior_state, 'merged'), viewPr, prNumber, 'escalation resolved by an observed merge', { formalReviewMissing: reviewMissing, issue: record.issue, repo }) };
     }
-    if (livePr && closingLinkage(viewPr, record.issue, repo) !== 'none') {
+    if (livePr && isClosingLinkageEscalation(record) && closingLinkage(viewPr, record.issue, repo) !== 'none') {
       const back = record.prior_state && record.prior_state !== 'escalated' ? record.prior_state : 'ci-wait';
       return {
         actions: [{
@@ -769,6 +782,6 @@ if (require.main === module) {
 
 module.exports = {
   evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
-  stableStringify, closingLinked, closingLinkage, closingLinkageTag, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
+  stableStringify, closingLinked, closingLinkage, closingLinkageTag, CLOSING_LINKAGE_TAG_PREFIX, isClosingLinkageEscalation, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
   cli, FLAGS, PrWatchError,
 };

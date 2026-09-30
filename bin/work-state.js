@@ -444,16 +444,40 @@ function preserveReusableSnapshot(p, reusable) {
   fs.renameSync(source, destination);
 }
 
-function untouchedReservation(record, events, { legacy = false } = {}) {
-  if (!record || !['released', ...(legacy ? ['retired'] : [])].includes(record.state)) return false;
-  if (legacy && Number(record.eventSequence) > 2) return false;
+// fleet#227: the record-level half of "untouched reservation", shared by release, abandon
+// and the reuse proof, so the three cannot drift apart.
+function reservationFieldsUntouched(record) {
   if (Number(record.budget?.cumulativeTokens || 0) !== 0 || record.budget?.extension) return false;
   if (record.github?.prNumber || record.github?.prUrl || record.github?.headSha) return false;
   if (record.review?.progress && record.review.progress !== 'not-started') return false;
+  return true;
+}
+
+// The one predicate behind the two doors: an assigned record with an untouched reservation
+// and nothing recorded past its last `assignment-reserved`. `release` accepts exactly
+// these and `abandon` refuses exactly these, so every assigned record has one door.
+function isUntouchedReservation(record, events) {
+  return record.state === 'assigned'
+    && reservationFieldsUntouched(record)
+    && currentAttemptEvents(events, record.id).length === 0;
+}
+
+function untouchedReservation(record, events, { legacy = false } = {}) {
+  if (!record || !['released', ...(legacy ? ['retired'] : [])].includes(record.state)) return false;
+  if (legacy && Number(record.eventSequence) > 2) return false;
+  if (!reservationFieldsUntouched(record)) return false;
   const lineage = events.filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
   if (lineage.length !== Number(record.eventSequence) || lineage.length < 2) return false;
-  if (lineage.some((event) => !['assignment-reserved', 'assignment-released'].includes(event.type))) return false;
-  return lineage[lineage.length - 1].type === 'assignment-released';
+  if (legacy) {
+    if (lineage.some((event) => !['assignment-reserved', 'assignment-released'].includes(event.type))) return false;
+    return lineage[lineage.length - 1].type === 'assignment-released';
+  }
+  // fleet#227: only the current attempt counts. It must be exactly the release that
+  // closed it; earlier attempts (work-created, escalations, abandonments) are history.
+  const attempt = currentAttemptEvents(events, record.id);
+  return attempt.length === 1
+    && attempt[0].type === 'assignment-released'
+    && Number(attempt[0].sequence) === Number(record.eventSequence);
 }
 
 function reusableReleasedRecord(p, recordId) {
@@ -794,6 +818,17 @@ function reserveRecord(options = {}) {
   });
 }
 
+// fleet#227: an attempt starts at an `assignment-reserved` event, and a record can hold
+// several (abandon or release, then reserve again). The current attempt is what came
+// after the last reservation; a record with no reservation event (created directly) is
+// all one attempt. `release` and `abandon` both read this, so an assigned record with
+// no events past its reservation is releasable and every other one is abandonable.
+function currentAttemptEvents(events, recordId) {
+  const lineage = events.filter((event) => event.recordId === recordId).sort((a, b) => a.sequence - b.sequence);
+  const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
+  return lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
+}
+
 function releaseRecord(options = {}) {
   const root = asRoot(options.root);
   const key = requireIdempotency(options.idempotencyKey);
@@ -806,11 +841,7 @@ function releaseRecord(options = {}) {
     if (record.state !== 'assigned') throw new WorkStateError('INVALID_RELEASE', `only assigned records can release reservations (was ${record.state})`);
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const events = eventLines(p);
-    const currentAttemptIsUntouched = Number(record.budget?.cumulativeTokens || 0) === 0
-      && !record.budget?.extension
-      && !record.github?.prNumber && !record.github?.prUrl && !record.github?.headSha
-      && (!record.review?.progress || record.review.progress === 'not-started')
-      && events.filter((event) => event.recordId === record.id).every((event) => ['assignment-reserved', 'assignment-released'].includes(event.type));
+    const currentAttemptIsUntouched = isUntouchedReservation(record, events);
     if (!currentAttemptIsUntouched) throw new WorkStateError('INVALID_RELEASE', `record '${record.id}' does not prove an untouched reservation`);
     const now = isoNow(options.now);
     const next = { ...record, state: 'released', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
@@ -845,10 +876,7 @@ function abandonRecord(options = {}) {
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
     if (['merged', 'retiring'].includes(record.state)) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state} and must complete retirement`);
-    const lineage = eventLines(p).filter((event) => event.recordId === record.id).sort((a, b) => a.sequence - b.sequence);
-    const lastReservation = lineage.map((event) => event.type).lastIndexOf('assignment-reserved');
-    const currentAttemptEvents = lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
-    if (currentAttemptEvents.length === 0) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
+    if (isUntouchedReservation(record, eventLines(p))) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
     const now = isoNow(options.now);
     const actor = options.actor || 'fleet-operator';
     const next = {
