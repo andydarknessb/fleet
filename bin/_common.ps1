@@ -572,3 +572,56 @@ function Test-FleetIdentityLive {
   $why = ("$out" -replace '\s+', ' '); if ($why.Length -gt 200) { $why = $why.Substring(0, 200) }
   return [pscustomobject]@{ code = 'FLEET_IDENTITY_INVALID'; message = "the token in $($Plan.dir) did not answer as $($Plan.login) (gh api user: $why); it may be expired or revoked: re-run bin/wizard-fleet-identity.sh (ADR 0015)" }
 }
+function Invoke-ManifestRelease {
+  # fleet #253 / #256: release the reservation behind an assignment manifest and stamp the launch.ps1
+  # marker <manifest>.invalidated.json ({schemaVersion, manifestId, invalidatedAt, reason}). Same
+  # idempotency key as launch.ps1's Invalidate-Manifest ("assignment-invalidated:<manifest id>"), so
+  # the two doors replay each other. The current revision is read off state/work/active.json (the
+  # manifest's workRecordRevision is the reserve-time one and goes stale). Never throws: the result is
+  # {ok; code; detail; revision; marker}, where a failure carries work-state's own error code
+  # (NOT_FOUND, INVALID_RELEASE, RELEASE_CLAIMED, STALE_REVISION) or one of MANIFEST_UNREADABLE,
+  # ACTIVE_UNREADABLE, TIMEOUT, NODE_MISSING, ERROR. The marker is written only when the release succeeded.
+  param([Parameter(Mandatory)][string]$Manifest, [Parameter(Mandatory)][string]$WorkRecordId, [Parameter(Mandatory)][string]$Reason)
+  $result = [pscustomobject]@{ ok = $false; code = ''; detail = ''; revision = $null; marker = $false }
+  $mf = $null
+  try { $mf = Get-Content -LiteralPath $Manifest -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch {}
+  if ($null -eq $mf -or -not $mf.PSObject.Properties['id'] -or -not "$($mf.id)") { $result.code = 'MANIFEST_UNREADABLE'; $result.detail = "manifest $Manifest is missing or has no id"; return $result }
+  $record = $null
+  try {
+    $active = Get-Content -LiteralPath "$FleetHome\state\work\active.json" -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    $prop = $active.records.PSObject.Properties[$WorkRecordId]
+    if ($null -ne $prop) { $record = $prop.Value }
+  } catch { $result.code = 'ACTIVE_UNREADABLE'; $result.detail = 'state/work/active.json is unreadable'; return $result }
+  if ($null -eq $record) { $result.code = 'NOT_FOUND'; $result.detail = "no active Work record '$WorkRecordId'"; return $result }
+  $result.revision = [int]$record.revision
+  # The record must still be the reservation THIS manifest made: a released unit can be reserved again under the same
+  # Work record id with a new manifest, and releasing on the old manifest's say-so would drop the new reservation and
+  # mark the wrong file. assignment.manifestId is what assignment.js reserve stamps on the record.
+  $recordManifestId = ''
+  if ($record.PSObject.Properties['assignment'] -and $record.assignment -and $record.assignment.PSObject.Properties['manifestId']) { $recordManifestId = "$($record.assignment.manifestId)" }
+  if ($recordManifestId -and $recordManifestId -ne "$($mf.id)") { $result.code = 'MANIFEST_MISMATCH'; $result.detail = "Work record '$WorkRecordId' is now reserved under manifest $recordManifestId, not $($mf.id)"; return $result }
+  # No assignment.manifestId on the record (reserved without the assignment block): fall back to the record's
+  # manifestPath against this manifest's path, resolved and case-insensitive.
+  if (-not $recordManifestId -and $record.PSObject.Properties['manifestPath'] -and "$($record.manifestPath)") {
+    $samePath = $false
+    try { $samePath = [IO.Path]::GetFullPath("$($record.manifestPath)").Equals([IO.Path]::GetFullPath($Manifest), [StringComparison]::OrdinalIgnoreCase) } catch {}
+    if (-not $samePath) { $result.code = 'MANIFEST_MISMATCH'; $result.detail = "Work record '$WorkRecordId' is reserved under manifest file $($record.manifestPath), not $Manifest"; return $result }
+  }
+  $node = $null
+  try { $node = Get-NodeExe } catch { $result.code = 'NODE_MISSING'; $result.detail = "$($_.Exception.Message)"; return $result }
+  $run = Invoke-BoundedExe -FilePath $node -ArgumentList @("$FleetHome\bin\work-state.js", 'release', '--root', $FleetHome, '--id', $WorkRecordId, '--expected-revision', "$($record.revision)", '--idempotency-key', "assignment-invalidated:$($mf.id)", '--evidence', $Reason) -TimeoutSec 15 -Name "work-state release $WorkRecordId"
+  if ($run.timedOut) { $result.code = 'TIMEOUT'; $result.detail = 'work-state release timed out after 15s'; return $result }
+  if ($run.startError) { $result.code = 'ERROR'; $result.detail = "$($run.startError)"; return $result }
+  if ($run.exitCode -ne 0) {
+    $err = $null; try { $err = ("$($run.stderr)".Trim() -split "`n")[-1] | ConvertFrom-Json } catch {}
+    $result.code = if ($err -and $err.PSObject.Properties['code'] -and $err.code) { "$($err.code)" } else { 'ERROR' }
+    $result.detail = if ($err -and $err.PSObject.Properties['message']) { "$($err.message)" } else { ("$($run.stderr)" -replace '\s+', ' ').Trim() }
+    return $result
+  }
+  $result.ok = $true
+  try {
+    Write-Json "$Manifest.invalidated.json" ([pscustomobject]@{ schemaVersion = 1; manifestId = "$($mf.id)"; invalidatedAt = (Now-Iso); reason = $Reason })
+    $result.marker = $true
+  } catch { $result.detail = "released, but the invalidation marker could not be written: $($_.Exception.Message)" }
+  return $result
+}

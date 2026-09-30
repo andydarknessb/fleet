@@ -9,6 +9,14 @@ $wanted += @($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role
 foreach ($w in $wanted) {
   $row = $daemon | Where-Object { $_.name -eq $w.name } | Sort-Object startedAt -Descending | Select-Object -First 1
   if ($row -and $row.pid) { $out += "$($w.name): already running ($($row.id))"; continue }
+  # fleet #253: the sentinel retires a dead-before-ack row and then invalidates its manifest (Invoke-ManifestRelease
+  # writes <manifest>.invalidated.json once the reservation is released). A recovery pass that read the roster
+  # before the retire would respawn or relaunch the row and write it back active over a released Work record, so
+  # a row whose manifest carries the marker is skipped and logged. (launch.ps1 checks the marker only under -Manifest.)
+  if ($w.entry -and $w.entry.PSObject.Properties['manifest'] -and "$($w.entry.manifest)" -and (Test-Path -LiteralPath "$($w.entry.manifest).invalidated.json")) {
+    $out += "$($w.name): skipped, its assignment manifest was invalidated ($($w.entry.manifest).invalidated.json) and the reservation released; not respawned or relaunched"
+    continue
+  }
   if ($row) { & claude respawn $row.id 2>&1 | Out-Null; $out += "$($w.name): respawned $($row.id)"; continue }
   if ($w.fromRoster) {
     $r = (& "$PSScriptRoot\launch.ps1" -FromRoster $w.name | Out-String).Trim()

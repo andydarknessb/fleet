@@ -3,7 +3,9 @@
   Applied with -Apply: respawn (failed / stopped / reaped-while-on-roster / stuck), retire (IC done + issue closed),
   worktree sweep (merged fleet branches, >7 days, unlocked), PAUSE on a rate-limit signal, clear a PAUSE it set once its window passes.
   Also applied, only under state/flags/ic-cleanup-live (fleet #252): stop + rm an orphan late IC session (its manifest was invalidated, no roster row claims it).
-  Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session). The Sentinel session acts on those.
+  Same flag (fleet #253): retire an IC roster row that died before ack (no heartbeat, no ack, job gone) and release its reservation.
+  Same flag (fleet #256 AC2): release an assigned reservation stranded with no roster row, no job and no marker.
+  Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack / reservation-stranded). The Sentinel session acts on those.
 #>
 param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel', [string]$HealRespawn = '')
 . "$PSScriptRoot\_common.ps1"
@@ -20,7 +22,7 @@ function Write-AppliedLedger {
     $line = [ordered]@{
       at = $Report.at; actor = $Actor; applied = $true
       respawned = @($Report.respawned); respawnFailed = @($Report.respawnFailed); respawnDeferred = @($Report.respawnDeferred); launchNeeded = @($Report.launchNeeded); escalate = @($Report.escalate)
-      retired = @($Report.retired); stopped = @($Report.stopped); stopFailed = @($Report.stopFailed); worktrees = @($Report.worktrees); sync = @($Report.sync); pause = $Report.pause; okCount = $okCount
+      retired = @($Report.retired); stopped = @($Report.stopped); stopFailed = @($Report.stopFailed); deadRetired = @($Report.deadRetired); strandedReleased = @($Report.strandedReleased); strandedReleaseFailed = @($Report.strandedReleaseFailed); worktrees = @($Report.worktrees); sync = @($Report.sync); pause = $Report.pause; okCount = $okCount
     }
     if ($Report.daemonReadError) { $line.daemonReadError = $Report.daemonReadError }
     $day = (ConvertTo-UtcDateTime $Report.at).ToString('yyyyMMdd')
@@ -35,7 +37,7 @@ $now = (Get-Date).ToUniversalTime()
 if ($Apply -and $Actor -eq 'sentinel' -and (Test-SentinelOff)) {
   $refused = [ordered]@{
     at = (Now-Iso); applied = $false; refused = 'state/flags/sentinel-off stands: the rostered Sentinel is retired and the watchdog task supervises; nothing applied'
-    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
+    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @()
   }
   [pscustomobject]$refused | ConvertTo-Json -Depth 6
   exit 0
@@ -48,7 +50,7 @@ $daemon = $null
 try { $daemon = Get-DaemonSessions -All -Strict } catch {
   $errorReport = [ordered]@{
     at = (Now-Iso); applied = [bool]$Apply; daemonReadError = "$($_.Exception.Message)"
-    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); worktrees = @(); sync = @(); pause = $null
+    respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null
     ok = @([pscustomobject]@{ name = 'daemon-read'; detail = 'session list unreadable; proposing nothing this tick (a bad read must not look like an empty fleet)' })
   }
   if (-not $ReportPath) { $ReportPath = "$FleetHome\state\sentinel\last-check.json" }
@@ -57,7 +59,7 @@ try { $daemon = Get-DaemonSessions -All -Strict } catch {
   [pscustomobject]$errorReport | ConvertTo-Json -Depth 6
   exit 0
 }
-$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
+$report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
 
 # fleet #252: one strict read of state/roster.json for the orphan pass. Get-LiveRoster above folds an
 # unparseable file into an empty roster, and "no row claims this job" off an empty roster would let
@@ -72,18 +74,87 @@ if (Test-Path -LiteralPath $rosterPath) {
 }
 if ($rosterUnreadable) { $report.ok += [pscustomobject]@{ name = 'roster-read'; detail = 'state/roster.json unreadable; orphan and dead-row checks skipped' } }
 
-function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name } | Sort-Object startedAt -Descending | Select-Object -First 1 }
+# fleet #253: job ids the orphan-late-session pass classified (filled before the expected loop). An orphan
+# is not any roster row's session, so a same-named orphan that started later must never be picked as the
+# IC's row by name (it would read as a healthy "working" IC and hide the real, dead one).
+$script:orphanJobIds = @{}
+$script:DeadRetireCount = 0
+function Latest-Row { param($name) $daemon | Where-Object { $_.name -eq $name -and -not $script:orphanJobIds.ContainsKey("$($_.id)") } | Sort-Object startedAt -Descending | Select-Object -First 1 }
+# fleet #253 / #256: config/cycle.json watchdog knobs, read once. deadBeforeAckMinutes (default 60) is the
+# grace before a launched row with no ack and no heartbeat can read as dead; staleMinutes (default 45, the
+# watchdog's own) is how fresh a job state must be to count as a live job; strandedReservationHours
+# (default 6) is how long an assigned reservation may sit with nothing behind it; deadBeforeAckMaxPerTick (default 2)
+# caps the dead-before-ack retires one tick performs, the rest roll to the next tick.
+$script:DeadBeforeAckMinutes = 60; $script:DeadBeforeAckMaxPerTick = 2; $script:JobStaleMinutes = 45; $script:StrandedReservationHours = 6
+try {
+  $wdCfg = (Read-Json "$FleetHome\config\cycle.json").watchdog
+  if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMinutes']) { $script:DeadBeforeAckMinutes = [double]$wdCfg.deadBeforeAckMinutes }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMaxPerTick']) { $script:DeadBeforeAckMaxPerTick = [int]$wdCfg.deadBeforeAckMaxPerTick }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['staleMinutes']) { $script:JobStaleMinutes = [double]$wdCfg.staleMinutes }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['strandedReservationHours']) { $script:StrandedReservationHours = [double]$wdCfg.strandedReservationHours }
+} catch {}
+# (Get-ForeignRosterRoot is defined here, above Get-ExpectedRow and the -HealRespawn call site, because the stand-in rules use it.)
+# `claude agents --all` lists every job on the machine, not only this root's. A scratch
+# root (bin/scratch-root.ps1) launches through its own doors under the same fleet names,
+# so its IC read here as a stray (ic-1686, job cf1d0d8e, 2026-09-26 03:46:57Z). A job's
+# frozen --settings is <root>\state\sessions\<name>.settings.json; when that names
+# another root whose live roster holds this very job, the session is that root's. Anything
+# short of that proof (no settings, this root's settings, a root that does not roster
+# the job) stays a stray.
+function Get-ForeignRosterRoot {
+  param($row)
+  $js = $null; try { $js = Get-JobState $row.id } catch {}
+  if (-not $js -or -not $js.PSObject.Properties['respawnFlags']) { return $null }
+  $flags = @($js.respawnFlags | ForEach-Object { "$_" })
+  $i = [array]::IndexOf($flags, '--settings')
+  if ($i -lt 0 -or ($i + 1) -ge $flags.Count) { return $null }
+  try {
+    $sessionsDir = Split-Path -Parent $flags[$i + 1]
+    $stateDir = Split-Path -Parent $sessionsDir
+    if ((Split-Path -Leaf $sessionsDir) -ne 'sessions' -or (Split-Path -Leaf $stateDir) -ne 'state') { return $null }
+    $root = [IO.Path]::GetFullPath((Split-Path -Parent $stateDir)).TrimEnd('\', '/')
+    $own = [IO.Path]::GetFullPath($FleetHome).TrimEnd('\', '/')
+  } catch { return $null }
+  if ($root.Equals($own, [StringComparison]::OrdinalIgnoreCase)) { return $null }
+  # Another root's roster is not this root's to trust: unreadable means not proven.
+  $roster = $null; try { $roster = Read-Json "$root\state\roster.json" } catch {}
+  if (-not $roster) { return $null }
+  $held = @($roster.sessions | Where-Object { $_.name -eq $row.name -and "$($_.jobId)" -eq "$($row.id)" -and "$($_.status)" -eq 'active' })
+  if ($held.Count -eq 0) { return $null }
+  return $root
+}
 # fleet #252 QA: Latest-Row is newest-by-name, which picks a stopped or orphaned same-name row over the
 # rostered job when it is newer (Do-Respawn would then respawn the orphan). An IC whose active live-roster
-# row records a jobId is judged by the daemon row with that id; Latest-Row stays the fallback when the
-# roster has no jobId or the daemon has no such row. Statics keep Latest-Row.
+# row records a jobId is judged by the daemon row with that id. Latest-Row stays the fallback only when the
+# roster has no jobId. Statics keep Latest-Row. Two follow-ups from the #252 re-QA:
+#  - the roster's jobId is not in the daemon list: a same-name row with a DIFFERENT id and no pid is the stopped
+#    orphan whose rm failed, and respawning it would revive the orphan, so it is treated as no row (ic-vanished or
+#    the dead-before-ack path). Only a same-name row that is running (a pid, not a classified orphan) stands in.
+#  - the rostered job's row has no pid but a NEWER same-name row with a pid exists (not a classified orphan):
+#    launch.ps1 -Recover is between `claude --bg` and its roster write, so the newer running row is the one judged,
+#    not a respawn of the old one.
+# Neither stand-in may be a row another fleet root rosters (Get-ForeignRosterRoot): a scratch root's session with the
+# same name is not this root's job.
 function Get-ExpectedRow {
   param($x)
   if (-not $x.static) {
     $rr = @($live.sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.status)" -eq 'active' }) | Select-Object -Last 1
     if ($rr -and $rr.PSObject.Properties['jobId'] -and $rr.jobId) {
       $byId = $daemon | Where-Object { "$($_.id)" -eq "$($rr.jobId)" } | Select-Object -First 1
-      if ($byId) { return $byId }
+      if ($byId) {
+        if (-not $byId.pid) {
+          $byIdStart = ConvertTo-UtcDateTime $byId.startedAt
+          $newer = @($daemon | Where-Object {
+            "$($_.name)" -eq "$($x.name)" -and $_.pid -and "$($_.id)" -ne "$($byId.id)" -and -not $script:orphanJobIds.ContainsKey("$($_.id)") -and -not (Get-ForeignRosterRoot $_) -and
+            $null -ne $byIdStart -and $null -ne (ConvertTo-UtcDateTime $_.startedAt) -and (ConvertTo-UtcDateTime $_.startedAt) -gt $byIdStart
+          } | Sort-Object startedAt -Descending | Select-Object -First 1)
+          if ($newer.Count -gt 0) { return $newer[0] }
+        }
+        return $byId
+      }
+      $fallback = Latest-Row $x.name
+      if ($fallback -and $fallback.pid -and -not (Get-ForeignRosterRoot $fallback)) { return $fallback }
+      return $null
     }
   }
   return (Latest-Row $x.name)
@@ -116,12 +187,15 @@ function Test-RespawnVerified {
   # differs from $PreviousPid (or appears where there was none) proves a new process
   # replaced the old one. An unreadable listing during the wait is NOT "pid changed" -
   # it is respawn-failed, the same as a genuine no-op; it must never be read as success.
-  param([string]$Name, $PreviousPid)
+  # With -JobId (an IC: a daemon respawn keeps the job id) the row is the one with that id, never newest-by-name: a
+  # running same-name row would make a no-op respawn of the rostered job look verified.
+  param([string]$Name, $PreviousPid, [string]$JobId = '')
   $deadline = (Get-Date).AddMilliseconds($script:RespawnVerifyBoundMs)
   do {
     try {
       $after = Get-DaemonSessions -All -Strict
-      $row = $after | Where-Object { $_.name -eq $Name } | Sort-Object startedAt -Descending | Select-Object -First 1
+      if ($JobId) { $row = $after | Where-Object { "$($_.id)" -eq $JobId } | Select-Object -First 1 }
+      else { $row = $after | Where-Object { $_.name -eq $Name -and -not $script:orphanJobIds.ContainsKey("$($_.id)") } | Sort-Object startedAt -Descending | Select-Object -First 1 }
       if ($row -and $row.pid -and ("$($row.pid)" -ne "$PreviousPid")) { return $true }
     } catch {
       # unreadable this poll: fall through to the bound, never treated as success
@@ -273,7 +347,8 @@ function Do-Respawn {
   }
   $script:RespawnVerifyCount++
   & claude respawn $row.id 2>&1 | Out-Null
-  if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid) {
+  $verifyId = if ($entry.static) { '' } else { "$($row.id)" }
+  if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid -JobId $verifyId) {
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
   } else {
     # Feeds the existing launch-retry cap exactly as a failed launch would: this
@@ -286,10 +361,57 @@ function Do-Respawn {
 
 function Property-Names { param($obj) if ($null -eq $obj) { return @() }; return @($obj.PSObject.Properties.Name) }
 
+# fleet #253: an IC that got a roster row and died before `assignment-started`. launch.ps1 writes the row
+# (manifest, workRecordId, launchedAt) only after it saw the session, and the session's first turn writes
+# the ack sidecar and, at the end of the turn, a heartbeat; a row with neither, past the grace, whose job
+# is gone will never do either. Returns the one-line why, or $null when any leg of the proof is missing
+# (a legacy row without a manifest, any heartbeat - the recover/respawn path owns that row -, an ack, the
+# grace not yet over, an unparseable or future launchedAt, a job that could still be running, a roster
+# that did not read cleanly). Branch (a): no daemon row for the name AND the job state is terminal, or
+# not fresh (updatedAt older than watchdog.staleMinutes); a working state with no updatedAt is not proof.
+# Branch (b): the daemon row is this row's own job, has no pid, is stopped|failed|done, and the job state
+# is older than the grace (absent updatedAt counts as old).
+function Test-DeadBeforeAck {
+  param($x, $row)
+  if ($x.static -or $rosterUnreadable -or $null -eq $x.rosterRow) { return $null }
+  $r = $x.rosterRow
+  foreach ($f in 'manifest', 'workRecordId', 'launchedAt', 'jobId') {
+    if (-not $r.PSObject.Properties[$f] -or -not "$($r.$f)") { return $null }
+  }
+  if (Test-Path -LiteralPath "$FleetHome\state\heartbeats\$($x.name).json") { return $null }
+  if (Test-Path -LiteralPath "$($r.manifest).acknowledged.json") { return $null }
+  # The ledger's own proof of no ack: acknowledgeAssignment moves the Work record out of `assigned` BEFORE it writes
+  # the sidecar, so a missing sidecar alone is not proof. Anything but an `assigned` record (implementing, released,
+  # absent, an unreadable active.json) falls through to today's path.
+  try {
+    $activeForAck = Get-Content -LiteralPath "$FleetHome\state\work\active.json" -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $recProp = $activeForAck.records.PSObject.Properties["$($r.workRecordId)"]
+    if ($null -eq $recProp -or "$($recProp.Value.state)" -ne 'assigned') { return $null }
+  } catch { return $null }
+  $launched = ConvertTo-UtcDateTime $r.launchedAt
+  if ($null -eq $launched) { return $null }
+  $sinceLaunch = ($now - $launched).TotalMinutes
+  if ($sinceLaunch -lt $script:DeadBeforeAckMinutes) { return $null }
+  $js = $null
+  try { $js = Get-JobState "$($r.jobId)" } catch { return $null }
+  $jobUpdated = $null; if ($js -and $js.PSObject.Properties['updatedAt']) { $jobUpdated = ConvertTo-UtcDateTime $js.updatedAt }
+  $lead = "no heartbeat was ever written for $($x.name) and its manifest was never acknowledged ($([int]$sinceLaunch) min since launch); "
+  if (-not $row) {
+    if (-not $js) { return $lead + "job $($r.jobId) has no daemon row and no job state" }
+    $jobState = "$($js.state)"
+    if ($jobState -in @('stopped', 'failed', 'done')) { return $lead + "job $($r.jobId) has no daemon row and its job state is $jobState" }
+    if ($null -ne $jobUpdated -and ($now - $jobUpdated).TotalMinutes -gt $script:JobStaleMinutes) { return $lead + "job $($r.jobId) has no daemon row and its job state ($jobState) has not moved for $([int]($now - $jobUpdated).TotalMinutes) min" }
+    return $null
+  }
+  if ($row.pid -or "$($row.id)" -ne "$($r.jobId)" -or "$($row.state)" -notin @('stopped', 'failed', 'done')) { return $null }
+  if ($null -ne $jobUpdated -and ($now - $jobUpdated).TotalMinutes -lt $script:DeadBeforeAckMinutes) { return $null }
+  return $lead + "job $($r.jobId) is $($row.state) with no process"
+}
+
 # --- roster sessions: static (always expected) + active ICs ---
 $expected = @()
-foreach ($s in (Get-ExpectedStaticSessions $static)) { $expected += [pscustomobject]@{ name = $s.name; role = $s.role; parent = $s.parent; tenant = $s.tenant; issue = $null; static = $true } }
-foreach ($e in ($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' })) { $expected += [pscustomobject]@{ name = $e.name; role = $e.role; parent = $e.parent; tenant = $e.tenant; issue = $e.issue; static = $false } }
+foreach ($s in (Get-ExpectedStaticSessions $static)) { $expected += [pscustomobject]@{ name = $s.name; role = $s.role; parent = $s.parent; tenant = $s.tenant; issue = $null; static = $true; rosterRow = $null } }
+foreach ($e in ($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' })) { $expected += [pscustomobject]@{ name = $e.name; role = $e.role; parent = $e.parent; tenant = $e.tenant; issue = $e.issue; static = $false; rosterRow = $e } }
 
 # Ticket 84: heal a blocked, stale IC through the ticket 85 Do-Respawn path (a
 # no-op still counts as respawn-failed). The Watchdog decides WHETHER to heal
@@ -324,8 +446,105 @@ if ($HealRespawn) {
   exit 0
 }
 
+# fleet #253: the orphan pass runs BEFORE the expected loop (it used to follow it) so the loop's Latest-Row can leave
+# the job ids it classified out.
+# fleet #252: an orphan late session. launch.ps1's no-session path releases the reservation, writes
+# <manifest>.invalidated.json and exits before it writes a roster row, so a job ic-N that starts
+# AFTER that has no roster row, cannot ack (the manifest is invalidated) and is invisible to the
+# roster-driven paths. Proof required, all of it: this root's job (a pid, an ic-<N> name, not held
+# by another root), no active|retiring roster row claims it BY JOB ID (a duplicate name does not
+# vouch for it), the manifest its launch prompt names carries an .invalidated.json marker and was
+# never acknowledged, and the roster read cleanly. Anything short of that falls through to `stray`.
+# Acting (claude stop, verified, then claude rm) needs -Apply AND state/flags/ic-cleanup-live:
+# shadow-first, Cory creates the flag after a clean shadow week. The page is raised in every mode.
+$cleanupLive = ([bool]$Apply) -and (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")
+if (-not $rosterUnreadable) {
+  foreach ($row in @($daemon | Where-Object { $_.pid -and ("$($_.name)" -match '^ic-[0-9]+$') })) {
+    $jobId = "$($row.id)"
+    if (-not $jobId) { continue }
+    $claimed = @($rosterRows | Where-Object { "$($_.status)" -in @('active', 'retiring') -and "$($_.jobId)" -eq $jobId })
+    if ($claimed.Count -gt 0) { continue }
+    if (Get-ForeignRosterRoot $row) { continue }
+    $js = $null; try { $js = Get-JobState $jobId } catch {}
+    if (-not $js -or -not $js.PSObject.Properties['intent']) { continue }
+    $intent = ("$($js.intent)").TrimStart([char]0xFEFF)
+    if ($intent -notmatch 'assignment manifest at (\S+?\.json)(\s|$)') { continue }
+    $manifestPath = $Matches[1]
+    $markerPath = "$manifestPath.invalidated.json"
+    if (-not (Test-Path -LiteralPath $markerPath)) { continue }
+    if (Test-Path -LiteralPath "$manifestPath.acknowledged.json") { continue }
+    $script:orphanJobIds[$jobId] = $true
+    $markerReason = ''
+    try { $marker = Read-Json $markerPath; if ($marker -and $marker.PSObject.Properties['reason']) { $markerReason = Get-OneLineText "$($marker.reason)" } } catch {}
+    $manifestParent = ''
+    try { $mf = Read-Json $manifestPath; if ($mf -and $mf.PSObject.Properties['parent'] -and $mf.parent) { $manifestParent = "$($mf.parent)" } } catch {}
+    $outcome = 'would stop (state/flags/ic-cleanup-live absent)'
+    if ($cleanupLive) {
+      & claude stop $jobId 2>&1 | Out-Null
+      if (Test-JobStopped -Id $jobId) {
+        # rm's own result is not trusted: a refused rm leaves the stopped row listed, and a stopped row
+        # newer than the rostered job of the same name is what Latest-Row used to respawn. Confirm by a
+        # strict re-read that the row is gone, and say so when it is not.
+        # Continue while rm runs: a native stderr line under a Stop preference would throw before the exit code is read.
+        $rmEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        $rmOut = ''; $rmExit = $null
+        try { $rmOut = "$(& claude rm $jobId 2>&1 | Out-String)"; $rmExit = $LASTEXITCODE } catch { $rmOut = "$($_.Exception.Message)"; $rmExit = -1 } finally { $ErrorActionPreference = $rmEap }
+        $removed = Test-JobRemoved -Id $jobId
+        $rmError = ''
+        if (-not $removed) {
+          $rmError = if ($rmExit -ne 0) { "claude rm exit ${rmExit}: $(Get-OneLineText $rmOut)" } else { "row $jobId still listed after claude rm (exit 0)" }
+        }
+        $outcome = if ($removed) { 'stopped' } else { "stopped, not removed: $rmError" }
+        $report.stopped += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = "orphan late session: manifest invalidated ($markerReason)"; verified = $true; removed = $removed; rmError = $rmError }
+      } else {
+        $failReason = "job $jobId still had a pid after claude stop (waited $($script:RespawnVerifyBoundMs) ms)"
+        $outcome = "stop failed: $failReason"
+        $report.stopFailed += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = $failReason }
+      }
+    }
+    $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'orphan-late-session'; detail = "job $jobId started after launch.ps1 released its manifest ($markerPath, reason: $markerReason); no roster row claims it; $outcome"; parent = $manifestParent }
+  }
+}
 foreach ($x in $expected) {
   $row = Get-ExpectedRow $x
+  # fleet #253: shadow-first like #252. Acting needs -Apply AND state/flags/ic-cleanup-live; the page is raised in
+  # every mode and the shadow falls through to today's ic-vanished / respawn branch.
+  $deadWhy = Test-DeadBeforeAck $x $row
+  if ($deadWhy) {
+    $rr = $x.rosterRow
+    if (-not $cleanupLive) {
+      $whyNot = if (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live") { 'read-only run' } else { 'state/flags/ic-cleanup-live absent' }
+      $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-dead-before-ack'; detail = "$deadWhy; would retire the row and release Work record $($rr.workRecordId) ($whyNot)"; parent = $x.parent }
+    } elseif (Test-Paused) {
+      $report.ok += [pscustomobject]@{ name = $x.name; detail = "dead-before-ack retire and release deferred: PAUSE is set; $deadWhy" }
+    } elseif ($script:DeadRetireCount -ge $script:DeadBeforeAckMaxPerTick) {
+      $report.ok += [pscustomobject]@{ name = $x.name; detail = "dead-before-ack retire deferred to the next tick: $($script:DeadBeforeAckMaxPerTick) retires already done this tick (watchdog.deadBeforeAckMaxPerTick); $deadWhy" }
+    } else {
+      # Re-read the live roster right before acting (the Do-Respawn rule): the row must still be this active job's.
+      $fresh = @((Get-LiveRoster).sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.status)" -eq 'active' -and "$($_.jobId)" -eq "$($rr.jobId)" })
+      if ($fresh.Count -eq 0) {
+        $report.ok += [pscustomobject]@{ name = $x.name; detail = 'dead-before-ack retire cancelled: the live roster row is no longer this active job' }
+        continue
+      }
+      $retireOut = & "$PSScriptRoot\retire.ps1" -Name $x.name -Reason "dead before ack: $deadWhy" 2>&1 | Out-String
+      $retireJson = ConvertFrom-LastJsonLine $retireOut
+      $script:DeadRetireCount++
+      # Count the row retired only when retire.ps1 said so (its JSON line names it) and the roster agrees.
+      $retiredRow = @((Get-LiveRoster).sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.jobId)" -eq "$($rr.jobId)" } | Select-Object -Last 1)[0]
+      $retireOk = ($null -ne $retireJson) -and ("$($retireJson.retired)" -eq "$($x.name)") -and ($null -ne $retiredRow) -and ("$($retiredRow.status)" -eq 'retired')
+      if ($retireOk) { $report.retired += $x.name }
+      # Release AFTER the retire: a claimed reservation (an active|retiring roster row) refuses release.
+      if (-not $retireOk) {
+        $release = [pscustomobject]@{ ok = $false; code = 'RETIRE_FAILED'; detail = (Get-OneLineText $retireOut); revision = $null; marker = $false }
+      } else {
+        $release = Invoke-ManifestRelease -Manifest "$($rr.manifest)" -WorkRecordId "$($rr.workRecordId)" -Reason "dead before ack: $deadWhy"
+      }
+      $report.deadRetired += [pscustomobject]@{ name = $x.name; jobId = "$($rr.jobId)"; workRecordId = "$($rr.workRecordId)"; manifest = "$($rr.manifest)"; reason = $deadWhy; retire = $retireJson; release = $release }
+      $releaseNote = if ($release.ok) { "released Work record $($rr.workRecordId)" } else { "release of Work record $($rr.workRecordId) failed: $($release.code) ($($release.detail))" }
+      $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-dead-before-ack'; detail = "$deadWhy; $(if ($retireOk) { 'retired the row' } else { 'retire FAILED, the row stays on the roster and the release was skipped' }); $releaseNote"; parent = $x.parent }
+      continue
+    }
+  }
   if (-not $row) {
     if ($x.static) { $report.launchNeeded += [pscustomobject]@{ name = $x.name; reason = 'no job known to the daemon' } }
     else { $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-vanished'; detail = "active IC for issue #$($x.issue) has no job; parent $($x.parent) must relaunch or retire"; parent = $x.parent } }
@@ -449,94 +668,7 @@ foreach ($x in $expected) {
 # --- strays and cap ---
 $fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$'
 $known = @($expected | ForEach-Object { $_.name })
-# `claude agents --all` lists every job on the machine, not only this root's. A scratch
-# root (bin/scratch-root.ps1) launches through its own doors under the same fleet names,
-# so its IC read here as a stray (ic-1686, job cf1d0d8e, 2026-09-26 03:46:57Z). A job's
-# frozen --settings is <root>\state\sessions\<name>.settings.json; when that names
-# another root whose live roster holds this very job, the session is that root's. Anything
-# short of that proof (no settings, this root's settings, a root that does not roster
-# the job) stays a stray.
-function Get-ForeignRosterRoot {
-  param($row)
-  $js = $null; try { $js = Get-JobState $row.id } catch {}
-  if (-not $js -or -not $js.PSObject.Properties['respawnFlags']) { return $null }
-  $flags = @($js.respawnFlags | ForEach-Object { "$_" })
-  $i = [array]::IndexOf($flags, '--settings')
-  if ($i -lt 0 -or ($i + 1) -ge $flags.Count) { return $null }
-  try {
-    $sessionsDir = Split-Path -Parent $flags[$i + 1]
-    $stateDir = Split-Path -Parent $sessionsDir
-    if ((Split-Path -Leaf $sessionsDir) -ne 'sessions' -or (Split-Path -Leaf $stateDir) -ne 'state') { return $null }
-    $root = [IO.Path]::GetFullPath((Split-Path -Parent $stateDir)).TrimEnd('\', '/')
-    $own = [IO.Path]::GetFullPath($FleetHome).TrimEnd('\', '/')
-  } catch { return $null }
-  if ($root.Equals($own, [StringComparison]::OrdinalIgnoreCase)) { return $null }
-  # Another root's roster is not this root's to trust: unreadable means not proven.
-  $roster = $null; try { $roster = Read-Json "$root\state\roster.json" } catch {}
-  if (-not $roster) { return $null }
-  $held = @($roster.sessions | Where-Object { $_.name -eq $row.name -and "$($_.jobId)" -eq "$($row.id)" -and "$($_.status)" -eq 'active' })
-  if ($held.Count -eq 0) { return $null }
-  return $root
-}
-# fleet #252: an orphan late session. launch.ps1's no-session path releases the reservation, writes
-# <manifest>.invalidated.json and exits before it writes a roster row, so a job ic-N that starts
-# AFTER that has no roster row, cannot ack (the manifest is invalidated) and is invisible to the
-# roster-driven paths. Proof required, all of it: this root's job (a pid, an ic-<N> name, not held
-# by another root), no active|retiring roster row claims it BY JOB ID (a duplicate name does not
-# vouch for it), the manifest its launch prompt names carries an .invalidated.json marker and was
-# never acknowledged, and the roster read cleanly. Anything short of that falls through to `stray`.
-# Acting (claude stop, verified, then claude rm) needs -Apply AND state/flags/ic-cleanup-live:
-# shadow-first, Cory creates the flag after a clean shadow week. The page is raised in every mode.
-$orphanJobIds = @{}
-$cleanupLive = ([bool]$Apply) -and (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")
-if (-not $rosterUnreadable) {
-  foreach ($row in @($daemon | Where-Object { $_.pid -and ("$($_.name)" -match '^ic-[0-9]+$') })) {
-    $jobId = "$($row.id)"
-    if (-not $jobId) { continue }
-    $claimed = @($rosterRows | Where-Object { "$($_.status)" -in @('active', 'retiring') -and "$($_.jobId)" -eq $jobId })
-    if ($claimed.Count -gt 0) { continue }
-    if (Get-ForeignRosterRoot $row) { continue }
-    $js = $null; try { $js = Get-JobState $jobId } catch {}
-    if (-not $js -or -not $js.PSObject.Properties['intent']) { continue }
-    $intent = ("$($js.intent)").TrimStart([char]0xFEFF)
-    if ($intent -notmatch 'assignment manifest at (\S+?\.json)(\s|$)') { continue }
-    $manifestPath = $Matches[1]
-    $markerPath = "$manifestPath.invalidated.json"
-    if (-not (Test-Path -LiteralPath $markerPath)) { continue }
-    if (Test-Path -LiteralPath "$manifestPath.acknowledged.json") { continue }
-    $orphanJobIds[$jobId] = $true
-    $markerReason = ''
-    try { $marker = Read-Json $markerPath; if ($marker -and $marker.PSObject.Properties['reason']) { $markerReason = Get-OneLineText "$($marker.reason)" } } catch {}
-    $manifestParent = ''
-    try { $mf = Read-Json $manifestPath; if ($mf -and $mf.PSObject.Properties['parent'] -and $mf.parent) { $manifestParent = "$($mf.parent)" } } catch {}
-    $outcome = 'would stop (state/flags/ic-cleanup-live absent)'
-    if ($cleanupLive) {
-      & claude stop $jobId 2>&1 | Out-Null
-      if (Test-JobStopped -Id $jobId) {
-        # rm's own result is not trusted: a refused rm leaves the stopped row listed, and a stopped row
-        # newer than the rostered job of the same name is what Latest-Row used to respawn. Confirm by a
-        # strict re-read that the row is gone, and say so when it is not.
-        # Continue while rm runs: a native stderr line under a Stop preference would throw before the exit code is read.
-        $rmEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        $rmOut = ''; $rmExit = $null
-        try { $rmOut = "$(& claude rm $jobId 2>&1 | Out-String)"; $rmExit = $LASTEXITCODE } catch { $rmOut = "$($_.Exception.Message)"; $rmExit = -1 } finally { $ErrorActionPreference = $rmEap }
-        $removed = Test-JobRemoved -Id $jobId
-        $rmError = ''
-        if (-not $removed) {
-          $rmError = if ($rmExit -ne 0) { "claude rm exit ${rmExit}: $(Get-OneLineText $rmOut)" } else { "row $jobId still listed after claude rm (exit 0)" }
-        }
-        $outcome = if ($removed) { 'stopped' } else { "stopped, not removed: $rmError" }
-        $report.stopped += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = "orphan late session: manifest invalidated ($markerReason)"; verified = $true; removed = $removed; rmError = $rmError }
-      } else {
-        $failReason = "job $jobId still had a pid after claude stop (waited $($script:RespawnVerifyBoundMs) ms)"
-        $outcome = "stop failed: $failReason"
-        $report.stopFailed += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = $failReason }
-      }
-    }
-    $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'orphan-late-session'; detail = "job $jobId started after launch.ps1 released its manifest ($markerPath, reason: $markerReason); no roster row claims it; $outcome"; parent = $manifestParent }
-  }
-}
-foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fleetPattern) -and ($known -notcontains $_.name) -and -not $orphanJobIds.ContainsKey("$($_.id)") })) {
+foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fleetPattern) -and ($known -notcontains $_.name) -and -not $script:orphanJobIds.ContainsKey("$($_.id)") })) {
   $foreign = Get-ForeignRosterRoot $row
   if ($foreign) {
     $report.ok += [pscustomobject]@{ name = $row.name; detail = "another fleet root's session (job $($row.id), rostered by $foreign); not this root's to supervise" }
@@ -548,6 +680,127 @@ $liveFleet = @($daemon | Where-Object { $_.pid -and ($known -contains $_.name) }
 # The cap counts what the door counts: cap-exempt names (config/cycle.json cap.exemptNamePrefixes, the Principal) are outside it.
 $capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
 if ($capCounted.Count -gt [int]$static.cap) { $report.escalate += [pscustomobject]@{ name = 'fleet'; kind = 'cap-exceeded'; detail = "$($capCounted.Count) live fleet sessions, cap $($static.cap)" } }
+
+# --- fleet #256 AC2: a stranded reservation ---
+# launch.ps1 leaves an `assigned` Work record behind on several pre-launch refusals (a gh failure, a fetch failure,
+# an assignment-count refusal): no roster row, no job, no invalidation marker, and the planner keeps excluding
+# the issue as reserved (live 2026-09-30: nidus:issue-7, assigned rev 1 since 09-29T18:55Z). A record is stranded
+# when ALL of these hold: state assigned with a manifestPath; its reservation is older than
+# watchdog.strandedReservationHours (default 6), measured from the record's updatedAt (an assigned record is only
+# written at reserve time, and unlike createdAt it is restamped when a released unit is reserved again); no
+# active|retiring roster row names its tenant and issue; no job (a daemon row or any job state under
+# ~/.claude/jobs) has an intent naming its manifest file; and neither <manifest>.invalidated.json nor
+# <manifest>.acknowledged.json exists. The page is raised in every mode and reads as information (a lead may be
+# holding the unit behind its cap). Releasing (Invoke-ManifestRelease, the helper the dead-before-ack retire uses)
+# needs -Apply AND state/flags/ic-cleanup-live, is deferred under PAUSE, and is guarded against a launch in flight:
+# the record must have been classified stranded on the PREVIOUS tick too (state/sentinel/stranded-seen.json keeps
+# first/last-seen per record id; a gap over an hour restarts the count), and every leg is re-read fresh (roster,
+# daemon list, job intents, markers, the record's state and revision) right before the release.
+# An unreadable state/work/active.json or roster classifies nothing.
+function Get-AllJobIntents {
+  # Lower-cased intents of every job the daemon lists or ~/.claude/jobs holds; a state that will not read is skipped.
+  param($DaemonRows)
+  $intents = @()
+  $jobIds = @($DaemonRows | ForEach-Object { "$($_.id)" } | Where-Object { $_ })
+  $jobsDir = Join-Path $env:USERPROFILE '.claude\jobs'
+  if (Test-Path -LiteralPath $jobsDir) { $jobIds += @(Get-ChildItem -LiteralPath $jobsDir -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
+  foreach ($jid in @($jobIds | Select-Object -Unique)) {
+    try { $jst = Get-JobState $jid; if ($jst -and $jst.PSObject.Properties['intent'] -and $jst.intent) { $intents += ("$($jst.intent)").ToLowerInvariant() } } catch {}
+  }
+  return ,@($intents)
+}
+function Test-StrandedLegs {
+  # The marker / roster / job legs of the stranded predicate against the given roster rows and job intents.
+  param($Rec, $RosterRows, $JobIntents)
+  $mp = "$($Rec.manifestPath)"
+  if ((Test-Path -LiteralPath "$mp.invalidated.json") -or (Test-Path -LiteralPath "$mp.acknowledged.json")) { return $false }
+  $claimed = @($RosterRows | Where-Object { "$($_.status)" -in @('active', 'retiring') -and "$($_.tenant)" -eq "$($Rec.tenant)" -and "$($_.issue)" -eq "$($Rec.issue)" })
+  if ($claimed.Count -gt 0) { return $false }
+  $leaf = (Split-Path -Leaf $mp).ToLowerInvariant()
+  if (@($JobIntents | Where-Object { $_.Contains($leaf) }).Count -gt 0) { return $false }
+  return $true
+}
+function Read-ActiveWorkStrict {
+  $path = Join-Path $FleetHome 'state\work\active.json'
+  if (-not (Test-Path -LiteralPath $path)) { return $null }
+  $a = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+  if ($null -eq $a) { throw 'empty active.json' }
+  return $a
+}
+$strandedSeenPath = Join-Path $FleetHome 'state\sentinel\stranded-seen.json'
+$activeWork = $null; $activeWorkUnreadable = $false
+try { $activeWork = Read-ActiveWorkStrict } catch { $activeWorkUnreadable = $true; $activeWork = $null }
+if ($activeWorkUnreadable) { $report.ok += [pscustomobject]@{ name = 'work-state-read'; detail = 'state/work/active.json unreadable; stranded-reservation check skipped' } }
+elseif (-not $rosterUnreadable -and $null -ne $activeWork -and $activeWork.PSObject.Properties['records'] -and $null -ne $activeWork.records) {
+  $seenBefore = @{}
+  try { $sf = Read-Json $strandedSeenPath; if ($sf) { foreach ($p in $sf.PSObject.Properties) { $seenBefore[$p.Name] = $p.Value } } } catch {}
+  $seenNow = [ordered]@{}
+  $jobIntents = $null   # loaded once, only when a record gets past the cheap tests
+  foreach ($prop in @($activeWork.records.PSObject.Properties)) {
+    $rec = $prop.Value
+    if ("$($rec.state)" -ne 'assigned' -or -not "$($rec.manifestPath)") { continue }
+    $reservedAt = ConvertTo-UtcDateTime $(if ($rec.PSObject.Properties['updatedAt'] -and $rec.updatedAt) { $rec.updatedAt } else { $rec.createdAt })
+    if ($null -eq $reservedAt) { continue }
+    $ageHours = ($now - $reservedAt).TotalHours
+    if ($ageHours -le $script:StrandedReservationHours) { continue }
+    $manifestPath = "$($rec.manifestPath)"
+    if ($null -eq $jobIntents) { $jobIntents = Get-AllJobIntents $daemon }
+    if (-not (Test-StrandedLegs $rec $rosterRows $jobIntents)) { continue }
+    # Stranded this tick. Has the PREVIOUS tick classified it stranded too (same manifest and revision, within the last hour)?
+    $prior = $seenBefore["$($rec.id)"]
+    # A prior sighting counts only when it is at least 10 minutes old (measured from the FIRST sighting, which is
+    # kept while the sightings stay unbroken), so two runs seconds apart cannot arm a release.
+    $priorValid = $false; $seenPrev = $false
+    if ($prior -and "$($prior.manifest)" -eq $manifestPath -and "$($prior.revision)" -eq "$($rec.revision)") {
+      $lastSeen = ConvertTo-UtcDateTime $prior.lastSeen
+      if ($null -ne $lastSeen -and ($now - $lastSeen).TotalMinutes -le 60) { $priorValid = $true }
+    }
+    $firstSeen = if ($priorValid -and $prior.firstSeen) { "$($prior.firstSeen)" } else { $now.ToString('o') }
+    if ($priorValid) {
+      $firstSeenUtc = ConvertTo-UtcDateTime $firstSeen
+      if ($null -ne $firstSeenUtc -and ($now - $firstSeenUtc).TotalMinutes -ge 10) { $seenPrev = $true }
+    }
+    $seenNow["$($rec.id)"] = [ordered]@{ firstSeen = $firstSeen; lastSeen = $now.ToString('o'); manifest = $manifestPath; revision = $rec.revision }
+    $strandedParent = ''
+    try { $mf = Read-Json $manifestPath; if ($mf -and $mf.PSObject.Properties['parent'] -and $mf.parent) { $strandedParent = "$($mf.parent)" } } catch {}
+    $reason = "stranded reservation: assigned since $($reservedAt.ToString('o')) with no roster row, no job and no marker"
+    $outcome = 'would release (state/flags/ic-cleanup-live absent)'
+    if (-not $Apply -and (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")) { $outcome = 'would release (read-only run)' }
+    if ($cleanupLive) {
+      if (Test-Paused) {
+        $outcome = 'release deferred: PAUSE is set'
+      } elseif (-not $seenPrev) {
+        $outcome = 'first sighting; releases on a later tick (once the first sighting is 10 minutes old) if it is still stranded'
+      } else {
+        # Fresh re-read of every leg right before acting (the dead-before-ack rule): a launch in flight must win.
+        $still = $false
+        try {
+          $freshRoster = @((Get-Content -LiteralPath $rosterPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop).sessions)
+          $freshDaemon = Get-DaemonSessions -All -Strict
+          $freshActive = Read-ActiveWorkStrict
+          $freshRecProp = $freshActive.records.PSObject.Properties["$($rec.id)"]
+          if ($null -ne $freshRecProp -and "$($freshRecProp.Value.state)" -eq 'assigned' -and "$($freshRecProp.Value.revision)" -eq "$($rec.revision)" -and "$($freshRecProp.Value.manifestPath)" -eq $manifestPath) {
+            $still = Test-StrandedLegs $freshRecProp.Value $freshRoster (Get-AllJobIntents $freshDaemon)
+          }
+        } catch { $still = $false }
+        if (-not $still) {
+          $outcome = 'release cancelled: the fresh re-read no longer shows it stranded'
+        } else {
+          $release = Invoke-ManifestRelease -Manifest $manifestPath -WorkRecordId "$($rec.id)" -Reason $reason
+          $entry = [pscustomobject]@{ recordId = "$($rec.id)"; tenant = "$($rec.tenant)"; issue = $rec.issue; manifest = $manifestPath; reservedAt = $reservedAt.ToString('o'); firstSeenStranded = $firstSeen; ageHours = [math]::Round($ageHours, 1); release = $release }
+          if ($release.ok) { $outcome = 'released'; $report.strandedReleased += $entry; $seenNow.Remove("$($rec.id)") }
+          else { $outcome = "release failed: $($release.code) ($($release.detail))"; $report.strandedReleaseFailed += $entry }
+        }
+      }
+    }
+    $report.escalate += [pscustomobject]@{ name = "$($rec.id)"; kind = 'reservation-stranded'; detail = "Work record $($rec.id) reserved $([int]$ageHours) h with no session (a lead may be holding it behind the cap): no roster row for $($rec.tenant) issue #$($rec.issue), no job naming $((Split-Path -Leaf $manifestPath)) and no invalidation or ack marker (assigned since $($reservedAt.ToString('o')), limit $($script:StrandedReservationHours) h); $outcome"; parent = $strandedParent }
+  }
+  # Remembered only by an applying run: a hand read-only run must not arm a release for the next applying tick.
+  if ($Apply) { try {
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $strandedSeenPath)) | Out-Null
+    Write-Json $strandedSeenPath ([pscustomobject]$seenNow)
+  } catch { Write-Warning "stranded-seen write failed: $($_.Exception.Message)" } }
+}
 
 # --- clear a PAUSE we set once its window passed ---
 if (Test-Paused) {
