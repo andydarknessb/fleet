@@ -436,6 +436,64 @@ try {
   Assert-True ("$((Find-Worktree $applied '88-clean-merged').mergeLeg)" -eq 'ancestor') 'an ancestor-merged branch must record leg ancestor'
   Assert-True ("$((Find-Worktree $applied '91-clean-squashed').mergeLeg)" -eq 'remote-gone') 'a branch gone on the remote must record leg remote-gone'
 
+  # --- fleet#251: a worktree that a live IC roster row owns is never swept, however settled it ---
+  # --- looks. The fixture is the measured shape: a clean worktree at its base (so it is merged
+  # --- by ancestry), no active Work record (a release removed it), the issue CLOSED. Only the
+  # --- roster row says an IC still lives there. ---
+  function New-RosterGuardFixture {
+    param([string]$Name, [int]$Issue, [string]$WorktreeLeaf, [string]$RosterJson)
+    $root = New-MiniRoot $Name
+    $ten = New-MiniTenantRepo -Root $root -TenantName $Name -Issue $Issue -BranchSlug 'assignment'
+    if ($WorktreeLeaf) {
+      Invoke-Git @('-C', $ten.repo, 'worktree', 'remove', '--force', $ten.worktree) | Out-Null
+      $ten.worktree = "$root\.claude\worktrees\$WorktreeLeaf"
+      Invoke-Git @('-C', $ten.repo, 'worktree', 'add', '-q', $ten.worktree, $ten.branch) | Out-Null
+    }
+    Write-Utf8 "$root\tenants\$Name.json" (@{ name = $Name; repo = $ten.repo; github = 'owner/repo'; defaultBranch = 'main' } | ConvertTo-Json -Compress)
+    Write-Utf8 "$root\state\work\active.json" (@{ schemaVersion = 1; records = @{} } | ConvertTo-Json -Depth 6)
+    if ($RosterJson) { Write-Utf8 "$root\state\roster.json" $RosterJson.Replace('__CWD__', ($ten.worktree -replace '\\', '\\')) }
+    [IO.Directory]::CreateDirectory("$root\mock-bin") | Out-Null
+    Write-Utf8 "$root\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'echo {"state":"CLOSED"}' + "`r`n" + 'exit /b 0' + "`r`n")
+    return [pscustomobject]@{ root = $root; tenant = $ten }
+  }
+  function Run-RosterGuard {
+    param($Fixture)
+    $oldPathRG = $env:PATH; $env:PATH = "$($Fixture.root)\mock-bin;$oldPathRG"
+    try { return Run-JanitorAt -Root $Fixture.root -Arguments @('-Apply', '-TempRoot', "$($Fixture.root)\mini-temp") } finally { $env:PATH = $oldPathRG }
+  }
+  $rowActive = '{"sessions":[{"name":"ic-2513","role":"ic","tenant":"x","issue":2513,"status":"active","cwd":"__CWD__"}]}'
+
+  # (a) the row's name matches the worktree leaf (<name>-assignment) -> listed, kept.
+  $fxLeaf = New-RosterGuardFixture -Name 'rg-leaf' -Issue 2513 -WorktreeLeaf 'ic-2513-assignment' -RosterJson '{"sessions":[{"name":"ic-2513","role":"ic","tenant":"x","issue":2513,"status":"active"}]}'
+  $repLeaf = Run-RosterGuard $fxLeaf
+  $wtLeaf = Find-Worktree $repLeaf 'ic-2513-assignment'
+  Assert-True ($wtLeaf.action -eq 'listed' -and "$($wtLeaf.reason)" -match "worktree belongs to live roster row 'ic-2513' \(status active\)") "a worktree named for a live roster row must be listed with the roster reason: $($wtLeaf | ConvertTo-Json -Compress)"
+  Assert-True (Test-Path $fxLeaf.tenant.worktree) 'a worktree owned by a live roster row must not be removed'
+
+  # (b) the row's cwd is the worktree path (a name the leaf does not spell) -> listed, kept.
+  $fxCwd = New-RosterGuardFixture -Name 'rg-cwd' -Issue 2513 -WorktreeLeaf '' -RosterJson $rowActive
+  $repCwd = Run-RosterGuard $fxCwd
+  $wtCwd = Find-Worktree $repCwd '2513-assignment'
+  Assert-True ($wtCwd.action -eq 'listed' -and "$($wtCwd.reason)" -match "live roster row 'ic-2513'") "a live row whose cwd is the worktree must list it: $($wtCwd | ConvertTo-Json -Compress)"
+  Assert-True (Test-Path $fxCwd.tenant.worktree) 'a worktree that is a live row cwd must not be removed'
+
+  # (c) a retiring row still owns it.
+  $fxRetiring = New-RosterGuardFixture -Name 'rg-retiring' -Issue 2513 -WorktreeLeaf 'ic-2513-assignment' -RosterJson '{"sessions":[{"name":"ic-2513","role":"ic","tenant":"x","issue":2513,"status":"retiring"}]}'
+  $wtRetiring = Find-Worktree (Run-RosterGuard $fxRetiring) 'ic-2513-assignment'
+  Assert-True ($wtRetiring.action -eq 'listed' -and "$($wtRetiring.reason)" -match 'status retiring') 'a retiring row must still own its worktree'
+
+  # (d) a retired row (or any non-ic row) does not: the worktree is swept as before.
+  $fxRetired = New-RosterGuardFixture -Name 'rg-retired' -Issue 2513 -WorktreeLeaf 'ic-2513-assignment' -RosterJson '{"sessions":[{"name":"ic-2513","role":"ic","tenant":"x","issue":2513,"status":"retired"},{"name":"ic-2513","role":"project-lead","tenant":"x","issue":2513,"status":"active"}]}'
+  $wtRetired = Find-Worktree (Run-RosterGuard $fxRetired) 'ic-2513-assignment'
+  Assert-True ($wtRetired.action -eq 'removed') "a retired IC row must not block the sweep: $($wtRetired | ConvertTo-Json -Compress)"
+  Assert-True (-not (Test-Path $fxRetired.tenant.worktree)) 'the retired-row worktree must actually be removed'
+
+  # (e) an unreadable roster is unknown ownership: every worktree is listed, none removed.
+  $fxBad = New-RosterGuardFixture -Name 'rg-corrupt' -Issue 2513 -WorktreeLeaf 'ic-2513-assignment' -RosterJson '{"sessions": [ this is not json'
+  $wtBad = Find-Worktree (Run-RosterGuard $fxBad) 'ic-2513-assignment'
+  Assert-True ($wtBad.action -eq 'listed' -and "$($wtBad.reason)" -match 'state/roster\.json unreadable; a live IC may own this worktree') "a corrupt roster must list the worktree as possibly owned: $($wtBad | ConvertTo-Json -Compress)"
+  Assert-True (Test-Path $fxBad.tenant.worktree) 'a worktree must survive an unreadable roster'
+
   # --- two runs on the same day must not overwrite each other's report ---
   $rootRP = New-MiniRoot 'report-unique'
   $rep1 = Run-JanitorAt -Root $rootRP -Arguments @('-TempRoot', "$rootRP\mini-temp")

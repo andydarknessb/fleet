@@ -758,6 +758,11 @@ function writeSidecar(file, value) {
   return file;
 }
 
+// launch.ps1's no-session poll alone is ~15 s, plus the gh read, fetch and worktree add. A timeout kill
+// between `claude --bg` and the roster write leaves a session with no roster row, so the budget is generous,
+// but it stays under the lead's 2-minute Bash tool limit: this process spends time on its own gh query and
+// up to two git fetches before it launches.
+const LAUNCH_TIMEOUT_MS = 90000;
 function launchReservedAssignment({ manifestPath, workRecordId, root, launchScript, repoPath, githubRepo, powershell = 'powershell', dryRun = false, runner = execFileSync } = {}) {
   if (!manifestPath || !workRecordId) throw new WorkStateError('INVALID_LAUNCH', 'manifestPath and workRecordId are required');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
@@ -788,14 +793,47 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
   const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', launchScript || path.join(__dirname, 'launch.ps1'), '-Manifest', manifestPath, '-WorkRecordId', workRecordId];
   if (dryRun) return { launched: false, dryRun: true, command: [powershell, ...args] };
   try {
-    const output = runner(powershell, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000 });
+    const output = runner(powershell, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: LAUNCH_TIMEOUT_MS });
     return { launched: true, output: String(output) };
   } catch (error) {
-    throw new WorkStateError('LAUNCH_FAILED', String(error.stderr || error.message || error));
+    // fleet#256: launch.ps1 prints its refusal as one JSON line on stdout (reason, reservationReleased,
+    // releaseError) and exits nonzero; stderr alone said only "Command failed".
+    let refusal = null;
+    for (const line of String(error.stdout || '').split(/\r?\n/).reverse()) {
+      if (!line.trim().startsWith('{')) continue;
+      try { refusal = JSON.parse(line); break; } catch { /* not the JSON line */ }
+    }
+    const stderr = String(error.stderr || '').trim();
+    const timedOut = error.code === 'ETIMEDOUT' || error.killed === true;
+    const parts = [];
+    if (timedOut) parts.push(`timed out after ${LAUNCH_TIMEOUT_MS / 1000} s`);
+    if (refusal && refusal.reason) parts.push(`launch refused: ${refusal.reason}`);
+    if (refusal && 'reservationReleased' in refusal) parts.push(`reservationReleased=${refusal.reservationReleased}`);
+    if (refusal && refusal.releaseError) parts.push(`releaseError=${refusal.releaseError}`);
+    if (stderr) parts.push(stderr);
+    if (!parts.length) parts.push(String(error.message || error));
+    throw new WorkStateError('LAUNCH_FAILED', parts.join('; '), { exitCode: error.status ?? null, refusal, stderr, timedOut });
   }
 }
 
-function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, actor = 'ic', evidence = 'assignment-started' } = {}) {
+// fleet#251: launch.ps1 invalidates (and releases) a manifest whose launch produced no session, and
+// a session that appears late still runs its first-turn ack. The release removed the record from
+// active state, so that ack answered NOT_FOUND and the session read it as a glitch. The manifest
+// sidecar says why: an invalidated, never-acknowledged manifest means this assignment was released.
+// The caller passes the manifest path (the ack CLI reads FLEET_ASSIGNMENT_MANIFEST or --manifest).
+function assertManifestNotInvalidated(manifestPath) {
+  if (!manifestPath) return;
+  if (fs.existsSync(`${manifestPath}.acknowledged.json`) || !fs.existsSync(`${manifestPath}.invalidated.json`)) return;
+  let reason = 'reason unreadable';
+  try {
+    const recorded = JSON.parse(fs.readFileSync(`${manifestPath}.invalidated.json`, 'utf8').replace(/^\uFEFF/, '')).reason;
+    reason = typeof recorded === 'string' ? recorded : JSON.stringify(recorded);
+  } catch { /* the invalidation itself is the fact; the reason is best effort */ }
+  throw new WorkStateError('MANIFEST_INVALIDATED', `manifest ${path.basename(manifestPath, '.json')} was invalidated (${reason}) before this session acknowledged it; stop, this assignment was released`, { reason });
+}
+
+function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, actor = 'ic', evidence = 'assignment-started', manifestPath } = {}) {
+  assertManifestNotInvalidated(manifestPath);
   const record = getRecord({ root, id: workRecordId });
   const result = transitionRecord({ root, id: workRecordId, expectedRevision, to: 'implementing', idempotencyKey: `assignment-started:${workRecordId}:${expectedRevision}`, evidence, actor, now });
   if (record.manifestPath) writeSidecar(`${record.manifestPath}.acknowledged.json`, { schemaVersion: 1, workRecordId, acknowledgedAt: now || new Date().toISOString(), actor, evidence });
@@ -822,7 +860,7 @@ const FLAGS = Object.freeze({
   ],
   validate: ['manifest', 'issue', 'base-sha'],
   launch: ['root', 'manifest', 'work-record-id', 'launch-script', 'repo-path', 'github-repo', 'dry-run'],
-  ack: ['root', 'work-record-id', 'expected-revision', 'now', 'evidence'],
+  ack: ['root', 'work-record-id', 'expected-revision', 'now', 'evidence', 'manifest'],
 });
 
 function usage(message) {
@@ -915,7 +953,7 @@ function cli(argv) {
   }
   if (command === 'validate') return validateManifest({ manifest: readFixture(args.manifest), issue: readFixture(args.issue), base: args['base-sha'] ? { sha: args['base-sha'] } : undefined });
   if (command === 'launch') return launchReservedAssignment({ manifestPath: args.manifest, workRecordId: args['work-record-id'], root: args.root, launchScript: args['launch-script'], repoPath: args['repo-path'], githubRepo: args['github-repo'], dryRun: args['dry-run'] === 'true' });
-  if (command === 'ack') return acknowledgeAssignment({ root: args.root, workRecordId: args['work-record-id'], expectedRevision: Number(args['expected-revision']), now: args.now, evidence: args.evidence });
+  if (command === 'ack') return acknowledgeAssignment({ root: args.root, workRecordId: args['work-record-id'], expectedRevision: Number(args['expected-revision']), now: args.now, evidence: args.evidence, manifestPath: args.manifest || process.env.FLEET_ASSIGNMENT_MANIFEST || undefined });
   throw new WorkStateError('USAGE', 'commands: frontier, assign, proof, validate, launch, ack');
 }
 

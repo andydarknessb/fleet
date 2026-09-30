@@ -331,12 +331,30 @@ function archiveExpiredEvents(p, now) {
 // (replayIfKnown) before any event is built, and a reserve starts that map fresh, so a
 // caller may reuse a key in a later attempt. Matching keys across the whole lineage
 // silently dropped nidus:issue-4's seq-8 abandon (2026-09-28) and wedged the record.
-function hasEvent(p, recordId, sequence) {
-  return eventLines(p).some((event) => event.recordId === recordId && event.sequence === sequence);
+function existingEvent(p, recordId, sequence) {
+  return eventLines(p).find((event) => event.recordId === recordId && event.sequence === sequence) || null;
+}
+
+// fleet#251: a (recordId, sequence) match used to be dropped silently, which hid a
+// shadow-projected event colliding with an assignment-released one (its record then
+// claimed a sequence the ledger did not hold). The only legitimate duplicate is
+// recoverPendingUnlocked replaying the identical journal event after a crash between
+// appendEvent and the journal removal: same key, same type. Anything else is a collision.
+// Returns true when the event is already recorded (a replay), false when the slot is free.
+function checkEventSlot(p, event) {
+  const prior = existingEvent(p, event.recordId, event.sequence);
+  if (!prior) return false;
+  if (prior.idempotencyKey === event.idempotencyKey && prior.type === event.type) return true;
+  throw new WorkStateError('EVENT_SEQUENCE_COLLISION', `event ${event.type} (${event.idempotencyKey}) collides with ${prior.type} (${prior.idempotencyKey}) at ${event.recordId} sequence ${event.sequence}`, {
+    recordId: event.recordId,
+    sequence: event.sequence,
+    existing: { type: prior.type, idempotencyKey: prior.idempotencyKey, revision: prior.revision },
+    attempted: { type: event.type, idempotencyKey: event.idempotencyKey, revision: event.revision },
+  });
 }
 
 function appendEvent(p, event) {
-  if (hasEvent(p, event.recordId, event.sequence)) return;
+  if (checkEventSlot(p, event)) return;
   fs.mkdirSync(path.dirname(eventFile(p, event.at)), { recursive: true });
   fs.appendFileSync(eventFile(p, event.at), `${JSON.stringify(event)}\n`, 'utf8');
 }
@@ -513,6 +531,20 @@ function recoverPendingUnlocked(p) {
     const journalPath = path.join(p.pending, file);
     const journal = readJson(journalPath);
     if (!journal) continue;
+    // fleet#251: checked before the journal touches active.json. A journal whose event
+    // collides can never complete; left in place it would wedge every door call, so it
+    // moves to pending/collided/ and the call that found it fails once, naming the file.
+    try {
+      checkEventSlot(p, journal.event);
+    } catch (error) {
+      if (error.code !== 'EVENT_SEQUENCE_COLLISION') throw error;
+      const collidedDir = path.join(p.pending, 'collided');
+      fs.mkdirSync(collidedDir, { recursive: true });
+      // A unique name: an earlier quarantined journal of the same file name is evidence too.
+      const quarantined = path.join(collidedDir, `${file.replace(/\.json$/, '')}.${Date.now()}.${process.pid}.${fs.readdirSync(collidedDir).length}.json`);
+      fs.renameSync(journalPath, quarantined);
+      throw new WorkStateError('EVENT_SEQUENCE_COLLISION', `${error.message}; the pending journal was moved to ${quarantined}`, { recordId: error.recordId, sequence: error.sequence, existing: error.existing, attempted: error.attempted, quarantined });
+    }
     const active = activeState(p);
     const existing = active.records[journal.recordId];
     if (journal.afterRecord === null) {
@@ -531,6 +563,9 @@ function recoverPendingUnlocked(p) {
 }
 
 function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive = null, releasedRecord = null, abandonedRecord = null, supersedeReusable = null, killPoint }) {
+  // fleet#251: refuse a colliding event before the journal or the record is written, so a
+  // refused mutation leaves nothing behind for recovery to trip over.
+  checkEventSlot(p, event);
   const journalPath = pendingFile(p, recordId, event.idempotencyKey);
   writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable });
   if (killPoint === 'after-journal') throw new WorkStateError('KILL_POINT', 'stopped after journal write');
@@ -829,13 +864,56 @@ function currentAttemptEvents(events, recordId) {
   return lastReservation < 0 ? lineage : lineage.slice(lastReservation + 1);
 }
 
+// fleet#251: the roster rows that claim a unit. An IC row (role ic, status active or
+// retiring, a positive issue) claims `<tenant>:issue-<issue>`. Shadow projects from this
+// set and release refuses against it, so the two cannot disagree about who owns a record.
+// Match is tenant plus issue only: heartbeats are written at turn end and do not exist in
+// the window this guards, so liveness cannot be the test.
+function rosterPathFor(p, rosterPath) {
+  return path.resolve(rosterPath || path.join(p.state, 'roster.json'));
+}
+
+function rosterClaimRows(p, rosterPath) {
+  const roster = readJson(rosterPathFor(p, rosterPath), { sessions: [] });
+  const rows = Array.isArray(roster) ? roster : (roster.sessions || []);
+  return rows
+    .filter((row) => String(row.role).toLowerCase() === 'ic' && ['active', 'retiring'].includes(String(row.status).toLowerCase()) && Number(row.issue))
+    .map((row) => ({ id: `${row.tenant}:issue-${Number(row.issue)}`, row }));
+}
+
+function rosterClaims(p, rosterPath) {
+  return new Map(rosterClaimRows(p, rosterPath).map(({ id, row }) => [id, row]));
+}
+
+function samePath(a, b, base) {
+  const [left, right] = [path.resolve(base, String(a)), path.resolve(base, String(b))];
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+// Release's narrower claim (fleet#251 QA): an IC that died and was abandoned without its row
+// being retired leaves a stale row for the same issue, and a later reservation of that issue
+// must still be releasable when its own pre-launch gate refuses. A row that names the manifest
+// it was launched from claims the record only when that is the record's current manifest; a row
+// with no manifest falls back to tenant plus issue. Shadow keeps the plain tenant+issue match.
+function releaseClaim(p, rosterPath, record) {
+  return rosterClaimRows(p, rosterPath).find(({ id, row }) => id === record.id
+    && (!row.manifest || (record.manifestPath && samePath(row.manifest, record.manifestPath, p.base))))?.row || null;
+}
+
 function releaseRecord(options = {}) {
   const root = asRoot(options.root);
   const key = requireIdempotency(options.idempotencyKey);
   return withLock(root, (p) => {
     const active = activeState(p);
     const record = active.records[String(options.id)];
-    if (!record) throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    if (!record) {
+      // fleet#251 (QA on #250): like abandon, a replay of the key that released this record
+      // answers from the release snapshot instead of NOT_FOUND.
+      const released = readJson(releaseFile(p, options.id))?.record;
+      const releasedReplay = released && replayIfKnown(released, key);
+      if (releasedReplay) return releasedReplay;
+      throw new WorkStateError('NOT_FOUND', `active record '${options.id}' was not found`);
+    }
     const replay = replayIfKnown(record, key);
     if (replay) return replay;
     if (record.state !== 'assigned') throw new WorkStateError('INVALID_RELEASE', `only assigned records can release reservations (was ${record.state})`);
@@ -843,6 +921,17 @@ function releaseRecord(options = {}) {
     const events = eventLines(p);
     const currentAttemptIsUntouched = isUntouchedReservation(record, events);
     if (!currentAttemptIsUntouched) throw new WorkStateError('INVALID_RELEASE', `record '${record.id}' does not prove an untouched reservation`);
+    // fleet#251: a live IC row for this unit means a session exists for it (launch writes the
+    // row only after `claude --bg` produced one), so releasing would leave that session
+    // working an unreserved issue. An absent or unreadable roster is no claim: this guard
+    // must not wedge a release on a bad file.
+    let claim = null;
+    try { claim = releaseClaim(p, options.rosterPath, record); } catch { claim = null; }
+    if (claim) {
+      throw new WorkStateError('RELEASE_CLAIMED', `record '${record.id}' is claimed by roster row '${claim.name}' (status ${claim.status}, sessionId ${claim.sessionId || 'none'}); retire the session (bin\\retire.ps1 -Name ${claim.name}) before releasing, or let it acknowledge`, {
+        rosterRow: { name: claim.name, status: claim.status, sessionId: claim.sessionId || null, jobId: claim.jobId || null },
+      });
+    }
     const now = isoNow(options.now);
     const next = { ...record, state: 'released', revision: record.revision + 1, eventSequence: record.eventSequence + 1, updatedAt: now, idempotency: { ...record.idempotency } };
     next.idempotency[key] = { revision: next.revision, eventSequence: next.eventSequence, type: 'assignment-released' };
@@ -1510,18 +1599,10 @@ function projectStatus(options = {}) {
 function shadowProject(options = {}) {
   const root = asRoot(options.root);
   return withLock(root, (p) => {
-    const rosterPath = path.resolve(options.rosterPath || path.join(p.state, 'roster.json'));
-    const roster = readJson(rosterPath, { sessions: [] });
-    const rows = Array.isArray(roster) ? roster : (roster.sessions || []);
+    const rosterPath = rosterPathFor(p, options.rosterPath);
+    const desired = new Map([...rosterClaims(p, rosterPath)].map(([id, row]) => [id, { row, rosterStatus: String(row.status).toLowerCase() }]));
     const active = activeState(p);
     const rosterEvidence = path.relative(p.base, rosterPath);
-    const desired = new Map();
-    for (const row of rows) {
-      const rosterStatus = String(row.status).toLowerCase();
-      if (String(row.role).toLowerCase() !== 'ic' || !['active', 'retiring'].includes(rosterStatus) || !Number(row.issue)) continue;
-      const id = `${row.tenant}:issue-${Number(row.issue)}`;
-      desired.set(id, { row, rosterStatus });
-    }
     for (const record of Object.values(active.records)) {
       if (desired.has(record.id)) continue;
       // 02/03 cutover: a record this projection did not create (a manifest reservation, or
@@ -1555,6 +1636,7 @@ function shadowProject(options = {}) {
       delete active.records[record.id];
     }
     const projected = [];
+    const skipped = [];
     for (const [id, { row, rosterStatus }] of desired) {
       if (active.records[id]) {
         if (rosterStatus === 'retiring' && active.records[id].state === 'implementing') {
@@ -1581,10 +1663,16 @@ function shadowProject(options = {}) {
         projected.push(active.records[id]);
         continue;
       }
-      // An abandoned attempt stays ended even if its dead IC's roster row is
-      // stale. A later assignment re-enters through reserve first, so it has an
-      // active record by the time the new session can appear here.
-      if (fs.existsSync(abandonFile(p, id))) continue;
+      // An abandoned or released attempt stays ended even if its IC's roster row is
+      // stale or late. A later assignment re-enters through reserve first, so it has an
+      // active record by the time the new session can appear here. fleet#251: a late
+      // session's row used to resurrect a released record as `implementing` on a sequence
+      // the release had already used; the skip is reported so a caller can see it.
+      if (fs.existsSync(abandonFile(p, id))) { skipped.push({ id, name: row.name, reason: 'abandon-snapshot' }); continue; }
+      if (fs.existsSync(releaseFile(p, id))) { skipped.push({ id, name: row.name, reason: 'release-snapshot' }); continue; }
+      // A record that finished and was archived is ended too: its lineage already holds
+      // sequence 1, so building a fresh record from a lingering row would collide.
+      if (fs.existsSync(archiveFile(p, id))) { skipped.push({ id, name: row.name, reason: 'archive' }); continue; }
       const now = isoNow(options.now);
       const key = `shadow:${id}:${row.sessionId || row.name || 'unknown'}`;
       const record = baseRecord({
@@ -1603,7 +1691,7 @@ function shadowProject(options = {}) {
       projected.push(record);
       active.records[id] = record;
     }
-    return { projected };
+    return { projected, skipped };
   });
 }
 
@@ -1648,7 +1736,7 @@ const COMMON_FLAGS = ['root', 'now', 'actor', 'evidence', 'idempotency-key'];
 const FLAGS = Object.freeze({
   create: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'state', 'pr-number'],
   reserve: [...COMMON_FLAGS, 'id', 'tenant', 'issue', 'manifest', 'reservations', 'assignment', 'independence-proof', 'issue-url', 'body-hash'],
-  release: [...COMMON_FLAGS, 'id', 'expected-revision'],
+  release: [...COMMON_FLAGS, 'id', 'expected-revision', 'roster'],
   abandon: [...COMMON_FLAGS, 'id', 'expected-revision', 'reason', 'kill-point'],
   transition: [...COMMON_FLAGS, 'id', 'to', 'expected-revision', 'kill-point', 'pr-number', 'repo', 'github-state', 'merged-at', 'merged-by', 'github-evidence', 'no-notifier', 'ruling', 'reason', 'premise'],
   reconcile: ['repo', 'pr-number'],
@@ -1678,7 +1766,7 @@ function cli(argv) {
     independenceProof: args['independence-proof'] ? JSON.parse(args['independence-proof']) : undefined,
     github: args['issue-url'] ? { issueNumber: Number(args.issue), issueUrl: args['issue-url'], bodyHash: args['body-hash'] } : undefined,
   });
-  if (command === 'release') return releaseRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']) });
+  if (command === 'release') return releaseRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']), rosterPath: args.roster });
   if (command === 'abandon') return abandonRecord({ ...common, id: args.id, expectedRevision: Number(args['expected-revision']), reason: args.reason, killPoint: args['kill-point'] });
   if (command === 'transition') {
     const result = transitionRecord({
@@ -1741,6 +1829,9 @@ module.exports = {
   TRANSITIONS,
   WorkStateError,
   abandonRecord,
+  appendEvent,
+  commitMutation,
+  paths,
   appendWakeOutbox,
   cli,
   createRecord,

@@ -48,16 +48,22 @@ exit /b %errorlevel%
 
   $body = 'original criteria'
   $comments = @([pscustomobject]@{ id = 'comment-1'; createdAt = '2026-09-01T01:00:00Z'; body = 'Use ruling A.' })
-  $manifestPath = "$testRoot\state\manifests\assignment-test-1108.json"
-  $manifest = [ordered]@{
-    schemaVersion = 1; status = 'pending-ack'; id = 'assignment-test-1108'; workRecordId = 'test:issue-1108'; workRecordRevision = 1
-    issue = [ordered]@{ number = 1108; bodyHash = (Criteria-Hash $body @()); criteriaHash = (Criteria-Hash $body $comments); commentCount = 1 }
-    base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = ('a' * 40) }
-    branch = 'fleet/1108-test'; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
+  # One reservation per launch: the PAUSE refusal releases its reservation (fleet#256), so the second
+  # launch below needs a fresh one (its own issue number, hence its own record and manifest).
+  function New-Reservation {
+    param([int]$Issue)
+    $script:manifestPath = "$testRoot\state\manifests\assignment-test-$Issue.json"
+    $manifest = [ordered]@{
+      schemaVersion = 1; status = 'pending-ack'; id = "assignment-test-$Issue"; workRecordId = "test:issue-$Issue"; workRecordRevision = 1
+      issue = [ordered]@{ number = $Issue; bodyHash = (Criteria-Hash $body @()); criteriaHash = (Criteria-Hash $body $comments); commentCount = 1 }
+      base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = ('a' * 40) }
+      branch = "fleet/$Issue-test"; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
+    }
+    Write-Utf8 $script:manifestPath ($manifest | ConvertTo-Json -Depth 8)
+    $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "test:issue-$Issue" --tenant test --issue $Issue --manifest $script:manifestPath --idempotency-key "reserve-$Issue"
+    if ($LASTEXITCODE -ne 0) { throw 'fixture reservation failed' }
   }
-  Write-Utf8 $manifestPath ($manifest | ConvertTo-Json -Depth 8)
-  $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id test:issue-1108 --tenant test --issue 1108 --manifest $manifestPath --idempotency-key reserve-1108
-  if ($LASTEXITCODE -ne 0) { throw 'fixture reservation failed' }
+  New-Reservation 1108
   Write-Utf8 "$testRoot\state\PAUSE" 'comments test'
   $env:PATH = "$testRoot\mock-bin;$oldPath"
 
@@ -65,6 +71,8 @@ exit /b %errorlevel%
   $matching = Run-Launch
   Assert-True ($lastExit -eq 3 -and "$($matching.reason)" -match 'PAUSE') "matching comment criteria must reach PAUSE: $lastOut"
 
+  Assert-True ($matching.reservationReleased -eq $true) "the PAUSE refusal releases the reservation it holds: $lastOut"
+  New-Reservation 1109
   $env:FLEET_TEST_ISSUE_COMMENT = 'CORRECTION: use ruling B.'
   $null = Run-Launch
   Assert-True ($lastExit -eq 4 -and $lastOut -match 'criteria changed') "a comment-only correction must invalidate launch: $lastOut"
