@@ -95,15 +95,34 @@ try {
 } catch {}
 # fleet #252 QA: Latest-Row is newest-by-name, which picks a stopped or orphaned same-name row over the
 # rostered job when it is newer (Do-Respawn would then respawn the orphan). An IC whose active live-roster
-# row records a jobId is judged by the daemon row with that id; Latest-Row stays the fallback when the
-# roster has no jobId or the daemon has no such row. Statics keep Latest-Row.
+# row records a jobId is judged by the daemon row with that id. Latest-Row stays the fallback only when the
+# roster has no jobId. Statics keep Latest-Row. Two follow-ups from the #252 re-QA:
+#  - the roster's jobId is not in the daemon list: a same-name row with a DIFFERENT id and no pid is the stopped
+#    orphan whose rm failed, and respawning it would revive the orphan, so it is treated as no row (ic-vanished or
+#    the dead-before-ack path). Only a same-name row that is running (a pid, not a classified orphan) stands in.
+#  - the rostered job's row has no pid but a NEWER same-name row with a pid exists (not a classified orphan):
+#    launch.ps1 -Recover is between `claude --bg` and its roster write, so the newer running row is the one judged,
+#    not a respawn of the old one.
 function Get-ExpectedRow {
   param($x)
   if (-not $x.static) {
     $rr = @($live.sessions | Where-Object { "$($_.name)" -eq "$($x.name)" -and "$($_.status)" -eq 'active' }) | Select-Object -Last 1
     if ($rr -and $rr.PSObject.Properties['jobId'] -and $rr.jobId) {
       $byId = $daemon | Where-Object { "$($_.id)" -eq "$($rr.jobId)" } | Select-Object -First 1
-      if ($byId) { return $byId }
+      if ($byId) {
+        if (-not $byId.pid) {
+          $byIdStart = ConvertTo-UtcDateTime $byId.startedAt
+          $newer = @($daemon | Where-Object {
+            "$($_.name)" -eq "$($x.name)" -and $_.pid -and "$($_.id)" -ne "$($byId.id)" -and -not $script:orphanJobIds.ContainsKey("$($_.id)") -and
+            $null -ne $byIdStart -and $null -ne (ConvertTo-UtcDateTime $_.startedAt) -and (ConvertTo-UtcDateTime $_.startedAt) -gt $byIdStart
+          } | Sort-Object startedAt -Descending | Select-Object -First 1)
+          if ($newer.Count -gt 0) { return $newer[0] }
+        }
+        return $byId
+      }
+      $fallback = Latest-Row $x.name
+      if ($fallback -and $fallback.pid) { return $fallback }
+      return $null
     }
   }
   return (Latest-Row $x.name)
@@ -136,12 +155,15 @@ function Test-RespawnVerified {
   # differs from $PreviousPid (or appears where there was none) proves a new process
   # replaced the old one. An unreadable listing during the wait is NOT "pid changed" -
   # it is respawn-failed, the same as a genuine no-op; it must never be read as success.
-  param([string]$Name, $PreviousPid)
+  # With -JobId (an IC: claude respawn keeps the job id) the row is the one with that id, never newest-by-name: a
+  # running same-name row would make a no-op respawn of the rostered job look verified.
+  param([string]$Name, $PreviousPid, [string]$JobId = '')
   $deadline = (Get-Date).AddMilliseconds($script:RespawnVerifyBoundMs)
   do {
     try {
       $after = Get-DaemonSessions -All -Strict
-      $row = $after | Where-Object { $_.name -eq $Name -and -not $script:orphanJobIds.ContainsKey("$($_.id)") } | Sort-Object startedAt -Descending | Select-Object -First 1
+      if ($JobId) { $row = $after | Where-Object { "$($_.id)" -eq $JobId } | Select-Object -First 1 }
+      else { $row = $after | Where-Object { $_.name -eq $Name -and -not $script:orphanJobIds.ContainsKey("$($_.id)") } | Sort-Object startedAt -Descending | Select-Object -First 1 }
       if ($row -and $row.pid -and ("$($row.pid)" -ne "$PreviousPid")) { return $true }
     } catch {
       # unreadable this poll: fall through to the bound, never treated as success
@@ -293,7 +315,8 @@ function Do-Respawn {
   }
   $script:RespawnVerifyCount++
   & claude respawn $row.id 2>&1 | Out-Null
-  if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid) {
+  $verifyId = if ($entry.static) { '' } else { "$($row.id)" }
+  if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid -JobId $verifyId) {
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
   } else {
     # Feeds the existing launch-retry cap exactly as a failed launch would: this

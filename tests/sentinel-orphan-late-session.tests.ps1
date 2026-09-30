@@ -39,10 +39,12 @@ if ($Verb -eq 'agents') {
   $rows = @($obj)
   foreach ($r in $rows) { if (Test-Path "$root\mock-bin\stopped-$($r.id).txt") { $r.pid = $null; $r.state = 'stopped' } }
   $rows = @($rows | Where-Object { -not (Test-Path "$root\mock-bin\removed-$($_.id).txt") })
+  if (Test-Path "$root\mock-bin\agents-extra.json") { $extra = Get-Content "$root\mock-bin\agents-extra.json" -Raw | ConvertFrom-Json; foreach ($e in $extra) { $rows += $e } }
   ConvertTo-Json -InputObject @($rows) -Compress
   exit 0
 }
 [IO.File]::AppendAllText("$root\calls.txt", "claude $Verb $Arg1`r`n")
+if ($Verb -eq 'respawn' -and (Test-Path "$root\mock-bin\respawn-spawns.json")) { Copy-Item "$root\mock-bin\respawn-spawns.json" "$root\mock-bin\agents-extra.json" -Force }
 if ($Verb -eq 'stop' -and $env:MOCK_STOP_DROPS -eq '1') { Set-Content "$root\mock-bin\stopped-$Arg1.txt" 'x' -Encoding ASCII }
 if ($Verb -eq 'rm') {
   if ($env:MOCK_RM_FAILS -eq '1') { [Console]::Error.WriteLine('cannot remove job: still referenced'); exit 1 }
@@ -81,6 +83,7 @@ exit 0
     Get-ChildItem "$testRoot\mock-bin" -Filter 'removed-*.txt' -ErrorAction SilentlyContinue | Remove-Item -Force
     Get-ChildItem "$testRoot\profile\.claude\jobs" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
     Remove-Item "$testRoot\calls.txt" -Force -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\mock-bin\agents-extra.json", "$testRoot\mock-bin\respawn-spawns.json" -Force -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\sentinel\applied" -Recurse -Force -ErrorAction SilentlyContinue
     Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
     $env:MOCK_STOP_DROPS = '0'
@@ -280,8 +283,41 @@ exit 0
   Remove-Item "$testRoot\calls.txt" -Force -ErrorAction SilentlyContinue
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-gone"}]}'
   $o8c = Run-Check -Apply
-  Assert-True (@($o8c.respawned).Count + @($o8c.respawnFailed).Count -eq 1 -and (@($o8c.respawned) + @($o8c.respawnFailed))[0].jobId -eq 'job-B') 'O8c: a roster jobId the daemon does not list falls back to newest-by-name'
+  Assert-True (@($o8c.respawned).Count + @($o8c.respawnFailed).Count -eq 0 -and @(Calls | Where-Object { $_ -like 'claude respawn*' }).Count -eq 0) "O8c: a roster jobId the daemon does not list must not fall back to a same-name stopped row with another id (respawning it revives the orphan; calls: $((Calls) -join '; '))"
+  Assert-True ((Kinds-For $o8c 'ic-1001') -contains 'ic-vanished') 'O8c: it reads as no row: ic-vanished'
   Write-Output 'sentinel-orphan-late-session O8 passed'
+
+  # ---- O9 (#252 re-QA): a respawn is verified by the rostered JOB ID, not the newest row by name. ic-1001 is rostered as
+  # job-A (failed, no pid). The respawn is a no-op, but a same-name process (job-N) shows up while it is verified: that
+  # must not make the no-op look verified.
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-A"}]}'
+  Write-Job 'job-A' 'ic-1001' (Manifest-Intent '1001')
+  Set-Agents @(@{ id = 'job-A'; name = 'ic-1001'; pid = $null; state = 'failed'; startedAt = '2026-09-30T03:00:00Z' })
+  Write-Utf8 "$testRoot\mock-bin\respawn-spawns.json" '[{"id":"job-N","name":"ic-1001","state":"working","status":"idle","pid":77,"startedAt":"2026-09-30T05:00:00Z"}]'
+  $o9 = Run-Check -Apply
+  Assert-True ((Calls) -contains 'claude respawn job-A') "O9: the rostered job was respawned (calls: $((Calls) -join '; '))"
+  Assert-True (@($o9.respawned).Count -eq 0 -and @($o9.respawnFailed).Count -eq 1 -and $o9.respawnFailed[0].jobId -eq 'job-A') "O9: a no-op respawn of job-A stays respawn-failed though another same-name row is running (got: $(($o9.respawned + $o9.respawnFailed | ConvertTo-Json -Compress -Depth 3)))"
+  Write-Output 'sentinel-orphan-late-session O9 passed'
+
+  # ---- O10 (#252 re-QA): the recover race. The rostered job-A has no pid, but a NEWER same-name row job-B WITH a pid (not
+  # an orphan: no invalidated manifest) exists - launch.ps1 -Recover is between `claude --bg` and its roster write. The
+  # newer running row is judged; job-A is not respawned.
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1001","role":"ic","tenant":"test","parent":"pl-test","issue":1001,"status":"active","jobId":"job-A"}]}'
+  Write-Job 'job-A' 'ic-1001' (Manifest-Intent '1001')
+  Write-Job 'job-B' 'ic-1001' $null
+  Set-Agents @(@{ id = 'job-A'; name = 'ic-1001'; pid = $null; state = 'stopped'; startedAt = '2026-09-30T03:00:00Z' }, @{ id = 'job-B'; name = 'ic-1001'; pid = 55; startedAt = '2026-09-30T04:00:00Z' })
+  $o10 = Run-Check -Apply
+  Assert-True (@(Calls | Where-Object { $_ -like 'claude respawn*' }).Count -eq 0) "O10: the old job is not respawned while a newer running same-name row exists (calls: $((Calls) -join '; '))"
+  Assert-True (@($o10.respawned).Count -eq 0 -and @($o10.respawnFailed).Count -eq 0) 'O10: nothing respawned or failed'
+  # an ORPHAN that is newer and running does not count: job-A (stopped) is still respawned
+  Write-Job 'job-B' 'ic-1001' (Manifest-Intent '1002')
+  Write-Marker '1002'
+  Remove-Item "$testRoot\calls.txt" -Force -ErrorAction SilentlyContinue
+  $o10b = Run-Check
+  Assert-True (@($o10b.respawned).Count -eq 1 -and $o10b.respawned[0].jobId -eq 'job-A') 'O10b: a newer running ORPHAN does not stand in for the rostered job'
+  Write-Output 'sentinel-orphan-late-session O10 passed'
 
   Write-Output 'sentinel-orphan-late-session tests passed'
 } finally {
