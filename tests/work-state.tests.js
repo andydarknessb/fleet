@@ -331,6 +331,43 @@ test('a first-attempt reservation still releases, and a touched first attempt st
   );
 });
 
+// fleet#227 (QA on PR #250): the reuse proof for a released record had the same
+// whole-lineage flaw, so a re-reserved record released through the new door could
+// never be reserved again (RELEASE_NOT_REUSABLE / RECORD_RELEASED). The real #1749
+// lineage: 1 work-created, 2 state-escalated, 3 assignment-abandoned, 4 assignment-reserved.
+test('a re-reserved record released after an earlier touched attempt can be reserved again', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1749';
+  createRecord({ root, id, tenant: 'endzone', issue: 1749, state: 'assigned', idempotencyKey: 'create-1749', now: '2026-09-28T10:00:00.000Z' });
+  move(root, id, 1, 'escalated', 'escalate-1749', 'stale premises', '2026-09-28T10:00:05.000Z');
+  abandonRecord({ root, id, expectedRevision: 2, idempotencyKey: 'abandon-1749', reason: 'ruled', now: '2026-09-28T10:30:00.000Z' });
+  const second = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-b', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-b', now: '2026-09-28T11:00:00.000Z' });
+  assert.equal(second.eventSequence, 4);
+  const released = releaseRecord({ root, id, expectedRevision: second.revision, idempotencyKey: 'release-1749', now: '2026-09-28T11:00:05.000Z' });
+  assert.equal(released.eventSequence, 5);
+
+  assert.deepEqual(reservationBaseline({ root, id }), { revision: released.revision + 1, eventSequence: released.eventSequence + 1, reused: true });
+  const third = reserveRecord({ root, id, tenant: 'endzone', issue: 1749, manifestPath: 'm1749-c', reservations: { components: ['src/cutscene'] }, idempotencyKey: 'reserve-1749-c', now: '2026-09-28T12:00:00.000Z' });
+  assert.equal(third.record.state, 'assigned');
+  assert.equal(third.revision, released.revision + 1);
+  assert.deepEqual(readEvents(root).filter((event) => event.recordId === id).map((event) => event.sequence), [1, 2, 3, 4, 5, 6]);
+});
+
+// fleet#227 (QA on PR #250, low): release and abandon are exact complements. A record
+// reserved with github.prNumber set is not an untouched reservation, so release refuses
+// it; abandon must then accept it instead of also refusing "must be released".
+test('an assigned reservation that carries a PR number is abandonable when it cannot be released', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1754';
+  const reserved = reserveRecord({ root, id, tenant: 'endzone', issue: 1754, manifestPath: 'm1754', github: { issueNumber: 1754, prNumber: 9 }, reservations: { components: ['src/e'] }, idempotencyKey: 'reserve-1754', now: '2026-09-28T10:00:00.000Z' });
+  assert.throws(
+    () => releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-1754' }),
+    (error) => error.code === 'INVALID_RELEASE',
+  );
+  const abandoned = abandonRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'abandon-1754', reason: 'carries a PR', now: '2026-09-28T10:05:00.000Z' });
+  assert.equal(abandoned.record.state, 'abandoned');
+});
+
 test('an escalated touched assignment can be abandoned and reserved again with a fresh lineage step', () => {
   const root = rootDir();
   const id = 'endzone:issue-1136';
