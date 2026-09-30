@@ -12,7 +12,7 @@
 //
 // Classes: identical (same set, order aside - the hook's list is GitHub-ordered and
 // the lead is told to launch the oldest); planner-excludes (the hook would launch an
-// issue the planner refuses, carrying the planner's exclusion codes, e.g. spec-parent,
+// issue the planner refuses, carrying the planner's exclusion codes, e.g. spec-parent, spec-uncut,
 // ready-for-human, assigned, dependency-blocked, frontier-exclusion, reserved);
 // planner-includes (the planner would launch something the hook would not);
 // planner-failed (the planner could not answer: never evidence of agreement).

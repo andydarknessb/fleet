@@ -449,6 +449,7 @@ function windowReasons({ issue, readyAt, ownerLogin, now } = {}) {
 // even when it also carries the ready label, so the live frontier never offers it. A
 // scratch root runs with haiku-rehearsal as its own readyLabel; there it is the ready label.
 const REHEARSAL_LABEL = 'haiku-rehearsal';
+const SPEC_LABEL = 'spec';
 //
 // #209 (spec #193): `boundedReadies` is [{ issue, at }], the tickets standing readied
 // under Bounded authority and when (plannerInputs reads them
@@ -471,6 +472,9 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (foreignAssignees.length) reasons.push({ code: 'assigned', detail: foreignAssignees.join(', ') });
     if (issue.unresolvedDependencies.length) reasons.push({ code: 'dependency-blocked', detail: issue.unresolvedDependencies.map((dependency) => dependency.number || dependency.id || dependency).join(', ') });
     if (issue.isSpecParent) reasons.push({ code: 'spec-parent', detail: 'sub-issues remain or issue is marked as a spec parent' });
+    // fleet #260: the label is evidence on its own. Sub-issue counts say a spec has been cut; they
+    // never say an issue is not a spec. A spec with nothing open under it is not one ticket either.
+    else if (issue.labels.includes(SPEC_LABEL)) reasons.push({ code: 'spec-uncut', detail: 'spec label with no sub-issues; cut it into tickets or remove the spec label to build it as one ticket' });
     if (issue.commentsTruncated) reasons.push({ code: 'issue-comments-truncated', detail: 'the complete issue comment thread could not be pinned' });
     if (issue.labels.includes('ready-for-human')) reasons.push({ code: 'ready-for-human', detail: 'ready-for-human label is present' });
     if (readyLabel !== REHEARSAL_LABEL && issue.labels.includes(REHEARSAL_LABEL)) reasons.push({ code: 'haiku-rehearsal', detail: `${REHEARSAL_LABEL} label is present; the rehearsal owner holds it` });

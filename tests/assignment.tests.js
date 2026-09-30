@@ -72,6 +72,24 @@ test('frontier ordering and exclusion evidence are deterministic', () => {
   assert.ok(excluded.get(10).includes('frontier-exclusion'));
 });
 
+// fleet #260: the spec label alone keeps an issue off the frontier; sub-issue counts are not the only
+// evidence (endzone #1800 was ready-for-agent + spec with no sub-issues and was offered).
+test('a spec-labelled issue is never launchable, even with no sub-issues, and says spec-uncut (fleet #260)', () => {
+  const issues = [
+    issue(20, { labels: ['ready-for-agent', 'spec'] }),
+    issue(21, { labels: ['ready-for-agent', 'spec'], subIssuesSummary: { completed: 0, total: 2 } }),
+    issue(22, { labels: [{ name: 'ready-for-agent' }, { name: 'spec' }], subIssuesSummary: { completed: 2, total: 2 } }),
+    issue(23),
+  ];
+  const result = selectFrontier({ issues, readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.eligible.map((entry) => entry.number), [23]);
+  const reasons = new Map(result.excluded.map((entry) => [entry.issue, entry.reasons]));
+  assert.deepEqual(reasons.get(20).map((reason) => reason.code), ['spec-uncut']);
+  assert.match(reasons.get(20)[0].detail, /spec label with no sub-issues; cut it into tickets or remove the spec label to build it as one ticket/);
+  assert.deepEqual(reasons.get(21).map((reason) => reason.code), ['spec-parent'], 'open sub-issues keep the distinct spec-parent code');
+  assert.deepEqual(reasons.get(22).map((reason) => reason.code), ['spec-uncut'], 'every child closed is still a spec, not a ticket');
+});
+
 test('a haiku-rehearsal issue is off the live frontier even when it carries the ready label (fleet #182)', () => {
   const issues = [issue(11, { labels: ['ready-for-agent', 'haiku-rehearsal'] }), issue(12)];
   const live = selectFrontier({ issues, readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });

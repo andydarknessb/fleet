@@ -298,7 +298,7 @@ _Avoid_: quota, allowance, token limit (unqualified), cost
 **Frontier**:
 The ordered set of ready Units of work the fleet may launch next: open,
 carrying the tenant's ready label, unassigned, with no open blockers, not a
-spec parent, not marked ready for human work, not held for a haiku rehearsal
+spec parent and not labelled `spec` (fleet #260), not marked ready for human work, not held for a haiku rehearsal
 (`haiku-rehearsal`, fleet #182, unless that is the ready label), not reserved by an active Work
 record, and not under a Frontier exclusion; oldest first. The assignment
 planner (`bin/assignment.js`) computes it from GitHub facts, and the project
