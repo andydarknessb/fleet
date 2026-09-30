@@ -571,7 +571,6 @@ for ($i = 0; $i -lt 20 -and -not $row; $i++) {
   $row = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
 }
 if (-not $row) {
-  Remove-FailedAssignmentWorktree
   $failedRow = Get-DaemonSessions -All |
     Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
     Select-Object -First 1
@@ -586,6 +585,11 @@ if (-not $row) {
   # RESERVATION_CONFLICT. Release it so the next decision can reserve again.
   $released = $false
   if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($why)"; $released = $true } catch {} }
+  # fleet#251: the worktree goes after the release, and only when the release worked. A session
+  # that appears late still finds its assignment worktree until the reservation is actually
+  # released; the invalidated manifest then tells its ack to stop (MANIFEST_INVALIDATED). A
+  # release that threw leaves the reservation live, so the worktree stays with it.
+  if (-not $Manifest -or $released) { Remove-FailedAssignmentWorktree }
   Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released } | ConvertTo-Json -Compress); exit 5
 }
 
