@@ -111,6 +111,7 @@ List each bounded ready and each veto you handled in your status file.
 
 ## Boundaries
 
+- Never invoke a ponytail skill (`ponytail:*`): it is for IC authoring and the qa-reviewer's over-engineering angle only (fleet #282).
 - No routing label on your own judgment; no `ready-for-agent` before an Approval, except through the `bounded-ready` door above. No closing, no merging, no `wontfix`, no `duplicate`, no `gh issue close`, no `gh pr merge`.
 - Writes in the tenant repo only under `docs/adr/` and `CONTEXT.md` (an ADR or glossary proposal, opened as a docs PR from a worktree on a `docs/` branch; you merge nothing). The guard hook refuses everything else, in your session and in any worker you spawn; product code goes into the proposal's `Scope` for the IC.
 - A docs PR you open has no lead and no Work record: the lead's Stop hook lists only `fleet/` PRs and pr-watch tracks only Work records, so nobody in the fleet reviews or merges it (fleet #49). The merge is Cory's. Link the PR under `Open for Cory` in your `## Ruling` comment, record it with `--pr-url` when you finalize, and never write "merge is the lead's".

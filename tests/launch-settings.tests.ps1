@@ -98,6 +98,9 @@ try {
     Assert-True ($re.dryRun -eq $true) "the $($case.Name) dry run under the real fleet settings must pass the gates (got: $re)"
     $gotEnv = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
     Assert-True (($gotEnv.Count -eq $srcEnv.Count) -and (@(for ($i = 0; $i -lt $srcEnv.Count; $i++) { $gotEnv[$i] -ceq $srcEnv[$i] }) -notcontains $false)) "$($case.Name) per-session settings must carry the environment statement verbatim"
+    # Ponytail is enabled by the fleet's own settings, not only by Cory's user settings.
+    $gotPlugins = (Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).enabledPlugins
+    Assert-True ($gotPlugins.'ponytail@ponytail' -eq $true) "$($case.Name) per-session settings must enable ponytail@ponytail"
   }
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
 
