@@ -32,7 +32,7 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
 # fleet #232: a bad pages priority would otherwise only surface as a config-invalid page at runtime.
 $cycleCfg = $null
 try { $cycleCfg = Read-Json "$FleetHome\config\cycle.json" } catch { Write-Error "config/cycle.json: $($_.Exception.Message)"; exit 1 }
-$pf = @(Get-PagesPriorityFindings $cycleCfg.pages)
-foreach ($f in $pf) { Write-Error "config/cycle.json: $($f.Key) is '$($f.Value)', not one of emergency|high|normal" }
+$pf = @(Get-PagesPriorityFindings $cycleCfg.pages) + @(Get-WatchdogSyncStallFindings $cycleCfg.watchdog)
+foreach ($f in $pf) { $expect = 'one of emergency|high|normal'; if ($f.PSObject.Properties['Expect']) { $expect = $f.Expect }; Write-Error "config/cycle.json: $($f.Key) is '$($f.Value)', not $expect" }
 if ($pf.Count) { exit 1 }
 Write-Output "setup complete. Next: bin\pilot.ps1 to start the pilot, bin\status.ps1 to watch."

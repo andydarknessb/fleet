@@ -123,5 +123,27 @@ function Get-PagesPriorityFindings {
   if ($Pages.PSObject.Properties['defaultPriority'] -and $Pages.defaultPriority -and $valid -notcontains "$($Pages.defaultPriority)") {
     $found += [pscustomobject]@{ Key = 'pages.defaultPriority'; Value = "$($Pages.defaultPriority)" }
   }
+  # fleet #274: pages.minAgeMinutes.<kind> must be a number of minutes, 0 or more (Expect names the rule).
+  if ($Pages.PSObject.Properties['minAgeMinutes'] -and $null -ne $Pages.minAgeMinutes) {
+    if ($Pages.minAgeMinutes -isnot [pscustomobject]) {
+      $found += [pscustomobject]@{ Key = 'pages.minAgeMinutes'; Value = "$($Pages.minAgeMinutes)"; Expect = 'a map of kind to minutes' }
+    } else {
+      foreach ($p in $Pages.minAgeMinutes.PSObject.Properties) {
+        $v = $p.Value
+        if (-not (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and $v -ge 0)) { $found += [pscustomobject]@{ Key = "pages.minAgeMinutes.$($p.Name)"; Value = "$v"; Expect = 'a number of minutes, 0 or more' } }
+      }
+    }
+  }
   $found
+}
+
+# fleet #274 QA: watchdog.syncStallMinutes must be a number of minutes above 0; the sync run falls back
+# to 120 on anything else, so setup.ps1 and the Watchdog name a typo instead of leaving it silent.
+function Get-WatchdogSyncStallFindings {
+  param($Watchdog)
+  if (-not $Watchdog -or -not $Watchdog.PSObject.Properties['syncStallMinutes']) { return }
+  $v = $Watchdog.syncStallMinutes
+  if (-not (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and $v -gt 0)) {
+    [pscustomobject]@{ Key = 'watchdog.syncStallMinutes'; Value = "$v"; Expect = 'a number of minutes, more than 0' }
+  }
 }

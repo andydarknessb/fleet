@@ -905,9 +905,11 @@ test('old event partitions move to the archive after thirty days, once the ledge
   assert.equal(fs.existsSync(old), true);
   getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(fs.existsSync(old), true, 'ticket 09: no verified ledger, no archival');
-  // A fresh passing verdict from bin/verify-events.js permits the move.
+  // A fresh passing verdict from bin/verify-events.js permits the move. It is dated a
+  // second ahead: mtimeMs has sub-millisecond precision, so a verdict stamped in the same
+  // millisecond as the last write reads as older than it and archival is refused.
   fs.mkdirSync(path.join(root, 'state', 'verify'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'state', 'verify', 'last.json'), JSON.stringify({ pass: true, at: new Date().toISOString() }));
+  fs.writeFileSync(path.join(root, 'state', 'verify', 'last.json'), JSON.stringify({ pass: true, at: new Date(Date.now() + 1000).toISOString() }));
   getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(fs.existsSync(path.join(root, 'state', 'events', 'archive', '2026-07-01.jsonl')), true);
 });

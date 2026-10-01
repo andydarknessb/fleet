@@ -72,4 +72,25 @@ Assert-Count @(Get-PagesPriorityFindings $shippedPages) 0 'the shipped config/cy
 $strPri = @(Get-PagesPriorityFindings ([pscustomobject]@{ priority = 'high' }))
 Assert-True ($strPri.Count -eq 1 -and $strPri[0].Key -eq 'pages.priority' -and $strPri[0].Value -eq 'high') 'a pages.priority that is not a map is reported as pages.priority itself'
 
+# fleet #274: pages.minAgeMinutes.<kind> must be a number of minutes, 0 or more.
+Assert-Count @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = [decimal]60.5 } })) 0 'a decimal number of minutes is not a finding'
+Assert-Count @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = 60; 'x' = 0 } })) 0 'a non-negative number of minutes is not a finding'
+$badAge = @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = 'soon'; 'sync-blocked' = -5 } }))
+Assert-Count $badAge 2 'a string and a negative number are each a finding'
+Assert-True (@($badAge | Where-Object { $_.Key -eq 'pages.minAgeMinutes.sync-unattested' -and $_.Value -eq 'soon' }).Count -eq 1) 'an invalid minAgeMinutes value is reported by dotted key and value'
+$strAge = @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = 60 }))
+Assert-True ($strAge.Count -eq 1 -and $strAge[0].Key -eq 'pages.minAgeMinutes') 'a pages.minAgeMinutes that is not a map is reported as itself'
+
+# fleet #274 QA: watchdog.syncStallMinutes must be a number of minutes above 0 (Get-SyncStallMinutes
+# falls back to 120 on anything else, so a typo would otherwise be silent).
+Assert-Count @(Get-WatchdogSyncStallFindings $null) 0 'an absent watchdog block is not a finding'
+Assert-Count @(Get-WatchdogSyncStallFindings ([pscustomobject]@{ staleMinutes = 45 })) 0 'an absent syncStallMinutes is not a finding'
+Assert-Count @(Get-WatchdogSyncStallFindings ([pscustomobject]@{ syncStallMinutes = 120 })) 0 'a positive number is not a finding'
+Assert-Count @(Get-WatchdogSyncStallFindings ([pscustomobject]@{ syncStallMinutes = [decimal]90.5 })) 0 'a decimal number of minutes is not a finding'
+Assert-Count @(Get-WatchdogSyncStallFindings (Get-Content "$PSScriptRoot\..\config\cycle.json" -Raw -Encoding UTF8 | ConvertFrom-Json).watchdog) 0 'the shipped config/cycle.json carries a valid syncStallMinutes'
+foreach ($bad in 'soon', 0, -5, $true) {
+  $f = @(Get-WatchdogSyncStallFindings ([pscustomobject]@{ syncStallMinutes = $bad }))
+  Assert-True ($f.Count -eq 1 -and $f[0].Key -eq 'watchdog.syncStallMinutes' -and $f[0].Value -eq "$bad") "syncStallMinutes '$bad' is reported by dotted key and value"
+}
+
 Write-Output 'check-policy tests passed'

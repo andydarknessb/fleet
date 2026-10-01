@@ -126,12 +126,16 @@ try {
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
+  # fleet #274: sync-unattested (a release tip that only lacks the fleet-review status; normal, and held
+  # back by pages.minAgeMinutes until it has stood 60 min) and sync-blocked (a required check failed on the
+  # release tip; high), sync-stalled (one sha waited on checks past watchdog.syncStallMinutes; normal).
+  # sync-refused now means an unexplained refusal and stays high.
   # fleet #232: config-invalid (a pages.priority value that is not emergency|high|normal) is normal;
   # a bad priority is reported, never paged louder than the thing it broke.
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
   # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -159,18 +163,50 @@ try {
     if ($PagesConfig.PSObject.Properties['priority'] -and $PagesConfig.priority) {
       if ($PagesConfig.priority -isnot [pscustomobject]) {
         # not a map (a bare string, say): the block itself is the finding, not its .Length
-        [pscustomobject]@{ key = 'pages.priority'; value = "$($PagesConfig.priority)"; fallback = 'normal' }
+        [pscustomobject]@{ key = 'pages.priority'; value = "$($PagesConfig.priority)"; fallback = 'normal'; expect = 'one of emergency|high|normal' }
       } else {
         foreach ($p in $PagesConfig.priority.PSObject.Properties) {
           if (-not $script:PagePriorityValues.ContainsKey("$($p.Value)")) {
-            [pscustomobject]@{ key = "pages.priority.$($p.Name)"; value = "$($p.Value)"; fallback = (Get-PagePriority -Kind $p.Name -PagesConfig $PagesConfig) }
+            [pscustomobject]@{ key = "pages.priority.$($p.Name)"; value = "$($p.Value)"; fallback = (Get-PagePriority -Kind $p.Name -PagesConfig $PagesConfig); expect = 'one of emergency|high|normal' }
           }
         }
       }
     }
     if ($PagesConfig.PSObject.Properties['defaultPriority'] -and $PagesConfig.defaultPriority -and -not $script:PagePriorityValues.ContainsKey("$($PagesConfig.defaultPriority)")) {
-      [pscustomobject]@{ key = 'pages.defaultPriority'; value = "$($PagesConfig.defaultPriority)"; fallback = 'normal' }
+      [pscustomobject]@{ key = 'pages.defaultPriority'; value = "$($PagesConfig.defaultPriority)"; fallback = 'normal'; expect = 'one of emergency|high|normal' }
     }
+    # fleet #274: pages.minAgeMinutes.<kind> must be a number of minutes, 0 or more.
+    if ($PagesConfig.PSObject.Properties['minAgeMinutes'] -and $null -ne $PagesConfig.minAgeMinutes) {
+      if ($PagesConfig.minAgeMinutes -isnot [pscustomobject]) {
+        [pscustomobject]@{ key = 'pages.minAgeMinutes'; value = "$($PagesConfig.minAgeMinutes)"; fallback = 'built-in'; expect = 'a map of kind to minutes' }
+      } else {
+        foreach ($p in $PagesConfig.minAgeMinutes.PSObject.Properties) {
+          if (-not (Test-PageMinAgeValue $p.Value)) {
+            [pscustomobject]@{ key = "pages.minAgeMinutes.$($p.Name)"; value = "$($p.Value)"; fallback = 'built-in'; expect = 'a number of minutes, 0 or more' }
+          }
+        }
+      }
+    }
+  }
+  # fleet #274: pages.minAgeMinutes.<kind> holds a page back until its condition has stood that many
+  # minutes (firstSeen in paged.json); the condition is carried forward undelivered and pages once the
+  # age is reached, and never if it clears first. Exact kind match (a grace is deliberate, not a prefix
+  # family); a value that is not a non-negative number is reported by Get-InvalidPagePriorities and
+  # falls back to the built-in below.
+  $script:DefaultPageMinAge = @{ 'sync-unattested' = 60 }
+  function Test-PageMinAgeValue {
+    param($Value)
+    return (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -ge 0)
+  }
+  function Get-PageMinAgeMinutes {
+    param([string]$Kind, $PagesConfig)
+    $minutes = 0
+    if ($script:DefaultPageMinAge.ContainsKey($Kind)) { $minutes = $script:DefaultPageMinAge[$Kind] }
+    if ($PagesConfig -and $PagesConfig.PSObject.Properties['minAgeMinutes'] -and $PagesConfig.minAgeMinutes -is [pscustomobject]) {
+      $prop = $PagesConfig.minAgeMinutes.PSObject.Properties[$Kind]
+      if ($prop -and (Test-PageMinAgeValue $prop.Value)) { $minutes = [double]$prop.Value }
+    }
+    return $minutes
   }
 
   # --- ticket 81 (ADR 0012): a passed date, in config or on a Notice, pages once
@@ -430,7 +466,7 @@ try {
   # so a bare fixture with no config/cycle.json supervisor.pageKinds override
   # still pages a refused push, the same reasoning ticket 77's Get-PagePriority
   # default already documents for its own hardcoded map.
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded', 'respawn-loop', 'respawn-loop-down', 'cleanup-pending', 'ic-first-turn-stale')
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'sync-unattested', 'sync-blocked', 'sync-stalled', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded', 'respawn-loop', 'respawn-loop-down', 'cleanup-pending', 'ic-first-turn-stale')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
@@ -1223,7 +1259,7 @@ try {
   if ($mode -eq 'live' -and $check) {
     foreach ($e in @($check.escalate)) {
       if ($pageKinds -notcontains "$($e.kind)") { continue }
-      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; kind = "$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e; url = $null }
+      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; kind = "$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e; url = $(if ($e.PSObject.Properties['url'] -and $e.url) { "$($e.url)" } else { $null }) }
     }
   }
   foreach ($pw in $permissionWaits) {
@@ -1294,8 +1330,15 @@ try {
   }
   # fleet #232: an invalid pages priority pages once (paged-state dedupe) and rides every tick line.
   $invalidPagePriority = @(Get-InvalidPagePriorities -PagesConfig $pagesConfig)
+  # fleet #274 QA: watchdog.syncStallMinutes (read by sync-integration.ps1) reports the same way; the sync run falls back to 120.
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['syncStallMinutes']) {
+    $ssm = $watchdogConfig.syncStallMinutes
+    if (-not (($ssm -is [int] -or $ssm -is [long] -or $ssm -is [double] -or $ssm -is [decimal]) -and $ssm -gt 0)) {
+      $invalidPagePriority += [pscustomobject]@{ key = 'watchdog.syncStallMinutes'; value = "$ssm"; fallback = '120'; expect = 'a number of minutes, more than 0' }
+    }
+  }
   foreach ($ip in $invalidPagePriority) {
-    $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not one of emergency|high|normal; pages of that kind fall back to their built-in default until it is fixed"; url = $null }
+    $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not $($ip.expect); pages of that kind fall back to their built-in default until it is fixed"; url = $null }
   }
   # #113 (ADR 0013): the previous tick's deploy step refused to move `live`
   # (not on live, dirty, diverged, fetch or CI unreadable). One page per
@@ -1434,6 +1477,7 @@ try {
       url = $url
     }
     if ($c.key -eq 'fleet-dead') { $entryObj | Add-Member -NotePropertyName repeatedAt -NotePropertyValue $repeatedAt -Force }
+    if ($prevEntry -and $prevEntry.PSObject.Properties['escalationFiledAt']) { $entryObj | Add-Member -NotePropertyName escalationFiledAt -NotePropertyValue $prevEntry.escalationFiledAt -Force }
     $nextPaged | Add-Member -NotePropertyName $c.key -NotePropertyValue $entryObj
   }
 
@@ -1470,14 +1514,37 @@ try {
       $isNew = ($oldKeys -notcontains $c.key)
       $entry = $nextPaged.($c.key)
 
-      if ($isNew -and $c.PSObject.Properties['escalation'] -and $c.escalation) {
+      # fleet #274: pages.minAgeMinutes - inside the grace the condition stands (banner, conditions, the
+      # carried-forward entry above) but nothing is sent and no attempt is counted; an unreadable
+      # firstSeen fails toward paging.
+      $inPageGrace = $false
+      $pageMinAge = Get-PageMinAgeMinutes -Kind "$($c.kind)" -PagesConfig $pagesConfig
+      if ($pageMinAge -gt 0) {
+        $firstSeenUtc = ConvertTo-UtcDateTime $entry.firstSeen
+        if ($firstSeenUtc -and (New-TimeSpan -Start $firstSeenUtc -End $now).TotalMinutes -lt $pageMinAge) { $inPageGrace = $true }
+      }
+
+      # The escalation file is what the dispatcher's reader relays, so a kind with a grace files it when
+      # its page is first actually sent (escalationFiledAt in the entry), not on first sight: a flap that
+      # clears inside the grace leaves no file, and the reader cannot page ahead of the grace. Every
+      # other kind files on first sight, as before.
+      $fileEscalation = $false
+      if ($c.PSObject.Properties['escalation'] -and $c.escalation) {
+        if ($pageMinAge -gt 0) { $fileEscalation = (-not $inPageGrace) -and (-not $entry.PSObject.Properties['escalationFiledAt']) }
+        else { $fileEscalation = $isNew }
+      }
+      if ($fileEscalation) {
         $e = $c.escalation
         $parentName = ''; if ($e.PSObject.Properties['parent']) { $parentName = "$($e.parent)" }
         $escFile = Write-Escalation -From 'supervisor' -Kind "$($e.kind)" -Detail "$($e.detail)" -Name "$($e.name)" -Parent $parentName
-        if ($escFile) { $entry.url = "$escFile" }
+        # A condition that carries its own link (an unattested tip's reconciliation PR) keeps it.
+        if ($escFile -and -not ($c.PSObject.Properties['url'] -and $c.url)) { $entry.url = "$escFile" }
         $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
+        if ($pageMinAge -gt 0) { $entry | Add-Member -NotePropertyName escalationFiledAt -NotePropertyValue (Now-Iso) -Force }
       }
-      if (-not $entry.url -and $c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
+      # The link is refreshed from the current report each tick: a reconciliation PR that was closed and
+      # reopened elsewhere is linked by its new url, with no new page.
+      if ($c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
 
       # review 2: a given-up entry gets one more chance once the retry window has
       # passed, or right away once pushover.json was touched after the give-up
@@ -1496,7 +1563,7 @@ try {
       }
 
       $deliveredThisTick = $false   # #197: a page delivered in THIS tick has no repeat clock to run yet
-      if (-not $entry.deliveredAt -and -not $entry.gaveUpAt) {
+      if (-not $entry.deliveredAt -and -not $entry.gaveUpAt -and -not $inPageGrace) {
         $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
         $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $entry.url -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast
         # `-contains`/`-eq` against a boolean literal on the LEFT coerces any
