@@ -28,8 +28,11 @@ $ErrorActionPreference = 'Stop'
 $fleetRoot = Split-Path -Parent $PSScriptRoot
 if (-not $TestsDir) { $TestsDir = Join-Path $fleetRoot 'tests' }
 $ownLogDir = -not $LogDir
-if (-not $LogDir) { $LogDir = Join-Path ([IO.Path]::GetTempPath()) ('fleet-test-all-' + [guid]::NewGuid().ToString('N')) }
-[IO.Directory]::CreateDirectory($LogDir) | Out-Null
+# A short name: every suite's TEMP lives under it, and test-all.tests.ps1 nests a runner inside
+# the runner, so each character here is paid twice against MAX_PATH (#278).
+if (-not $LogDir) { $LogDir = Join-Path ([IO.Path]::GetTempPath()) ('fleet-test-all-' + [guid]::NewGuid().ToString('N').Substring(0, 12)) }
+# Suites run from the fleet root with this as TEMP, so it must not stay relative.
+$LogDir = [IO.Path]::GetFullPath([IO.Path]::Combine((Get-Location).ProviderPath, $LogDir))
 
 $node = (Get-Command node -ErrorAction SilentlyContinue)
 $powershell = Join-Path $PSHOME 'powershell.exe'
@@ -47,9 +50,20 @@ if (($suites | Where-Object { $_.Name -like '*.tests.js' }) -and -not $node) {
   exit 2
 }
 
+# Windows PowerShell 5.1 spins in Start-Process when the child's TEMP nears MAX_PATH, out of
+# reach of -SuiteTimeoutMinutes; refuse up front instead (#278).
+$maxTempPath = 200
+if (($LogDir.Length + 4) -gt $maxTempPath) {
+  Write-Output "test-all: -LogDir '$LogDir' is too long; each suite's TEMP under it must stay within $maxTempPath characters"
+  exit 2
+}
+[IO.Directory]::CreateDirectory($LogDir) | Out-Null
+
 $failed = New-Object System.Collections.Generic.List[string]
 $started = Get-Date
+$suiteIndex = 0
 foreach ($suite in $suites) {
+  $suiteIndex++
   $log = Join-Path $LogDir ($suite.Name + '.log')
   $errLog = Join-Path $LogDir ($suite.Name + '.err.log')
   if ($suite.Name -like '*.tests.js') {
@@ -59,8 +73,8 @@ foreach ($suite in $suites) {
     $exe = $powershell
     $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $suite.FullName + '"'
   }
-  $suiteTemp = Join-Path $LogDir 'tmp'
-  if (Test-Path -LiteralPath $suiteTemp) { Remove-Item -LiteralPath $suiteTemp -Recurse -Force -ErrorAction SilentlyContinue }
+  # One directory per suite, so a leftover a suite could not delete is never blamed on the next one.
+  $suiteTemp = Join-Path $LogDir ('t' + $suiteIndex)
   [IO.Directory]::CreateDirectory($suiteTemp) | Out-Null
   $savedTemp = $env:TEMP; $savedTmp = $env:TMP
   $env:TEMP = $suiteTemp; $env:TMP = $suiteTemp
@@ -83,7 +97,11 @@ foreach ($suite in $suites) {
   $clock.Stop()
   $seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
   $leaked = @(Get-ChildItem -LiteralPath $suiteTemp -Force -Filter 'fleet-*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Sort-Object)
-  Remove-Item -LiteralPath $suiteTemp -Recurse -Force -ErrorAction SilentlyContinue
+  # A detached child the suite started may still hold a file for a moment after the suite exits.
+  for ($attempt = 1; $attempt -le 5 -and (Test-Path -LiteralPath $suiteTemp); $attempt++) {
+    Remove-Item -LiteralPath $suiteTemp -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $suiteTemp) { Start-Sleep -Milliseconds 500 }
+  }
   $ok = ($code -is [int]) -and $code -eq 0 -and $leaked.Count -eq 0
   $label = if ($ok) { 'PASS' } else { 'FAIL' }
   $leakNote = if ($leaked.Count -gt 0) { '  leaked {0} temp entr{1}: {2}' -f $leaked.Count, $(if ($leaked.Count -eq 1) { 'y' } else { 'ies' }), (($leaked | Select-Object -First 5) -join ', ') } else { '' }

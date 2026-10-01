@@ -76,6 +76,16 @@ try {
 
   $none = Run-Runner @('-Filter', 'zzz*')
   Assert-True ($script:lastExit -eq 2) "a filter matching nothing exits 2, got $($script:lastExit): $none"
+  Assert-True ((Get-LogDirs).Count -eq 0) "an exit-2 run leaves no log dir in TEMP: $((Get-LogDirs) -join ', ')"
+
+  Push-Location $fixture
+  try { $relative = Run-Runner @('-Filter', '[ag]*', '-LogDir', 'rel-logs') } finally { Pop-Location }
+  Assert-True ($script:lastExit -eq 0) "a relative -LogDir resolves against the caller's directory, got $($script:lastExit): $relative"
+  Assert-True (Test-Path -LiteralPath (Join-Path $fixture 'rel-logs\alpha.tests.js.log')) 'a relative -LogDir lands under the caller directory'
+
+  $tooLong = Join-Path $fixture ('x' * 200)
+  $long = Run-Runner @('-Filter', '[ag]*', '-LogDir', $tooLong)
+  Assert-True ($script:lastExit -eq 2 -and $long -match 'too long') "a -LogDir too long for the suites' TEMP is refused, got $($script:lastExit): $long"
 
   Write-Output 'test-all.tests.ps1: all assertions passed'
 } finally {
