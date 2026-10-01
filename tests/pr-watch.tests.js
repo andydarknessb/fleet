@@ -1,8 +1,8 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { evaluateChecks, planRecord, runWatch, closingLinked, closingLinkage, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
@@ -12,7 +12,7 @@ const { selectFrontier } = require('../bin/assignment');
 const { CASES: CLOSING_CASES, ISSUE: CLOSING_ISSUE, REPO: CLOSING_REPO } = require('./closing-link.cases');
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-pr-watch-'));
+  return makeTempDir('fleet-pr-watch-');
 }
 
 const TENANT = {

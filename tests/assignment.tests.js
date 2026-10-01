@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { spawnSync } = require('node:child_process');
@@ -27,7 +27,7 @@ const {
 const { WorkStateError, abandonRecord, createRecord, getRecord, reserveRecord, transitionRecord } = require('../bin/work-state');
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-assignment-'));
+  return makeTempDir('fleet-assignment-');
 }
 
 function issue(number, overrides = {}) {
@@ -949,7 +949,7 @@ test('#154: assigned-to-owner is foreign, assigned-to-fleet is kept, unassigned 
 });
 
 test('#154: the assignment loader refuses a tenant whose fleetIdentity is its ownerLogin', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-154-'));
+  const root = makeTempDir('fleet-154-');
   fs.mkdirSync(path.join(root, 'tenants'));
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' }));
   assert.throws(() => readTenantConfig(root, 'endzone'), { code: 'TENANT_IDENTITY_NOT_DISTINCT' });
@@ -1051,7 +1051,7 @@ test('#209: a ticket readied through the owner Approval is unaffected, whatever 
 });
 
 function plannerRoot(rows) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-209-'));
+  const root = makeTempDir('fleet-209-');
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'example/repo', readyLabel: 'ready-for-agent', fleetIdentity: 'fleet-bot', ownerLogin: OWNER, defaultBranch: 'integration' }));

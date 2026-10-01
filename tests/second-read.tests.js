@@ -4,8 +4,8 @@
 // Cory's session to run. Red-tell: before bin/second-read.js nothing samples them.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { createRecord, transitionRecord, recordReview } = require('../bin/work-state');
 const { previousWeek } = require('../bin/report-week');
@@ -15,7 +15,7 @@ const NOW = '2026-09-28T12:00:00.000Z'; // a Monday: the week read is 2026-09-21
 const IN_WEEK = '2026-09-23T10:00:00.000Z';
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-second-read-'));
+  const root = makeTempDir('fleet-second-read-');
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'andydarknessb/Endzone-Empire' }));

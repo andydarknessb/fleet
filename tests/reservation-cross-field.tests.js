@@ -6,15 +6,15 @@
 // through as independent while both units edited that file.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { buildLaunchPlan, independenceProof, selectFrontier } = require('../bin/assignment');
 const { proofFor, reservationConflicts, reservationOverlaps, reserveRecord } = require('../bin/work-state');
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cross-field-'));
+  return makeTempDir('fleet-cross-field-');
 }
 
 function issue(number, reservations) {

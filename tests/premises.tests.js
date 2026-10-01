@@ -4,8 +4,8 @@
 // whose paths moved between their sha and the fetched base.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { parsePremises, PremisesError } = require('../bin/premises');
@@ -15,7 +15,7 @@ const { getRecord } = require('../bin/work-state');
 const SHA = '0123456789abcdef0123456789abcdef01234567';
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-premises-'));
+  return makeTempDir('fleet-premises-');
 }
 
 function issue(number, body) {
@@ -135,7 +135,7 @@ function git(repo, ...args) {
 // A tenant checkout with two commits: `first` writes src/a.js and src/lib/b.js,
 // `head` changes only src/lib/b.js. `head` is the fetched base.
 function tenantRepo() {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-premises-repo-'));
+  const repo = makeTempDir('fleet-premises-repo-');
   git(repo, 'init', '-q');
   git(repo, 'config', 'user.email', 'test@example.com');
   git(repo, 'config', 'user.name', 'test');

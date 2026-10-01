@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const {
@@ -328,7 +328,7 @@ test('buildCycleRecords and buildReport retain control-plane session metrics sep
 });
 
 test('collectFromFiles writes stable daily JSON and summary artifacts', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const root = makeTempDir('fleet-cycle-');
   const transcripts = path.join(root, 'transcripts');
   const output = path.join(root, 'output');
   fs.mkdirSync(path.join(transcripts, 'project-worktree'), { recursive: true });
@@ -435,7 +435,7 @@ test('buildCycleRecords classifies a closed-unmerged unit as abandoned and an un
 });
 
 test('the seven-day report names its own window and is persisted as JSON', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const root = makeTempDir('fleet-cycle-');
   const transcripts = path.join(root, 'transcripts');
   fs.mkdirSync(path.join(transcripts, 'p'), { recursive: true });
   fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{ name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1' }] }));
@@ -466,7 +466,7 @@ test('cli: refuses --transcript (confusable with --transcripts) as an unknown fl
 });
 
 test('cli: a correct invocation still works, matching the direct call', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const root = makeTempDir('fleet-cycle-');
   const transcripts = path.join(root, 'transcripts');
   const output = path.join(root, 'output');
   fs.mkdirSync(path.join(transcripts, 'project-worktree'), { recursive: true });
@@ -565,7 +565,7 @@ test('#124: a synthetic assistant row does not name the session model', () => {
 // --- #125: the collector counts sessions that rotation retired ----------------------
 // Red-tell: the rotated-lead fixture counts only the live lead session before the change.
 function rotationFixture({ retiredLines, rosterSessions, transcripts, subagents = {} }) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-retired-'));
+  const root = makeTempDir('fleet-cycle-retired-');
   const dir = path.join(root, 'transcripts', 'p');
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
@@ -800,7 +800,7 @@ test('#128: the seven-day JSON carries the per-family figures, and the shipped c
   assert.deepEqual(shipped.budgets.icJobTokensTargets, nullTargets);
   assert.equal(shipped.budgets.icJobTokensMedianReference, 60000);
   assert.equal(shipped.budgets.icJobTokensMedian, undefined, 'the judged key is gone');
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-cycle-'));
+  const root = makeTempDir('fleet-cycle-');
   const transcripts = path.join(root, 'transcripts');
   fs.mkdirSync(path.join(transcripts, 'p'), { recursive: true });
   fs.writeFileSync(path.join(root, 'roster.json'), JSON.stringify({ sessions: [{ name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'retired', retiredAt: '2026-09-01T00:01:00.000Z', sessionId: 'session-1' }] }));

@@ -2,14 +2,14 @@
 // Ticket 09 telemetry: the unified budget summary.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { buildSummary, family, median, cli, BUDGET_REPORT_FLAGS, BudgetReportError } = require('../bin/budget-report');
 const { createRecord, transitionRecord, recordBudget } = require('../bin/work-state');
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-budget-report-'));
+  const root = makeTempDir('fleet-budget-report-');
   fs.mkdirSync(path.join(root, 'state', 'budget'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'metrics'), { recursive: true });
   fs.writeFileSync(path.join(root, 'state', 'roster.json'), JSON.stringify({ sessions: [
