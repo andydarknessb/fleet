@@ -72,6 +72,19 @@ test('unrouted and triage-labelled issues are tickets; routed, spec-parent, owne
   assert.equal(result.counts.tickets, 4);
 });
 
+// fleet #260: the assignment planner was blind to the spec label; the Principal's frontier is not.
+// A spec with no sub-issues, and one carrying any other label beside it, is routed, never a ticket.
+test('a spec-labelled issue is routed even with no sub-issues and with other labels beside it (fleet #260)', () => {
+  const result = frontier([
+    issue(30, { labels: ['spec'] }),
+    issue(31, { labels: ['spec', 'bug'] }),
+    issue(32, { labels: ['spec', 'needs-triage'] }),
+  ]);
+  assert.deepEqual(result.eligible, []);
+  for (const entry of result.skipped) assert.match(entry.reason, /routed/);
+  assert.equal(result.skipped.length, 3);
+});
+
 // fleet#55: every fleet session posts under the tenant's ownerLogin, so "the owner has
 // the newest comment" was true of every fleet comment and could not mean "Cory is in
 // conversation". Two companion tickets left the frontier on the strength of the lead's
@@ -410,6 +423,221 @@ test('a standing bounded ready settles the issue like a finalized row; a Veto st
   recordEntry({ root, tenant: 'endzone', kind: 'veto', issue: 7, by: OWNER, now: '2026-09-24T00:31:00.000Z' });
   const vetoed = frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [veto] })], { ...at, entries: readLedger(root, 'endzone') });
   assert.deepEqual(vetoed.eligible.map((row) => row.number), [], 'the vetoed proposal awaits Approval; it is not re-proposed under a hold label');
+  // #263: the owner's Veto is newest above, which the conversation rule skips by itself. A fleet
+  // comment after it (a lead's cross-link, a measurement) is what used to put it back as unrouted.
+  const later = comment(FLEET, 'Companion: #1800.', '2026-09-24T00:45:00.000Z');
+  const afterFleet = frontier([issue(7, { body, labels: ['haiku-rehearsal'], comments: [veto, later] })], { ...at, entries: readLedger(root, 'endzone') });
+  assert.deepEqual(afterFleet.eligible.map((row) => row.number), [], 'a fleet comment after the Veto does not re-serve the vetoed proposal');
+  assert.match(afterFleet.skipped.find((row) => row.number === 7).reason, /awaiting approval/);
+});
+
+// #263 (sibling of the #1773 loop #239 fixes for settled issues): an OPEN proposal (a ledger
+// `proposed` row with no outcome) whose marker Cory swapped for a label the frontier does not route
+// is still awaiting his Approval. Served as `ticket: unrouted`, the Principal's
+// `record --kind proposed` is refused with TRIAGE_PROPOSAL_OPEN and the Stop hook loops.
+const OPEN_BODY = '## What to build\n\nThe thing.\n';
+const OPEN_AT = '2026-09-10T00:00:00.000Z';
+function openProposalWorld() {
+  const root = rootDir();
+  const hash = triage.normalizeIssue(issue(7, { body: OPEN_BODY })).bodyHash;
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/7', model: 'fable', now: OPEN_AT });
+  return { root, entries: readLedger(root, 'endzone') };
+}
+// What the Principal does with a frontier item, against a copy of the ledger (the real record path):
+// a ticket is `record --kind proposed`; a reproposal, or an escalation carrying an openProposal (#268),
+// supersedes the open proposal first, then proposes.
+function principalCanRecord(world, item) {
+  const copy = rootDir();
+  fs.mkdirSync(path.dirname(triage.ledgerPath(copy, 'endzone')), { recursive: true });
+  fs.copyFileSync(triage.ledgerPath(world.root, 'endzone'), triage.ledgerPath(copy, 'endzone'));
+  const base = { root: copy, tenant: 'endzone', issue: item.number, now: '2026-09-25T00:00:00.000Z' };
+  try {
+    if (item.kind === 'reproposal' || item.openProposal) recordEntry({ ...base, kind: 'superseded', bodyHash: item.bodyHash });
+    recordEntry({ ...base, kind: 'proposed', bodyHash: item.bodyHash, commentUrl: 'https://x/new', model: 'fable' });
+    return true;
+  } catch (error) {
+    if (error.code === 'TRIAGE_PROPOSAL_OPEN') return false;
+    throw error;
+  }
+}
+
+test('#263: an open proposal whose marker became a hold label waits for Approval, whoever commented last', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
+  const veto = comment(OWNER, 'Veto: not like this.', '2026-09-11T00:00:00.000Z');
+  const ownerChat = comment(OWNER, 'Let us park this behind the rehearsal.', '2026-09-11T00:00:00.000Z');
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const fleetAsk = comment(FLEET, 'Re-propose: scope moved.', '2026-09-12T01:00:00.000Z');
+  const cases = [
+    [['haiku-rehearsal'], [veto, cross]],
+    [['haiku-rehearsal'], [ownerChat, cross]],
+    [['bug', 'haiku-rehearsal'], [cross]],
+    [['haiku-rehearsal'], []],
+    [['haiku-rehearsal'], [fleetAsk]],
+    [['needs-triage'], [ownerChat, cross]],
+    [[], [ownerChat, cross]],
+    [['haiku-rehearsal'], [comment(OWNER, 'Re-propose: scope moved.', '2026-09-11T00:00:00.000Z'), cross]],
+  ];
+  for (const [labels, comments] of cases) {
+    const result = frontier([issue(7, { body: OPEN_BODY, labels, comments })], at);
+    const what = `labels [${labels}], comments [${comments.map((c) => `${c.author}: ${c.body.slice(0, 10)}`)}]`;
+    assert.deepEqual(result.eligible, [], `${what} must not be served`);
+    const reason = result.skipped.find((row) => row.number === 7).reason;
+    assert.match(reason, /awaiting approval/, what);
+    assert.ok(reason.includes(OPEN_AT), `${what}: the reason names the proposal time`);
+    assert.match(reason, /until Cory comments Approved or Re-propose, or the body changes/, `${what}: the reason names the releasing events`);
+    assert.ok(labels.every((label) => reason.includes(label)), `${what}: the reason names the labels it sits under`);
+  }
+  // Control: with no open proposal the same issue is a ticket, and with one open, record refuses it.
+  const served = frontier([issue(7, { body: OPEN_BODY, labels: ['haiku-rehearsal'], comments: [cross] })], { ...at, entries: [] });
+  assert.deepEqual(served.eligible.map((row) => row.kind), ['ticket']);
+  assert.equal(principalCanRecord(world, served.eligible[0]), false, 'with the proposal open, record --kind proposed refuses it');
+});
+
+test('#263: the owner\'s Re-propose as the newest comment yields a reproposal under a hold label, and the Principal can record it', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-11T00:00:00.000Z');
+  const ask = comment(OWNER, 'Re-propose: scope moved.', '2026-09-12T00:00:00.000Z');
+  const emitted = [];
+  for (const labels of [['haiku-rehearsal'], ['bug', 'haiku-rehearsal'], ['needs-triage'], []]) {
+    const result = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross, ask] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:reproposal'], `labels [${labels}]`);
+    assert.equal(result.eligible[0].reason, 'owner asked for a new proposal');
+    emitted.push(...result.eligible);
+  }
+  // The same kind and shape the marked issue yields.
+  const marked = frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'], comments: [cross, ask] })], at);
+  assert.deepEqual(emitted[0], marked.eligible[0]);
+  // A fleet comment after the ask buries it, as it does under the marker.
+  const buried = frontier([issue(7, { body: OPEN_BODY, labels: ['haiku-rehearsal'], comments: [ask, comment(FLEET, 'Companion: #1801.', '2026-09-13T00:00:00.000Z')] })], at);
+  assert.deepEqual(buried.eligible, []);
+  for (const item of emitted) assert.equal(principalCanRecord(world, item), true, 'supersede then propose succeeds');
+});
+
+test('#263: a changed body reopens an unmarked open proposal as a reproposal, as it does under the marker; an unchanged body waits', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const changedBody = `${OPEN_BODY}More.
+`;
+  const marked = frontier([issue(7, { body: changedBody, labels: ['triage-proposed'], comments: [cross] })], at);
+  assert.deepEqual(marked.eligible.map((row) => `${row.number}:${row.kind}`), ['7:reproposal']);
+  assert.match(marked.eligible[0].reason, /body changed since the proposal/);
+  for (const labels of [['haiku-rehearsal'], ['bug', 'haiku-rehearsal'], ['needs-triage'], []]) {
+    const changed = frontier([issue(7, { body: changedBody, labels, comments: [cross] })], at);
+    assert.deepEqual(changed.eligible, marked.eligible, `labels [${labels}]: the same item the marker path yields`);
+    assert.equal(principalCanRecord(world, changed.eligible[0]), true, 'supersede then propose succeeds');
+    const same = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross] })], at);
+    assert.deepEqual(same.eligible, [], `labels [${labels}]: an unchanged body waits`);
+  }
+});
+
+// #268: a decision-needed wake newer than the consumed marker is served as an escalation, open proposal or not
+// (it is a decision the Principal must see). It carries the open proposal so the Principal supersedes it first.
+const WAKE = { wake: 'decision-needed', recordId: 'endzone:issue-7', at: '2026-09-20T00:00:00.000Z', evidence: 'lead needs a ruling', reason: 'stale-premise', premise: 'src/a.js: x @abc1234' };
+
+test('#268: an escalation on an issue with an open proposal is served carrying that proposal, under the marker or a hold label', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET, outbox: [WAKE] };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const proposalHash = triage.normalizeIssue(issue(7, { body: OPEN_BODY })).bodyHash;
+  for (const labels of [['triage-proposed'], ['haiku-rehearsal'], ['fleet-escalation'], ['needs-triage'], []]) {
+    const result = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:escalation'], `labels [${labels}]`);
+    assert.deepEqual(result.eligible[0].openProposal, { commentUrl: 'https://x/7', bodyHash: proposalHash, at: OPEN_AT });
+    assert.equal(result.eligible[0].bodyHash, proposalHash);
+    assert.equal(principalCanRecord(world, result.eligible[0]), true, 'supersede then propose succeeds');
+  }
+  // A changed body: the item carries the live hash and the proposal's own, so superseding uses the live one.
+  const changed = frontier([issue(7, { body: `${OPEN_BODY}More.
+`, labels: ['haiku-rehearsal'], comments: [cross] })], at);
+  assert.notEqual(changed.eligible[0].bodyHash, changed.eligible[0].openProposal.bodyHash);
+  // No open proposal: no openProposal, and record --kind proposed is accepted as it stands.
+  const fresh = frontier([issue(7, { body: OPEN_BODY, labels: ['needs-triage'], comments: [cross] })], { ...at, entries: [] });
+  const escalation = fresh.eligible.find((row) => row.kind === 'escalation');
+  assert.equal('openProposal' in escalation, false);
+  // An outcome recorded (approved, awaiting finalize) is not an open proposal either.
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 7, by: OWNER, now: '2026-09-21T00:00:00.000Z' });
+  const decided = frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'], comments: [cross] })], { ...at, entries: readLedger(world.root, 'endzone') });
+  assert.equal('openProposal' in decided.eligible.find((row) => row.kind === 'escalation'), false);
+});
+
+test('#268: an escalation the open proposal already answers is marked answered, not openProposal; the wake it never reached still carries openProposal', () => {
+  const root = rootDir();
+  const hash = triage.normalizeIssue(issue(7, { body: OPEN_BODY })).bodyHash;
+  // Proposed after the wake (20th), recorded against it: the proposal IS the answer.
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/answer', model: 'fable', recordId: WAKE.recordId, now: '2026-09-21T00:00:00.000Z' });
+  const at = { entries: readLedger(root, 'endzone'), now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET, outbox: [WAKE] };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-22T00:00:00.000Z');
+  for (const labels of [['triage-proposed'], ['haiku-rehearsal'], []]) {
+    const result = frontier([issue(7, { body: OPEN_BODY, labels, comments: [cross] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:escalation'], `labels [${labels}]`);
+    assert.deepEqual(result.eligible[0].answered, { commentUrl: 'https://x/answer', at: '2026-09-21T00:00:00.000Z' });
+    assert.equal('openProposal' in result.eligible[0], false);
+  }
+  // What the Principal does with an answered item: consumed through the wake, nothing else.
+  recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: WAKE.at, recordId: WAKE.recordId, now: '2026-09-25T00:00:00.000Z' });
+  assert.deepEqual(frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'], comments: [cross] })], { ...at, entries: readLedger(root, 'endzone') }).eligible, []);
+  // An older proposal with the same constant recordId (the id is per issue) is not the answer to a newer wake.
+  const old = rootDir();
+  recordEntry({ root: old, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/old', model: 'fable', recordId: WAKE.recordId, now: '2026-09-10T00:00:00.000Z' });
+  const older = frontier([issue(7, { body: OPEN_BODY, labels: ['triage-proposed'] })], { ...at, entries: readLedger(old, 'endzone') });
+  assert.equal(older.eligible[0].openProposal.commentUrl, 'https://x/old');
+  assert.equal('answered' in older.eligible[0], false);
+});
+
+test('#268: an escalation for an issue replaces any ticket or reproposal for the same issue on the frontier', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET, outbox: [WAKE] };
+  const cross = comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z');
+  const ask = comment(OWNER, 'Re-propose: scope moved.', '2026-09-13T00:00:00.000Z');
+  for (const [labels, body, comments] of [[['triage-proposed'], `${OPEN_BODY}More.
+`, [cross]], [['haiku-rehearsal'], `${OPEN_BODY}More.
+`, [cross]], [['haiku-rehearsal'], OPEN_BODY, [cross, ask]]]) {
+    const result = frontier([issue(7, { body, labels, comments }), issue(8, { labels: ['needs-triage'] })], at);
+    assert.deepEqual(result.eligible.map((row) => `${row.number}:${row.kind}`), ['7:escalation', '8:ticket'], `labels [${labels}]`);
+    assert.deepEqual(result.proposeNow, [8], 'the dropped item does not spend the proposal cap');
+    assert.equal(result.counts.tickets, 1);
+    assert.equal(principalCanRecord(world, result.eligible[0]), true);
+  }
+});
+
+test('#263/#268: no ticket, reproposal or escalation the frontier emits for an open-proposal issue is refused by record --kind proposed', () => {
+  const world = openProposalWorld();
+  const at = { entries: world.entries, now: '2026-09-25T00:00:00.000Z', fleetIdentity: FLEET };
+  const singles = [comment(OWNER, 'Re-propose: again.', '2026-09-12T00:00:00.000Z'), comment(FLEET, 'note', '2026-09-12T00:00:00.000Z'), comment(OWNER, 'Veto', '2026-09-12T00:00:00.000Z')];
+  for (const labels of [['haiku-rehearsal'], ['held'], ['needs-triage'], ['question'], [], ['triage-proposed']]) {
+    for (const comments of [[], ...singles.map((one) => [one]), [singles[0], singles[1]], [singles[2], singles[1]]]) {
+      for (const outbox of [[], [WAKE]]) {
+      const result = frontier([issue(7, { body: OPEN_BODY, labels, comments })], { ...at, outbox });
+      for (const item of result.eligible) {
+        if (item.kind === 'approval') continue;   // an approval is recorded as an outcome, not a proposal
+        assert.equal(principalCanRecord(world, item), true, `${item.kind} for labels [${labels}] comments [${comments.map((c) => c.body)}] outbox ${outbox.length}`);
+      }
+      }
+    }
+  }
+});
+
+test('#263: an exact Approved on a proposal parked under a hold label is left by the finalize script (labels) and shown to the Principal as an approval', () => {
+  // Decision: no frontier change is needed. Step 1 of the frontier surfaces an owner Approved newer than
+  // an open proposal before any label is read, and the finalize script refuses the issue on clause 9
+  // (`labels`: the hold label itself is a blocking label for haiku-rehearsal and held; with a non-blocking
+  // label the same clause fires on the missing triage-proposed marker), so the Principal, not the script,
+  // finalizes it.
+  for (const labels of [['haiku-rehearsal'], ['held']]) {
+    const world = finalizeWorld({ each: () => ({ labels, thread: { extraComments: [comment(FLEET, 'Companion: #1800.', '2026-09-12T00:00:00.000Z')] } }) });
+    const before = JSON.stringify(world.fixtureIssue());
+    const result = world.finalize();
+    assert.deepEqual(result.finalized, []);
+    assert.equal(result.left.find((row) => row.issue === 40).reason, 'labels');
+    assert.equal(JSON.stringify(world.fixtureIssue()), before, 'the script writes nothing');
+    const shown = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW });
+    assert.deepEqual(shown.eligible.map((row) => `${row.number}:${row.kind}`), ['40:approval'], `labels [${labels}]`);
+    assert.equal(shown.eligible[0].withEdits, false);
+    assert.equal(shown.eligible[0].commentUrl, approvalUrl(40));
+  }
 });
 
 test('#145: hash prints the live body hash exactly as the frontier computes it', () => {
@@ -826,6 +1054,103 @@ test('#207: the finalize CLI runs against a fixture and prints what it finalized
   assert.deepEqual(out.left, [{ issue: 41, reason: 'not-exact-approval' }]);
   assert.ok(TRIAGE_FLAGS.finalize.includes('fixture'));
   assert.throws(() => cli(['finalize', '--root', world.root, '--tenant', 'endzone', '--fixtrue', 'x']), (error) => /unknown flag/.test(error.message));
+});
+
+// #233: the triage block used to read a tenant's open issues twice per tick (finalize, then frontier).
+// `triageTick` reads once, finalizes over that read, patches the read with what the finalize wrote to
+// GitHub, and computes the frontier over the patched read.
+function countingRunner(seed, write) {
+  const counts = { queries: 0, writes: [] };
+  const runner = ghRunner(seed, (exe, args, options) => { counts.writes.push(args.slice(0, 2).join(' ')); return write ? write(exe, args, options) : ''; }, () => { counts.queries += 1; });
+  return { runner, counts };
+}
+
+test('#233: a tick reads the open issues once, and the frontier it returns shows the finalize (marker gone, ready label on, no approval)', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed);
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1, 'one GraphQL read for finalize and frontier together');
+  assert.deepEqual(counts.writes, ['issue comment', 'issue edit']);
+  assert.deepEqual(tick.finalize.finalized.map((row) => row.issue), [40]);
+  assert.equal(tick.finalize.error, undefined);
+  assert.deepEqual(tick.frontier.eligible, [], 'the finalized issue is neither an approval nor a ticket');
+  assert.deepEqual(tick.frontier.skipped, [{ number: 40, reason: 'routed (ready-for-agent)' }], 'it is routed, which only the patched labels can say (unpatched: marker still on)');
+  // What a second, standalone read after the finalize would say is the same.
+  const seedAfter = JSON.parse(JSON.stringify(seed));
+  seedAfter[0].labels = ['needs-triage', 'ready-for-agent', 'bug'];
+  assert.deepEqual(tick.frontier.skipped, computeFrontier({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seedAfter, () => '') }).skipped);
+});
+
+test('#233: a tick that finalizes nothing still reads once, and the frontier is the standalone frontier', () => {
+  const root = rootDir();
+  const seed = [issue(1, { labels: ['needs-triage'] }), issue(2, { labels: ['ready-for-agent'] })];
+  const { runner, counts } = countingRunner(seed);
+  const tick = triage.triageTick({ root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1);
+  assert.deepEqual(counts.writes, []);
+  assert.deepEqual(tick.finalize.finalized, []);
+  const alone = computeFrontier({ root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, () => '') });
+  assert.deepEqual(tick.frontier, alone);
+});
+
+test('#233: a finalize write that FAILED on GitHub is not applied to the frontier read', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed, (exe, args) => { if (args[1] === 'edit') throw Object.assign(new Error('gh: 502'), { stderr: 'HTTP 502' }); return ''; });
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1);
+  assert.deepEqual(tick.finalize.finalized, []);
+  assert.match(tick.finalize.errors[0].message, /502/);
+  // The claim stands on the ledger and the Ruling comment landed, but the labels did not change: the marker is still on.
+  assert.deepEqual(tick.frontier.eligible, []);
+  assert.deepEqual(tick.frontier.skipped, [{ number: 40, reason: 'outcome approved recorded, marker not yet removed' }]);
+});
+
+test('#233: a finalize that throws after the read is reported and the frontier still runs over the same read', () => {
+  const world = finalizeWorld();
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed);
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner, finalizeImpl: () => { throw new Error('finalize blew up'); } });
+  assert.equal(counts.queries, 1);
+  assert.match(tick.finalize.error, /finalize blew up/);
+  assert.deepEqual(tick.frontier.eligible.map((item) => [item.kind, item.number]), [['approval', 40]], 'the Principal still sees the approval');
+  // An unreadable GitHub fails the tick closed: there is no frontier to hand back.
+  assert.throws(() => triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner: () => { throw Object.assign(new Error('x'), { stderr: 'rate limited' }); } }), { code: 'GITHUB_QUERY_FAILED' });
+});
+
+test('#233: a frontier that throws after a completed finalize returns the finalize with a frontierError, not a failure', () => {
+  const world = finalizeWorld();
+  fs.mkdirSync(path.join(world.root, 'state', 'work'), { recursive: true });
+  fs.writeFileSync(path.join(world.root, 'state', 'work', 'active.json'), '{not json');
+  const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const { runner, counts } = countingRunner(seed);
+  assert.throws(() => computeFrontier({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, () => '') }), 'the standalone frontier does throw on that state');
+  const tick = triage.triageTick({ root: world.root, tenant: 'endzone', now: NOW, runner });
+  assert.equal(counts.queries, 1);
+  assert.deepEqual(tick.finalize.finalized.map((row) => row.issue), [40], 'the finalize result survives');
+  assert.equal(tick.frontier, undefined);
+  assert.equal(typeof tick.frontierError, 'string');
+  assert.ok(tick.frontierError.length > 0);
+  // Through the CLI the same result is printed with exit 0 (cli returns rather than throws).
+  const world2 = finalizeWorld();
+  fs.mkdirSync(path.join(world2.root, 'state', 'work'), { recursive: true });
+  fs.writeFileSync(path.join(world2.root, 'state', 'work', 'active.json'), '{not json');
+  const out = cli(['tick', '--root', world2.root, '--tenant', 'endzone', '--fixture', world2.fixture, '--now', NOW]);
+  assert.deepEqual(out.finalize.finalized.map((row) => row.issue), [40]);
+  assert.ok(out.frontierError);
+});
+
+test('#233: the tick CLI runs against a fixture: the fixture is edited as finalize edits it and the frontier omits the finalized issue', () => {
+  const world = finalizeWorld({ numbers: [40, 41], each: (n) => (n === 41 ? { thread: { approval: 'Approved with: tier haiku' } } : {}) });
+  const out = cli(['tick', '--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', NOW]);
+  assert.deepEqual(out.finalize.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(out.finalize.left, [{ issue: 41, reason: 'not-exact-approval' }]);
+  assert.deepEqual(out.frontier.eligible.map((item) => [item.kind, item.number]), [['approval', 41]]);
+  assert.equal(out.frontier.source, 'fixture');
+  assert.deepEqual([...world.fixtureIssue(40).labels].sort(), ['bug', 'needs-triage', 'ready-for-agent']);
+  assert.ok(TRIAGE_FLAGS.tick.includes('fixture'));
+  assert.deepEqual(TRIAGE_FLAGS.tick, TRIAGE_FLAGS.finalize);
 });
 
 test('#207: a trailing full stop is allowed on an exact field, and a Premises heading may carry a parenthesis and a blank-separated verified block', () => {

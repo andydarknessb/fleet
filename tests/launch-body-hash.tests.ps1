@@ -56,7 +56,7 @@ exit /b %errorlevel%
     branch = 'fleet/1098-test'; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
   }
   Write-Utf8 $manifestPath ($manifest | ConvertTo-Json -Depth 8)
-  $active = @{ records = @{ 'test:issue-1098' = @{ id = 'test:issue-1098'; issue = 1098; state = 'assigned'; manifestPath = $manifestPath } } }
+  $active = @{ records = @{ 'test:issue-1098' = @{ id = 'test:issue-1098'; issue = 1098; state = 'assigned'; revision = 1; manifestPath = $manifestPath } } }
   Write-Utf8 "$testRoot\state\work\active.json" ($active | ConvertTo-Json -Depth 8)
   Write-Utf8 "$testRoot\state\PAUSE" 'hash test'
 

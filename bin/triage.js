@@ -560,6 +560,17 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       continue;
     }
 
+    // 2b. (#263) An open proposal whose marker is gone is still awaiting the owner's Approval: Cory
+    // swapped the marker for a hold such as haiku-rehearsal, or removed it. It is not a fresh
+    // candidate: served as a ticket, `record --kind proposed` is refused with TRIAGE_PROPOSAL_OPEN
+    // and the Stop hook loops. As under the marker, a changed body or the owner's Re-propose reopens it.
+    if (proposed) {
+      if (issue.bodyHash !== proposed.bodyHash) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'body changed since the proposal' }); continue; }
+      if (ownerAsksAgain) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
+      skipped.push({ number: issue.number, reason: `proposed ${proposed.at}, awaiting approval (${marker} replaced by ${labels.size ? [...labels].join(', ') : 'no label'}) until Cory comments Approved or Re-propose, or the body changes` });
+      continue;
+    }
+
     // 3. A fresh candidate: unrouted or carrying a triage label.
     if (!hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
     // Settled at this body: the triage is done, and a label the owner moves it to
@@ -604,7 +615,17 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // the issue is closed or absent) so the Principal copies the hash into
     // `record --kind proposed` instead of hashing the body by hand and mismatching.
     const issue = issueByNumber.get(Number(parsed.issue)) || null;
-    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
+    // #268: an escalation is a decision the Principal must see, served even when the issue has an open
+    // proposal. `record --kind proposed` would be refused with TRIAGE_PROPOSAL_OPEN, so the item carries
+    // the proposal it replaces and the Principal records `superseded` first. A proposal made AFTER the
+    // wake and recorded against it (the recordId is per issue, so the time decides) already answers it:
+    // the item says `answered` and the Principal only records `consumed`.
+    const openRow = projection.byIssue[parsed.issue] || null;
+    const open = openRow && openRow.proposed && !openRow.outcome ? openRow.proposed : null;
+    const answers = open && String(open.at) > String(record.at) && open.recordId && open.recordId === String(record.recordId);
+    const openProposal = open && !answers ? { commentUrl: open.commentUrl || null, bodyHash: open.bodyHash || null, at: open.at } : null;
+    const answered = answers ? { commentUrl: open.commentUrl || null, at: open.at } : null;
+    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, ...(openProposal ? { openProposal } : {}), ...(answered ? { answered } : {}), reason: 'decision-needed wake newer than the consumed marker' });
   }
 
   // Spec fleet #92 (#143): the backfill census. Open issues carrying the ready
@@ -621,6 +642,9 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   approvals.sort((left, right) => left.at.localeCompare(right.at));
   vetoes.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
+  // #268: an escalation carries the issue's proposal context, so a ticket or reproposal for the same issue is not also served.
+  const escalated = new Set(escalationList.map((item) => Number(item.number)));
+  for (let index = tickets.length - 1; index >= 0; index -= 1) if (escalated.has(Number(tickets[index].number))) tickets.splice(index, 1);
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
@@ -632,12 +656,14 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   };
 }
 
-function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner } = {}) {
+// #233: `issues` is an already-read (and, after a finalize, patched) open-issue set: the tick reads GitHub once
+// and hands the same read to the finalize and the frontier. Standalone callers pass none and it is read here.
+function computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner, issues: given = null } = {}) {
   const config = readTriageConfig(root);
   const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
   const ownerLogin = ownerLoginOf(tenantConfig);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
-  const issues = fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner: runner || execFileSync });
+  const issues = given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner: runner || execFileSync }));
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
   const entries = readLedger(root, tenant);
   const held = readHeldIssues(root, tenant, at);
@@ -909,6 +935,22 @@ function ghIssueWriter({ repo, runner }) {
   };
 }
 
+// What a finalize write does to an issue's comments and labels, in one place: the fixture writer
+// applies it to the fixture file, and applyFinalizeMutations (#233) to the tick's in-memory read,
+// so the frontier computed after a finalize sees exactly what the writes did.
+function appendFinalizeComment(target, { number, body, author, at }) {
+  const comments = normalizeComments(target.comments);
+  const id = `finalize-${number}-${comments.length + 1}`;
+  comments.push({ id, url: `${target.url || ''}#issuecomment-${id}`, createdAt: at, author, body });
+  target.comments = comments;
+}
+
+function relabelFinalize(target, { add, remove }) {
+  const labels = normalizeLabels(target.labels).filter((label) => label !== remove);
+  for (const label of add) if (!labels.includes(label)) labels.push(label);
+  target.labels = labels;
+}
+
 // The fixture stands in for GitHub in tests and in the watchdog test: a finalize against
 // it edits the fixture file, so the next frontier read sees what GitHub would show.
 function fixtureIssueWriter({ file, author, at }) {
@@ -920,25 +962,35 @@ function fixtureIssueWriter({ file, author, at }) {
     fs.writeFileSync(path.resolve(file), JSON.stringify(issues), 'utf8');
   };
   return {
-    comment(number, body) {
-      edit(number, (target) => {
-        const comments = normalizeComments(target.comments);
-        const id = `finalize-${number}-${comments.length + 1}`;
-        comments.push({ id, url: `${target.url || ''}#issuecomment-${id}`, createdAt: at, author, body });
-        target.comments = comments;
-      });
-    },
-    relabel(number, { add, remove }) {
-      edit(number, (target) => {
-        const labels = normalizeLabels(target.labels).filter((label) => label !== remove);
-        for (const label of add) if (!labels.includes(label)) labels.push(label);
-        target.labels = labels;
-      });
-    },
+    comment(number, body) { edit(number, (target) => appendFinalizeComment(target, { number, body, author, at })); },
+    relabel(number, change) { edit(number, (target) => relabelFinalize(target, change)); },
   };
 }
 
-function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner = execFileSync } = {}) {
+// Wraps a writer so each write that SUCCEEDED is also recorded in `mutations` (a write that throws is
+// not: what GitHub refused must not reach the frontier).
+function recordingWriter(writer, mutations) {
+  return {
+    comment(number, body) { writer.comment(number, body); mutations.push({ kind: 'comment', number, body }); },
+    relabel(number, change) { writer.relabel(number, change); mutations.push({ kind: 'relabel', number, add: [...change.add], remove: change.remove || null }); },
+  };
+}
+
+// Returns a copy of `issues` with the recorded finalize writes applied; the input is not touched.
+function applyFinalizeMutations(issues, mutations, { author, at } = {}) {
+  const patched = issues.map((issue) => ({ ...issue, labels: [...issue.labels], comments: issue.comments.map((comment) => ({ ...comment })) }));
+  for (const mutation of mutations) {
+    const target = patched.find((issue) => issue.number === Number(mutation.number));
+    if (!target) continue;
+    if (mutation.kind === 'comment') appendFinalizeComment(target, { number: mutation.number, body: mutation.body, author, at });
+    else relabelFinalize(target, mutation);
+  }
+  return patched;
+}
+
+// `issues` (#233) is an already-read open-issue set and `mutations` an array that collects each write that
+// succeeded; both are for triageTick. finalizeApprovals, the standalone command, passes neither.
+function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner = execFileSync, issues: given = null, mutations = [] } = {}) {
   const config = readTriageConfig(root);
   const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
   const owner = ownerLoginOf(tenantConfig);
@@ -947,13 +999,13 @@ function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath
   // claim below collides with (TRIAGE_ALREADY_DECIDED), not something this run already saw.
   const entries = readLedger(root, tenant);
   const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
-  const issues = fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner });
+  const issues = given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner }));
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
   const marker = config.markerLabel;
-  const writer = fixture
+  const writer = recordingWriter(fixture
     ? fixtureIssueWriter({ file: fixture, author: tenantConfig.fleetIdentity || 'fleet', at })
-    : ghIssueWriter({ repo: tenantConfig.github, runner });
+    : ghIssueWriter({ repo: tenantConfig.github, runner }), mutations);
   const finalized = [];
   const left = [];
   const errors = [];
@@ -1029,6 +1081,38 @@ function finalizeApprovals({ root, tenant, tenantConfigPath, fixture, outboxPath
   return { tenant: String(tenant), source: fixture ? 'fixture' : 'github', at, finalized, left, errors };
 }
 
+function finalizeApprovals(options = {}) {
+  return runFinalize(options);
+}
+
+// #233: the watchdog's triage block in one process and ONE read of the tenant's open issues. The finalize
+// runs over that read; the writes it made to GitHub are applied to it; the frontier is computed over the
+// result, so it sees the marker gone and the ready label on (and no approval) exactly as a second read
+// would have. A finalize that throws after the read is reported under finalize.error and the frontier
+// still runs (over the read as the finalize's completed writes left it), as when the two were two commands.
+// An unreadable GitHub or tenant throws: there is nothing to compute a frontier from.
+function triageTick({ root, tenant, tenantConfigPath, fixture, outboxPath, now, runner = execFileSync, finalizeImpl = runFinalize } = {}) {
+  const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const read = fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner });
+  const mutations = [];
+  let finalize;
+  try {
+    finalize = finalizeImpl({ root, tenant, tenantConfigPath, fixture, outboxPath, now: at, runner, issues: read, mutations });
+  } catch (error) {
+    finalize = { error: String(error.message || error) };
+  }
+  const issues = applyFinalizeMutations(read, mutations, { author: tenantConfig.fleetIdentity || 'fleet', at });
+  // The finalize's writes are already on GitHub and the ledger, so a frontier that throws here (local state
+  // unreadable) must not take the finalize result with it: report it beside the finalize, exit 0, and the
+  // caller records the finalize and treats the missing frontier as a frontier failure.
+  try {
+    return { tenant: String(tenant), finalize, frontier: computeFrontier({ root, tenant, tenantConfigPath, fixture, outboxPath, now: at, runner, issues }) };
+  } catch (error) {
+    return { tenant: String(tenant), finalize, frontierError: String(error.message || error) };
+  }
+}
+
 // ------------------------------------------------------------------ CLI ----
 
 const TRIAGE_FLAGS = Object.freeze({
@@ -1037,12 +1121,14 @@ const TRIAGE_FLAGS = Object.freeze({
   state: ['root', 'tenant', 'now', 'days'],
   hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
   finalize: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
+  // #233: finalize then frontier over one read of the issues; the flags are finalize's.
+  tick: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
   // Spec fleet #193 (#210): the Bounded-authority doors (bin/bounded-authority.js).
   'bounded-ready': ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
   veto: ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
   'bounded-scan': ['root', 'tenant', 'tenant-config', 'fixture', 'now'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), bounded-scan (--tenant [--fixture <issues.json>] [--now <iso>])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), tick (the flags of finalize: finalize then frontier over one read), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), bounded-scan (--tenant [--fixture <issues.json>] [--now <iso>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -1067,6 +1153,7 @@ function cli(argv) {
       by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
     });
   }
+  if (command === 'tick') return triageTick({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if (command === 'finalize') return finalizeApprovals({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
   const config = readTriageConfig(args.root);
@@ -1097,6 +1184,8 @@ module.exports = {
   computeFrontier,
   exactField,
   finalizeApprovals,
+  triageTick,
+  applyFinalizeMutations,
   parseProposal,
   proposalGate,
   repairBlockers,
