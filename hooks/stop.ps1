@@ -2,7 +2,7 @@
 # 1) Every fleet session: write a heartbeat.
 # 2) Project leads only: exit 2 (keep going) while there is actionable work and no PAUSE.
 #    "Actionable" = a non-draft fleet PR awaiting review, or an assignment-planner frontier issue
-#    (bin/assignment.js: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not haiku-rehearsal,
+#    (bin/assignment.js: ready, open, unassigned, unblocked, not a spec (no open sub-issues, no spec label: uncut or done), not ready-for-human, not haiku-rehearsal,
 #    not excluded, not reserved) with a free cap + IC slot.
 $ErrorActionPreference = 'SilentlyContinue'
 . "$PSScriptRoot\..\bin\check-policy.ps1"
@@ -42,7 +42,7 @@ function Continue-With {
   if ($key -eq $script:lastKey) { $script:count++ } else { $script:count = 1 }
   $script:total++
   [IO.File]::WriteAllText($counterPath, (@{ count = $script:count; total = $script:total; lastAt = $now; continuedBecause = $key } | ConvertTo-Json -Compress), $utf8)
-  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
+  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner, unless it carries Cory's own Re-propose, which you answer." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
   [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (same-reason continuation $script:count/30, total $script:total/100 since last natural stop). $hint")
   exit 2
 }
@@ -220,7 +220,7 @@ if ($plannerFailure) {
   }
   Stop-Now "assignment planner failed ($plannerFailure); launching nothing, escalation filed"
 }
-if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not haiku-rehearsal, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch'$lagNote" }
+if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, not a spec (no open sub-issues, no spec label: uncut or done), not ready-for-human, not haiku-rehearsal, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch'$lagNote" }
 $why = "assignment frontier empty"
 if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (the watcher records checks-settled and the watchdog wakes you; never poll)" }
 $why += $lagNote
