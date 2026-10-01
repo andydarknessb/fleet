@@ -136,3 +136,14 @@ function Get-PagesPriorityFindings {
   }
   $found
 }
+
+# fleet #274 QA: watchdog.syncStallMinutes must be a number of minutes above 0; the sync run falls back
+# to 120 on anything else, so setup.ps1 and the Watchdog name a typo instead of leaving it silent.
+function Get-WatchdogSyncStallFindings {
+  param($Watchdog)
+  if (-not $Watchdog -or -not $Watchdog.PSObject.Properties['syncStallMinutes']) { return }
+  $v = $Watchdog.syncStallMinutes
+  if (-not (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and $v -gt 0)) {
+    [pscustomobject]@{ Key = 'watchdog.syncStallMinutes'; Value = "$v"; Expect = 'a number of minutes, more than 0' }
+  }
+}

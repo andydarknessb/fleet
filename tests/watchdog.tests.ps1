@@ -2481,6 +2481,16 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True (@($g4.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0) 'a bad minAgeMinutes falls back to the built-in grace, not to no grace'
     Assert-True (@($g4.line.newlyPaged | Where-Object { $_.key -eq 'config-invalid:pages.minAgeMinutes.sync-unattested' -and $_.priority -eq 'normal' }).Count -eq 1) 'the config-invalid page goes once at normal'
 
+    # G4b: a bad watchdog.syncStallMinutes (read by sync-integration.ps1, silently 120) is reported the same way.
+    Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"syncStallMinutes":"soon"}}'
+    $g4b = Run-WatchdogCaptured
+    Assert-True (-not $g4b.crashed) "a bad syncStallMinutes must not crash the tick (exit $($g4b.exitCode): $($g4b.error))"
+    Assert-True (@($g4b.line.invalidPagePriority | Where-Object { $_.key -eq 'watchdog.syncStallMinutes' -and $_.value -eq 'soon' }).Count -eq 1) "the tick line must name the invalid syncStallMinutes key and value (got $($g4b.line.invalidPagePriority | ConvertTo-Json -Compress))"
+    Assert-True (@($g4b.line.conditions) -contains 'config-invalid:watchdog.syncStallMinutes') 'the bad syncStallMinutes must stand as a config-invalid condition'
+    Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"syncStallMinutes":90}}'
+    $g4c = Run-WatchdogCaptured
+    Assert-True (@($g4c.line.invalidPagePriority | Where-Object { $_.key -eq 'watchdog.syncStallMinutes' }).Count -eq 0) 'a valid syncStallMinutes raises nothing'
+
     # G5: sync-blocked pages at high at once (no grace), and a bare fixture (no config) still knows it.
     Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue

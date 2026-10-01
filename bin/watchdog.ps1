@@ -1330,6 +1330,13 @@ try {
   }
   # fleet #232: an invalid pages priority pages once (paged-state dedupe) and rides every tick line.
   $invalidPagePriority = @(Get-InvalidPagePriorities -PagesConfig $pagesConfig)
+  # fleet #274 QA: watchdog.syncStallMinutes (read by sync-integration.ps1) reports the same way; the sync run falls back to 120.
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['syncStallMinutes']) {
+    $ssm = $watchdogConfig.syncStallMinutes
+    if (-not (($ssm -is [int] -or $ssm -is [long] -or $ssm -is [double] -or $ssm -is [decimal]) -and $ssm -gt 0)) {
+      $invalidPagePriority += [pscustomobject]@{ key = 'watchdog.syncStallMinutes'; value = "$ssm"; fallback = '120'; expect = 'a number of minutes, more than 0' }
+    }
+  }
   foreach ($ip in $invalidPagePriority) {
     $conditions += [pscustomobject]@{ key = "config-invalid:$($ip.key)"; kind = 'config-invalid'; detail = "$($ip.key) is '$($ip.value)', not $($ip.expect); pages of that kind fall back to their built-in default until it is fixed"; url = $null }
   }

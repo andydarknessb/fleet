@@ -10,7 +10,7 @@
 # contexts and their state on the tip: a PENDING one waits quietly (sync-waiting), a FAILED one is
 # blocked (sync-blocked, high), an ABSENT one or an unreadable lookup pushes as before. A refusal is then
 # classified by its text. An unattested tip (sync-unattested) carries the reconciliation PR and the attest
-# command, and is memoized in state/sentinel/sync-last.json so the same sha and status counts are not
+# command, and is memoized in state/sentinel/sync-last-<tenant>.json so the same sha and status counts are not
 # pushed on every tick.
 param([string]$Tenant = 'endzone', [switch]$Apply)
 . "$PSScriptRoot\_common.ps1"
@@ -187,7 +187,7 @@ function Write-SyncMemo {
   try {
     [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
     Write-Json $Path $Record
-  } catch {}
+  } catch { [Console]::Error.WriteLine("sync-integration: could not write sync memo ${Path}: $($_.Exception.Message)") }
 }
 
 function New-WaitingOutcome {
@@ -294,7 +294,8 @@ $tipSha = "$(& git -C $repo rev-parse "origin/$rel" 2>$null)".Trim()
 $tipShort = "$(& git -C $repo rev-parse --short "origin/$rel" 2>$null)".Trim()
 $reviewContext = 'fleet-review'
 if ($t.PSObject.Properties['reviewStatus'] -and "$($t.reviewStatus)".Trim()) { $reviewContext = "$($t.reviewStatus)".Trim() }
-$memoPath = "$FleetHome\state\sentinel\sync-last.json"
+# Per tenant: the release-branch tenants share FleetHome, so one file would let tenant B clear or overwrite A's memo.
+$memoPath = "$FleetHome\state\sentinel\sync-last-$Tenant.json"
 $memo = $null; try { $memo = Read-Json $memoPath } catch {}
 $required = Get-RequiredContexts -Repo $t.github -Branch $def
 $tipState = Get-CommitCheckState -Repo $t.github -Sha $tipSha

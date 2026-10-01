@@ -264,18 +264,18 @@ try {
   function Get-LineCount { param([string]$Path) if (Test-Path $Path) { @(Get-Content $Path | Where-Object { "$_".Trim() }).Count } else { 0 } }
   function Set-MemoAge {
     # Backdates both the clock start (since) and the last touch (at) of the waiting memo.
-    param([int]$SinceMinutes, [int]$AtMinutes)
-    $m = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+    param([int]$SinceMinutes, [int]$AtMinutes, [string]$Tenant = 'f1')
+    $m = Get-Content "$testRoot\state\sentinel\sync-last-$Tenant.json" -Raw | ConvertFrom-Json
     $m.since = (Get-Date).ToUniversalTime().AddMinutes(-$SinceMinutes).ToString('o')
     $m.at = (Get-Date).ToUniversalTime().AddMinutes(-$AtMinutes).ToString('o')
-    Write-Utf8 "$testRoot\state\sentinel\sync-last.json" ($m | ConvertTo-Json -Compress)
+    Write-Utf8 "$testRoot\state\sentinel\sync-last-$Tenant.json" ($m | ConvertTo-Json -Compress)
   }
   function Set-MemoSince {
     # Backdates the sync-waiting memo so a run sees the sha as having waited $Minutes already.
-    param([int]$Minutes)
-    $m = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+    param([int]$Minutes, [string]$Tenant = 'f1')
+    $m = Get-Content "$testRoot\state\sentinel\sync-last-$Tenant.json" -Raw | ConvertFrom-Json
     $m.since = (Get-Date).ToUniversalTime().AddMinutes(-$Minutes).ToString('o')
-    Write-Utf8 "$testRoot\state\sentinel\sync-last.json" ($m | ConvertTo-Json -Compress)
+    Write-Utf8 "$testRoot\state\sentinel\sync-last-$Tenant.json" ($m | ConvertTo-Json -Compress)
   }
   $env:PATH = "$testRoot\mock-bin-ff;$oldPath"
 
@@ -292,7 +292,7 @@ try {
   Assert-True ("$($ra.to)" -and $f1.sha.StartsWith("$($ra.to)")) 'the result must carry the target sha'
   # Waiting has a ceiling: the memo remembers when this sha first waited, and past the stall limit
   # (default 120 min) the same pending check escalates as sync-stalled (still no push).
-  $memoW = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+  $memoW = Get-Content "$testRoot\state\sentinel\sync-last-f1.json" -Raw | ConvertFrom-Json
   Assert-True ($memoW.kind -eq 'sync-waiting' -and $memoW.tenant -eq 'f1' -and $memoW.sha -eq $f1.sha -and "$($memoW.since)") "the waiting memo must record tenant, sha, kind and since (got $($memoW | ConvertTo-Json -Compress))"
   $ra2 = Run-Sync @('-Tenant', 'f1', '-Apply')
   Assert-True ($script:lastExit -eq 0 -and $ra2.kind -eq 'sync-waiting' -and $ra2.escalate -eq $false) 'a second tick inside the limit is still a quiet wait'
@@ -316,7 +316,7 @@ try {
   Set-MockApi $f1 $rulesTwo '{"state":"failure","total_count":1,"statuses":[{"context":"test-build","state":"failure"}]}' $noRuns
   $rb1 = Run-Sync @('-Tenant', 'f1', '-Apply')
   Assert-True ($rb1.kind -eq 'sync-blocked') 'a failed check blocks'
-  Assert-True (-not (Test-Path "$testRoot\state\sentinel\sync-last.json")) 'a blocked tip clears the waiting memo'
+  Assert-True (-not (Test-Path "$testRoot\state\sentinel\sync-last-f1.json")) 'a blocked tip clears the waiting memo'
   Set-MockApi $f1 $rulesTwo '{"state":"pending","total_count":1,"statuses":[{"context":"test-build","state":"pending"}]}' $noRuns
   $rg3 = Run-Sync @('-Tenant', 'f1', '-Apply')
   Assert-True ($script:lastExit -eq 0 -and $rg3.kind -eq 'sync-waiting') "pending again after a blocked tick is a fresh quiet wait (got $($rg3 | ConvertTo-Json -Compress))"
@@ -345,7 +345,7 @@ try {
   Assert-True ("$($rc.reason)".Length -le 280 -and "$($rc.reason)".IndexOf('MERGE COMMIT') -lt "$($rc.reason)".IndexOf('review-policy.js')) "the reason must fit the Watchdog's 300-character body with the merge alternative first (len $("$($rc.reason)".Length))"
   Assert-True ((Get-LineCount "$($f3.dir)\hook-attempts.log") -eq 1) 'the first tick pushes once'
   Assert-True ((Get-LineCount "$($f3.dir)\pr-create-calls.log") -eq 1) 'exactly one reconciliation PR is created'
-  $memo = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+  $memo = Get-Content "$testRoot\state\sentinel\sync-last-f3.json" -Raw | ConvertFrom-Json
   Assert-True ("$($memo.sha)" -eq $f3.sha -and "$($memo.kind)" -eq 'sync-unattested' -and $memo.statusCount -eq 1 -and $memo.checkRunCount -eq 0 -and "$($memo.at)") "the evidence memo must record sha, kind, counts and time (got $($memo | ConvertTo-Json -Compress))"
   Assert-True ("$($memo.contexts)" -eq 'fleet-review,test-build') "the memo key must include the required contexts (got $($memo.contexts))"
 
@@ -433,7 +433,7 @@ try {
   $ri = Run-Sync @('-Tenant', 'f8', '-Apply')
   Assert-True ($ri.kind -eq 'sync-waiting' -and $ri.escalate -eq $false -and $script:lastExit -eq 0) "the real N-of-7 wording waits (got $($ri | ConvertTo-Json -Compress))"
   # F9: the refusal-text waiting path has the same ceiling.
-  Set-MemoSince 121
+  Set-MemoSince 121 -Tenant 'f8'
   $rj = Run-Sync @('-Tenant', 'f8', '-Apply')
   Assert-True ($script:lastExit -eq 2 -and $rj.kind -eq 'sync-stalled' -and $rj.escalate -eq $true) "a refusal-text wait past the limit escalates as sync-stalled (got $($rj | ConvertTo-Json -Compress))"
   Assert-True ((Get-LineCount "$($f8.dir)\hook-attempts.log") -eq 2) 'the refusal-text path pushes each tick (it has no pre-check evidence)'
@@ -454,6 +454,39 @@ try {
   $env:MOCK_GH_DIR = $f12.dir
   $rp = Run-Sync @('-Tenant', 'f12', '-Apply')
   Assert-True ($rp.kind -eq 'sync-refused') 'with a different reviewStatus, fleet-review being expected is not the review context'
+  # F13 (fleet #274 QA): the memo is per tenant. Tenant B's blocked, waiting and synced outcomes must not
+  # remove or overwrite tenant A's memo, or A's stall clock never accrues.
+  $pendingStatus = '{"state":"pending","total_count":1,"statuses":[{"context":"test-build","state":"pending"}]}'
+  $f13 = New-FfFixture 'f13' 'Required status check "fleet-review" is expected.'
+  Set-MockApi $f13 $rulesTwo $pendingStatus $noRuns
+  $env:MOCK_GH_DIR = $f13.dir
+  $null = Run-Sync @('-Tenant', 'f13', '-Apply')
+  Set-MemoSince 90 -Tenant 'f13'
+  $memoA = Get-Content "$testRoot\state\sentinel\sync-last-f13.json" -Raw
+  $f14 = New-FfFixture 'f14'
+  $env:MOCK_GH_DIR = $f14.dir
+  Set-MockApi $f14 $rulesTwo '{"state":"failure","total_count":1,"statuses":[{"context":"test-build","state":"failure"}]}' $noRuns
+  $null = Run-Sync @('-Tenant', 'f14', '-Apply')
+  Assert-True ((Test-Path "$testRoot\state\sentinel\sync-last-f13.json") -and (Get-Content "$testRoot\state\sentinel\sync-last-f13.json" -Raw) -eq $memoA) "tenant B's sync-blocked must not clear tenant A's waiting memo"
+  Set-MockApi $f14 $rulesTwo $pendingStatus $noRuns
+  $null = Run-Sync @('-Tenant', 'f14', '-Apply')
+  Assert-True ((Get-Content "$testRoot\state\sentinel\sync-last-f13.json" -Raw) -eq $memoA) "tenant B's sync-waiting must not overwrite tenant A's memo"
+  Set-MockApi $f14 $rulesTwo '{"state":"success","total_count":2,"statuses":[{"context":"test-build","state":"success"},{"context":"fleet-review","state":"success"}]}' $noRuns
+  $rsync = Run-Sync @('-Tenant', 'f14', '-Apply')
+  Assert-True ($rsync.synced -eq $true) "tenant B's push should go through (got $($rsync | ConvertTo-Json -Compress))"
+  Assert-True ((Get-Content "$testRoot\state\sentinel\sync-last-f13.json" -Raw) -eq $memoA) "tenant B's successful sync must not remove tenant A's memo"
+  $env:MOCK_GH_DIR = $f13.dir
+  Set-MemoSince 121 -Tenant 'f13'
+  $rA = Run-Sync @('-Tenant', 'f13', '-Apply')
+  Assert-True ($rA.kind -eq 'sync-stalled') "tenant A's clock keeps accruing across tenant B's runs (got $($rA | ConvertTo-Json -Compress))"
+  # F15: an unwritable memo is not fully silent: a warning on stderr, and the outcome is unchanged.
+  $f15 = New-FfFixture 'f15' 'Required status check "fleet-review" is expected.'
+  Set-MockApi $f15 $rulesTwo $pendingStatus $noRuns
+  $env:MOCK_GH_DIR = $f15.dir
+  [IO.Directory]::CreateDirectory("$testRoot\state\sentinel\sync-last-f15.json") | Out-Null
+  $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $warnOut = & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\bin\sync-integration.ps1" -Tenant f15 -Apply 2>&1 | Out-String } finally { $ErrorActionPreference = $eap }
+  Assert-True ($warnOut -match 'could not write sync memo' -and $warnOut -match '"kind":"sync-waiting"') "a failed memo write must warn on stderr and not change the outcome (got $warnOut)"
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   Remove-Item Env:MOCK_GH_DIR -ErrorAction SilentlyContinue
 
