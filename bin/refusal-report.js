@@ -68,22 +68,44 @@ function categoryOf(text) {
 // `gh pr merge` flags that take a value, so the value is not mistaken for the PR number.
 const MERGE_VALUE_FLAGS = new Set(['-b', '--body', '-F', '--body-file', '-t', '--subject', '-A', '--author-email', '--match-head-commit']);
 
+// Quoted strings are swapped for placeholders (no whitespace, no shell separators) so a
+// string literal can neither hold a command nor supply an argument.
+function maskQuoted(command) {
+  const quoted = [];
+  const text = String(command || '').replace(/"(?:[^"\\]|\\.)*"|'[^']*'/g, (match) => {
+    quoted.push(match.slice(1, -1));
+    return `\u0000${quoted.length - 1}\u0000`;
+  });
+  return { text, quoted };
+}
+
+// `gh pr merge` as a command: at the start, or after a shell separator (; & | newline, a
+// subshell or backtick), optionally after gh's own global flags (`gh -R o/r pr merge 5`).
+const GH_MERGE = /(?:^|[;&|\n(`])\s*gh((?:\s+(?:-R|--repo)(?:\s+|=)\S+)*)\s+pr\s+merge\b([^;&|\n]*)/;
+
+function findGhMerge(command) {
+  const { text, quoted } = maskQuoted(command);
+  const match = text.match(GH_MERGE);
+  return match ? { tokens: `${match[1]} ${match[2]}`.trim().split(/\s+/).filter(Boolean), quoted } : null;
+}
+
 // The PR a refused `gh pr merge` named: { number, repo } (repo null when the command carries
 // no -R / --repo / PR URL), or null when the command is not a merge of a named PR. Reads only
-// the `gh pr merge` segment of a chained command.
+// the `gh pr merge` segment of a chained command, never a string literal.
 function parseGhMerge(command) {
-  const match = String(command || '').match(/\bgh\s+pr\s+merge\b([^;&|\n]*)/);
-  if (!match) return null;
-  const tokens = match[1].trim().split(/\s+/).filter(Boolean).map((token) => token.replace(/^["']|["']$/g, ''));
+  const found = findGhMerge(command);
+  if (!found) return null;
+  const unmask = (token) => String(token || '').replace(/\u0000(\d+)\u0000/g, (_, index) => found.quoted[Number(index)]);
+  const tokens = found.tokens;
   let repo = null;
   let number = null;
   for (let i = 0; i < tokens.length; i += 1) {
     const token = tokens[i];
-    if (token === '-R' || token === '--repo') { repo = tokens[i + 1] || null; i += 1; continue; }
-    if (token.startsWith('--repo=')) { repo = token.slice('--repo='.length) || null; continue; }
+    if (token === '-R' || token === '--repo') { repo = unmask(tokens[i + 1]) || null; i += 1; continue; }
+    if (token.startsWith('--repo=')) { repo = unmask(token.slice('--repo='.length)) || null; continue; }
     if (MERGE_VALUE_FLAGS.has(token)) { i += 1; continue; }
     if (token.startsWith('-')) continue;
-    const url = token.match(/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/);
+    const url = unmask(token).match(/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/);
     if (url && number === null) { repo = repo || url[1]; number = Number(url[2]); continue; }
     if (/^#?\d+$/.test(token) && number === null) number = Number(token.replace('#', ''));
   }
@@ -133,7 +155,7 @@ function scanTranscript(contents, { sessionId = null } = {}) {
           toolUseId: block.tool_use_id || null,
           command,
           pr: parseGhMerge(command),
-          refusedGhPrMerge: /\bgh\s+pr\s+merge\b/.test(command),
+          refusedGhPrMerge: findGhMerge(command) !== null,
         });
       } else if (DENIAL_TEXT.test(text)) {
         unconfirmed.push({ ms, timestamp: row.timestamp, category: categoryOf(text) });
@@ -286,16 +308,18 @@ const isoOrNull = (value) => {
 };
 
 // Merge facts per PR key. With a `gh` runner: `gh pr view <n> -R <repo> --json
-// mergedAt,mergedBy,state`; a failed lookup is an error and the PR stays unresolved. With
-// `gh: null` (--no-verify-github): the pr-watch `state-merged` event in the fleet ledger.
+// mergedAt,mergedBy,state,closedAt`; a failed lookup is an error and the PR stays unresolved.
+// With `gh: null` (--no-verify-github): the pr-watch `state-merged` event in the fleet
+// ledger. The ledger has no closed-without-merge event, so a closed PR cannot be told apart
+// there and stays unresolved.
 function fetchMerges(keys, { gh = defaultGh, fleetHome = null, tenants = {} } = {}) {
   const merges = {};
   const errors = [];
   if (gh) {
     for (const { repo, number } of keys) {
       try {
-        const view = JSON.parse(gh(['pr', 'view', String(number), '-R', repo, '--json', 'mergedAt,mergedBy,state']));
-        merges[mergeKey(repo, number)] = { state: view.state || null, mergedAt: isoOrNull(view.mergedAt), mergedBy: view.mergedBy?.login || (typeof view.mergedBy === 'string' ? view.mergedBy : null) };
+        const view = JSON.parse(gh(['pr', 'view', String(number), '-R', repo, '--json', 'mergedAt,mergedBy,state,closedAt']));
+        merges[mergeKey(repo, number)] = { state: view.state || null, mergedAt: isoOrNull(view.mergedAt), mergedBy: view.mergedBy?.login || (typeof view.mergedBy === 'string' ? view.mergedBy : null), closedAt: isoOrNull(view.closedAt) };
       } catch (error) {
         errors.push({ repo, number, error: String(error.message || error).split('\n')[0] });
       }
@@ -312,7 +336,7 @@ function fetchMerges(keys, { gh = defaultGh, fleetHome = null, tenants = {} } = 
     const key = mergeKey(repo, event.changes.prNumber);
     if (!wanted.has(key)) continue;
     const observed = String(event.evidence || '').match(/observed merged at (\S+)/);
-    merges[key] = { state: 'MERGED', mergedAt: isoOrNull(observed ? observed[1] : event.at), mergedBy: event.changes.mergedBy || null };
+    merges[key] = { state: 'MERGED', mergedAt: isoOrNull(observed ? observed[1] : event.at), mergedBy: event.changes.mergedBy || null, closedAt: null };
   }
   return { merges, errors };
 }
@@ -336,6 +360,7 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
   const byCategory = new Map([[MERGE_CATEGORY, { count: 0, sessions: new Set(), names: new Set(), refusedGhPrMerge: 0 }]]);
   const refusals = [];
   const mwrPrs = new Map();
+  const unresolvedKeys = new Set();
   let unresolved = 0;
   let followOn = 0;
   let outside = 0;
@@ -358,17 +383,24 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
       if (refusal.refusedGhPrMerge) entry.refusedGhPrMerge += 1;
       const listed = { at: refusal.timestamp, name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, category: refusal.category };
       if (refusal.pr) listed.pr = refusal.pr;
-      if (refusal.category === UNCATEGORIZED && refusal.refusedGhPrMerge) listed.refusedGhPrMerge = true;
-      refusals.push({ ms: refusal.ms, listed });
+      // Marked on every non-merge category (a refused `gh pr merge` that the classifier gave
+      // another name, e.g. Production Deploy), and never priced.
+      if (refusal.category !== MERGE_CATEGORY && refusal.refusedGhPrMerge) listed.refusedGhPrMerge = true;
+      const row = { ms: refusal.ms, listed, key: null };
+      refusals.push(row);
       if (refusal.category !== MERGE_CATEGORY) continue;
       // The classifier also refuses the reads that follow a denied merge (memory files, `gh pr
       // view`), labelled the same: those name no PR to merge and are counted, not priced.
       if (!refusal.refusedGhPrMerge) { followOn += 1; continue; }
-      if (!refusal.pr || !refusal.pr.repo) { unresolved += 1; continue; }
+      if (!refusal.pr || !refusal.pr.repo) { unresolved += 1; listed.unresolved = true; continue; }
       const key = mergeKey(refusal.pr.repo, refusal.pr.number);
+      row.key = key;
       const known = mwrPrs.get(key);
-      if (!known || refusal.ms < known.firstMs) {
-        mwrPrs.set(key, { key, repo: refusal.pr.repo, number: refusal.pr.number, name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms });
+      if (!known) {
+        mwrPrs.set(key, { key, repo: refusal.pr.repo, number: refusal.pr.number, name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms, refusals: 1 });
+      } else {
+        known.refusals += 1;
+        if (refusal.ms < known.firstMs) Object.assign(known, { name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms });
       }
     }
   }
@@ -380,17 +412,27 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
   };
   const prs = [...mwrPrs.values()].sort((a, b) => a.firstMs - b.firstMs).map((pr) => {
     const merge = merges[pr.key] || null;
-    const entry = { repo: pr.repo, number: pr.number, name: pr.name, role: pr.role, sessionId: pr.sessionId, firstRefusedAt: new Date(pr.firstMs).toISOString(), state: merge?.state || null, mergedAt: merge?.mergedAt || null, mergedBy: merge?.mergedBy || null, hours: 0, stillOpen: false, resolved: Boolean(merge) };
+    const entry = { repo: pr.repo, number: pr.number, name: pr.name, role: pr.role, sessionId: pr.sessionId, firstRefusedAt: new Date(pr.firstMs).toISOString(), state: merge?.state || null, mergedAt: merge?.mergedAt || null, mergedBy: merge?.mergedBy || null, closedAt: merge?.closedAt || null, refusals: pr.refusals, hours: 0, stillOpen: false, closedUnmerged: false, resolved: Boolean(merge) };
     const holder = nameEntry(pr.name || pr.sessionId);
     holder.prs += 1;
-    if (!merge) { unresolved += 1; return entry; }
+    // `unresolved` is one unit, refusals: every refusal of a PR with no merge data.
+    if (!merge) { unresolved += pr.refusals; unresolvedKeys.add(pr.key); return entry; }
+    // The wait ends at the merge, or for a PR closed unmerged at its closedAt; an open PR has
+    // no end. Whatever the end, the window caps it: past --until the PR is still open at the
+    // window end and bills only to --until.
     const mergedMs = merge.state === 'MERGED' && merge.mergedAt ? new Date(merge.mergedAt).getTime() : NaN;
-    entry.stillOpen = !Number.isFinite(mergedMs);
-    const end = Math.max(pr.firstMs, Number.isFinite(mergedMs) ? mergedMs : bounds.upper);
+    const closedMs = merge.state === 'CLOSED' && merge.closedAt ? new Date(merge.closedAt).getTime() : NaN;
+    const endMs = Number.isFinite(mergedMs) ? mergedMs : (Number.isFinite(closedMs) ? closedMs : Infinity);
+    entry.stillOpen = endMs > bounds.upper;
+    entry.closedUnmerged = Number.isFinite(closedMs) && closedMs <= bounds.upper;
+    const end = Math.max(pr.firstMs, Math.min(endMs, bounds.upper));
     entry.hours = hours(end - pr.firstMs);
     holder.intervals.push([pr.firstMs, end]);
     return entry;
   });
+  for (const row of refusals) {
+    if (row.key && unresolvedKeys.has(row.key)) row.listed.unresolved = true;
+  }
   const perName = [...intervalsByName].map(([name, value]) => ({ name, prs: value.prs, waitMs: unionMs(value.intervals) }))
     .sort((a, b) => b.waitMs - a.waitMs || a.name.localeCompare(b.name));
   const waitMs = perName.reduce((sum, item) => sum + item.waitMs, 0);
@@ -401,7 +443,7 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
   for (const [category, entry] of [...byCategory].filter(([name]) => name !== MERGE_CATEGORY)
     .sort(([a, x], [b, y]) => rank(a) - rank(b) || y.count - x.count || a.localeCompare(b))) {
     const item = { category, count: entry.count, sessions: entry.sessions.size, names: sorted(entry.names) };
-    if (category === UNCATEGORIZED) item.refusedGhPrMerge = entry.refusedGhPrMerge;
+    if (category === UNCATEGORIZED || entry.refusedGhPrMerge > 0) item.refusedGhPrMerge = entry.refusedGhPrMerge;
     categories.push(item);
   }
   return {
@@ -420,6 +462,7 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
       waitHours: hours(waitMs),
       waitHoursPer7Days: windowMs > 0 ? Math.round((waitMs / windowMs) * 7 * 24 * 100) / 100 : 0,
       stillOpen: prs.filter((pr) => pr.stillOpen).length,
+      closedUnmerged: prs.filter((pr) => pr.closedUnmerged).length,
       unresolved,
       followOn,
     },
@@ -441,18 +484,23 @@ function renderMarkdown(report) {
     `| ${OUTSIDE_ROSTER_LABEL} | ${report.outsideRoster.count} | | |`,
     '',
   ];
-  const uncategorized = report.categories.find((c) => c.category === UNCATEGORIZED);
-  if (uncategorized && uncategorized.refusedGhPrMerge > 0) {
-    out.push(`Uncategorized refusals where the refused command was gh pr merge: ${uncategorized.refusedGhPrMerge} of ${uncategorized.count}.`, '');
+  const marked = report.categories.filter((c) => c.category !== MERGE_CATEGORY && c.refusedGhPrMerge > 0);
+  if (marked.length > 0) {
+    out.push(`Refused command was gh pr merge under another category (marked, not priced): ${marked.map((c) => `${c.category} ${c.refusedGhPrMerge} of ${c.count}`).join(', ')}.`, '');
   }
   out.push(
-    `Merge Without Review wait, refusal to PR merge: ${mwr.waitHours} session-hours over ${report.windowHours} h (${mwr.waitHoursPer7Days} per 7 days); ${mwr.prs.length} PRs, ${mwr.stillOpen} still open at the window end, ${mwr.unresolved} unresolved; ${mwr.followOn} of the ${mwr.count} refusals were follow-on commands that were not a PR merge.`,
+    `Merge Without Review wait, refusal to PR merge: ${mwr.waitHours} session-hours over ${report.windowHours} h (${mwr.waitHoursPer7Days} per 7 days); ${mwr.prs.length} PRs, ${mwr.stillOpen} still open at the window end, ${mwr.closedUnmerged} closed unmerged, ${mwr.unresolved} unresolved refusals; ${mwr.followOn} of the ${mwr.count} refusals were follow-on commands that were not a PR merge.`,
     '',
   );
   if (mwr.prs.length > 0) {
     out.push('| PR | Roster name | First refused | Merged at | Merged by | Hours |', '| --- | --- | --- | --- | --- | ---: |');
     for (const pr of mwr.prs) {
-      const mergedAt = pr.mergedAt && pr.state === 'MERGED' ? pr.mergedAt : (pr.resolved ? `open (${pr.state || 'unknown'})` : 'unresolved');
+      let mergedAt = 'unresolved';
+      if (pr.resolved) {
+        if (pr.closedUnmerged) mergedAt = `closed unmerged ${pr.closedAt}`;
+        else if (pr.stillOpen) mergedAt = pr.mergedAt ? `${pr.mergedAt} (after the window end)` : `open (${pr.state || 'unknown'})`;
+        else mergedAt = pr.mergedAt;
+      }
       out.push(`| ${pr.repo}#${pr.number} | ${pr.name || ''} | ${pr.firstRefusedAt} | ${mergedAt} | ${pr.mergedBy || ''} | ${pr.hours} |`);
     }
     out.push('');
@@ -463,7 +511,8 @@ function renderMarkdown(report) {
   if (report.refusals.length > 0) {
     out.push('| At | Roster name | Role | Category | PR |', '| --- | --- | --- | --- | --- |');
     for (const item of report.refusals) {
-      const category = item.refusedGhPrMerge ? `${item.category} (refused command was gh pr merge)` : item.category;
+      const notes = [item.refusedGhPrMerge ? 'refused command was gh pr merge' : '', item.unresolved ? 'unresolved' : ''].filter(Boolean);
+      const category = notes.length > 0 ? `${item.category} (${notes.join('; ')})` : item.category;
       out.push(`| ${item.at} | ${item.name || ''} | ${item.role || ''} | ${category} | ${item.pr ? `${item.pr.repo || '?'}#${item.pr.number}` : ''} |`);
     }
     out.push('');
@@ -471,7 +520,8 @@ function renderMarkdown(report) {
   out.push(
     `Unconfirmed (classifier wording without the automode-blocked tag, not counted): ${report.unconfirmed}.`,
     `Excluded by design: ${report.unavailable} automode-unavailable rows (the classifier gave no verdict; not a refusal).`,
-    'Wait: first refusal of a PR to its merge (mergedAt), or to the window end while still open; session-hours are the union of intervals per roster name.',
+    'Wait: first refusal of a PR to its merge (mergedAt), to its closedAt if closed unmerged, or to the window end while still open or if the end falls after the window; session-hours are the union of intervals per roster name.',
+    "Merged by shows the GitHub account; the lead's own successful merges also appear as andydarknessb.",
   );
   for (const item of report.lookupErrors) out.push(`Lookup failed for ${item.repo}#${item.number}: ${item.error}`);
   out.push('');

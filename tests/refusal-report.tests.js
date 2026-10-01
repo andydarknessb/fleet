@@ -10,6 +10,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { execFileSync } = require('node:child_process');
 const {
   scanTranscript, parseGhMerge, loadFleetSessions, collectRefusals, prKeysToResolve, mergeKey, fetchMerges, buildReport, renderMarkdown, cli,
   MERGE_CATEGORY, OUTSIDE_ROSTER_LABEL, UNCATEGORIZED, REFUSAL_REPORT_FLAGS,
@@ -120,6 +121,13 @@ test('a tagged refusal with no bracketed reason is uncategorized, flagged when t
   assert.deepEqual(refusals.map((r) => r.refusedGhPrMerge), [true, false, false, false]);
 });
 
+test('a refused command that only quotes gh pr merge is not a refused merge', () => {
+  const text = lines(attempt(at(0), 'a', 'echo "gh pr merge 5 -R o/r"'), attempt(at(1), 'b', 'gh -R o/r pr merge 6'));
+  const refusals = scanTranscript(text, { sessionId: 's' }).refusals;
+  assert.deepEqual(refusals.map((r) => r.refusedGhPrMerge), [false, true]);
+  assert.deepEqual(refusals.map((r) => r.pr), [null, { number: 6, repo: 'o/r' }]);
+});
+
 test('the unavailable-verdict rows (automode-unavailable) are excluded by design, and counted so the footnote can say how many', () => {
   const unavailable = toolResult(at(0), 'a', 'The server-side auto mode classifier gave no verdict (error), so auto mode cannot determine the safety of Bash.', true, { toolDenialKind: 'automode-unavailable' });
   const scan = scanTranscript(lines(unavailable), { sessionId: 's' });
@@ -156,6 +164,14 @@ test('parseGhMerge: number and repo from -R / --repo / --repo= / a URL; the merg
   assert.deepEqual(parseGhMerge('cd x && gh pr merge 6 --squash; gh pr view 6 -R other/repo'), { number: 6, repo: null });
   assert.deepEqual(parseGhMerge('gh pr merge https://github.com/o/r/pull/12 --squash'), { number: 12, repo: 'o/r' });
   assert.deepEqual(parseGhMerge('gh pr merge 1644 -R $R --squash'), { number: 1644, repo: null }, 'a shell variable is not a repo');
+  assert.deepEqual(parseGhMerge('gh pr merge --body "Merging 3 fixes" 280 -R o/r'), { number: 280, repo: 'o/r' }, 'quoted strings are not arguments');
+  assert.deepEqual(parseGhMerge('gh pr merge 280 --subject "fix: 12 things; and more" --squash'), { number: 280, repo: null });
+  assert.deepEqual(parseGhMerge('gh -R o/r pr merge 5 --squash'), { number: 5, repo: 'o/r' }, 'a global -R before pr merge');
+  assert.deepEqual(parseGhMerge('echo hi\ngh pr merge 9 -R o/r'), { number: 9, repo: 'o/r' });
+  assert.deepEqual(parseGhMerge('cd x && gh pr merge 10 || true'), { number: 10, repo: null });
+  assert.equal(parseGhMerge('echo "run gh pr merge 5 later"'), null, 'inside a quoted string is not a command');
+  assert.equal(parseGhMerge("git commit -m 'gh pr merge 6 was refused'"), null);
+  assert.equal(parseGhMerge('cat notes-about-gh-pr-merge.md'), null);
   assert.equal(parseGhMerge('gh pr view 33 -R o/r'), null);
   assert.equal(parseGhMerge('gh pr merge --auto'), null);
   assert.equal(parseGhMerge(undefined), null);
@@ -169,7 +185,7 @@ function writeTranscripts() {
   fs.mkdirSync(path.join(project, 'sess-live', 'subagents', 'workflows', 'wf_1'), { recursive: true });
   const named = (name, role) => [JSON.stringify({ type: 'agent-name', agentName: name }), JSON.stringify({ type: 'agent-setting', agentSetting: role })];
   fs.writeFileSync(path.join(project, 'sess-live.jsonl'), lines(
-    ...named('pl-endzone', 'project-lead'),
+    ...named('stale-title', 'wrong-role'), // the transcript's own title differs: the roster name must win
     attempt('2026-10-01T10:00:00.000Z', 'a', `gh pr merge 100 -R ${REPO}`),
     attempt('2026-10-01T10:30:00.000Z', 'a2', `gh pr merge 100 -R ${REPO}`),
     attempt('2026-10-02T09:00:00.000Z', 'c', 'psql prod', '[Production Reads]'),
@@ -180,7 +196,7 @@ function writeTranscripts() {
   ));
   fs.writeFileSync(path.join(project, 'sess-live', 'subagents', 'agent-x1.jsonl'), lines(attempt('2026-10-03T08:00:00.000Z', 'h', `gh pr merge 101 -R ${REPO}`)));
   fs.writeFileSync(path.join(project, 'sess-live', 'subagents', 'workflows', 'wf_1', 'agent-w1.jsonl'), lines(attempt('2026-10-03T09:00:00.000Z', 'i', `gh pr merge 102 -R ${REPO}`)));
-  fs.writeFileSync(path.join(project, 'sess-rotated.jsonl'), lines(...named('pl-endzone', 'project-lead'), attempt('2026-10-01T10:45:00.000Z', 'j', `gh pr merge 103 -R ${REPO}`)));
+  fs.writeFileSync(path.join(project, 'sess-rotated.jsonl'), lines(...named('another-title', 'ic'), attempt('2026-10-01T10:45:00.000Z', 'j', `gh pr merge 103 -R ${REPO}`)));
   fs.writeFileSync(path.join(project, 'sess-cory.jsonl'), lines(...named('x', 'y'), attempt('2026-10-04T08:00:00.000Z', 'k', `gh pr merge 200 -R ${REPO}`), attempt('2026-10-04T08:05:00.000Z', 'l', 'rm -rf x', '[Irreversible Local Destruction]')));
   fs.writeFileSync(path.join(project, 'sess-ancient.jsonl'), lines(attempt('2026-10-04T09:00:00.000Z', 'm', `gh pr merge 201 -R ${REPO}`)));
   return dir;
@@ -212,6 +228,7 @@ test('collect: only roster sessions count; subagents and workflow subagents belo
   assert.equal(report.mergeWithoutReview.count, 5);
   assert.equal(report.mergeWithoutReview.prs.length, 4);
   assert.deepEqual(report.mergeWithoutReview.names, ['pl-endzone']);
+  assert.ok(report.refusals.every((r) => r.name === 'pl-endzone' && r.role === 'project-lead'), 'roster name and role win over the transcript');
   assert.equal(report.mergeWithoutReview.sessions, 2);
   assert.deepEqual(report.outsideRoster, { count: 2 }); // sess-cory 200 and sess-ancient 201
   assert.equal(report.categories.find((c) => c.category === 'Production Reads').count, 1);
@@ -277,14 +294,50 @@ test('session-hours are the union per roster name across sessionIds, not a sum o
   assert.equal(mwr.waitHours, 4);
 });
 
-test('a PR still open at --until ends at --until and is counted as still open; a PR with no merge data is unresolved and costs nothing', () => {
+test('an open PR runs to --until and is still open; a PR closed unmerged ends at closedAt and is reported as closed unmerged; a PR with no merge data is unresolved', () => {
   const collected = scansFor([{ sessionId: 's1', name: 'pl-endzone', refusals: [['2026-10-01T10:00:00.000Z', 1], ['2026-10-01T10:00:00.000Z', 2], ['2026-10-01T10:00:00.000Z', 3]] }]);
-  const merges = { [mergeKey(REPO, 1)]: { state: 'OPEN', mergedAt: null, mergedBy: null }, [mergeKey(REPO, 2)]: { state: 'CLOSED', mergedAt: null, mergedBy: null } };
+  const merges = {
+    [mergeKey(REPO, 1)]: { state: 'OPEN', mergedAt: null, mergedBy: null, closedAt: null },
+    [mergeKey(REPO, 2)]: { state: 'CLOSED', mergedAt: null, mergedBy: null, closedAt: '2026-10-01T12:00:00.000Z' },
+  };
   const mwr = buildReport(collected, { since: '2026-10-01T00:00:00Z', until: '2026-10-01T16:00:00Z', merges }).mergeWithoutReview;
-  assert.equal(mwr.stillOpen, 2); // open and closed-unmerged both run to --until
+  assert.equal(mwr.stillOpen, 1); // only the open PR
+  assert.equal(mwr.closedUnmerged, 1);
   assert.equal(mwr.unresolved, 1);
-  assert.equal(mwr.waitHours, 6);
+  assert.equal(mwr.prs.find((p) => p.number === 1).hours, 6);
+  assert.equal(mwr.prs.find((p) => p.number === 2).hours, 2);
+  assert.equal(mwr.prs.find((p) => p.number === 2).closedUnmerged, true);
   assert.equal(mwr.prs.find((p) => p.number === 3).hours, 0);
+  assert.equal(mwr.waitHours, 6); // union of 10:00-16:00 and 10:00-12:00
+});
+
+test('the wait is capped at --until: a PR merged (or closed) after the window bills only to --until and counts as still open', () => {
+  const collected = scansFor([{ sessionId: 's1', name: 'pl-endzone', refusals: [['2026-10-01T10:00:00.000Z', 1], ['2026-10-01T10:00:00.000Z', 2]] }]);
+  const merges = {
+    [mergeKey(REPO, 1)]: { state: 'MERGED', mergedAt: '2026-10-02T10:00:00.000Z', mergedBy: 'andydarknessb', closedAt: '2026-10-02T10:00:00.000Z' },
+    [mergeKey(REPO, 2)]: { state: 'CLOSED', mergedAt: null, mergedBy: null, closedAt: '2026-10-03T10:00:00.000Z' },
+  };
+  const mwr = buildReport(collected, { since: '2026-10-01T00:00:00Z', until: '2026-10-01T12:00:00Z', merges }).mergeWithoutReview;
+  assert.equal(mwr.prs.find((p) => p.number === 1).hours, 2);
+  assert.equal(mwr.prs.find((p) => p.number === 1).stillOpen, true);
+  assert.equal(mwr.prs.find((p) => p.number === 1).mergedAt, '2026-10-02T10:00:00.000Z', 'the real merge time is still shown');
+  assert.equal(mwr.prs.find((p) => p.number === 2).hours, 2);
+  assert.equal(mwr.prs.find((p) => p.number === 2).stillOpen, true);
+  assert.equal(mwr.prs.find((p) => p.number === 2).closedUnmerged, false, 'closed after the window is still open at the window end');
+  assert.equal(mwr.stillOpen, 2);
+  assert.equal(mwr.waitHours, 2);
+});
+
+test('unresolved counts refusals, one unit throughout: unparseable merge commands plus every refusal of a PR with no merge data', () => {
+  const text = lines(
+    attempt('2026-10-01T10:00:00.000Z', 'a', 'gh pr merge --auto'),
+    attempt('2026-10-01T10:01:00.000Z', 'b', 'gh pr merge 5 -R o/r'),
+    attempt('2026-10-01T10:02:00.000Z', 'c', 'gh pr merge 5 -R o/r'),
+  );
+  const collected = { scans: [{ ...scanTranscript(text, { sessionId: 's' }), sessionId: 's', name: 'pl-endzone', role: 'project-lead', inRoster: true }], filesScanned: 1 };
+  const report = buildReport(collected, { ...DAY, merges: {} });
+  assert.equal(report.mergeWithoutReview.unresolved, 3);
+  assert.deepEqual(report.refusals.map((r) => r.unresolved), [true, true, true]);
 });
 
 test('a refused merge whose PR cannot be read from the command is unresolved', () => {
@@ -331,9 +384,22 @@ test('other categories report count, sessions and roster names, no wait; uncateg
   assert.ok(!('waitHours' in report.categories[1]));
 });
 
+test('the refused-command-was-gh-pr-merge marker applies to every non-merge category (e.g. Production Deploy), unpriced', () => {
+  const text = lines(attempt(at(0), 'a', 'gh pr merge 1711 -R o/r', '[Production Deploy]'), attempt(at(1), 'b', 'psql', '[Production Deploy]'));
+  const collected = { scans: [{ ...scanTranscript(text, { sessionId: 's' }), sessionId: 's', name: 'pl-endzone', role: 'project-lead', inRoster: true }], filesScanned: 1 };
+  const report = buildReport(collected, { ...DAY, merges: {} });
+  const deploy = report.categories.find((c) => c.category === 'Production Deploy');
+  assert.equal(deploy.count, 2);
+  assert.equal(deploy.refusedGhPrMerge, 1);
+  assert.deepEqual(report.refusals.map((r) => r.refusedGhPrMerge), [true, undefined]);
+  assert.equal(report.mergeWithoutReview.waitHours, 0);
+  assert.equal(report.mergeWithoutReview.prs.length, 0);
+  assert.match(renderMarkdown(report), /Production Deploy 1 of 2/);
+});
+
 test('every refusal is listed with its roster name and role', () => {
   const collected = scansFor([{ sessionId: 's1', name: 'pl-nidus', role: 'project-lead', refusals: [['2026-10-01T10:00:00.000Z', 33]] }]);
-  const report = buildReport(collected, { ...DAY, merges: {} });
+  const report = buildReport(collected, { ...DAY, merges: Object.fromEntries([merged(33, '2026-10-01T11:00:00.000Z')]) });
   assert.deepEqual(report.refusals[0], { at: '2026-10-01T10:00:00.000Z', name: 'pl-nidus', role: 'project-lead', sessionId: 's1', category: MERGE_CATEGORY, pr: { number: 33, repo: REPO } });
 });
 
@@ -347,8 +413,8 @@ test('fetchMerges asks gh pr view per PR (injected runner) and reports a failed 
     return JSON.stringify({ state: 'MERGED', mergedAt: '2026-10-01T12:00:00Z', mergedBy: { login: 'andydarknessb-fleet' } });
   };
   const { merges, errors } = fetchMerges([{ repo: 'o/r', number: 8 }, { repo: 'o/r', number: 9 }], { gh });
-  assert.deepEqual(calls, ['pr view 8 -R o/r --json mergedAt,mergedBy,state', 'pr view 9 -R o/r --json mergedAt,mergedBy,state']);
-  assert.deepEqual(merges[mergeKey('o/r', 8)], { state: 'MERGED', mergedAt: '2026-10-01T12:00:00.000Z', mergedBy: 'andydarknessb-fleet' });
+  assert.deepEqual(calls, ['pr view 8 -R o/r --json mergedAt,mergedBy,state,closedAt', 'pr view 9 -R o/r --json mergedAt,mergedBy,state,closedAt']);
+  assert.deepEqual(merges[mergeKey('o/r', 8)], { state: 'MERGED', mergedAt: '2026-10-01T12:00:00.000Z', mergedBy: 'andydarknessb-fleet', closedAt: null });
   assert.equal(merges[mergeKey('o/r', 9)], undefined);
   assert.equal(errors.length, 1);
 });
@@ -362,7 +428,7 @@ test('without GitHub, the pr-watch state-merged event supplies the merge time an
   });
   const tenants = { nidus: { github: 'andydarknessb/Nidus' } };
   const { merges } = fetchMerges([{ repo: 'andydarknessb/Nidus', number: 44 }, { repo: 'andydarknessb/Nidus', number: 45 }], { gh: null, fleetHome: home, tenants });
-  assert.deepEqual(merges[mergeKey('andydarknessb/Nidus', 44)], { state: 'MERGED', mergedAt: '2026-10-01T11:42:47.000Z', mergedBy: 'andydarknessb-fleet' });
+  assert.deepEqual(merges[mergeKey('andydarknessb/Nidus', 44)], { state: 'MERGED', mergedAt: '2026-10-01T11:42:47.000Z', mergedBy: 'andydarknessb-fleet', closedAt: null });
   assert.equal(merges[mergeKey('andydarknessb/Nidus', 45)], undefined);
 });
 
@@ -389,6 +455,7 @@ test('default output is a Markdown report; --json prints the same figures as JSO
   assert.match(markdown, /andydarknessb-fleet/);
   assert.match(markdown, /#100/);
   assert.match(markdown, /automode-unavailable/);
+  assert.ok(markdown.includes("Merged by shows the GitHub account; the lead's own successful merges also appear as andydarknessb."));
   assert.ok(!markdown.includes('\u2014'), 'no em-dashes in output');
   const parsed = JSON.parse(cli([...argv, '--json'], { gh }));
   assert.equal(parsed.since, SINCE);
@@ -396,6 +463,15 @@ test('default output is a Markdown report; --json prints the same figures as JSO
   assert.equal(parsed.mergeWithoutReview.stillOpen, 1); // 103 is open at --until
   assert.equal(parsed.mergeWithoutReview.prs.find((p) => p.number === 100).hours, 2);
   assert.equal(renderMarkdown(parsed), markdown);
+});
+
+test('the Markdown tables name a closed-unmerged PR and mark an unresolved refusal row', () => {
+  const collected = scansFor([{ sessionId: 's1', name: 'pl-endzone', refusals: [['2026-10-01T10:00:00.000Z', 1], ['2026-10-01T10:30:00.000Z', 2]] }]);
+  const merges = { [mergeKey(REPO, 1)]: { state: 'CLOSED', mergedAt: null, mergedBy: null, closedAt: '2026-10-01T11:00:00.000Z' } };
+  const markdown = renderMarkdown(buildReport(collected, { ...DAY, merges }));
+  assert.match(markdown, /Endzone-Empire#1 \| pl-endzone \| 2026-10-01T10:00:00.000Z \| closed unmerged 2026-10-01T11:00:00.000Z \|/);
+  assert.match(markdown, /Endzone-Empire#2 \| pl-endzone \| 2026-10-01T10:30:00.000Z \| unresolved \|/);
+  assert.match(markdown, /\| 2026-10-01T10:30:00.000Z \| pl-endzone \| project-lead \| Merge Without Review \(unresolved\) \|/);
 });
 
 test('--no-verify-github never calls gh and falls back to the events ledger', () => {
@@ -409,12 +485,18 @@ test('--no-verify-github never calls gh and falls back to the events ledger', ()
   assert.equal(parsed.mergeWithoutReview.waitHours, 2);
 });
 
-test('--since and --until without an offset are UTC', () => {
-  const { argv, gh } = cliFixture();
-  const bare = argv.map((value) => (value === SINCE ? '2026-09-29T23:32:13' : (value === UNTIL ? '2026-10-06T23:32:13' : value)));
-  const parsed = JSON.parse(cli([...bare, '--json'], { gh }));
+test('--since and --until without an offset are UTC, whatever the host time zone (run in America/Chicago)', () => {
+  const home = fleetHome({ live: [] });
+  const dir = scratch();
+  const script = path.join(__dirname, '..', 'bin', 'refusal-report.js');
+  const env = { ...process.env, TZ: 'America/Chicago' };
+  const out = execFileSync(process.execPath, [script, '--fleet-home', home, '--transcripts', dir, '--since', '2026-09-29T23:32:13', '--until', '2026-10-06T23:32:13', '--json', '--no-verify-github'], { encoding: 'utf8', env });
+  const parsed = JSON.parse(out);
   assert.equal(parsed.since, '2026-09-29T23:32:13.000Z');
   assert.equal(parsed.until, '2026-10-06T23:32:13.000Z');
+  // the zone really applied: the same bare string read as local time is five hours later in UTC
+  const local = execFileSync(process.execPath, ['-e', "process.stdout.write(new Date('2026-09-29T23:32:13').toISOString())"], { encoding: 'utf8', env });
+  assert.equal(local, '2026-09-30T04:32:13.000Z');
 });
 
 test('--until defaults to now', () => {
