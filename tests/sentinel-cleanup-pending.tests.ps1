@@ -213,6 +213,26 @@ try {
   Assert-True (@($after | Where-Object { $_.jobId -eq 'job-12' }).Count -eq 1 -and @($after | Where-Object { $_.jobId -eq 'job-1' }).Count -eq 1) "a line appended during the pass must survive the rewrite: $($after | ConvertTo-Json -Compress)"
   Remove-Item "$testRoot\mock-state\append.txt"
 
+  # Case 11 (re-QA C): an unreadable, empty-during-a-write or missing roster blocks every worktree removal (janitor's rule):
+  # without a roster no claim can be seen. The job is still stopped and removed; the line stays with attempts+1 and the reason.
+  foreach ($rosterState in 'empty', 'missing') {   # (an unparseable roster already stops the whole check at its first read)
+    Remove-Item $calls -ErrorAction SilentlyContinue
+    Reset-Fixture
+    Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
+    switch ($rosterState) {
+      'empty'   { Write-Utf8 "$testRoot\state\roster.json" '' }
+      'missing' { Remove-Item "$testRoot\state\roster.json" }
+    }
+    $r = Run-Check -Apply
+    Assert-True (Test-Path $wt) "a $rosterState roster must block worktree removal"
+    $kept = @(Get-Content $pendingPath | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+    Assert-True ($kept.Count -eq 1 -and $kept[0].attempts -eq 1 -and "$($kept[0].lastError)" -match 'roster') "a $rosterState roster must keep the line with attempts=1 and say why: $($kept | ConvertTo-Json -Compress)"
+  }
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
+  $r = Run-Check -Apply
+  Assert-True (-not (Test-Path $wt)) 'a readable (even empty-sessions) roster still lets a clean worktree go'
+
   Write-Output 'sentinel-cleanup-pending tests passed'
 } finally {
   foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }

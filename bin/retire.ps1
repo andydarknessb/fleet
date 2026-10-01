@@ -125,7 +125,8 @@ if ($e.jobId -and -not $cliMissing) {
   elseif (-not $daemonListOk) { Write-Warning "daemon session list unreadable for job $($e.jobId); worktree cleanup skipped rather than guessed" }
   elseif ($stillThere) { Write-Warning "job $($e.jobId) still exists after claude rm; inspect with: claude agents --json --all" }
 }
-if ($cliMissing -and -not $script:ClaudeCliMissing) { $script:ClaudeCliMissing = [pscustomobject]@{ tried = @("$($script:ClaudeCli)"); waitedSec = 0 } }$e.status = 'retired'
+if ($cliMissing -and -not $script:ClaudeCliMissing) { $script:ClaudeCliMissing = [pscustomobject]@{ tried = @("$($script:ClaudeCli)"); waitedSec = 0 } }
+$e.status = 'retired'
 $e | Add-Member -NotePropertyName retiredAt -NotePropertyValue (Now-Iso) -Force
 if ($cliMissing) {
   $e | Add-Member -NotePropertyName jobRemoval -NotePropertyValue 'cli-missing' -Force

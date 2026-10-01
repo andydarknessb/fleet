@@ -174,6 +174,43 @@ try {
   $hookCall = @(Get-Content "$sourceRoot\hooks\stop.ps1" | Where-Object { $_ -match 'Invoke-ClaudeCli' -and $_ -notmatch '^\s*#' })
   Assert-True ($hookCall.Count -eq 1 -and $hookCall[0] -match '-TimeoutSec 20\b' -and $hookCall[0] -match '-Tries 2\b' -and $hookCall[0] -match '-PollMs 2000\b') "hooks/stop.ps1 must bound the agents read (-TimeoutSec 20) and use a short ladder (-Tries 2 -PollMs 2000): $($hookCall -join ' | ')"
 
+  # Case 13 (re-QA A): a sub-second npm blip. A -NoRetry miss (launch.ps1's post-bg poll) must NOT arm the remembered-miss
+  # short-circuit, or every later tolerant read returns @() for a minute and the poll finds no session.
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+  $script:ClaudeCli = $null; $script:ClaudeCliTolerantMissAt = $null
+  Assert-True (@(Get-DaemonSessions -Strict).Count -eq 1) 'case 13 fixture: a strict read resolves and caches'
+  Remove-Item "$testRoot\mock-bin\claude.cmd"
+  Assert-True (@(Get-DaemonSessions -NoRetry 3>$null).Count -eq 0) 'during the blip a -NoRetry read finds nothing'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+  Assert-True (@(Get-DaemonSessions -NoRetry).Count -eq 1) 'the CLI is back: the very next -NoRetry read must return rows (a -NoRetry miss must not be remembered)'
+  Assert-True (@(Get-DaemonSessions).Count -eq 1) 'and so must a retrying tolerant read'
+
+  # ... and a remembered miss from a RETRYING read is only a downgrade to a cheap re-probe, never a blanket @():
+  # when the CLI is back the next tolerant read (any flavour) sees it, immediately.
+  Remove-Item "$testRoot\mock-bin\claude.cmd"
+  $script:ClaudeCli = $null
+  $null = @(Get-DaemonSessions 3>$null)
+  Assert-True ($null -ne $script:ClaudeCliTolerantMissAt) 'a retrying tolerant miss is remembered'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+  Assert-True (@(Get-DaemonSessions).Count -eq 1) 'a remembered miss must be a -NoRetry re-probe, not a blanket empty list: the CLI is back'
+  Assert-True ($null -eq $script:ClaudeCliTolerantMissAt) 'and finding the CLI clears the memory'
+
+  # Case 14 (re-QA B): the per-process cache revalidates. The package claude.exe turning back into the placeholder stub under
+  # a long-lived process must not keep being used.
+  Remove-Item "$testRoot\mock-bin\claude.cmd"
+  $shimPkg = "$testRoot\mock-bin\node_modules\@anthropic-ai\claude-code"
+  [IO.Directory]::CreateDirectory("$shimPkg\bin") | Out-Null
+  Copy-Item "$env:SystemRoot\System32\whoami.exe" "$shimPkg\bin\claude.exe" -Force
+  Write-Utf8 "$shimPkg\package.json" '{"name":"@anthropic-ai/claude-code"}'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $shimBody
+  $script:ClaudeCli = $null
+  $first = Invoke-ClaudeCli -Arguments @('/?') -NoRetry
+  Assert-True ($first.cli -eq "$shimPkg\bin\claude.exe") 'case 14 fixture: the call used the package exe and cached it'
+  [IO.File]::WriteAllBytes("$shimPkg\bin\claude.exe", (New-Object byte[] 100))
+  $msg = Get-Thrown { Invoke-ClaudeCli -Arguments @('/?') -NoRetry }
+  Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found') "a cached path that became the placeholder stub must be re-resolved, not reused: $msg"
+  Remove-Item "$testRoot\mock-bin\node_modules" -Recurse -Force
+
   Write-Output 'claude-cli-resolver tests passed'
 } finally {
   foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }

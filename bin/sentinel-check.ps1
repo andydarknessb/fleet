@@ -911,7 +911,15 @@ if (Test-Path -LiteralPath $cleanupPendingPath) {
       # A worktree another session now owns is left alone (the same path is relaunched for the next attempt at an issue):
       # an active|retiring roster row of the same name, or naming that worktree as its cwd, or a live daemon row whose cwd is it.
       $cpNorm = { param($x) ("$x" -replace '/', '\').TrimEnd('\').ToLowerInvariant() }
-      $cpRosterNow = @((Get-LiveRoster).sessions | Where-Object { "$($_.status)" -in @('active', 'retiring') })
+      # A strict read, janitor's rule: a roster that is missing, empty (mid-write) or unparseable shows no claims at all, and
+      # "nobody claims it" off that reading would remove a live session's worktree. It blocks every removal instead.
+      $cpRosterNow = @()
+      if ($cpWorktrees.Count -gt 0) {
+        $cpRosterRaw = $null
+        try { $cpRosterRaw = Get-Content -LiteralPath $rosterPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch {}
+        if ($null -eq $cpRosterRaw -or -not $cpRosterRaw.PSObject.Properties['sessions']) { throw 'state/roster.json is missing, empty or unreadable; worktree removal blocked because no claim can be seen' }
+        $cpRosterNow = @($cpRosterRaw.sessions | Where-Object { "$($_.status)" -in @('active', 'retiring') })
+      }
       $cpDaemonNow = @(Get-DaemonSessions -All -Strict | Where-Object { $_.pid -and "$($_.id)" -ne $cpJob })
       $cpClaimedBy = {
         param($wtPath)

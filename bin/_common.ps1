@@ -211,10 +211,12 @@ function Get-DaemonSessions {
   # 2026-09-01 near-miss: one glitched read told the Sentinel every session was
   # missing while the same source disarmed launch.ps1's duplicate and cap guards.
   param([switch]$All, [switch]$Strict, [switch]$NoRetry)
-  # A tolerant read that already missed the CLI (after the whole ladder) is remembered for a minute, so a script that
-  # reads the list repeatedly does not wait the ladder on every call (launch.ps1 must finish well inside assignment.js's
-  # 90 s). A strict read is never short-circuited, and a CLI that resolves again clears the memory (Invoke-ClaudeCli).
-  if (-not $Strict -and $script:ClaudeCliTolerantMissAt -and ((Get-Date) - $script:ClaudeCliTolerantMissAt).TotalSeconds -lt 60) { return @() }
+  # A tolerant, RETRYING read that already missed the CLI (after the whole ladder) is remembered for a minute: while that
+  # memory stands a retrying read is downgraded to -NoRetry, a cheap re-probe that still sees the CLI the moment it is
+  # back, so a script that reads the list repeatedly does not wait the ladder on every call (launch.ps1 must finish well
+  # inside assignment.js's 90 s). A -NoRetry miss never arms the memory (a sub-second npm blip must not blind a poll
+  # loop for a minute), a strict read is never downgraded, and a CLI that resolves again clears it (Invoke-ClaudeCli).
+  if (-not $Strict -and $script:ClaudeCliTolerantMissAt -and ((Get-Date) - $script:ClaudeCliTolerantMissAt).TotalSeconds -lt 60) { $NoRetry = $true }
   $cliArgs = @('agents', '--json'); if ($All) { $cliArgs += '--all' }
   $run = $null
   try { $run = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec 60 -Name "claude $($cliArgs -join ' ')" -NoRetry:$NoRetry }
@@ -222,7 +224,7 @@ function Get-DaemonSessions {
     # fleet #265: a missing CLI is not an empty fleet. Strict callers fail closed with the
     # resolver's text; tolerant ones still get @() but the cause is on the warning stream.
     if ($Strict) { throw "daemon session list unreadable: $($_.Exception.Message)" }
-    $script:ClaudeCliTolerantMissAt = Get-Date
+    if (-not $NoRetry) { $script:ClaudeCliTolerantMissAt = Get-Date }
     Write-Warning "daemon session list unavailable: $($_.Exception.Message)"
     return @()
   }
@@ -541,7 +543,8 @@ function Resolve-ClaudeCli {
   $script:ClaudeCliMissing = [pscustomobject]@{ tried = @($tried); waitedSec = $waited }
   $waitNote = if ($NoRetry) { 'no wait' } else { "waited ${waited}s for an in-flight npm reinstall" }
   throw "claude CLI not found (tried: $($tried -join '; '); FLEET_CLAUDE_CLI=unset; $waitNote)"
-}function Get-ClaudeCliMissingJson {
+}
+function Get-ClaudeCliMissingJson {
   # The JSON a script prints (exit 6) when it gives up because the CLI is absent.
   param($Extra = $null)
   $m = $script:ClaudeCliMissing
@@ -558,13 +561,16 @@ function Invoke-ClaudeCli {
   # -NoRetry / -Tries / -PollMs are Resolve-ClaudeCli's, for a caller that already resolved or has a deadline.
   param([string[]]$Arguments, [int]$TimeoutSec = 60, [string]$Name = '', [string]$StdinText = $null, [switch]$NoRetry, [int]$Tries = 0, [int]$PollMs = -1)
   $cli = $null
-  if ($script:ClaudeCli -and "$script:ClaudeCliOverride" -eq "$env:FLEET_CLAUDE_CLI" -and (Test-Path -LiteralPath $script:ClaudeCli -PathType Leaf)) { $cli = $script:ClaudeCli }
+  # The per-process cache is revalidated every call (Test-ClaudeCliCandidate, not just existence): a long-lived process can see the
+  # package claude.exe turn back into npm's placeholder stub, or lose its package.json, mid-reinstall.
+  if ($script:ClaudeCli -and "$script:ClaudeCliOverride" -eq "$env:FLEET_CLAUDE_CLI" -and (Test-ClaudeCliCandidate $script:ClaudeCli)) { $cli = $script:ClaudeCli }
   if (-not $cli) { $cli = Resolve-ClaudeCli -NoRetry:$NoRetry -Tries $Tries -PollMs $PollMs; $script:ClaudeCli = $cli; $script:ClaudeCliOverride = "$env:FLEET_CLAUDE_CLI" }
   $script:ClaudeCliTolerantMissAt = $null
   if (-not $Name) { $Name = "claude $((@($Arguments) | Select-Object -First 2) -join ' ')" }
   $r = Invoke-BoundedExe -FilePath $cli -ArgumentList $Arguments -TimeoutSec $TimeoutSec -Name $Name -StdinText $StdinText
   return [pscustomobject]@{ cli = $cli; exitCode = $r.exitCode; stdout = "$($r.stdout)"; stderr = "$($r.stderr)"; timedOut = $r.timedOut; startError = $r.startError }
-}function ConvertFrom-LastJsonLine {
+}
+function ConvertFrom-LastJsonLine {
   param($Text)
   try { return ("$Text".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
 }
