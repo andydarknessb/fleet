@@ -1127,6 +1127,8 @@ module.exports = {
   buildReport,
   loadRetiredRows,
   readSubagents,
+  defaultTranscriptsDir,
+  listTranscriptFiles,
   RISK_REVIEWER_TYPE,
   mergeSessionRows,
   classifyTurns,
