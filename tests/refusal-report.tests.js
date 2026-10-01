@@ -12,7 +12,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { execFileSync } = require('node:child_process');
 const {
-  scanTranscript, parseGhMerge, loadFleetSessions, collectRefusals, prKeysToResolve, mergeKey, fetchMerges, buildReport, renderMarkdown, cli,
+  scanTranscript, parseGhMerge, parseGhMerges,loadFleetSessions, collectRefusals, prKeysToResolve, mergeKey, fetchMerges, buildReport, renderMarkdown, cli,
   MERGE_CATEGORY, OUTSIDE_ROSTER_LABEL, UNCATEGORIZED, REFUSAL_REPORT_FLAGS,
 } = require('../bin/refusal-report');
 
@@ -358,6 +358,54 @@ test('a Merge Without Review refusal of a command that is not a PR merge (the cl
   assert.equal(mwr.followOn, 1);
   assert.equal(mwr.unresolved, 0);
   assert.equal(mwr.waitHours, 1);
+});
+
+test('parseGhMerge finds a merge after { , env assignments, timeout and gh.exe', () => {
+  assert.deepEqual(parseGhMerge('git fetch; if ($?) { gh pr merge 1900 -R a/b }'), { number: 1900, repo: 'a/b' });
+  assert.deepEqual(parseGhMerge('GH_TOKEN=x gh pr merge 7'), { number: 7, repo: null });
+  assert.deepEqual(parseGhMerge('GH_TOKEN=x FOO="a b" gh pr merge 7 -R o/r'), { number: 7, repo: 'o/r' });
+  assert.deepEqual(parseGhMerge('timeout 60 gh pr merge 8 -R o/r'), { number: 8, repo: 'o/r' });
+  assert.deepEqual(parseGhMerge('gh.exe pr merge 9 -R o/r'), { number: 9, repo: 'o/r' });
+  assert.equal(parseGhMerge('echo { "gh pr merge 5" }'), null);
+});
+
+test('every gh pr merge in a chained command is read: parseGhMerges lists them, a refusal carries them, and each PR is priced', () => {
+  const command = 'gh pr merge 14 -R a/b && gh pr merge 15 -R c/d';
+  assert.deepEqual(parseGhMerges(command), [{ number: 14, repo: 'a/b' }, { number: 15, repo: 'c/d' }]);
+  assert.deepEqual(parseGhMerge(command), { number: 14, repo: 'a/b' });
+  const scan = scanTranscript(lines(attempt('2026-10-01T10:00:00.000Z', 'a', command)), { sessionId: 's' });
+  assert.deepEqual(scan.refusals[0].prs, [{ number: 14, repo: 'a/b' }, { number: 15, repo: 'c/d' }]);
+  const collected = { scans: [{ ...scan, sessionId: 's', name: 'pl-endzone', role: 'project-lead', inRoster: true }], filesScanned: 1 };
+  assert.deepEqual(prKeysToResolve(collected, DAY).map((k) => mergeKey(k.repo, k.number)).sort(), ['a/b#14', 'c/d#15']);
+  const merges = { [mergeKey('a/b', 14)]: { state: 'MERGED', mergedAt: '2026-10-01T11:00:00.000Z' }, [mergeKey('c/d', 15)]: { state: 'MERGED', mergedAt: '2026-10-01T12:00:00.000Z' } };
+  const mwr = buildReport(collected, { ...DAY, merges }).mergeWithoutReview;
+  assert.deepEqual(mwr.prs.map((p) => [p.number, p.hours]), [[14, 1], [15, 2]]);
+  assert.equal(mwr.count, 1);
+});
+
+test('a Merge Without Review refusal that contains pr merge but does not parse is unresolved, not a follow-on', () => {
+  const text = lines(attempt('2026-10-01T10:00:00.000Z', 'a', 'echo 7 | xargs gh pr merge -R o/r'), attempt('2026-10-01T10:01:00.000Z', 'b', 'cat memory/notes.md'));
+  const collected = { scans: [{ ...scanTranscript(text, { sessionId: 's' }), sessionId: 's', name: 'pl-endzone', role: 'project-lead', inRoster: true }], filesScanned: 1 };
+  const report = buildReport(collected, { ...DAY, merges: {} });
+  assert.equal(report.mergeWithoutReview.unresolved, 1);
+  assert.equal(report.mergeWithoutReview.followOn, 1);
+  assert.deepEqual(report.refusals.map((r) => r.unresolved), [true, undefined]);
+});
+
+test('a PR merged (or closed) before its first refusal is the wrong PR: unresolved with a reason, not clamped to 0 h', () => {
+  const collected = scansFor([{ sessionId: 's1', name: 'pl-endzone', refusals: [['2026-10-01T10:00:00.000Z', 1], ['2026-10-01T10:00:00.000Z', 2], ['2026-10-01T10:30:00.000Z', 2]] }]);
+  const merges = Object.fromEntries([merged(1, '2026-09-30T10:00:00.000Z')]);
+  merges[mergeKey(REPO, 2)] = { state: 'CLOSED', mergedAt: null, mergedBy: null, closedAt: '2026-09-30T10:00:00.000Z' };
+  const report = buildReport(collected, { ...DAY, merges });
+  const mwr = report.mergeWithoutReview;
+  assert.equal(mwr.unresolved, 3);
+  for (const pr of mwr.prs) {
+    assert.equal(pr.resolved, false);
+    assert.match(pr.unresolvedReason, /before the first refusal/);
+    assert.equal(pr.hours, 0);
+  }
+  assert.equal(mwr.waitHours, 0);
+  assert.deepEqual(report.refusals.map((r) => r.unresolved), [true, true, true]);
 });
 
 test('window length and the Merge Without Review rate per 7 days', () => {

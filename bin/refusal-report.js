@@ -80,21 +80,27 @@ function maskQuoted(command) {
 }
 
 // `gh pr merge` as a command: at the start, or after a shell separator (; & | newline, a
-// subshell or backtick), optionally after gh's own global flags (`gh -R o/r pr merge 5`).
-const GH_MERGE = /(?:^|[;&|\n(`])\s*gh((?:\s+(?:-R|--repo)(?:\s+|=)\S+)*)\s+pr\s+merge\b([^;&|\n]*)/;
+// subshell, backtick or block `{`), optionally after env assignments and `timeout 60`, as `gh`
+// or `gh.exe`, optionally with gh's own global flags (`gh -R o/r pr merge 5`).
+const GH_MERGE = /(?:^|[;&|\n(`{])\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:timeout\s+\d\S*\s+)?gh(?:\.exe)?((?:\s+(?:-R|--repo)(?:\s+|=)\S+)*)\s+pr\s+merge\b([^;&|\n]*)/g;
 
-function findGhMerge(command) {
+// Every `gh pr merge` segment of a command, in order.
+function findGhMerges(command) {
   const { text, quoted } = maskQuoted(command);
-  const match = text.match(GH_MERGE);
-  return match ? { tokens: `${match[1]} ${match[2]}`.trim().split(/\s+/).filter(Boolean), quoted } : null;
+  return [...text.matchAll(GH_MERGE)].map((match) => ({ tokens: `${match[1]} ${match[2]}`.trim().split(/\s+/).filter(Boolean), quoted }));
 }
 
-// The PR a refused `gh pr merge` named: { number, repo } (repo null when the command carries
-// no -R / --repo / PR URL), or null when the command is not a merge of a named PR. Reads only
-// the `gh pr merge` segment of a chained command, never a string literal.
-function parseGhMerge(command) {
-  const found = findGhMerge(command);
-  if (!found) return null;
+// The PRs a refused command's `gh pr merge` segments named: [{ number, repo }] (repo null when
+// a segment carries no -R / --repo / PR URL); a segment naming no PR adds nothing. Reads only
+// the `gh pr merge` segments of a chained command, never a string literal.
+function parseGhMerges(command) {
+  return findGhMerges(command).map(parseSegment).filter(Boolean);
+}
+
+// The first of them, or null when the command is not a merge of a named PR.
+const parseGhMerge = (command) => parseGhMerges(command)[0] || null;
+
+function parseSegment(found) {
   const unmask = (token) => String(token || '').replace(/\u0000(\d+)\u0000/g, (_, index) => found.quoted[Number(index)]);
   const tokens = found.tokens;
   let repo = null;
@@ -148,14 +154,16 @@ function scanTranscript(contents, { sessionId = null } = {}) {
         unavailableMs.push(ms);
       } else if (row.toolDenialKind === BLOCKED_KIND) {
         const command = commands.get(block.tool_use_id) || '';
+        const prs = parseGhMerges(command);
         refusals.push({
           ms,
           timestamp: row.timestamp,
           category: categoryOf(text),
           toolUseId: block.tool_use_id || null,
           command,
-          pr: parseGhMerge(command),
-          refusedGhPrMerge: findGhMerge(command) !== null,
+          pr: prs[0] || null,
+          prs,
+          refusedGhPrMerge: findGhMerges(command).length > 0,
         });
       } else if (DENIAL_TEXT.test(text)) {
         unconfirmed.push({ ms, timestamp: row.timestamp, category: categoryOf(text) });
@@ -258,7 +266,8 @@ function collectRefusals({ transcriptsDir, since, fleetSessions = new Map(), ten
       const scan = scanTranscript(contents, { sessionId: hostId });
       const repo = repoForSession({ tenant: member?.tenant, cwd: scan.cwd }, tenants);
       for (const refusal of scan.refusals) {
-        if (refusal.pr && !refusal.pr.repo) refusal.pr = { number: refusal.pr.number, repo };
+        refusal.prs = refusal.prs.map((pr) => (pr.repo ? pr : { number: pr.number, repo }));
+        refusal.pr = refusal.prs[0] || null;
       }
       scans.push({
         ...scan,
@@ -291,8 +300,8 @@ function prKeysToResolve(collected, window) {
   for (const scan of collected.scans || []) {
     if (!scan.inRoster) continue;
     for (const refusal of scan.refusals) {
-      if (refusal.category !== MERGE_CATEGORY || !inWindow(refusal.ms, bounds) || !refusal.pr || !refusal.pr.repo) continue;
-      seen.set(mergeKey(refusal.pr.repo, refusal.pr.number), { repo: refusal.pr.repo, number: refusal.pr.number });
+      if (refusal.category !== MERGE_CATEGORY || !inWindow(refusal.ms, bounds)) continue;
+      for (const pr of refusal.prs) if (pr.repo) seen.set(mergeKey(pr.repo, pr.number), { repo: pr.repo, number: pr.number });
     }
   }
   return [...seen.values()];
@@ -386,21 +395,24 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
       // Marked on every non-merge category (a refused `gh pr merge` that the classifier gave
       // another name, e.g. Production Deploy), and never priced.
       if (refusal.category !== MERGE_CATEGORY && refusal.refusedGhPrMerge) listed.refusedGhPrMerge = true;
-      const row = { ms: refusal.ms, listed, key: null };
+      const row = { ms: refusal.ms, listed, keys: [] };
       refusals.push(row);
       if (refusal.category !== MERGE_CATEGORY) continue;
       // The classifier also refuses the reads that follow a denied merge (memory files, `gh pr
       // view`), labelled the same: those name no PR to merge and are counted, not priced.
-      if (!refusal.refusedGhPrMerge) { followOn += 1; continue; }
-      if (!refusal.pr || !refusal.pr.repo) { unresolved += 1; listed.unresolved = true; continue; }
-      const key = mergeKey(refusal.pr.repo, refusal.pr.number);
-      row.key = key;
-      const known = mwrPrs.get(key);
-      if (!known) {
-        mwrPrs.set(key, { key, repo: refusal.pr.repo, number: refusal.pr.number, name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms, refusals: 1 });
-      } else {
-        known.refusals += 1;
-        if (refusal.ms < known.firstMs) Object.assign(known, { name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms });
+      // A command that says `pr merge` yet parsed to no merge is not a follow-on: unresolved.
+      if (!refusal.refusedGhPrMerge && !/\bpr\s+merge\b/.test(refusal.command || '')) { followOn += 1; continue; }
+      if (refusal.prs.length === 0 || refusal.prs.some((pr) => !pr.repo)) { unresolved += 1; listed.unresolved = true; }
+      for (const pr of refusal.prs.filter((p) => p.repo)) {
+        const key = mergeKey(pr.repo, pr.number);
+        row.keys.push(key);
+        const known = mwrPrs.get(key);
+        if (!known) {
+          mwrPrs.set(key, { key, repo: pr.repo, number: pr.number, name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms, refusals: 1 });
+        } else {
+          known.refusals += 1;
+          if (refusal.ms < known.firstMs) Object.assign(known, { name: scan.name || null, role: scan.role || null, sessionId: scan.sessionId, firstMs: refusal.ms });
+        }
       }
     }
   }
@@ -423,6 +435,15 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
     const mergedMs = merge.state === 'MERGED' && merge.mergedAt ? new Date(merge.mergedAt).getTime() : NaN;
     const closedMs = merge.state === 'CLOSED' && merge.closedAt ? new Date(merge.closedAt).getTime() : NaN;
     const endMs = Number.isFinite(mergedMs) ? mergedMs : (Number.isFinite(closedMs) ? closedMs : Infinity);
+    // A merge or close before the PR's first refusal cannot be the PR that was refused (a `cd`
+    // elsewhere with no -R reads the tenant repo): unresolved, never clamped to 0 h.
+    if (endMs < pr.firstMs) {
+      entry.resolved = false;
+      entry.unresolvedReason = `${merge.state === 'MERGED' ? 'merged' : 'closed'} at ${new Date(endMs).toISOString()}, before the first refusal; likely a different repo than the tenant fallback`;
+      unresolved += pr.refusals;
+      unresolvedKeys.add(pr.key);
+      return entry;
+    }
     entry.stillOpen = endMs > bounds.upper;
     entry.closedUnmerged = Number.isFinite(closedMs) && closedMs <= bounds.upper;
     const end = Math.max(pr.firstMs, Math.min(endMs, bounds.upper));
@@ -431,7 +452,7 @@ function buildReport({ scans = [], filesScanned = 0 } = {}, { since, until, merg
     return entry;
   });
   for (const row of refusals) {
-    if (row.key && unresolvedKeys.has(row.key)) row.listed.unresolved = true;
+    if (row.keys.some((key) => unresolvedKeys.has(key))) row.listed.unresolved = true;
   }
   const perName = [...intervalsByName].map(([name, value]) => ({ name, prs: value.prs, waitMs: unionMs(value.intervals) }))
     .sort((a, b) => b.waitMs - a.waitMs || a.name.localeCompare(b.name));
@@ -495,7 +516,7 @@ function renderMarkdown(report) {
   if (mwr.prs.length > 0) {
     out.push('| PR | Roster name | First refused | Merged at | Merged by | Hours |', '| --- | --- | --- | --- | --- | ---: |');
     for (const pr of mwr.prs) {
-      let mergedAt = 'unresolved';
+      let mergedAt = pr.unresolvedReason ? `unresolved (${pr.unresolvedReason})` : 'unresolved';
       if (pr.resolved) {
         if (pr.closedUnmerged) mergedAt = `closed unmerged ${pr.closedAt}`;
         else if (pr.stillOpen) mergedAt = pr.mergedAt ? `${pr.mergedAt} (after the window end)` : `open (${pr.state || 'unknown'})`;
@@ -565,6 +586,7 @@ module.exports = {
   REFUSAL_REPORT_FLAGS,
   RefusalReportError,
   parseGhMerge,
+  parseGhMerges,
   scanTranscript,
   loadFleetSessions,
   collectRefusals,
