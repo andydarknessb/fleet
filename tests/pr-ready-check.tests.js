@@ -5,8 +5,8 @@
 // bin/pr-ready-check.js, so the renamed-identifier fixture below passes unnoticed.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { spawnSync } = require('node:child_process');
 
@@ -34,7 +34,7 @@ const CLEAN_BODY = [
 ].join('\n');
 
 function fixtureRepo({ readmeUpdated }) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-pr-ready-'));
+  const root = makeTempDir('fleet-pr-ready-');
   const repo = path.join(root, 'repo');
   fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
   const git = (...args) => {

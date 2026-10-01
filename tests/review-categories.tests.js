@@ -5,8 +5,8 @@
 // recorded categories back to the IC.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { createRecord, transitionRecord, recordReview } = require('../bin/work-state');
 const { writeReviewCategoryNotice, topCategories, cli, REVIEW_CATEGORY_FLAGS, ReviewCategoriesError } = require('../bin/review-categories');
@@ -15,7 +15,7 @@ const NOW = '2026-09-28T12:00:00.000Z'; // a Monday: the week read is 2026-09-21
 const IN_WEEK = '2026-09-23T10:00:00.000Z';
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-review-categories-'));
+  const root = makeTempDir('fleet-review-categories-');
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   return root;

@@ -113,15 +113,21 @@ function defaultGh(args) {
 function defaultCollect({ base, week, dryRun = false }) {
   const { collectFromFiles } = require('./measure-cycle');
   const os = require('node:os');
-  return collectFromFiles({
-    rosterPath: path.join(base, 'state', 'roster.json'),
-    outputDir: dryRun ? fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-scorecard-collector-')) : path.join(base, 'state', 'metrics', 'scorecard', 'collector'),
-    tenantConfigsDir: path.join(base, 'tenants'),
-    configPath: path.join(base, 'config', 'cycle.json'),
-    since: week.start,
-    until: week.end,
-    generatedAt: week.end,
-  }).summaryReport;
+  const outputDir = dryRun ? fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-scorecard-collector-')) : path.join(base, 'state', 'metrics', 'scorecard', 'collector');
+  try {
+    return collectFromFiles({
+      rosterPath: path.join(base, 'state', 'roster.json'),
+      outputDir,
+      tenantConfigsDir: path.join(base, 'tenants'),
+      configPath: path.join(base, 'config', 'cycle.json'),
+      since: week.start,
+      until: week.end,
+      generatedAt: week.end,
+    }).summaryReport;
+  } finally {
+    // The dry-run collector output is never read again; leaving it behind leaked one TEMP dir per run (#278).
+    if (dryRun) fs.rmSync(outputDir, { recursive: true, force: true });
+  }
 }
 
 // Every record snapshot the ledger knows: active, archived, released, abandoned.

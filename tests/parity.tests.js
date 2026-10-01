@@ -3,8 +3,8 @@
 // the rostered Sentinel's applied ledger. Fixtures write both logs directly.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { compareParity, EXPECTED_CLASSES, cli, PARITY_FLAGS, ParityError } = require('../bin/parity');
@@ -14,7 +14,7 @@ const T0 = Date.parse('2026-09-02T00:00:00.000Z');
 const MIN = 60 * 1000;
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-parity-'));
+  const root = makeTempDir('fleet-parity-');
   fs.mkdirSync(path.join(root, 'state', 'sentinel', 'shadow'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'sentinel', 'applied'), { recursive: true });
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });

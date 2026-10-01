@@ -7,15 +7,15 @@
 // between crossings; the live per-record figure is a projection in state/budget/last.json.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { spawnSync } = require('node:child_process');
 const { applyBudgets, budgetConfig, isLive, BUDGET_STATES, cli, FLAGS, BudgetError } = require('../bin/budget');
 const { createRecord, transitionRecord, getRecord, readEvents, recordBudget } = require('../bin/work-state');
 
 function rootDir(config) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-budget-'));
+  const root = makeTempDir('fleet-budget-');
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
   fs.mkdirSync(path.join(root, 'claude-home', 'projects', 'p'), { recursive: true });

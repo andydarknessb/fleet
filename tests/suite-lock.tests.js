@@ -2,8 +2,8 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const {
@@ -19,7 +19,7 @@ const {
 const CLI = path.join(__dirname, '..', 'bin', 'suite-lock.js');
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-suite-lock-'));
+  return makeTempDir('fleet-suite-lock-');
 }
 
 test('acquire takes the semaphore and status exposes the owning Work record', () => {

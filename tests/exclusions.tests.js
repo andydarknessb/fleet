@@ -1,8 +1,8 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { addExclusion, liftExclusion, readExclusions, projectExclusions, activeExclusions, cli, EXCLUSIONS_FLAGS } = require('../bin/exclusions');
@@ -11,7 +11,7 @@ const workState = require('../bin/work-state');
 const { WorkStateError } = workState;
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-exclusions-'));
+  return makeTempDir('fleet-exclusions-');
 }
 
 const BASE = {

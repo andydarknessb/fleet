@@ -4,8 +4,8 @@
 // Red-tell: before bin/weekly-scorecard.js nothing weekly exists.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const workState = require('../bin/work-state');
 const { buildScorecard, writeScorecard, parseEscapedFrom, renderScorecard, latestScorecard, headlineOf, cli, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError } = require('../bin/weekly-scorecard');
@@ -14,7 +14,7 @@ const NOW = '2026-09-28T12:40:00.000Z'; // Monday: the week is 2026-09-21..2026-
 const H = (n) => String(n).repeat(40).slice(0, 40);
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-scorecard-'));
+  const root = makeTempDir('fleet-scorecard-');
   for (const dir of ['tenants', 'config', 'state/sentinel/shadow', 'state/verify']) fs.mkdirSync(path.join(root, dir), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'andydarknessb/Endzone-Empire', branchPrefix: 'fleet/' }));
   return root;

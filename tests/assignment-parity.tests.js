@@ -6,8 +6,8 @@
 // state/assignment/parity-approved.json.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const {
   AssignmentParityError,
@@ -24,7 +24,7 @@ const T0 = Date.parse('2026-09-04T00:00:00.000Z');
 const MIN = 60 * 1000;
 
 function rootDir(config) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-assignment-parity-'));
+  const root = makeTempDir('fleet-assignment-parity-');
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
   fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ assignment: { parityEvaluations: 4, parityDistinctFrontiers: 2, parityHours: 0, ...(config || {}) } }));

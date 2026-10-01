@@ -1,8 +1,8 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const {
@@ -50,7 +50,7 @@ function commitIn(root) {
 }
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-review-policy-'));
+  return makeTempDir('fleet-review-policy-');
 }
 
 const TENANT = {

@@ -4,8 +4,8 @@
 // graduation metric. Fail closed on an unset owner, an unreadable GitHub, a typo'd flag.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const { execFileSync } = require('node:child_process');
 const test = require('node:test');
 
@@ -17,7 +17,7 @@ const FLEET = 'fleet-bot';
 const NOW = '2026-09-12T12:00:00.000Z';
 
 function rootDir({ ownerLogin = OWNER } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-triage-'));
+  const root = makeTempDir('fleet-triage-');
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'watch'), { recursive: true });
@@ -1277,7 +1277,7 @@ const REAL_TENANT = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'tenan
 // A tenant root with the flag, an open proposal on issue 7 carrying the given fields, and a fake
 // tenant checkout (`tree` directories, `files` contents) for the door to read Scope against.
 function boundedRoot({ flag = true, suspended = false, tenant = 'endzone', tenantOver = {}, proposal = {}, recordOver = {}, issueOver = {}, extraComments = [], labels = ['bug', 'triage-proposed'], tree = TREE, files = {}, proposalOver = {}, seed, body = B_BODY } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-bounded-'));
+  const root = makeTempDir('fleet-bounded-');
   for (const dir of ['tenants', 'config', path.join('state', 'watch'), path.join('state', 'flags')]) fs.mkdirSync(path.join(root, dir), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', `${tenant}.json`), JSON.stringify({ ...REAL_TENANT, name: tenant, github: 'owner/repo', repo: null, fleetIdentity: FLEET, ownerLogin: OWNER, ...tenantOver }));
   fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ triage: { maxProposalsPerTurn: 2 } }));

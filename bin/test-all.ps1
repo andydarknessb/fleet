@@ -12,6 +12,10 @@
 # -TestsDir points the runner at another directory (its own test uses a fixture).
 # A suite that outlives -SuiteTimeoutMinutes is killed and counted as failed.
 # Each suite's output goes to -LogDir\<suite>.log; a failed suite's tail is printed.
+# Each suite runs with TEMP/TMP pointed at its own empty directory under -LogDir (#278).
+# A suite that leaves a fleet-* entry there is FAIL even when it exits 0, and the directory
+# is removed after every suite either way. A green run removes the default -LogDir too;
+# a failed run keeps it and prints the path. An explicit -LogDir is never removed.
 param(
   [string]$Filter = '*',
   [string]$TestsDir = '',
@@ -23,6 +27,7 @@ $ErrorActionPreference = 'Stop'
 
 $fleetRoot = Split-Path -Parent $PSScriptRoot
 if (-not $TestsDir) { $TestsDir = Join-Path $fleetRoot 'tests' }
+$ownLogDir = -not $LogDir
 if (-not $LogDir) { $LogDir = Join-Path ([IO.Path]::GetTempPath()) ('fleet-test-all-' + [guid]::NewGuid().ToString('N')) }
 [IO.Directory]::CreateDirectory($LogDir) | Out-Null
 
@@ -54,9 +59,16 @@ foreach ($suite in $suites) {
     $exe = $powershell
     $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $suite.FullName + '"'
   }
+  $suiteTemp = Join-Path $LogDir 'tmp'
+  if (Test-Path -LiteralPath $suiteTemp) { Remove-Item -LiteralPath $suiteTemp -Recurse -Force -ErrorAction SilentlyContinue }
+  [IO.Directory]::CreateDirectory($suiteTemp) | Out-Null
+  $savedTemp = $env:TEMP; $savedTmp = $env:TMP
+  $env:TEMP = $suiteTemp; $env:TMP = $suiteTemp
   $clock = [Diagnostics.Stopwatch]::StartNew()
-  $process = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $fleetRoot `
-    -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
+  try {
+    $process = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $fleetRoot `
+      -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
+  } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
   # Windows PowerShell 5.1: ExitCode reads back null unless the handle was taken
   # while the process was alive.
   $null = $process.Handle
@@ -70,9 +82,12 @@ foreach ($suite in $suites) {
   }
   $clock.Stop()
   $seconds = [math]::Round($clock.Elapsed.TotalSeconds, 1)
-  $ok = ($code -is [int]) -and $code -eq 0
+  $leaked = @(Get-ChildItem -LiteralPath $suiteTemp -Force -Filter 'fleet-*' -ErrorAction SilentlyContinue | ForEach-Object { $_.Name } | Sort-Object)
+  Remove-Item -LiteralPath $suiteTemp -Recurse -Force -ErrorAction SilentlyContinue
+  $ok = ($code -is [int]) -and $code -eq 0 -and $leaked.Count -eq 0
   $label = if ($ok) { 'PASS' } else { 'FAIL' }
-  Write-Output ('{0}  {1}  exit={2}  {3}s' -f $label, $suite.Name, $code, $seconds)
+  $leakNote = if ($leaked.Count -gt 0) { '  leaked {0} temp entr{1}: {2}' -f $leaked.Count, $(if ($leaked.Count -eq 1) { 'y' } else { 'ies' }), (($leaked | Select-Object -First 5) -join ', ') } else { '' }
+  Write-Output ('{0}  {1}  exit={2}  {3}s{4}' -f $label, $suite.Name, $code, $seconds, $leakNote)
   if (-not $ok) {
     $failed.Add($suite.Name)
     foreach ($file in @($log, $errLog)) {
@@ -90,4 +105,5 @@ if ($failed.Count -gt 0) {
   exit 1
 }
 Write-Output ("test-all: all {0} suites passed in {1} min" -f $suites.Count, $total)
+if ($ownLogDir) { Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue }
 exit 0
