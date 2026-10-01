@@ -91,6 +91,7 @@ $exitRows = @(
   @{ Anchor = 'reason = \$legacyRefusal'; Decision = 'keep' }                   # no manifest on this path
   @{ Anchor = 'no tenant file for'; Nth = 2; Decision = 'release' }
   @{ Anchor = 'is not assigned'; Decision = 'keep' }                            # the record is not ours to release
+  @{ Anchor = 'but the manifest reserved revision'; Decision = 'keep' }         # fleet#264: assigned at another revision (escalate -> assigned round trip): not this manifest's reservation
   @{ Anchor = 'a fourth assignment'; Decision = 'release' }
   @{ Anchor = 'third assignment requires'; Decision = 'release' }
   @{ Anchor = 'reason = \$haikuReason'; Decision = 'release' }
@@ -118,6 +119,7 @@ $exitRows = @(
   @{ Anchor = 'manifest base precondition changed'; Decision = 'release' }
   @{ Anchor = 'assignment worktree already exists'; Decision = 'keep' }         # an earlier launch's session may be late; releasing loops assign -> launch -> refuse
   @{ Anchor = 'could not create assignment worktree'; Decision = 'release' }
+  @{ Anchor = 'right before claude --bg'; Decision = 'keep' }                   # fleet#264: the marker or the record moved in the window; the reservation is already gone or not ours
   @{ Anchor = 'did not produce a session'; Decision = 'release'; Window = 30 }   # the release sits at the top of a long block
 )
 $releasePattern = 'Invalidate-Manifest|Release-ReservationOnRefusal'

@@ -76,6 +76,11 @@ test('classifyEvaluation: an issue the planner excludes carries its exclusion co
   assert.deepEqual(result.differences, [{ class: 'planner-excludes', issue: 11, codes: ['spec-parent', 'assigned'] }]);
 });
 
+test('classifyEvaluation: the spec-uncut code (fleet #260) rides through like any other exclusion code', () => {
+  const result = classifyEvaluation({ hookFrontier: [10, 11], planner: planner([10], [{ issue: 11, reasons: [{ code: 'spec-uncut' }] }]) });
+  assert.deepEqual(result.differences, [{ class: 'planner-excludes', issue: 11, codes: ['spec-uncut'] }]);
+});
+
 test('classifyEvaluation: an issue only the planner would launch is planner-includes', () => {
   const result = classifyEvaluation({ hookFrontier: [10], planner: planner([10, 12]) });
   assert.deepEqual(result.differences, [{ class: 'planner-includes', issue: 12, codes: [] }]);
