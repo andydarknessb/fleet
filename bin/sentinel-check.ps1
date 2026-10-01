@@ -5,6 +5,7 @@
   Also applied, only under state/flags/ic-cleanup-live (fleet #252): stop + rm an orphan late IC session (its manifest was invalidated, no roster row claims it).
   Same flag (fleet #253): retire an IC roster row that died before ack (no heartbeat, no ack, job gone) and release its reservation.
   Same flag (fleet #256 AC2): release an assigned reservation stranded with no roster row, no job and no marker.
+  Same flag (fleet #257 Gap A): respawn an IC whose first turn never completed (alive, no heartbeat ever, job state silent, job never reached a terminal state); the page is raised in every mode.
   Bounded (fleet #257 Gap B): a verified respawn (or launched relaunch) is counted in state/sentinel/respawn-streak.json; the (watchdog.respawnLoopCap+1)th for one job inside
   watchdog.respawnLoopWindowHours, with no heartbeat in between, is held (respawnHeld) and escalated as respawn-loop when the row has a live pid; a row
   with no pid is always respawned (and counted), with respawn-loop-down raised beside it once the cap is reached.
@@ -92,6 +93,9 @@ $script:DeadBeforeAckMinutes = 60; $script:DeadBeforeAckMaxPerTick = 2; $script:
 # fleet #257 Gap B: respawnLoopCap (default 3) verified respawns of one job inside respawnLoopWindowHours (default 24)
 # are allowed; the next is held (Test-RespawnStreakHold).
 $script:RespawnLoopCap = 3; $script:RespawnLoopWindowHours = 24
+# fleet #257 Gap A: minutes since launch before an IC with no heartbeat ever and a silent job state reads as a hung first turn
+# (healthy first turns: p50 8 min, p90 32 min).
+$script:FirstTurnStaleMinutes = 120
 try {
   $wdCfg = (Read-Json "$FleetHome\config\cycle.json").watchdog
   if ($wdCfg -and $wdCfg.PSObject.Properties['deadBeforeAckMinutes']) { $script:DeadBeforeAckMinutes = [double]$wdCfg.deadBeforeAckMinutes }
@@ -100,6 +104,7 @@ try {
   if ($wdCfg -and $wdCfg.PSObject.Properties['strandedReservationHours']) { $script:StrandedReservationHours = [double]$wdCfg.strandedReservationHours }
   if ($wdCfg -and $wdCfg.PSObject.Properties['respawnLoopCap']) { $script:RespawnLoopCap = [int]$wdCfg.respawnLoopCap }
   if ($wdCfg -and $wdCfg.PSObject.Properties['respawnLoopWindowHours']) { $script:RespawnLoopWindowHours = [double]$wdCfg.respawnLoopWindowHours }
+  if ($wdCfg -and $wdCfg.PSObject.Properties['firstTurnStaleMinutes']) { $script:FirstTurnStaleMinutes = [double]$wdCfg.firstTurnStaleMinutes }
 } catch {}
 # fleet #257 Gap B: state/sentinel/respawn-streak.json, { "<name>": { "jobId", "attempts": [iso...], "downAttempts": [iso...], "lastReason" } }, one
 # strict read per tick. downAttempts is the subset of attempts made when the row had NO pid (a death); an entry without it (an older file) has
@@ -547,6 +552,46 @@ function Test-DeadBeforeAck {
   return $lead + "job $($r.jobId) is $($row.state) with no process"
 }
 
+# fleet #257 Gap A: an IC whose FIRST turn never ended. The session is alive, but the stop hook (which writes state/heartbeats/<name>.json
+# at the end of a turn) never fired, so Heartbeat-Age is $null and the stale-heartbeat respawn (`$null -ne $age -and $age -gt 120`) never
+# considered it. The job state is the other witness: the daemon moves its `updatedAt` about every 20-30 s while the model works, and stamps
+# `firstTerminalAt` the first time the job reaches a terminal state (done). Returns the one-line why, or $null when any leg of the proof is missing:
+#  - a non-static row whose daemon row has a pid and state working; no heartbeat value AND no heartbeat file;
+#  - not busy, or busy with only a leaked background task in flight (Get-BusyStanding, the same gate as the stale-heartbeat branch: a hung
+#    busy first turn is mid-turn by that measure and stays with the watchdog's busy-stale page);
+#  - at least watchdog.firstTurnStaleMinutes (default 120) since launchedAt (startedAt when the roster has none), both unparseable -> $null;
+#  - the job state is readable with a parseable updatedAt that has not moved for watchdog.staleMinutes (default 45);
+#  - no firstTerminalAt. A firstTerminalAt marks the job's first TERMINAL STATE (done), not the end of a first turn: a job that has been done is
+#    not a hung first turn, so it is not respawned and is named under ok. The diagnosis there is narrow: it only covers a stop hook that failed
+#    after the job went done (a hook that never ran in a turn that ended while the job stayed working is exactly what the predicate above catches).
+function Get-FirstTurnStaleReason {
+  param($x, $row)
+  if ($x.static -or $null -eq $row -or -not $row.pid -or "$($row.state)" -ne 'working') { return $null }
+  if ($null -ne (Heartbeat-Age $x.name) -or (Test-Path -LiteralPath "$FleetHome\state\heartbeats\$($x.name).json")) { return $null }
+  if ("$($row.status)" -eq 'busy' -and (Get-BusyStanding $row -QuietMinutes (Get-BusyQuietMinutes)).standing -ne 'background') { return $null }
+  $launched = $null
+  if ($x.rosterRow -and $x.rosterRow.PSObject.Properties['launchedAt']) { $launched = ConvertTo-UtcDateTime $x.rosterRow.launchedAt }
+  if ($null -eq $launched) { $launched = ConvertTo-UtcDateTime $row.startedAt }
+  if ($null -eq $launched) { return $null }
+  $sinceLaunch = ($now - $launched).TotalMinutes
+  if ($sinceLaunch -lt $script:FirstTurnStaleMinutes) { return $null }
+  $js = $null; try { $js = Get-JobState "$($row.id)" } catch { return $null }
+  if (-not $js -or -not $js.PSObject.Properties['updatedAt']) { return $null }
+  $updated = ConvertTo-UtcDateTime $js.updatedAt
+  if ($null -eq $updated) { return $null }
+  $quiet = ($now - $updated).TotalMinutes
+  if ($quiet -lt $script:JobStaleMinutes) { return $null }
+  if ($js.PSObject.Properties['firstTerminalAt'] -and "$($js.firstTerminalAt)") {
+    $script:report.ok += [pscustomobject]@{ name = "$($x.name)"; detail = "job reached its first terminal state (done) at $($js.firstTerminalAt) but no heartbeat was ever written; not a hung first turn, not respawned; the only hook fault this can indicate is a stop hook failed after done" }
+    return $null
+  }
+  $ackText = 'manifest never acknowledged'
+  if ($x.rosterRow -and $x.rosterRow.PSObject.Properties['manifest'] -and "$($x.rosterRow.manifest)") {
+    try { $ack = Read-Json "$($x.rosterRow.manifest).acknowledged.json"; if ($ack -and $ack.PSObject.Properties['acknowledgedAt']) { $ackText = "manifest acknowledged at $($ack.acknowledgedAt)" } } catch {}
+  }
+  return "first turn never completed: no heartbeat ever written, $([int]$sinceLaunch) min since launch, job state silent $([int]$quiet) min (updatedAt $($updated.ToString('o'))), $ackText; state=$($row.state) status=$($row.status)"
+}
+
 # --- roster sessions: static (always expected) + active ICs ---
 $expected = @()
 foreach ($s in (Get-ExpectedStaticSessions $static)) { $expected += [pscustomobject]@{ name = $s.name; role = $s.role; parent = $s.parent; tenant = $s.tenant; issue = $null; static = $true; rosterRow = $null } }
@@ -759,10 +804,14 @@ foreach ($x in $expected) {
   }
   if ($state -eq 'working') {
     $age = Heartbeat-Age $x.name
+    # fleet #257 Gap A: no heartbeat at all is the one case the age test below cannot see. An IC whose first turn never ended
+    # (Get-FirstTurnStaleReason) goes down the same exemption path (skip-list hold, open PR) and then Do-Respawn.
+    $firstTurnWhy = $null
+    if ($null -eq $age) { $firstTurnWhy = Get-FirstTurnStaleReason $x $row }
     # fleet #149: a busy row is skipped only mid-turn. Busy with nothing but a (leaked)
     # background task in flight is between turns (Get-BusyStanding), and respawns like
     # any stale row; an unreadable job state stays skipped, and the watchdog pages it busy-stale.
-    if ($null -ne $age -and $age -gt 120 -and ("$($row.status)" -ne 'busy' -or (Get-BusyStanding $row -QuietMinutes (Get-BusyQuietMinutes)).standing -eq 'background')) {
+    if (($null -ne $age -and $age -gt 120 -and ("$($row.status)" -ne 'busy' -or (Get-BusyStanding $row -QuietMinutes (Get-BusyQuietMinutes)).standing -eq 'background')) -or ($null -ne $firstTurnWhy)) {
       if ($x.role -eq 'ic' -and $x.tenant) {
         $t = Read-Json "$FleetHome\tenants\$($x.tenant).json"
         $skip = Read-Json "$FleetHome\state\skip\$($x.tenant).json"
@@ -794,6 +843,24 @@ foreach ($x in $expected) {
           $report.ok += [pscustomobject]@{ name = $x.name; detail = "waiting on PR #$($pr.number)$suffix" }
           continue
         }
+      }
+      if ($null -ne $firstTurnWhy) {
+        # Shadow-first like #252/#253/#256: the page is raised in every mode; the respawn (through Do-Respawn, so the Gap B bound
+        # applies) needs -Apply AND state/flags/ic-cleanup-live. PAUSE does not stop it, as it does not stop the stale-heartbeat respawn.
+        $flagPresent = Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live"
+        if (-not $cleanupLive) {
+          $outcome = if ($flagPresent) { 'would respawn (read-only run)' } else { 'would respawn (state/flags/ic-cleanup-live absent)' }
+        } else {
+          $beforeCounts = @(@($report.respawned).Count, @($report.respawnFailed).Count, @($report.respawnDeferred).Count, @($report.respawnHeld).Count)
+          Do-Respawn $row $x $firstTurnWhy
+          $outcome = if (@($report.respawned).Count -gt $beforeCounts[0]) { 'respawned' }
+            elseif (@($report.respawnFailed).Count -gt $beforeCounts[1]) { "respawn failed: $(@($report.respawnFailed)[-1].reason)" }
+            elseif (@($report.respawnDeferred).Count -gt $beforeCounts[2]) { "respawn deferred: $(@($report.respawnDeferred)[-1].reason)" }
+            elseif (@($report.respawnHeld).Count -gt $beforeCounts[3]) { 'respawn held by the respawn-loop bound' }
+            else { 'respawn cancelled (the live roster no longer shows this IC active)' }
+        }
+        $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-first-turn-stale'; detail = "$firstTurnWhy; $outcome"; parent = $x.parent }
+        continue
       }
       Do-Respawn $row $x "heartbeat stale ($([int]$age) min), state=$state status=$($row.status), no open PR"
       continue
