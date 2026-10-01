@@ -74,6 +74,41 @@ try {
   $litter = @(Get-ChildItem -LiteralPath $script:runTemp -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'fleet-leak-*' -or $_.Name -eq 'other-tool-litter' })
   Assert-True ($litter.Count -eq 0) "every suite's temp dir is removed even when it leaked: $(($litter | ForEach-Object FullName) -join ', ')"
 
+  # #278 QA: a red suite that made a fleet-* dir through tests/temp-dir.js, and a throwing PowerShell
+  # suite that cleans up in finally, leave nothing behind: the helper and the idiom the suites use.
+  $cleanRed = Join-Path $fixture 'clean-red'
+  [IO.Directory]::CreateDirectory($cleanRed) | Out-Null
+  $tempDirJs = (Join-Path (Split-Path -Parent $PSScriptRoot) 'tests\temp-dir.js') -replace '\\', '/'
+  Write-Utf8 "$cleanRed\red.tests.js" "const test = require('node:test'); const assert = require('node:assert'); const { makeTempDir } = require('$tempDirJs'); test('red with a temp dir', () => { makeTempDir('fleet-leak-red-'); assert.equal(1, 2, 'CLEAN-RED'); });`n"
+  Write-Utf8 "$cleanRed\throws.tests.ps1" "`$ErrorActionPreference = 'Stop'`n`$testRoot = Join-Path ([IO.Path]::GetTempPath()) 'fleet-leak-throws'`n[IO.Directory]::CreateDirectory(`$testRoot) | Out-Null`ntry { throw 'CLEAN-THROW' } finally { Remove-Item -Recurse -Force `$testRoot -ErrorAction SilentlyContinue }`n"
+  $red = Run-Runner @() $cleanRed
+  Assert-True ($script:lastExit -eq 1) "the red suites fail the run, got $($script:lastExit): $red"
+  Assert-True ($red -match '(?m)^FAIL  red\.tests\.js  exit=1  [\d.]+s?$') "the red node suite fails without a leak note: $red"
+  Assert-True ($red -match '(?m)^FAIL  throws\.tests\.ps1  exit=1  [\d.]+s?$') "the throwing PowerShell suite fails without a leak note: $red"
+  $litter = @(Get-ChildItem -LiteralPath $script:runTemp -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'fleet-leak-*' })
+  Assert-True ($litter.Count -eq 0) "red suites that clean up leave no fleet-leak-* behind: $(($litter | ForEach-Object FullName) -join ', ')"
+
+  # #278 QA: a suite that exits 0 but leaves a process whose cwd is its TEMP (a non-fleet-* entry, so the
+  # leak scan sees nothing) keeps the directory alive: FAIL, never a silent green.
+  $busy = Join-Path $fixture 'busy'
+  [IO.Directory]::CreateDirectory($busy) | Out-Null
+  Write-Utf8 "$busy\busy.tests.ps1" "`$ErrorActionPreference = 'Stop'`n`$null = Start-Process -FilePath (Join-Path `$PSHOME 'powershell.exe') -ArgumentList '-NoProfile -Command Start-Sleep 25 # BUSY-278' -WorkingDirectory ([IO.Path]::GetTempPath()) -WindowStyle Hidden`n"
+  try { $stuck = Run-Runner @() $busy } finally {
+    Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.CommandLine -like '*BUSY-278*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  }
+  Assert-True ($script:lastExit -eq 1) "a suite whose TEMP cannot be removed fails the run, got $($script:lastExit): $stuck"
+  Assert-True ($stuck -match '(?m)^FAIL  busy\.tests\.ps1  exit=0  [\d.]+s  could not remove its TEMP ') "the busy suite is FAIL naming its TEMP: $stuck"
+  Assert-True ((Get-LogDirs).Count -eq 1) "a failed run keeps its log dir: $stuck"
+
+  # #278 QA: the runner removes only the per-suite dirs it made; a t1 the caller already had in -LogDir survives.
+  $sharedLogs = Join-Path $fixture 'shared-logs'
+  [IO.Directory]::CreateDirectory((Join-Path $sharedLogs 't1')) | Out-Null
+  Write-Utf8 "$sharedLogs\t1\keep.txt" 'precious'
+  $null = Run-Runner @('-Filter', '[ag]*', '-LogDir', $sharedLogs)
+  Assert-True ($script:lastExit -eq 0) "the run with a pre-populated -LogDir exits 0, got $($script:lastExit)"
+  Assert-True (Test-Path -LiteralPath "$sharedLogs\t1\keep.txt") 'a t1 that pre-existed in an explicit -LogDir is not removed or blamed'
+  Assert-True (@(Get-ChildItem -LiteralPath $sharedLogs -Directory).Count -eq 1) 'the per-suite dirs the runner made are gone'
+
   $none = Run-Runner @('-Filter', 'zzz*')
   Assert-True ($script:lastExit -eq 2) "a filter matching nothing exits 2, got $($script:lastExit): $none"
   Assert-True ((Get-LogDirs).Count -eq 0) "an exit-2 run leaves no log dir in TEMP: $((Get-LogDirs) -join ', ')"

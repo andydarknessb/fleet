@@ -229,6 +229,24 @@ test('#131: a dry run writes nothing under state/ and tells the collector so', (
   assert.equal(fs.existsSync(path.join(root, 'state', 'metrics')), false);
 });
 
+// #278 QA: the real collector (no stub) in a dry run writes to a temp dir and removes it again.
+test('#278: a dry run with the real collector leaves no fleet-scorecard-collector-* in TEMP', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'roster.json'), JSON.stringify({ sessions: [] }));
+  const tmp = makeTempDir('fleet-scorecard-tmp-');
+  const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR, USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+  // TEMP is where the collector dir lands; the home dir is emptied so no real transcripts are read.
+  Object.assign(process.env, { TEMP: tmp, TMP: tmp, TMPDIR: tmp, USERPROFILE: tmp, HOME: tmp });
+  try {
+    buildScorecard({ root, now: NOW, gh: ghStub().gh, dryRun: true });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  }
+  assert.deepEqual(fs.readdirSync(tmp).filter((name) => name.startsWith('fleet-scorecard-collector-')), []);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'metrics')), false);
+});
+
 test('#131 review: the IC cost table cell carries the per-family medians', () => {
   const row = build().rows.find((r) => r.key === 'icCost');
   assert.match(row.result, /whole-life: haiku median 30000 \(1 unit\), sonnet median 60000 \(3 units\)/);

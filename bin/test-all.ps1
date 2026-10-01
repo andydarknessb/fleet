@@ -14,8 +14,10 @@
 # Each suite's output goes to -LogDir\<suite>.log; a failed suite's tail is printed.
 # Each suite runs with TEMP/TMP pointed at its own empty directory under -LogDir (#278).
 # A suite that leaves a fleet-* entry there is FAIL even when it exits 0, and the directory
-# is removed after every suite either way. A green run removes the default -LogDir too;
-# a failed run keeps it and prints the path. An explicit -LogDir is never removed.
+# is removed after every suite either way; one that cannot be removed is FAIL too. A green run
+# removes the default -LogDir too (exit 1 naming it if that fails); a failed run keeps it and
+# prints the path. An explicit -LogDir is never removed; only the per-run t<N>-<hex> directories
+# the runner created inside it are.
 param(
   [string]$Filter = '*',
   [string]$TestsDir = '',
@@ -53,7 +55,7 @@ if (($suites | Where-Object { $_.Name -like '*.tests.js' }) -and -not $node) {
 # Windows PowerShell 5.1 spins in Start-Process when the child's TEMP nears MAX_PATH, out of
 # reach of -SuiteTimeoutMinutes; refuse up front instead (#278).
 $maxTempPath = 200
-if (($LogDir.Length + 4) -gt $maxTempPath) {
+if (($LogDir.Length + 14) -gt $maxTempPath) {
   Write-Output "test-all: -LogDir '$LogDir' is too long; each suite's TEMP under it must stay within $maxTempPath characters"
   exit 2
 }
@@ -74,7 +76,8 @@ foreach ($suite in $suites) {
     $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $suite.FullName + '"'
   }
   # One directory per suite, so a leftover a suite could not delete is never blamed on the next one.
-  $suiteTemp = Join-Path $LogDir ('t' + $suiteIndex)
+  # The hex makes it unique per run: an explicit -LogDir may already hold a t<N> the runner must not touch.
+  $suiteTemp = Join-Path $LogDir ('t' + $suiteIndex + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
   [IO.Directory]::CreateDirectory($suiteTemp) | Out-Null
   $savedTemp = $env:TEMP; $savedTmp = $env:TMP
   $env:TEMP = $suiteTemp; $env:TMP = $suiteTemp
@@ -102,9 +105,12 @@ foreach ($suite in $suites) {
     Remove-Item -LiteralPath $suiteTemp -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $suiteTemp) { Start-Sleep -Milliseconds 500 }
   }
-  $ok = ($code -is [int]) -and $code -eq 0 -and $leaked.Count -eq 0
+  # A process the suite left running with its cwd inside TEMP keeps the directory alive.
+  $stuck = Test-Path -LiteralPath $suiteTemp
+  $ok = ($code -is [int]) -and $code -eq 0 -and $leaked.Count -eq 0 -and -not $stuck
   $label = if ($ok) { 'PASS' } else { 'FAIL' }
   $leakNote = if ($leaked.Count -gt 0) { '  leaked {0} temp entr{1}: {2}' -f $leaked.Count, $(if ($leaked.Count -eq 1) { 'y' } else { 'ies' }), (($leaked | Select-Object -First 5) -join ', ') } else { '' }
+  if ($stuck) { $leakNote += "  could not remove its TEMP $suiteTemp" }
   Write-Output ('{0}  {1}  exit={2}  {3}s{4}' -f $label, $suite.Name, $code, $seconds, $leakNote)
   if (-not $ok) {
     $failed.Add($suite.Name)
@@ -123,5 +129,11 @@ if ($failed.Count -gt 0) {
   exit 1
 }
 Write-Output ("test-all: all {0} suites passed in {1} min" -f $suites.Count, $total)
-if ($ownLogDir) { Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue }
+if ($ownLogDir) {
+  Remove-Item -LiteralPath $LogDir -Recurse -Force -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath $LogDir) {
+    Write-Output "test-all: could not remove the log dir $LogDir"
+    exit 1
+  }
+}
 exit 0
