@@ -1,7 +1,6 @@
 # Reboot recovery: bring the roster back. Run at logon (install-recovery-task.ps1) or by hand.
 . "$PSScriptRoot\_common.ps1"
 # fleet #265: the claude CLI is resolved (and an npm reinstall waited out), never assumed; a miss says so and exits 6.
-
 try { $null = Invoke-ClaudeCli -Arguments @('daemon', 'status') } catch { Write-Output (Get-ClaudeCliMissingJson @{ detail = "$($_.Exception.Message)" }); exit 6 }
 $static = Get-StaticRoster; $live = Get-LiveRoster; $daemon = Get-DaemonSessions -All
 $out = @()

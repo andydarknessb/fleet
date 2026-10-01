@@ -210,14 +210,19 @@ function Get-DaemonSessions {
   # empty output, or unparseable JSON throws so actuators can fail CLOSED. The
   # 2026-09-01 near-miss: one glitched read told the Sentinel every session was
   # missing while the same source disarmed launch.ps1's duplicate and cap guards.
-  param([switch]$All, [switch]$Strict)
+  param([switch]$All, [switch]$Strict, [switch]$NoRetry)
+  # A tolerant read that already missed the CLI (after the whole ladder) is remembered for a minute, so a script that
+  # reads the list repeatedly does not wait the ladder on every call (launch.ps1 must finish well inside assignment.js's
+  # 90 s). A strict read is never short-circuited, and a CLI that resolves again clears the memory (Invoke-ClaudeCli).
+  if (-not $Strict -and $script:ClaudeCliTolerantMissAt -and ((Get-Date) - $script:ClaudeCliTolerantMissAt).TotalSeconds -lt 60) { return @() }
   $cliArgs = @('agents', '--json'); if ($All) { $cliArgs += '--all' }
   $run = $null
-  try { $run = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec 60 -Name "claude $($cliArgs -join ' ')" }
+  try { $run = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec 60 -Name "claude $($cliArgs -join ' ')" -NoRetry:$NoRetry }
   catch {
     # fleet #265: a missing CLI is not an empty fleet. Strict callers fail closed with the
     # resolver's text; tolerant ones still get @() but the cause is on the warning stream.
     if ($Strict) { throw "daemon session list unreadable: $($_.Exception.Message)" }
+    $script:ClaudeCliTolerantMissAt = Get-Date
     Write-Warning "daemon session list unavailable: $($_.Exception.Message)"
     return @()
   }
@@ -467,6 +472,9 @@ function Get-ClaudeCliKnownPaths {
 function Test-ClaudeCliCandidate {
   param([string]$Path)
   if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+  # npm's package ships bin/claude.exe as a placeholder stub (install.cjs treats under 4096 bytes as the stub) until its
+  # postinstall hardlinks the native binary over it; the stub is not a CLI.
+  if ($Path -match '\.exe$' -and (Get-Item -LiteralPath $Path).Length -lt 4096) { return $false }
   # A package dir half-written by npm has a claude.exe before (or after) its package.json.
   if ($Path -match '[\\/]node_modules[\\/]') {
     $pkgRoot = Split-Path -Parent (Split-Path -Parent $Path)
@@ -474,8 +482,24 @@ function Test-ClaudeCliCandidate {
   }
   return $true
 }
+function Get-ClaudeNpmShimTarget {
+  # fleet #265 QA: npm links its bin shim (claude.cmd) before the package's postinstall puts the native binary behind it,
+  # so a shim on PATH is not proof of a CLI. For an npm shim this returns the package claude.exe it runs (which may not
+  # exist or may be the placeholder); for anything else $null (the path is used as it is). Resolving straight to the
+  # exe also drops the cmd.exe hop, so a timeout kills the CLI and not just the cmd.exe wrapping it.
+  param([string]$Path)
+  if ([IO.Path]::GetFileName($Path) -ne 'claude.cmd') { return $null }
+  $dir = Split-Path -Parent $Path
+  $pkg = Join-Path $dir 'node_modules\@anthropic-ai\claude-code'
+  $isShim = Test-Path -LiteralPath $pkg -PathType Container
+  if (-not $isShim) { try { $isShim = ([IO.File]::ReadAllText($Path) -match 'node_modules\\@anthropic-ai\\claude-code\\bin\\claude\.exe') } catch {} }
+  if ($isShim) { return (Join-Path $pkg 'bin\claude.exe') }
+  return $null
+}
 function Resolve-ClaudeCli {
-  param([switch]$NoRetry)
+  # -Tries / -PollMs (when given) win over FLEET_CLAUDE_RESOLVE_TRIES / _POLL_MS, which win over 6 x 5 s; a caller with a
+  # tight deadline (the Stop hook) passes a short ladder.
+  param([switch]$NoRetry, [int]$Tries = 0, [int]$PollMs = -1)
   $override = $env:FLEET_CLAUDE_CLI
   if ($override) {
     # Never a silent fallback: a wrong override is a wrong override.
@@ -485,25 +509,39 @@ function Resolve-ClaudeCli {
     }
     return $override
   }
-  $tries = 6; $pollMs = 5000
-  if ($env:FLEET_CLAUDE_RESOLVE_TRIES -match '^\d+$') { $tries = [Math]::Max(1, [int]$env:FLEET_CLAUDE_RESOLVE_TRIES) }
-  if ($env:FLEET_CLAUDE_RESOLVE_POLL_MS -match '^\d+$') { $pollMs = [int]$env:FLEET_CLAUDE_RESOLVE_POLL_MS }
-  if ($NoRetry) { $tries = 1 }
+  # (PowerShell variables are case-insensitive: the working values must not share a name with -Tries / -PollMs.)
+  $maxAttempts = 6; $pauseMs = 5000
+  if ($env:FLEET_CLAUDE_RESOLVE_TRIES -match '^\d+$') { $maxAttempts = [Math]::Max(1, [int]$env:FLEET_CLAUDE_RESOLVE_TRIES) }
+  if ($env:FLEET_CLAUDE_RESOLVE_POLL_MS -match '^\d+$') { $pauseMs = [int]$env:FLEET_CLAUDE_RESOLVE_POLL_MS }
+  if ($Tries -gt 0) { $maxAttempts = $Tries }
+  if ($PollMs -ge 0) { $pauseMs = $PollMs }
+  if ($NoRetry) { $maxAttempts = 1 }
   $started = Get-Date
   $known = @(Get-ClaudeCliKnownPaths)
-  for ($attempt = 1; $attempt -le $tries; $attempt++) {
+  $shimNote = $null
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     $hit = Resolve-ExePath 'claude'
-    if ($hit) { return $hit }
-    foreach ($k in $known) { if (Test-ClaudeCliCandidate $k) { return $k } }
-    if ($attempt -lt $tries) { Start-Sleep -Milliseconds $pollMs }
+    if ($hit) {
+      $shimTarget = Get-ClaudeNpmShimTarget $hit
+      if ($null -eq $shimTarget) { return $hit }
+      if (Test-ClaudeCliCandidate $shimTarget) { return $shimTarget }
+      $shimNote = "npm shim $hit has no usable target $shimTarget"
+    }
+    foreach ($k in $known) {
+      $cand = $k
+      $kt = Get-ClaudeNpmShimTarget $k
+      if ($null -ne $kt) { $cand = $kt }
+      if (Test-ClaudeCliCandidate $cand) { return $cand }
+    }
+    if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $pauseMs }
   }
   $waited = [int][Math]::Round(((Get-Date) - $started).TotalSeconds)
   $tried = @('PATH (claude.exe/.cmd/.bat)') + $known
+  if ($shimNote) { $tried += $shimNote }
   $script:ClaudeCliMissing = [pscustomobject]@{ tried = @($tried); waitedSec = $waited }
   $waitNote = if ($NoRetry) { 'no wait' } else { "waited ${waited}s for an in-flight npm reinstall" }
   throw "claude CLI not found (tried: $($tried -join '; '); FLEET_CLAUDE_CLI=unset; $waitNote)"
-}
-function Get-ClaudeCliMissingJson {
+}function Get-ClaudeCliMissingJson {
   # The JSON a script prints (exit 6) when it gives up because the CLI is absent.
   param($Extra = $null)
   $m = $script:ClaudeCliMissing
@@ -517,15 +555,16 @@ function Invoke-ClaudeCli {
   # Run the claude CLI through the resolver, bounded, with stdout and stderr captured
   # (never `2>$null`). Throws only when the CLI cannot be found; a run that fails comes
   # back as { exitCode, stderr, timedOut, startError } for the caller to judge.
-  param([string[]]$Arguments, [int]$TimeoutSec = 60, [string]$Name = '', [string]$StdinText = $null)
+  # -NoRetry / -Tries / -PollMs are Resolve-ClaudeCli's, for a caller that already resolved or has a deadline.
+  param([string[]]$Arguments, [int]$TimeoutSec = 60, [string]$Name = '', [string]$StdinText = $null, [switch]$NoRetry, [int]$Tries = 0, [int]$PollMs = -1)
   $cli = $null
   if ($script:ClaudeCli -and "$script:ClaudeCliOverride" -eq "$env:FLEET_CLAUDE_CLI" -and (Test-Path -LiteralPath $script:ClaudeCli -PathType Leaf)) { $cli = $script:ClaudeCli }
-  if (-not $cli) { $cli = Resolve-ClaudeCli; $script:ClaudeCli = $cli; $script:ClaudeCliOverride = "$env:FLEET_CLAUDE_CLI" }
+  if (-not $cli) { $cli = Resolve-ClaudeCli -NoRetry:$NoRetry -Tries $Tries -PollMs $PollMs; $script:ClaudeCli = $cli; $script:ClaudeCliOverride = "$env:FLEET_CLAUDE_CLI" }
+  $script:ClaudeCliTolerantMissAt = $null
   if (-not $Name) { $Name = "claude $((@($Arguments) | Select-Object -First 2) -join ' ')" }
   $r = Invoke-BoundedExe -FilePath $cli -ArgumentList $Arguments -TimeoutSec $TimeoutSec -Name $Name -StdinText $StdinText
   return [pscustomobject]@{ cli = $cli; exitCode = $r.exitCode; stdout = "$($r.stdout)"; stderr = "$($r.stderr)"; timedOut = $r.timedOut; startError = $r.startError }
-}
-function ConvertFrom-LastJsonLine {
+}function ConvertFrom-LastJsonLine {
   param($Text)
   try { return ("$Text".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
 }

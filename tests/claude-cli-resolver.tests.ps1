@@ -109,6 +109,71 @@ try {
   Assert-True ($found -eq "$testRoot\mock-bin\claude.cmd") 'Resolve-ClaudeCli must wait out a reinstall and return the CLI that reappeared'
   Assert-True ($clock.Elapsed.TotalSeconds -ge 1.5) "the resolver must actually have waited (took $($clock.Elapsed.TotalSeconds)s)"
 
+  # Case 8 (QA #275 finding 1): a PATH hit that is an npm shim whose target is missing is NOT a CLI. npm windows exist
+  # where claude.cmd is already linked but node_modules\@anthropic-ai\claude-code\bin\claude.exe is not (yet).
+  $shimBody = '@ECHO off' + "`r`n" + '"%~dp0\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*' + "`r`n"
+  $script:ClaudeCli = $null
+  $env:FLEET_CLAUDE_RESOLVE_TRIES = '2'
+  $env:FLEET_CLAUDE_RESOLVE_POLL_MS = '50'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $shimBody
+  $msg = Get-Thrown { Resolve-ClaudeCli -NoRetry }
+  Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found') "an npm shim with no target must not resolve: $msg"
+  $msg = Get-Thrown { Get-DaemonSessions -Strict }
+  Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found') "a strict read through a target-less shim must say the CLI was not found: $msg"
+
+  # Case 9: the shim's target is the placeholder stub npm leaves before its postinstall links the native binary
+  # (install.cjs: a bin/claude.exe under 4096 bytes). Not a CLI either.
+  $shimPkg = "$testRoot\mock-bin\node_modules\@anthropic-ai\claude-code"
+  [IO.Directory]::CreateDirectory("$shimPkg\bin") | Out-Null
+  [IO.File]::WriteAllBytes("$shimPkg\bin\claude.exe", (New-Object byte[] 100))
+  Write-Utf8 "$shimPkg\package.json" '{"name":"@anthropic-ai/claude-code"}'
+  $msg = Get-Thrown { Resolve-ClaudeCli -NoRetry }
+  Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found') "a placeholder-stub claude.exe behind the shim must not resolve: $msg"
+
+  # Case 10: the real binary behind the shim: resolve straight to the exe (no cmd.exe hop, so a timeout kills the CLI itself).
+  Copy-Item "$env:SystemRoot\System32\whoami.exe" "$shimPkg\bin\claude.exe" -Force
+  Assert-True ((Resolve-ClaudeCli -NoRetry) -eq "$shimPkg\bin\claude.exe") 'an npm shim must resolve to the package claude.exe it points at'
+  Remove-Item "$testRoot\mock-bin\node_modules" -Recurse -Force
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+  Assert-True ((Resolve-ClaudeCli -NoRetry) -eq "$testRoot\mock-bin\claude.cmd") 'a plain claude.cmd (no npm package behind it) still resolves as-is'
+  Remove-Item "$testRoot\mock-bin\claude.cmd"
+
+  # Case 11 (findings 3, 7): -NoRetry reaches Get-DaemonSessions through Invoke-ClaudeCli, -Tries/-PollMs shorten the ladder,
+  # and a tolerant read that missed the CLI is remembered, so repeated tolerant calls do not each wait the whole ladder.
+  $script:ClaudeCli = $null
+  $env:FLEET_CLAUDE_RESOLVE_TRIES = '6'
+  $env:FLEET_CLAUDE_RESOLVE_POLL_MS = '400'
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  $msg = Get-Thrown { Get-DaemonSessions -All -Strict -NoRetry }
+  $clock.Stop()
+  Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found' -and $clock.Elapsed.TotalSeconds -lt 1.5) "-NoRetry must not wait the ladder (took $($clock.Elapsed.TotalSeconds)s): $msg"
+  $clock.Restart()
+  $msg = Get-Thrown { Resolve-ClaudeCli -Tries 2 -PollMs 100 }
+  $clock.Stop()
+  Assert-True ($null -ne $msg -and $clock.Elapsed.TotalSeconds -lt 1.5) "-Tries 2 -PollMs 100 must override the env ladder (took $($clock.Elapsed.TotalSeconds)s)"
+  $clock.Restart()
+  $null = @(Get-DaemonSessions -All 3>&1)
+  $first = $clock.Elapsed.TotalSeconds
+  $clock.Restart()
+  $null = @(Get-DaemonSessions -All 3>&1)
+  $null = @(Get-DaemonSessions 3>&1)
+  $second = $clock.Elapsed.TotalSeconds
+  Assert-True ($first -ge 1.5) "the first tolerant read waits the ladder (took ${first}s)"
+  Assert-True ($second -lt 1.0) "a tolerant read after a miss must not wait again (took ${second}s)"
+  # ... and the CLI coming back is noticed (a strict read is never short-circuited by the remembered miss).
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+  Assert-True (@(Get-DaemonSessions -Strict).Count -eq 1) 'a strict read must still find the CLI that came back'
+  Assert-True (@(Get-DaemonSessions).Count -eq 1) 'and the tolerant read recovers once the CLI has resolved'
+
+  # Case 12 (findings 3, 7): launch.ps1 resolves once up front (its strict read), so every tolerant read after that is
+  # -NoRetry (it must finish well inside assignment.js's 90 s even with the CLI gone); the Stop hook runs a short
+  # ladder and a short bound so it stays under its own 60 s limit.
+  foreach ($ln in @(Get-Content "$sourceRoot\bin\launch.ps1" | Where-Object { $_ -match 'Get-DaemonSessions' -and $_ -notmatch '^\s*#' })) {
+    Assert-True ($ln -match '-Strict' -or $ln -match '-NoRetry') "launch.ps1: a tolerant Get-DaemonSessions must pass -NoRetry: $($ln.Trim())"
+  }
+  $hookCall = @(Get-Content "$sourceRoot\hooks\stop.ps1" | Where-Object { $_ -match 'Invoke-ClaudeCli' -and $_ -notmatch '^\s*#' })
+  Assert-True ($hookCall.Count -eq 1 -and $hookCall[0] -match '-TimeoutSec 20\b' -and $hookCall[0] -match '-Tries 2\b' -and $hookCall[0] -match '-PollMs 2000\b') "hooks/stop.ps1 must bound the agents read (-TimeoutSec 20) and use a short ladder (-Tries 2 -PollMs 2000): $($hookCall -join ' | ')"
+
   Write-Output 'claude-cli-resolver tests passed'
 } finally {
   foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }

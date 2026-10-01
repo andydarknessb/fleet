@@ -31,6 +31,9 @@ function Reset-Fixture {
   # a clean, owned worktree plus a pending line naming job-1 and that worktree
   Remove-Item "$testRoot\mock-state" -Recurse -Force -ErrorAction SilentlyContinue
   [IO.Directory]::CreateDirectory("$testRoot\mock-state") | Out-Null
+  Write-Utf8 "$testRoot\mock-state\running-row.txt" '{"id":"job-1","name":"ic-9","state":"working","status":"idle","pid":77,"startedAt":"2026-09-30T00:00:00Z"}'
+  Write-Utf8 "$testRoot\mock-state\stopped-row.txt" '{"id":"job-1","name":"ic-9","state":"stopped","status":"idle","startedAt":"2026-09-30T00:00:00Z"}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
   Remove-Item "$testRoot\repo\.claude\worktrees\ic-9" -Recurse -Force -ErrorAction SilentlyContinue
   $eapGit = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   & git -C "$testRoot\repo" worktree prune
@@ -58,18 +61,23 @@ try {
   # A stateful mock: job-1 has a pid until `stop`, then a row with no pid until `rm`, then no row.
   # MOCK_CLAUDE_FAIL=1 makes stop and rm exit 9 without doing anything (the job stays up); agents still reads.
   $ms = "$testRoot\mock-state"
-  $row = '{"id":"job-1","name":"ic-9","state":"working","status":"idle","pid":77,"startedAt":"2026-09-30T00:00:00Z"}'
-  $rowStopped = '{"id":"job-1","name":"ic-9","state":"stopped","status":"idle","startedAt":"2026-09-30T00:00:00Z"}'
   $cmd = '@echo off' + "`r`n" +
     'if "%1"=="agents" goto agents' + "`r`n" +
     'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" +
-    'if "%1"=="stop" (echo stop %2>>"' + $testRoot + '\claude-calls.log" & echo x>"' + $ms + '\stopped" & exit /b 0)' + "`r`n" +
+    'if "%1"=="stop" (echo stop %2>>"' + $testRoot + '\claude-calls.log" & echo x>"' + $ms + '\stopped" & if exist "' + $ms + '\append.txt" type "' + $ms + '\append.txt">>"' + $pendingPath + '" & exit /b 0)' + "`r`n" +
     'if "%1"=="rm" (echo rm %2>>"' + $testRoot + '\claude-calls.log" & echo x>"' + $ms + '\removed" & exit /b 0)' + "`r`n" +
     'exit /b 0' + "`r`n" +
     ':agents' + "`r`n" +
-    'if exist "' + $ms + '\removed" (echo [] & exit /b 0)' + "`r`n" +
-    'if exist "' + $ms + '\stopped" (echo [' + $rowStopped + '] & exit /b 0)' + "`r`n" +
-    'echo [' + $row + ']' + "`r`n" +
+    'set "MAIN="' + "`r`n" +
+    'set "EXTRA="' + "`r`n" +
+    'if exist "' + $ms + '\removed" goto readextra' + "`r`n" +
+    'if exist "' + $ms + '\stopped" (set /p MAIN=<"' + $ms + '\stopped-row.txt") else (set /p MAIN=<"' + $ms + '\running-row.txt")' + "`r`n" +
+    ':readextra' + "`r`n" +
+    'if exist "' + $ms + '\extra-row.txt" set /p EXTRA=<"' + $ms + '\extra-row.txt"' + "`r`n" +
+    'if defined MAIN if defined EXTRA (echo [%MAIN%,%EXTRA%]& exit /b 0)' + "`r`n" +
+    'if defined MAIN (echo [%MAIN%]& exit /b 0)' + "`r`n" +
+    'if defined EXTRA (echo [%EXTRA%]& exit /b 0)' + "`r`n" +
+    'echo []' + "`r`n" +
     'exit /b 0' + "`r`n"
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" $cmd
 
@@ -134,6 +142,76 @@ try {
   Assert-True ($esc.Count -eq 1 -and $esc[0].name -eq 'ic-9' -and "$($esc[0].detail)" -match 'job-1') 'the third failed attempt must escalate kind cleanup-pending naming the job'
   Assert-True (Test-Path "$testRoot\repo\.claude\worktrees\ic-9") 'worktrees stay while the job is still up'
   $env:MOCK_CLAUDE_FAIL = '0'
+
+  $wt = "$testRoot\repo\.claude\worktrees\ic-9"
+  $wtJson = $wt.Replace('\', '\\')
+  $cpEsc = { param($r) @($r.escalate | Where-Object { $_.kind -eq 'cleanup-pending' }) }
+
+  # Case 6 (QA #275 finding 2): the same path was relaunched. An active roster row for ic-9 now owns the worktree
+  # (a new job), so the old job is stopped and removed but the worktree is left alone and the line is dropped.
+  Remove-Item $calls -ErrorAction SilentlyContinue
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"ic-9","role":"ic","tenant":"test","parent":"pl-test","issue":9,"cwd":"' + $wtJson + '","status":"active","jobId":"job-2"}]}')
+  Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
+  $r = Run-Check -Apply
+  Assert-True ((Get-Content $calls -Raw) -match 'stop job-1' -and (Get-Content $calls -Raw) -match 'rm job-1') 'the old job is still stopped and removed'
+  Assert-True (Test-Path $wt) 'a worktree claimed by an active roster row (same name) must NOT be removed'
+  Assert-True (-not (Test-Path $pendingPath)) 'the line is dropped: the job is gone and the worktree is somebody else''s now'
+  Assert-True (@($r.cleanupPending)[0].outcome -match 'claimed') "the outcome must say the worktree was claimed: $(@($r.cleanupPending)[0].outcome)"
+  # ... a roster row under another name but the same cwd claims it too
+  Remove-Item $calls -ErrorAction SilentlyContinue
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"ic-10","role":"ic","tenant":"test","parent":"pl-test","issue":10,"cwd":"' + $wtJson + '","status":"retiring","jobId":"job-3"}]}')
+  $r = Run-Check -Apply
+  Assert-True (Test-Path $wt) 'a worktree that a retiring roster row names as its cwd must NOT be removed'
+
+  # Case 7: a daemon row with a pid whose cwd is the worktree claims it as well.
+  Remove-Item $calls -ErrorAction SilentlyContinue
+  Reset-Fixture
+  Write-Utf8 "$testRoot\mock-state\extra-row.txt" ('{"id":"job-2","name":"ic-5","state":"working","status":"idle","pid":88,"cwd":"' + $wtJson + '","startedAt":"2026-09-30T20:00:00Z"}')
+  $r = Run-Check -Apply
+  Assert-True (Test-Path $wt) 'a worktree that a live daemon row (pid, cwd = the worktree) owns must NOT be removed'
+  Assert-True (-not (Test-Path $pendingPath)) 'the line is dropped once the old job is gone'
+  Remove-Item "$testRoot\mock-state\extra-row.txt"
+
+  # Case 8: a line older than 7 days is not acted on; it escalates for a human (kept, so it keeps saying so).
+  Remove-Item $calls -ErrorAction SilentlyContinue
+  Reset-Fixture
+  $old = [ordered]@{ at = (Get-Date).ToUniversalTime().AddDays(-10).ToString('o'); name = 'ic-9'; jobId = 'job-1'; cwd = "$testRoot\repo"; worktrees = @($wt); reason = 'claude-cli-missing'; tried = @('PATH'); attempts = 0 }
+  Write-Utf8 $pendingPath ((($old | ConvertTo-Json -Compress -Depth 4)) + [Environment]::NewLine)
+  $r = Run-Check -Apply
+  Assert-True (-not (Test-Path $calls)) 'a stale line must not stop or rm anything'
+  Assert-True (Test-Path $wt) 'a stale line must not remove a worktree'
+  $e = @(& $cpEsc $r)
+  Assert-True ($e.Count -eq 1 -and "$($e[0].detail)" -match 'stale entry, check by hand') "a stale line must escalate cleanup-pending 'stale entry, check by hand': $($e | ConvertTo-Json -Compress)"
+  Assert-True (Test-Path $pendingPath) 'a stale line is kept'
+  Remove-Item "$testRoot\state\flags\ic-cleanup-live"
+  $r = Run-Check
+  Assert-True (@(& $cpEsc $r).Count -eq 1) 'a stale line escalates in a read-only run too (it is a page, not an action)'
+
+  # Case 9 (finding 4): the stray page for a job the cleanup-pending file lists says why; a stray not listed keeps the old wording.
+  Remove-Item $calls -ErrorAction SilentlyContinue
+  Reset-Fixture
+  Write-Utf8 "$testRoot\mock-state\extra-row.txt" '{"id":"job-7","name":"ic-7","state":"working","status":"idle","pid":99,"startedAt":"2026-09-30T20:00:00Z"}'
+  $r = Run-Check -Apply
+  $stray1 = @($r.escalate | Where-Object { $_.kind -eq 'stray' -and $_.detail -match 'job-1' })
+  $stray7 = @($r.escalate | Where-Object { $_.kind -eq 'stray' -and $_.detail -match 'job-7' })
+  Assert-True ($stray1.Count -eq 1 -and "$($stray1[0].detail)" -match 'retire could not remove it \(claude CLI missing at 2026-09-30T19:17:13Z\); cleanup pending') "the listed stray must say retire could not remove it: $($stray1 | ConvertTo-Json -Compress)"
+  Assert-True ($stray1[0].detail -notmatch 'cause not measured') 'and drop the cause-not-measured wording'
+  Assert-True ($stray7.Count -eq 1 -and "$($stray7[0].detail)" -match 'cause not measured') 'a stray the file does not list keeps the old detail'
+  Remove-Item "$testRoot\mock-state\extra-row.txt"
+
+  # Case 10 (finding 5): a line retire.ps1 appends while the pass runs (the mock `stop` appends one) survives the rewrite.
+  Remove-Item $calls -ErrorAction SilentlyContinue
+  Reset-Fixture
+  Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
+  Write-Utf8 "$testRoot\mock-state\append.txt" ('{"at":"2026-09-30T20:30:00Z","name":"ic-12","jobId":"job-12","cwd":"x","worktrees":[],"reason":"claude-cli-missing","tried":["PATH"],"attempts":0}' + [Environment]::NewLine)
+  # keep job-1's line failing so the file is rewritten rather than deleted
+  Write-Utf8 "$testRoot\repo\.claude\worktrees\ic-9\unsaved.txt" 'work in progress'
+  $r = Run-Check -Apply
+  $after = @(Get-Content $pendingPath | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+  Assert-True (@($after | Where-Object { $_.jobId -eq 'job-12' }).Count -eq 1 -and @($after | Where-Object { $_.jobId -eq 'job-1' }).Count -eq 1) "a line appended during the pass must survive the rewrite: $($after | ConvertTo-Json -Compress)"
+  Remove-Item "$testRoot\mock-state\append.txt"
 
   Write-Output 'sentinel-cleanup-pending tests passed'
 } finally {

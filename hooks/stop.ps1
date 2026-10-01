@@ -156,7 +156,7 @@ $cap = [int]$static.cap
 $liveRaw = $null
 try {
   . "$PSScriptRoot\..\bin\_common.ps1"
-  $agentsRun = Invoke-ClaudeCli -Arguments @('agents', '--json') -TimeoutSec 60
+  $agentsRun = Invoke-ClaudeCli -Arguments @('agents', '--json') -TimeoutSec 20 -Tries 2 -PollMs 2000
   if ($agentsRun.startError -or $agentsRun.timedOut -or $agentsRun.exitCode -ne 0) {
     $agentsWhy = if ($agentsRun.startError) { "$($agentsRun.startError)" } elseif ($agentsRun.timedOut) { 'timed out' } else { "exit $($agentsRun.exitCode)" }
     throw "claude agents --json failed ($agentsWhy)"

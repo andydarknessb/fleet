@@ -84,6 +84,54 @@ try {
   Assert-True ($calls -match 'stop job-1' -and $calls -match 'rm job-1') "stop and rm must both run through the override: $calls"
   Assert-True (-not (Test-Path "$testRoot\repo\.claude\worktrees\ic-9")) 'the owned worktree is removed once the job is confirmed gone'
 
+  function Reset-Case {
+    Remove-Item "$testRoot\state\sentinel\cleanup-pending.jsonl", $mockLog -ErrorAction SilentlyContinue
+    Set-Roster
+    $eapGit = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    & git -C "$testRoot\repo" worktree prune
+    & git -C "$testRoot\repo" branch -D worktree-ic-9 2>$null | Out-Null
+    & git -C "$testRoot\repo" worktree add "$testRoot\repo\.claude\worktrees\ic-9" -b worktree-ic-9 --quiet 2>$null
+    $ErrorActionPreference = $eapGit
+    Assert-True (Test-Path "$testRoot\repo\.claude\worktrees\ic-9") 'fixture: the owned worktree must exist'
+  }
+  function Assert-CliMissingRetire {
+    param($Result, [string]$Why)
+    Assert-True ($script:lastExit -eq 6) "$Why : exit 6 expected, got $script:lastExit ($($Result.out))"
+    Assert-True ($null -ne $Result.json -and "$($Result.json.retired)" -eq 'ic-9' -and "$($Result.json.jobRemoval)" -eq 'cli-missing' -and $Result.json.cleanupPending -eq $true) "$Why : JSON must say retired, cli-missing, cleanupPending: $($Result.out)"
+    $row = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions)[0]
+    Assert-True ($row.status -eq 'retired' -and $row.cleanupPending -eq $true) "$Why : the roster row must be retired with cleanupPending"
+    $pending = @(Get-Content "$testRoot\state\sentinel\cleanup-pending.jsonl" | Where-Object { $_.Trim() } | ForEach-Object { $_ | ConvertFrom-Json })
+    Assert-True ($pending.Count -eq 1 -and $pending[0].jobId -eq 'job-1' -and $pending[0].reason -eq 'claude-cli-missing') "$Why : one pending line for job-1 expected"
+    Assert-True (Test-Path "$testRoot\repo\.claude\worktrees\ic-9") "$Why : the worktree must be untouched"
+  }
+
+  # Case 3 (QA #275 finding 1): the npm window where claude.cmd is linked but its target exe is not. The shim is on PATH,
+  # so a bare resolve would "succeed" and every call would fail with a cmd.exe error; that must read as a missing CLI.
+  Remove-Item Env:\FLEET_CLAUDE_CLI -ErrorAction SilentlyContinue
+  Reset-Case
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@ECHO off' + "`r`n" + '"%~dp0\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*' + "`r`n")
+  $r = Run-Retire
+  Assert-CliMissingRetire $r 'a shim with a missing target'
+  Assert-True (-not (Test-Path $mockLog)) 'a shim with a missing target must not run anything'
+  Remove-Item "$testRoot\mock-bin\claude.cmd"
+
+  # Case 4: the CLI resolves but stop, rm and the strict list ALL fail (a broken install): not "unknown + exit 0";
+  # the same cleanup-pending record and exit 6.
+  Reset-Case
+  Write-Utf8 "$testRoot\elsewhere\failing.cmd" ('@echo off' + "`r`n" + 'echo failing %1>>"' + $mockLog + '"' + "`r`n" + 'exit /b 9' + "`r`n")
+  $env:FLEET_CLAUDE_CLI = "$testRoot\elsewhere\failing.cmd"
+  $r = Run-Retire
+  Assert-CliMissingRetire $r 'stop, rm and the list all failing'
+  Remove-Item Env:\FLEET_CLAUDE_CLI
+
+  # Case 5 (finding 6): the CLI resolves, then vanishes mid-run (npm reinstalls it between stop and rm). The resolver's
+  # "claude CLI not found" must take the cli-missing path, not degrade to jobRemoval 'unknown' with exit 0.
+  Reset-Case
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="stop" goto selfdelete' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n" + ':selfdelete' + "`r`n" + 'echo stop %2>>"' + $mockLog + '"' + "`r`n" + '(goto) 2>nul & del "%~f0"' + "`r`n")
+  $r = Run-Retire
+  Assert-True ((Get-Content $mockLog -Raw) -match 'stop job-1') 'case 5 fixture: stop must have run before the CLI vanished'
+  Assert-CliMissingRetire $r 'the CLI vanishing mid-run'
+
   Write-Output 'retire-cli-missing tests passed'
 } finally {
   foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }

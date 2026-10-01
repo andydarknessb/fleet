@@ -599,7 +599,7 @@ if ($Manifest) {
 
 # --- launch ---
 $before = @($daemon | ForEach-Object { $_.sessionId })
-$beforeJobIds = @(Get-DaemonSessions -All | ForEach-Object { $_.id })
+$beforeJobIds = @(Get-DaemonSessions -All -NoRetry | ForEach-Object { $_.id })
 $locationPushed = $false
 # fleet#264: the gh check, fetch and worktree add above take 10-40 s with no job and no roster row, so a
 # release that lands in that window (the stranded-reservation sweep, #261) cannot see this launch. Look
@@ -621,7 +621,7 @@ try {
   # CLI's prompt input as well, and preserves the exact string without another
   # command-line parse.
   # fleet #265: resolved once (waiting out an npm reinstall); the prompt still goes over stdin.
-  $claudeCli = Resolve-ClaudeCli
+  $claudeCli = Resolve-ClaudeCli -Tries 3 -PollMs 3000   # a short ladder: the strict read above already resolved once, and the launch must stay inside assignment.js's 90 s
   $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
 } catch {
   if ($locationPushed) { Pop-Location; $locationPushed = $false }
@@ -636,10 +636,10 @@ try {
 $row = $null
 for ($i = 0; $i -lt 20 -and -not $row; $i++) {
   Start-Sleep -Milliseconds 750
-  $row = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+  $row = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
 }
 if (-not $row) {
-  $failedRow = Get-DaemonSessions -All |
+  $failedRow = Get-DaemonSessions -All -NoRetry |
     Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
     Select-Object -First 1
   $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
@@ -670,7 +670,7 @@ if (-not $row) {
       if ($currentRecord -and $currentRecord.state -and "$($currentRecord.state)" -notin @('assigned', 'released')) { $keepWorktree = $true }
     } catch {}
     try {
-      $lateRow = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+      $lateRow = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
       if ($lateRow) { $keepWorktree = $true }
     } catch {}
   }
