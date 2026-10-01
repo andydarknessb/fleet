@@ -417,6 +417,16 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1003-respawn-loop.json').Count -eq 1) 'respawn-loop leaves one escalation file'
   $r10rl2 = Run-Watchdog
   Assert-True (-not (@($r10rl2.conditions) -contains 'escalation:ic-1003:respawn-loop')) 'the respawn-loop escalation clears once the check stops raising it'
+  # ic-first-turn-stale (#257 Gap A) is a paging kind at NORMAL through the default map (no config/cycle.json in this fixture).
+  $origCheckFt = Get-Content "$testRoot\bin\sentinel-check.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); respawnHeld = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1004"; kind = "ic-first-turn-stale"; detail = "canned"; parent = "pl-test" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
+  try { $r10ft = Run-Watchdog } finally { Write-Utf8 "$testRoot\bin\sentinel-check.ps1" $origCheckFt }
+  Assert-True (@($r10ft.conditions) -contains 'escalation:ic-1004:ic-first-turn-stale') 'ic-first-turn-stale must become an escalation condition'
+  Assert-True ((@($r10ft.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1004:ic-first-turn-stale' })[0]).priority -eq 'normal') 'ic-first-turn-stale pages at normal priority via the default map'
+  Assert-True (@($r10ft.conditions | Where-Object { "$_" -like 'config-invalid*' }).Count -eq 0) 'the ic-first-turn-stale case raises no config-invalid condition'
+  Assert-True (@(Get-EscalationFiles '*-supervisor-ic-1004-ic-first-turn-stale.json').Count -eq 1) 'ic-first-turn-stale leaves one escalation file'
+  $r10ft2 = Run-Watchdog
+  Assert-True (-not (@($r10ft2.conditions) -contains 'escalation:ic-1004:ic-first-turn-stale')) 'the ic-first-turn-stale escalation clears once the check stops raising it'
 
   # cleanup-pending (#265): the Sentinel's cleanup-pending pass escalates once a retire's job/worktree cleanup has failed 3 times. Normal priority.
   Write-Utf8 "$testRoot\bin\sentinel-check.ps1" ('param([switch]$Apply,[string]$ReportPath="",[string]$Actor="sentinel",[string]$HealRespawn="")' + "`r`n" + '$r = @{ at = (Get-Date).ToUniversalTime().ToString("o"); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); launchNeeded = @(); retired = @(); worktrees = @(); sync = @(); pause = $null; ok = @(); escalate = @(@{ name = "ic-1003"; kind = "cleanup-pending"; detail = "canned"; parent = "dispatcher" }) }' + "`r`n" + '[IO.File]::WriteAllText($ReportPath, ($r | ConvertTo-Json -Depth 6))' + "`r`n")
@@ -1921,6 +1931,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ((@($r10rl.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1003:respawn-loop' })[0]).priority -eq 'normal') 'respawn-loop (#257) is deliberately normal'
   Assert-True ((@($r10rl.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1005:respawn-loop-down' })[0]).priority -eq 'high') 'respawn-loop-down (#257) is deliberately high'
   Assert-True ((@($r10cp.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1003:cleanup-pending' })[0]).priority -eq 'normal') 'cleanup-pending (#265) is deliberately normal'
+  Assert-True ((@($r10ft.newlyPaged | Where-Object { $_.key -eq 'escalation:ic-1004:ic-first-turn-stale' })[0]).priority -eq 'normal') 'ic-first-turn-stale (#257) is deliberately normal'
   Assert-True ((@($r10f.newlyPaged | Where-Object { $_.key -eq 'escalation:dispatcher:blocked' })[0]).priority -eq 'normal') 'a configured blocked page is deliberately normal'
   Assert-True ((@($pg1.newlyPaged | Where-Object { $_.key -eq 'permission-wait:ic-950:job-ic-950' })[0]).priority -eq 'high') 'permission-wait is ADR-ruled high'
   Assert-True ((@($h7c.newlyPaged | Where-Object { $_.key -eq 'human-wait:pl-test' })[0]).priority -eq 'normal') 'human-wait is Cory-ruled normal (2026-09-18)'
@@ -2155,6 +2166,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ("$($realConfig.pages.priority.dated)" -eq 'normal') "the real config's dated priority must be normal"
   Assert-True ("$($realConfig.pages.priority.'respawn-loop')" -eq 'normal' -and "$($realConfig.pages.priority.'respawn-loop-down')" -eq 'high' -and @($realConfig.supervisor.pageKinds) -contains 'respawn-loop' -and @($realConfig.supervisor.pageKinds) -contains 'respawn-loop-down') "the real config must page respawn-loop at normal and respawn-loop-down at high (#257)"
   Assert-True ([int]$realConfig.watchdog.respawnLoopCap -eq 3 -and [double]$realConfig.watchdog.respawnLoopWindowHours -eq 24) "the real config's respawn loop bound is 3 per 24 h (#257)"
+  Assert-True ("$($realConfig.pages.priority.'ic-first-turn-stale')" -eq 'normal' -and @($realConfig.supervisor.pageKinds) -contains 'ic-first-turn-stale' -and [double]$realConfig.watchdog.firstTurnStaleMinutes -eq 120) "the real config must page ic-first-turn-stale at normal with a 120 min threshold (#257)"
 
   # ===== #113 (ADR 0013): the deploy step =====
   # The fixture home is not a git checkout, so the step is `unmanaged` and spawns
