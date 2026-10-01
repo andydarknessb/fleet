@@ -58,9 +58,42 @@ function Remove-EmptyOwnedWorktreeDirs {
 $ownedBefore = @(Get-OwnedWorktrees)
 $stillThere = $false
 $daemonListOk = $true
+# fleet #265: resolve the claude CLI before touching the job. The CLI is briefly absent while
+# its own npm auto-update reinstalls it (about twice an hour); Resolve-ClaudeCli waits that out.
+# When it is still missing the roster side below still completes (a retired row releases the
+# Work record's claim) but the job and its worktrees are left for the Sentinel's cleanup-pending
+# pass: a live job may be writing in that directory, and nothing here could tell.
+$cliMissing = $false
+$cliError = $null
 if ($e.jobId) {
-  & claude stop $e.jobId 2>$null | Out-Null
-  & claude rm $e.jobId 2>$null | Out-Null
+  try { $null = Resolve-ClaudeCli } catch { $cliMissing = $true; $cliError = "$($_.Exception.Message)" }
+}
+$script:quietThrew = $null
+function Invoke-ClaudeQuiet {
+  # stop/rm: a nonzero exit is routine (rm refuses a dirty worktree) and the daemon list below
+  # is what decides. A throw means the resolver lost the CLI mid-run (an npm reinstall between
+  # two calls): that is the cli-missing path, not "unknown", so it is recorded for the caller
+  # and $null comes back. Otherwise returns whether the call failed outright.
+  param([string[]]$Arguments)
+  try {
+    $r = Invoke-ClaudeCli -Arguments $Arguments
+    return [pscustomobject]@{ failed = [bool]($r.startError -or $r.timedOut -or $r.exitCode -ne 0) }
+  } catch {
+    if (-not $script:quietThrew) { $script:quietThrew = "claude $($Arguments -join ' ') did not run: $($_.Exception.Message)" }
+    return $null
+  }
+}
+$stopFailed = $false; $rmFailed = $false
+if ($e.jobId -and $cliMissing) {
+  Write-Warning "claude CLI missing; job $($e.jobId) left for the Sentinel's cleanup-pending pass: $cliError"
+} elseif ($e.jobId) {
+  $stopRun = Invoke-ClaudeQuiet @('stop', "$($e.jobId)")
+  $rmRun = Invoke-ClaudeQuiet @('rm', "$($e.jobId)")
+  $stopFailed = ($null -eq $stopRun) -or $stopRun.failed
+  $rmFailed = ($null -eq $rmRun) -or $rmRun.failed
+  if ($script:quietThrew) { $cliMissing = $true; $cliError = $script:quietThrew }
+}
+if ($e.jobId -and -not $cliMissing) {
   # claude rm refuses when the session's worktree has uncommitted changes, and when it succeeds it
   # still leaves a clean worktree registered. A retired IC's leftovers are disposable (its work is in
   # the PR), so force-remove any worktree it owns whether or not the job went, then rm again if needed.
@@ -77,16 +110,28 @@ if ($e.jobId) {
     }
     & git -C $e.cwd worktree prune 2>$null | Out-Null
     if ($stillThere) {
-      & claude rm $e.jobId 2>$null | Out-Null
+      $null = Invoke-ClaudeQuiet @('rm', "$($e.jobId)")
+      if ($script:quietThrew) { $cliMissing = $true; $cliError = $script:quietThrew }
       try { $stillThere = @(Get-DaemonSessions -All -Strict | Where-Object { $_.id -eq $e.jobId }).Count -gt 0 }
       catch { $daemonListOk = $false }
     }
   }
-  if (-not $daemonListOk) { Write-Warning "daemon session list unreadable for job $($e.jobId); worktree cleanup skipped rather than guessed" }
+  if (-not $daemonListOk -and $stopFailed -and $rmFailed) {
+    # stop, rm and the strict list ALL failed: whatever resolved is not a working CLI (a broken install). That is a
+    # missing CLI for this purpose, not a job of unknown state to report as retired with exit 0.
+    $cliMissing = $true
+    $cliError = "claude stop, claude rm and the daemon session list all failed through $($script:ClaudeCli)"
+  }
+  elseif (-not $daemonListOk) { Write-Warning "daemon session list unreadable for job $($e.jobId); worktree cleanup skipped rather than guessed" }
   elseif ($stillThere) { Write-Warning "job $($e.jobId) still exists after claude rm; inspect with: claude agents --json --all" }
 }
+if ($cliMissing -and -not $script:ClaudeCliMissing) { $script:ClaudeCliMissing = [pscustomobject]@{ tried = @("$($script:ClaudeCli)"); waitedSec = 0 } }
 $e.status = 'retired'
 $e | Add-Member -NotePropertyName retiredAt -NotePropertyValue (Now-Iso) -Force
+if ($cliMissing) {
+  $e | Add-Member -NotePropertyName jobRemoval -NotePropertyValue 'cli-missing' -Force
+  $e | Add-Member -NotePropertyName cleanupPending -NotePropertyValue $true -Force
+}
 # A retired entry's prompt has no reader (recovery replays active ICs only); archive the full row, then drop it so the roster stays small.
 # Strip only after the archive append succeeded; a re-retire (prompt already gone) appends nothing.
 if ($e.PSObject.Properties['prompt']) {
@@ -105,8 +150,15 @@ $remainingWorktrees = @($ownedAfter | ForEach-Object { $_.path })
 $worktreeCleanup = if ($ownedBefore.Count -eq 0 -and $ownedAfter.Count -eq 0) { 'none-owned' } elseif ($ownedAfter.Count -eq 0) { 'removed' } else { 'remaining' }
 # Only once the job is confirmed gone (or none was recorded): a live job may still be in the directory.
 $dirSweep = [pscustomobject]@{ removed = @(); remaining = @() }
-if (-not $e.jobId -or ($daemonListOk -and -not $stillThere)) { $dirSweep = Remove-EmptyOwnedWorktreeDirs -RegisteredPaths $remainingWorktrees }
-$jobRemoval = if (-not $e.jobId) { 'no-job-recorded' } elseif (-not $daemonListOk) { 'unknown' } elseif ($stillThere) { 'still-present' } else { 'removed' }
+if (-not $e.jobId -or (-not $cliMissing -and $daemonListOk -and -not $stillThere)) { $dirSweep = Remove-EmptyOwnedWorktreeDirs -RegisteredPaths $remainingWorktrees }
+$jobRemoval = if (-not $e.jobId) { 'no-job-recorded' } elseif ($cliMissing) { 'cli-missing' } elseif (-not $daemonListOk) { 'unknown' } elseif ($stillThere) { 'still-present' } else { 'removed' }
+if ($cliMissing) {
+  # One line per job the Sentinel's cleanup-pending pass must stop/rm (and whose worktrees it
+  # may remove once clean) when the CLI is back. The script still reports retired:<name>.
+  $pendingLine = [ordered]@{ at = (Now-Iso); name = $Name; jobId = "$($e.jobId)"; cwd = $e.cwd; worktrees = @($remainingWorktrees); reason = 'claude-cli-missing'; tried = @($script:ClaudeCliMissing.tried); attempts = 0 }
+  [IO.Directory]::CreateDirectory("$FleetHome\state\sentinel") | Out-Null
+  [IO.File]::AppendAllText("$FleetHome\state\sentinel\cleanup-pending.jsonl", (($pendingLine | ConvertTo-Json -Compress -Depth 6) + [Environment]::NewLine), $Utf8)
+}
 Write-Output (@{
   retired = $Name
   reason = $Reason
@@ -116,8 +168,11 @@ Write-Output (@{
   worktreesRemaining = $remainingWorktrees
   worktreeDirsRemoved = @($dirSweep.removed)
   worktreeDirsRemaining = @($dirSweep.remaining)
+  cleanupPending = [bool]$cliMissing
 } | ConvertTo-Json -Compress)
 # claude/git above leave their last exit code in $LASTEXITCODE, and a nonzero code on
-# a successful retire is expected (claude rm refuses dirty worktrees). Exit 0 so
-# callers read success from the exit code; the JSON above carries the detail.
+# a successful retire is expected (claude rm refuses dirty worktrees). Callers read
+# success from the JSON `retired` field; the exit code is 0, or 6 when the roster side
+# completed but the claude CLI was missing (fleet #265: cleanupPending:true, job untouched).
+if ($cliMissing) { exit 6 }
 exit 0

@@ -171,7 +171,7 @@ if ($Manifest) {
 # reservation time.
 if (-not $Permissions) { $Permissions = 'auto' }
 if ($Model -eq 'haiku' -and $Permissions -ne 'allowlist') {
-  $haikuReason = "the installed Claude Code CLI ($(try { (& claude --version 2>$null | Out-String).Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
+  $haikuReason = "the installed Claude Code CLI ($(try { "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
   $released = $false
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $haikuReason; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $haikuReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
@@ -197,7 +197,7 @@ if ($Model -eq 'haiku' -and $Permissions -eq 'allowlist') {
   if (-not ($haikuProfile -and $haikuProfile.rehearsalRoot -eq $true)) {
     $verifiedCli = if ($haikuProfile) { "$($haikuProfile.verifiedCliVersion)".Trim() } else { '' }
     $installedCli = ''
-    try { $installedCli = "$((& claude --version 2>$null | Out-String))".Trim() } catch {}
+    try { $installedCli = "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch {}
     $installedVersion = if ($installedCli -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { $installedCli }
     $rehearsalHow = "(bin\scratch-root.ps1 -Path <dir> -Issue <n>, then its printed assign and launch); a clean verdict writes verifiedCliVersion in config\permissions-allowlist.json. Launch this ticket on sonnet meanwhile"
     $versionReason = $null
@@ -252,7 +252,8 @@ if ((Test-Paused) -and -not $Force) {
 # The duplicate-name guard and the cap read the same daemon list the caller may have
 # acted on; a glitched read must refuse the launch, never pass the guards empty.
 $daemon = $null
-try { $daemon = Get-DaemonSessions -Strict } catch {
+# A short ladder (3 x 3 s, like the --bg resolve below): a kill between --bg and the roster write leaves an unrostered session, so the whole launch must stay well inside assignment.js's 90 s.
+try { $daemon = Get-DaemonSessions -Strict -Tries 3 -PollMs 3000 } catch {
   $failClosedReason = "refusing to launch, fail closed: $($_.Exception.Message)"
   # no release: a failed daemon read cannot tell whether a session named for this reservation exists, so it is the same unknown as the suspected-bad-read guard below and keeps the reservation; the stranded-reservation sweep (fleet#253) releases it later if no session ever acknowledges.
   Write-Output (@{ launched = $false; reason = $failClosedReason } | ConvertTo-Json -Compress); exit 3
@@ -603,7 +604,7 @@ if ($Manifest) {
 
 # --- launch ---
 $before = @($daemon | ForEach-Object { $_.sessionId })
-$beforeJobIds = @(Get-DaemonSessions -All | ForEach-Object { $_.id })
+$beforeJobIds = @(Get-DaemonSessions -All -NoRetry | ForEach-Object { $_.id })
 $locationPushed = $false
 # fleet#264: the gh check, fetch and worktree add above take 10-40 s with no job and no roster row, so a
 # release that lands in that window (the stranded-reservation sweep, #261) cannot see this launch. Look
@@ -624,12 +625,15 @@ try {
   # so argv delivery silently truncated every measured IC prompt. stdin is the
   # CLI's prompt input as well, and preserves the exact string without another
   # command-line parse.
-  $out = $Prompt | & claude --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
+  # fleet #265: resolved once (waiting out an npm reinstall); the prompt still goes over stdin.
+  $claudeCli = Resolve-ClaudeCli -Tries 3 -PollMs 3000   # a short ladder: the strict read above already resolved once, and the launch must stay inside assignment.js's 90 s
+  $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
 } catch {
   if ($locationPushed) { Pop-Location; $locationPushed = $false }
   # fleet#256: claude itself failing to run (not on PATH, spawn error) is a refusal too. Release first, then remove the worktree (fleet#251 order); the helper never throws, so the original error is what surfaces.
   [void](Release-ReservationOnRefusal "launch failed: claude --bg threw: $($_.Exception.Message)")
   Remove-FailedAssignmentWorktree
+  if ("$($_.Exception.Message)" -match '^(claude CLI not found|FLEET_CLAUDE_CLI does not point)') { Write-Output (Get-ClaudeCliMissingJson @{ launched = $false; reason = "$($_.Exception.Message)" }); exit 6 }   # fleet #265: a CLI still missing after the bounded wait is reported as such, not as a bare exception
   throw
 } finally {
   if ($locationPushed) { Pop-Location }
@@ -637,10 +641,10 @@ try {
 $row = $null
 for ($i = 0; $i -lt 20 -and -not $row; $i++) {
   Start-Sleep -Milliseconds 750
-  $row = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+  $row = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
 }
 if (-not $row) {
-  $failedRow = Get-DaemonSessions -All |
+  $failedRow = Get-DaemonSessions -All -NoRetry |
     Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
     Select-Object -First 1
   $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
@@ -671,7 +675,7 @@ if (-not $row) {
       if ($currentRecord -and $currentRecord.state -and "$($currentRecord.state)" -notin @('assigned', 'released')) { $keepWorktree = $true }
     } catch {}
     try {
-      $lateRow = Get-DaemonSessions | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+      $lateRow = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
       if ($lateRow) { $keepWorktree = $true }
     } catch {}
   }

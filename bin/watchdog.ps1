@@ -108,7 +108,7 @@ try {
   # --- Cory's 2026-09-18 heal ruling); sentinel-stale, check-failed,
   # --- state-unreadable, double-actor, and the check-escalation kinds stray,
   # --- cap-exceeded, ic-vanished, pr-lookup-failed, blocked, orphan-late-session (#252),
-  # --- ic-dead-before-ack (#253) and reservation-stranded (#256) default to normal - none
+  # --- ic-dead-before-ack (#253), reservation-stranded (#256) and cleanup-pending (#265) default to normal - none
   # --- of these is a Cory decision the ADR names, so falling to pages.defaultPriority
   # --- is the reasoned choice, not a silent gap. respawn-loop (#257: a live session that
   # --- keeps being respawned with no turn in between; the check holds the next respawn) is
@@ -131,7 +131,7 @@ try {
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
   # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'ic-first-turn-stale' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -430,7 +430,7 @@ try {
   # so a bare fixture with no config/cycle.json supervisor.pageKinds override
   # still pages a refused push, the same reasoning ticket 77's Get-PagePriority
   # default already documents for its own hardcoded map.
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded', 'respawn-loop', 'respawn-loop-down', 'ic-first-turn-stale')
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded', 'respawn-loop', 'respawn-loop-down', 'cleanup-pending', 'ic-first-turn-stale')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
