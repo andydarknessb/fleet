@@ -1525,7 +1525,9 @@ try {
         $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
         if ($pageMinAge -gt 0) { $entry | Add-Member -NotePropertyName escalationFiledAt -NotePropertyValue (Now-Iso) -Force }
       }
-      if (-not $entry.url -and $c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
+      # The link is refreshed from the current report each tick: a reconciliation PR that was closed and
+      # reopened elsewhere is linked by its new url, with no new page.
+      if ($c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
 
       # review 2: a given-up entry gets one more chance once the retry window has
       # passed, or right away once pushover.json was touched after the give-up

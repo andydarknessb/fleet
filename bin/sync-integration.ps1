@@ -133,18 +133,17 @@ function Get-CommitCheckState {
   $statuses = @($st.data.statuses | Where-Object { $null -ne $_ })
   $runs = @($cr.data.check_runs | Where-Object { $null -ne $_ })
   foreach ($s in $statuses) { & $add "$($s.context)" (ConvertTo-CheckClass -Kind 'status' -State "$($s.state)") }
-  # Reruns and superseded suites leave several runs under one name: only the newest (started_at, then id)
-  # speaks for it, or a cancelled older run reads as a red check. Worst-wins applies only between a status
+  # Reruns and superseded suites leave several runs under one name: only the newest speaks for it, or a
+  # cancelled older run reads as a red check. The run id is monotonic, so the highest id is the newest
+  # (started_at can order a rerun before the run it replaced). Worst-wins applies only between a status
   # context and the newest run that share a name.
   $newest = @{}
   foreach ($r in $runs) {
     $name = "$($r.name)"
     if (-not $name) { continue }
-    $startedAt = "$($r.started_at)"; $runId = 0L; try { $runId = [long]$r.id } catch {}
+    $runId = 0L; try { $runId = [long]$r.id } catch {}
     $cur = $newest[$name]
-    if ($null -eq $cur -or [string]::CompareOrdinal($startedAt, $cur.startedAt) -gt 0 -or ($startedAt -eq $cur.startedAt -and $runId -gt $cur.id)) {
-      $newest[$name] = [pscustomobject]@{ startedAt = $startedAt; id = $runId; run = $r }
-    }
+    if ($null -eq $cur -or $runId -gt $cur.id) { $newest[$name] = [pscustomobject]@{ id = $runId; run = $r } }
   }
   foreach ($name in $newest.Keys) { $r = $newest[$name].run; & $add $name (ConvertTo-CheckClass -Kind 'run' -State "$($r.status)" -Conclusion "$($r.conclusion)") }
   return [pscustomobject]@{ status = 'ok'; classes = $seen; statusCount = $statuses.Count; checkRunCount = $runs.Count }
@@ -197,9 +196,13 @@ function New-WaitingOutcome {
   param([string]$TenantName, [string]$Def, [string]$Rel, [string]$Sha, [string]$ShortSha, [string[]]$WaitingOn, [string]$PushError, $Memo, [string]$MemoPath)
   $nowUtc = (Get-Date).ToUniversalTime()
   $since = $nowUtc
+  # The clock carries only across consecutive ticks: the memo must have been touched within two ticks
+  # (35 min). An older memo is a different wait (checks settled, a blocked or unattested stretch, or the
+  # run did not reach this path for hours), so the clock restarts instead of stalling a fresh wait.
   if ($Memo -and "$($Memo.tenant)" -eq $TenantName -and "$($Memo.sha)" -eq $Sha -and "$($Memo.kind)" -eq 'sync-waiting') {
     $parsed = ConvertTo-UtcDateTime "$($Memo.since)"
-    if ($parsed -and $parsed -le $nowUtc) { $since = $parsed }
+    $touched = ConvertTo-UtcDateTime "$($Memo.at)"
+    if ($parsed -and $parsed -le $nowUtc -and $touched -and $touched -le $nowUtc -and ($nowUtc - $touched).TotalMinutes -le 35) { $since = $parsed }
   }
   Write-SyncMemo $MemoPath ([ordered]@{ tenant = $TenantName; sha = $Sha; kind = 'sync-waiting'; since = $since.ToString('o'); at = (Now-Iso) })
   $ageMinutes = [int][Math]::Floor(($nowUtc - $since).TotalMinutes)
@@ -300,6 +303,7 @@ if ($required.status -eq 'ok' -and $tipState.status -eq 'ok') {
   $waitingOn = @($required.contexts | Where-Object { $tipState.classes[$_] -eq 'pending' })
   if ($failedChecks.Count -gt 0) {
     # A red check will not heal by waiting; a pending one beside it does not change that.
+    if ($memo -and "$($memo.kind)" -eq 'sync-waiting') { Remove-Item $memoPath -ErrorAction SilentlyContinue }
     Write-Output ([ordered]@{ synced = $false; escalate = $true; kind = 'sync-blocked'; to = $tipShort; failedChecks = $failedChecks; reason = "$rel tip $tipShort cannot be fast-forwarded into ${def}: required check(s) failed on it: $($failedChecks -join ', ')" } | ConvertTo-Json -Compress)
     exit 2
   }

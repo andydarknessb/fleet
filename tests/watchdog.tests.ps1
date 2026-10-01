@@ -2371,6 +2371,14 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     $g3 = Run-WatchdogCaptured
     Assert-True (-not $g3.crashed -and @($g3.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0 -and @(Get-PostedBodies $pushLog274).Count -eq 1) 'a second tick past the grace sends nothing more'
     Assert-True ((Get-EscalationFileCount274) -eq $filesBefore + 1) 'a standing condition files its escalation once, not every tick'
+    # A reopened reconciliation PR has a new url: the condition's url is refreshed from the current report
+    # each tick, with no new page and no new file.
+    Set-SyncStub274 'sync-unattested' 'integration tip abc lacks fleet-review: merge the PR with a MERGE COMMIT, or attest it: node bin/review-policy.js attest --tenant test --pr 9 --head abc' 'https://github.com/owner/repo/pull/9'
+    $g3b = Run-WatchdogCaptured
+    $pg3b = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw | ConvertFrom-Json).$key274
+    Assert-True ("$($pg3b.url)" -eq 'https://github.com/owner/repo/pull/9') "a changed reconciliation PR url must replace the stored one (got $($pg3b.url))"
+    Assert-True (@($g3b.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0 -and @(Get-PostedBodies $pushLog274).Count -eq 1 -and (Get-EscalationFileCount274) -eq $filesBefore + 1) 'a refreshed url pages and files nothing'
+    Set-SyncStub274 'sync-unattested' 'integration tip abc lacks fleet-review: merge the PR with a MERGE COMMIT, or attest it: node bin/review-policy.js attest --tenant test --pr 7 --head abc' $prUrl274
 
     # G4: a bad minAgeMinutes value is reported (config-invalid, once, normal) and the built-in grace
     # applies instead: a condition first seen 10 minutes ago still waits.

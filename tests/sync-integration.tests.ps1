@@ -262,6 +262,14 @@ try {
   $rulesThree = '[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test-build"},{"context":"guards"},{"context":"fleet-review"}]}}]'
   $noRuns = '{"total_count":0,"check_runs":[]}'
   function Get-LineCount { param([string]$Path) if (Test-Path $Path) { @(Get-Content $Path | Where-Object { "$_".Trim() }).Count } else { 0 } }
+  function Set-MemoAge {
+    # Backdates both the clock start (since) and the last touch (at) of the waiting memo.
+    param([int]$SinceMinutes, [int]$AtMinutes)
+    $m = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+    $m.since = (Get-Date).ToUniversalTime().AddMinutes(-$SinceMinutes).ToString('o')
+    $m.at = (Get-Date).ToUniversalTime().AddMinutes(-$AtMinutes).ToString('o')
+    Write-Utf8 "$testRoot\state\sentinel\sync-last.json" ($m | ConvertTo-Json -Compress)
+  }
   function Set-MemoSince {
     # Backdates the sync-waiting memo so a run sees the sha as having waited $Minutes already.
     param([int]$Minutes)
@@ -296,6 +304,22 @@ try {
   Assert-True ($script:lastExit -eq 2) "a sha that has waited past the limit must exit 2 (got $($script:lastExit): $rs)"
   Assert-True ($rs.synced -eq $false -and $rs.kind -eq 'sync-stalled' -and $rs.escalate -eq $true -and @($rs.waitingOn) -contains 'test-build') "a stalled wait must escalate as sync-stalled (got $($rs | ConvertTo-Json -Compress))"
   Assert-True (-not (Test-Path "$($f1.dir)\hook-attempts.log")) 'a stalled pre-check wait still never pushes'
+  # The clock only carries across consecutive ticks: a memo whose `at` is older than two ticks (~35 min) is a
+  # different wait, so the clock restarts. Wait at T0, blocked at T0+30, pending again at T0+5h is a fresh
+  # quiet wait, not a stall.
+  Set-MemoAge -SinceMinutes 300 -AtMinutes 300
+  $rg1 = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($script:lastExit -eq 0 -and $rg1.kind -eq 'sync-waiting') "a memo last touched 5 hours ago restarts the clock (got $($rg1 | ConvertTo-Json -Compress))"
+  Set-MemoAge -SinceMinutes 300 -AtMinutes 5
+  $rg2 = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($script:lastExit -eq 2 -and $rg2.kind -eq 'sync-stalled') 'a memo touched on the previous tick still carries its clock'
+  Set-MockApi $f1 $rulesTwo '{"state":"failure","total_count":1,"statuses":[{"context":"test-build","state":"failure"}]}' $noRuns
+  $rb1 = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($rb1.kind -eq 'sync-blocked') 'a failed check blocks'
+  Assert-True (-not (Test-Path "$testRoot\state\sentinel\sync-last.json")) 'a blocked tip clears the waiting memo'
+  Set-MockApi $f1 $rulesTwo '{"state":"pending","total_count":1,"statuses":[{"context":"test-build","state":"pending"}]}' $noRuns
+  $rg3 = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($script:lastExit -eq 0 -and $rg3.kind -eq 'sync-waiting') "pending again after a blocked tick is a fresh quiet wait (got $($rg3 | ConvertTo-Json -Compress))"
 
   # --- F2 (RED B): the rules and status lookups both fail (unknown); the push is tried, and the
   # --- remote says a check is in progress. Classified by text: sync-waiting, no escalation, exit 0.
@@ -371,22 +395,21 @@ try {
   $env:MOCK_GH_DIR = $f6b.dir
   $rk = Run-Sync @('-Tenant', 'f6b', '-Apply')
   Assert-True ($rk.kind -ne 'sync-waiting' -and $rk.synced -eq $true) "an unrecognised conclusion must not read as pending (got $($rk | ConvertTo-Json -Compress))"
-  # --- F6c: the live duplicate-suite shape. A superseded suite leaves a cancelled run under the same name
-  # --- as the newer green one; only the newest run per name (started_at, then id) counts. Context
-  # --- spelling is shared with a status of the same name: worst wins between those two only.
-  $dupRuns = '{"total_count":5,"check_runs":[' +
-    '{"id":901,"name":"test-build","status":"completed","conclusion":"cancelled","started_at":"2026-09-30T10:00:00Z"},' +
-    '{"id":902,"name":"test-build","status":"completed","conclusion":"success","started_at":"2026-09-30T10:05:00Z"},' +
-    '{"id":911,"name":"guards","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"},' +
-    '{"id":913,"name":"guards","status":"completed","conclusion":"cancelled","started_at":"2026-09-30T10:00:00Z"},' +
+  # --- F6c: the live duplicate-suite shape. A rerun or superseded suite leaves several runs under one name;
+  # --- the run id is monotonic, so the highest id is the newest, whatever started_at says. A NEWER cancelled
+  # --- run blocks; an OLDER cancelled run under a newer green one does not.
+  $dupRuns = '{"total_count":4,"check_runs":[' +
+    '{"id":901,"name":"test-build","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"},' +
+    '{"id":902,"name":"test-build","status":"completed","conclusion":"cancelled","started_at":"2026-09-30T10:05:00Z"},' +
+    '{"id":911,"name":"guards","status":"completed","conclusion":"cancelled","started_at":"2026-09-30T10:09:00Z"},' +
     '{"id":912,"name":"guards","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"}]}'
   $f6c = New-FfFixture 'f6c'
   Set-MockApi $f6c $rulesThree '{"state":"success","total_count":1,"statuses":[{"context":"fleet-review","state":"success"}]}' $dupRuns
   $env:MOCK_GH_DIR = $f6c.dir
   $rl = Run-Sync @('-Tenant', 'f6c', '-Apply')
-  Assert-True ($rl.kind -eq 'sync-blocked' -and @($rl.failedChecks) -contains 'guards' -and @($rl.failedChecks) -notcontains 'test-build') "same started_at: the higher run id (a cancelled 913) is the newest; the older cancelled test-build run is not (got $($rl | ConvertTo-Json -Compress))"
-  $dupRuns2 = $dupRuns.Replace('"id":913,"name":"guards","status":"completed","conclusion":"cancelled"', '"id":910,"name":"guards","status":"completed","conclusion":"cancelled"')
-  Set-MockApi $f6c $rulesThree '{"state":"success","total_count":1,"statuses":[{"context":"fleet-review","state":"success"}]}' $dupRuns2
+  Assert-True ($rl.kind -eq 'sync-blocked' -and @($rl.failedChecks) -contains 'test-build' -and @($rl.failedChecks) -notcontains 'guards') "the highest run id is the newest: a NEWER cancelled test-build blocks, while guards (green run has the higher id despite the earlier started_at) does not (got $($rl | ConvertTo-Json -Compress))"
+  $dupRuns2 = $dupRuns.Replace('"id":902,"name":"test-build"', '"id":900,"name":"test-build"')
+  Set-MockApi $f6c $rulesThree '{"state":"success","total_count":1,"statuses":[{"context":"fleet-review","state":"success"}]}' $dupRuns2.Replace('"id":911,"name":"guards"', '"id":913,"name":"guards"').Replace('"id":912,"name":"guards","status":"completed","conclusion":"success"', '"id":914,"name":"guards","status":"completed","conclusion":"success"')
   $rl2 = Run-Sync @('-Tenant', 'f6c', '-Apply')
   Assert-True ($rl2.synced -eq $true) "an older cancelled run under a newer green one must not block (got $($rl2 | ConvertTo-Json -Compress))"
   $f6d = New-FfFixture 'f6d'
