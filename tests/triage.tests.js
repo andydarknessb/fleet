@@ -72,6 +72,19 @@ test('unrouted and triage-labelled issues are tickets; routed, spec-parent, owne
   assert.equal(result.counts.tickets, 4);
 });
 
+// fleet #260: the assignment planner was blind to the spec label; the Principal's frontier is not.
+// A spec with no sub-issues, and one carrying any other label beside it, is routed, never a ticket.
+test('a spec-labelled issue is routed even with no sub-issues and with other labels beside it (fleet #260)', () => {
+  const result = frontier([
+    issue(30, { labels: ['spec'] }),
+    issue(31, { labels: ['spec', 'bug'] }),
+    issue(32, { labels: ['spec', 'needs-triage'] }),
+  ]);
+  assert.deepEqual(result.eligible, []);
+  for (const entry of result.skipped) assert.match(entry.reason, /routed/);
+  assert.equal(result.skipped.length, 3);
+});
+
 // fleet#55: every fleet session posts under the tenant's ownerLogin, so "the owner has
 // the newest comment" was true of every fleet comment and could not mean "Cory is in
 // conversation". Two companion tickets left the frontier on the strength of the lead's

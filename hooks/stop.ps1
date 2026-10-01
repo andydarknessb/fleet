@@ -2,7 +2,7 @@
 # 1) Every fleet session: write a heartbeat.
 # 2) Project leads only: exit 2 (keep going) while there is actionable work and no PAUSE.
 #    "Actionable" = a non-draft fleet PR awaiting review, or an assignment-planner frontier issue
-#    (bin/assignment.js: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not haiku-rehearsal,
+#    (bin/assignment.js: ready, open, unassigned, unblocked, not a spec (no open sub-issues, no spec label: uncut or done), not ready-for-human, not haiku-rehearsal,
 #    not excluded, not reserved) with a free cap + IC slot.
 $ErrorActionPreference = 'SilentlyContinue'
 . "$PSScriptRoot\..\bin\check-policy.ps1"
@@ -205,7 +205,7 @@ if ($plannerFailure) {
   }
   Stop-Now "assignment planner failed ($plannerFailure); launching nothing, escalation filed"
 }
-if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, no spec parent, not ready-for-human, not haiku-rehearsal, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch'$lagNote" }
+if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, not a spec (no open sub-issues, no spec label: uncut or done), not ready-for-human, not haiku-rehearsal, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch'$lagNote" }
 $why = "assignment frontier empty"
 if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (the watcher records checks-settled and the watchdog wakes you; never poll)" }
 $why += $lagNote
