@@ -73,6 +73,8 @@
     "deadBeforeAckMinutes": 60,
     "deadBeforeAckMaxPerTick": 2,
     "strandedReservationHours": 6,
+    "respawnLoopCap": 3,
+    "respawnLoopWindowHours": 24,
     "syncStallMinutes": 120
   },
   "pages": {
@@ -94,7 +96,9 @@
       "human-wait": "normal",
       "orphan-late-session": "normal",
       "ic-dead-before-ack": "normal",
-      "reservation-stranded": "normal"
+      "reservation-stranded": "normal",
+      "respawn-loop": "normal",
+      "respawn-loop-down": "high"
     },
     "defaultPriority": "normal",
     "minAgeMinutes": { "sync-unattested": 60 },
@@ -108,7 +112,7 @@
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "sync-stalled", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "sync-stalled", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded", "respawn-loop", "respawn-loop-down"]
   },
   "assignment": {
     "parityEvaluations": 20,
