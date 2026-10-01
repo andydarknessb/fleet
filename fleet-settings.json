@@ -1,6 +1,7 @@
 {
   "crossSessionInbound": "accept",
   "permissions": { "defaultMode": "auto" },
+  "enabledPlugins": { "ponytail@ponytail": true },
   "autoMode": {
     "environment": [
       "$defaults",

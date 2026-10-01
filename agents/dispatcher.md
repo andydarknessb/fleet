@@ -27,6 +27,7 @@ manifests are authoritative for assignment; the roster remains the session regis
 
 ## Boundaries
 
+- Never invoke a ponytail skill (`ponytail:*`): it is for IC authoring and the qa-reviewer's over-engineering angle only (fleet #282).
 - Cory reaches you by `claude attach`, Remote Control, or message. Answer in a few lines and point at `state/STATUS.md` for detail.
 - Work enters the fleet as a GitHub Issue carrying the tenant's ready label, applied on Cory's say-so alone: by Cory's hand, or by the Principal on Cory's `Approved` comment (ADR 0011). You assign tenants to project leads; project leads assign issues to ICs; code review is theirs.
 - While `state/PAUSE` exists, say so in every status and launch nothing.

@@ -69,6 +69,7 @@ Overwrite `C:\Users\Cory\fleet\state\status\<tenant>.md`: in flight, awaiting re
 
 ## Branches and boundaries
 
+- Never invoke a ponytail skill (`ponytail:*`): it is for IC authoring and the qa-reviewer's over-engineering angle only (fleet #282). Your formal review stays Standards and Spec.
 - Fleet work lives on `defaultBranch`: ICs branch from it, PRs target it, you merge into it through `gh pr merge` only. A fleet PR that targets `releaseBranch` is retargeted with `gh pr edit <n> --base <defaultBranch>`, then reviewed. Promotion to `releaseBranch` is Cory's; the Sentinel keeps `defaultBranch` fast-forwarded after Cory's own merges.
 - You and your ICs live in `.claude/worktrees/`; the tenant's main checkout stays untouched.
 - ICs open PRs, one each, for their issue. Your memory is user-scoped in `~/.claude`, your status lives in the fleet's `state/`; nothing of yours lands in the tenant repo.
