@@ -93,7 +93,7 @@ try {
   Remove-Item $pkgDir -Recurse -Force
 
   # Case 7: the reinstall window. mock-bin starts empty; a background job writes claude.cmd after ~2-4 s.
-  $script:ClaudeCli = $null
+  $script:ClaudeCli = $null; $script:ClaudeCliLadderExhausted = $false   # (a fresh process: cases 1-6 already exhausted a ladder)
   $env:FLEET_CLAUDE_RESOLVE_TRIES = '40'
   $env:FLEET_CLAUDE_RESOLVE_POLL_MS = '250'
   $job = Start-Job -ScriptBlock {
@@ -140,7 +140,7 @@ try {
 
   # Case 11 (findings 3, 7): -NoRetry reaches Get-DaemonSessions through Invoke-ClaudeCli, -Tries/-PollMs shorten the ladder,
   # and a tolerant read that missed the CLI is remembered, so repeated tolerant calls do not each wait the whole ladder.
-  $script:ClaudeCli = $null
+  $script:ClaudeCli = $null; $script:ClaudeCliLadderExhausted = $false
   $env:FLEET_CLAUDE_RESOLVE_TRIES = '6'
   $env:FLEET_CLAUDE_RESOLVE_POLL_MS = '400'
   $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -151,6 +151,7 @@ try {
   $msg = Get-Thrown { Resolve-ClaudeCli -Tries 2 -PollMs 100 }
   $clock.Stop()
   Assert-True ($null -ne $msg -and $clock.Elapsed.TotalSeconds -lt 1.5) "-Tries 2 -PollMs 100 must override the env ladder (took $($clock.Elapsed.TotalSeconds)s)"
+  $script:ClaudeCliLadderExhausted = $false   # (the -Tries 2 miss above exhausted a ladder; case 15 covers that memory)
   $clock.Restart()
   $null = @(Get-DaemonSessions -All 3>&1)
   $first = $clock.Elapsed.TotalSeconds
@@ -171,8 +172,8 @@ try {
   foreach ($ln in @(Get-Content "$sourceRoot\bin\launch.ps1" | Where-Object { $_ -match 'Get-DaemonSessions' -and $_ -notmatch '^\s*#' })) {
     Assert-True ($ln -match '-Strict' -or $ln -match '-NoRetry') "launch.ps1: a tolerant Get-DaemonSessions must pass -NoRetry: $($ln.Trim())"
   }
-  $hookCall = @(Get-Content "$sourceRoot\hooks\stop.ps1" | Where-Object { $_ -match 'Invoke-ClaudeCli' -and $_ -notmatch '^\s*#' })
-  Assert-True ($hookCall.Count -eq 1 -and $hookCall[0] -match '-TimeoutSec 20\b' -and $hookCall[0] -match '-Tries 2\b' -and $hookCall[0] -match '-PollMs 2000\b') "hooks/stop.ps1 must bound the agents read (-TimeoutSec 20) and use a short ladder (-Tries 2 -PollMs 2000): $($hookCall -join ' | ')"
+  $hookCall = @(Get-Content "$sourceRoot\hooks\stop.ps1" | Where-Object { $_ -match 'Get-DaemonSessions' -and $_ -notmatch '^\s*#' })
+  Assert-True ($hookCall.Count -eq 1 -and $hookCall[0] -match '-Strict' -and $hookCall[0] -match '-TimeoutSec 20\b' -and $hookCall[0] -match '-Tries 2\b' -and $hookCall[0] -match '-PollMs 2000\b') "hooks/stop.ps1 must read the fleet strictly (-Strict: an empty read is not an empty fleet), bound it (-TimeoutSec 20) and use a short ladder (-Tries 2 -PollMs 2000): $($hookCall -join ' | ')"
 
   # Case 13 (re-QA A): a sub-second npm blip. A -NoRetry miss (launch.ps1's post-bg poll) must NOT arm the remembered-miss
   # short-circuit, or every later tolerant read returns @() for a minute and the poll finds no session.
@@ -210,6 +211,62 @@ try {
   $msg = Get-Thrown { Invoke-ClaudeCli -Arguments @('/?') -NoRetry }
   Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found') "a cached path that became the placeholder stub must be re-resolved, not reused: $msg"
   Remove-Item "$testRoot\mock-bin\node_modules" -Recurse -Force
+
+  # Case 15 (QA #275 finding 3): a miss is remembered per process. After ONE exhausted ladder every later resolve is a single
+  # path check (no wait), so Test-JobStopped / Test-JobRemoved / Test-RespawnVerified polls cannot each pay the ladder again;
+  # the single check still finds a CLI that has come back, and finding one re-arms the full ladder for the next outage.
+  Remove-Item "$testRoot\mock-bin\claude.cmd" -ErrorAction SilentlyContinue
+  $script:ClaudeCli = $null; $script:ClaudeCliLadderExhausted = $false; $script:ClaudeCliTolerantMissAt = $null
+  $env:FLEET_CLAUDE_RESOLVE_TRIES = '4'; $env:FLEET_CLAUDE_RESOLVE_POLL_MS = '400'
+  $clock = [Diagnostics.Stopwatch]::StartNew()
+  $msg = Get-Thrown { Resolve-ClaudeCli }
+  $clock.Stop()
+  Assert-True ($null -ne $msg -and $clock.Elapsed.TotalSeconds -ge 1.0) "case 15 fixture: the first miss waits the ladder (took $($clock.Elapsed.TotalSeconds)s)"
+  $clock.Restart()
+  $msg = Get-Thrown { Resolve-ClaudeCli }
+  $msg2 = Get-Thrown { Invoke-ClaudeCli -Arguments @('agents', '--json') }
+  $clock.Stop()
+  Assert-True ($null -ne $msg -and $null -ne $msg2 -and $clock.Elapsed.TotalSeconds -lt 0.7) "after one exhausted ladder a later resolve must not wait again (took $($clock.Elapsed.TotalSeconds)s)"
+  Assert-True ($msg2 -match 'claude CLI not found' -and $msg2 -match 'no wait') "the later miss must say it did not wait: $msg2"
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+  Assert-True ((Resolve-ClaudeCli) -eq "$testRoot\mock-bin\claude.cmd") 'a CLI that reappeared is still found by the single re-check'
+  Remove-Item "$testRoot\mock-bin\claude.cmd"
+  $clock.Restart()
+  $msg = Get-Thrown { Resolve-ClaudeCli }
+  $clock.Stop()
+  Assert-True ($null -ne $msg -and $clock.Elapsed.TotalSeconds -ge 1.0) "finding the CLI re-arms the full ladder for the next outage (took $($clock.Elapsed.TotalSeconds)s)"
+
+  # Case 16 (QA #275 finding 1): Get-DaemonSessions passes -Tries/-PollMs through, so launch.ps1's strict read can use a short
+  # ladder inside assignment.js's 90 s launch timeout.
+  $script:ClaudeCli = $null; $script:ClaudeCliLadderExhausted = $false
+  $env:FLEET_CLAUDE_RESOLVE_TRIES = '6'; $env:FLEET_CLAUDE_RESOLVE_POLL_MS = '2000'
+  $clock.Restart()
+  $msg = Get-Thrown { Get-DaemonSessions -Strict -Tries 2 -PollMs 100 }
+  $clock.Stop()
+  Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found' -and $clock.Elapsed.TotalSeconds -lt 2.0) "Get-DaemonSessions -Tries 2 -PollMs 100 must override the env ladder (took $($clock.Elapsed.TotalSeconds)s): $msg"
+  $strictLine = @(Get-Content "$sourceRoot\bin\launch.ps1" | Where-Object { $_ -match 'Get-DaemonSessions -Strict' -and $_ -notmatch '^\s*#' })
+  Assert-True ($strictLine.Count -eq 1 -and $strictLine[0] -match '-Tries \d' -and $strictLine[0] -match '-PollMs \d') "launch.ps1's strict daemon read must use a short ladder: $($strictLine -join ' | ')"
+
+  # Case 17 (QA #275 finding 5): no -StdinText means no redirected stdin. A [string] parameter defaulting to $null is '', and
+  # `$null -ne ''` made every bounded child get an empty stdin file; an explicit -StdinText still redirects.
+  function Start-Process {
+    param([string]$FilePath, [string]$ArgumentList, [switch]$NoNewWindow, [switch]$PassThru, [string]$RedirectStandardOutput, [string]$RedirectStandardError, [string]$RedirectStandardInput)
+    $script:spKeys = @($PSBoundParameters.Keys)
+    Microsoft.PowerShell.Management\Start-Process @PSBoundParameters
+  }
+  try {
+    $script:spKeys = @()
+    $null = Invoke-BoundedExe -FilePath "$env:SystemRoot\System32\whoami.exe" -ArgumentList @() -TimeoutSec 30
+    Assert-True ($script:spKeys -contains 'RedirectStandardOutput' -and $script:spKeys -notcontains 'RedirectStandardInput') "Invoke-BoundedExe with no -StdinText must not redirect stdin: $($script:spKeys -join ',')"
+    $script:spKeys = @()
+    $null = Invoke-BoundedExe -FilePath "$env:SystemRoot\System32\whoami.exe" -ArgumentList @() -TimeoutSec 30 -StdinText 'hello'
+    Assert-True ($script:spKeys -contains 'RedirectStandardInput') 'Invoke-BoundedExe with -StdinText must redirect stdin'
+    Write-Utf8 "$testRoot\mock-bin\claude.cmd" $mockBody
+    $script:ClaudeCli = $null; $script:spKeys = @()
+    $run = Invoke-ClaudeCli -Arguments @('agents', '--json') -NoRetry
+    Assert-True ($run.exitCode -eq 0 -and $script:spKeys -notcontains 'RedirectStandardInput') "Invoke-ClaudeCli with no -StdinText must not redirect stdin: $($script:spKeys -join ',')"
+  } finally { Remove-Item Function:\Start-Process -ErrorAction SilentlyContinue }
+  Remove-Item "$testRoot\mock-bin\claude.cmd" -ErrorAction SilentlyContinue
 
   Write-Output 'claude-cli-resolver tests passed'
 } finally {

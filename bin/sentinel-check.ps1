@@ -1124,6 +1124,12 @@ if (Test-Path -LiteralPath $cleanupPendingPath) {
       $cpWhyNot = if (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live") { 'read-only run' } else { 'state/flags/ic-cleanup-live absent' }
       $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "would stop and remove job $($cp.jobId) and $($cpWorktrees.Count) worktree(s) when clean ($cpWhyNot)" }
       [void]$cpKept.Add($cpRaw)
+      # The flag is off in production, so a line nobody acts on would never reach a human. With the flag absent the pass escalates it,
+      # without acting (the report only; the watchdog dedupes by name + kind, so once per line). A read-only run with the flag on is
+      # about to be acted on by the next -Apply and stays quiet.
+      if (-not (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")) {
+        $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and state/flags/ic-cleanup-live is off, so nothing will act on it: finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')) and drop its line from state/sentinel/cleanup-pending.jsonl, or turn the flag on"; parent = 'dispatcher' }
+      }
       continue
     }
     $cpFailure = $null

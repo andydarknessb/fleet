@@ -252,7 +252,8 @@ if ((Test-Paused) -and -not $Force) {
 # The duplicate-name guard and the cap read the same daemon list the caller may have
 # acted on; a glitched read must refuse the launch, never pass the guards empty.
 $daemon = $null
-try { $daemon = Get-DaemonSessions -Strict } catch {
+# A short ladder (3 x 3 s, like the --bg resolve below): a kill between --bg and the roster write leaves an unrostered session, so the whole launch must stay well inside assignment.js's 90 s.
+try { $daemon = Get-DaemonSessions -Strict -Tries 3 -PollMs 3000 } catch {
   $failClosedReason = "refusing to launch, fail closed: $($_.Exception.Message)"
   # no release: a failed daemon read cannot tell whether a session named for this reservation exists, so it is the same unknown as the suspected-bad-read guard below and keeps the reservation; the stranded-reservation sweep (fleet#253) releases it later if no session ever acknowledges.
   Write-Output (@{ launched = $false; reason = $failClosedReason } | ConvertTo-Json -Compress); exit 3

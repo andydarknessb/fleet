@@ -210,7 +210,8 @@ function Get-DaemonSessions {
   # empty output, or unparseable JSON throws so actuators can fail CLOSED. The
   # 2026-09-01 near-miss: one glitched read told the Sentinel every session was
   # missing while the same source disarmed launch.ps1's duplicate and cap guards.
-  param([switch]$All, [switch]$Strict, [switch]$NoRetry)
+  # -TimeoutSec / -Tries / -PollMs are Invoke-ClaudeCli's, for a caller with a deadline (launch.ps1, the Stop hook).
+  param([switch]$All, [switch]$Strict, [switch]$NoRetry, [int]$TimeoutSec = 60, [int]$Tries = 0, [int]$PollMs = -1)
   # A tolerant, RETRYING read that already missed the CLI (after the whole ladder) is remembered for a minute: while that
   # memory stands a retrying read is downgraded to -NoRetry, a cheap re-probe that still sees the CLI the moment it is
   # back, so a script that reads the list repeatedly does not wait the ladder on every call (launch.ps1 must finish well
@@ -219,7 +220,7 @@ function Get-DaemonSessions {
   if (-not $Strict -and $script:ClaudeCliTolerantMissAt -and ((Get-Date) - $script:ClaudeCliTolerantMissAt).TotalSeconds -lt 60) { $NoRetry = $true }
   $cliArgs = @('agents', '--json'); if ($All) { $cliArgs += '--all' }
   $run = $null
-  try { $run = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec 60 -Name "claude $($cliArgs -join ' ')" -NoRetry:$NoRetry }
+  try { $run = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec $TimeoutSec -Name "claude $($cliArgs -join ' ')" -NoRetry:$NoRetry -Tries $Tries -PollMs $PollMs }
   catch {
     # fleet #265: a missing CLI is not an empty fleet. Strict callers fail closed with the
     # resolver's text; tolerant ones still get @() but the cause is on the warning stream.
@@ -398,7 +399,7 @@ function ConvertTo-ProcessArgument {
   return '"' + $escaped + '"'
 }
 function Invoke-BoundedExe {
-  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '', [string]$StdinText = $null)
+  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '', $StdinText = $null)   # untyped: a [string] default of $null is '', and '' is not "no stdin"
   $result = [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = $null }
   $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName(); $childIn = $null
   try {
@@ -518,6 +519,10 @@ function Resolve-ClaudeCli {
   if ($Tries -gt 0) { $maxAttempts = $Tries }
   if ($PollMs -ge 0) { $pauseMs = $PollMs }
   if ($NoRetry) { $maxAttempts = 1 }
+  # One exhausted ladder per process is enough: while the miss stands every later resolve is a single path check, so a poll
+  # loop (Test-JobStopped, Test-RespawnVerified) or a run of calls cannot each pay the ladder again. The check still finds a
+  # CLI that has come back, and finding one clears the memory.
+  if ($script:ClaudeCliLadderExhausted) { $maxAttempts = 1 }
   $started = Get-Date
   $known = @(Get-ClaudeCliKnownPaths)
   $shimNote = $null
@@ -525,23 +530,24 @@ function Resolve-ClaudeCli {
     $hit = Resolve-ExePath 'claude'
     if ($hit) {
       $shimTarget = Get-ClaudeNpmShimTarget $hit
-      if ($null -eq $shimTarget) { return $hit }
-      if (Test-ClaudeCliCandidate $shimTarget) { return $shimTarget }
+      if ($null -eq $shimTarget) { $script:ClaudeCliLadderExhausted = $false; return $hit }
+      if (Test-ClaudeCliCandidate $shimTarget) { $script:ClaudeCliLadderExhausted = $false; return $shimTarget }
       $shimNote = "npm shim $hit has no usable target $shimTarget"
     }
     foreach ($k in $known) {
       $cand = $k
       $kt = Get-ClaudeNpmShimTarget $k
       if ($null -ne $kt) { $cand = $kt }
-      if (Test-ClaudeCliCandidate $cand) { return $cand }
+      if (Test-ClaudeCliCandidate $cand) { $script:ClaudeCliLadderExhausted = $false; return $cand }
     }
     if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $pauseMs }
   }
+  if ($maxAttempts -gt 1) { $script:ClaudeCliLadderExhausted = $true }
   $waited = [int][Math]::Round(((Get-Date) - $started).TotalSeconds)
   $tried = @('PATH (claude.exe/.cmd/.bat)') + $known
   if ($shimNote) { $tried += $shimNote }
   $script:ClaudeCliMissing = [pscustomobject]@{ tried = @($tried); waitedSec = $waited }
-  $waitNote = if ($NoRetry) { 'no wait' } else { "waited ${waited}s for an in-flight npm reinstall" }
+  $waitNote = if ($maxAttempts -le 1) { 'no wait' } else { "waited ${waited}s for an in-flight npm reinstall" }
   throw "claude CLI not found (tried: $($tried -join '; '); FLEET_CLAUDE_CLI=unset; $waitNote)"
 }
 function Get-ClaudeCliMissingJson {
@@ -559,7 +565,7 @@ function Invoke-ClaudeCli {
   # (never `2>$null`). Throws only when the CLI cannot be found; a run that fails comes
   # back as { exitCode, stderr, timedOut, startError } for the caller to judge.
   # -NoRetry / -Tries / -PollMs are Resolve-ClaudeCli's, for a caller that already resolved or has a deadline.
-  param([string[]]$Arguments, [int]$TimeoutSec = 60, [string]$Name = '', [string]$StdinText = $null, [switch]$NoRetry, [int]$Tries = 0, [int]$PollMs = -1)
+  param([string[]]$Arguments, [int]$TimeoutSec = 60, [string]$Name = '', $StdinText = $null, [switch]$NoRetry, [int]$Tries = 0, [int]$PollMs = -1)
   $cli = $null
   # The per-process cache is revalidated every call (Test-ClaudeCliCandidate, not just existence): a long-lived process can see the
   # package claude.exe turn back into npm's placeholder stub, or lose its package.json, mid-reinstall.

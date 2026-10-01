@@ -153,20 +153,16 @@ $cap = [int]$static.cap
 # fleet #265: the claude CLI is resolved by bin\_common.ps1 (override, PATH, known npm paths, waiting out an npm
 # reinstall), never called bare. A missing CLI or a failed read is NOT an empty fleet (capFree would wrongly be
 # the whole cap): stop now, and the next wake re-reads. (Under SilentlyContinue only try/catch sees the throw.)
-$liveRaw = $null
+# -Strict also rejects exit 0 with empty or unparseable output (an unreadable fleet, not an empty one).
+$liveRows = @()
 try {
   . "$PSScriptRoot\..\bin\_common.ps1"
-  $agentsRun = Invoke-ClaudeCli -Arguments @('agents', '--json') -TimeoutSec 20 -Tries 2 -PollMs 2000
-  if ($agentsRun.startError -or $agentsRun.timedOut -or $agentsRun.exitCode -ne 0) {
-    $agentsWhy = if ($agentsRun.startError) { "$($agentsRun.startError)" } elseif ($agentsRun.timedOut) { 'timed out' } else { "exit $($agentsRun.exitCode)" }
-    throw "claude agents --json failed ($agentsWhy)"
-  }
-  $liveRaw = $agentsRun.stdout
+  $liveRows = @(Get-DaemonSessions -Strict -TimeoutSec 20 -Tries 2 -PollMs 2000)
 } catch {
   $agentsError = ("$($_.Exception.Message)" -replace '\s+', ' ')
   Stop-Now "claude CLI unavailable (reinstall in progress?): $agentsError"
 }
-$liveNames = @(ConvertFrom-JsonArray $liveRaw | ForEach-Object { $_.name })
+$liveNames = @($liveRows | ForEach-Object { $_.name })
 $rosterNames = @($static.sessions | ForEach-Object { $_.name })
 if ($roster) { $rosterNames += @($roster.sessions | Where-Object { $_.status -eq 'active' } | ForEach-Object { $_.name }) }
 $liveFleet = @($liveNames | Where-Object { $rosterNames -contains $_ })

@@ -107,6 +107,13 @@ try {
   $r = Run-Check -Apply
   Assert-True (@($r.cleanupPending)[0].outcome -match 'ic-cleanup-live absent') "without the flag the pass only reports: $(@($r.cleanupPending)[0].outcome)"
   Assert-True ([IO.File]::ReadAllText($pendingPath) -eq $before -and -not (Test-Path $calls)) 'without the flag nothing is written or run'
+  # QA #275 finding 2: the flag is off in production, so a line nobody acts on must still reach a human, once per line
+  # (the watchdog dedupes by name+kind), in the report only.
+  $cpEsc = @($r.escalate | Where-Object { $_.kind -eq 'cleanup-pending' })
+  Assert-True ($cpEsc.Count -eq 1 -and "$($cpEsc[0].name)" -eq 'ic-9' -and "$($cpEsc[0].detail)" -match 'job-1' -and "$($cpEsc[0].detail)" -match 'ic-cleanup-live') "with the flag off a pending line must escalate cleanup-pending without acting: $($r.escalate | ConvertTo-Json -Compress)"
+  $r = Run-Check
+  Assert-True (@($r.escalate | Where-Object { $_.kind -eq 'cleanup-pending' }).Count -eq 1) 'a read-only run with the flag absent escalates too (a page is not an action)'
+  Assert-True ([IO.File]::ReadAllText($pendingPath) -eq $before -and -not (Test-Path $calls)) 'the flag-off escalation writes nothing and runs nothing'
 
   # Case 3: flag + -Apply: stop, rm (each verified), worktree removed (clean), line dropped, outcome reported.
   Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
