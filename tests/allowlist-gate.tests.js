@@ -7,8 +7,8 @@
 // below reaches the CLI as a prompt.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { spawnSync } = require('node:child_process');
 
@@ -70,7 +70,7 @@ test('heredoc bodies and quoted text never split a call into segments', () => {
 });
 
 function sandbox(settings) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-allowlist-gate-'));
+  const home = makeTempDir('fleet-allowlist-gate-');
   fs.mkdirSync(path.join(home, 'state', 'sessions'), { recursive: true });
   fs.mkdirSync(path.join(home, 'state', 'flags'), { recursive: true });
   if (settings !== undefined) fs.writeFileSync(path.join(home, 'state', 'sessions', 'ic-1.settings.json'), settings);

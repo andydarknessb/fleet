@@ -4,11 +4,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { verifyLedger, verifyRecordEvents, stateAfter, cli, VERIFY_EVENTS_FLAGS, VerifyEventsError } = require('../bin/verify-events');
 const { abandonRecord, createRecord, observeRecord, recordReview, releaseRecord, reserveRecord, transitionRecord, readEvents } = require('../bin/work-state');
 
-function rootDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-verify-')); }
+function rootDir() { return makeTempDir('fleet-verify-'); }
 const HEAD = 'a'.repeat(40);
 // A unit that reaches `merged` is reviewed on the way, as the fleet requires (#114):
 // a formal review at `formalAt` (default: the merged head; null for none) and a PR

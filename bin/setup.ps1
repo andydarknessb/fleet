@@ -1,7 +1,10 @@
 # One-time setup. Idempotent. Run: powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\setup.ps1
 . "$PSScriptRoot\_common.ps1"
 . "$PSScriptRoot\check-policy.ps1"
-$v = (& claude --version 2>$null | Out-String).Trim()
+# FLEET_CLAUDE_CLI (optional) pins the claude executable, like FLEET_NODE_PATH pins node; unset, the resolver
+# tries PATH and then the known npm/native install paths, waiting out an in-flight npm reinstall (fleet #265).
+$v = ''
+try { $v = "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch { Write-Error "claude not found: $($_.Exception.Message)"; exit 6 }
 Write-Output "claude: $v"
 if ($v -notmatch '(\d+)\.(\d+)\.(\d+)') { Write-Error 'claude not found'; exit 1 }
 $ver = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"

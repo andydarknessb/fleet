@@ -69,6 +69,14 @@ try {
   $out3 = Run-Stop
   Assert-True ($lastExit -eq 2 -and $out3 -match 'assignment frontier #101') "recovery: the hook must continue on the assignment frontier again: exit $lastExit :: $out3"
 
+  # Case 4 (fleet #265 QA): a CLI that exits 0 with EMPTY stdout is an unreadable fleet, not an empty one (capFree would
+  # read as the whole cap and the lead would be told to launch). The hook stops now and says so.
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'exit /b 0' + "`r`n")
+  $out4 = Run-Stop
+  Assert-True ($lastExit -eq 0 -and $out4 -notmatch 'assignment frontier') "an empty claude agents read must stop the lead, not launch: exit $lastExit :: $out4"
+  Assert-True ((Get-Continue).stoppedBecause -match 'claude CLI unavailable' -and (Get-Continue).stoppedBecause -match 'empty') "the stop reason must name the unreadable read: $((Get-Continue).stoppedBecause)"
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+
   # fleet#51: "CI settled" used to be read from live GitHub while `record --kind formal` reads
   # the Work record, which the watcher advances on a five-minute tick; the hook continued the
   # lead onto a PR the review gate then refused (INVALID_REVIEW_STATE). A PR awaits review only

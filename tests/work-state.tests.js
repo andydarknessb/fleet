@@ -3,6 +3,7 @@ const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const {
@@ -27,7 +28,7 @@ const {
 } = require('../bin/work-state');
 
 function rootDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-work-state-'));
+  return makeTempDir('fleet-work-state-');
 }
 
 function makeRecord(root, overrides = {}) {
@@ -1758,7 +1759,7 @@ test('#211: an escalation may carry the named reason criteria-defect with no pre
 const RACE_ROUNDS = Number(process.env.WORK_STATE_RACE_ROUNDS || 3);
 
 function contend(children) {
-  const barrier = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-work-state-barrier-'));
+  const barrier = makeTempDir('fleet-work-state-barrier-');
   const preamble = (index) => `
 const fs=require('node:fs');const path=require('node:path');
 const wait=(ms)=>Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,ms);

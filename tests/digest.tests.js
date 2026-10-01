@@ -1,8 +1,8 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { projectDigest, foldLedger, cli, DIGEST_FLAGS, DigestError } = require('../bin/digest');
@@ -11,7 +11,7 @@ const { runNotifier } = require('../bin/notify');
 const workState = require('../bin/work-state');
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-digest-'));
+  const root = makeTempDir('fleet-digest-');
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({
     name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', defaultBranch: 'integration', releaseBranch: 'main',

@@ -443,7 +443,13 @@ function Do-Relaunch {
     return
   }
   $script:RespawnVerifyCount++
-  if ($row.pid) { & claude stop $row.id 2>&1 | Out-Null }
+  if ($row.pid) {
+    # fleet #265: the CLI is resolved, not assumed; a miss is a named failure, not a silent no-op stop.
+    try { $null = Invoke-ClaudeCli -Arguments @('stop', "$($row.id)") } catch {
+      $script:report.respawnFailed += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "relaunch not attempted, claude stop could not run: $(Get-OneLineText "$($_.Exception.Message)"): $reason"; via = 'launch' }
+      return
+    }
+  }
   # Hashtable splat (rotate.ps1's lesson: PS 5.1 array splatting passes '-FromRoster' as a value).
   $launchArgs = @{ FromRoster = "$($entry.name)" }
   # A hand-set -Model on the roster row survives the relaunch (launch.ps1's ValidateSet tokens only).
@@ -489,7 +495,10 @@ function Do-Respawn {
     return
   }
   $script:RespawnVerifyCount++
-  & claude respawn $row.id 2>&1 | Out-Null
+  try { $null = Invoke-ClaudeCli -Arguments @('respawn', "$($row.id)") } catch {
+    $script:report.respawnFailed += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "claude respawn could not run: $(Get-OneLineText "$($_.Exception.Message)"): $reason" }
+    return
+  }
   $verifyId = if ($entry.static) { '' } else { "$($row.id)" }
   if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid -JobId $verifyId) {
     Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($row.id)" $reason -Down:(-not $row.pid)
@@ -664,15 +673,16 @@ if (-not $rosterUnreadable) {
     try { $mf = Read-Json $manifestPath; if ($mf -and $mf.PSObject.Properties['parent'] -and $mf.parent) { $manifestParent = "$($mf.parent)" } } catch {}
     $outcome = 'would stop (state/flags/ic-cleanup-live absent)'
     if ($cleanupLive) {
-      & claude stop $jobId 2>&1 | Out-Null
-      if (Test-JobStopped -Id $jobId) {
+      $stopRunError = ''
+      try { $null = Invoke-ClaudeCli -Arguments @('stop', "$jobId") } catch { $stopRunError = " (claude stop could not run: $(Get-OneLineText "$($_.Exception.Message)"))" }
+      if (-not $stopRunError -and (Test-JobStopped -Id $jobId)) {
         # rm's own result is not trusted: a refused rm leaves the stopped row listed, and a stopped row
         # newer than the rostered job of the same name is what Latest-Row used to respawn. Confirm by a
         # strict re-read that the row is gone, and say so when it is not.
         # Continue while rm runs: a native stderr line under a Stop preference would throw before the exit code is read.
         $rmEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         $rmOut = ''; $rmExit = $null
-        try { $rmOut = "$(& claude rm $jobId 2>&1 | Out-String)"; $rmExit = $LASTEXITCODE } catch { $rmOut = "$($_.Exception.Message)"; $rmExit = -1 } finally { $ErrorActionPreference = $rmEap }
+        try { $rmRun = Invoke-ClaudeCli -Arguments @('rm', "$jobId"); $rmOut = "$($rmRun.stdout)$($rmRun.stderr)"; $rmExit = if ($rmRun.timedOut -or $rmRun.startError) { -1 } else { $rmRun.exitCode } } catch { $rmOut = "$($_.Exception.Message)"; $rmExit = -1 } finally { $ErrorActionPreference = $rmEap }
         $removed = Test-JobRemoved -Id $jobId
         $rmError = ''
         if (-not $removed) {
@@ -681,7 +691,7 @@ if (-not $rosterUnreadable) {
         $outcome = if ($removed) { 'stopped' } else { "stopped, not removed: $rmError" }
         $report.stopped += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = "orphan late session: manifest invalidated ($markerReason)"; verified = $true; removed = $removed; rmError = $rmError }
       } else {
-        $failReason = "job $jobId still had a pid after claude stop (waited $($script:RespawnVerifyBoundMs) ms)"
+        $failReason = "job $jobId still had a pid after claude stop (waited $($script:RespawnVerifyBoundMs) ms)$stopRunError"
         $outcome = "stop failed: $failReason"
         $report.stopFailed += [pscustomobject]@{ name = $row.name; jobId = $jobId; manifest = $manifestPath; reason = $failReason }
       }
@@ -894,6 +904,13 @@ if ($Apply -and -not $script:RespawnStreakUnreadable -and $script:RespawnStreak.
 
 # --- strays and cap ---
 $fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$'
+$script:cleanupPendingAt = @{}
+try {
+  foreach ($cpLine in @(Get-Content -LiteralPath "$FleetHome\state\sentinel\cleanup-pending.jsonl" -Encoding UTF8 -ErrorAction Stop)) {
+    $cpObj = $null; try { $cpObj = "$cpLine" | ConvertFrom-Json } catch {}
+    if ($cpObj -and $cpObj.PSObject.Properties['jobId'] -and "$($cpObj.jobId)") { $script:cleanupPendingAt["$($cpObj.jobId)"] = "$($cpObj.at)" }
+  }
+} catch {}
 $known = @($expected | ForEach-Object { $_.name })
 foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fleetPattern) -and ($known -notcontains $_.name) -and -not $script:orphanJobIds.ContainsKey("$($_.id)") })) {
   $foreign = Get-ForeignRosterRoot $row
@@ -901,7 +918,9 @@ foreach ($row in ($daemon | Where-Object { $_.pid -and ("$($_.name)" -match $fle
     $report.ok += [pscustomobject]@{ name = $row.name; detail = "another fleet root's session (job $($row.id), rostered by $foreign); not this root's to supervise" }
     continue
   }
-  $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'stray'; detail = "fleet-named session not on the roster (job $($row.id)); cause not measured: launched outside launch.ps1, or its roster entry was lost or retired while the process lived" }
+  # fleet #265: a job retire.ps1 queued in cleanup-pending.jsonl (the claude CLI was missing when it retired the row) is a known cause.
+  $strayCause = if ($script:cleanupPendingAt.ContainsKey("$($row.id)")) { "retire could not remove it (claude CLI missing at $($script:cleanupPendingAt["$($row.id)"])); cleanup pending" } else { 'cause not measured: launched outside launch.ps1, or its roster entry was lost or retired while the process lived' }
+  $report.escalate += [pscustomobject]@{ name = $row.name; kind = 'stray'; detail = "fleet-named session not on the roster (job $($row.id)); $strayCause" }
 }
 $liveFleet = @($daemon | Where-Object { $_.pid -and ($known -contains $_.name) })
 # The cap counts what the door counts: cap-exempt names (config/cycle.json cap.exemptNamePrefixes, the Principal) are outside it.
@@ -1068,6 +1087,125 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
       # fleet #274: an unattested tip's page links its reconciliation PR (the Watchdog reads `url`).
       if ($syncKind -eq 'sync-unattested' -and $res.PSObject.Properties['prUrl'] -and $res.prUrl) { $report.escalate[-1] | Add-Member -NotePropertyName url -NotePropertyValue "$($res.prUrl)" -Force }
     }
+  }
+}
+
+# --- fleet #265: cleanup-pending ---
+# retire.ps1 writes one line here when the claude CLI was missing (an npm auto-update window) and so could
+# not stop/rm the job: the roster already says retired, the job and its worktrees were left untouched.
+# Acting needs -Apply AND state/flags/ic-cleanup-live, like the other cleanup passes (shadow-first): the job is
+# stopped and removed (each verified by a strict re-read), then each listed worktree is removed only when
+# `git status --porcelain` is empty. A line that finishes is dropped; any other keeps its line with attempts+1,
+# and from the third attempt the kind `cleanup-pending` (normal priority) is escalated. A read-only run
+# reports what it would do and writes nothing.
+$cleanupPendingPath = "$FleetHome\state\sentinel\cleanup-pending.jsonl"
+$report.cleanupPending = @()
+if (Test-Path -LiteralPath $cleanupPendingPath) {
+  $cpRawLines = @(Get-Content -LiteralPath $cleanupPendingPath -Encoding UTF8 | Where-Object { "$_".Trim() })
+  $cpKept = New-Object System.Collections.ArrayList
+  $cpChanged = $false
+  foreach ($cpRaw in $cpRawLines) {
+    $cp = $null; try { $cp = $cpRaw | ConvertFrom-Json } catch {}
+    if (-not $cp) {
+      [void]$cpKept.Add($cpRaw)
+      $report.ok += [pscustomobject]@{ name = 'cleanup-pending'; detail = 'a line in state/sentinel/cleanup-pending.jsonl did not parse and was kept untouched' }
+      continue
+    }
+    $cpAttempts = if ($cp.PSObject.Properties['attempts'] -and "$($cp.attempts)" -match '^\d+$') { [int]$cp.attempts } else { 0 }
+    $cpWorktrees = @(@($cp.worktrees) | Where-Object { $_ })
+    # A line older than 7 days is not acted on: the job or its worktree may long since belong to something else.
+    # It is kept and escalated (in every mode: a page is not an action) until a human drops it.
+    $cpAt = ConvertTo-UtcDateTime $cp.at
+    if ($cpAt -and ($now - $cpAt).TotalDays -gt 7) {
+      [void]$cpKept.Add($cpRaw)
+      $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "stale: queued $($cp.at), more than 7 days ago; not acted on" }
+      $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "stale entry, check by hand: retire of $($cp.name) queued job $($cp.jobId) (and worktrees: $($cpWorktrees -join ', ')) for cleanup at $($cp.at), more than 7 days ago; not acted on. Verify what still exists, finish by hand, then drop its line from state/sentinel/cleanup-pending.jsonl"; parent = 'dispatcher' }
+      continue
+    }
+    if (-not $cleanupLive) {
+      $cpWhyNot = if (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live") { 'read-only run' } else { 'state/flags/ic-cleanup-live absent' }
+      $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "would stop and remove job $($cp.jobId) and $($cpWorktrees.Count) worktree(s) when clean ($cpWhyNot)" }
+      [void]$cpKept.Add($cpRaw)
+      # The flag is off in production, so a line nobody acts on would never reach a human. With the flag absent the pass escalates it,
+      # without acting (the report only; the watchdog dedupes by name + kind, so once per line). A read-only run with the flag on is
+      # about to be acted on by the next -Apply and stays quiet.
+      if (-not (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")) {
+        $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and state/flags/ic-cleanup-live is off, so nothing will act on it: finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')) and drop its line from state/sentinel/cleanup-pending.jsonl, or turn the flag on"; parent = 'dispatcher' }
+      }
+      continue
+    }
+    $cpFailure = $null
+    try {
+      $cpJob = "$($cp.jobId)"
+      if ($cpJob) {
+        try { $null = Invoke-ClaudeCli -Arguments @('stop', $cpJob) } catch { throw "claude stop could not run: $($_.Exception.Message)" }
+        if (-not (Test-JobStopped -Id $cpJob)) { throw "job $cpJob still had a pid after claude stop" }
+        try { $null = Invoke-ClaudeCli -Arguments @('rm', $cpJob) } catch { throw "claude rm could not run: $($_.Exception.Message)" }
+        if (-not (Test-JobRemoved -Id $cpJob)) { throw "job $cpJob still listed after claude rm" }
+      }
+      # A worktree another session now owns is left alone (the same path is relaunched for the next attempt at an issue):
+      # an active|retiring roster row of the same name, or naming that worktree as its cwd, or a live daemon row whose cwd is it.
+      $cpNorm = { param($x) ("$x" -replace '/', '\').TrimEnd('\').ToLowerInvariant() }
+      # A strict read, janitor's rule: a roster that is missing, empty (mid-write) or unparseable shows no claims at all, and
+      # "nobody claims it" off that reading would remove a live session's worktree. It blocks every removal instead.
+      $cpRosterNow = @()
+      if ($cpWorktrees.Count -gt 0) {
+        $cpRosterRaw = $null
+        try { $cpRosterRaw = Get-Content -LiteralPath $rosterPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch {}
+        if ($null -eq $cpRosterRaw -or -not $cpRosterRaw.PSObject.Properties['sessions']) { throw 'state/roster.json is missing, empty or unreadable; worktree removal blocked because no claim can be seen' }
+        $cpRosterNow = @($cpRosterRaw.sessions | Where-Object { "$($_.status)" -in @('active', 'retiring') })
+      }
+      $cpDaemonNow = @(Get-DaemonSessions -All -Strict | Where-Object { $_.pid -and "$($_.id)" -ne $cpJob })
+      $cpClaimedBy = {
+        param($wtPath)
+        $w = & $cpNorm $wtPath
+        $under = { param($c) $n = & $cpNorm $c; $n -and ($n -eq $w -or $n.StartsWith($w + '\')) }
+        foreach ($rr in $cpRosterNow) {
+          if ("$($rr.name)" -eq "$($cp.name)") { return "active roster row $($rr.name) (job $($rr.jobId))" }
+          if (& $under $rr.cwd) { return "active roster row $($rr.name) (cwd is the worktree)" }
+        }
+        foreach ($dr in $cpDaemonNow) { if ($dr.PSObject.Properties['cwd'] -and (& $under $dr.cwd)) { return "live session $($dr.name) (job $($dr.id), cwd is the worktree)" } }
+        return $null
+      }
+      $cpLeftAlone = @()
+      $cpRepoRoot = $null
+      if ($cp.cwd) { $cpRepoRoot = if ("$($cp.cwd)" -match '^(.+?)[\\/]\.claude[\\/]worktrees[\\/]') { $Matches[1] } else { "$($cp.cwd)" } }
+      foreach ($cpWt in $cpWorktrees) {
+        if (-not (Test-Path -LiteralPath $cpWt)) { continue }
+        $cpClaim = & $cpClaimedBy $cpWt
+        if ($cpClaim) { $cpLeftAlone += "worktree $cpWt claimed by $cpClaim, left alone"; continue }
+        $cpStatus = Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', "$cpWt", 'status', '--porcelain') -TimeoutSec 30 -Name "git status $cpWt"
+        if ($cpStatus.startError -or $cpStatus.timedOut -or $cpStatus.exitCode -ne 0) { throw "worktree $cpWt status unreadable: $(Get-OneLineText "$($cpStatus.startError)$($cpStatus.stderr)")" }
+        if ("$($cpStatus.stdout)".Trim()) { throw "worktree $cpWt has uncommitted changes; kept" }
+        if (-not $cpRepoRoot) { throw "worktree $cpWt cannot be removed: the pending line has no cwd" }
+        $cpBranch = "$((Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', "$cpWt", 'rev-parse', '--abbrev-ref', 'HEAD') -TimeoutSec 30 -Name "git rev-parse $cpWt").stdout)".Trim()
+        [void](Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', $cpRepoRoot, 'worktree', 'unlock', "$cpWt") -TimeoutSec 30 -Name "git worktree unlock $cpWt")
+        [void](Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', $cpRepoRoot, 'worktree', 'remove', '--force', "$cpWt") -TimeoutSec 60 -Name "git worktree remove $cpWt")
+        if (Test-Path -LiteralPath $cpWt) { throw "worktree $cpWt still present after git worktree remove" }
+        if ($cpBranch -like 'worktree-*') { [void](Invoke-BoundedCommand -Command 'git' -ArgumentList @('-C', $cpRepoRoot, 'branch', '-D', $cpBranch) -TimeoutSec 30 -Name "git branch -D $cpBranch") }
+      }
+    } catch { $cpFailure = Get-OneLineText "$($_.Exception.Message)" }
+    if (-not $cpFailure) {
+      $cpChanged = $true
+      $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "cleaned: job $($cp.jobId) stopped and removed, $($cpWorktrees.Count) worktree(s) handled$(if ($cpLeftAlone.Count -gt 0) { '; ' + ($cpLeftAlone -join '; ') })" }
+      continue
+    }
+    $cpAttempts++
+    $cp | Add-Member -NotePropertyName attempts -NotePropertyValue $cpAttempts -Force
+    $cp | Add-Member -NotePropertyName lastAttemptAt -NotePropertyValue (Now-Iso) -Force
+    $cp | Add-Member -NotePropertyName lastError -NotePropertyValue $cpFailure -Force
+    [void]$cpKept.Add(($cp | ConvertTo-Json -Compress -Depth 6))
+    $cpChanged = $true
+    $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "failed: $cpFailure" }
+    if ($cpAttempts -ge 3) {
+      $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and $cpAttempts attempts have not finished it: $cpFailure; finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')), then drop its line from state/sentinel/cleanup-pending.jsonl"; parent = 'dispatcher' }
+    }
+  }
+  if ($cpChanged) {
+    # retire.ps1 appends to this file at any time: re-read it just before writing and keep every line this pass never saw.
+    try { foreach ($cpNow in @(Get-Content -LiteralPath $cleanupPendingPath -Encoding UTF8 | Where-Object { "$_".Trim() })) { if ($cpRawLines -notcontains $cpNow) { [void]$cpKept.Add($cpNow) } } } catch {}
+    if ($cpKept.Count -gt 0) { [IO.File]::WriteAllText($cleanupPendingPath, (($cpKept -join [Environment]::NewLine) + [Environment]::NewLine), $Utf8) }
+    else { Remove-Item -LiteralPath $cleanupPendingPath -Force -ErrorAction SilentlyContinue }
   }
 }
 

@@ -8,13 +8,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const { execFileSync } = require('node:child_process');
 
 const identity = require('../bin/identity');
 const { SESSION_CHECKS } = require('../bin/premises');
 
-function tmp(prefix) { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
+function tmp(prefix) { return makeTempDir(prefix); }
 
 function identityDir({ login = 'endzone-fleet', token = 'ghp_fixture' } = {}) {
   const dir = tmp('fleet-identity-');

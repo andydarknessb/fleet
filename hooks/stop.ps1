@@ -150,8 +150,19 @@ $activeIcs = @()
 if ($roster) { $activeIcs = @($roster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $tenant }) }
 $static = Get-Content "$home_\roster.json" -Raw -Encoding UTF8 | ConvertFrom-Json
 $cap = [int]$static.cap
-$liveRaw = & claude agents --json 2>$null
-$liveNames = @(ConvertFrom-JsonArray $liveRaw | ForEach-Object { $_.name })
+# fleet #265: the claude CLI is resolved by bin\_common.ps1 (override, PATH, known npm paths, waiting out an npm
+# reinstall), never called bare. A missing CLI or a failed read is NOT an empty fleet (capFree would wrongly be
+# the whole cap): stop now, and the next wake re-reads. (Under SilentlyContinue only try/catch sees the throw.)
+# -Strict also rejects exit 0 with empty or unparseable output (an unreadable fleet, not an empty one).
+$liveRows = @()
+try {
+  . "$PSScriptRoot\..\bin\_common.ps1"
+  $liveRows = @(Get-DaemonSessions -Strict -TimeoutSec 20 -Tries 2 -PollMs 2000)
+} catch {
+  $agentsError = ("$($_.Exception.Message)" -replace '\s+', ' ')
+  Stop-Now "claude CLI unavailable (reinstall in progress?): $agentsError"
+}
+$liveNames = @($liveRows | ForEach-Object { $_.name })
 $rosterNames = @($static.sessions | ForEach-Object { $_.name })
 if ($roster) { $rosterNames += @($roster.sessions | Where-Object { $_.status -eq 'active' } | ForEach-Object { $_.name }) }
 $liveFleet = @($liveNames | Where-Object { $rosterNames -contains $_ })

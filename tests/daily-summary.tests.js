@@ -1,15 +1,15 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
 const { formatAge, buildSummary, runDailySummary, waitingRows, cli, exitCodeFor, DAILY_SUMMARY_FLAGS, DailySummaryError } = require('../bin/daily-summary');
 const workState = require('../bin/work-state');
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-daily-summary-'));
+  const root = makeTempDir('fleet-daily-summary-');
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', readyLabel: 'ready-for-agent', defaultBranch: 'integration', releaseBranch: 'main' }));
   return root;

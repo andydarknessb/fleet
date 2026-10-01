@@ -4,8 +4,8 @@
 // Red-tell: before bin/weekly-scorecard.js nothing weekly exists.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
+const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const workState = require('../bin/work-state');
 const { buildScorecard, writeScorecard, parseEscapedFrom, renderScorecard, latestScorecard, headlineOf, cli, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError } = require('../bin/weekly-scorecard');
@@ -14,7 +14,7 @@ const NOW = '2026-09-28T12:40:00.000Z'; // Monday: the week is 2026-09-21..2026-
 const H = (n) => String(n).repeat(40).slice(0, 40);
 
 function rootDir() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fleet-scorecard-'));
+  const root = makeTempDir('fleet-scorecard-');
   for (const dir of ['tenants', 'config', 'state/sentinel/shadow', 'state/verify']) fs.mkdirSync(path.join(root, dir), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'andydarknessb/Endzone-Empire', branchPrefix: 'fleet/' }));
   return root;
@@ -226,6 +226,24 @@ test('#131: a dry run writes nothing under state/ and tells the collector so', (
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: (options) => { seen.push(options.dryRun); return collectorReport(); }, dryRun: true });
   assert.deepEqual(seen, [true]);
   assert.equal(card.artifacts, undefined);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'metrics')), false);
+});
+
+// #278 QA: the real collector (no stub) in a dry run writes to a temp dir and removes it again.
+test('#278: a dry run with the real collector leaves no fleet-scorecard-collector-* in TEMP', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'roster.json'), JSON.stringify({ sessions: [] }));
+  const tmp = makeTempDir('fleet-scorecard-tmp-');
+  const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR, USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME };
+  // TEMP is where the collector dir lands; the home dir is emptied so no real transcripts are read.
+  Object.assign(process.env, { TEMP: tmp, TMP: tmp, TMPDIR: tmp, USERPROFILE: tmp, HOME: tmp });
+  try {
+    buildScorecard({ root, now: NOW, gh: ghStub().gh, dryRun: true });
+  } finally {
+    for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  }
+  assert.deepEqual(fs.readdirSync(tmp).filter((name) => name.startsWith('fleet-scorecard-collector-')), []);
   assert.equal(fs.existsSync(path.join(root, 'state', 'metrics')), false);
 });
 
