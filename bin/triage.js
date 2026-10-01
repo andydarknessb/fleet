@@ -560,6 +560,17 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       continue;
     }
 
+    // 2b. (#263) An open proposal whose marker is gone is still awaiting the owner's Approval: Cory
+    // swapped the marker for a hold such as haiku-rehearsal, or removed it. It is not a fresh
+    // candidate: served as a ticket, `record --kind proposed` is refused with TRIAGE_PROPOSAL_OPEN
+    // and the Stop hook loops. As under the marker, a changed body or the owner's Re-propose reopens it.
+    if (proposed) {
+      if (issue.bodyHash !== proposed.bodyHash) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'body changed since the proposal' }); continue; }
+      if (ownerAsksAgain) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
+      skipped.push({ number: issue.number, reason: `proposed ${proposed.at}, awaiting approval (${marker} replaced by ${labels.size ? [...labels].join(', ') : 'no label'}) until Cory comments Approved or Re-propose, or the body changes` });
+      continue;
+    }
+
     // 3. A fresh candidate: unrouted or carrying a triage label.
     if (!hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
     // Settled at this body: the triage is done, and a label the owner moves it to
@@ -604,7 +615,17 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // the issue is closed or absent) so the Principal copies the hash into
     // `record --kind proposed` instead of hashing the body by hand and mismatching.
     const issue = issueByNumber.get(Number(parsed.issue)) || null;
-    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, reason: 'decision-needed wake newer than the consumed marker' });
+    // #268: an escalation is a decision the Principal must see, served even when the issue has an open
+    // proposal. `record --kind proposed` would be refused with TRIAGE_PROPOSAL_OPEN, so the item carries
+    // the proposal it replaces and the Principal records `superseded` first. A proposal made AFTER the
+    // wake and recorded against it (the recordId is per issue, so the time decides) already answers it:
+    // the item says `answered` and the Principal only records `consumed`.
+    const openRow = projection.byIssue[parsed.issue] || null;
+    const open = openRow && openRow.proposed && !openRow.outcome ? openRow.proposed : null;
+    const answers = open && String(open.at) > String(record.at) && open.recordId && open.recordId === String(record.recordId);
+    const openProposal = open && !answers ? { commentUrl: open.commentUrl || null, bodyHash: open.bodyHash || null, at: open.at } : null;
+    const answered = answers ? { commentUrl: open.commentUrl || null, at: open.at } : null;
+    if (!previous || String(record.at) > String(previous.at)) escalations.set(record.recordId, { kind: 'escalation', recordId: String(record.recordId), number: parsed.issue, at: String(record.at), evidence: String(record.evidence || ''), escalationReason: record.reason ? String(record.reason) : null, premise: record.premise ? String(record.premise) : null, bodyHash: issue ? issue.bodyHash : null, title: issue ? issue.title : null, url: issue ? issue.url : null, ...(openProposal ? { openProposal } : {}), ...(answered ? { answered } : {}), reason: 'decision-needed wake newer than the consumed marker' });
   }
 
   // Spec fleet #92 (#143): the backfill census. Open issues carrying the ready
@@ -621,6 +642,9 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   approvals.sort((left, right) => left.at.localeCompare(right.at));
   vetoes.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
+  // #268: an escalation carries the issue's proposal context, so a ticket or reproposal for the same issue is not also served.
+  const escalated = new Set(escalationList.map((item) => Number(item.number)));
+  for (let index = tickets.length - 1; index >= 0; index -= 1) if (escalated.has(Number(tickets[index].number))) tickets.splice(index, 1);
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
