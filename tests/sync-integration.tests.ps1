@@ -228,7 +228,7 @@ try {
     # owner/repo so the mock's PR url matches. $HookStderr, when given, is what the remote's
     # pre-receive says when it refuses; every push attempt it sees appends a line to
     # <dir>\hook-attempts.log.
-    param([string]$Name, [string]$HookStderr)
+    param([string]$Name, [string]$HookStderr, [string]$ReviewStatus)
     $dir = Join-Path $ghDirRoot $Name
     [IO.Directory]::CreateDirectory($dir) | Out-Null
     $remote = "$testRoot\remote-$Name.git"; $repo = "$testRoot\repo-$Name"
@@ -245,9 +245,11 @@ try {
     if ($HookStderr) {
       [IO.Directory]::CreateDirectory("$remote\hooks") | Out-Null
       $logPath = ("$dir\hook-attempts.log").Replace('\', '/')
-      Write-Utf8 "$remote\hooks\pre-receive" ("#!/bin/sh`necho attempt >> `"$logPath`"`necho `"remote: error: GH013: Repository rule violations found for refs/heads/main.`" 1>&2`necho `"remote: $HookStderr`" 1>&2`nexit 1`n")
+      Write-Utf8 "$remote\hooks\pre-receive" ("#!/bin/sh`necho attempt >> `"$logPath`"`necho `"remote: error: GH013: Repository rule violations found for refs/heads/main.`" 1>&2`necho 'remote: $HookStderr' 1>&2`nexit 1`n")
     }
-    Write-Utf8 "$testRoot\tenants\$Name.json" (@{ name = $Name; repo = $repo; github = 'owner/repo'; defaultBranch = 'main'; releaseBranch = 'integration' } | ConvertTo-Json -Compress)
+    $tenantObj = [ordered]@{ name = $Name; repo = $repo; github = 'owner/repo'; defaultBranch = 'main'; releaseBranch = 'integration' }
+    if ($ReviewStatus) { $tenantObj.reviewStatus = $ReviewStatus }
+    Write-Utf8 "$testRoot\tenants\$Name.json" ($tenantObj | ConvertTo-Json -Compress)
     return [pscustomobject]@{ dir = $dir; repo = $repo; sha = (Invoke-Git @('-C', $repo, 'rev-parse', 'integration')).Trim() }
   }
   function Set-MockApi {
@@ -260,6 +262,13 @@ try {
   $rulesThree = '[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"test-build"},{"context":"guards"},{"context":"fleet-review"}]}}]'
   $noRuns = '{"total_count":0,"check_runs":[]}'
   function Get-LineCount { param([string]$Path) if (Test-Path $Path) { @(Get-Content $Path | Where-Object { "$_".Trim() }).Count } else { 0 } }
+  function Set-MemoSince {
+    # Backdates the sync-waiting memo so a run sees the sha as having waited $Minutes already.
+    param([int]$Minutes)
+    $m = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+    $m.since = (Get-Date).ToUniversalTime().AddMinutes(-$Minutes).ToString('o')
+    Write-Utf8 "$testRoot\state\sentinel\sync-last.json" ($m | ConvertTo-Json -Compress)
+  }
   $env:PATH = "$testRoot\mock-bin-ff;$oldPath"
 
   # --- F1 (RED A): the required test-build is pending on the tip. No push is attempted at all;
@@ -273,6 +282,20 @@ try {
   Assert-True ($ra.synced -eq $false -and $ra.kind -eq 'sync-waiting' -and $ra.escalate -eq $false) "a pending required check must report sync-waiting without escalating (got $($ra | ConvertTo-Json -Compress))"
   Assert-True (@($ra.waitingOn) -contains 'test-build') 'the result must name the pending context'
   Assert-True ("$($ra.to)" -and $f1.sha.StartsWith("$($ra.to)")) 'the result must carry the target sha'
+  # Waiting has a ceiling: the memo remembers when this sha first waited, and past the stall limit
+  # (default 120 min) the same pending check escalates as sync-stalled (still no push).
+  $memoW = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
+  Assert-True ($memoW.kind -eq 'sync-waiting' -and $memoW.tenant -eq 'f1' -and $memoW.sha -eq $f1.sha -and "$($memoW.since)") "the waiting memo must record tenant, sha, kind and since (got $($memoW | ConvertTo-Json -Compress))"
+  $ra2 = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($script:lastExit -eq 0 -and $ra2.kind -eq 'sync-waiting' -and $ra2.escalate -eq $false) 'a second tick inside the limit is still a quiet wait'
+  Set-MemoSince 119
+  $rs0 = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($script:lastExit -eq 0 -and $rs0.kind -eq 'sync-waiting') 'waiting 119 minutes is still under the limit'
+  Set-MemoSince 121
+  $rs = Run-Sync @('-Tenant', 'f1', '-Apply')
+  Assert-True ($script:lastExit -eq 2) "a sha that has waited past the limit must exit 2 (got $($script:lastExit): $rs)"
+  Assert-True ($rs.synced -eq $false -and $rs.kind -eq 'sync-stalled' -and $rs.escalate -eq $true -and @($rs.waitingOn) -contains 'test-build') "a stalled wait must escalate as sync-stalled (got $($rs | ConvertTo-Json -Compress))"
+  Assert-True (-not (Test-Path "$($f1.dir)\hook-attempts.log")) 'a stalled pre-check wait still never pushes'
 
   # --- F2 (RED B): the rules and status lookups both fail (unknown); the push is tried, and the
   # --- remote says a check is in progress. Classified by text: sync-waiting, no escalation, exit 0.
@@ -295,10 +318,12 @@ try {
   Assert-True ("$($rc.prUrl)" -eq 'https://github.com/owner/repo/pull/501') 'the escalation must carry the reconciliation PR url'
   Assert-True ("$($rc.reason)" -match ('review-policy\.js attest --tenant f3 --pr 501 --head ' + $f3.sha)) 'the reason must carry the attest command for the PR and the tip sha'
   Assert-True ("$($rc.reason)" -match 'MERGE COMMIT') 'the reason must name the merge-commit alternative'
+  Assert-True ("$($rc.reason)".Length -le 280 -and "$($rc.reason)".IndexOf('MERGE COMMIT') -lt "$($rc.reason)".IndexOf('review-policy.js')) "the reason must fit the Watchdog's 300-character body with the merge alternative first (len $("$($rc.reason)".Length))"
   Assert-True ((Get-LineCount "$($f3.dir)\hook-attempts.log") -eq 1) 'the first tick pushes once'
   Assert-True ((Get-LineCount "$($f3.dir)\pr-create-calls.log") -eq 1) 'exactly one reconciliation PR is created'
   $memo = Get-Content "$testRoot\state\sentinel\sync-last.json" -Raw | ConvertFrom-Json
   Assert-True ("$($memo.sha)" -eq $f3.sha -and "$($memo.kind)" -eq 'sync-unattested' -and $memo.statusCount -eq 1 -and $memo.checkRunCount -eq 0 -and "$($memo.at)") "the evidence memo must record sha, kind, counts and time (got $($memo | ConvertTo-Json -Compress))"
+  Assert-True ("$($memo.contexts)" -eq 'fleet-review,test-build') "the memo key must include the required contexts (got $($memo.contexts))"
 
   # --- F4 (RED D): the same sha with the same counts is not pushed again; same JSON, same PR,
   # --- still one `pr create`.
@@ -311,6 +336,12 @@ try {
   Set-MockApi $f3 $rulesTwo '{"state":"success","total_count":2,"statuses":[{"context":"test-build","state":"success"},{"context":"fleet-review","state":"success"}]}' $noRuns
   $null = Run-Sync @('-Tenant', 'f3', '-Apply')
   Assert-True ((Get-LineCount "$($f3.dir)\hook-attempts.log") -eq 2) 'a changed status count must push again'
+  # The required contexts are part of the memo key: the same sha and counts under a changed ruleset pushes again.
+  $null = Run-Sync @('-Tenant', 'f3', '-Apply')
+  Assert-True ((Get-LineCount "$($f3.dir)\hook-attempts.log") -eq 2) 'the re-memoized tip with unchanged counts and contexts is not pushed'
+  Set-MockApi $f3 $rulesThree '{"state":"success","total_count":2,"statuses":[{"context":"test-build","state":"success"},{"context":"fleet-review","state":"success"}]}' '{"total_count":1,"check_runs":[{"id":1,"name":"guards","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"}]}'
+  $null = Run-Sync @('-Tenant', 'f3', '-Apply')
+  Assert-True ((Get-LineCount "$($f3.dir)\hook-attempts.log") -eq 3) 'a changed required-contexts list must push again'
 
   # --- F5 (RED E): guards failed on the tip: nothing is pushed; sync-blocked escalates, naming it.
   $f5 = New-FfFixture 'f5' 'Required status check "fleet-review" is expected.'
@@ -333,24 +364,73 @@ try {
   $rg = Run-Sync @('-Tenant', 'f6', '-Apply')
   Assert-True ($script:lastExit -eq 0 -and $rg.synced -eq $true) "an absent fleet-review with the rest green must still push (got $($rg | ConvertTo-Json -Compress))"
 
+  # --- F6b: an unrecognised check-run conclusion is not "pending" (it would wait forever): the context
+  # --- reads as unknown/absent and the push goes ahead.
+  $f6b = New-FfFixture 'f6b'
+  Set-MockApi $f6b $rulesThree '{"state":"success","total_count":2,"statuses":[{"context":"test-build","state":"success"},{"context":"fleet-review","state":"success"}]}' '{"total_count":1,"check_runs":[{"id":1,"name":"guards","status":"completed","conclusion":"some_future_conclusion","started_at":"2026-09-30T10:00:00Z"}]}'
+  $env:MOCK_GH_DIR = $f6b.dir
+  $rk = Run-Sync @('-Tenant', 'f6b', '-Apply')
+  Assert-True ($rk.kind -ne 'sync-waiting' -and $rk.synced -eq $true) "an unrecognised conclusion must not read as pending (got $($rk | ConvertTo-Json -Compress))"
+  # --- F6c: the live duplicate-suite shape. A superseded suite leaves a cancelled run under the same name
+  # --- as the newer green one; only the newest run per name (started_at, then id) counts. Context
+  # --- spelling is shared with a status of the same name: worst wins between those two only.
+  $dupRuns = '{"total_count":5,"check_runs":[' +
+    '{"id":901,"name":"test-build","status":"completed","conclusion":"cancelled","started_at":"2026-09-30T10:00:00Z"},' +
+    '{"id":902,"name":"test-build","status":"completed","conclusion":"success","started_at":"2026-09-30T10:05:00Z"},' +
+    '{"id":911,"name":"guards","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"},' +
+    '{"id":913,"name":"guards","status":"completed","conclusion":"cancelled","started_at":"2026-09-30T10:00:00Z"},' +
+    '{"id":912,"name":"guards","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"}]}'
+  $f6c = New-FfFixture 'f6c'
+  Set-MockApi $f6c $rulesThree '{"state":"success","total_count":1,"statuses":[{"context":"fleet-review","state":"success"}]}' $dupRuns
+  $env:MOCK_GH_DIR = $f6c.dir
+  $rl = Run-Sync @('-Tenant', 'f6c', '-Apply')
+  Assert-True ($rl.kind -eq 'sync-blocked' -and @($rl.failedChecks) -contains 'guards' -and @($rl.failedChecks) -notcontains 'test-build') "same started_at: the higher run id (a cancelled 913) is the newest; the older cancelled test-build run is not (got $($rl | ConvertTo-Json -Compress))"
+  $dupRuns2 = $dupRuns.Replace('"id":913,"name":"guards","status":"completed","conclusion":"cancelled"', '"id":910,"name":"guards","status":"completed","conclusion":"cancelled"')
+  Set-MockApi $f6c $rulesThree '{"state":"success","total_count":1,"statuses":[{"context":"fleet-review","state":"success"}]}' $dupRuns2
+  $rl2 = Run-Sync @('-Tenant', 'f6c', '-Apply')
+  Assert-True ($rl2.synced -eq $true) "an older cancelled run under a newer green one must not block (got $($rl2 | ConvertTo-Json -Compress))"
+  $f6d = New-FfFixture 'f6d'
+  Set-MockApi $f6d $rulesTwo '{"state":"failure","total_count":1,"statuses":[{"context":"test-build","state":"failure"}]}' '{"total_count":1,"check_runs":[{"id":1,"name":"test-build","status":"completed","conclusion":"success","started_at":"2026-09-30T10:00:00Z"}]}'
+  $env:MOCK_GH_DIR = $f6d.dir
+  $rm = Run-Sync @('-Tenant', 'f6d', '-Apply')
+  Assert-True ($rm.kind -eq 'sync-blocked' -and @($rm.failedChecks) -contains 'test-build') 'a status and a run sharing a name: the worse (failed status) wins'
+
   # --- F7: a refusal that is neither pending nor expected stays sync-refused (high, unchanged).
   $f7 = New-FfFixture 'f7' 'Cannot update this protected ref.'
   Set-MockApi $f7 $null $null $null
   $env:MOCK_GH_DIR = $f7.dir
   $rh = Run-Sync @('-Tenant', 'f7', '-Apply')
   Assert-True ($script:lastExit -eq 2 -and $rh.kind -eq 'sync-refused' -and $rh.escalate -eq $true -and "$($rh.pushError)" -match 'protected ref') "an unexplained refusal must stay sync-refused (got $($rh | ConvertTo-Json -Compress))"
-  # F8/F9: a bare "have not succeeded" naming only an expected check is unattested, not waiting;
-  # one that also names checks in progress waits (the pending check decides the next tick).
-  $f8 = New-FfFixture 'f8' '1 of 7 required status checks have not succeeded: fleet-review is expected.'
+  # F8: GitHub's real wording when the rule suite is not done: `N of 7 required status checks have not
+  # succeeded: 1 expected.` names no context. With unknown lookups that reads as waiting (chosen: the
+  # stall ceiling catches one that never settles), not as an unattested tip.
+  $f8 = New-FfFixture 'f8' '- 4 of 7 required status checks have not succeeded: 1 expected.'
   Set-MockApi $f8 $null $null $null
   $env:MOCK_GH_DIR = $f8.dir
   $ri = Run-Sync @('-Tenant', 'f8', '-Apply')
-  Assert-True ($ri.kind -eq 'sync-unattested') "a have-not-succeeded refusal naming only an expected check is unattested (got $($ri | ConvertTo-Json -Compress))"
-  $f9 = New-FfFixture 'f9' '3 of 7 required status checks have not succeeded: 2 are in progress and 1 is expected.'
-  Set-MockApi $f9 $null $null $null
-  $env:MOCK_GH_DIR = $f9.dir
-  $rj = Run-Sync @('-Tenant', 'f9', '-Apply')
-  Assert-True ($rj.kind -eq 'sync-waiting' -and $rj.escalate -eq $false -and $script:lastExit -eq 0) "a refusal with checks in progress waits (got $($rj | ConvertTo-Json -Compress))"
+  Assert-True ($ri.kind -eq 'sync-waiting' -and $ri.escalate -eq $false -and $script:lastExit -eq 0) "the real N-of-7 wording waits (got $($ri | ConvertTo-Json -Compress))"
+  # F9: the refusal-text waiting path has the same ceiling.
+  Set-MemoSince 121
+  $rj = Run-Sync @('-Tenant', 'f8', '-Apply')
+  Assert-True ($script:lastExit -eq 2 -and $rj.kind -eq 'sync-stalled' -and $rj.escalate -eq $true) "a refusal-text wait past the limit escalates as sync-stalled (got $($rj | ConvertTo-Json -Compress))"
+  Assert-True ((Get-LineCount "$($f8.dir)\hook-attempts.log") -eq 2) 'the refusal-text path pushes each tick (it has no pre-check evidence)'
+  # F10: an expected context that is NOT the review status is not an unattested tip.
+  $f10 = New-FfFixture 'f10' 'Required status check "test-build" is expected.'
+  Set-MockApi $f10 $null $null $null
+  $env:MOCK_GH_DIR = $f10.dir
+  $rn = Run-Sync @('-Tenant', 'f10', '-Apply')
+  Assert-True ($script:lastExit -eq 2 -and $rn.kind -eq 'sync-refused' -and $rn.escalate -eq $true) "an expected non-review context stays sync-refused (got $($rn | ConvertTo-Json -Compress))"
+  # F11: the review context is the tenant's reviewStatus, not a hardcoded name.
+  $f11 = New-FfFixture 'f11' 'Required status check "ci/review" is expected.' 'ci/review'
+  Set-MockApi $f11 $null $null $null
+  $env:MOCK_GH_DIR = $f11.dir
+  $ro = Run-Sync @('-Tenant', 'f11', '-Apply')
+  Assert-True ($ro.kind -eq 'sync-unattested' -and "$($ro.reason)" -match 'lacks ci/review') "the tenant's reviewStatus names the unattested context (got $($ro | ConvertTo-Json -Compress))"
+  $f12 = New-FfFixture 'f12' 'Required status check "fleet-review" is expected.' 'ci/review'
+  Set-MockApi $f12 $null $null $null
+  $env:MOCK_GH_DIR = $f12.dir
+  $rp = Run-Sync @('-Tenant', 'f12', '-Apply')
+  Assert-True ($rp.kind -eq 'sync-refused') 'with a different reviewStatus, fleet-review being expected is not the review context'
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   Remove-Item Env:MOCK_GH_DIR -ErrorAction SilentlyContinue
 

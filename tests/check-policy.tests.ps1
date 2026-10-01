@@ -73,6 +73,7 @@ $strPri = @(Get-PagesPriorityFindings ([pscustomobject]@{ priority = 'high' }))
 Assert-True ($strPri.Count -eq 1 -and $strPri[0].Key -eq 'pages.priority' -and $strPri[0].Value -eq 'high') 'a pages.priority that is not a map is reported as pages.priority itself'
 
 # fleet #274: pages.minAgeMinutes.<kind> must be a number of minutes, 0 or more.
+Assert-Count @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = [decimal]60.5 } })) 0 'a decimal number of minutes is not a finding'
 Assert-Count @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = 60; 'x' = 0 } })) 0 'a non-negative number of minutes is not a finding'
 $badAge = @(Get-PagesPriorityFindings ([pscustomobject]@{ minAgeMinutes = [pscustomobject]@{ 'sync-unattested' = 'soon'; 'sync-blocked' = -5 } }))
 Assert-Count $badAge 2 'a string and a negative number are each a finding'

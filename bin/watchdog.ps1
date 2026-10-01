@@ -122,13 +122,14 @@ try {
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
   # fleet #274: sync-unattested (a release tip that only lacks the fleet-review status; normal, and held
   # back by pages.minAgeMinutes until it has stood 60 min) and sync-blocked (a required check failed on the
-  # release tip; high). sync-refused now means an unexplained refusal and stays high.
+  # release tip; high), sync-stalled (one sha waited on checks past watchdog.syncStallMinutes; normal).
+  # sync-refused now means an unexplained refusal and stays high.
   # fleet #232: config-invalid (a pages.priority value that is not emergency|high|normal) is normal;
   # a bad priority is reported, never paged louder than the thing it broke.
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
   # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -189,7 +190,7 @@ try {
   $script:DefaultPageMinAge = @{ 'sync-unattested' = 60 }
   function Test-PageMinAgeValue {
     param($Value)
-    return (($Value -is [int] -or $Value -is [long] -or $Value -is [double]) -and $Value -ge 0)
+    return (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -ge 0)
   }
   function Get-PageMinAgeMinutes {
     param([string]$Kind, $PagesConfig)
@@ -459,7 +460,7 @@ try {
   # so a bare fixture with no config/cycle.json supervisor.pageKinds override
   # still pages a refused push, the same reasoning ticket 77's Get-PagePriority
   # default already documents for its own hardcoded map.
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'sync-unattested', 'sync-blocked', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded')
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'sync-unattested', 'sync-blocked', 'sync-stalled', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
@@ -1248,7 +1249,7 @@ try {
   if ($mode -eq 'live' -and $check) {
     foreach ($e in @($check.escalate)) {
       if ($pageKinds -notcontains "$($e.kind)") { continue }
-      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; kind = "$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e; url = $null }
+      $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; kind = "$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e; url = $(if ($e.PSObject.Properties['url'] -and $e.url) { "$($e.url)" } else { $null }) }
     }
   }
   foreach ($pw in $permissionWaits) {
@@ -1459,6 +1460,7 @@ try {
       url = $url
     }
     if ($c.key -eq 'fleet-dead') { $entryObj | Add-Member -NotePropertyName repeatedAt -NotePropertyValue $repeatedAt -Force }
+    if ($prevEntry -and $prevEntry.PSObject.Properties['escalationFiledAt']) { $entryObj | Add-Member -NotePropertyName escalationFiledAt -NotePropertyValue $prevEntry.escalationFiledAt -Force }
     $nextPaged | Add-Member -NotePropertyName $c.key -NotePropertyValue $entryObj
   }
 
@@ -1495,12 +1497,33 @@ try {
       $isNew = ($oldKeys -notcontains $c.key)
       $entry = $nextPaged.($c.key)
 
-      if ($isNew -and $c.PSObject.Properties['escalation'] -and $c.escalation) {
+      # fleet #274: pages.minAgeMinutes - inside the grace the condition stands (banner, conditions, the
+      # carried-forward entry above) but nothing is sent and no attempt is counted; an unreadable
+      # firstSeen fails toward paging.
+      $inPageGrace = $false
+      $pageMinAge = Get-PageMinAgeMinutes -Kind "$($c.kind)" -PagesConfig $pagesConfig
+      if ($pageMinAge -gt 0) {
+        $firstSeenUtc = ConvertTo-UtcDateTime $entry.firstSeen
+        if ($firstSeenUtc -and (New-TimeSpan -Start $firstSeenUtc -End $now).TotalMinutes -lt $pageMinAge) { $inPageGrace = $true }
+      }
+
+      # The escalation file is what the dispatcher's reader relays, so a kind with a grace files it when
+      # its page is first actually sent (escalationFiledAt in the entry), not on first sight: a flap that
+      # clears inside the grace leaves no file, and the reader cannot page ahead of the grace. Every
+      # other kind files on first sight, as before.
+      $fileEscalation = $false
+      if ($c.PSObject.Properties['escalation'] -and $c.escalation) {
+        if ($pageMinAge -gt 0) { $fileEscalation = (-not $inPageGrace) -and (-not $entry.PSObject.Properties['escalationFiledAt']) }
+        else { $fileEscalation = $isNew }
+      }
+      if ($fileEscalation) {
         $e = $c.escalation
         $parentName = ''; if ($e.PSObject.Properties['parent']) { $parentName = "$($e.parent)" }
         $escFile = Write-Escalation -From 'supervisor' -Kind "$($e.kind)" -Detail "$($e.detail)" -Name "$($e.name)" -Parent $parentName
-        if ($escFile) { $entry.url = "$escFile" }
+        # A condition that carries its own link (an unattested tip's reconciliation PR) keeps it.
+        if ($escFile -and -not ($c.PSObject.Properties['url'] -and $c.url)) { $entry.url = "$escFile" }
         $notified += [pscustomobject]@{ name = "$($e.name)"; kind = "$($e.kind)"; parent = $parentName; toastDelivered = $null }
+        if ($pageMinAge -gt 0) { $entry | Add-Member -NotePropertyName escalationFiledAt -NotePropertyValue (Now-Iso) -Force }
       }
       if (-not $entry.url -and $c.PSObject.Properties['url'] -and $c.url) { $entry.url = "$($c.url)" }
 
@@ -1521,15 +1544,6 @@ try {
       }
 
       $deliveredThisTick = $false   # #197: a page delivered in THIS tick has no repeat clock to run yet
-      # fleet #274: pages.minAgeMinutes - inside the grace the condition stands (banner, conditions, the
-      # carried-forward entry above) but nothing is sent and no attempt is counted; an unreadable
-      # firstSeen fails toward paging.
-      $inPageGrace = $false
-      $pageMinAge = Get-PageMinAgeMinutes -Kind "$($c.kind)" -PagesConfig $pagesConfig
-      if ($pageMinAge -gt 0) {
-        $firstSeenUtc = ConvertTo-UtcDateTime $entry.firstSeen
-        if ($firstSeenUtc -and (New-TimeSpan -Start $firstSeenUtc -End $now).TotalMinutes -lt $pageMinAge) { $inPageGrace = $true }
-      }
       if (-not $entry.deliveredAt -and -not $entry.gaveUpAt -and -not $inPageGrace) {
         $priority = Get-PagePriority -Kind "$($c.kind)" -PagesConfig $pagesConfig
         $pageResult = Send-FleetPage -Kind "$($c.kind)" -Title 'Fleet watchdog' -Body "$($c.detail)" -Priority $priority -Url $entry.url -Detail ([pscustomobject]@{ key = $c.key }) -NoToast:$NoToast

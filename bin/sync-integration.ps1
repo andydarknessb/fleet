@@ -106,7 +106,9 @@ function ConvertTo-CheckClass {
     switch ($Conclusion) {
       { $_ -in 'success', 'neutral', 'skipped' } { return 'success' }
       { $_ -in 'failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale' } { return 'failed' }
-      default { return 'pending' }
+      # A conclusion this does not know is unknown (the context reads as absent and the ruleset decides),
+      # never "still running": a pending reading would wait on a completed run indefinitely.
+      default { return $null }
     }
   }
   if ($State -in 'queued', 'in_progress', 'waiting', 'requested', 'pending') { return 'pending' }
@@ -131,25 +133,94 @@ function Get-CommitCheckState {
   $statuses = @($st.data.statuses | Where-Object { $null -ne $_ })
   $runs = @($cr.data.check_runs | Where-Object { $null -ne $_ })
   foreach ($s in $statuses) { & $add "$($s.context)" (ConvertTo-CheckClass -Kind 'status' -State "$($s.state)") }
-  foreach ($r in $runs) { & $add "$($r.name)" (ConvertTo-CheckClass -Kind 'run' -State "$($r.status)" -Conclusion "$($r.conclusion)") }
+  # Reruns and superseded suites leave several runs under one name: only the newest (started_at, then id)
+  # speaks for it, or a cancelled older run reads as a red check. Worst-wins applies only between a status
+  # context and the newest run that share a name.
+  $newest = @{}
+  foreach ($r in $runs) {
+    $name = "$($r.name)"
+    if (-not $name) { continue }
+    $startedAt = "$($r.started_at)"; $runId = 0L; try { $runId = [long]$r.id } catch {}
+    $cur = $newest[$name]
+    if ($null -eq $cur -or [string]::CompareOrdinal($startedAt, $cur.startedAt) -gt 0 -or ($startedAt -eq $cur.startedAt -and $runId -gt $cur.id)) {
+      $newest[$name] = [pscustomobject]@{ startedAt = $startedAt; id = $runId; run = $r }
+    }
+  }
+  foreach ($name in $newest.Keys) { $r = $newest[$name].run; & $add $name (ConvertTo-CheckClass -Kind 'run' -State "$($r.status)" -Conclusion "$($r.conclusion)") }
   return [pscustomobject]@{ status = 'ok'; classes = $seen; statusCount = $statuses.Count; checkRunCount = $runs.Count }
 }
 
 function Get-RefusalKind {
-  # Classifies a refused push by git's text. Checks in progress or pending win (the next tick sees
-  # the settled state); an expected context with nothing running is an unattested tip; a bare
-  # "have not succeeded" is waiting; anything else is an unexplained refusal.
-  param([string]$Text)
+  # Classifies a refused push by git's text. Checks in progress or pending win (the next tick sees the
+  # settled state). `Required status check "<name>" is expected` is an unattested tip only when <name> is
+  # the tenant's review status context ($ReviewContext); any other expected context, or an unnamed one, is
+  # an unexplained refusal. GitHub's `N of 7 required status checks have not succeeded: 1 expected.` names
+  # nothing, so it reads as waiting (the stall ceiling catches one that never settles); anything else is
+  # an unexplained refusal.
+  param([string]$Text, [string]$ReviewContext = 'fleet-review')
   if ($Text -match 'is in progress|are in progress|is pending|are pending') { return 'sync-waiting' }
-  if ($Text -match 'is expected|are expected') { return 'sync-unattested' }
+  $named = @([regex]::Matches($Text, 'Required status check "([^"]+)" is expected'))
+  if ($named.Count -gt 0) {
+    foreach ($m in $named) { if ($m.Groups[1].Value -ne $ReviewContext) { return 'sync-refused' } }
+    return 'sync-unattested'
+  }
+  if ($Text -match 'is expected|are expected') { return 'sync-refused' }
   if ($Text -match 'have not succeeded') { return 'sync-waiting' }
   return 'sync-refused'
+}
+
+function Get-SyncStallMinutes {
+  # config/cycle.json watchdog.syncStallMinutes: how long one sha may sit waiting on checks before it
+  # becomes sync-stalled. Default 120; anything that is not a positive number reads as the default.
+  $minutes = 120
+  try {
+    $w = (Read-Json "$FleetHome\config\cycle.json").watchdog
+    if ($w -and $w.PSObject.Properties['syncStallMinutes']) {
+      $v = $w.syncStallMinutes
+      if (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and $v -gt 0) { $minutes = [double]$v }
+    }
+  } catch {}
+  return $minutes
+}
+
+function Write-SyncMemo {
+  param([string]$Path, $Record)
+  try {
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
+    Write-Json $Path $Record
+  } catch {}
+}
+
+function New-WaitingOutcome {
+  # fleet #274: waiting has a ceiling. The memo remembers when this sha first waited; once it has waited
+  # the stall limit the result escalates as sync-stalled (normal) instead of staying silent for good.
+  param([string]$TenantName, [string]$Def, [string]$Rel, [string]$Sha, [string]$ShortSha, [string[]]$WaitingOn, [string]$PushError, $Memo, [string]$MemoPath)
+  $nowUtc = (Get-Date).ToUniversalTime()
+  $since = $nowUtc
+  if ($Memo -and "$($Memo.tenant)" -eq $TenantName -and "$($Memo.sha)" -eq $Sha -and "$($Memo.kind)" -eq 'sync-waiting') {
+    $parsed = ConvertTo-UtcDateTime "$($Memo.since)"
+    if ($parsed -and $parsed -le $nowUtc) { $since = $parsed }
+  }
+  Write-SyncMemo $MemoPath ([ordered]@{ tenant = $TenantName; sha = $Sha; kind = 'sync-waiting'; since = $since.ToString('o'); at = (Now-Iso) })
+  $ageMinutes = [int][Math]::Floor(($nowUtc - $since).TotalMinutes)
+  $stall = Get-SyncStallMinutes
+  $what = if (@($WaitingOn).Count -gt 0) { "required check(s) still running: $(@($WaitingOn) -join ', ')" } else { "the ruleset is still waiting on checks ($PushError)" }
+  $result = [ordered]@{ synced = $false; escalate = $false; kind = 'sync-waiting'; to = $ShortSha }
+  if (@($WaitingOn).Count -gt 0) { $result.waitingOn = @($WaitingOn) }
+  if ($PushError) { $result.pushError = $PushError }
+  if ($ageMinutes -ge $stall) {
+    $result.escalate = $true; $result.kind = 'sync-stalled'
+    $result.reason = "$Rel tip $ShortSha has waited $ageMinutes min (limit $stall) to fast-forward into ${Def}: $what"
+    return [pscustomobject]@{ result = $result; exit = 2 }
+  }
+  $result.reason = "waiting on $Rel tip ${ShortSha}: $what"
+  return [pscustomobject]@{ result = $result; exit = 0 }
 }
 
 function New-UnattestedResult {
   # The escalation for a tip that only lacks the fleet-review status: reuses the open reconciliation PR
   # (or opens one, once) so the page carries its URL and the command that clears it.
-  param([string]$TenantName, $TenantJson, [string]$Def, [string]$Rel, [string]$Sha, [string]$ShortSha)
+  param([string]$TenantName, $TenantJson, [string]$Def, [string]$Rel, [string]$Sha, [string]$ShortSha, [string]$ReviewContext)
   $result = [ordered]@{ synced = $false; escalate = $true; kind = 'sync-unattested'; to = $ShortSha }
   $lookup = Get-OpenReconciliationPr -Repo $TenantJson.github -Base $Def -Head $Rel
   $pr = $null
@@ -161,14 +232,14 @@ function New-UnattestedResult {
   } else {
     $result.prError = "could not confirm whether a reconciliation PR already exists ($($lookup.error))"
   }
-  $lead = "$Rel tip $ShortSha carries no fleet-review status, which the ruleset on $Def requires"
+  # Short on purpose: the Watchdog's page body is cut at 300 characters, so the action comes first.
   if ($pr -and $pr.url) {
     $prNumber = ''
     if ($pr.PSObject.Properties['number'] -and $pr.number) { $prNumber = "$($pr.number)" } elseif ("$($pr.url)" -match '/pull/(\d+)') { $prNumber = $Matches[1] }
     $result.prUrl = "$($pr.url)"
-    $result.reason = "$lead; reconciliation PR: $($pr.url); attest it: node bin/review-policy.js attest --tenant $TenantName --pr $prNumber --head $Sha --artifact <review.json>, or merge it with a MERGE COMMIT"
+    $result.reason = "$Rel tip $ShortSha lacks ${ReviewContext}: merge $($pr.url) with a MERGE COMMIT, or attest it: node bin/review-policy.js attest --tenant $TenantName --pr $prNumber --head $Sha --artifact <review.json>"
   } else {
-    $result.reason = "$lead; opening the reconciliation PR failed: $($result.prError); once it exists attest its head ($Sha) with node bin/review-policy.js attest --tenant $TenantName, or merge it with a MERGE COMMIT"
+    $result.reason = "$Rel tip $ShortSha lacks ${ReviewContext}: open a PR $Rel into $Def and merge it with a MERGE COMMIT or attest its head (pr create failed: $($result.prError))"
   }
   return $result
 }
@@ -218,6 +289,10 @@ if (-not $Apply) { Write-Output (@{ synced = $false; dryRun = $true; wouldFastFo
 # reason to pre-refuse - a tip has passed the ruleset without one before.
 $tipSha = "$(& git -C $repo rev-parse "origin/$rel" 2>$null)".Trim()
 $tipShort = "$(& git -C $repo rev-parse --short "origin/$rel" 2>$null)".Trim()
+$reviewContext = 'fleet-review'
+if ($t.PSObject.Properties['reviewStatus'] -and "$($t.reviewStatus)".Trim()) { $reviewContext = "$($t.reviewStatus)".Trim() }
+$memoPath = "$FleetHome\state\sentinel\sync-last.json"
+$memo = $null; try { $memo = Read-Json $memoPath } catch {}
 $required = Get-RequiredContexts -Repo $t.github -Branch $def
 $tipState = Get-CommitCheckState -Repo $t.github -Sha $tipSha
 if ($required.status -eq 'ok' -and $tipState.status -eq 'ok') {
@@ -229,23 +304,24 @@ if ($required.status -eq 'ok' -and $tipState.status -eq 'ok') {
     exit 2
   }
   if ($waitingOn.Count -gt 0) {
-    Write-Output ([ordered]@{ synced = $false; escalate = $false; kind = 'sync-waiting'; to = $tipShort; waitingOn = $waitingOn; reason = "waiting on required check(s) still running on $rel tip ${tipShort}: $($waitingOn -join ', ')" } | ConvertTo-Json -Compress)
-    exit 0
+    $waiting = New-WaitingOutcome -TenantName $Tenant -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -WaitingOn $waitingOn -PushError '' -Memo $memo -MemoPath $memoPath
+    Write-Output ($waiting.result | ConvertTo-Json -Compress)
+    exit $waiting.exit
   }
 }
 
 # The evidence memo: an unattested tip stays unattested until something changes on it, so the same sha
-# with the same status and check-run counts is reported again without another push (each refused push
-# is a failed rule suite on the remote). Counts are only known when the status lookups worked; without
-# them, and once the memo is older than the recheck window, the push is tried again.
-$memoPath = "$FleetHome\state\sentinel\sync-last.json"
+# with the same required contexts and the same status and check-run counts is reported again without
+# another push (each refused push is a failed rule suite on the remote). Counts are only known when the
+# status lookups worked; without them, and once the memo is older than the recheck window, the push is
+# tried again. The same file remembers when a sha first waited (sync-waiting, see New-WaitingOutcome).
 $memoRecheckMinutes = 360
-$memo = $null; try { $memo = Read-Json $memoPath } catch {}
-if ($memo -and "$($memo.tenant)" -eq $Tenant -and "$($memo.sha)" -eq $tipSha -and "$($memo.kind)" -eq 'sync-unattested' -and $null -ne $tipState.statusCount -and $null -ne $memo.statusCount -and $null -ne $memo.checkRunCount) {
+$contextsKey = '?'; if ($required.status -eq 'ok') { $contextsKey = (@($required.contexts | Sort-Object) -join ',') }
+if ($memo -and "$($memo.tenant)" -eq $Tenant -and "$($memo.sha)" -eq $tipSha -and "$($memo.kind)" -eq 'sync-unattested' -and "$($memo.contexts)" -eq $contextsKey -and $null -ne $tipState.statusCount -and $null -ne $memo.statusCount -and $null -ne $memo.checkRunCount) {
   $memoAt = ConvertTo-UtcDateTime "$($memo.at)"
   $memoFresh = ($memoAt -and ((Get-Date).ToUniversalTime() - $memoAt).TotalMinutes -lt $memoRecheckMinutes -and ((Get-Date).ToUniversalTime() - $memoAt).TotalMinutes -ge 0)
   if ($memoFresh -and [int]$memo.statusCount -eq $tipState.statusCount -and [int]$memo.checkRunCount -eq $tipState.checkRunCount) {
-    Write-Output ((New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort) | ConvertTo-Json -Compress)
+    Write-Output ((New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -ReviewContext $reviewContext) | ConvertTo-Json -Compress)
     exit 2
   }
 }
@@ -264,18 +340,17 @@ if ($ok) {
   Write-Output (@{ synced = $true; fastForwarded = $ahead; to = (& git -C $repo rev-parse --short "origin/$rel") } | ConvertTo-Json -Compress)
 } else {
   $pushError = (("$pushErrText" -replace '\s+', ' ').Trim())
-  $refusal = Get-RefusalKind $pushError
+  $refusal = Get-RefusalKind $pushError $reviewContext
   if ($refusal -eq 'sync-waiting') {
-    # A check is still running on the tip: the ruleset will say yes on a later tick. Not a page.
-    Write-Output ([ordered]@{ synced = $false; escalate = $false; kind = 'sync-waiting'; to = $tipShort; pushError = $pushError } | ConvertTo-Json -Compress)
-    exit 0
+    # A check is still running on the tip: the ruleset will say yes on a later tick. Not a page, until
+    # the same sha has waited past the stall limit.
+    $waiting = New-WaitingOutcome -TenantName $Tenant -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -WaitingOn @() -PushError $pushError -Memo $memo -MemoPath $memoPath
+    Write-Output ($waiting.result | ConvertTo-Json -Compress)
+    exit $waiting.exit
   }
   if ($refusal -eq 'sync-unattested') {
-    $unattested = New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort
-    try {
-      [IO.Directory]::CreateDirectory((Split-Path -Parent $memoPath)) | Out-Null
-      Write-Json $memoPath ([ordered]@{ tenant = $Tenant; sha = $tipSha; kind = 'sync-unattested'; statusCount = $tipState.statusCount; checkRunCount = $tipState.checkRunCount; at = (Now-Iso) })
-    } catch {}
+    $unattested = New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -ReviewContext $reviewContext
+    Write-SyncMemo $memoPath ([ordered]@{ tenant = $Tenant; sha = $tipSha; kind = 'sync-unattested'; contexts = $contextsKey; statusCount = $tipState.statusCount; checkRunCount = $tipState.checkRunCount; at = (Now-Iso) })
     Write-Output ($unattested | ConvertTo-Json -Compress)
     exit 2
   }

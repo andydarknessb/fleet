@@ -838,6 +838,8 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
         elseif ($res.PSObject.Properties['prUrl'] -and $res.prUrl) { "$($res.prUrl)" }
         else { "$syncKind for tenant $($t.name) (no further detail reported)" }
       $report.escalate += [pscustomobject]@{ name = "pl-$($t.name)"; kind = $syncKind; detail = $syncDetail; parent = 'dispatcher' }
+      # fleet #274: an unattested tip's page links its reconciliation PR (the Watchdog reads `url`).
+      if ($syncKind -eq 'sync-unattested' -and $res.PSObject.Properties['prUrl'] -and $res.prUrl) { $report.escalate[-1] | Add-Member -NotePropertyName url -NotePropertyValue "$($res.prUrl)" -Force }
     }
   }
 }

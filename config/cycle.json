@@ -72,7 +72,8 @@
     "watchFailTicks": 3,
     "deadBeforeAckMinutes": 60,
     "deadBeforeAckMaxPerTick": 2,
-    "strandedReservationHours": 6
+    "strandedReservationHours": 6,
+    "syncStallMinutes": 120
   },
   "pages": {
     "priority": {
@@ -84,6 +85,7 @@
       "branch-diverged": "high",
       "sync-refused": "high",
       "sync-unattested": "normal",
+      "sync-stalled": "normal",
       "sync-blocked": "high",
       "watcher-stale": "high",
       "state-escalated": "normal",
@@ -106,7 +108,7 @@
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "sync-stalled", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded"]
   },
   "assignment": {
     "parityEvaluations": 20,

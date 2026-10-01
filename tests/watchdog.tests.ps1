@@ -2295,7 +2295,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $key274 = 'escalation:pl-test:sync-unattested'
   $pushLog274 = Join-Path $testRoot 'pushover-requests-274.log'
   [IO.File]::WriteAllText($pushLog274, '')
-  $pushMock274 = Start-MockPushover -LogPath $pushLog274 -Count 4
+  $pushMock274 = Start-MockPushover -LogPath $pushLog274 -Count 6
   $oldPushoverUrl274 = $env:FLEET_PUSHOVER_URL
   $env:FLEET_PUSHOVER_URL = $pushMock274.Prefix
   [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
@@ -2304,9 +2304,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   function Set-ReleaseBranch274 { param([string]$Branch)
     (Get-Content "$testRoot\tenants\test.json" -Raw | ConvertFrom-Json) | ForEach-Object { $_ | Add-Member -NotePropertyName releaseBranch -NotePropertyValue $Branch -Force; $_ | ConvertTo-Json -Compress } | Set-Content "$testRoot\tenants\test.json" -Encoding UTF8
   }
-  function Set-SyncStub274 { param([string]$Kind, [string]$Reason)
-    Write-Utf8 "$testRoot\bin\sync-integration.ps1" ('param([string]$Tenant,[switch]$Apply)' + "`r`n" + 'Write-Output (@{ synced = $false; escalate = $true; kind = "' + $Kind + '"; reason = "' + $Reason + '" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 2' + "`r`n")
+  function Set-SyncStub274 { param([string]$Kind, [string]$Reason, [string]$PrUrl)
+    $prPart = ''; if ($PrUrl) { $prPart = '; prUrl = "' + $PrUrl + '"' }
+    Write-Utf8 "$testRoot\bin\sync-integration.ps1" ('param([string]$Tenant,[switch]$Apply)' + "`r`n" + 'Write-Output (@{ synced = $false; escalate = $true; kind = "' + $Kind + '"; reason = "' + $Reason + '"' + $prPart + ' } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 2' + "`r`n")
   }
+  function Get-EscalationFileCount274 { @(Get-ChildItem "$testRoot\state\escalations" -Filter *.json -ErrorAction SilentlyContinue).Count }
   function Set-PagedSeen274 { param([string]$Key, [int]$MinutesAgo)
     $seen = (Get-Date).ToUniversalTime().AddMinutes(-$MinutesAgo).ToString('o')
     $entry = [ordered]@{ firstSeen = $seen; lastSeen = $seen; detail = 'seeded'; deliveredAt = $null; attempts = 0; lastAttemptAt = $null; lastError = $null; gaveUpAt = $null; url = $null }
@@ -2322,7 +2324,22 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Remove-Item "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\banner.txt", "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
     Write-Utf8 "$testRoot\config\cycle.json" '{"pages":{"minAgeMinutes":{"sync-unattested":60}}}'
     Set-ReleaseBranch274 'release'
-    Set-SyncStub274 'sync-unattested' 'integration tip abc carries no fleet-review status; attest it: node bin/review-policy.js attest --tenant test --pr 7 --head abc'
+    $prUrl274 = 'https://github.com/owner/repo/pull/7'
+    Set-SyncStub274 'sync-unattested' 'integration tip abc lacks fleet-review: merge the PR with a MERGE COMMIT, or attest it: node bin/review-policy.js attest --tenant test --pr 7 --head abc' $prUrl274
+
+    # G0: FIRST sighting inside the grace. The condition stands and links the PR, but the escalation file
+    # (what the dispatcher's reader relays) is not filed yet, nothing is sent, and a flap that clears here
+    # leaves no file behind.
+    $filesBefore = Get-EscalationFileCount274
+    $g0 = Run-WatchdogCaptured
+    Assert-True (-not $g0.crashed) "the first-sight grace tick must not crash (exit $($g0.exitCode): $($g0.error))"
+    Assert-True (@($g0.line.conditions) -contains $key274) 'the sync-unattested condition stands on first sight'
+    Assert-True ((Get-EscalationFileCount274) -eq $filesBefore) 'no escalation file is filed inside the grace'
+    Assert-True (@(Get-PostedBodies $pushLog274).Count -eq 0) 'nothing is sent on first sight inside the grace'
+    $pg0 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw | ConvertFrom-Json).$key274
+    Assert-True ("$($pg0.url)" -eq $prUrl274) 'the condition url is the reconciliation PR, not an escalation file'
+    Assert-True ($null -eq $pg0.PSObject.Properties['escalationFiledAt']) 'no escalationFiledAt until the file is filed'
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
 
     # G1: first seen 10 minutes ago, inside the 60-minute grace: the condition stands, nothing is
     # sent, no pages.jsonl row is written, and the entry stays undelivered with its firstSeen kept.
@@ -2345,10 +2362,15 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     $g2Entry = @($g2.line.newlyPaged | Where-Object { $_.key -eq $key274 })[0]
     Assert-True ($null -ne $g2Entry -and $g2Entry.priority -eq 'normal' -and $g2Entry.page.pushover -eq $true) "past the grace it pages once at normal (got $($g2Entry | ConvertTo-Json -Compress))"
     $g2Posts = @(Get-PostedBodies $pushLog274 | ForEach-Object { ConvertFrom-FormBody $_ })
+    Assert-True ((Get-EscalationFileCount274) -eq $filesBefore + 1) 'the escalation file is filed when the page is first actually sent'
+    Assert-True ($g2Posts.Count -ge 1 -and $g2Posts[0].url -eq $prUrl274) "the page links the reconciliation PR (got url '$($g2Posts[0].url)')"
+    $pg2 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw | ConvertFrom-Json).$key274
+    Assert-True ("$($pg2.escalationFiledAt)" -ne '' -and "$($pg2.url)" -eq $prUrl274) 'the entry records the filing and keeps the PR link'
     Assert-True ($g2Posts.Count -eq 1 -and $g2Posts[0].priority -eq '0' -and $g2Posts[0].message -like '*review-policy.js*attest*') "exactly one Pushover POST at priority 0 carrying the attest command (got $($g2Posts.Count))"
     # G3: the next tick sends nothing.
     $g3 = Run-WatchdogCaptured
     Assert-True (-not $g3.crashed -and @($g3.line.newlyPaged | Where-Object { $_.key -eq $key274 }).Count -eq 0 -and @(Get-PostedBodies $pushLog274).Count -eq 1) 'a second tick past the grace sends nothing more'
+    Assert-True ((Get-EscalationFileCount274) -eq $filesBefore + 1) 'a standing condition files its escalation once, not every tick'
 
     # G4: a bad minAgeMinutes value is reported (config-invalid, once, normal) and the built-in grace
     # applies instead: a condition first seen 10 minutes ago still waits.
@@ -2368,6 +2390,13 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     $g5 = Run-WatchdogCaptured
     $g5Entry = @($g5.line.newlyPaged | Where-Object { $_.key -eq 'escalation:pl-test:sync-blocked' })[0]
     Assert-True ($null -ne $g5Entry -and $g5Entry.priority -eq 'high' -and $g5Entry.page.pushover -eq $true) "sync-blocked pages at high immediately (got $($g5Entry | ConvertTo-Json -Compress))"
+
+    # G7: sync-stalled (one sha waited on checks past the limit) pages at normal at once: no grace.
+    Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Set-SyncStub274 'sync-stalled' 'integration tip abc has waited 125 min (limit 120) to fast-forward into main'
+    $g7 = Run-WatchdogCaptured
+    $g7Entry = @($g7.line.newlyPaged | Where-Object { $_.key -eq 'escalation:pl-test:sync-stalled' })[0]
+    Assert-True ($null -ne $g7Entry -and $g7Entry.priority -eq 'normal' -and $g7Entry.page.pushover -eq $true) "sync-stalled pages at normal immediately (got $($g7Entry | ConvertTo-Json -Compress))"
 
     # G6: a bare fixture's built-in default map and page kinds carry sync-unattested: seen 61 min ago
     # with no config at all it pages at normal; seen 10 min ago it waits.

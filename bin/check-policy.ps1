@@ -130,7 +130,7 @@ function Get-PagesPriorityFindings {
     } else {
       foreach ($p in $Pages.minAgeMinutes.PSObject.Properties) {
         $v = $p.Value
-        if (-not (($v -is [int] -or $v -is [long] -or $v -is [double]) -and $v -ge 0)) { $found += [pscustomobject]@{ Key = "pages.minAgeMinutes.$($p.Name)"; Value = "$v"; Expect = 'a number of minutes, 0 or more' } }
+        if (-not (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and $v -ge 0)) { $found += [pscustomobject]@{ Key = "pages.minAgeMinutes.$($p.Name)"; Value = "$v"; Expect = 'a number of minutes, 0 or more' } }
       }
     }
   }
