@@ -16,8 +16,8 @@
     "supabase/config.toml"
   ],
   "checks": {
-    "unit": "pnpm test",
-    "lint": "pnpm lint && pnpm typecheck"
+    "unit": "npm test",
+    "lint": "npm run lint && npm run typecheck"
   },
   "riskTriggers": {
     "auth": {
