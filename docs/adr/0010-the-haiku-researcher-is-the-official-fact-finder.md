@@ -39,9 +39,10 @@ the habit wins.
    untouched. The sentinel is not gated either: it runs scripts, never research.
 4. **One sonnet re-dispatch, never opus.** A thin haiku answer is re-asked once
    with `model: sonnet` and the reason is written down (PR body for an IC,
-   status file for a lead). A haiku researcher that wanders burns its 30 turns
+   status file for a lead). A haiku researcher that wanders burns its 60 turns
    with nothing to report, so a large sweep is handed to it as one script to
-   run, not as an open question.
+   run, not as an open question. (Raised from 30 to 60 on 2026-10-03, fleet #284:
+   16% of runs hit the 30-turn cap.)
 5. **Rollback is a flag.** `state/flags/research-gate-off` disables the gate
    for every session at once; the session-start line reports whether the gate
    is on or off so a session never guesses. The role-file text stands either
