@@ -213,7 +213,7 @@ try {
   Remove-Item $calls -ErrorAction SilentlyContinue
   Reset-Fixture
   Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
-  Write-Utf8 "$testRoot\mock-state\append.txt" ('{"at":"2026-09-30T20:30:00Z","name":"ic-12","jobId":"job-12","cwd":"x","worktrees":[],"reason":"claude-cli-missing","tried":["PATH"],"attempts":0}' + [Environment]::NewLine)
+  Write-Utf8 "$testRoot\mock-state\append.txt" ('{"at":"' + $script:queuedAt + '","name":"ic-12","jobId":"job-12","cwd":"x","worktrees":[],"reason":"claude-cli-missing","tried":["PATH"],"attempts":0}' + [Environment]::NewLine)
   # keep job-1's line failing so the file is rewritten rather than deleted
   Write-Utf8 "$testRoot\repo\.claude\worktrees\ic-9\unsaved.txt" 'work in progress'
   $r = Run-Check -Apply
