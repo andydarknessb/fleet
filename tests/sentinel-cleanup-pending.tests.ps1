@@ -41,7 +41,8 @@ function Reset-Fixture {
   & git -C "$testRoot\repo" worktree add "$testRoot\repo\.claude\worktrees\ic-9" -b worktree-ic-9 --quiet 2>$null
   $ErrorActionPreference = $eapGit
   Assert-True (Test-Path "$testRoot\repo\.claude\worktrees\ic-9") 'fixture: the owned worktree must exist'
-  $line = [ordered]@{ at = '2026-09-30T19:17:13Z'; name = 'ic-9'; jobId = 'job-1'; cwd = "$testRoot\repo"; worktrees = @("$testRoot\repo\.claude\worktrees\ic-9"); reason = 'claude-cli-missing'; tried = @('PATH'); attempts = 0 }
+  $script:queuedAt = (Get-Date).ToUniversalTime().AddHours(-1).ToString('yyyy-MM-ddTHH:mm:ssZ')
+  $line = [ordered]@{ at = $script:queuedAt; name = 'ic-9'; jobId = 'job-1'; cwd = "$testRoot\repo"; worktrees = @("$testRoot\repo\.claude\worktrees\ic-9"); reason = 'claude-cli-missing'; tried = @('PATH'); attempts = 0 }
   Write-Utf8 $pendingPath ((($line | ConvertTo-Json -Compress -Depth 4)) + [Environment]::NewLine)
 }
 
@@ -203,7 +204,7 @@ try {
   $r = Run-Check -Apply
   $stray1 = @($r.escalate | Where-Object { $_.kind -eq 'stray' -and $_.detail -match 'job-1' })
   $stray7 = @($r.escalate | Where-Object { $_.kind -eq 'stray' -and $_.detail -match 'job-7' })
-  Assert-True ($stray1.Count -eq 1 -and "$($stray1[0].detail)" -match 'retire could not remove it \(claude CLI missing at 2026-09-30T19:17:13Z\); cleanup pending') "the listed stray must say retire could not remove it: $($stray1 | ConvertTo-Json -Compress)"
+  Assert-True ($stray1.Count -eq 1 -and "$($stray1[0].detail)" -match "retire could not remove it \(claude CLI missing at $([regex]::Escape($script:queuedAt))\); cleanup pending") "the listed stray must say retire could not remove it: $($stray1 | ConvertTo-Json -Compress)"
   Assert-True ($stray1[0].detail -notmatch 'cause not measured') 'and drop the cause-not-measured wording'
   Assert-True ($stray7.Count -eq 1 -and "$($stray7[0].detail)" -match 'cause not measured') 'a stray the file does not list keeps the old detail'
   Remove-Item "$testRoot\mock-state\extra-row.txt"
@@ -212,7 +213,7 @@ try {
   Remove-Item $calls -ErrorAction SilentlyContinue
   Reset-Fixture
   Write-Utf8 "$testRoot\state\flags\ic-cleanup-live" 'on'
-  Write-Utf8 "$testRoot\mock-state\append.txt" ('{"at":"2026-09-30T20:30:00Z","name":"ic-12","jobId":"job-12","cwd":"x","worktrees":[],"reason":"claude-cli-missing","tried":["PATH"],"attempts":0}' + [Environment]::NewLine)
+  Write-Utf8 "$testRoot\mock-state\append.txt" ('{"at":"' + $script:queuedAt + '","name":"ic-12","jobId":"job-12","cwd":"x","worktrees":[],"reason":"claude-cli-missing","tried":["PATH"],"attempts":0}' + [Environment]::NewLine)
   # keep job-1's line failing so the file is rewritten rather than deleted
   Write-Utf8 "$testRoot\repo\.claude\worktrees\ic-9\unsaved.txt" 'work in progress'
   $r = Run-Check -Apply
