@@ -60,3 +60,14 @@ the habit wins.
   not cover passes. The role-file rule still applies; the hook is the floor,
   not the whole rule. Extend the pattern list when a new spelling shows up in a
   transcript, and add a case to `tests/research-gate.tests.ps1`.
+
+## Amendment (2026-10-08, fleet #289): the researcher pins Haiku 5.5
+
+The researcher's role file pins `model: claude-haiku-5-5` instead of the
+`haiku` alias. On Claude Code 2.1.295 the alias resolves to Haiku 5.5 on the
+first-party API, but the resolution is the CLI's: an older CLI or a provider
+route resolves it to `claude-haiku-4-5`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL`
+can point it at any model. A pin is a decision the fleet owns, as the IC's
+sonnet pin (ruling 2026-09-28) and the project lead's `claude-opus-5-5` are.
+"Haiku researcher" in role files and hooks names the family and stands. The
+one sonnet re-dispatch rule (decision 4) is unchanged.
