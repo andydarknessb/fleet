@@ -516,6 +516,7 @@ test('#124: modelFamily folds aliases and full ids onto one family key and keeps
   assert.deepEqual(modelFamily('claude-opus-5-5[1m]'), { key: 'opus', recognized: true });
   assert.deepEqual(modelFamily('Opus'), { key: 'opus', recognized: true });
   assert.deepEqual(modelFamily('claude-haiku-4-5-20251001'), { key: 'haiku', recognized: true });
+  assert.deepEqual(modelFamily('claude-haiku-5-5'), { key: 'haiku', recognized: true });
   assert.deepEqual(modelFamily('fable'), { key: 'fable', recognized: true });
   assert.deepEqual(modelFamily('claude-fable-5-1'), { key: 'fable', recognized: true });
   assert.deepEqual(modelFamily('gpt-9-turbo'), { key: 'gpt-9-turbo', recognized: false });
