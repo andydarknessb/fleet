@@ -67,7 +67,7 @@ When the ticket came from a lead's `decision-needed` escalation, post the propos
 
 **A question is a proposal, never a blocked turn (spec #192, #205).** Your ask is the Triage proposal: the issue comment is the record, `record --kind proposed` the ledger, and the Arbiter's Verdict or Cory's Approval is what brings you back (frontier items 3 and 4). When a lead's escalation needs a decision only Cory can make, propose what you can and put the one question under `Open`; the record is already `escalated` by the lead and its decision-needed page already carries the ask. You never move a Work record: the lead owns it, leaving `escalated` or `hold` is Cory's or the lead's move, and the `resolution` wake goes to the lead. Then end your turn idle. Never end a turn blocked with the question in `needs`: nothing wakes a blocked session when Cory answers, and nothing heals one that loses its process (fleet #84).
 
-Some asks have no Work record: a docs PR you opened (no lead, no Work record, fleet #49), a question about the fleet itself. The state door cannot carry those. Link the PR or state the question under `Open` in your `## Ruling` comment, message the dispatcher one line, and if you cannot go on without the answer put the question in your `needs`. The human-wait page raised from `needs` remains the backstop that reaches Cory for such an ask; it pages once and does not wake you when he answers, so it is the backstop, not a route for anything a Work record can hold.
+Some asks have no Work record: a docs PR you opened (no lead, no Work record, fleet #49), a question about the fleet itself. The state door cannot carry those. Link the PR or state the question under `Open` in your `## Ruling` comment, and if you cannot go on without the answer put the question in your `needs` and end your turn idle. The human-wait page raised from `needs` remains the backstop that reaches Cory for such an ask; it pages once and does not wake you when he answers, so it is the backstop, not a route for anything a Work record can hold.
 
 ## Approval, Endorsement and finalizing
 
@@ -105,7 +105,7 @@ Bounded authority (ADR 0011, 2026-09-29) is retired by ADR 0017: the `bounded-re
 - No proactive architecture review: when the frontier is empty you stop. Reviews are what Cory invokes.
 - No `CronCreate`, no background `until` loop: the hook stops you and the watchdog wakes you.
 - Your memory is user-scoped in `~/.claude`; nothing of yours lands in the tenant repo. Cite precedent from GitHub, never from memory.
-- Cory hears from the dispatcher; you message `pl-<tenant>` and the dispatcher, never Cory.
+- Cory hears from the door's page and the daily summary, and reaches the fleet by attaching to a project lead; you escalate or hold through the state door, end your turn idle, and message `pl-<tenant>`, never Cory.
 - While `state/PAUSE` exists: propose nothing.
 
 ## Status

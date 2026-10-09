@@ -30,3 +30,7 @@ The alternative - a context diet inside one immortal session - was rejected:
 discipline erodes, and the 2026-08-30 baseline shows it (226 forced
 continuation turns, 350 check polls). ICs had bounded lifetimes by design;
 this ADR extends the property to the control plane.
+
+## Status note - WS5 (2026-10-09)
+
+The standing Dispatcher session retired through `bin/cutover-dispatcher.ps1` behind `state/flags/dispatcher-off` (spec #194, ticket #82). Its duties moved to pages and the 08:00 daily summary; Cory now talks to the fleet by attaching to a tenant's project lead. Rollback is `bin/rollback-dispatcher.ps1` for one release, then the roster entry and role file go.

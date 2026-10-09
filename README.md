@@ -6,9 +6,9 @@ The standing crew of Claude Code sessions that runs Cory's projects between prom
 
 ```
 cory
- └─ dispatcher (sonnet)    your interface; relays escalations; daily digest; reads the supervisor's escalation files
+ └─ dispatcher (sonnet)    retired at the WS5 cutover (2026-10-09, spec #194); pages carry escalations, the 08:00 daily summary the digest; roster entry and role file stay one release for rollback
  └─ Fleet watchdog (task)  the supervisor: keeps the roster alive and under the cap; never reasons about work (cut over from the sentinel session 2026-09-04; rollback path retired by ticket 89)
-     └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges
+     └─ pl-<tenant> (sonnet)   one per tenant; turns ready issues into ICs; reviews and merges; where you attach (`claude attach`) to talk to the fleet
          └─ ic-<issue> (haiku or sonnet, high) one per issue, launched from a manifest with /implement; opens a PR; talks only to its project lead
              └─ qa-reviewer (opus worker)   risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
      └─ pe-<tenant> (opus-5.5, high)  the Principal (ADR 0011): reads unrouted tickets and decision-needed escalations, posts triage proposals; the Arbiter decides each one, or Cory's `Approved` comment does. Outside the cap. Inert until `state/flags/principal-live`.
@@ -16,7 +16,7 @@ cory
 ```
 
 - **Sessions** are background Claude Code sessions hosted by the daemon (`claude agents`). **Workers** are subagents inside a session. Cap counts sessions only.
-- Reporting line: IC → project lead → dispatcher → Cory. The supervisor files escalations for the dispatcher. Nobody skips a level.
+- Reporting line: IC → project lead → Cory (through the state door: an Escalation or a Hold pages him). The supervisor files its escalations with `parent: cory`. Nobody skips a level.
 - **Supervision** (ticket 08b, CUT OVER 2026-09-04; the Sentinel's roster entry, role file and rollback script were retired for good by ticket 89, after one release). The `Fleet watchdog` scheduled task is the supervisor: the flag `state/flags/sentinel-off` stands (`bin/cutover-sentinel.ps1` passed the 48-hour parity gate, 52.5 h, 31 approved differences in `state/sentinel/parity-approved.json`; record in `state/sentinel/cutover.json`), and the watchdog runs the same check with `-Apply` (launches through the one door, escalations as files + one page). `bin/status.ps1` reports "supervisor: watchdog task".
 - **Assignment** (tickets 02/03, CUT OVER 2026-09-09 10:17Z; the legacy launch block, the Stop hook's own frontier and parity observation, and the `-Prompt` IC launch path were retired for good by ticket 89, ADR 0006, after one release). The assignment planner is authoritative: `state/flags/assignment-live` stands (parity PASS on 35 evaluations over 47.7 h and 12 distinct frontiers, record in `state/assignment/cutover.json`). The lead's Stop hook decides from the planner's frontier, and the lead reserves a manifest and launches it through `bin/assignment.js assign` + `launch`; `launch.ps1` refuses a `-Prompt` IC launch unconditionally, with no flag or `-Force` to bring it back. `bin/cutover-assignment.ps1` (gated on `config/cycle.json` `assignment.parityEvaluations` agreeing evaluations spanning `parityHours` over `parityDistinctFrontiers` distinct frontiers, differences approved in `state/assignment/parity-approved.json`) writes `state/flags/assignment-live`. `bin/status.ps1` reports "assignment: planner authoritative".
 - Work is a GitHub Issue carrying the tenant's `readyLabel`. That label lands on an Endorsement or on your say-so (that is your 35% interaction: you approve scope, not code): the Arbiter reads each of the Principal's `## Triage proposal` comments and posts a `## Verdict`; `Endorsed` / `Endorsed with: <edits>` is a ruling at once and the Principal (or a script, for an exact `Endorsed`) applies the label, and you hear only a high-level decision, a `wontfix`, `duplicate`, close or `spec` parent, a double Return, or an Arbiter suspension (ADR 0017, inert until `state/flags/arbiter-live`). You can still apply it by hand, or reply `Approved` / `Approved with: <edits>` to the proposal, which wins when it lands first (ADR 0011). No fleet session may write a comment beginning `Approved`; `hooks/principal-guard.ps1` refuses it in every role because the fleet acts under your own GitHub login. A tenant's `fleetIdentity` is the GitHub login the fleet acts as: the planner treats an assignee as "someone else owns this" only when it is not that login, since in a single-account tenant an assignee says nothing about who owns the issue and nothing ever removes one.
@@ -110,7 +110,7 @@ is reserved for deterministic fixture runs and must not be used for production b
 powershell -File C:\Users\Cory\fleet\bin\status.ps1
 claude agents                      # TUI: attach, peek, reply, pin (Ctrl+T pins a session so it is never idle-reaped)
 
-# talk to the dispatcher
+# talk to the fleet: attach to a tenant's project lead (pl-<tenant>)
 claude attach <job id>             # or from claude.ai/code / the mobile app: fleet sessions auto-connect to Remote Control
 
 # stop everything launching (sessions finish their turn and idle)
@@ -134,7 +134,7 @@ New-Item C:\Users\Cory\fleet\state\flags\arbiter-live              # expect, lau
 
 **Questions for you (spec #192, #204, #205).** A project lead or Principal that needs you records the ask on the Work record, as an `escalated` record or, for a clean PR waiting only on your merge, a `hold`, and ends its turn idle. It never ends a turn blocked on you. Your answer wakes it: when the record leaves `escalated` or `hold` (you resolve the escalation with the command above, or you merge and the watcher records it), the state door appends a `resolution` line to the wake outbox and the Watchdog rotates the session that asked back in, naming the record and the states it left and entered (the lead for the escalations it, pr-watch or the budget check raised; the Principal has no escalation door today, its ask is the proposal, ADR 0011, so its branch of the wake serves a future door). An ask with no Work record, such as a PR from your own session or a question about the fleet, cannot be escalated. That session puts the question in its `needs`, and the human-wait page raised from `needs` is the backstop that reaches you. That page does not wake the session when you answer, and nothing heals a blocked session by reading `needs` (fleet #84), so answer it by message.
 
-Status files: `state/STATUS.md` (dispatcher's digest), `state/status/<tenant>.md` (each project lead), `state/escalations/*.json` (anything that needs you). Ticket-07 projections, script-generated and never hand-edited: `state/status/DIGEST.md` (Needs Cory with delivery state, active work, merges, frontier exclusions, your authority) and `state/status/<tenant>-status.md`.
+Status files: `state/STATUS.md` (the old dispatcher digest; the 08:00 daily summary, `bin/daily-summary.js`, carries the digest now), `state/status/<tenant>.md` (each project lead), `state/escalations/*.json` (anything that needs you). Ticket-07 projections, script-generated and never hand-edited: `state/status/DIGEST.md` (Needs Cory with delivery state, active work, merges, frontier exclusions, your authority) and `state/status/<tenant>-status.md`.
 
 ```powershell
 # ticket 07: decisions, exclusions, delivery
@@ -214,7 +214,7 @@ Every fleet script reaches the CLI through `Resolve-ClaudeCli` / `Invoke-ClaudeC
 
 1. `powershell -File C:\Users\Cory\fleet\bin\setup.ps1` (junction, state dirs, version and label checks). Idempotent.
 2. `powershell -File C:\Users\Cory\fleet\bin\pilot.ps1 -DryRun`, then without `-DryRun`.
-3. `claude agents`, pin dispatcher and pl-endzone with Ctrl+T.
+3. `claude agents`, pin pl-endzone and pl-nidus with Ctrl+T (you attach to `pl-<tenant>` to talk to the fleet).
 4. Optional, survives reboot: `powershell -File C:\Users\Cory\fleet\bin\install-recovery-task.ps1`.
 5. `powershell -File C:\Users\Cory\fleet\bin\install-watchdog-task.ps1`: the scheduled supervisor (shadow until cutover, then live).
 
@@ -239,5 +239,5 @@ The `mattpocock-skills` plugin is enabled at user scope, so every fleet session 
 - **Hook commands run through a POSIX shell, even on Windows.** Backslashes in `fleet-settings.json` hook paths get eaten (`C:UsersCory...`). Use forward slashes: `-File C:/Users/Cory/fleet/hooks/stop.ps1`. PowerShell accepts them.
 - **So does anything a session pastes into its Bash tool.** The ack command in the launch prompt and the session-start context, and every `node C:/Users/Cory/fleet/bin/...` example in the role files, are written with forward slashes for the same reason: an unquoted `C:\Users\...` collapses to a drive-relative `C:UsersCory...` and node reports MODULE_NOT_FOUND against `C:\`. Every IC since the manifest cutover lost its first turn to this before 2026-09-11. Keep new examples in forward slashes.
 - `--settings <file>` on `claude --bg` applies the file's `env` block and `hooks`; that is how a session learns who it is (`FLEET_*`). `respawnFlags` in the job's `state.json` records the settings path, so `claude respawn` keeps the identity.
-- Cron jobs inside a session expire after 7 days; the SessionStart hook reminds the dispatcher to recreate its own.
+- Cron jobs inside a session expire after 7 days; the SessionStart hook reminds a rostered dispatcher to recreate its own (history: the dispatcher retired at the WS5 cutover, 2026-10-09).
 - Max 5x: rate limiting is a first-class state. The supervisor's applied check sets a 59-minute PAUSE when a fleet job reports one (one minute short of the 15-minute tick cadence, so the tick one hour later clears it rather than the one after), clears it after the window, and pauses at most once per distinct limit wording per session (`state/sentinel/rate-limit-signal.json`): the wording is the session's own status summary and outlives the limit it names.
