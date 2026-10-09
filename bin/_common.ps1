@@ -5,6 +5,9 @@ function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw 
 function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
 function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
+# WS5 cutover (fleet #82, spec #194): while this flag stands the dispatcher is retired;
+# pages and the daily summary carry its duties, and nothing expects or launches it.
+function Test-DispatcherOff { Test-Path "$FleetHome\state\flags\dispatcher-off" }
 # 02/03 cutover: while this flag stands the assignment planner (bin/assignment.js) is the
 # authoritative frontier and launch path for ICs; the launch door refuses a legacy IC launch.
 function Test-AssignmentLive { Test-Path "$FleetHome\state\flags\assignment-live" }
@@ -195,6 +198,8 @@ function Get-ExpectedStaticSessions {
   if (-not $Static) { $Static = Get-StaticRoster }
   $sessions = @(); if ($Static -and $Static.sessions) { $sessions = @($Static.sessions) }
   if (Test-SentinelOff) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'sentinel' -and "$($_.name)" -ne 'sentinel' }) }
+  # WS5 (fleet #82 / spec #194): the dispatcher is retired while state/flags/dispatcher-off stands.
+  if (Test-DispatcherOff) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'dispatcher' -and "$($_.name)" -ne 'dispatcher' }) }
   # The inverse gate for the Principal: expected only while principal-live stands (ADR 0011).
   if (-not (Test-PrincipalLive)) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'principal' -and "$($_.name)" -notmatch '^pe-' }) }
   # And for the Arbiter: expected only while arbiter-live stands (ADR 0017).

@@ -163,6 +163,18 @@ exit /b 0
   Assert-True ($watchdogApply.applied -eq $true) 'the watchdog actor still applies under the flag'
   Remove-Item "$testRoot\state\flags\sentinel-off"
 
+  # WS5 (fleet #82): the same for the dispatcher under state/flags/dispatcher-off. The roster.json row
+  # stays (the rollback path) but a missing dispatcher is never launchNeeded while the flag stands.
+  $rosterBeforeD = Get-Content "$testRoot\roster.json" -Raw
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory","cwd":"C:\\fleet","prompt":"p"}]}'
+  $dExpected = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True (@($dExpected.launchNeeded | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'without the flag a missing dispatcher is launchNeeded'
+  Write-Utf8 "$testRoot\state\flags\dispatcher-off" 'cut over by test'
+  $dOff = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True (@($dOff.launchNeeded | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 0) 'with dispatcher-off the retired dispatcher is never launchNeeded'
+  Remove-Item "$testRoot\state\flags\dispatcher-off"
+  Write-Utf8 "$testRoot\roster.json" $rosterBeforeD
+
   # Rate-limit PAUSE, 2026-09-10 (three re-arms in 14h). The detail line is a level, not an
   # event: the same wording stood for 12 hours and re-armed a PAUSE one tick after each manual
   # clear. And the 60-minute window phase-locked to the 15-minute tick: until landed ~100 ms
