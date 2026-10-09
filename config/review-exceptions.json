@@ -103,6 +103,12 @@
       "head": "de62d9277358f59cc84be55a5e09b54b506d0c2b",
       "pr": 889,
       "ruling": "Ruling 2026-09-24 (fleet PR #122): merged after the formal-review door existed with a risk review at most, no formal review. A real bypass like #1241/#1263; acknowledged so archival resumes, and a retro review is owed (see ruling on PR #122)."
+    },
+    {
+      "recordId": "endzone:issue-1599",
+      "head": "f306bdb2b3b6d015c99b48a0089a1a19d27426f0",
+      "pr": 1602,
+      "ruling": "Merged 2026-09-24 at the fix-up head f306bdb2 after formal-001 at 8dbdf69c; no formal review recorded at the merged head. Ruling 2026-10-09 (Cory, fleet optimization review): acknowledged."
     }
   ]
 }

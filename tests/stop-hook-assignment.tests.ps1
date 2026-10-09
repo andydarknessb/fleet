@@ -99,6 +99,28 @@ try {
   Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{}}'
   $out51d = Run-Stop
   Assert-True ($lastExit -eq 2 -and $out51d -match 'awaiting your review with CI settled: #7' -and $out51d -match 'no Work record') "a PR without a Work record keeps the live verdict and says so: exit $lastExit :: $out51d"
+
+  # A PR held for Cory (state/skip/<tenant>.json "prs") is out of the awaiting-review list, but a held PR whose Work
+  # record is still `review` reads as fleet work to the watchdog (fleet-dead): the lead parks the record with
+  # review-policy.js hold, so the hook continues it and names the PR, the record and the command.
+  Write-Utf8 "$testRoot\gh-pr.json" '[{"number":7,"isDraft":false,"headRefName":"fleet/101-fixture","statusCheckRollup":[{"name":"test-build","status":"COMPLETED","conclusion":"SUCCESS"}]}]'
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"prs":{"7":"held for Cory"}}'
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"review","revision":8,"github":{"issueNumber":101,"prNumber":7}}}}'
+  $out52a = Run-Stop
+  Assert-True ($lastExit -eq 2 -and $out52a -match 'held PR\(s\) whose Work record is still in review: #7 \(test:issue-101 revision ' -and $out52a -match 'review-policy\.js hold' -and $out52a -match '--to escalated') "a held PR whose record is in review must continue the lead with the park command: exit $lastExit :: $out52a"
+  Assert-True ($out52a -notmatch 'awaiting your review') "a held PR is never offered for review: $out52a"
+  # Parked: the record is in `hold`, so the hook proceeds as before (here, to the assignment frontier).
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"hold","revision":9,"github":{"issueNumber":101,"prNumber":7}}}}'
+  $out52b = Run-Stop
+  Assert-True ($out52b -notmatch 'whose Work record is still in review' -and $out52b -notmatch '#7 \(') "a held PR whose record is in hold must not be named: $out52b"
+  Assert-True ($lastExit -eq 2 -and $out52b -match 'assignment frontier #101') "a parked held PR leaves the hook on the assignment frontier: exit $lastExit :: $out52b"
+  # Under state/flags/pr-watch-off the records are not read, so the check does not run.
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"review","revision":8,"github":{"issueNumber":101,"prNumber":7}}}}'
+  Write-Utf8 "$testRoot\state\flags\pr-watch-off" 'test'
+  $out52c = Run-Stop
+  Assert-True ($out52c -notmatch 'whose Work record is still in review') "under pr-watch-off the held-but-unparked check must not run: $out52c"
+  Remove-Item "$testRoot\state\flags\pr-watch-off"
+  Remove-Item "$testRoot\state\skip\test.json"
   Write-Utf8 "$testRoot\gh-pr.json" '[]'
 
   # Case 5: the session-start hook prints the acknowledgment command with the record's current revision.

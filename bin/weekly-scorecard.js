@@ -14,7 +14,11 @@
 //     (every Nidus bug) is read from its newest `## Ruling` or `## Triage proposal` comment's `Escaped from:` line (#213:
 //     `#<PR>`, `none` or `unknown`). A bug with neither, or marked unknown, is
 //     unclassified, and the row says how many; before the form lands the row reads 0 classified with N unclassified,
-//     which is a true reading. A GitHub failure makes the row `unknown`, never a zero;
+//     which is a true reading. A GitHub failure makes the row `unknown`, never a zero. A fleet-PR
+//     bug whose body cites a fleet review of its own escaped-from PR ("review of PR #<n>", or
+//     `PR #<n>` then a finding id such as `formal-001-f5` on the same line) is a review
+//     follow-up, filed at merge for a finding review caught: counted apart, not as an escape,
+//     and not in the rate (ruled 2026-10-09). A review of another PR does not qualify;
 //   - the watchdog shadow log (state/sentinel/shadow/*.jsonl): `fleet-dead` ticks over
 //     total ticks;
 //   - #214: the page log's human-wait rows (state/pages/pages.jsonl) with the same watchdog
@@ -300,18 +304,30 @@ function classifyEscape(issue) {
   return { pr: proposal.kind === 'pr' ? proposal.pr : null, kind: proposal.kind === 'pr' ? null : proposal.kind, source: 'proposal' };
 }
 
+// A bug filed from a fleet review finding (a non-blocking formal or risk finding ticketed at merge) was
+// caught by review, not escaped (ruled 2026-10-09). Only a review of the bug's own escaped-from PR counts:
+// "review of PR #<pr>", or "PR #<pr>" and a finding id within 80 characters on one line, with no other "PR #" between. A bare artifact
+// path or finding id, or a review of a different PR that merely found the bug, does not.
+function isReviewFollowUp(body, pr) {
+  const text = String(body || '');
+  if (!Number.isInteger(pr)) return false;
+  return new RegExp(`\\breview of PR #${pr}\\b`, 'i').test(text)
+    || new RegExp(`\\bPR #${pr}\\b(?:(?!PR #)[^\\n]){0,80}\\b(?:formal|risk)-\\d{3}`, 'i').test(text);
+}
+
 function escapedRow(base, week, merged, settings, gh) {
   const tenants = Object.entries(workState.readTenantConfigs(base)).filter(([, config]) => config && config.github);
   const bugs = [];
   try {
     for (const [name, config] of tenants) {
       const listed = JSON.parse(gh(['issue', 'list', '-R', config.github, '--label', 'bug', '--state', 'all', '--search', `created:${week.monday}..${week.sunday}`, '--json', 'number,createdAt,body,comments', '--limit', '200']));
-      for (const issue of listed) bugs.push({ tenant: name, repo: config.github, prefix: config.branchPrefix || 'fleet/', number: issue.number, ...classifyEscape(issue) });
+      for (const issue of listed) bugs.push({ tenant: name, repo: config.github, prefix: config.branchPrefix || 'fleet/', number: issue.number, body: issue.body, ...classifyEscape(issue) });
     }
   } catch (error) {
     return { figures: { error: String(error.message || error).split('\n')[0] }, result: `unavailable: ${String(error.message || error).split('\n')[0]}`, status: 'unknown' };
   }
   const escapedFromFleet = [];
+  const reviewFollowUps = [];
   const namedNonFleet = [];
   let lookups = 0;
   for (const bug of bugs.filter((entry) => entry.pr !== null)) {
@@ -320,7 +336,7 @@ function escapedRow(base, week, merged, settings, gh) {
       lookups += 1;
       try { head = JSON.parse(gh(['pr', 'view', String(bug.pr), '-R', bug.repo, '--json', 'number,headRefName'])).headRefName || null; } catch { head = null; }
     }
-    if (head && head.startsWith(bug.prefix)) escapedFromFleet.push({ issue: bug.number, pr: bug.pr });
+    if (head && head.startsWith(bug.prefix)) (isReviewFollowUp(bug.body, bug.pr) ? reviewFollowUps : escapedFromFleet).push({ issue: bug.number, pr: bug.pr });
     else namedNonFleet.push(head ? { issue: bug.number, pr: bug.pr } : { issue: bug.number, pr: bug.pr, unverified: true });
   }
   // #213: `none` is a classification (no PR introduced the bug); `unknown` and a bug nothing classifies are not.
@@ -333,8 +349,8 @@ function escapedRow(base, week, merged, settings, gh) {
   if (escapedFromFleet.length && (rate === null || rate > settings.escapedRate.weak)) status = 'weak';
   else if (escapedFromFleet.length) status = 'watch';
   return {
-    figures: { bugs: bugs.length, escapedFromFleet, namedNonFleet, none, unknown, fromProposal, unclassified, merged, rate },
-    result: `${escapedFromFleet.length} escaped from a fleet PR${escapedFromFleet.length ? ` (${escapedFromFleet.map((e) => `#${e.issue} from PR #${e.pr}`).join(', ')})` : ''}, ${namedNonFleet.length} named another PR, ${none.length} traced to no PR, ${unclassified} unclassified${unknown ? ` (${unknown} marked unknown)` : ''}, of ${plural(bugs.length, 'bug')} opened${rate !== null ? `; ${pct(rate)} of ${merged} merged` : ''}`,
+    figures: { bugs: bugs.length, escapedFromFleet, reviewFollowUps, namedNonFleet, none, unknown, fromProposal, unclassified, merged, rate },
+    result: `${escapedFromFleet.length} escaped from a fleet PR${escapedFromFleet.length ? ` (${escapedFromFleet.map((e) => `#${e.issue} from PR #${e.pr}`).join(', ')})` : ''}, ${plural(reviewFollowUps.length, 'review follow-up')} from a fleet PR${reviewFollowUps.length ? ` (${reviewFollowUps.map((e) => `#${e.issue} from PR #${e.pr}`).join(', ')})` : ''}, ${namedNonFleet.length} named another PR, ${none.length} traced to no PR, ${unclassified} unclassified${unknown ? ` (${unknown} marked unknown)` : ''}, of ${plural(bugs.length, 'bug')} opened${rate !== null ? `; ${pct(rate)} of ${merged} merged` : ''}`,
     status,
   };
 }
@@ -885,4 +901,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { DEFAULTS, ROWS, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError, buildScorecard, cli, headlineOf, latestScorecard, parseEscapedFrom, parseProposalEscapedFrom, renderScorecard, writeScorecard };
+module.exports = { DEFAULTS, ROWS, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError, buildScorecard, cli, headlineOf, isReviewFollowUp, latestScorecard, parseEscapedFrom, parseProposalEscapedFrom, renderScorecard, writeScorecard };

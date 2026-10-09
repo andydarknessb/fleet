@@ -8,7 +8,7 @@ const path = require('node:path');
 const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 const workState = require('../bin/work-state');
-const { buildScorecard, writeScorecard, parseEscapedFrom, renderScorecard, latestScorecard, headlineOf, cli, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError } = require('../bin/weekly-scorecard');
+const { buildScorecard, writeScorecard, parseEscapedFrom, isReviewFollowUp, renderScorecard, latestScorecard, headlineOf, cli, WEEKLY_SCORECARD_FLAGS, WeeklyScorecardError } = require('../bin/weekly-scorecard');
 
 const NOW = '2026-09-28T12:40:00.000Z'; // Monday: the week is 2026-09-21..2026-09-27
 const H = (n) => String(n).repeat(40).slice(0, 40);
@@ -134,9 +134,66 @@ test('#131: the review gate counts formal and risk reviews and separates acknowl
 test('#131: the escaped-defects row prints the classified and the unclassified count', () => {
   const card = build();
   const row = card.rows.find((r) => r.key === 'escapedDefects');
-  assert.deepEqual(row.figures, { bugs: 4, escapedFromFleet: [{ issue: 900, pr: 112 }], namedNonFleet: [{ issue: 903, pr: 77 }], none: [], unknown: 0, fromProposal: 0, unclassified: 2, merged: 4, rate: 0.25 });
+  assert.deepEqual(row.figures, { bugs: 4, escapedFromFleet: [{ issue: 900, pr: 112 }], reviewFollowUps: [], namedNonFleet: [{ issue: 903, pr: 77 }], none: [], unknown: 0, fromProposal: 0, unclassified: 2, merged: 4, rate: 0.25 });
   assert.match(row.result, /1 escaped from a fleet PR/);
   assert.match(row.result, /2 unclassified/);
+});
+
+// Ruled 2026-10-09: a bug filed from a fleet review finding was caught by review, not escaped.
+function followUpGhStub(issues) {
+  return {
+    gh: (args) => {
+      if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify(issues);
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: Number(args[2]), headRefName: { 112: 'fleet/12-thing', 77: 'feature/by-hand' }[Number(args[2])] });
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    },
+  };
+}
+const followUpBody = (pr) => `### Escaped from PR #\n\n${pr}\n\n### What happened\n\nFollow-up from the formal review of PR #${pr} (#12), artifact \`state/reviews/endzone_issue-12/formal-001.json\`, non-blocking.`;
+
+test('2026-10-09: a fleet-PR bug citing a review artifact is a review follow-up, not an escape, and stays out of the rate', () => {
+  const stub = followUpGhStub([
+    { number: 920, createdAt: '2026-09-24T00:00:00Z', body: followUpBody(112) },
+    { number: 921, createdAt: '2026-09-24T00:00:00Z', body: followUpBody(77) },
+  ]);
+  const row = build(fixtureWeek(), stub).rows.find((r) => r.key === 'escapedDefects');
+  assert.deepEqual(row.figures.reviewFollowUps, [{ issue: 920, pr: 112 }]);
+  assert.deepEqual(row.figures.escapedFromFleet, []);
+  assert.deepEqual(row.figures.namedNonFleet, [{ issue: 921, pr: 77 }], 'a follow-up of a non-fleet PR is still another PR\'s');
+  assert.equal(row.figures.rate, 0);
+  assert.equal(row.status, 'good');
+  assert.match(row.result, /0 escaped from a fleet PR, 1 review follow-up from a fleet PR \(#920 from PR #112\)/);
+});
+
+test('2026-10-09: a plain fleet-PR bug still escapes beside a review follow-up', () => {
+  const stub = followUpGhStub([
+    { number: 920, createdAt: '2026-09-24T00:00:00Z', body: followUpBody(112) },
+    { number: 922, createdAt: '2026-09-24T00:00:00Z', body: '### Escaped from PR #\n\n112\n\n### What happened\n\nboom' },
+  ]);
+  const row = build(fixtureWeek(), stub).rows.find((r) => r.key === 'escapedDefects');
+  assert.deepEqual(row.figures.escapedFromFleet, [{ issue: 922, pr: 112 }]);
+  assert.deepEqual(row.figures.reviewFollowUps, [{ issue: 920, pr: 112 }]);
+  assert.equal(row.figures.rate, 0.25, 'only the true escape is over the 4 merged');
+  assert.notEqual(row.status, 'good');
+  assert.match(row.result, /1 escaped from a fleet PR \(#922 from PR #112\), 1 review follow-up from a fleet PR \(#920 from PR #112\)/);
+});
+
+test('2026-10-09: isReviewFollowUp counts only a fleet review of the bug\'s own escaped-from PR', () => {
+  assert.equal(isReviewFollowUp('Follow-up from the formal review of PR #1884 (#1883), artifact `state/reviews/endzone_issue-1883/formal-001.json` ...', 1884), true);
+  assert.equal(isReviewFollowUp('From the formal review of PR #1871 (#1855), finding formal-001 f1 (minor). Fleet artifact: state/reviews/endzone_issue-1855/formal-001.json.', 1871), true);
+  assert.equal(isReviewFollowUp('Escaped from PR #1786 (#1775). Formal review finding formal-001-f5, ruled 2026-10-01.', 1786), true);
+  assert.equal(isReviewFollowUp('Escaped from PR #12. Risk finding risk-002 (minor).', 12), true);
+  // #1842: escaped from PR #1837, found in the review of a different PR (#1838): an escape.
+  assert.equal(isReviewFollowUp('Found in the formal review of PR #1838 (#1831): `state/reviews/endzone_issue-1831/formal-001.json`', 1837), false);
+  assert.equal(isReviewFollowUp('Escaped from PR #200. Found in the formal review of PR #201 (#190), finding formal-001.', 200), false, 'a review of PR #B, escaped from #A');
+  assert.equal(isReviewFollowUp('Found by qa-reviewer on #1201; the gap predates #1201. Escaped from PR #1100.', 1100), false);
+  assert.equal(isReviewFollowUp('Review of PR #18840 (#1).', 1884), false, 'the PR number is a whole number');
+  assert.equal(isReviewFollowUp('PR #1786 broke it.\n\nThe artifact is formal-001-f5 of another issue.', 1786), false, 'the finding id must follow on the same line');
+  assert.equal(isReviewFollowUp('state/reviews/endzone_issue-9/risk-001.json', 9), false, 'a bare artifact path qualifies nothing');
+  assert.equal(isReviewFollowUp('Risk review risk-002 flagged this.', 2), false, 'a bare finding id qualifies nothing');
+  assert.equal(isReviewFollowUp('informal-001x and formal-12 after PR #5', 5), false);
+  assert.equal(isReviewFollowUp('formal review of PR #5', null), false);
+  assert.equal(isReviewFollowUp(null, 5), false);
 });
 
 test('#131: before the template lands the escaped row reads 0 classified with N unclassified', () => {
