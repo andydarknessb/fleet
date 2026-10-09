@@ -245,3 +245,21 @@ Not chosen:
 - **Features in the class.** Decision 3 names bugs only.
 
 Source: the 2026-09-29 fleet audit (ruling R5) and its grill (Q5 to Q7).
+
+## Amendment (2026-10-08, ADR 0017): the Arbiter decides
+
+By 2026-10-08 the ledger showed the owner approving almost every proposal
+unchanged, and the Bounded-authority door never called. ADR 0017 moves the
+decision into the fleet: a second seat, the Arbiter (`ar-<tenant>`), posts a
+Verdict on each Triage proposal, and an Endorsement is a Ruling at once.
+
+- Decisions 1 and 3 and the 2026-09-29 amendment (Bounded authority, its Veto
+  window, cap and suspension) are history. Decision 2 stands with "an
+  Endorsement or an Approval" in place of "an Approval": leads still wait. The Approval is no longer the only
+  way a proposal becomes a Ruling; it remains the owner's override and wins
+  when it lands first. The graduation criterion earned nothing further.
+- Decision 4 is superseded: the Principal is no longer the fleet's Fable seat.
+  The Arbiter is (`claude-fable-5-1`); the Principal moves to `claude-opus-5-5`.
+- Decisions 5 and 6 and the two 2026-09-12 amendments stand: the frontier is
+  still computed by script, the write boundary is still a hook, and `Approved`,
+  `Re-propose` and `Veto` keep their shapes and their guard-hook refusal.

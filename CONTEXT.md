@@ -61,12 +61,22 @@ _Avoid_: agent, worker (a worker is a subagent; an IC is a session)
 
 **Principal**:
 The session that reads a tenant's tickets and escalations and proposes
-rulings for them. One per tenant, standing, and the fleet's one seat on the
-top model tier. In advisory mode it decides nothing on its own: its Triage
-proposals become Rulings only on the tenant owner's Approval. It writes no
-product code, merges nothing, and closes nothing.
+rulings for them. One per tenant, standing, and no longer the top-tier seat
+(that is the Arbiter's, ADR 0017). It proposes and decides nothing on its own:
+its Triage proposals become Rulings on the Arbiter's Endorsement or on the
+tenant owner's Approval, whichever lands first. It writes no product code,
+merges nothing, and closes nothing.
 _Avoid_: architect, staff engineer, triage bot, PE (in prose; `pe-<tenant>`
 is only the session name)
+
+**Arbiter**:
+The session that decides a tenant's Triage proposals: it reads each one,
+re-checks the premises it cites, and posts a Verdict. One per tenant, standing,
+and the fleet's one seat on the top model tier (ADR 0017). It decides what is
+a High-level decision and what is not, and applies no routing label itself. It
+writes no product code, merges nothing, and closes nothing.
+_Avoid_: judge, reviewer (a review is of a pull request), approver, AR (in
+prose; `ar-<tenant>` is only the session name)
 
 ### Keeping it alive
 
@@ -371,7 +381,7 @@ _Avoid_: grooming, review (a review is of a pull request), prioritisation
 A decision recorded on a ticket that settles a question the ticket's work
 depends on. A ruling is precedent for later tickets until it is explicitly
 overruled; whoever overrules one quotes it and says why.
-_Avoid_: decision (unqualified), verdict, call
+_Avoid_: decision (unqualified), call
 
 **Premise**:
 A fact about the tenant's code that a ticket's criteria depend on, stated with
@@ -394,20 +404,51 @@ mechanically, by re-reading the named paths that changed since that commit.
 _Avoid_: drift, outdated ticket
 
 **Triage proposal**:
-A Principal's advisory triage of one ticket, posted on the ticket in a fixed
-shape and awaiting the tenant owner's Approval, edit, or rejection. It is not
-a Ruling and no session acts on it.
+A Principal's triage of one ticket, posted on the ticket in a fixed shape and
+awaiting the Arbiter's Verdict or the tenant owner's Approval. It is not a
+Ruling, and nobody acts on it before one of those two lands.
 _Avoid_: recommendation, draft ruling, suggestion
+
+**Verdict**:
+The Arbiter's one comment on a Triage proposal, opening with its outcome:
+Endorsed, Endorsed with edits or an answer, Returned, or Escalated with the
+class of the question and the question itself. Only the Arbiter may write one,
+which is what makes it the Arbiter's. It is not a Ruling until it is an
+Endorsement.
+_Avoid_: ruling, approval (the owner's word), review, grade
+
+**Endorsement**:
+A Verdict that adopts a Triage proposal, as it stands or with the Arbiter's
+edits, and so turns it into a Ruling at once. It has no waiting period, no
+Veto window and no page of its own; it appears in the daily summary only.
+_Avoid_: approval (the owner's word), sign-off, auto-approval
+
+**Return**:
+A Verdict that sends a Triage proposal back to the Principal with numbered
+reasons. The Principal answers with one new proposal; a second Return on the
+same proposal parks the ticket for the tenant owner.
+_Avoid_: rejection, veto (the owner's word), send-back (a reviewed PR)
+
+**High-level decision**:
+A question only the tenant owner can answer: it needs product intent, money, a
+user-facing promise, or a change to the fleet's or a tenant's rules. The
+Arbiter escalates these and answers every other open question itself. The
+tenant owner hears of nothing else but a closing, a `wontfix` or `duplicate`,
+a `spec` parent, a double Return, and an Arbiter suspension.
+_Avoid_: big decision, important decision, escalation (a record on a Work
+record)
 
 **Approval**:
 The tenant owner's comment adopting a Triage proposal, with or without edits,
 which turns it into a Ruling. Only the tenant owner's login approves; the same
-word from anyone else, including the fleet's own identity, is not one. A
-ticket the Principal routes itself under Bounded authority has no Approval.
+word from anyone else, including the fleet's own identity, is not one. It is
+still the owner's override: it wins when it lands before a Verdict. A ticket
+the Principal routes itself under Bounded authority (retired) has no Approval.
 _Avoid_: sign-off, LGTM, ack
 
 **Bounded authority**:
-The Principal's standing permission, in a tenant whose proposals have earned it
+Retired by ADR 0017: the Arbiter decides the class it covered. It was the
+Principal's standing permission, in a tenant whose proposals have earned it
 (ADR 0011), to route one narrow class of ticket to ready itself, with no
 Approval: a bug with a reproducible red-tell that needs no Ruling and touches
 no carve-out or risk-trigger path. It is capped per day, and it suspends itself
@@ -419,7 +460,7 @@ _Avoid_: auto-approval, self-approval, graduation (the event that grants it)
 The time after a Bounded-authority ready during which no assignment may take
 the ticket, long enough for the Tenant owner to see it and Veto it. A ready
 made overnight keeps its window open until the morning's daily Page has listed
-it.
+it. Retired with Bounded authority by ADR 0017; an Endorsement has none.
 _Avoid_: grace period, cooling-off, delay
 
 **Veto**:

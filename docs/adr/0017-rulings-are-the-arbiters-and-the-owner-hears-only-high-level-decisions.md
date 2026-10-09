@@ -51,9 +51,10 @@ the decision into the fleet.
 6. **The owner's words stay his.** `Approved`, `Re-propose` and `Veto` keep
    their shapes, their author lock and their guard-hook refusal to every fleet
    role, and still work: the ledger's first-writer claim decides when an
-   Approval and an Endorsement both land. `Endorsed` and `Returned` are
-   refused by the guard hook to every role but `arbiter`, which is what makes
-   a Verdict the Arbiter's.
+   Approval and an Endorsement both land. `Endorsed`, `Returned`,
+   `Escalated:` and a `## Verdict` heading are refused by the guard hook to
+   every role but `arbiter`, which is what makes a Verdict the Arbiter's; the
+   Arbiter itself posts only through the door.
 7. **The Arbiter suspends itself.** An escaped defect traced to an endorsed
    ticket, or a send-back or escalation on one marked `criteria-defect`,
    writes `state/flags/arbiter-suspended-<tenant>` and pages the owner once.
@@ -102,9 +103,10 @@ asked to hear only high-level decisions.
   but `arbiter`, and bounds the Arbiter's writes as it bounds the Principal's.
 - Each tenant repository's `triage-labels.md` and `issue-tracker.md` describe
   the Verdict and the `Open:` field.
-- ADR 0011 is amended, not superseded: its decisions 1 to 3 and the
-  2026-09-29 amendment are history; decisions 5 and 6 and the two 2026-09-12
-  amendments stand.
+- ADR 0011 is amended, not superseded: its decisions 1, 3 and 4 and the
+  2026-09-29 amendment are history; decision 2 stands with "an Endorsement or
+  an Approval" in place of "an Approval"; decisions 5 and 6 and the two
+  2026-09-12 amendments stand.
 - Delivery is by hand per ADR 0008: fleet PR A (this ADR, glossary, role
   files, launch door, config, hook role lists), PR B (`triage.js`, watchdog,
   daily summary, Principal frontier), PR C (guard hook, suspension scan), and

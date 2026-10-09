@@ -386,7 +386,7 @@ function availabilityRow(base, week, settings) {
 // with a project lead or Principal waiting, and counting them reads 71%, the audit's two
 // figures. Only project leads and Principals are counted.
 const DAY_MS = 24 * HOUR_MS;
-const WAITING_ROLES = ['project-lead', 'principal'];
+const WAITING_ROLES = ['project-lead', 'principal', 'arbiter'];
 
 function readJsonl(file) {
   let text;
@@ -404,6 +404,7 @@ function roleOfSession(name, rosterRoles) {
   if (name === 'dispatcher') return 'dispatcher';
   if (name.startsWith('pl-')) return 'project-lead';
   if (name.startsWith('pe-')) return 'principal';
+  if (name.startsWith('ar-')) return 'arbiter';
   if (name.startsWith('ic-')) return 'ic';
   return null;
 }

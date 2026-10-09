@@ -5,11 +5,12 @@
     "dispatcher": 22000,
     "project-lead": 30000,
     "ic": 35000,
-    "principal": 30000
+    "principal": 30000,
+    "arbiter": 30000
   },
   "meterChange": { "date": "2026-09-30" },
   "cap": {
-    "exemptNamePrefixes": ["pe-"]
+    "exemptNamePrefixes": ["pe-", "ar-"]
   },
   "triage": {
     "markerLabel": "triage-proposed",
@@ -61,7 +62,8 @@
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },
     "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 125000 },
-    "principal": { "maxAgeHours": 24, "maxJobTokens": 125000 }
+    "principal": { "maxAgeHours": 24, "maxJobTokens": 125000 },
+    "arbiter": { "maxAgeHours": 24, "maxJobTokens": 125000 }
   },
   "watchdog": {
     "staleMinutes": 45,

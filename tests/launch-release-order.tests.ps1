@@ -86,7 +86,9 @@ $exitRows = @(
   @{ Anchor = 'missing -\$req'; Decision = 'release' }
   @{ Anchor = 'does not match the fleet naming scheme'; Decision = 'release' }
   @{ Anchor = 'a principal session is named'; Decision = 'keep' }
+  @{ Anchor = 'an arbiter session is named'; Decision = 'keep' }
   @{ Anchor = 'a principal needs -Tenant'; Decision = 'keep' }
+  @{ Anchor = 'an arbiter needs -Tenant'; Decision = 'keep' }
   @{ Anchor = 'rostered Sentinel is disabled'; Decision = 'keep' }
   @{ Anchor = 'reason = \$legacyRefusal'; Decision = 'keep' }                   # no manifest on this path
   @{ Anchor = 'no tenant file for'; Nth = 2; Decision = 'release' }

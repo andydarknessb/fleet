@@ -617,9 +617,9 @@ if ($HealRespawn) {
   # of $expected membership (sentinel-off, say, drops 'sentinel' from $expected
   # entirely, which must never read as "safe to respawn" here) - a control-plane
   # name is healed only through rotate.ps1, by the Watchdog, never this path.
-  $healRespawnControlPlaneNames = ($HealRespawn -eq 'dispatcher') -or ($HealRespawn -eq 'sentinel') -or ($HealRespawn -match '^pl-') -or ($HealRespawn -match '^pe-')
+  $healRespawnControlPlaneNames = ($HealRespawn -eq 'dispatcher') -or ($HealRespawn -eq 'sentinel') -or ($HealRespawn -match '^pl-') -or ($HealRespawn -match '^pe-') -or ($HealRespawn -match '^ar-')
   $target = $expected | Where-Object { $_.name -eq $HealRespawn } | Select-Object -First 1
-  if ($healRespawnControlPlaneNames -or ($target -and (@('dispatcher', 'project-lead', 'principal', 'sentinel') -contains "$($target.role)"))) {
+  if ($healRespawnControlPlaneNames -or ($target -and (@('dispatcher', 'project-lead', 'principal', 'arbiter', 'sentinel') -contains "$($target.role)"))) {
     $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = $(if ($target) { $target.parent } else { '' }); reason = "heal-respawn refused: '$HealRespawn' is a control-plane name/role, healed only through rotate.ps1" }
   } elseif (-not $target) {
     $report.respawnFailed += [pscustomobject]@{ name = $HealRespawn; jobId = $null; parent = ''; reason = 'heal-respawn: not an expected session (roster changed underfoot)' }
@@ -903,7 +903,7 @@ if ($Apply -and -not $script:RespawnStreakUnreadable -and $script:RespawnStreak.
 }
 
 # --- strays and cap ---
-$fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$'
+$fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$'
 $script:cleanupPendingAt = @{}
 try {
   foreach ($cpLine in @(Get-Content -LiteralPath "$FleetHome\state\sentinel\cleanup-pending.jsonl" -Encoding UTF8 -ErrorAction Stop)) {
