@@ -293,7 +293,7 @@ function boundedFailures({ root, tenant, number, issue, row, open, entries, proj
 function ghEdit({ runner, tenantConfig, number, edits }) {
   const args = ['issue', 'edit', String(number), '-R', String(tenantConfig.github)];
   for (const [flag, label] of edits) args.push(flag, label);
-  runner('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
+  runner('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 });
 }
 
 // The Central wall clock of an instant, for pages and the summary: 2026-09-29 12:00 Central.
@@ -519,7 +519,7 @@ function queryEscapeBugs({ repo, runner = execFileSync } = {}) {
   const [owner, name] = String(repo || '').split('/');
   if (!owner || !name) throw new WorkStateError('INVALID_GITHUB_QUERY', `repo must be owner/name: ${repo}`);
   let result;
-  try { result = JSON.parse(runner('gh', ['api', 'graphql', '-f', `query=${ESCAPE_QUERY}`, '-f', `owner=${owner}`, '-f', `name=${name}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 })); } catch (error) {
+  try { result = JSON.parse(runner('gh', ['api', 'graphql', '-f', `query=${ESCAPE_QUERY}`, '-f', `owner=${owner}`, '-f', `name=${name}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 })); } catch (error) {
     throw new WorkStateError('GITHUB_QUERY_FAILED', String(error.stderr || error.message || error));
   }
   const nodes = result && result.data && result.data.repository && result.data.repository.issues && result.data.repository.issues.nodes;

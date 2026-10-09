@@ -953,7 +953,7 @@ function verifyPullRequests(records, tenantConfigs) {
     }
     try {
       const raw = execFileSync('gh', ['pr', 'list', '-R', config.github, '--state', 'all', '--limit', '1000', '--json', 'number,state,mergedAt'], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000,
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000,
       });
       const listed = JSON.parse(raw);
       const byNumber = new Map(listed.map((item) => [Number(item.number), item]));

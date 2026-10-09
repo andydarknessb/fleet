@@ -47,7 +47,7 @@ function config(base) {
 }
 
 function defaultGh(args) {
-  return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000 });
+  return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 30000 });
 }
 
 function picksFile(base) { return path.join(base, 'state', 'second-read', 'picks.jsonl'); }

@@ -424,7 +424,7 @@ function queryGithubIssues({ repo, executable = 'gh', runner = execFileSync } = 
     do {
       const queryArgs = ['api', 'graphql', '-f', `query=${ISSUE_QUERY}`, '-f', `owner=${owner}`, '-f', `name=${name}`];
       if (cursor) queryArgs.push('-f', `cursor=${cursor}`); else queryArgs.push('-F', 'cursor=null');
-      const raw = runner(executable, queryArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
+      const raw = runner(executable, queryArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 });
       const result = JSON.parse(raw);
       const page = result?.data?.repository?.issues;
       if (!Array.isArray(page?.nodes)) throw new Error('GitHub GraphQL issue query did not return nodes');
@@ -684,7 +684,7 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
   } else {
     const repo = readTenantConfig(root, tenant, tenantConfigPath).github;
     try {
-      body = JSON.parse(runner('gh', ['issue', 'view', String(number), '-R', String(repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 })).body;
+      body = JSON.parse(runner('gh', ['issue', 'view', String(number), '-R', String(repo), '--json', 'body'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 })).body;
     } catch (error) {
       throw new WorkStateError('GITHUB_QUERY_FAILED', String(error.stderr || error.message || error));
     }
@@ -919,7 +919,7 @@ function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_
 function ghIssueWriter({ repo, runner }) {
   const run = (args, input) => {
     try {
-      runner('gh', args, { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 });
+      runner('gh', args, { encoding: 'utf8', input, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 });
     } catch (error) {
       throw new WorkStateError('GITHUB_WRITE_FAILED', String(error.stderr || error.message || error).trim());
     }

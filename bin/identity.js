@@ -208,7 +208,7 @@ function checkSessionIdentity({ sessionLogin, tenant } = {}) {
 }
 
 function defaultGhUser() {
-  return execFileSync(process.env.FLEET_GH || 'gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000 }).trim();
+  return execFileSync(process.env.FLEET_GH || 'gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 }).trim();
 }
 
 const FLAGS = { check: ['root', 'tenant', 'login'], plan: ['root'] };

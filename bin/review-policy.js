@@ -433,7 +433,7 @@ function reviewStatusFor(artifact, artifactPath) {
 function defaultGh(args) {
   // FLEET_GH names another executable (the tests use one that always fails).
   return execFileSync(process.env.FLEET_GH || 'gh', args, {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000, maxBuffer: 16 * 1024 * 1024,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000, maxBuffer: 64 * 1024 * 1024,
   });
 }
 

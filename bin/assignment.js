@@ -509,7 +509,7 @@ function queryGithubIssues({ repo, readyLabel, executable = 'gh', runner = execF
       do {
         const queryArgs = ['api', 'graphql', '-f', `query=${query}`, '-f', `owner=${owner}`, '-f', `name=${name}`];
         if (cursor) queryArgs.push('-f', `cursor=${cursor}`); else queryArgs.push('-F', 'cursor=null');
-        const raw = runner(executable, queryArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 });
+        const raw = runner(executable, queryArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000 });
         const result = JSON.parse(raw);
         const page = result?.data?.repository?.issues;
         if (!Array.isArray(page?.nodes)) throw new Error('GitHub GraphQL issue query did not return nodes');
@@ -529,7 +529,7 @@ function queryGithubIssues({ repo, readyLabel, executable = 'gh', runner = execF
         commentsTruncated: Boolean(issue.comments?.pageInfo?.hasNextPage),
       }));
     }
-    const raw = runner(executable, ['issue', 'list', '-R', String(repo), '--state', 'open', '--limit', '100', '--json', 'number,title,url,body,createdAt,state,labels,assignees'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 });
+    const raw = runner(executable, ['issue', 'list', '-R', String(repo), '--state', 'open', '--limit', '100', '--json', 'number,title,url,body,createdAt,state,labels,assignees'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000 });
     const issues = JSON.parse(raw);
     if (!Array.isArray(issues)) throw new Error('GitHub issue list did not return an array');
     return issues.map((issue) => ({ ...issue, bodyHash: sha256(issue.body || '') }));
