@@ -1952,7 +1952,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ((@($rp9a.newlyPaged | Where-Object { $_.key -eq 'fleet-dead' })[0]).priority -eq 'high') 'the first fleet-dead page under the real config must be high'
     Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $rp7Delivered + '","lastSeen":"' + $rp7Delivered + '","detail":"stale","deliveredAt":"' + $rp7Delivered + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
     $rp9 = Run-Watchdog
-    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'emergency') 'the repeat under the real config must be emergency (#206)'
+    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'high') 'the repeat under the real config is high until #302 lands (#206 check, 2026-10-09)'
     Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   } finally {
