@@ -607,7 +607,9 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     if (row && row.outcome && ['endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized && labels.has(marker)
       && (row.outcome.kind === 'endorsed-with-edits' || new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000)) {
       const verdict = newestVerdict(issue, fleetIdentity, row.proposed ? row.proposed.at : '');
-      endorsements.push({ kind: 'endorsement', number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling, apply the labels, record finalized' });
+      // The owner commented after the Endorsement (the door's row comes just before its Verdict comment): his words may carry the edits.
+      const spokeAfter = ownerComments.filter((comment) => comment.createdAt > (verdict ? verdict.comment.createdAt : row.outcome.at)).pop();
+      endorsements.push({ kind: 'endorsement', ...(spokeAfter ? { ownerCommentUrl: spokeAfter.url } : {}), number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling only if none is newer than the Verdict, apply the labels, record finalized' });
       continue;
     }
 
@@ -896,30 +898,46 @@ function verdictDoor({ root, tenant, issue: issueValue, kind, text = '', edits, 
   const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
   const row = projection.byIssue[number] || null;
   const earlier = [];
-  if (kind === 'returned' && entries.some((entry) => entry.kind === 'returned' && Number(entry.issue) === number)) {
+  // A Return counts against this proposal's body only, and only since the issue was last finalized: a changed body, or a
+  // ticket finalized and later reopened, is a fresh round.
+  const lastFinalized = entries.filter((entry) => entry.kind === 'finalized' && Number(entry.issue) === number).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  const openHash = row && row.proposed ? row.proposed.bodyHash : null;
+  const loadFound = () => {
+    const all = given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner }));
+    return all.map((entry) => entry.number !== undefined && entry.comments && Array.isArray(entry.labels) && entry.bodyHash ? entry : normalizeIssue(entry)).find((entry) => entry.number === number);
+  };
+  const writer = fixture ? fixtureIssueWriter({ file: fixture, author: fleetIdentity || 'fleet', at }) : ghIssueWriter({ repo: tenantConfig.github, runner });
+  const postVerdict = (entry) => {
+    try { writer.comment(number, verdictCommentBody({ kind, edits, reason, question, text: kind === 'returned' && !text0.trim() ? reasons : text0 })); } catch (error) {
+      throw new WorkStateError('GITHUB_WRITE_FAILED', `the ${kind} of #${number} is recorded, but posting its Verdict comment failed (${String(error.message || error).slice(0, 200)}); run the same verdict command again: it posts the missing comment and records nothing twice`, { issue: number, entry });
+    }
+  };
+  // A retry after a failed post: the door's own row for THIS kind stands at the issue's current body and no Verdict follows
+  // the proposal, so the missing comment is posted. Nothing is recorded or paged again.
+  const kept = row && row.proposed ? (kind === 'returned' ? row.returned : (row.outcome && row.outcome.kind === kind ? row.outcome : null)) : null;
+  if (kept && kept.actor === ARBITER_ACTOR) {
+    const present = loadFound();
+    if (present && present.bodyHash === kept.bodyHash && !newestVerdict(present, fleetIdentity, row.proposed.at)) {
+      postVerdict(kept);
+      return { tenant: String(tenant), issue: number, kind, at, source: fixture ? 'fixture' : 'github', recorded: true, commented: true, paged: false, recovered: true, entry: kept };
+    }
+  }
+  if (kind === 'returned' && entries.some((entry) => entry.kind === 'returned' && Number(entry.issue) === number && entry.bodyHash === openHash && String(entry.at) > lastFinalized)) {
     earlier.push({ code: 'returned-once', detail: `issue #${number} has already been Returned once; a second Return is an escalation: use --kind escalated --reason disagreement` });
   }
   if (!row || !row.proposed || row.outcome) throw verdictRefused([...earlier, { code: 'no-open-proposal', detail: `issue #${number} has no open proposal in the ledger (none recorded, or its outcome is already recorded)` }]);
-  const all = given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner }));
-  const found = all.map((entry) => entry.number !== undefined && entry.comments && Array.isArray(entry.labels) && entry.bodyHash ? entry : normalizeIssue(entry)).find((entry) => entry.number === number);
+  const found = loadFound();
   if (!found) throw verdictRefused([...earlier, { code: 'no-open-proposal', detail: `issue #${number} is not among ${tenant}'s open issues` }]);
   const failures = [...earlier, ...verdictBlockers({ issue: found, row, config, owner, fleetIdentity, held: readHeldIssues(root, tenant, at) })];
   if (failures.length) throw verdictRefused(failures);
 
   const open = row.proposed;
-  const body = verdictCommentBody({ kind, edits, reason, question, text: kind === 'returned' && !text0.trim() ? reasons : text0 });
   const result = { tenant: String(tenant), issue: number, kind, at, source: fixture ? 'fixture' : 'github', recorded: false, commented: false, paged: false };
   const claim = () => {
     // TRIAGE_ALREADY_DECIDED (an Approval or another verdict won the claim) propagates as it is.
     return recordEntry({ root, tenant, kind, issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, edits, reasons: kind === 'returned' ? (reasons || text0) : undefined, reason: kind === 'escalated' ? reason : undefined, question, actor: ARBITER_ACTOR, now: at });
   };
-  const writer = fixture ? fixtureIssueWriter({ file: fixture, author: fleetIdentity || 'fleet', at }) : ghIssueWriter({ repo: tenantConfig.github, runner });
-  const post = () => {
-    try { writer.comment(number, body); } catch (error) {
-      throw new WorkStateError('GITHUB_WRITE_FAILED', `the ${kind} of #${number} is recorded, but posting the Verdict comment failed (${String(error.message || error).slice(0, 200)}); post it by hand: the frontier no longer lists the issue`, { issue: number, entry: result.entry });
-    }
-    result.commented = true;
-  };
+  const post = () => { postVerdict(result.entry); result.commented = true; };
 
   if (kind === 'escalated') {
     const page = {
@@ -1310,10 +1328,13 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
       if (!verdict) { leave('no-verdict', 'the endorsement is recorded but no Verdict comment from the fleet identity follows the proposal'); continue; }
       if (!verdict.exact) { leave('not-exact-endorsement'); continue; }   // clause 2
       const decided = verdict.comment;
-      if (issue.comments.some((comment) => comment.createdAt > decided.createdAt && RULING_HEADING_RE.test(comment.body))) { leave('ruling-already-posted'); continue; }   // clause 3
-      if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > decided.createdAt)) { leave('owner-commented-after-approval'); continue; }
+      // Clause 3 differs from an Approval's: the claim is already ours, so a Ruling newer than the Verdict is a run that died
+      // after posting it. complete() posts none when one stands and finishes the labels and the finalized row.
+      const ruled = issue.comments.some((comment) => comment.createdAt > decided.createdAt && RULING_HEADING_RE.test(comment.body));
+      if (!ruled && issue.comments.some((comment) => comment.author === owner && comment.createdAt > decided.createdAt)) { leave('owner-commented-after-approval'); continue; }
       const proposal = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
-      const failures = proposalGate({ issue, row: { ...row, outcome: null }, proposal, approval: decided, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });   // clauses 1, 4-9
+      // A Ruling already stands: the gate passed in the run that posted it (and its relabel may have removed the marker), so only finish.
+      const failures = ruled ? (proposal ? [] : [{ code: 'stale-proposal', detail: 'recovery: proposal comment not found' }]) : proposalGate({ issue, row: { ...row, outcome: null }, proposal, approval: decided, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });   // clauses 1, 4-9
       if (failures.length) { leave(failures[0].code, failures[0].detail); continue; }
       if (claims >= FINALIZE_CAP) { leave('cap'); continue; }   // clause 10
       claims += 1;
@@ -1445,6 +1466,7 @@ function cli(argv) {
   }
   if (command === 'record') {
     if (args.now && Date.parse(args.now) > Date.now() + 5 * 60000) throw new WorkStateError('USAGE', 'record --now is in the future: the ledger\'s time is the wall clock, and a later time would put a proposal after the comments it should answer to');
+    if (ARBITER_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is the Arbiter's verdict, written only by its door (triage.js verdict), which checks what it records`);
     if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto, bounded-scan), which checks what it records`);
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,

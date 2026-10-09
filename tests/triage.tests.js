@@ -2313,8 +2313,10 @@ test('ADR 0017 CLI: frontier --role arbiter and verdict run through cli(), princ
   assert.match(world.fixtureIssue().comments.pop().body, /^## Verdict\nReturned\n1\. Premise 2 is false\./);
   assert.throws(() => cli(['verdict', ...common, '--issue', '40', '--kind', 'returned', '--reasons-file', reasons]), { code: 'VERDICT_REFUSED' });
   assert.throws(() => cli(['verdict', '--root', world.root, '--tenant', 'endzone', '--issue', '40', '--kind', 'endorsed', '--now', NOW]), { code: 'USAGE' });
-  const record = cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', 'escalated', '--issue', '40', '--body-hash', 'h', '--comment-url', 'https://x/1', '--reason', 'rule-change', '--question', 'Edit CLAUDE.md?']);
-  assert.deepEqual([record.kind, record.actor, record.reason, record.question], ['escalated', 'arbiter', 'rule-change', 'Edit CLAUDE.md?']);
+  // Only the door writes a verdict kind: `record` refuses all four, as it refuses the bounded kinds.
+  for (const kind of ['endorsed', 'endorsed-with-edits', 'returned', 'escalated']) {
+    assert.throws(() => cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', kind, '--issue', '40', '--body-hash', 'h', '--comment-url', 'https://x/1', '--edits', 'e', '--reasons', 'r', '--reason', 'rule-change', '--question', 'Edit CLAUDE.md?']), { code: 'USAGE', message: /only by its door/ }, kind);
+  }
 });
 
 test('boundedScan reads the bug list with a 64 MiB maxBuffer (spawnSync gh ENOBUFS at the 1 MiB default)', () => {
@@ -2325,4 +2327,93 @@ test('boundedScan reads the bug list with a 64 MiB maxBuffer (spawnSync gh ENOBU
   assert.equal(seen.length, 1);
   assert.equal(seen[0].exe, 'gh');
   assert.ok(seen[0].options.maxBuffer >= 64 * 1024 * 1024, 'the gh call must raise maxBuffer');
+});
+
+// ADR 0017 (opus review of PR B).
+const editFixture = (world, change) => {
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  change(issues[0]);
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+};
+const RULING_AT = '2026-09-12T12:00:30.000Z';
+const earlyRuling = { id: 'ruling-first', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling-first', author: FLEET, body: '## Ruling\nEndorsed without edits.', createdAt: RULING_AT };
+
+test('review 1: a retried finalize of an exact Endorsed whose first run died after the Ruling posts no second Ruling and finishes', () => {
+  const died = arbiterWorld();
+  died.door({ kind: 'endorsed' });
+  editFixture(died, (target) => target.comments.push(earlyRuling));
+  const result = died.finalize();
+  assert.deepEqual(result.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(result.left, []);
+  assert.equal(rulingsOn(died.fixtureIssue()).length, 1, 'no second Ruling');
+  assert.deepEqual([...died.fixtureIssue().labels].sort(), ['bug', 'needs-triage', 'ready-for-agent']);
+  assert.deepEqual(died.ledger().slice(1).map((row) => [row.kind, row.actor]), [['endorsed', 'arbiter'], ['finalized', 'finalize-script']]);
+  // It died after the relabel too (marker already gone): only the finalized row is missing.
+  const relabelled = arbiterWorld();
+  relabelled.door({ kind: 'endorsed' });
+  editFixture(relabelled, (target) => { target.comments.push(earlyRuling); target.labels = ['needs-triage', 'bug', 'ready-for-agent']; });
+  assert.deepEqual(relabelled.finalize().finalized.map((row) => row.issue), [40]);
+  assert.equal(rulingsOn(relabelled.fixtureIssue()).length, 1);
+  assert.equal(relabelled.ledger().pop().kind, 'finalized');
+  // The Principal's item says so.
+  const stale = arbiterWorld();
+  stale.door({ kind: 'endorsed', now: '2026-09-12T11:00:00.000Z' });
+  const [item] = computeFrontier({ root: stale.root, tenant: 'endzone', fixture: stale.fixture, now: NOW }).eligible;
+  assert.match(item.reason, /post the Ruling only if none is newer than the Verdict/);
+});
+
+test('review 2: record refuses the four verdict kinds from the CLI, but the door still writes them', () => {
+  const world = arbiterWorld();
+  const common = ['--root', world.root, '--tenant', 'endzone', '--issue', '40', '--body-hash', 'h', '--comment-url', 'https://x/1'];
+  for (const kind of triage.ARBITER_KINDS) assert.throws(() => cli(['record', ...common, '--kind', kind, '--edits', 'e', '--reasons', 'r', '--reason', 'money', '--question', 'q']), { code: 'USAGE' }, kind);
+  assert.deepEqual(world.rows(), []);
+  assert.equal(world.door().recorded, true);
+});
+
+test('review 3: a retried verdict after a failed comment post posts the missing comment and records nothing twice', () => {
+  const world = arbiterWorld();
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const failing = (exe, args) => { if (args[0] === 'issue' && args[1] === 'comment') throw Object.assign(new Error('gh: 502'), { stderr: 'HTTP 502' }); return ''; };
+  const live = { issues, runner: failing };   // no fixture: the comment goes through gh
+  const error = (() => { try { world.door({ ...live, fixture: undefined }); } catch (e) { return e; } return null; })();
+  assert.equal(error.code, 'GITHUB_WRITE_FAILED');
+  assert.doesNotMatch(error.message, /by hand/);
+  assert.match(error.message, /run the same verdict command again/);
+  assert.equal(world.rows().length, 1, 'the row stands');
+  const posted = [];
+  const working = (exe, args, options) => { if (args[0] === 'issue' && args[1] === 'comment') posted.push(options.input); return ''; };
+  const retried = world.door({ issues, runner: working, fixture: undefined, kind: 'endorsed', text: 'Premises:\n  x' });
+  assert.equal(retried.recovered, true);
+  assert.equal(posted.length, 1);
+  assert.match(posted[0], /^## Verdict\nEndorsed\nPremises:/);
+  assert.equal(world.rows().length, 1, 'no second row');
+  // With the Verdict on the thread the same command is refused as decided.
+  const withVerdict = issues.map((entry) => ({ ...entry, comments: [...entry.comments, verdictComment(40, '## Verdict\nEndorsed', '2026-09-12T12:00:00.000Z')] }));
+  refusedWith(() => world.door({ issues: withVerdict, runner: working, fixture: undefined }), 'no-open-proposal');
+  assert.equal(posted.length, 1);
+});
+
+test('review 4: returned-once counts only Returns at this proposal\'s body since the last finalize', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'returned', reasons: '1. no', text: '1. no' });
+  const oldHash = triage.normalizeIssue(world.fixtureIssue()).bodyHash;
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: oldHash, now: '2026-09-12T12:01:00.000Z' });
+  // The body changes, and the Principal proposes again at the new body.
+  const newBody = 'Body of #40 rewritten\n\n## Premises\n\nsrc/list.js: slices one short @abcdef1\n';
+  const second = '2026-09-12T12:02:00.000Z';
+  editFixture(world, (target) => { target.body = newBody; target.comments.push({ id: 'second', url: 'https://github.com/owner/repo/issues/40#issuecomment-second', author: FLEET, body: OPEN_PROPOSAL, createdAt: second }); });
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: triage.normalizeIssue(world.fixtureIssue()).bodyHash, commentUrl: 'https://github.com/owner/repo/issues/40#issuecomment-second', model: 'opus-5.5', now: second });
+  const later = '2026-09-12T12:03:00.000Z';
+  assert.equal(world.door({ kind: 'returned', reasons: '1. still no', text: '1. still no', now: later }).recorded, true, 'a Return at a different body is a fresh round');
+});
+
+test('review 5: an endorsement item carries ownerCommentUrl when the owner commented after the Endorsement', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'endorsed-with-edits', edits: 'tier haiku', now: '2026-09-12T11:59:00.000Z' });
+  const [plain] = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
+  assert.equal(plain.ownerCommentUrl, undefined);
+  editFixture(world, (target) => target.comments.push({ id: 'owner-late', url: 'https://github.com/owner/repo/issues/40#issuecomment-owner-late', author: OWNER, body: 'Also use the shared helper.', createdAt: '2026-09-12T12:00:05.000Z' }));
+  const [spoke] = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
+  assert.equal(spoke.kind, 'endorsement');
+  assert.equal(spoke.ownerCommentUrl, 'https://github.com/owner/repo/issues/40#issuecomment-owner-late');
 });

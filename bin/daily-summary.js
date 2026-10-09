@@ -113,13 +113,34 @@ function windowedReadies({ root, now }) {
   return lines;
 }
 
-// ADR 0017: the Arbiter's last 24 hours per tenant, from the triage ledger: how many it endorsed, endorsed with
+// ADR 0017: the Arbiter's activity per tenant since the last SENT summary (24 hours when none has been sent), from the triage ledger: how many it endorsed, endorsed with
 // edits, returned and escalated, each escalation with its class and question (the owner's to answer), and whether
 // state/flags/arbiter-suspended-<tenant> stands (only Cory removes it). A tenant the Arbiter did nothing for, and
 // is not suspended, adds no line. Endorsements reach the owner only here (ADR 0017, decision 4).
+function sentStatePath(base) { return path.join(base, 'state', 'notify', 'daily-summary.json'); }
+
+// The instant the last summary was actually SENT (null when none has been), so a quiet day's Arbiter activity, which
+// does not page, appears in the next summary that does.
+function lastSentAt(base) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(sentStatePath(base), 'utf8'));
+    const ms = new Date(parsed.lastSentAt).getTime();
+    return Number.isFinite(ms) ? ms : null;
+  } catch { return null; }
+}
+
+function recordSent(base, at) {
+  try {
+    fs.mkdirSync(path.dirname(sentStatePath(base)), { recursive: true });
+    fs.writeFileSync(sentStatePath(base), `${JSON.stringify({ schemaVersion: 1, lastSentAt: new Date(at || Date.now()).toISOString() })}
+`, 'utf8');
+  } catch { /* the marker is a convenience: losing it widens the next window to 24 h, never loses a page */ }
+}
+
 function arbiterLines({ root, now }) {
   const base = baseOf(root);
-  const sinceMs = new Date(now || Date.now()).getTime() - 86400000;
+  const sent = lastSentAt(base);
+  const sinceMs = sent !== null ? sent : new Date(now || Date.now()).getTime() - 86400000;
   const names = new Set(Object.keys(workState.readTenantConfigs(base)));
   try { for (const name of fs.readdirSync(path.join(base, 'state', 'triage'))) if (name.endsWith('.jsonl')) names.add(name.slice(0, -'.jsonl'.length)); } catch { /* no ledger yet */ }
   const lines = [];
@@ -127,12 +148,12 @@ function arbiterLines({ root, now }) {
   for (const tenant of [...names].sort()) {
     let entries = [];
     try { entries = readLedger(base, tenant); } catch { continue; }
-    const recent = entries.filter((entry) => ARBITER_KINDS.includes(entry.kind) && new Date(entry.at).getTime() >= sinceMs);
+    const recent = entries.filter((entry) => ARBITER_KINDS.includes(entry.kind) && new Date(entry.at).getTime() > sinceMs);
     const count = (kind) => recent.filter((entry) => entry.kind === kind).length;
     const suspended = fs.existsSync(path.join(base, 'state', 'flags', `arbiter-suspended-${tenant}`));
     if (!recent.length && !suspended) continue;
     if (suspended) anySuspended = true;
-    lines.push(`Arbiter ${tenant}, last 24 h: ${count('endorsed')} endorsed, ${count('endorsed-with-edits')} endorsed with edits, ${count('returned')} returned, ${count('escalated')} escalated.`);
+    lines.push(`Arbiter ${tenant}, ${sent !== null ? 'since the last summary' : 'last 24 h'}: ${count('endorsed')} endorsed, ${count('endorsed-with-edits')} endorsed with edits, ${count('returned')} returned, ${count('escalated')} escalated.`);
     for (const entry of recent.filter((row) => row.kind === 'escalated')) lines.push(`Arbiter escalated ${tenant} #${entry.issue} (${entry.reason}): ${String(entry.question || '').replace(/\s+/g, ' ').slice(0, 300)}`);
     if (suspended) lines.push(`Arbiter is suspended for ${tenant}: it posts no verdict and proposals wait for an Approval. Removing state/flags/arbiter-suspended-${tenant} lifts it.`);
   }
@@ -225,6 +246,7 @@ function runDailySummary(options = {}) {
   let result;
   try { result = send(summary); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
   const ok = Boolean(result && result.ok);
+  if (ok) recordSent(base, options.now);
   return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice, ...boundedScan, ...arbiterScan };
 }
 
