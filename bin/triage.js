@@ -1189,7 +1189,7 @@ function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_
   if (issue.bodyHash !== proposed.bodyHash) fail('body-changed');   // clause 6
   else if (!PREMISES_HEADING_RE.test(issue.body)) fail('no-premises-heading');
   const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant: tenant || tenantConfig.name, outbox, consumedThrough, history });   // clause 7
-  const answered = endorsed && Boolean(proposed.recordId);   // #305: only an Endorsement of a proposal recorded against its wake answers it
+  const answered = endorsed && Boolean(proposed.recordId) && parseRecordIssue(proposed.recordId).issue === issue.number;   // #305: only an Endorsement of a proposal recorded against this issue's wake answers it
   if (escalation && !answered) fail('escalation', escalation);
   if (identified) for (const code of proposalRefusals(proposal.body)) fail(code);   // clause 8
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';

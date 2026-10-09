@@ -2456,6 +2456,14 @@ test('fleet #305: an exact Endorsed on an escalation ruling the wake flags but t
   assert.match(served[0].reason, /finalize script declined \(escalation/);
 });
 
+test('fleet #305: a record id naming another issue does not answer this one: the Endorsement is left with reason escalation', () => {
+  const world = arbiterWorld({ each: () => ({ recordId: 'endzone:issue-99', labels: ESCALATION_LABELS }) });
+  world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'escalation');
+});
+
 test("fleet #305: the owner's exact Approved on an escalation ruling is still left with reason escalation", () => {
   const world = finalizeWorld({ each: () => ({ recordId: 'endzone:issue-40' }) });
   assert.deepEqual(world.finalize().finalized, []);

@@ -142,5 +142,7 @@ Decided:
   wait their tick or the 30-minute return as before. A Ruling newer than the
   Verdict that the script did not write is the Principal's: the script leaves
   it.
-- A hold on a ticket after its Endorsement (`held`, `haiku-rehearsal`) is
-  Cory's; the Principal does not finalize over it.
+- A hold on a ticket after its Endorsement (`held`, `haiku-rehearsal`, a
+  frontier exclusion) is Cory's; the Principal does not finalize over it. The
+  record id must name the issue it is recorded on; one naming another issue
+  answers nothing and fails closed.
