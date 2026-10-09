@@ -130,11 +130,16 @@ if (-not $watchOff) {
   } catch {}
 }
 $prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName,statusCheckRollup 2>$null
-$awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @(); $recordLag = @(); $noRecord = @()
+$unparked = @(); $awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @(); $recordLag = @(); $noRecord = @()
 foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   if ($pr.isDraft -or -not $pr.headRefName.StartsWith($t.branchPrefix)) { continue }
   $n = [int]$pr.number
-  if ($heldPrs.ContainsKey($n)) { $held += $n; continue }
+  if ($heldPrs.ContainsKey($n)) {
+    # A PR held for Cory whose Work record is still in review reads as fleet work to the watchdog (fleet-dead):
+    # the lead parks the record with review-policy.js hold, never ends its turn on the skip entry alone.
+    if (-not $watchOff -and $recordsByPr.ContainsKey($n) -and "$($recordsByPr[$n].state)" -eq "review") { $unparked += "#$n ($($recordsByPr[$n].id) revision $($recordsByPr[$n].revision))" }
+    $held += $n; continue
+  }
   $checkState = Get-CheckPolicyEvaluation $checkPolicy @($pr.statusCheckRollup)
   foreach ($finding in $checkState.WatchedFindings) { $watchedFindings += "#$n/$($finding.Name)=$($finding.Conclusion)" }
   if ($checkState.GatePending.Count -gt 0) { $waitingOnCi += $n; continue }
@@ -154,6 +159,7 @@ if ($awaiting.Count -gt 0) {
   if ($watchedFindings.Count -gt 0) { $reason += "; watched finding(s), not gates: $($watchedFindings -join ', ')" }
   Continue-With "$reason$lagNote"
 }
+if ($unparked.Count -gt 0) { Continue-With "held PR(s) whose Work record is still in review: $($unparked -join ', '). If it is reviewed clean and waits only on Cory's merge, park it with 'node $home_\bin\review-policy.js hold --id <record> --expected-revision <revision> --reason <why>' (one-way: it leaves only by his merge); otherwise escalate it with 'work-state.js transition --to escalated' (agents/project-lead.md, Hold and the escalation door), then stop" }
 
 # --- capacity ---
 $roster = $null
