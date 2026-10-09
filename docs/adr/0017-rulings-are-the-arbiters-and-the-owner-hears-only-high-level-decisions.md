@@ -111,3 +111,38 @@ asked to hear only high-level decisions.
   files, launch door, config, hook role lists), PR B (`triage.js`, watchdog,
   daily summary, Principal frontier), PR C (guard hook, suspension scan), and
   one docs PR per tenant.
+
+## Amendment 2026-10-09 - an exact Endorsed on an escalation ruling is the script's (fleet #305)
+
+Endzone #2139, an escalation ruling (the Principal's proposal answering
+`pl-endzone`'s `decision-needed` wake), was Endorsed exactly at 15:06Z and
+ruled only at 15:36Z, by the Principal's hand. Decision 2 says an exact
+`Endorsed` is finalized by script within a tick; the finalize gate's clause 7
+(#207) refused every escalation ruling, and the Principal's frontier treated
+the refusal as a script that had died, returning the item only after the
+30-minute claim expiry. Clause 7 guarded the one step the script cannot take
+on the owner's `Approved`: waking the lead. On an Endorsement the Arbiter sends
+that wake itself after its Verdict (`agents/arbiter.md`), so nothing is left to
+judgment.
+
+Decided:
+
+- An exact `Endorsed` on an escalation ruling recorded against its wake
+  (`--record-id`, the flag the Arbiter's frontier shows as `escalation: true`
+  and sends the lead's line on) is finalized by script. For the `endorsed`
+  branch alone, clause 7 does not refuse such a proposal, and clause 9 accepts
+  the ready label and the escalation label on it (the ticket is mid-work by
+  design); every other clause stands. An escalation ruling the wake checks
+  flag without a record id still fails closed to the Principal, who wakes the
+  lead. The owner's exact `Approved` on an escalation ruling is unchanged.
+- An exact Endorsement the script declines (a gate clause fails, or the owner
+  spoke after the Verdict) is the Principal's at once: the frontier serves the
+  `endorsement` item naming the clause, unless the ticket is on hold, which
+  waits on Cory. A Verdict not yet posted, a cap, and a Ruling already posted
+  wait their tick or the 30-minute return as before. A Ruling newer than the
+  Verdict that the script did not write is the Principal's: the script leaves
+  it.
+- A hold on a ticket after its Endorsement (`held`, `haiku-rehearsal`, a
+  frontier exclusion) is Cory's; the Principal does not finalize over it. The
+  record id must name the issue it is recorded on; one naming another issue
+  answers nothing and fails closed.

@@ -2336,7 +2336,7 @@ const editFixture = (world, change) => {
   fs.writeFileSync(world.fixture, JSON.stringify(issues));
 };
 const RULING_AT = '2026-09-12T12:00:30.000Z';
-const earlyRuling = { id: 'ruling-first', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling-first', author: FLEET, body: '## Ruling\nEndorsed without edits.', createdAt: RULING_AT };
+const earlyRuling = { id: 'ruling-first', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling-first', author: FLEET, body: '## Ruling\nEndorsed without edits. Finalized by script (fleet #207).', createdAt: RULING_AT };
 
 test('review 1: a retried finalize of an exact Endorsed whose first run died after the Ruling posts no second Ruling and finishes', () => {
   const died = arbiterWorld();
@@ -2416,4 +2416,141 @@ test('review 5: an endorsement item carries ownerCommentUrl when the owner comme
   const [spoke] = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
   assert.equal(spoke.kind, 'endorsement');
   assert.equal(spoke.ownerCommentUrl, 'https://github.com/owner/repo/issues/40#issuecomment-owner-late');
+});
+
+// fleet #305: an Arbiter-endorsed escalation ruling is finalized by the script, and a declined Endorsement reaches the Principal at once.
+const ESCALATION_LABELS = ['needs-triage', 'triage-proposed', 'ready-for-agent', 'fleet-escalation'];
+const ENDORSE_TEXT = 'Premises:\n  src/list.js: slices one short @abcdef1 verified @abcdef2';
+const ESCALATION_WAKE = { at: '2026-09-09T00:00:00.000Z', recordId: 'endzone:issue-40', wake: 'decision-needed', evidence: 'stuck' };
+
+test('fleet #305: an exact Endorsed on an escalation ruling recorded against its wake (recordId) is finalized by script', () => {
+  for (const [name, options] of [['recordId', { each: () => ({ recordId: 'endzone:issue-40', labels: ESCALATION_LABELS }) }]]) {
+    const world = arbiterWorld(options);
+    world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+    const result = world.finalize();
+    assert.deepEqual(result.finalized.map((row) => row.issue), [40], name);
+    assert.deepEqual(result.left, [], name);
+    const after = world.fixtureIssue();
+    const verdict = after.comments.find((entry) => /^## Verdict/.test(entry.body));
+    assert.equal(rulingsOn(after).length, 1, name);
+    assert.equal(rulingsOn(after)[0].body.split('\n')[0], '## Ruling', name);
+    assert.equal(rulingsOn(after)[0].body.split('\n')[1], `Endorsed without edits: ${verdict.url}. Finalized by script (fleet #207).`, name);
+    assert.deepEqual([...after.labels].sort(), ['bug', 'fleet-escalation', 'needs-triage', 'ready-for-agent'], name);
+    assert.deepEqual(world.ledger().slice(1).map((row) => [row.kind, row.actor]), [['endorsed', 'arbiter'], ['finalized', 'finalize-script']], name);
+    assert.deepEqual(world.finalize().finalized, [], `${name}: a replay finalizes nothing`);
+    assert.equal(rulingsOn(world.fixtureIssue()).length, 1, name);
+    // The unconsumed wake itself still surfaces as its own escalation item; the endorsement does not come back.
+    assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible.filter((item) => item.kind !== 'escalation'), [], name);
+  }
+});
+
+test('fleet #305: an exact Endorsed on an escalation ruling the wake flags but that carries no recordId is left, and the frontier serves it at once', () => {
+  const world = arbiterWorld({ each: () => ({ labels: ESCALATION_LABELS }), outbox: [ESCALATION_WAKE] });
+  world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'escalation');
+  assert.equal(rulingsOn(world.fixtureIssue()).length, 0);
+  const served = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible.filter((item) => item.kind === 'endorsement');
+  assert.equal(served.length, 1);
+  assert.match(served[0].reason, /finalize script declined \(escalation/);
+});
+
+test('fleet #305: a record id naming another issue does not answer this one: the Endorsement is left with reason escalation', () => {
+  const world = arbiterWorld({ each: () => ({ recordId: 'endzone:issue-99', labels: ESCALATION_LABELS }) });
+  world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'escalation');
+});
+
+test("fleet #305: the owner's exact Approved on an escalation ruling is still left with reason escalation", () => {
+  const world = finalizeWorld({ each: () => ({ recordId: 'endzone:issue-40' }) });
+  assert.deepEqual(world.finalize().finalized, []);
+  assert.equal(world.finalize().left[0].reason, 'escalation');
+  const labelled = finalizeWorld({ each: () => ({ recordId: 'endzone:issue-40', labels: ESCALATION_LABELS }) });
+  assert.equal(labelled.finalize().left[0].reason, 'escalation');
+});
+
+test('fleet #305: an endorsed non-escalation proposal already carrying ready-for-agent is still left with reason labels', () => {
+  const world = arbiterWorld({ each: () => ({ labels: ['needs-triage', 'triage-proposed', 'ready-for-agent'] }) });
+  world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'labels');
+  assert.match(result.left[0].detail, /ready-for-agent/);
+});
+
+test('fleet #305: an exact endorsed row the script declines appears to the Principal at once; one the gate passes still waits 30 minutes', () => {
+  const frontier = (world, now = NOW) => computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now }).eligible;
+  // (a) a routing label on the issue fails clause 9.
+  const labelled = arbiterWorld({ each: () => ({ recordId: 'endzone:issue-40', labels: ['needs-triage', 'triage-proposed', 'needs-info'] }) });
+  labelled.door({ kind: 'endorsed', text: ENDORSE_TEXT, now: '2026-09-12T11:59:00.000Z' });
+  assert.equal(labelled.finalize().left[0].reason, 'labels');
+  const [declined] = frontier(labelled);
+  assert.equal(declined.kind, 'endorsement');
+  assert.equal(declined.withEdits, false);
+  assert.equal(declined.startAt, 'ruling');
+  assert.match(declined.reason, /finalize script declined \(labels/);
+  assert.match(declined.reason, /skip the claim step/);
+  // (b) the owner commented after the Verdict with no Ruling.
+  const spoke = arbiterWorld();
+  spoke.door({ kind: 'endorsed', text: ENDORSE_TEXT, now: '2026-09-12T11:59:00.000Z' });
+  const issues = JSON.parse(fs.readFileSync(spoke.fixture, 'utf8'));
+  issues[0].comments.push({ id: 'late', url: 'https://github.com/owner/repo/issues/40#issuecomment-late', author: OWNER, body: 'wait, hold on', createdAt: '2026-09-12T12:00:01.000Z' });
+  fs.writeFileSync(spoke.fixture, JSON.stringify(issues));
+  const [late] = frontier(spoke, '2026-09-12T12:01:00.000Z');
+  assert.equal(late.kind, 'endorsement');
+  assert.equal(late.withEdits, false);
+  assert.equal(late.startAt, 'ruling');
+  assert.match(late.reason, /declined \(owner-commented-after-approval\)/);
+  // The negative: a row the gate passes is the script's until it is 30 minutes old.
+  const passing = arbiterWorld({ each: () => ({ recordId: 'endzone:issue-40', labels: ESCALATION_LABELS }) });
+  passing.door({ kind: 'endorsed', text: ENDORSE_TEXT, now: '2026-09-12T11:50:00.000Z' });
+  assert.deepEqual(frontier(passing, '2026-09-12T12:10:00.000Z'), [], '20 minutes: the script has time');
+  assert.match(frontier(passing, '2026-09-12T12:30:00.000Z')[0].reason, /older than 30 minutes/);
+});
+
+test("fleet #305: the Principal's own Ruling after a declined Endorsement is left alone; a script-written one is finished", () => {
+  const world = arbiterWorld({ each: () => ({ labels: ['needs-triage', 'triage-proposed', 'needs-info'] }) });
+  world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  assert.equal(world.finalize().left[0].reason, 'labels');
+  const verdict = world.fixtureIssue().comments.find((entry) => /^## Verdict/.test(entry.body));
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  issues[0].comments.push({ id: 'principal-ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-principal-ruling', author: FLEET, body: '## Ruling\nKept on needs-info.', createdAt: '2026-09-12T12:00:30.000Z' });
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+  assert.ok('2026-09-12T12:00:30.000Z' > verdict.createdAt);
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'ruling-already-posted');
+  const after = world.fixtureIssue();
+  assert.ok(after.labels.includes('needs-info'));
+  assert.ok(!after.labels.includes('ready-for-agent'));
+  assert.ok(!after.labels.includes('bug'));
+  assert.ok(!world.ledger().some((row) => row.kind === 'finalized'));
+  // The positive: a Ruling the script wrote (it died before the relabel) is finished by the recovery path.
+  const recovery = arbiterWorld();
+  recovery.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  const rows = JSON.parse(fs.readFileSync(recovery.fixture, 'utf8'));
+  rows[0].comments.push({ id: 'script-ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-script-ruling', author: FLEET, body: '## Ruling\nEndorsed without edits. Finalized by script (fleet #207).\n\nbody', createdAt: '2026-09-12T12:00:30.000Z' });
+  fs.writeFileSync(recovery.fixture, JSON.stringify(rows));
+  assert.ok(recovery.fixtureIssue().labels.includes('triage-proposed'));
+  const done = recovery.finalize();
+  assert.deepEqual(done.finalized.map((row) => row.issue), [40]);
+  assert.equal(rulingsOn(recovery.fixtureIssue()).length, 1);
+  assert.ok(!recovery.fixtureIssue().labels.includes('triage-proposed'));
+});
+
+test('fleet #305: an exact Endorsed put on hold afterwards is not served to the Principal', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'endorsed', text: ENDORSE_TEXT });
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  issues[0].labels.push('haiku-rehearsal');
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.equal(result.left[0].reason, 'labels');
+  const frontier = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-12T12:01:00.000Z' });
+  assert.deepEqual(frontier.eligible, []);
+  assert.ok(frontier.skipped.some((entry) => entry.number === 40 && /on hold/.test(entry.reason)));
 });
