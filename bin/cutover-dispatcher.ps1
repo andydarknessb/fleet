@@ -59,9 +59,11 @@ if ($null -eq $lastRunAgeMin) { $reasons += 'no watchdog run recorded (state/wat
 elseif ($lastRunAgeMin -gt $freshRunMinutes) { $reasons += "last watchdog run is $lastRunAgeMin min old (> $freshRunMinutes); the supervisor is not ticking" }
 
 $daemon = @()
-try { $daemon = Get-DaemonSessions -All -Strict } catch { $reasons += "daemon session list unreadable: $($_.Exception.Message)" }
+$daemonError = $null
+try { $daemon = Get-DaemonSessions -All -Strict } catch { $daemonError = "daemon session list unreadable: $($_.Exception.Message)" }
 $dispatcherRow = $daemon | Where-Object { "$($_.name)" -eq 'dispatcher' -and $_.pid } | Sort-Object startedAt -Descending | Select-Object -First 1
-$boundaryReason = $null
+# An unreadable list is a boundary failure (the turn boundary cannot be seen), never one -Force overrides.
+$boundaryReason = $daemonError
 if ($dispatcherRow -and "$($dispatcherRow.status)" -eq 'busy') { $boundaryReason = "the dispatcher session (job $($dispatcherRow.id)) is busy mid-turn; retry at its next idle moment" }
 
 $gateFailures = @($reasons)
@@ -105,9 +107,5 @@ $record = [ordered]@{
 [IO.Directory]::CreateDirectory("$FleetHome\state\dispatcher") | Out-Null
 Write-Json $cutoverPath ([pscustomobject]$record)
 
-Write-Output 'Cut over. Paperwork for this release (by hand):'
-Write-Output '  - CONTEXT.md: rewrite the Dispatcher entry (retired actor; pages and the daily summary carry its duties).'
-Write-Output '  - README.md: the Shape diagram and the dispatcher rows now describe the rollback path.'
-Write-Output '  - roster.json: keep the dispatcher entry (and agents/dispatcher.md) for one release for bin\rollback-dispatcher.ps1, then delete them.'
-Write-Output '  - Watch bin\status.ps1: no dispatcher row and no missing-session line at the next tick.'
+Write-Output 'Cut over. Watch bin\status.ps1: no dispatcher row and no absent-session line at the next tick. The roster.json entry and agents/dispatcher.md stay one release for bin\rollback-dispatcher.ps1 (fleet #303 deletes them).'
 Emit ([ordered]@{ cutover = $true; forced = [bool]$Force; flag = $flagPath; retired = $retired; record = $cutoverPath }) 0

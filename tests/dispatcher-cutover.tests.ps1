@@ -114,7 +114,7 @@ try {
   Assert-True (-not (Test-Path "$testRoot\state\heartbeats\dispatcher.json")) 'retirement removes the dispatcher heartbeat'
   $record = (Get-Content "$testRoot\state\dispatcher\cutover.json" -Raw) | ConvertFrom-Json
   Assert-True ($record.notifierLive -eq $true -and $record.forced -eq $false -and @($record.rollbacks).Count -eq 0) 'the cutover record must carry the gate evidence and no rollbacks'
-  Assert-True ($lastOut -match 'CONTEXT.md') 'cutover must print the paperwork checklist'
+  Assert-True ($lastOut -match 'rollback-dispatcher') 'cutover must say what stays for the rollback'
   $staticAfter = (Get-Content "$testRoot\roster.json" -Raw) | ConvertFrom-Json
   Assert-True (@($staticAfter.sessions | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'the roster.json entry must survive as the rollback path'
   Assert-True ((Get-Hash "$testRoot\state\events\2026-09-01.jsonl") -eq $eventsHash) 'cutover must not touch the event ledger'

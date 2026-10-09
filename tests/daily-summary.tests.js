@@ -486,7 +486,16 @@ test('#299: a proposal with no outcome is listed oldest first and sends on a qui
   const result = runDailySummary({ root, now: NOW, send });
   assert.equal(result.sent, true);
   assert.equal(result.count, 0, 'count stays the number of waiting rows');
-  assert.match(send.calls[0].body, /^Proposals awaiting a verdict or Approval, endzone: #12 \(since 3h\), #15 \(since 20m\)$/m);
+  assert.match(send.calls[0].body, /^Proposals awaiting Approval, endzone: #12 \(since 3h\), #15 \(since 20m\)$/m);
+  // ADR 0017: while the Arbiter is live only a proposal it escalated waits on Cory.
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'arbiter-live'), 'on');
+  fs.appendFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${JSON.stringify({ schemaVersion: 1, kind: 'escalated', tenant: 'endzone', issue: 12, at: hoursAgo(2), reason: 'money', question: 'which?' })}\n`);
+  const live = buildSummary({ root, now: NOW });
+  assert.match(live.body, /^Proposals awaiting your ruling, endzone: #12 \(since 3h\)$/m, 'only the escalated proposal is listed while the Arbiter is live');
+  fs.unlinkSync(path.join(root, 'state', 'flags', 'arbiter-live'));
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${Array.from({ length: 12 }, (_, i) => proposed(100 + i, hoursAgo(12 - i))).join('\n')}\n`);
+  assert.match(buildSummary({ root, now: NOW }).body, /^Proposals awaiting Approval, endzone: #100 \(since 12h\), .* and 2 more$/m, 'the line names at most ten issues');
 });
 
 test('#299: a human-wait condition with its paged detail sends one "Waiting on you" line; a missing paged entry costs the detail only', () => {
@@ -507,7 +516,8 @@ test('#299: a human-wait condition with its paged detail sends one "Waiting on y
 test('#299: per-tenant in-flight and merged-in-24h counts ride the page but never send a quiet day', () => {
   const root = rootDir();
   seedToState(root, { issue: 21, hops: ['pr-open', 'ci-wait', 'review'], enteredAt: hoursAgo(5) });
-  seedToState(root, { issue: 22, hops: ['pr-open', 'ci-wait', 'review', 'merged'], enteredAt: hoursAgo(2) });
+  // A merged record moves on to retired within minutes; it still counts as merged in the last 24 h.
+  seedToState(root, { issue: 22, hops: ['pr-open', 'ci-wait', 'review', 'merged', 'retiring', 'retired'], enteredAt: hoursAgo(2) });
   seedToState(root, { issue: 23, hops: ['pr-open', 'ci-wait', 'review', 'merged'], enteredAt: hoursAgo(30) });
   assert.equal(buildSummary({ root, now: NOW }), null, 'counts alone send nothing');
   seedDecision(root, { issue: 9, to: 'hold', enteredAt: hoursAgo(1) });

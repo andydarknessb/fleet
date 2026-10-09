@@ -190,9 +190,16 @@ function proposalLines({ root, now }) {
   const lines = [];
   for (const tenant of names) {
     try {
+      // ADR 0017: while the Arbiter is live a proposal waits on its verdict, not on Cory; only one the
+      // Arbiter escalated is his. Without the Arbiter every pending proposal waits on his Approval.
+      const arbiterLive = fs.existsSync(path.join(base, 'state', 'flags', 'arbiter-live'));
       const pending = projectTriage({ entries: readLedger(base, tenant), now: new Date(nowMs).toISOString() }).pending
+        .filter((row) => !arbiterLive || row.escalated)
         .sort((a, b) => String(a.since).localeCompare(String(b.since)));
-      if (pending.length) lines.push(`Proposals awaiting a verdict or Approval, ${tenant}: ${pending.map((row) => `#${row.issue} (since ${formatAge(nowMs - new Date(row.since).getTime())})`).join(', ')}`);
+      // Send-FleetPage cuts a body at 1024 characters: the line names at most MAX_ROWS issues.
+      const named = pending.slice(0, MAX_ROWS).map((row) => `#${row.issue} (since ${formatAge(nowMs - new Date(row.since).getTime())})`).join(', ');
+      const more = pending.length > MAX_ROWS ? ` and ${pending.length - MAX_ROWS} more` : '';
+      if (pending.length) lines.push(`Proposals awaiting ${arbiterLive ? 'your ruling' : 'Approval'}, ${tenant}: ${named}${more}`);
     } catch { /* a torn ledger costs this tenant's line, never the summary */ }
   }
   return lines;
@@ -216,11 +223,9 @@ function waitLines({ root, now }) {
 
 // Spec fleet #194 (#299): per tenant, records in flight and PRs merged in the last 24 h, from the same fold waitingRows reads.
 const IN_FLIGHT_STATES = Object.freeze(['assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision']);
-function countLines({ root, now }) {
+function countLines({ root, now, rows }) {
   const base = baseOf(root);
   const nowMs = new Date(now || Date.now()).getTime();
-  let rows;
-  try { rows = [...foldLedger(workState.readEvents(base)).values()]; } catch { return []; }
   const tenantNames = scopedTenantNames(base, rows);
   const counts = {};
   for (const row of rows) {
@@ -228,7 +233,8 @@ function countLines({ root, now }) {
     const tally = counts[row.tenant] || (counts[row.tenant] = { inFlight: 0, merged: 0 });
     if (IN_FLIGHT_STATES.includes(row.state)) tally.inFlight += 1;
     const mergedMs = new Date(row.mergedAt).getTime();
-    if (row.state === 'merged' && Number.isFinite(mergedMs) && nowMs - mergedMs <= 86400000 && nowMs >= mergedMs) tally.merged += 1;
+    // A merged record moves on to retired within minutes; mergedAt stays on it (digest.js counts the same way).
+    if (Number.isFinite(mergedMs) && nowMs - mergedMs <= 86400000 && nowMs >= mergedMs) tally.merged += 1;
   }
   return Object.keys(counts).sort().filter((tenant) => counts[tenant].inFlight || counts[tenant].merged)
     .map((tenant) => `${tenant}: ${counts[tenant].inFlight} in flight, ${counts[tenant].merged} merged in the last 24 h`);
@@ -241,6 +247,8 @@ function countLines({ root, now }) {
 // decided from the FULL waiting set, before the cap, so the format never
 // shifts depending on how many rows happen to be shown.
 function buildSummary({ root, now } = {}) {
+  let allRows = [];
+  try { allRows = [...foldLedger(workState.readEvents(baseOf(root))).values()]; } catch { /* no ledger: no rows, no counts */ }
   const rows = waitingRows({ root, now });
   // Spec fleet #193 (#211): a standing Bounded-authority suspension is Cory's to lift, so it
   // heads the page and is reason enough to send one on a day nothing else waits.
@@ -255,11 +263,13 @@ function buildSummary({ root, now } = {}) {
   if (!rows.length && !suspensions.length && !windowed.length && !arbiterSuspended && !proposals.length && !waits.length) return null;
   const multiTenant = new Set(rows.map((row) => row.tenant)).size > 1;
   const shown = rows.slice(0, MAX_ROWS);
-  const lines = [...suspensions.map(suspensionLine), ...arbiter, ...windowed, ...proposals, ...waits, ...countLines({ root, now })];
+  const lines = [...suspensions.map(suspensionLine), ...arbiter, ...windowed];
   lines.push(...shown.map((row) => (multiTenant
     ? `${row.tenant} #${row.issue} ${row.state} ${formatAge(row.ageMs)}`
     : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`)));
   if (rows.length > MAX_ROWS) lines.push(`and ${rows.length - MAX_ROWS} more`);
+  // Spec fleet #194 (#299): after the decision rows, since the page body is cut at 1024 characters and the rows are the oldest asks.
+  lines.push(...waits, ...proposals, ...countLines({ root, now, rows: allRows }));
   // #131: the latest weekly scorecard's headline (the week and its weakest row) rides
   // the page as its last line. No scorecard file, no line; and a scorecard alone never
   // turns a quiet day into a page (the early return above stands).

@@ -114,6 +114,8 @@ try {
   Assert-True ($cpEsc.Count -eq 1 -and "$($cpEsc[0].name)" -eq 'ic-9' -and "$($cpEsc[0].detail)" -match 'job-1' -and "$($cpEsc[0].detail)" -match 'ic-cleanup-live') "with the flag off a pending line must escalate cleanup-pending without acting: $($r.escalate | ConvertTo-Json -Compress)"
   $r = Run-Check
   Assert-True (@($r.escalate | Where-Object { $_.kind -eq 'cleanup-pending' }).Count -eq 1) 'a read-only run with the flag absent escalates too (a page is not an action)'
+  # WS5 (fleet #300): the check's escalation rows name Cory as the parent; there is no dispatcher to relay them.
+  Assert-True ("$($cpEsc[0].parent)" -eq 'cory') "a check escalation row must carry parent cory (got '$($cpEsc[0].parent)')"
   Assert-True ([IO.File]::ReadAllText($pendingPath) -eq $before -and -not (Test-Path $calls)) 'the flag-off escalation writes nothing and runs nothing'
 
   # Case 3: flag + -Apply: stop, rm (each verified), worktree removed (clean), line dropped, outcome reported.
