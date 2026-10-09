@@ -2,7 +2,7 @@
   "name": "nidus",
   "repo": "E:\\Nidus",
   "github": "andydarknessb/Nidus",
-  "defaultBranch": "master",
+  "defaultBranch": "owner/v10",
   "releaseBranch": "master",
   "readyLabel": "ready-for-agent",
   "fleetIdentity": "andydarknessb-fleet",
@@ -48,7 +48,7 @@
   "ignoredChecks": ["Supabase Preview"],
   "notes": [
     "Greenfield repo: ticket #2 (walking skeleton) creates the toolchain; until it merges, checks.unit and checks.lint do not exist and only #2 is eligible anyway.",
-    "The fleet works on `master` directly: branch from it, open PRs against it, merge into it. Netlify production deploys from master only once ticket #14 lands.",
+    "For the v10 run (spec #198, docs/specs/0011-deeper-screens.md, tickets #200 to #205) the fleet works on `owner/v10`: branch from it, open PRs against it, merge into it. Promotion of owner/v10 to master is Cory's, as one release PR. Netlify production deploys from master. After the release, defaultBranch goes back to master.",
     "Every schema change is a committed migration under supabase/migrations/ applied to the LOCAL Supabase stack (`supabase start`). There is no hosted project until ticket #14; never create one from an IC.",
     "Tests act as a real principal through the Supabase JS client against the local stack; Google's HTTP API is the only fake. Never mock the database.",
     "Use CONTEXT.md vocabulary in code, tests and PR text. Respect docs/adr/0001 (Supabase, no custom backend) and 0002 (read-only mirror, never write to Google).",
