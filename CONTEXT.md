@@ -30,14 +30,19 @@ _Avoid_: agent, persona, profile
 ### Job titles
 
 **Lead**:
-A session with no tenant of its own. There are exactly two, with different
-jobs, and each watches the other's liveness: the Dispatcher and the Sentinel.
+A session with no tenant of its own. There were two, the Dispatcher and the
+Sentinel, and both are retired (the Sentinel at the 08b cutover, 2026-09-04;
+the Dispatcher at the WS5 cutover, 2026-10-09). The Watchdog task supervises
+and pages; Cory talks to the fleet by attaching to a tenant's project lead.
 _Avoid_: orchestrator, manager, supervisor (the supervisor is the daemon
 until the 08b cutover, then the Watchdog task; a lead is never one)
 
 **Dispatcher**:
-The lead that is Cory's interface to the fleet: it assigns tenants to project
-leads, relays escalations upward, and produces the daily digest.
+The retired lead that was Cory's interface to the fleet until the WS5 cutover
+(2026-10-09, spec #194): it relayed escalations upward and wrote the 07:57
+digest. Pages (ADR 0012) carry escalations now and the 08:00 daily summary
+carries the digest. Its roster entry and role file stay one release for the
+rollback script.
 _Avoid_: lead A, main agent, coordinator
 
 **Sentinel**:
@@ -124,8 +129,8 @@ A condition an IC or project lead may not resolve on its own, handed one level
 up the reporting line until it reaches Cory: a permission prompt, red CI twice
 on one PR, scope drift, a day without a commit, or a question only Cory can
 answer. A session that needs Cory escalates and ends its turn idle; it never
-ends a turn waiting on him. Escalations are the only
-events that page Cory through the reporting line. While the rostered Sentinel
+ends a turn waiting on him. Escalations are the only events that page
+Cory, through the one page door (ADR 0012). While the rostered Sentinel
 is enabled the Watchdog's out-of-band page exists solely for when that line
 itself is down; after the 08b cutover the Watchdog is the top of the
 mechanical line and files the check's escalations itself, one page per new
@@ -133,10 +138,10 @@ one, never a repeat.
 _Avoid_: alert, error, blocker, "off the rails"
 
 **Reporting line**:
-The fixed path a message takes: IC to project lead, project lead to
-dispatcher, dispatcher to Cory; the Sentinel reports to the dispatcher. A
-respawned session is told what it was doing by its parent on this line, never
-by the Sentinel. Nobody skips a level.
+The fixed path a message takes: IC to project lead; project lead to Cory
+through the state door, as an Escalation or a Hold that pages him once, never
+as a message. A respawned session is told what it was doing by its parent on
+this line. Nobody skips a level.
 _Avoid_: chain of command, hierarchy, org chart
 
 **Pause**:
@@ -229,9 +234,9 @@ replace them as state.
 _Avoid_: update, message, log entry
 
 **Control plane**:
-The Dispatcher, project lead, Sentinel, and exceptional notifier work that
-routes, observes, or reports Fleet cycles rather than implementing a Unit of
-work. Its token usage is measured separately from IC delivery work.
+The project lead, Principal, Arbiter and notifier work that routes, observes,
+or reports Fleet cycles rather than implementing a Unit of work (and the
+Dispatcher and Sentinel while they were rostered). Its token usage is measured separately from IC delivery work.
 _Avoid_: management work, overhead (when the measured category is meant)
 
 **Tenant**:

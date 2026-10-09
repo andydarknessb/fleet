@@ -63,6 +63,7 @@ never-sleep power plan: simpler, and the dead-man covers what is left.
 - The Dispatcher's last unique job, relaying escalations to Cory, ends when
   pages have been delivered for a week; ADR 0005 already rules that the
   standing session retires, and the Reporting line is rewritten then, not now.
+  Done 2026-10-09 (spec #194): the Reporting line and Dispatcher entries were rewritten at that cutover.
 - The Pushover token and the dead-man URL live under `state/`, never in the
   repository.
 
