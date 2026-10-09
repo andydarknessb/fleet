@@ -13,8 +13,16 @@
 #        no gh pr merge, no wontfix/duplicate label, no git push to a branch outside
 #        docs/. One named test file passes.
 #      - No Supabase or Netlify-writing MCP tool.
+#   1b. role arbiter (ADR 0017; main session and its sub-agents): Edit/Write only to its
+#      own status file state/status/ar-<tenant>.md, ~/.claude and the temp directory
+#      (no tenant-repo write at all, docs/adr and CONTEXT.md included). Bash/PowerShell:
+#      no gh issue/pr comment or api comments call of any kind (a Verdict goes through
+#      node bin/triage.js verdict, which records before it posts), no gh issue edit,
+#      close or reopen, no gh pr merge/close/review, no git push, and the same test,
+#      sync-* and MCP rules as the Principal.
 #   2. every fleet role: no comment whose body begins "Approved", "Re-propose" or "Veto"
-#      on any issue. Until #154 the fleet's gh login was the tenant owner's (fleetIdentity ==
+#      on any issue; and every role but arbiter: none beginning "Endorsed", "Returned",
+#      "Escalated:" or "## Verdict" (the Arbiter's Verdict, ADR 0017). Until #154 the fleet's gh login was the tenant owner's (fleetIdentity ==
 #      ownerLogin) and this rule alone made an Approval, and (fleet#55) a re-proposal
 #      ask, Cory's; (fleet#208) a Veto, the owner's withdrawal of a Bounded-authority
 #      ready (CONTEXT.md **Veto**), is his alone the same way. Since #154 the fleet
@@ -104,7 +112,7 @@ function Escape-Rx { param([string]$Text) [regex]::Escape($Text) }
 # cause and the one-step fix instead of asserting a first word the guard never saw.
 function Get-UninspectableReason {
   param([string]$Cause)
-  return "the comment body is $Cause, which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**), 'Re-propose' or 'Veto' (the tenant owner's withdrawal of a Bounded-authority ready, CONTEXT.md **Veto**): those shapes are the owner's alone, bin/triage.js recognises them by shape and author, and this guard is the second lock. Write the body to a file (in a separate call) and pass --body-file <path>; the guard reads the file's first line $cite"
+  return "the comment body is $Cause, which this guard cannot inspect, so it cannot clear the comment: no fleet session may post an issue or PR comment beginning 'Approved' (the tenant owner's Approval of a Triage proposal, CONTEXT.md **Approval**), 'Re-propose' or 'Veto' (the tenant owner's withdrawal of a Bounded-authority ready, CONTEXT.md **Veto**), and none but the Arbiter one beginning 'Endorsed', 'Returned', 'Escalated:' or '## Verdict' (CONTEXT.md **Verdict**, ADR 0017): those shapes are the owner's or the Arbiter's alone, bin/triage.js recognises them by shape and author, and this guard is the second lock. Write the body to a file (in a separate call) and pass --body-file <path>; the guard reads the file's first line $cite"
 }
 function Get-WordCause {
   param($Word)
@@ -461,6 +469,32 @@ if ($tool -in @('Bash', 'PowerShell')) {
     }
     if (-not $args_[0].Inspectable) { $reason = Get-UninspectableReason (Get-WordCause $args_[0]); break }
     $sub = $args_[0].Text
+    # ADR 0017 (rule 1b, applied here because this loop already resolved gh.exe paths and
+    # wrappers): the Arbiter and its workers may only READ through gh. Anything else (a
+    # comment, an edit, a close, a merge, a label, a non-GET api call, a field on an api
+    # call) is refused; a Verdict goes through node bin/triage.js verdict.
+    if ($role -eq 'arbiter') {
+      $ro = $false
+      if ($sub -in @('issue', 'pr', 'repo', 'label', 'release', 'run', 'workflow')) {
+        $ro = ($args_.Count -ge 2 -and $args_[1].Inspectable -and $args_[1].Text -cin @('view', 'list', 'diff', 'checks', 'status'))
+      } elseif ($sub -in @('auth', 'search', 'browse', 'help', 'version')) { $ro = $true
+      } elseif ($sub -eq 'api') {
+        $ro = $true
+        foreach ($aw in $args_) { if ($aw.Inspectable -and $aw.Text -ceq 'graphql') { $ro = $true } }
+        for ($x = 1; $x -lt $args_.Count; $x++) {
+          $tx = $args_[$x].Text
+          if (-not $args_[$x].Inspectable) { $ro = $false; break }
+          if ($tx -ceq 'graphql') { break }   # a mutation is refused below; a query is a read
+          if ($tx -cmatch '^(-X|--method)$') { if (($x + 1) -ge $args_.Count -or $args_[$x + 1].Text -cne 'GET') { $ro = $false; break }; $x++; continue }
+          if ($tx -cmatch '^(-X|--method)=(.+)$') { if ($Matches[2] -cne 'GET') { $ro = $false; break }; continue }
+          if ($tx -cmatch '^(-f|-F|--field|--raw-field|--input)(=|$)') { $ro = $false; break }
+        }
+      }
+      if (-not $ro) {
+        $reason = "a gh call that is not a read ('gh $sub ...') is outside the Arbiter's boundary: it reads issues and PRs (view, list, diff, checks, a GET api call) and decides only through the door; verdicts go through 'node $($home_ -replace '\\', '/')/bin/triage.js verdict' (ADR 0017; rollback flag state/flags/principal-guard-off)"
+        break
+      }
+    }
     $kind = ''
     $ai = 1
     $epUnins = $null
@@ -563,6 +597,11 @@ if ($tool -in @('Bash', 'PowerShell')) {
         $reason = "a comment that begins 'Veto' is the tenant owner's withdrawal of a Bounded-authority ready (CONTEXT.md **Veto**) and no fleet session may post one under any role: a Veto is the owner's alone, bin/triage.js recognises it by shape and author, and this guard is the second lock. Say what you mean in other words ('the lead is holding this ticket', 'this ready is wrong because ...') or leave the Veto to Cory $cite"
         break
       }
+      # ADR 0017: a Verdict is the Arbiter's alone, matched like Approved (first word, or a '## Verdict' heading).
+      if ($role -ne 'arbiter' -and ("$body" -match '^(?:\s|\uFEFF|\\n)*(?:endorsed\b|returned\b|escalated\s*:|##\s*verdict\b)')) {
+        $reason = "a comment that begins 'Endorsed', 'Returned', 'Escalated:' or '## Verdict' is the Arbiter's Verdict on a Triage proposal (CONTEXT.md **Verdict**, ADR 0017) and no other fleet role may post one: an Endorsement is a Ruling, bin/triage.js recognises it by shape and author, and this guard is the second lock. Say what you mean in other words ('the lead agrees with the proposal', 'sent back to the IC') or leave the decision to the Arbiter $cite"
+        break
+      }
     }
   }
 }
@@ -616,6 +655,57 @@ if (-not $reason -and $tool -in @('Bash', 'PowerShell')) {
       }
       if ($bad) { $reason = $flagsCause; break }
     }
+  }
+}
+
+# --- rule set 1b (ADR 0017): the Arbiter's write and action boundary ---
+if (-not $reason -and $role -eq 'arbiter') {
+  $door = "verdicts go through 'node $($home_ -replace '\\', '/')/bin/triage.js verdict' (ADR 0017; rollback flag state/flags/principal-guard-off)"
+  $homeN = Normalize-Path $home_ ''
+  $profileN = Normalize-Path $env:USERPROFILE ''
+  $tempN = Normalize-Path ([IO.Path]::GetTempPath()) ''
+  $arRepo = ''
+  try { if ($tenant) { $arRepo = (Get-Content "$home_\tenants\$tenant.json" -Raw -Encoding UTF8 | ConvertFrom-Json).repo } } catch {}
+  $arRepoN = Normalize-Path $arRepo ''
+  if ($tool -in @('Edit', 'Write', 'NotebookEdit', 'MultiEdit')) {
+    $target = "$($inp.tool_input.file_path)"; if (-not $target) { $target = "$($inp.tool_input.notebook_path)" }
+    $targetN = Normalize-Path $target "$($inp.cwd)"
+    $ok = $false
+    if ($profileN -and $targetN -match "^$(Escape-Rx $profileN)/\.claude/") { $ok = $true }
+    if ($tenant -and $targetN -match "^$(Escape-Rx $homeN)/state/status/ar-$(Escape-Rx $tenant.ToLowerInvariant())\.md$") { $ok = $true }
+    # The temp allowance never reaches inside the fleet or the tenant repo (a repo that lives under temp, as the test fixture does, gets no pass).
+    $arInside = $targetN.StartsWith("$homeN/") -or ($arRepoN -and $targetN.StartsWith("$arRepoN/"))
+    if (-not $ok -and $tempN -and -not $arInside -and $targetN -match "^$(Escape-Rx $tempN)/") { $ok = $true }
+    if (-not $ok) { $reason = "the Arbiter writes only its own status file (state/status/ar-<tenant>.md), its own memory and the temp directory; '$target' is none of those. It edits no repository and no ledger: $door" }
+  } elseif ($tool -in @('Bash', 'PowerShell')) {
+    $flat = "$($inp.tool_input.command)" -replace '\s+', ' '
+    $bareRunner = $null
+    foreach ($runner in @(
+      @{ re = '(^|[\s;&|(])npm\s+(test|t|run\s+test(:server)?)\b(?<rest>[^;&|]*)';  what = 'the bare test suite (npm test with no file)' },
+      @{ re = '(^|[\s;&|(])npx\s+jest\b(?<rest>[^;&|]*)';                           what = 'the bare jest suite (npx jest with no path)' },
+      @{ re = '(^|[\s;&|(])node\s+--test\b(?<rest>[^;&|]*)';                        what = 'the bare node test runner (node --test with no file)' }
+    )) {
+      if ($flat -match $runner.re) {
+        $namesFile = $false
+        foreach ($token in ("$($Matches['rest'])" -split '\s+' | Where-Object { $_ -and $_ -ne '--' })) { if ($token -match '[/\\]' -or $token -match '\.[jt]sx?$') { $namesFile = $true; break } }
+        if (-not $namesFile) { $bareRunner = $runner.what; break }
+      }
+    }
+    if ($bareRunner) { $reason = "$bareRunner is outside the Arbiter's boundary: it may run ONE named test file (npm test -- <path>, node --test <file>) to confirm a red-tell and nothing wider; $door" }
+    foreach ($r in @(
+      @{ re = '(^|[\s;&|(/\\"''])gh(\.exe)?["'']?\s+(-R\s+\S+\s+)?(issue|pr)\s+(-R\s+\S+\s+)?comment\b';       what = 'a comment posted by hand' },
+      @{ re = '(^|[\s;&|(/\\"''])gh(\.exe)?["'']?\s+(-R\s+\S+\s+)?issue\s+(-R\s+\S+\s+)?(edit|close|delete|reopen|transfer)\b'; what = 'an issue edit, label change, close or reopen' },
+      @{ re = '(^|[\s;&|(/\\"''])gh(\.exe)?["'']?\s+(-R\s+\S+\s+)?pr\s+(-R\s+\S+\s+)?(merge|close|review|edit|ready)\b';        what = 'a pull request merge, close, review or edit' },
+      @{ re = '(^|[\s;&|(])git(\s+-[Cc]\s+\S+|\s+--?\S+)*\s+push\b';                                        what = 'a git push (the Arbiter opens no PR)' },
+      @{ re = '(^|[\s;&|(])(bash|sh|zsh|dash|pwsh|powershell|cmd)(\.exe)?\s+(-c|-Command|-command|-EncodedCommand|//c|/c)\b|(^|[\s;&|(])(iex|Invoke-Expression|Start-Process)\b'; what = 'a nested interpreter (this guard reads one command line)' },
+      @{ re = '(^|[\s;&|(])npm\s+(run\s+)?test:server:(all|sweep)\b';                   what = 'the long server suite' },
+      @{ re = '(^|[\s;&|(])(node|npm\s+run|npx)\s+\S*sync-[a-z]';                      what = 'a sync-* script (production data, API quota)' }
+    )) {
+      if ($reason) { break }
+      if ($flat -match $r.re) { $reason = "$($r.what) is outside the Arbiter's boundary: it decides and the door records, posts and pages; it applies no label, posts no Ruling, merges and closes nothing; $door" }
+    }
+  } elseif ($tool -like 'mcp__claude_ai_Supabase__*' -or $tool -like 'mcp__claude_ai_Netlify__*updater*' -or $tool -like 'mcp__claude_ai_Netlify__*deploy*' -or $tool -like 'mcp__claude_ai_Netlify__import*') {
+    $reason = "'$tool' reaches production data or a deploy; the Arbiter reads code and tickets, never the shared Supabase database or Netlify; $door"
   }
 }
 
