@@ -1941,10 +1941,10 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ($null -ne $rp8.repeatPaged -and $rp8.repeatPaged.priority -eq 'high') "an unrecognized repeat priority must fall back to high (got $($rp8.repeatPaged | ConvertTo-Json -Compress))"
 
     # Case RP9: the shipped config's own pages block (config/cycle.json) yields a
-    # high first page and, since #206, an emergency repeat, and names both keys explicitly.
+    # high first page and a high repeat (#206 flipped it to emergency; its one-week check reverted it, #302 re-flips), and names both keys explicitly.
     $rp9Pages = (Get-Content "$sourceRoot\config\cycle.json" -Raw | ConvertFrom-Json).pages
     Assert-True ("$($rp9Pages.priority.'fleet-dead')" -eq 'high') "the real config's fleet-dead priority must be high"
-    Assert-True ("$($rp9Pages.fleetDeadRepeatPriority)" -eq 'emergency') "the real config's pages.fleetDeadRepeatPriority must be emergency (#206)"
+    Assert-True ("$($rp9Pages.fleetDeadRepeatPriority)" -eq 'high') "the real config's pages.fleetDeadRepeatPriority must be high until #302 lands (#206 check, 2026-10-09)"
     Assert-True ("$($rp9Pages.priority.'dead-man-silence')" -eq 'emergency') 'dead-man silence must stay emergency in the real config'
     Write-Utf8 "$testRoot\config\cycle.json" (@{ pages = $rp9Pages } | ConvertTo-Json -Depth 6)
     Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
@@ -1952,7 +1952,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ((@($rp9a.newlyPaged | Where-Object { $_.key -eq 'fleet-dead' })[0]).priority -eq 'high') 'the first fleet-dead page under the real config must be high'
     Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $rp7Delivered + '","lastSeen":"' + $rp7Delivered + '","detail":"stale","deliveredAt":"' + $rp7Delivered + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
     $rp9 = Run-Watchdog
-    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'emergency') 'the repeat under the real config must be emergency (#206)'
+    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'high') 'the repeat under the real config is high until #302 lands (#206 check, 2026-10-09)'
     Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   } finally {
