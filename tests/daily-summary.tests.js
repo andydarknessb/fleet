@@ -486,7 +486,7 @@ test('#299: a proposal with no outcome is listed oldest first and sends on a qui
   const result = runDailySummary({ root, now: NOW, send });
   assert.equal(result.sent, true);
   assert.equal(result.count, 0, 'count stays the number of waiting rows');
-  assert.match(send.calls[0].body, /^Proposals awaiting Approval, endzone: #12 \(since 3h\), #15 \(since 20m\)$/m);
+  assert.match(send.calls[0].body, /^Proposals awaiting a verdict or Approval, endzone: #12 \(since 3h\), #15 \(since 20m\)$/m);
 });
 
 test('#299: a human-wait condition with its paged detail sends one "Waiting on you" line; a missing paged entry costs the detail only', () => {

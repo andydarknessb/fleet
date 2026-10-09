@@ -192,7 +192,7 @@ function proposalLines({ root, now }) {
     try {
       const pending = projectTriage({ entries: readLedger(base, tenant), now: new Date(nowMs).toISOString() }).pending
         .sort((a, b) => String(a.since).localeCompare(String(b.since)));
-      if (pending.length) lines.push(`Proposals awaiting Approval, ${tenant}: ${pending.map((row) => `#${row.issue} (since ${formatAge(nowMs - new Date(row.since).getTime())})`).join(', ')}`);
+      if (pending.length) lines.push(`Proposals awaiting a verdict or Approval, ${tenant}: ${pending.map((row) => `#${row.issue} (since ${formatAge(nowMs - new Date(row.since).getTime())})`).join(', ')}`);
     } catch { /* a torn ledger costs this tenant's line, never the summary */ }
   }
   return lines;
