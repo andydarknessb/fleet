@@ -30,7 +30,8 @@ try {
   foreach ($roleName in 'dispatcher','project-lead','ic') {
     Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
   }
-  Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: fable`neffort: high`n---`nRole body for principal."
+  Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: opus-5.5`neffort: high`n---`nRole body for principal."
+  Write-Utf8 "$testRoot\agents\arbiter.md" "---`nname: arbiter`nmodel: fable`neffort: high`n---`nRole body for arbiter."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -272,12 +273,12 @@ exit $LASTEXITCODE
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{}}'
 
   # ADR 0011 (fleet #37): the Principal comes through the door as pe-<tenant>, on the
-  # pinned Fable id at effort high, with the control-plane tenant-repo denial and its
+  # pinned Opus 5.5 id (ADR 0017; Fable until then) at effort high, with the control-plane tenant-repo denial and its
   # own ceiling; it is named by scheme and needs a tenant; it neither counts toward
   # nor is refused by the cap.
   $rp = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun')
   Assert-True ($rp.dryRun -eq $true) "a principal dry run must pass the gates (got: $rp)"
-  Assert-True ("$($rp.command)" -match '--model claude-fable-5-1') 'a principal with no -Model must run the pinned Fable id'
+  Assert-True ("$($rp.command)" -match '--model claude-opus-5-5') 'a principal with no -Model must run the pinned Opus 5.5 id (ADR 0017)'
   Assert-True ("$($rp.command)" -match '--effort high') 'a principal must run at the role file effort'
   Assert-True ($rp.budget.ceiling -eq 30000) 'the principal ceiling must come from config/cycle.json'
   $denyP = @((Get-Content "$testRoot\state\sessions\pe-test.settings.json" -Raw | ConvertFrom-Json).permissions.deny)
@@ -285,6 +286,17 @@ exit $LASTEXITCODE
   Assert-True ($denyP -contains "Edit($rootFwd/state/work/**)") 'a principal still loses the direct state-door writes'
   $rpf = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-Model', 'fable', '-DryRun')
   Assert-True ("$($rpf.command)" -match '--model claude-fable-5-1') 'an explicit -Model fable must resolve to the same pinned id'
+  # ADR 0017: the Arbiter comes through the door as ar-<tenant> on the pinned Fable id at
+  # effort high, with its own first-turn ceiling; it is named by scheme and needs a tenant.
+  $rar = Run-Launch @('-Role', 'arbiter', '-Name', 'ar-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Decide triage.', '-DryRun')
+  Assert-True ($rar.dryRun -eq $true) "an arbiter dry run must pass the gates (got: $rar)"
+  Assert-True ("$($rar.command)" -match '--model claude-fable-5-1') 'an arbiter with no -Model must run the pinned Fable id (ADR 0017)'
+  Assert-True ("$($rar.command)" -match '--effort high') 'an arbiter must run at the role file effort'
+  Assert-True ($rar.budget.ceiling -eq 30000) 'the arbiter ceiling must come from config/cycle.json'
+  Run-Launch @('-Role', 'arbiter', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
+  Assert-True ($script:lastExit -eq 4) 'an arbiter not named ar-<tenant> must be refused as a usage error'
+  Run-Launch @('-Role', 'arbiter', '-Name', 'ar-test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
+  Assert-True ($script:lastExit -eq 4) 'an arbiter without -Tenant must be refused as a usage error'
   $rpl = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
   Assert-True ("$($rpl.command)" -match '--model claude-opus-5-5') 'a project lead with no -Model must run the pinned Opus 5.5 id'
   $rplo = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'sonnet', '-DryRun')
@@ -302,6 +314,10 @@ exit $LASTEXITCODE
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo [{"name":"pl-test","id":"j2","sessionId":"s2","state":"idle"}]' + "`r`n" + 'exit /b 0' + "`r`n")
   $rcap2 = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'p', '-DryRun')
   Assert-True ($rcap2.dryRun -eq $true) "a full cap must not refuse the principal (got: $rcap2)"
+  # ADR 0017: the Arbiter is cap-exempt the same way (ar- prefix).
+  Write-Utf8 "$testRoot\roster.json" '{"cap":1,"sessions":[{"name":"ar-test","role":"arbiter","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"p"},{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"p"}]}'
+  $rcap3 = Run-Launch @('-Role', 'arbiter', '-Name', 'ar-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'p', '-DryRun')
+  Assert-True ($rcap3.dryRun -eq $true) "a full cap must not refuse the arbiter (got: $rcap3)"
 
   Write-Output 'launch settings tests passed'
 } finally {

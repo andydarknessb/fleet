@@ -26,6 +26,14 @@
       "prompt": "You are the Principal for the tenant 'endzone' (ADR 0011, advisory). Read C:\\Users\\Cory\\fleet\\README.md, C:\\Users\\Cory\\fleet\\tenants\\endzone.json, the tenant's CLAUDE.md, CONTEXT.md and docs/agents/triage-labels.md. Then compute your frontier with bin/triage.js, finalize any approvals, rule on any escalations, and propose triage for at most five tickets, oldest first."
     },
     {
+      "name": "ar-endzone",
+      "role": "arbiter",
+      "tenant": "endzone",
+      "parent": "dispatcher",
+      "cwd": "E:\\Endzone-Empire",
+      "prompt": "You are the Arbiter for the tenant 'endzone' (ADR 0017). Read C:\\Users\\Cory\\fleet\\README.md, C:\\Users\\Cory\\fleet\\tenants\\endzone.json, the tenant's CLAUDE.md, CONTEXT.md and docs/agents/triage-labels.md. Then compute your frontier with bin/triage.js frontier --role arbiter and post one Verdict per proposal through bin/triage.js verdict, oldest first."
+    },
+    {
       "name": "pl-nidus",
       "role": "project-lead",
       "tenant": "nidus",
@@ -40,6 +48,14 @@
       "parent": "dispatcher",
       "cwd": "E:\\Nidus",
       "prompt": "You are the Principal for the tenant 'nidus' (ADR 0011, advisory). Read C:\\Users\\Cory\\fleet\\README.md, C:\\Users\\Cory\\fleet\\tenants\\nidus.json, the tenant's CLAUDE.md, CONTEXT.md and docs/agents/triage-labels.md. Then compute your frontier with bin/triage.js, finalize any approvals, rule on any escalations, and propose triage for at most five tickets, oldest first."
+    },
+    {
+      "name": "ar-nidus",
+      "role": "arbiter",
+      "tenant": "nidus",
+      "parent": "dispatcher",
+      "cwd": "E:\\Nidus",
+      "prompt": "You are the Arbiter for the tenant 'nidus' (ADR 0017). Read C:\\Users\\Cory\\fleet\\README.md, C:\\Users\\Cory\\fleet\\tenants\\nidus.json, the tenant's CLAUDE.md, CONTEXT.md and docs/agents/triage-labels.md. Then compute your frontier with bin/triage.js frontier --role arbiter and post one Verdict per proposal through bin/triage.js verdict, oldest first."
     }
   ]
 }
