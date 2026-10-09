@@ -32,7 +32,15 @@ const DEFAULT_CONFIG = Object.freeze({
 // (bin/bounded-authority.js: bounded-ready, veto, and the suspension scan), never by
 // `record`, and none of them is an outcome the unchanged ratio counts.
 const BOUNDED_KINDS = Object.freeze(['bounded-ready', 'veto', 'suspended']);
-const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed', ...BOUNDED_KINDS]);
+// ADR 0017: the Arbiter's verdict kinds. `endorsed`, `endorsed-with-edits` and `escalated` claim the proposal like an
+// Approval does (first writer wins) but are never one of the owner's `outcomes` the unchanged ratio counts;
+// `returned` marks the open proposal and claims nothing. An `escalated` claim is a hand-off to the owner, so his
+// outcome kinds (and a new proposal) replace it.
+const ARBITER_OUTCOME_KINDS = Object.freeze(['endorsed', 'endorsed-with-edits', 'escalated']);
+const ARBITER_KINDS = Object.freeze([...ARBITER_OUTCOME_KINDS, 'returned']);
+const ESCALATION_CLASSES = Object.freeze(['product-intent', 'money', 'user-promise', 'rule-change', 'disagreement']);
+const ARBITER_ACTOR = 'arbiter';
+const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed', ...BOUNDED_KINDS, ...ARBITER_KINDS]);
 const OUTCOME_KINDS = Object.freeze(['approved', 'approved-with-edits', 'rejected', 'superseded']);
 const APPROVAL_RE = /^\s*approved(\s+with\s*:|\b)/i;
 const APPROVAL_WITH_EDITS_RE = /^\s*approved\s+with\s*:/i;
@@ -46,6 +54,39 @@ function isExactApproval(body) { return EXACT_APPROVAL_RE.test(String(body || ''
 // "Re-propose", a wording hooks/principal-guard.ps1 refuses to every fleet role
 // exactly as it refuses "Approved"; the shape is what makes it the owner's.
 const REPROPOSE_RE = /^\s*re-?propose\b/i;
+// ADR 0017: a Verdict comment is `## Verdict` and, on its next non-blank line, one of these; it counts only
+// from the tenant's fleetIdentity (exact equality, as the owner check). The guard hook refuses
+// `Endorsed` and `Returned` to every role but the Arbiter.
+const ENDORSED_RE = /^\s*endorsed(\s+with\s*:|\b)/i;
+const EXACT_ENDORSED_RE = /^\s*endorsed\s*$/i;
+const RETURNED_RE = /^\s*returned\b/i;
+const ESCALATED_RE = /^\s*escalated\s*:/i;
+const VERDICT_HEADING_RE = /^\s*##\s*Verdict\b/i;
+
+// { kind: endorsed | endorsed-with-edits | returned | escalated, exact } for a fleet-authored Verdict comment, else null.
+// `exact` is true only for the bare word `Endorsed`; anything else ENDORSED_RE admits ("Endorsed, but skip X") is with edits.
+function verdictOf(comment, fleetIdentity) {
+  if (!fleetIdentity || !comment || comment.author !== fleetIdentity) return null;
+  const lines = String(comment.body || '').replace(/\r\n/g, '\n').split('\n');
+  if (!lines.length || !VERDICT_HEADING_RE.test(lines[0])) return null;
+  const word = lines.slice(1).find((line) => line.trim());
+  if (word === undefined) return null;
+  if (ESCALATED_RE.test(word)) return { kind: 'escalated', exact: false };
+  if (RETURNED_RE.test(word)) return { kind: 'returned', exact: false };
+  if (EXACT_ENDORSED_RE.test(word)) return { kind: 'endorsed', exact: true };
+  if (ENDORSED_RE.test(word)) return { kind: 'endorsed-with-edits', exact: false };
+  return null;
+}
+
+// The newest Verdict comment of `issue` created after `after` (an ISO time), with its decoded kind; null when none.
+function newestVerdict(issue, fleetIdentity, after = '') {
+  let found = null;
+  for (const comment of issue.comments) {
+    const verdict = comment.createdAt > after ? verdictOf(comment, fleetIdentity) : null;
+    if (verdict) found = { ...verdict, comment };
+  }
+  return found;
+}
 
 function baseOf(root) { return path.resolve(root || path.resolve(__dirname, '..')); }
 
@@ -140,10 +181,10 @@ function appendEntry(root, tenant, entry) {
   return entry;
 }
 
-function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, fields, now } = {}) {
+function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, by, edits, labels, through, recordId, actor, evidence, prUrl, premisesSha, reason, premise, reasons, question, fields, now } = {}) {
   if (!LEDGER_KINDS.includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `kind must be one of ${LEDGER_KINDS.join(', ')}`);
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
-  const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : 'principal' };
+  const entry = { schemaVersion: 1, kind, tenant: requireText(tenant, 'tenant'), at, actor: actor ? String(actor) : (ARBITER_KINDS.includes(kind) ? ARBITER_ACTOR : 'principal') };
   if (kind === 'consumed') {
     entry.through = isoOrThrow(through, 'through');
     if (recordId) entry.recordId = String(recordId);
@@ -168,6 +209,17 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     if (kind === 'approved-with-edits') entry.edits = requireText(edits, 'edits');
   }
   if (kind === 'superseded') entry.bodyHash = requireText(bodyHash, 'body-hash');
+  if (ARBITER_KINDS.includes(kind)) {
+    entry.bodyHash = requireText(bodyHash, 'body-hash');
+    entry.commentUrl = requireText(commentUrl, 'comment-url');
+    if (kind === 'endorsed-with-edits') entry.edits = requireText(edits, '--edits');
+    if (kind === 'returned') entry.reasons = requireText(reasons, '--reasons');
+    if (kind === 'escalated') {
+      if (!ESCALATION_CLASSES.includes(reason)) throw new WorkStateError('TRIAGE_INVALID', `--reason must be one of ${ESCALATION_CLASSES.join(', ')} for an escalation`);
+      entry.reason = reason;
+      entry.question = requireText(question, '--question');
+    }
+  }
   if (kind === 'bounded-ready') {
     entry.bodyHash = requireText(bodyHash, 'body-hash');
     if (commentUrl) entry.commentUrl = String(commentUrl);
@@ -191,7 +243,7 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
   }
   // Spec fleet #92 (#148): a proposal caused by a stale premise says so, with the
   // premise line, so its verdict can be counted before ADR 0011 is revisited.
-  if (reason !== undefined || premise !== undefined) {
+  if (kind !== 'escalated' && (reason !== undefined || premise !== undefined)) {
     if (kind !== 'proposed') throw new WorkStateError('TRIAGE_INVALID', '--reason and --premise belong to a proposal (--kind proposed)');
     if (!PROPOSAL_REASONS.includes(reason)) throw new WorkStateError('TRIAGE_INVALID', `--reason must be one of ${PROPOSAL_REASONS.join(', ')}${reason === undefined ? ' (--premise needs --reason stale-premise)' : ''}`);
     entry.reason = reason;
@@ -201,14 +253,18 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
   const entries = readLedger(root, tenant);
   if (kind === 'proposed') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
+    // An escalated proposal is the owner's to answer; his Re-propose is followed by a new proposal, so it does not block one.
     if (open && open.proposed && !open.outcome) throw new WorkStateError('TRIAGE_PROPOSAL_OPEN', `issue #${entry.issue} already has an open proposal at ${open.proposed.at}; record its outcome first`);
   } else if (kind !== 'consumed' && kind !== 'suspended') {
     const open = projectTriage({ entries, now: at }).byIssue[entry.issue];
     if (!open || !open.proposed) throw new WorkStateError('TRIAGE_NO_PROPOSAL', `issue #${entry.issue} has no proposal to ${kind}`);
     // #207: the outcome row is a first-writer-wins claim (the finalize script and the Principal both take it before posting a Ruling).
-    if ((OUTCOME_KINDS.includes(kind) || kind === 'bounded-ready') && open.outcome) throw new WorkStateError('TRIAGE_ALREADY_DECIDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at} by ${open.outcome.actor || 'principal'}`, { decidedBy: open.outcome.actor || 'principal' });
+    // ADR 0017: an Endorsement and an Approval race for the same claim; the first row wins. Only an `escalated` outcome
+    // yields, and only to the owner's own kinds: the escalation asked him, so his answer is the next outcome.
+    const yieldsToOwner = open.outcome && open.outcome.kind === 'escalated' && OUTCOME_KINDS.includes(kind);
+    if ((OUTCOME_KINDS.includes(kind) || kind === 'bounded-ready' || ARBITER_KINDS.includes(kind)) && open.outcome && !yieldsToOwner) throw new WorkStateError('TRIAGE_ALREADY_DECIDED', `issue #${entry.issue} already has outcome ${open.outcome.kind} at ${open.outcome.at} by ${open.outcome.actor || 'principal'}`, { decidedBy: open.outcome.actor || 'principal' });
     if (kind === 'veto' && !(open.outcome && open.outcome.kind === 'bounded-ready')) throw new WorkStateError('TRIAGE_NO_BOUNDED_READY', `issue #${entry.issue} has no standing bounded ready to veto`);
-    if (kind === 'finalized' && !open.outcome) throw new WorkStateError('TRIAGE_NOT_APPROVED', `issue #${entry.issue} has no approval to finalize`);
+    if (kind === 'finalized' && (!open.outcome || open.outcome.kind === 'escalated')) throw new WorkStateError('TRIAGE_NOT_APPROVED', `issue #${entry.issue} has no approval to finalize`);
   }
   appendEntry(root, tenant, entry);
   if (entry.reason === 'stale-premise') armStalePremiseNotice(root, entry);
@@ -314,11 +370,15 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
       continue;
     }
     const issue = Number(entry.issue);
-    if (!byIssue[issue]) byIssue[issue] = { issue, proposed: null, outcome: null, finalized: null, history: [] };
+    if (!byIssue[issue]) byIssue[issue] = { issue, proposed: null, outcome: null, finalized: null, returned: null, history: [] };
     const row = byIssue[issue];
     row.history.push(entry);
-    if (entry.kind === 'proposed') { row.proposed = entry; row.outcome = null; row.finalized = null; if (!firstProposedAt) firstProposedAt = entry.at; }
-    else if (OUTCOME_KINDS.includes(entry.kind)) { if (row.proposed && !row.outcome) { row.outcome = entry; outcomes.push(entry); } }
+    if (entry.kind === 'proposed') { row.proposed = entry; row.outcome = null; row.finalized = null; row.returned = null; if (!firstProposedAt) firstProposedAt = entry.at; }
+    else if (OUTCOME_KINDS.includes(entry.kind)) { if (row.proposed && (!row.outcome || row.outcome.kind === 'escalated')) { row.outcome = entry; outcomes.push(entry); } }
+    // ADR 0017: the Arbiter's verdicts. An Endorsement or an escalation claims the proposal as an Approval does but is
+    // never one of `outcomes` (the owner's graduation ratio); a Return only marks the open proposal.
+    else if (ARBITER_OUTCOME_KINDS.includes(entry.kind)) { if (row.proposed && !row.outcome) row.outcome = entry; }
+    else if (entry.kind === 'returned') { if (row.proposed && !row.outcome) row.returned = entry; }
     // Spec fleet #193: a bounded ready routes the proposal without an Approval, so it is
     // the row's outcome but never one of `outcomes`, which is what the ratio tallies; a veto
     // takes it back and the proposal is awaiting Approval again.
@@ -327,8 +387,8 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     else if (entry.kind === 'finalized') { if (row.outcome) row.finalized = entry; }
   }
   const rows = Object.values(byIssue).sort((left, right) => left.issue - right.issue);
-  const pending = rows.filter((row) => row.proposed && !row.outcome).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model }));
-  const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits'].includes(row.outcome.kind) && !row.finalized).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
+  const pending = rows.filter((row) => row.proposed && (!row.outcome || row.outcome.kind === 'escalated')).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model, ...(row.outcome ? { escalated: true } : {}), ...(row.returned ? { returned: true } : {}) }));
+  const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits', 'endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
   // Spec fleet #92 (#145): proposed at one hash, finalized at another. The finalize
   // edit is expected (a restated premise), not "body changed since the proposal".
   const restated = rows.filter((row) => row.finalized && row.finalized.bodyHash && row.proposed && row.finalized.bodyHash !== row.proposed.bodyHash).map((row) => ({ issue: row.issue, proposedBodyHash: row.proposed.bodyHash, finalizedBodyHash: row.finalized.bodyHash, finalizedAt: row.finalized.at }));
@@ -494,6 +554,8 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   const approvals = [];
   const vetoes = [];
   const repairs = [];
+  const endorsements = [];
+  const returns = [];
   const tickets = [];
   const skipped = [];
 
@@ -502,7 +564,9 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   for (const issue of normalized) {
     const labels = new Set(issue.labels);
     const row = projection.byIssue[issue.number] || null;
-    const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
+    // ADR 0017: an escalated proposal is waiting on the owner, so it stays the open proposal here: his Approved,
+    // Re-propose or a body change reach the paths below, and nothing else wakes the Principal for it.
+    const proposed = row && row.proposed && (!row.outcome || row.outcome.kind === 'escalated') ? row.proposed : null;
     const ownerComments = issue.comments.filter((comment) => comment.author === owner);
     const newest = issue.comments[issue.comments.length - 1] || null;
 
@@ -537,6 +601,18 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       continue;
     }
 
+    // 0c. (ADR 0017) An Endorsement with edits is the Principal's to finalize at once; an exact Endorsement is the finalize
+    // script's, and returns here only when its claim is older than CLAIM_EXPIRY_MINUTES with no finalized row (the script
+    // died or declined). As for an Approval, the marker must still stand.
+    if (row && row.outcome && ['endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized && labels.has(marker)
+      && (row.outcome.kind === 'endorsed-with-edits' || new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000)) {
+      const verdict = newestVerdict(issue, fleetIdentity, row.proposed ? row.proposed.at : '');
+      // The owner commented after the Endorsement (the door's row comes just before its Verdict comment): his words may carry the edits.
+      const spokeAfter = ownerComments.filter((comment) => comment.createdAt > (verdict ? verdict.comment.createdAt : row.outcome.at)).pop();
+      endorsements.push({ kind: 'endorsement', ...(spokeAfter ? { ownerCommentUrl: spokeAfter.url } : {}), number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling only if none is newer than the Verdict, apply the labels, record finalized' });
+      continue;
+    }
+
     // 1. An open proposal with the owner's Approved comment after it: finalize first.
     if (proposed) {
       const approval = ownerComments.filter((comment) => comment.createdAt > approvalFloor(row) && APPROVAL_RE.test(comment.body)).pop();
@@ -544,6 +620,14 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
         approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: !isExactApproval(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
         continue;
       }
+    }
+
+    // 1b. (ADR 0017) An open proposal the Arbiter Returned: supersede it and propose again, one reason at a time. A second
+    // Return is not possible (the door refuses it), so this item appears once per proposal.
+    if (proposed && !row.outcome && row.returned) {
+      const verdict = newestVerdict(issue, fleetIdentity, proposed.at);
+      returns.push({ kind: 'returned', number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict && verdict.kind === 'returned' ? verdict.comment.url : (row.returned.commentUrl || null), at: row.returned.at, reasons: row.returned.reasons || null, bodyHash: issue.bodyHash, reason: 'Arbiter returned the proposal; supersede it and post one new proposal answering each reason' });
+      continue;
     }
 
     const hasTriageLabel = [...labels].some((label) => triageLabels.has(label));
@@ -641,6 +725,8 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
 
   approvals.sort((left, right) => left.at.localeCompare(right.at));
   vetoes.sort((left, right) => left.at.localeCompare(right.at));
+  endorsements.sort((left, right) => left.at.localeCompare(right.at));
+  returns.sort((left, right) => left.at.localeCompare(right.at));
   const escalationList = [...escalations.values()].sort((left, right) => left.at.localeCompare(right.at));
   // #268: an escalation carries the issue's proposal context, so a ticket or reproposal for the same issue is not also served.
   const escalated = new Set(escalationList.map((item) => Number(item.number)));
@@ -648,11 +734,11 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
   const proposeNow = tickets.slice(0, config.maxProposalsPerTurn).map((ticket) => ticket.number);
   return {
     at, ownerLogin: owner, cap: config.maxProposalsPerTurn, consumedThrough: projection.consumedThrough,
-    eligible: [...vetoes, ...repairs, ...approvals, ...escalationList, ...tickets],
+    eligible: [...vetoes, ...repairs, ...approvals, ...endorsements, ...returns, ...escalationList, ...tickets],
     proposeNow,
     skipped,
     premises,
-    counts: { issues: issues.length, eligible: vetoes.length + repairs.length + approvals.length + escalationList.length + tickets.length, approvals: approvals.length, escalations: escalationList.length, tickets: tickets.length, vetoes: vetoes.length, repairs: repairs.length },
+    counts: { issues: issues.length, eligible: vetoes.length + repairs.length + approvals.length + endorsements.length + returns.length + escalationList.length + tickets.length, approvals: approvals.length, endorsements: endorsements.length, returned: returns.length, escalations: escalationList.length, tickets: tickets.length, vetoes: vetoes.length, repairs: repairs.length },
   };
 }
 
@@ -690,6 +776,192 @@ function issueBodyHash({ root, tenant, tenantConfigPath, issue, fixture, runner 
     }
   }
   return { tenant: String(tenant), issue: number, bodyHash: sha256(body || '') };
+}
+
+// ------------------------------------------------------------- arbiter ----
+// ADR 0017: the Arbiter's frontier and its one door, `verdict`. The Arbiter decides; it applies no label and posts
+// no Ruling. A Verdict comment is the fleet identity's `## Verdict`; the ledger row beside it is the claim.
+
+function safeTenant(tenant) { return String(tenant || '').replace(/[^a-zA-Z0-9_.-]/g, '_'); }
+function arbiterSuspendedFlagPath(root, tenant) { return path.join(baseOf(root), 'state', 'flags', `arbiter-suspended-${safeTenant(tenant)}`); }
+function pausePath(root) { return path.join(baseOf(root), 'state', 'PAUSE'); }
+const OWNER_SPOKE_RES = Object.freeze([APPROVAL_RE, REPROPOSE_RE, VETO_RE]);
+
+// Why the Arbiter may not act at all: the owner's PAUSE or the standing suspension flag (only Cory deletes it).
+function arbiterStanding(root, tenant) {
+  const paused = fs.existsSync(pausePath(root));
+  const suspended = fs.existsSync(arbiterSuspendedFlagPath(root, tenant));
+  const why = [];
+  if (paused) why.push('state/PAUSE exists');
+  if (suspended) why.push(`state/flags/arbiter-suspended-${safeTenant(tenant)} exists; only Cory removes it`);
+  return { paused, suspended, why: why.join('; ') };
+}
+
+// [{ code, detail }] for every reason the Arbiter may not rule on this issue's open proposal: the ONE predicate the
+// frontier and the door share, so they cannot disagree. `row` is the issue's projection row.
+function verdictBlockers({ issue, row, config = DEFAULT_CONFIG, owner, fleetIdentity, held = null } = {}) {
+  const failures = [];
+  const fail = (code, detail) => failures.push({ code, detail });
+  const proposed = row && row.proposed ? row.proposed : null;
+  if (!proposed || row.outcome) { fail('no-open-proposal', row && row.outcome ? `outcome ${row.outcome.kind} already recorded at ${row.outcome.at}` : 'no open proposal in the ledger'); return failures; }
+  if (row.returned) fail('no-open-proposal', `the proposal was returned at ${row.returned.at}; the Principal supersedes it and proposes again`);
+  const labels = new Set(issue.labels);
+  if (!labels.has(config.markerLabel)) fail('labels', `issue #${issue.number} does not carry ${config.markerLabel}`);
+  const hold = heldIn(held, issue.number) || (issue.labels.find((label) => NEVER_FINALIZED_LABELS.includes(label)) ? `carries ${issue.labels.filter((label) => NEVER_FINALIZED_LABELS.includes(label)).join(', ')}` : null);
+  if (hold) fail('held', hold);
+  if (issue.bodyHash !== proposed.bodyHash) fail('body-changed', `the issue body changed since the proposal at ${proposed.at}`);
+  const spoke = issue.comments.find((comment) => comment.author === owner && comment.createdAt > proposed.at && OWNER_SPOKE_RES.some((re) => re.test(comment.body)));
+  if (spoke) fail('owner-spoke', `${owner} commented ${String(spoke.body).trim().split(/\s+/)[0]} at ${spoke.createdAt}, after the proposal`);
+  return failures;
+}
+
+// `frontier --role arbiter`: the open proposals the Arbiter should rule on, oldest first.
+function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, config = DEFAULT_CONFIG, entries = [], held = new Map(), tenant, now, paused = false, suspended = false, why = '' } = {}) {
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const owner = requireText(ownerLogin, 'ownerLogin');
+  const base = { role: 'arbiter', tenant: tenant ? String(tenant) : null, at, ownerLogin: owner, suspended: Boolean(suspended), paused: Boolean(paused) };
+  if (paused || suspended) return { ...base, eligible: [], counts: { proposals: 0, issues: issues.length }, skipped: [], reason: why || (paused ? 'state/PAUSE exists' : 'arbiter suspended') };
+  const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
+  const normalized = issues.map((raw) => raw.number !== undefined && raw.comments && Array.isArray(raw.labels) && raw.bodyHash ? raw : normalizeIssue(raw));
+  const eligible = [];
+  const skipped = [];
+  for (const issue of normalized) {
+    const row = projection.byIssue[issue.number] || null;
+    if (!row || !row.proposed || row.outcome) continue;   // not an open proposal: nothing for the Arbiter to say
+    const proposed = row.proposed;
+    const failures = verdictBlockers({ issue, row, config, owner, fleetIdentity, held });
+    if (!failures.length && newestVerdict(issue, fleetIdentity, proposed.at)) failures.push({ code: 'verdict-posted', detail: 'a Verdict comment from the fleet identity is newer than the proposal' });
+    if (failures.length) { skipped.push({ number: issue.number, reason: `${failures[0].code}: ${failures[0].detail}` }); continue; }
+    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId), reason: 'open proposal with no verdict' });
+  }
+  eligible.sort((left, right) => left.proposedAt.localeCompare(right.proposedAt) || left.number - right.number);
+  return { ...base, eligible, counts: { proposals: eligible.length, issues: issues.length }, skipped };
+}
+
+function computeArbiterFrontier({ root, tenant, tenantConfigPath, fixture, now, runner, issues: given = null } = {}) {
+  const config = readTriageConfig(root);
+  const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
+  const ownerLogin = ownerLoginOf(tenantConfig);   // fail closed, as the Principal's frontier
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const standing = arbiterStanding(root, tenant);
+  const source = fixture ? 'fixture' : 'github';
+  // Suspended or paused: nothing is eligible, so GitHub is not read at all.
+  const issues = standing.paused || standing.suspended ? [] : (given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner: runner || execFileSync })));
+  return { source, ...selectArbiterFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, config, entries: readLedger(root, tenant), held: readHeldIssues(root, tenant, at), tenant, now: at, ...standing }) };
+}
+
+function verdictRefused(conditions) {
+  const plain = conditions.map((entry) => ({ code: entry.code, detail: entry.detail }));
+  const list = plain.map((entry) => `${entry.code}: ${entry.detail || entry.code}`).join('; ');
+  return new WorkStateError('VERDICT_REFUSED', `verdict refused (${list})`, { condition: plain[0].code, conditions: plain });
+}
+
+function verdictHeadline({ kind, edits, reason, question }) {
+  if (kind === 'endorsed') return 'Endorsed';
+  if (kind === 'endorsed-with-edits') return `Endorsed with: ${edits}`;
+  if (kind === 'returned') return 'Returned';
+  return `Escalated: ${reason} - ${question}`;
+}
+
+function verdictCommentBody({ kind, edits, reason, question, text }) {
+  const rest = String(text || '').replace(/\r\n/g, '\n').replace(/^\n+/, '').replace(/\s+$/, '');
+  return `## Verdict\n${verdictHeadline({ kind, edits, reason, question })}${rest ? `\n${rest}` : ''}`;
+}
+
+// The Arbiter's door. Order, once every refusal below has passed:
+//   1. the ledger row (the first-writer claim; TRIAGE_ALREADY_DECIDED against an Approval or an Endorsement that won),
+//   2. the `## Verdict` comment under the fleet identity,
+// and for an escalation the page to Cory comes BEFORE both, with the ledger row written only after the page is
+// delivered (page-failed records nothing and posts nothing, so the retry is clean, as boundedReady's is). It applies
+// no label. `text` is the body-file / reasons-file content (numbered reasons or answer lines and a Premises: block).
+// With a fixture the comment goes to the fixture file and an un-injected page is not sent.
+function verdictDoor({ root, tenant, issue: issueValue, kind, text = '', edits, reasons, reason, question, tenantConfigPath, fixture, issues: given, now, runner = execFileSync, send, env = process.env } = {}) {
+  if (!tenant) throw new WorkStateError('TRIAGE_INVALID', 'tenant is required');
+  const number = requireIssue(issueValue);
+  if (![...ARBITER_KINDS].includes(kind)) throw new WorkStateError('TRIAGE_INVALID', `--kind must be one of ${ARBITER_KINDS.join(', ')}`);
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  // The verdict is the Arbiter's. A session that names another fleet role is refused; an unset FLEET_ROLE (tests, Cory's own shell) is not.
+  if (env.FLEET_ROLE !== undefined && String(env.FLEET_ROLE).trim() !== ARBITER_ACTOR) throw verdictRefused([{ code: 'role', detail: `FLEET_ROLE is "${env.FLEET_ROLE}"; only the arbiter writes a verdict` }]);
+  const standing = arbiterStanding(root, tenant);
+  if (standing.paused || standing.suspended) throw verdictRefused([{ code: 'suspended', detail: `the Arbiter posts no verdict (${standing.why})` }]);
+  const text0 = String(text || '');
+  if (kind === 'escalated' && !ESCALATION_CLASSES.includes(reason)) throw verdictRefused([{ code: 'reason', detail: `--reason must be one of ${ESCALATION_CLASSES.join(', ')} for an escalation${reason ? ` (got "${reason}")` : ''}` }]);
+  if (kind === 'escalated' && !String(question || '').trim()) throw verdictRefused([{ code: 'question', detail: 'an escalation needs --question: the one question the owner answers' }]);
+  if (kind === 'endorsed-with-edits' && !String(edits || '').trim()) throw verdictRefused([{ code: 'edits', detail: '--edits is required for endorsed-with-edits' }]);
+  if (kind === 'returned' && !String(reasons || text0).trim()) throw verdictRefused([{ code: 'reasons', detail: 'a Return needs numbered reasons (--reasons-file)' }]);
+
+  const config = readTriageConfig(root);
+  const tenantConfig = readTenantConfig(root, tenant, tenantConfigPath);
+  const owner = ownerLoginOf(tenantConfig);
+  const fleetIdentity = tenantConfig.fleetIdentity || null;
+  const entries = readLedger(root, tenant);
+  const projection = projectTriage({ entries, now: at, windowDays: config.windowDays, graduation: config.graduation });
+  const row = projection.byIssue[number] || null;
+  const earlier = [];
+  // A Return counts against this proposal's body only, and only since the issue was last finalized: a changed body, or a
+  // ticket finalized and later reopened, is a fresh round.
+  const lastFinalized = entries.filter((entry) => entry.kind === 'finalized' && Number(entry.issue) === number).reduce((newest, entry) => (String(entry.at) > newest ? String(entry.at) : newest), '');
+  const openHash = row && row.proposed ? row.proposed.bodyHash : null;
+  const loadFound = () => {
+    const all = given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner }));
+    return all.map((entry) => entry.number !== undefined && entry.comments && Array.isArray(entry.labels) && entry.bodyHash ? entry : normalizeIssue(entry)).find((entry) => entry.number === number);
+  };
+  const writer = fixture ? fixtureIssueWriter({ file: fixture, author: fleetIdentity || 'fleet', at }) : ghIssueWriter({ repo: tenantConfig.github, runner });
+  const postVerdict = (entry) => {
+    try { writer.comment(number, verdictCommentBody({ kind, edits, reason, question, text: kind === 'returned' && !text0.trim() ? reasons : text0 })); } catch (error) {
+      throw new WorkStateError('GITHUB_WRITE_FAILED', `the ${kind} of #${number} is recorded, but posting its Verdict comment failed (${String(error.message || error).slice(0, 200)}); run the same verdict command again: it posts the missing comment and records nothing twice`, { issue: number, entry });
+    }
+  };
+  // A retry after a failed post: the door's own row for THIS kind stands at the issue's current body and no Verdict follows
+  // the proposal, so the missing comment is posted. Nothing is recorded or paged again.
+  const kept = row && row.proposed ? (kind === 'returned' ? row.returned : (row.outcome && row.outcome.kind === kind ? row.outcome : null)) : null;
+  if (kept && kept.actor === ARBITER_ACTOR) {
+    const present = loadFound();
+    if (present && present.bodyHash === kept.bodyHash && !newestVerdict(present, fleetIdentity, row.proposed.at)) {
+      postVerdict(kept);
+      return { tenant: String(tenant), issue: number, kind, at, source: fixture ? 'fixture' : 'github', recorded: true, commented: true, paged: false, recovered: true, entry: kept };
+    }
+  }
+  if (kind === 'returned' && entries.some((entry) => entry.kind === 'returned' && Number(entry.issue) === number && entry.bodyHash === openHash && String(entry.at) > lastFinalized)) {
+    earlier.push({ code: 'returned-once', detail: `issue #${number} has already been Returned once; a second Return is an escalation: use --kind escalated --reason disagreement` });
+  }
+  if (!row || !row.proposed || row.outcome) throw verdictRefused([...earlier, { code: 'no-open-proposal', detail: `issue #${number} has no open proposal in the ledger (none recorded, or its outcome is already recorded)` }]);
+  const found = loadFound();
+  if (!found) throw verdictRefused([...earlier, { code: 'no-open-proposal', detail: `issue #${number} is not among ${tenant}'s open issues` }]);
+  const failures = [...earlier, ...verdictBlockers({ issue: found, row, config, owner, fleetIdentity, held: readHeldIssues(root, tenant, at) })];
+  if (failures.length) throw verdictRefused(failures);
+
+  const open = row.proposed;
+  const result = { tenant: String(tenant), issue: number, kind, at, source: fixture ? 'fixture' : 'github', recorded: false, commented: false, paged: false };
+  const claim = () => {
+    // TRIAGE_ALREADY_DECIDED (an Approval or another verdict won the claim) propagates as it is.
+    return recordEntry({ root, tenant, kind, issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, edits, reasons: kind === 'returned' ? (reasons || text0) : undefined, reason: kind === 'escalated' ? reason : undefined, question, actor: ARBITER_ACTOR, now: at });
+  };
+  const post = () => { postVerdict(result.entry); result.commented = true; };
+
+  if (kind === 'escalated') {
+    const page = {
+      kind: 'arbiter-escalation',
+      title: `Fleet: ${tenant} #${number} needs your decision (${reason})`,
+      body: `${found.title}. The Arbiter escalated it as ${reason}: ${String(question).trim()}`,
+      priority: 'normal',
+      url: found.url,
+    };
+    const sender = send || (fixture ? () => ({ ok: true, detail: 'fixture: not sent' }) : require('./notify').pageSender({ root }));
+    let sent;
+    try { sent = sender(page); } catch (error) { sent = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
+    if (!sent || !sent.ok) throw verdictRefused([{ code: 'page-failed', detail: `the page to Cory was not delivered (${(sent && sent.detail) || 'no detail'}); nothing was recorded or posted, and the Arbiter may try again` }]);
+    result.paged = true;
+    result.pageDetail = sent.detail || null;
+    result.entry = claim();
+    result.recorded = true;
+    post();
+    return result;
+  }
+  result.entry = claim();
+  result.recorded = true;
+  post();
+  return result;
 }
 
 // Spec fleet #193 (m4): an Approval counts only when newer than the proposal AND newer than the
@@ -821,12 +1093,13 @@ function proposalClassification(text) {
 // The Ruling: the proposal under its own heading (its first `## Triage proposal` line
 // removed, otherwise verbatim, CRLF normalised), with the approval named above and the
 // labels applied below.
-function rulingBodyFor({ proposalBody, approvalUrl, labels, marker }) {
+function rulingBodyFor({ proposalBody, approvalUrl, labels, marker, endorsed = false }) {
   const lines = String(proposalBody || '').replace(/\r\n/g, '\n').split('\n');
   const first = lines.findIndex((line) => line.trim());
   if (first >= 0 && PROPOSAL_HEADING_RE.test(lines[first])) lines.splice(first, 1);
   const proposal = lines.join('\n').replace(/^\n+/, '').replace(/\s+$/, '');
-  const approved = approvalUrl ? `Approved without edits: ${approvalUrl}.` : 'Approved without edits.';
+  const word = endorsed ? 'Endorsed' : 'Approved';
+  const approved = approvalUrl ? `${word} without edits: ${approvalUrl}.` : `${word} without edits.`;
   return `## Ruling\n${approved} Finalized by script (fleet #207).\n\n${proposal}\n\nLabels: ${labels.join(', ')}; ${marker} removed.`;
 }
 
@@ -836,7 +1109,9 @@ function proposalRefusals(text) {
   const codes = [];
   const classification = exactField(parsed, 'Classification');
   if (classification !== 'bug' && classification !== 'feature') codes.push('classification');
-  if (exactField(parsed, 'Open for Cory') !== 'none') codes.push('open-for-cory');
+  // ADR 0017: the field is `Open:` and must be exactly none; `Open for Cory:` is the legacy spelling of the proposals already on the board.
+  const open = ['Open', 'Open for Cory'].map((name) => exactField(parsed, name)).filter((value) => value !== null);
+  if (!open.length || open.some((value) => value !== 'none')) codes.push('open-for-cory');
   if (exactField(parsed, 'Blocked_by') !== 'none') codes.push('blocked-by');
   const tier = exactField(parsed, 'Tier');
   if (tier !== 'haiku' && tier !== 'sonnet') codes.push('tier');
@@ -1013,10 +1288,10 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
 
   // Steps b to d of the effect, all idempotent: the Ruling unless one newer than the approval
   // stands, the labels, then the finalized row. The claim (step a) is what made this run the owner of it.
-  const complete = (issue, proposalComment, approvalUrl, approvalAt) => {
+  const complete = (issue, proposalComment, approvalUrl, approvalAt, endorsed = false) => {
     const applied = proposalClassification(proposalComment.body) === 'bug' ? [readyLabel, 'bug'] : [readyLabel];
     const posted = issue.comments.some((comment) => comment.createdAt > approvalAt && RULING_HEADING_RE.test(comment.body));
-    if (!posted) writer.comment(issue.number, rulingBodyFor({ proposalBody: proposalComment.body, approvalUrl, labels: applied, marker }));
+    if (!posted) writer.comment(issue.number, rulingBodyFor({ proposalBody: proposalComment.body, approvalUrl, labels: applied, marker, endorsed }));
     const have = new Set(issue.labels);
     if (applied.some((label) => !have.has(label)) || have.has(marker)) writer.relabel(issue.number, { add: applied.filter((label) => !have.has(label)), remove: have.has(marker) ? marker : null });
     recordEntry({ root, tenant, kind: 'finalized', issue: issue.number, labels: applied.join(','), actor: FINALIZE_ACTOR, now: at });
@@ -1039,6 +1314,35 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
   }
 
   let claims = 0;
+  // ADR 0017: an exact `Endorsed` Verdict is finalized as an exact `Approved` is, except that the claim is already
+  // the Arbiter's `endorsed` row (the door records it before it posts the Verdict), so there is nothing to claim here:
+  // every clause but the claim holds, then the Ruling, the labels and the finalized row. A Verdict comment not yet
+  // posted is left for the next tick.
+  const fleetIdentity = tenantConfig.fleetIdentity || null;
+  for (const issue of sorted) {
+    const row = projection.byIssue[issue.number] || null;
+    if (!row || !row.proposed || !row.outcome || row.outcome.kind !== 'endorsed' || row.finalized) continue;
+    const leave = (reason, detail) => left.push(detail ? { issue: issue.number, reason, detail } : { issue: issue.number, reason });
+    try {
+      const verdict = newestVerdict(issue, fleetIdentity, row.proposed.at);
+      if (!verdict) { leave('no-verdict', 'the endorsement is recorded but no Verdict comment from the fleet identity follows the proposal'); continue; }
+      if (!verdict.exact) { leave('not-exact-endorsement'); continue; }   // clause 2
+      const decided = verdict.comment;
+      // Clause 3 differs from an Approval's: the claim is already ours, so a Ruling newer than the Verdict is a run that died
+      // after posting it. complete() posts none when one stands and finishes the labels and the finalized row.
+      const ruled = issue.comments.some((comment) => comment.createdAt > decided.createdAt && RULING_HEADING_RE.test(comment.body));
+      if (!ruled && issue.comments.some((comment) => comment.author === owner && comment.createdAt > decided.createdAt)) { leave('owner-commented-after-approval'); continue; }
+      const proposal = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
+      // A Ruling already stands: the gate passed in the run that posted it (and its relabel may have removed the marker), so only finish.
+      const failures = ruled ? (proposal ? [] : [{ code: 'stale-proposal', detail: 'recovery: proposal comment not found' }]) : proposalGate({ issue, row: { ...row, outcome: null }, proposal, approval: decided, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });   // clauses 1, 4-9
+      if (failures.length) { leave(failures[0].code, failures[0].detail); continue; }
+      if (claims >= FINALIZE_CAP) { leave('cap'); continue; }   // clause 10
+      claims += 1;
+      complete(issue, proposal, decided.url, decided.createdAt, true);
+    } catch (error) {
+      errors.push({ issue: issue.number, message: String(error.message || error) });
+    }
+  }
   for (const issue of sorted) {
     const row = projection.byIssue[issue.number] || null;
     // Spec fleet #193: a standing bounded ready is a decision already taken; an Approval after it is left to the frontier's rules, never finalized here.
@@ -1116,8 +1420,8 @@ function triageTick({ root, tenant, tenantConfigPath, fixture, outboxPath, now, 
 // ------------------------------------------------------------------ CLI ----
 
 const TRIAGE_FLAGS = Object.freeze({
-  frontier: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
-  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'reason', 'premise', 'now'],
+  frontier: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now', 'role'],
+  record: ['root', 'tenant', 'kind', 'issue', 'body-hash', 'comment-url', 'model', 'by', 'edits', 'labels', 'through', 'record-id', 'actor', 'evidence', 'pr-url', 'premises-sha', 'reason', 'premise', 'reasons', 'question', 'now'],
   state: ['root', 'tenant', 'now', 'days'],
   hash: ['root', 'tenant', 'tenant-config', 'issue', 'fixture'],
   finalize: ['root', 'tenant', 'tenant-config', 'fixture', 'outbox', 'now'],
@@ -1127,8 +1431,10 @@ const TRIAGE_FLAGS = Object.freeze({
   'bounded-ready': ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
   veto: ['root', 'tenant', 'tenant-config', 'issue', 'fixture', 'now'],
   'bounded-scan': ['root', 'tenant', 'tenant-config', 'fixture', 'now'],
+  // ADR 0017: the Arbiter's door.
+  verdict: ['root', 'tenant', 'tenant-config', 'issue', 'kind', 'body-file', 'edits', 'reasons-file', 'reason', 'question', 'fixture', 'now'],
 });
-const TRIAGE_USAGE = 'commands: frontier (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), tick (the flags of finalize: finalize then frontier over one read), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), bounded-scan (--tenant [--fixture <issues.json>] [--now <iso>])';
+const TRIAGE_USAGE = 'commands: frontier (--tenant [--role principal|arbiter] [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), record (--tenant --kind proposed|approved|approved-with-edits|rejected|superseded|finalized|consumed ...), state (--tenant [--days n]), hash (--tenant --issue <n> [--fixture <issues.json>]), finalize (--tenant [--fixture <issues.json>] [--outbox <jsonl>] [--now <iso>]), tick (the flags of finalize: finalize then frontier over one read), bounded-ready (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), veto (--tenant --issue <n> [--fixture <issues.json>] [--now <iso>]), bounded-scan (--tenant [--fixture <issues.json>] [--now <iso>]), verdict (--tenant --issue <n> --kind endorsed|endorsed-with-edits|returned|escalated [--body-file <path>] [--edits <text>] [--reasons-file <path>] [--reason product-intent|money|user-promise|rule-change|disagreement] [--question <text>] [--fixture <issues.json>] [--now <iso>])';
 
 function cli(argv) {
   const [command, ...rest] = argv;
@@ -1136,6 +1442,19 @@ function cli(argv) {
   if (!flags) throw new WorkStateError('USAGE', TRIAGE_USAGE);
   const args = parseArgs(rest, flags);
   const tenant = requireText(args.tenant, '--tenant');
+  if (command === 'frontier') {
+    const role = args.role === undefined ? 'principal' : args.role;
+    if (role === 'arbiter') return computeArbiterFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now });
+    if (role !== 'principal') throw new WorkStateError('USAGE', '--role must be principal or arbiter');
+  }
+  if (command === 'verdict') {
+    if (args.now && !args.fixture) throw new WorkStateError('USAGE', '--now is for a fixture run only: the ledger\'s `at` is the wall clock in production (verdict)');
+    if (args.fixture && path.resolve(args.root || path.resolve(__dirname, '..')).toLowerCase() === path.resolve(__dirname, '..').toLowerCase()) throw new WorkStateError('USAGE', '--fixture is for a temp --root: on the fleet\'s own root a rehearsal would write state a live run acts on (verdict)');
+    const readText = (file) => { if (!file) return ''; const raw = fs.readFileSync(path.resolve(file), 'utf8'); return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw; };
+    const bodyText = readText(args['body-file']);
+    const reasonsText = readText(args['reasons-file']);
+    return verdictDoor({ root: args.root, tenant, issue: args.issue, kind: args.kind, text: args.kind === 'returned' ? (reasonsText || bodyText) : bodyText, edits: args.edits, reasons: reasonsText || undefined, reason: args.reason, question: args.question, tenantConfigPath: args['tenant-config'], fixture: args.fixture, now: args.now });
+  }
   if (command === 'frontier') return computeFrontier({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.now && !args.fixture) throw new WorkStateError('USAGE', `--now is for a fixture run only: the ledger's \`at\` and the Veto window are the wall clock in production (${command})`);
   if ((command === 'bounded-scan' || command === 'bounded-ready' || command === 'veto') && args.fixture && path.resolve(args.root || path.resolve(__dirname, '..')).toLowerCase() === path.resolve(__dirname, '..').toLowerCase()) throw new WorkStateError('USAGE', `--fixture is for a temp --root: on the fleet's own root a rehearsal would write state a live run acts on (${command})`);
@@ -1147,10 +1466,11 @@ function cli(argv) {
   }
   if (command === 'record') {
     if (args.now && Date.parse(args.now) > Date.now() + 5 * 60000) throw new WorkStateError('USAGE', 'record --now is in the future: the ledger\'s time is the wall clock, and a later time would put a proposal after the comments it should answer to');
+    if (ARBITER_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is the Arbiter's verdict, written only by its door (triage.js verdict), which checks what it records`);
     if (BOUNDED_KINDS.includes(args.kind)) throw new WorkStateError('USAGE', `record cannot write kind "${args.kind}"; it is written by its door (triage.js bounded-ready, veto, bounded-scan), which checks what it records`);
     return recordEntry({
       root: args.root, tenant, kind: args.kind, issue: args.issue, bodyHash: args['body-hash'], commentUrl: args['comment-url'], model: args.model,
-      by: args.by, edits: args.edits, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
+      by: args.by, edits: args.edits, reasons: args.reasons, question: args.question, labels: args.labels, through: args.through, recordId: args['record-id'], actor: args.actor, evidence: args.evidence, prUrl: args['pr-url'], premisesSha: args['premises-sha'], reason: args.reason, premise: args.premise, now: args.now,
     });
   }
   if (command === 'tick') return triageTick({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
@@ -1175,6 +1495,17 @@ if (require.main === module) {
 
 module.exports = {
   APPROVAL_RE,
+  ARBITER_KINDS,
+  ENDORSED_RE,
+  EXACT_ENDORSED_RE,
+  RETURNED_RE,
+  ESCALATED_RE,
+  ESCALATION_CLASSES,
+  verdictOf,
+  verdictDoor,
+  verdictBlockers,
+  selectArbiterFrontier,
+  computeArbiterFrontier,
   BOUNDED_KINDS,
   VERIFIED_PREMISE_RE,
   DEFAULT_CONFIG,

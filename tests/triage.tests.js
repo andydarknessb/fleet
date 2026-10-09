@@ -1985,6 +1985,340 @@ test('#210 minor 8: a Scope of more than 25 paths refuses scope-unresolved, so a
   assert.equal(world.door().readied, true);
 });
 
+// ADR 0017: the Arbiter's verdict door, ledger kinds, frontier, and the finalize of an exact Endorsed.
+const OPEN_PROPOSAL = PROPOSAL.replace('Open for Cory: none', 'Open: none');
+const VERDICT_AT = '2026-09-11T00:00:00.000Z';
+const verdictUrl = (n) => `https://github.com/owner/repo/issues/${n}#issuecomment-verdict-${n}`;
+const verdictComment = (n, body, createdAt = VERDICT_AT, author = FLEET) => ({ id: `verdict-${n}`, url: verdictUrl(n), author, body, createdAt });
+
+function arbiterWorld({ numbers = [40], each = () => ({}), pause = false, suspended = false, ...rest } = {}) {
+  const world = finalizeWorld({ numbers, each: (number) => ({ thread: { approval: null, proposal: OPEN_PROPOSAL }, ...each(number) }), ...rest });
+  if (pause) { fs.mkdirSync(path.join(world.root, 'state'), { recursive: true }); fs.writeFileSync(path.join(world.root, 'state', 'PAUSE'), ''); }
+  if (suspended) { fs.mkdirSync(path.join(world.root, 'state', 'flags'), { recursive: true }); fs.writeFileSync(path.join(world.root, 'state', 'flags', 'arbiter-suspended-endzone'), ''); }
+  const sent = [];
+  const door = (extra = {}) => triage.verdictDoor({ root: world.root, tenant: 'endzone', issue: 40, kind: 'endorsed', fixture: world.fixture, now: NOW, env: {}, send: (page) => { sent.push(page); return { ok: true, detail: 'sent' }; }, ...extra });
+  const rows = () => world.ledger().filter((row) => triage.ARBITER_KINDS.includes(row.kind) || row.kind === 'finalized');
+  return { ...world, door, sent, rows };
+}
+
+function refusedWith(fn, condition, pattern) {
+  try { fn(); } catch (error) {
+    assert.equal(error.code, 'VERDICT_REFUSED', `${condition}: ${error.message}`);
+    assert.equal(error.condition, condition, error.message);
+    if (pattern) assert.match(error.message, pattern);
+    return error;
+  }
+  assert.fail(`expected a ${condition} refusal`);
+}
+
+test('ADR 0017 verdict regexes: the shapes, whitespace and case tolerance, and fleet-identity authorship', () => {
+  assert.ok(triage.ENDORSED_RE.test('  endorsed'));
+  assert.ok(triage.ENDORSED_RE.test('Endorsed with: tier sonnet'));
+  assert.ok(triage.ENDORSED_RE.test('ENDORSED, but skip X'));
+  assert.ok(!triage.ENDORSED_RE.test('Unendorsed'));
+  assert.ok(triage.EXACT_ENDORSED_RE.test(' Endorsed \n'));
+  assert.ok(!triage.EXACT_ENDORSED_RE.test('Endorsed with: x'));
+  assert.ok(triage.RETURNED_RE.test('returned'));
+  assert.ok(triage.ESCALATED_RE.test('Escalated: money - which plan?'));
+  assert.ok(!triage.ESCALATED_RE.test('Escalated money'));
+  const v = (body, author = FLEET) => triage.verdictOf({ author, body }, FLEET);
+  assert.deepEqual(v('## Verdict\n\nEndorsed\nPremises:\n  x'), { kind: 'endorsed', exact: true });
+  assert.deepEqual(v('## Verdict\nEndorsed with: tier sonnet'), { kind: 'endorsed-with-edits', exact: false });
+  assert.deepEqual(v('## Verdict\nReturned\n1. no'), { kind: 'returned', exact: false });
+  assert.deepEqual(v('## Verdict\nEscalated: money - q'), { kind: 'escalated', exact: false });
+  assert.equal(v('## Verdict\nMaybe'), null);
+  assert.equal(v('Endorsed'), null, 'a bare Endorsed with no heading is not a Verdict');
+  assert.equal(v('## Verdict\nEndorsed', OWNER), null, 'only the fleet identity writes a Verdict');
+  assert.equal(triage.verdictOf({ author: FLEET, body: '## Verdict\nEndorsed' }, null), null);
+});
+
+test('ADR 0017: record writes the four arbiter kinds with actor arbiter, and validates their fields', () => {
+  const world = arbiterWorld();
+  const base = { root: world.root, tenant: 'endzone', issue: 40, bodyHash: 'h', commentUrl: proposalUrl(40), now: NOW };
+  assert.throws(() => recordEntry({ ...base, kind: 'endorsed-with-edits' }), { code: 'TRIAGE_INVALID', message: /edits/ });
+  assert.throws(() => recordEntry({ ...base, kind: 'returned' }), { code: 'TRIAGE_INVALID', message: /reasons/ });
+  assert.throws(() => recordEntry({ ...base, kind: 'escalated', reason: 'vibes', question: 'q' }), { code: 'TRIAGE_INVALID', message: /product-intent/ });
+  assert.throws(() => recordEntry({ ...base, kind: 'escalated', reason: 'money' }), { code: 'TRIAGE_INVALID', message: /question/ });
+  assert.throws(() => recordEntry({ ...base, kind: 'endorsed', commentUrl: undefined }), { code: 'TRIAGE_INVALID' });
+  const returned = recordEntry({ ...base, kind: 'returned', reasons: '1. no premise' });
+  assert.equal(returned.actor, 'arbiter');
+  assert.equal(returned.reasons, '1. no premise');
+  assert.equal(projectTriage({ entries: world.ledger(), now: NOW }).byIssue[40].outcome, null, 'a Return is not an outcome');
+  const withEdits = recordEntry({ ...base, kind: 'endorsed-with-edits', edits: 'tier haiku' });
+  assert.equal(withEdits.edits, 'tier haiku');
+  const projection = projectTriage({ entries: world.ledger(), now: NOW });
+  assert.equal(projection.allTime.decided, 0, 'an Endorsement is not one of the owner\'s outcomes');
+  assert.deepEqual(projection.awaitingFinalize.map((row) => row.outcome), ['endorsed-with-edits']);
+});
+
+test('ADR 0017: the ledger claim is first-writer-wins between an Approval and an Endorsement, both orders', () => {
+  const a = arbiterWorld();
+  recordEntry({ root: a.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, commentUrl: approvalUrl(40), now: NOW });
+  assert.throws(() => recordEntry({ root: a.root, tenant: 'endzone', kind: 'endorsed', issue: 40, bodyHash: 'h', commentUrl: proposalUrl(40), now: NOW }), { code: 'TRIAGE_ALREADY_DECIDED' });
+  refusedWith(() => a.door(), 'no-open-proposal', /already recorded/);
+  const b = arbiterWorld();
+  b.door();
+  assert.throws(() => recordEntry({ root: b.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, now: NOW }), { code: 'TRIAGE_ALREADY_DECIDED', decidedBy: 'arbiter' });
+  assert.throws(() => recordEntry({ root: b.root, tenant: 'endzone', kind: 'escalated', issue: 40, bodyHash: 'h', commentUrl: proposalUrl(40), reason: 'money', question: 'q', now: NOW }), { code: 'TRIAGE_ALREADY_DECIDED' });
+});
+
+test('ADR 0017: the door records the claim, then posts the Verdict under the fleet identity, and applies no label', () => {
+  const cases = [
+    [{ kind: 'endorsed', text: 'Premises:\n  src/list.js: slices one short @abcdef1 verified @abcdef2' }, /^## Verdict\nEndorsed\nPremises:/],
+    [{ kind: 'endorsed-with-edits', edits: 'tier haiku', text: '1. Owner: Andy\nPremises:\n  a' }, /^## Verdict\nEndorsed with: tier haiku\n1\. Owner: Andy/],
+    [{ kind: 'returned', reasons: '1. Premise 2 is false.\n2. Scope too wide.', text: '1. Premise 2 is false.\n2. Scope too wide.' }, /^## Verdict\nReturned\n1\. Premise 2 is false\.\n2\. Scope too wide\.$/],
+    [{ kind: 'escalated', reason: 'money', question: 'Which plan do we buy?', text: 'Premises:\n  b' }, /^## Verdict\nEscalated: money - Which plan do we buy\?\nPremises:/],
+  ];
+  for (const [options, shape] of cases) {
+    const world = arbiterWorld();
+    const result = world.door(options);
+    assert.equal(result.recorded, true);
+    assert.equal(result.commented, true);
+    const verdict = world.fixtureIssue().comments.find((entry) => /^## Verdict/.test(entry.body));
+    assert.match(verdict.body, shape, options.kind);
+    assert.equal(verdict.author, FLEET);
+    assert.deepEqual([...world.fixtureIssue().labels].sort(), ['needs-triage', 'triage-proposed'], 'the door applies no label');
+    const row = world.rows().pop();
+    assert.equal(row.kind, options.kind);
+    assert.equal(row.actor, 'arbiter');
+    assert.equal(row.issue, 40);
+    assert.equal(row.commentUrl, proposalUrl(40));
+    assert.equal(row.bodyHash, triage.normalizeIssue(world.fixtureIssue()).bodyHash);
+    assert.equal(world.sent.length, options.kind === 'escalated' ? 1 : 0, 'only an escalation pages');
+  }
+});
+
+test('ADR 0017: every door refusal code, each leaving the ledger and the thread untouched', () => {
+  const check = (name, condition, make, doorOptions = {}, pattern) => {
+    const world = make();
+    const before = world.ledger().length;
+    const comments = world.fixtureIssue().comments.length;
+    refusedWith(() => world.door(doorOptions), condition, pattern);
+    assert.equal(world.ledger().length, before, `${name}: no row`);
+    assert.equal(world.fixtureIssue().comments.length, comments, `${name}: no comment`);
+    assert.equal(world.sent.length, 0, `${name}: no page`);
+  };
+  check('flag', 'suspended', () => arbiterWorld({ suspended: true }), {}, /arbiter-suspended-endzone/);
+  check('PAUSE', 'suspended', () => arbiterWorld({ pause: true }), {}, /PAUSE/);
+  check('another role', 'role', () => arbiterWorld(), { env: { FLEET_ROLE: 'principal' } }, /principal/);
+  check('no proposal', 'no-open-proposal', () => arbiterWorld(), { issue: 41 });
+  check('no marker', 'labels', () => arbiterWorld({ each: () => ({ labels: ['needs-triage'] }) }));
+  check('held label', 'held', () => arbiterWorld({ each: () => ({ labels: ['needs-triage', 'triage-proposed', 'held'] }) }));
+  check('held by exclusion file', 'held', () => arbiterWorld({ afterPropose: (root) => { fs.mkdirSync(path.join(root, 'state', 'skip'), { recursive: true }); fs.writeFileSync(path.join(root, 'state', 'skip', 'endzone.json'), JSON.stringify({ issues: { 40: 'parked' } })); } }));
+  check('body changed', 'body-changed', () => arbiterWorld({ each: () => ({ proposedBody: 'Body of #40 before the edit\n\n## Premises\n' }) }));
+  for (const word of ['Approved', 'Re-propose: scope moved', 'Veto']) {
+    check(`owner said ${word}`, 'owner-spoke', () => arbiterWorld({ each: () => ({ thread: { approval: word, proposal: OPEN_PROPOSAL } }) }));
+  }
+  check('escalation with no reason', 'reason', () => arbiterWorld(), { kind: 'escalated', question: 'q?' });
+  check('escalation with an unknown reason', 'reason', () => arbiterWorld(), { kind: 'escalated', reason: 'vibes', question: 'q?' });
+});
+
+test('ADR 0017: a Return is one round: the Principal sees it, supersedes, proposes again, and a second Return is refused with the escalation instruction', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'returned', reasons: '1. Premise 2 is false.', text: '1. Premise 2 is false.' });
+  // The proposal stays open, marked returned; the Arbiter's own frontier no longer lists it.
+  assert.equal(projectTriage({ entries: world.ledger(), now: NOW }).byIssue[40].outcome, null);
+  assert.deepEqual(computeFrontierArbiter(world).eligible, []);
+  assert.match(computeFrontierArbiter(world).skipped[0].reason, /returned/);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'no-open-proposal', /returned/);
+  // The Principal's frontier: a `returned` item carrying the Verdict and the reasons.
+  const items = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
+  assert.equal(items.length, 1);
+  assert.equal(items[0].kind, 'returned');
+  assert.equal(items[0].number, 40);
+  assert.equal(items[0].reasons, '1. Premise 2 is false.');
+  assert.match(items[0].commentUrl, /issuecomment-finalize-40-/, 'the fixture writer names the Verdict comment');
+  // The Principal supersedes and proposes again at the same body.
+  const hash = triage.normalizeIssue(world.fixtureIssue()).bodyHash;
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: hash, now: '2026-09-12T12:01:00.000Z' });
+  assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible.filter((item) => item.kind === 'returned'), []);
+  const second = '2026-09-12T12:02:00.000Z';
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: hash, commentUrl: 'https://github.com/owner/repo/issues/40#issuecomment-second', model: 'opus-5.5', now: second });
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  issues[0].comments.push({ id: 'second', url: 'https://github.com/owner/repo/issues/40#issuecomment-second', author: FLEET, body: OPEN_PROPOSAL, createdAt: second });
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+  const later = '2026-09-12T12:03:00.000Z';
+  assert.deepEqual(computeFrontierArbiter(world, later).eligible.map((item) => item.commentUrl), ['https://github.com/owner/repo/issues/40#issuecomment-second'], 'the new proposal is the Arbiter\'s again');
+  const error = refusedWith(() => world.door({ kind: 'returned', reasons: '1. still no', text: '1. still no', now: later }), 'returned-once', /--kind escalated --reason disagreement/);
+  assert.equal(error.conditions[0].code, 'returned-once');
+  // The same new proposal can be endorsed.
+  assert.equal(world.door({ kind: 'endorsed', now: later }).recorded, true);
+});
+
+function computeFrontierArbiter(world, now = NOW) {
+  return triage.computeArbiterFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now });
+}
+
+test('ADR 0017: an escalation pages once before anything is recorded; a failed page records and posts nothing', () => {
+  const world = arbiterWorld();
+  const failing = () => world.door({ kind: 'escalated', reason: 'product-intent', question: 'Should ties show?', send: () => ({ ok: false, detail: 'pushover down' }) });
+  refusedWith(failing, 'page-failed', /pushover down/);
+  assert.deepEqual(world.rows(), []);
+  assert.equal(world.fixtureIssue().comments.filter((entry) => /^## Verdict/.test(entry.body)).length, 0);
+  const result = world.door({ kind: 'escalated', reason: 'product-intent', question: 'Should ties show?' });
+  assert.equal(result.paged, true);
+  assert.equal(world.sent.length, 1);
+  assert.equal(world.sent[0].priority, 'normal');
+  assert.match(world.sent[0].body, /Should ties show\?/);
+  assert.match(world.sent[0].title, /#40/);
+  assert.equal(world.sent[0].url, 'https://github.com/owner/repo/issues/40');
+  const row = world.rows().pop();
+  assert.deepEqual([row.kind, row.reason, row.question], ['escalated', 'product-intent', 'Should ties show?']);
+  // Off both frontiers until the owner speaks.
+  assert.deepEqual(computeFrontierArbiter(world).eligible, []);
+  assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible, []);
+  // An Approval racing the page wins the claim: the escalation is refused and posts nothing.
+  const race = arbiterWorld();
+  assert.throws(() => race.door({ kind: 'escalated', reason: 'money', question: 'q?', send: () => { recordEntry({ root: race.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, now: NOW }); return { ok: true }; } }), { code: 'TRIAGE_ALREADY_DECIDED' });
+  assert.equal(race.fixtureIssue().comments.filter((entry) => /^## Verdict/.test(entry.body)).length, 0);
+});
+
+test('ADR 0017: the owner answers an escalation with Approved, which reaches the Principal and records over the escalated claim', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'escalated', reason: 'money', question: 'Buy the plan?' });
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  issues[0].comments.push({ id: 'owner-yes', url: approvalUrl(40), author: OWNER, body: 'Approved', createdAt: '2026-09-12T13:00:00.000Z' });
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+  const later = '2026-09-12T14:00:00.000Z';
+  const items = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: later }).eligible;
+  assert.deepEqual(items.map((item) => item.kind), ['approval']);
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, commentUrl: approvalUrl(40), now: later });
+  assert.equal(projectTriage({ entries: world.ledger(), now: later }).allTime.unchanged, 1);
+});
+
+test('ADR 0017: an exact Endorsed Verdict is finalized by script as an exact Approved is, under either spelling of the Open field', () => {
+  for (const [name, proposal] of [['Open:', OPEN_PROPOSAL], ['legacy Open for Cory:', PROPOSAL]]) {
+    const world = arbiterWorld({ each: () => ({ thread: { approval: null, proposal } }) });
+    world.door({ kind: 'endorsed', text: 'Premises:\n  src/list.js: slices one short @abcdef1 verified @abcdef2' });
+    const result = world.finalize();
+    assert.deepEqual(result.finalized.map((row) => row.issue), [40], name);
+    assert.deepEqual(result.left, [], name);
+    const after = world.fixtureIssue();
+    const verdict = after.comments.find((entry) => /^## Verdict/.test(entry.body));
+    assert.equal(rulingsOn(after).length, 1);
+    assert.equal(rulingsOn(after)[0].body, `## Ruling\nEndorsed without edits: ${verdict.url}. Finalized by script (fleet #207).\n\n${proposal.split('\n').slice(1).join('\n')}\n\nLabels: ready-for-agent, bug; triage-proposed removed.`);
+    assert.deepEqual([...after.labels].sort(), ['bug', 'needs-triage', 'ready-for-agent']);
+    assert.deepEqual(world.ledger().slice(1).map((row) => [row.kind, row.actor]), [['endorsed', 'arbiter'], ['finalized', 'finalize-script']]);
+    assert.deepEqual(world.finalize().finalized, [], 'a replay finalizes nothing');
+    assert.equal(rulingsOn(world.fixtureIssue()).length, 1);
+    assert.deepEqual(computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible, []);
+  }
+});
+
+test('ADR 0017: finalize leaves an Endorsement it cannot finish, naming the clause', () => {
+  const left = (world) => world.finalize().left;
+  const open = arbiterWorld({ each: () => ({ thread: { approval: null, proposal: OPEN_PROPOSAL.replace('Open: none', 'Open: should ties show?') } }) });
+  open.door();
+  assert.deepEqual(left(open), [{ issue: 40, reason: 'open-for-cory' }]);
+  const notYet = arbiterWorld();
+  recordEntry({ root: notYet.root, tenant: 'endzone', kind: 'endorsed', issue: 40, bodyHash: triage.normalizeIssue(notYet.fixtureIssue()).bodyHash, commentUrl: proposalUrl(40), now: NOW });
+  assert.equal(left(notYet)[0].reason, 'no-verdict', 'a claim whose Verdict is not yet posted is retried next tick');
+  const withEdits = arbiterWorld();
+  withEdits.door({ kind: 'endorsed-with-edits', edits: 'tier haiku' });
+  assert.deepEqual(withEdits.finalize(), { tenant: 'endzone', source: 'fixture', at: NOW, finalized: [], left: [], errors: [] }, 'Endorsed with: is the Principal\'s to finalize');
+  const spoke = arbiterWorld();
+  spoke.door();
+  const issues = JSON.parse(fs.readFileSync(spoke.fixture, 'utf8'));
+  issues[0].comments.push({ id: 'late', url: 'https://github.com/owner/repo/issues/40#issuecomment-late', author: OWNER, body: 'wait, hold on', createdAt: '2026-09-12T12:00:01.000Z' });
+  fs.writeFileSync(spoke.fixture, JSON.stringify(issues));
+  assert.equal(left(spoke)[0].reason, 'owner-commented-after-approval');
+});
+
+test('ADR 0017: the Principal frontier shows an endorsed-with-edits row at once and an endorsed row only after 30 minutes without finalizing', () => {
+  const withEdits = arbiterWorld();
+  withEdits.door({ kind: 'endorsed-with-edits', edits: 'tier haiku; owner Andy', now: '2026-09-12T11:59:00.000Z' });
+  const [edits] = computeFrontier({ root: withEdits.root, tenant: 'endzone', fixture: withEdits.fixture, now: NOW }).eligible;
+  assert.equal(edits.kind, 'endorsement');
+  assert.equal(edits.withEdits, true);
+  assert.equal(edits.startAt, 'ruling', 'the claim is the Arbiter row, so the Principal starts at the Ruling');
+  assert.equal(edits.edits, 'tier haiku; owner Andy');
+  assert.match(edits.commentUrl, /issuecomment-finalize-40-/);
+  // Finalized by the Principal: gone.
+  recordEntry({ root: withEdits.root, tenant: 'endzone', kind: 'finalized', issue: 40, labels: 'ready-for-agent', now: NOW });
+  assert.deepEqual(computeFrontier({ root: withEdits.root, tenant: 'endzone', fixture: withEdits.fixture, now: NOW }).eligible, []);
+
+  const plain = arbiterWorld();
+  plain.door({ now: '2026-09-12T11:50:00.000Z' });
+  assert.deepEqual(computeFrontier({ root: plain.root, tenant: 'endzone', fixture: plain.fixture, now: '2026-09-12T12:10:00.000Z' }).eligible, [], '20 minutes: the script has time');
+  const [stale] = computeFrontier({ root: plain.root, tenant: 'endzone', fixture: plain.fixture, now: '2026-09-12T12:30:00.000Z' }).eligible;
+  assert.equal(stale.kind, 'endorsement');
+  assert.equal(stale.withEdits, false);
+  assert.match(stale.reason, /older than 30 minutes/);
+});
+
+test('ADR 0017: the arbiter frontier lists open proposals oldest first and drops each one that is decided, edited, held, spoken on or returned', () => {
+  const hashOf = (body) => triage.normalizeIssue(issue(1, { body })).bodyHash;
+  const world = arbiterWorld({
+    numbers: [40, 41, 42, 43, 44, 45, 46],
+    each: (number) => {
+      const base = { thread: { approval: null, proposal: OPEN_PROPOSAL } };
+      if (number === 41) return { ...base, recordId: 'endzone:issue-41' };
+      if (number === 42) return { ...base, labels: ['needs-triage'] };
+      if (number === 43) return { ...base, thread: { approval: 'Re-propose: smaller', proposal: OPEN_PROPOSAL } };
+      if (number === 44) return { ...base, comments: [...thread(44, { approval: null, proposal: OPEN_PROPOSAL }), verdictComment(44, '## Verdict\nReturned\n1. no', '2026-09-10T12:00:00.000Z')] };
+      if (number === 45) return { ...base, proposedBody: 'Body of #45 earlier\n\n## Premises\n' };
+      return base;
+    },
+  });
+  // #46 is the oldest proposal: re-stamp it.
+  const ledgerFile = triage.ledgerPath(world.root, 'endzone');
+  const rows = fs.readFileSync(ledgerFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  rows.find((row) => row.issue === 46).at = '2026-09-09T00:00:00.000Z';
+  fs.writeFileSync(ledgerFile, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+  const result = computeFrontierArbiter(world);
+  assert.equal(result.role, 'arbiter');
+  assert.equal(result.suspended, false);
+  assert.equal(result.paused, false);
+  assert.deepEqual(result.eligible.map((item) => item.number), [46, 40, 41]);
+  assert.deepEqual(result.eligible.map((item) => item.escalation), [false, false, true]);
+  const first = result.eligible[1];
+  assert.deepEqual([first.kind, first.bodyHash, first.commentUrl, first.proposedAt, first.issue], ['verdict', hashOf(BODY), proposalUrl(40), PROPOSED_AT, 40]);
+  assert.deepEqual(result.counts, { proposals: 3, issues: 7 });
+  const why = Object.fromEntries(result.skipped.map((entry) => [entry.number, entry.reason]));
+  assert.match(why[42], /^labels:/);
+  assert.match(why[43], /^owner-spoke:/);
+  assert.match(why[44], /^verdict-posted:/);
+  assert.match(why[45], /^body-changed:/);
+  // A decided proposal is not the Arbiter's.
+  world.door({ issue: 40 });
+  assert.deepEqual(computeFrontierArbiter(world).eligible.map((item) => item.number), [46, 41]);
+});
+
+test('ADR 0017: the arbiter frontier is empty, and says why, under the suspension flag or PAUSE', () => {
+  const suspended = arbiterWorld({ suspended: true });
+  const stopped = computeFrontierArbiter(suspended);
+  assert.deepEqual([stopped.eligible, stopped.suspended, stopped.paused], [[], true, false]);
+  assert.match(stopped.reason, /arbiter-suspended-endzone/);
+  const paused = computeFrontierArbiter(arbiterWorld({ pause: true }));
+  assert.deepEqual([paused.eligible, paused.suspended, paused.paused], [[], false, true]);
+  assert.match(paused.reason, /PAUSE/);
+  // Fail closed on an unset owner, as the Principal's frontier is.
+  const noOwner = rootDir({ ownerLogin: '' });
+  assert.throws(() => triage.computeArbiterFrontier({ root: noOwner, tenant: 'endzone', fixture: writeFixture(noOwner, []), now: NOW }), { code: 'TENANT_OWNER_UNSET' });
+});
+
+test('ADR 0017 CLI: frontier --role arbiter and verdict run through cli(), principal stays the default role', () => {
+  const world = arbiterWorld();
+  const common = ['--root', world.root, '--tenant', 'endzone', '--fixture', world.fixture, '--now', NOW];
+  const arbiter = cli(['frontier', ...common, '--role', 'arbiter']);
+  assert.deepEqual(arbiter.eligible.map((item) => item.number), [40]);
+  assert.deepEqual(cli(['frontier', ...common]).eligible, [], 'the Principal has nothing at an open proposal');
+  assert.throws(() => cli(['frontier', ...common, '--role', 'lead']), { code: 'USAGE' });
+  const reasons = path.join(world.root, 'reasons.md');
+  fs.writeFileSync(reasons, '1. Premise 2 is false.\n2. Scope too wide.\n');
+  const returned = cli(['verdict', ...common, '--issue', '40', '--kind', 'returned', '--reasons-file', reasons]);
+  assert.equal(returned.kind, 'returned');
+  const row = world.rows().pop();
+  assert.equal(row.reasons, '1. Premise 2 is false.\n2. Scope too wide.');
+  assert.match(world.fixtureIssue().comments.pop().body, /^## Verdict\nReturned\n1\. Premise 2 is false\./);
+  assert.throws(() => cli(['verdict', ...common, '--issue', '40', '--kind', 'returned', '--reasons-file', reasons]), { code: 'VERDICT_REFUSED' });
+  assert.throws(() => cli(['verdict', '--root', world.root, '--tenant', 'endzone', '--issue', '40', '--kind', 'endorsed', '--now', NOW]), { code: 'USAGE' });
+  // Only the door writes a verdict kind: `record` refuses all four, as it refuses the bounded kinds.
+  for (const kind of ['endorsed', 'endorsed-with-edits', 'returned', 'escalated']) {
+    assert.throws(() => cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', kind, '--issue', '40', '--body-hash', 'h', '--comment-url', 'https://x/1', '--edits', 'e', '--reasons', 'r', '--reason', 'rule-change', '--question', 'Edit CLAUDE.md?']), { code: 'USAGE', message: /only by its door/ }, kind);
+  }
+});
+
 test('boundedScan reads the bug list with a 64 MiB maxBuffer (spawnSync gh ENOBUFS at the 1 MiB default)', () => {
   const world = boundedRoot();
   const seen = [];
@@ -1993,4 +2327,93 @@ test('boundedScan reads the bug list with a 64 MiB maxBuffer (spawnSync gh ENOBU
   assert.equal(seen.length, 1);
   assert.equal(seen[0].exe, 'gh');
   assert.ok(seen[0].options.maxBuffer >= 64 * 1024 * 1024, 'the gh call must raise maxBuffer');
+});
+
+// ADR 0017 (opus review of PR B).
+const editFixture = (world, change) => {
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  change(issues[0]);
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+};
+const RULING_AT = '2026-09-12T12:00:30.000Z';
+const earlyRuling = { id: 'ruling-first', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling-first', author: FLEET, body: '## Ruling\nEndorsed without edits.', createdAt: RULING_AT };
+
+test('review 1: a retried finalize of an exact Endorsed whose first run died after the Ruling posts no second Ruling and finishes', () => {
+  const died = arbiterWorld();
+  died.door({ kind: 'endorsed' });
+  editFixture(died, (target) => target.comments.push(earlyRuling));
+  const result = died.finalize();
+  assert.deepEqual(result.finalized.map((row) => row.issue), [40]);
+  assert.deepEqual(result.left, []);
+  assert.equal(rulingsOn(died.fixtureIssue()).length, 1, 'no second Ruling');
+  assert.deepEqual([...died.fixtureIssue().labels].sort(), ['bug', 'needs-triage', 'ready-for-agent']);
+  assert.deepEqual(died.ledger().slice(1).map((row) => [row.kind, row.actor]), [['endorsed', 'arbiter'], ['finalized', 'finalize-script']]);
+  // It died after the relabel too (marker already gone): only the finalized row is missing.
+  const relabelled = arbiterWorld();
+  relabelled.door({ kind: 'endorsed' });
+  editFixture(relabelled, (target) => { target.comments.push(earlyRuling); target.labels = ['needs-triage', 'bug', 'ready-for-agent']; });
+  assert.deepEqual(relabelled.finalize().finalized.map((row) => row.issue), [40]);
+  assert.equal(rulingsOn(relabelled.fixtureIssue()).length, 1);
+  assert.equal(relabelled.ledger().pop().kind, 'finalized');
+  // The Principal's item says so.
+  const stale = arbiterWorld();
+  stale.door({ kind: 'endorsed', now: '2026-09-12T11:00:00.000Z' });
+  const [item] = computeFrontier({ root: stale.root, tenant: 'endzone', fixture: stale.fixture, now: NOW }).eligible;
+  assert.match(item.reason, /post the Ruling only if none is newer than the Verdict/);
+});
+
+test('review 2: record refuses the four verdict kinds from the CLI, but the door still writes them', () => {
+  const world = arbiterWorld();
+  const common = ['--root', world.root, '--tenant', 'endzone', '--issue', '40', '--body-hash', 'h', '--comment-url', 'https://x/1'];
+  for (const kind of triage.ARBITER_KINDS) assert.throws(() => cli(['record', ...common, '--kind', kind, '--edits', 'e', '--reasons', 'r', '--reason', 'money', '--question', 'q']), { code: 'USAGE' }, kind);
+  assert.deepEqual(world.rows(), []);
+  assert.equal(world.door().recorded, true);
+});
+
+test('review 3: a retried verdict after a failed comment post posts the missing comment and records nothing twice', () => {
+  const world = arbiterWorld();
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  const failing = (exe, args) => { if (args[0] === 'issue' && args[1] === 'comment') throw Object.assign(new Error('gh: 502'), { stderr: 'HTTP 502' }); return ''; };
+  const live = { issues, runner: failing };   // no fixture: the comment goes through gh
+  const error = (() => { try { world.door({ ...live, fixture: undefined }); } catch (e) { return e; } return null; })();
+  assert.equal(error.code, 'GITHUB_WRITE_FAILED');
+  assert.doesNotMatch(error.message, /by hand/);
+  assert.match(error.message, /run the same verdict command again/);
+  assert.equal(world.rows().length, 1, 'the row stands');
+  const posted = [];
+  const working = (exe, args, options) => { if (args[0] === 'issue' && args[1] === 'comment') posted.push(options.input); return ''; };
+  const retried = world.door({ issues, runner: working, fixture: undefined, kind: 'endorsed', text: 'Premises:\n  x' });
+  assert.equal(retried.recovered, true);
+  assert.equal(posted.length, 1);
+  assert.match(posted[0], /^## Verdict\nEndorsed\nPremises:/);
+  assert.equal(world.rows().length, 1, 'no second row');
+  // With the Verdict on the thread the same command is refused as decided.
+  const withVerdict = issues.map((entry) => ({ ...entry, comments: [...entry.comments, verdictComment(40, '## Verdict\nEndorsed', '2026-09-12T12:00:00.000Z')] }));
+  refusedWith(() => world.door({ issues: withVerdict, runner: working, fixture: undefined }), 'no-open-proposal');
+  assert.equal(posted.length, 1);
+});
+
+test('review 4: returned-once counts only Returns at this proposal\'s body since the last finalize', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'returned', reasons: '1. no', text: '1. no' });
+  const oldHash = triage.normalizeIssue(world.fixtureIssue()).bodyHash;
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: oldHash, now: '2026-09-12T12:01:00.000Z' });
+  // The body changes, and the Principal proposes again at the new body.
+  const newBody = 'Body of #40 rewritten\n\n## Premises\n\nsrc/list.js: slices one short @abcdef1\n';
+  const second = '2026-09-12T12:02:00.000Z';
+  editFixture(world, (target) => { target.body = newBody; target.comments.push({ id: 'second', url: 'https://github.com/owner/repo/issues/40#issuecomment-second', author: FLEET, body: OPEN_PROPOSAL, createdAt: second }); });
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: triage.normalizeIssue(world.fixtureIssue()).bodyHash, commentUrl: 'https://github.com/owner/repo/issues/40#issuecomment-second', model: 'opus-5.5', now: second });
+  const later = '2026-09-12T12:03:00.000Z';
+  assert.equal(world.door({ kind: 'returned', reasons: '1. still no', text: '1. still no', now: later }).recorded, true, 'a Return at a different body is a fresh round');
+});
+
+test('review 5: an endorsement item carries ownerCommentUrl when the owner commented after the Endorsement', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'endorsed-with-edits', edits: 'tier haiku', now: '2026-09-12T11:59:00.000Z' });
+  const [plain] = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
+  assert.equal(plain.ownerCommentUrl, undefined);
+  editFixture(world, (target) => target.comments.push({ id: 'owner-late', url: 'https://github.com/owner/repo/issues/40#issuecomment-owner-late', author: OWNER, body: 'Also use the shared helper.', createdAt: '2026-09-12T12:00:05.000Z' }));
+  const [spoke] = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
+  assert.equal(spoke.kind, 'endorsement');
+  assert.equal(spoke.ownerCommentUrl, 'https://github.com/owner/repo/issues/40#issuecomment-owner-late');
 });

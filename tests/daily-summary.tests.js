@@ -5,7 +5,10 @@ const path = require('node:path');
 const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
-const { formatAge, buildSummary, runDailySummary, waitingRows, cli, exitCodeFor, DAILY_SUMMARY_FLAGS, DailySummaryError } = require('../bin/daily-summary');
+const summaryModule = require('../bin/daily-summary');
+const { formatAge, buildSummary, waitingRows, cli, exitCodeFor, DAILY_SUMMARY_FLAGS, DailySummaryError } = summaryModule;
+// bin/arbiter.js (PR C) is in the tree: every run here injects a null scan so no test reaches gh; the ADR 0017 cases inject their own.
+const runDailySummary = (options) => summaryModule.runDailySummary({ arbiterScan: () => null, ...options });
 const workState = require('../bin/work-state');
 
 function rootDir() {
@@ -387,4 +390,76 @@ test('#209: the summary lists a bounded ready while its Veto window is open, alo
   fs.mkdirSync(path.join(vetoed, 'state', 'triage'), { recursive: true });
   fs.writeFileSync(path.join(vetoed, 'state', 'triage', 'endzone.jsonl'), `${JSON.stringify({ kind: 'bounded-ready', issue: 7, at: '2026-09-17T05:00:00.000Z' })}\n${JSON.stringify({ kind: 'veto', issue: 7, at: '2026-09-17T06:00:00.000Z' })}\n`);
   assert.equal(buildSummary({ root: vetoed, now: '2026-09-17T13:00:00.000Z' }), null, 'a vetoed ready is not listed');
+});
+
+// ADR 0017: the Arbiter section. Endorsements reach the owner only here, but Arbiter activity alone does not
+// page: it rides the next summary that sends. A standing suspension is a decision only he can make, so it pages;
+// an escalation lists its class and question.
+test('ADR 0017: the summary reports the Arbiter\'s last 24 hours, each escalation, and a standing suspension', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  const row = (kind, issue, at, extra = {}) => JSON.stringify({ schemaVersion: 1, kind, tenant: 'endzone', issue, at, actor: 'arbiter', bodyHash: 'h', commentUrl: 'https://x/1', ...extra });
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), [
+    row('endorsed', 1, hoursAgo(2)),
+    row('endorsed', 2, hoursAgo(5)),
+    row('endorsed-with-edits', 3, hoursAgo(6), { edits: 'tier haiku' }),
+    row('returned', 4, hoursAgo(7), { reasons: '1. no' }),
+    row('escalated', 5, hoursAgo(8), { reason: 'money', question: 'Buy the\n  plan?' }),
+    row('endorsed', 6, hoursAgo(30)),   // older than 24 h: not counted
+  ].join('\n') + '\n');
+  // Activity alone is content, never a page: a quiet day stays quiet.
+  assert.equal(buildSummary({ root, now: NOW }), null, 'Arbiter activity alone does not page');
+  const idle = sender();
+  const quietRun = runDailySummary({ root, now: NOW, send: idle });
+  assert.deepEqual([quietRun.sent, quietRun.attempted, idle.calls.length], [false, false, 0]);
+  // On a day something else pages, the section rides along.
+  seedDecision(root, { issue: 9, to: 'hold', enteredAt: hoursAgo(1) });
+  const summary = buildSummary({ root, now: NOW });
+  assert.equal(summary.arbiter, 2, 'the tenant line and the escalation line');
+  assert.match(summary.body, /^Arbiter endzone, last 24 h: 2 endorsed, 1 endorsed with edits, 1 returned, 1 escalated\.\nArbiter escalated endzone #5 \(money\): Buy the plan\?\n#9 hold 1h$/);
+  const send = sender();
+  const result = runDailySummary({ root, now: NOW, send });
+  assert.equal(result.sent, true);
+  assert.match(send.calls[0].body, /Arbiter endzone, last 24 h[\s\S]*#9 hold 1h/);
+  assert.equal(result.arbiterScan, undefined, 'a null scan reports nothing');
+
+  // The suspension flag stands until Cory removes it: it is a decision only he can make, so it pages on its own.
+  const quiet = rootDir();
+  assert.equal(buildSummary({ root: quiet, now: NOW }), null, 'no Arbiter activity and no flag: a quiet day');
+  fs.mkdirSync(path.join(quiet, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(quiet, 'state', 'flags', 'arbiter-suspended-endzone'), '');
+  assert.match(buildSummary({ root: quiet, now: NOW }).body, /^Arbiter endzone, last 24 h: 0 endorsed, 0 endorsed with edits, 0 returned, 0 escalated\.\nArbiter is suspended for endzone:.*arbiter-suspended-endzone lifts it\.$/);
+
+  // PR C's scan is called per tenant when present (injected here), and its failure never stops the summary.
+  const scanned = [];
+  const withScan = runDailySummary({ root: quiet, now: NOW, send: sender(), arbiterScan: ({ tenant }) => { scanned.push(tenant); return { suspended: true }; } });
+  assert.deepEqual(scanned, ['endzone']);
+  assert.deepEqual(withScan.arbiterScan, [{ tenant: 'endzone', result: { suspended: true } }]);
+  const failing = runDailySummary({ root: quiet, now: NOW, send: sender(), arbiterScan: () => { throw new Error('boom\nsecond line'); } });
+  assert.equal(failing.sent, true);
+  assert.deepEqual(failing.arbiterScan, [{ tenant: 'endzone', error: 'boom' }]);
+});
+
+// ADR 0017 (review): the Arbiter section covers activity since the last summary that was SENT, so activity on a
+// quiet day (which does not page) appears in the next summary that does.
+test('ADR 0017: the Arbiter section runs from the last sent summary, not a fixed 24 hours', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  const row = (kind, issue, at) => JSON.stringify({ schemaVersion: 1, kind, tenant: 'endzone', issue, at, actor: 'arbiter', bodyHash: 'h', commentUrl: 'https://x/1' });
+  // A summary sent 3 days ago; an Endorsement 2 days ago (quiet day, nothing paged), one 5 days ago (already reported).
+  fs.mkdirSync(path.join(root, 'state', 'notify'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'notify', 'daily-summary.json'), JSON.stringify({ lastSentAt: hoursAgo(72) }));
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), [row('endorsed', 1, hoursAgo(120)), row('endorsed', 2, hoursAgo(48))].join('\n') + '\n');
+  assert.equal(runDailySummary({ root, now: NOW, send: sender() }).attempted, false, 'activity alone sends nothing');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'notify', 'daily-summary.json'), 'utf8')).lastSentAt, hoursAgo(72), 'nothing sent: the marker stands');
+  seedDecision(root, { issue: 9, to: 'hold', enteredAt: hoursAgo(1) });
+  const send = sender();
+  assert.equal(runDailySummary({ root, now: NOW, send }).sent, true);
+  assert.match(send.calls[0].body, /^Arbiter endzone, since the last summary: 1 endorsed, 0 endorsed with edits, 0 returned, 0 escalated./);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'notify', 'daily-summary.json'), 'utf8')).lastSentAt, NOW, 'a sent summary moves the marker');
+  // The next day's summary does not repeat it.
+  const later = new Date(new Date(NOW).getTime() + 86400000).toISOString();
+  const next = sender();
+  runDailySummary({ root, now: later, send: next });
+  assert.doesNotMatch(next.calls[0].body, /Arbiter endzone/);
 });
