@@ -134,6 +134,17 @@ test('a bug that escaped from the PR that delivered an endorsed ticket writes th
   assert.equal(proposal.scan({ issues: [bug(32, 'No form here.', { comments: [comment] })] }).wrote, true);
 });
 
+test('a bug filed from the formal review of its own escaped-from PR is a review follow-up, not an escape (ruled 2026-10-09)', () => {
+  const followUp = world();
+  const result = followUp.scan({ issues: [bug(50, 'Follow-up from the formal review of PR #1007: the guard misses an empty list.\n\n### Escaped from PR #\n\n1007')] });
+  assert.equal(result.suspended, false);
+  assert.equal(followUp.pages.length, 0);
+  assert.ok(!fs.existsSync(followUp.flag));
+
+  const escaped = world();
+  assert.equal(escaped.scan({ issues: [bug(51, 'The guard misses an empty list.\n\n### Escaped from PR #\n\n1007')] }).wrote, true, 'the same bug without the review citation still suspends');
+});
+
 test('a bug from some other PR, a bug older than the endorsement, or a non-bug is not evidence; a fixture file is read like a live query', () => {
   const w = world();
   const result = w.scan({ issues: [

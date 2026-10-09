@@ -1817,6 +1817,15 @@ test('#211: Escaped from another PR, none or unknown, a bug older than the ready
   assert.equal(bounded.scanSuspension({ root: world.root, tenant: 'endzone', now: '2026-09-30T10:00:00.000Z' }).suspended, false, 'with no bugs to read the local evidence alone decides');
 });
 
+test('#211: a bug filed from the formal review of its own escaped-from PR is a review follow-up and does not suspend; without the citation it does (ruled 2026-10-09)', () => {
+  const followUp = { ...escapedBug({ form: '1007' }), body: 'Follow-up from the formal review of PR #1007: the guard misses an empty list.\n\n### Escaped from PR #\n\n1007\n' };
+  const held = readiedUnit();
+  assert.equal(bounded.scanSuspension({ root: held.root, tenant: 'endzone', issues: [held.bug, followUp], now: '2026-09-30T10:00:00.000Z' }).suspended, false);
+  assert.ok(!fs.existsSync(SUSPENDED_FLAG(held.root)));
+  const escaped = readiedUnit();
+  assert.equal(bounded.scanSuspension({ root: escaped.root, tenant: 'endzone', issues: [escaped.bug, escapedBug({ form: '1007' })], now: '2026-09-30T10:00:00.000Z' }).suspended, true);
+});
+
 test('#211: a Veto does not suspend', () => {
   const world = readiedUnit();
   const vetoedIssue = { ...world.bug, labels: ['bug', 'ready-for-agent'], comments: [...world.bug.comments, { id: 'v1', url: 'https://github.com/owner/repo/issues/7#issuecomment-6001', author: OWNER, createdAt: '2026-09-29T15:20:00.000Z', body: 'Veto: not now.' }] };
