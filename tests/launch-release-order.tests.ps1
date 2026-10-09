@@ -90,6 +90,7 @@ $exitRows = @(
   @{ Anchor = 'a principal needs -Tenant'; Decision = 'keep' }
   @{ Anchor = 'an arbiter needs -Tenant'; Decision = 'keep' }
   @{ Anchor = 'rostered Sentinel is disabled'; Decision = 'keep' }
+  @{ Anchor = 'the dispatcher is retired by'; Decision = 'keep' }
   @{ Anchor = 'reason = \$legacyRefusal'; Decision = 'keep' }                   # no manifest on this path
   @{ Anchor = 'no tenant file for'; Nth = 2; Decision = 'release' }
   @{ Anchor = 'is not assigned'; Decision = 'keep' }                            # the record is not ours to release

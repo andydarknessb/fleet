@@ -1083,7 +1083,7 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
         elseif ($res.PSObject.Properties['pushError'] -and $res.pushError) { "push refused: $($res.pushError)" }
         elseif ($res.PSObject.Properties['prUrl'] -and $res.prUrl) { "$($res.prUrl)" }
         else { "$syncKind for tenant $($t.name) (no further detail reported)" }
-      $report.escalate += [pscustomobject]@{ name = "pl-$($t.name)"; kind = $syncKind; detail = $syncDetail; parent = 'dispatcher' }
+      $report.escalate += [pscustomobject]@{ name = "pl-$($t.name)"; kind = $syncKind; detail = $syncDetail; parent = 'cory' }
       # fleet #274: an unattested tip's page links its reconciliation PR (the Watchdog reads `url`).
       if ($syncKind -eq 'sync-unattested' -and $res.PSObject.Properties['prUrl'] -and $res.prUrl) { $report.escalate[-1] | Add-Member -NotePropertyName url -NotePropertyValue "$($res.prUrl)" -Force }
     }
@@ -1119,7 +1119,7 @@ if (Test-Path -LiteralPath $cleanupPendingPath) {
     if ($cpAt -and ($now - $cpAt).TotalDays -gt 7) {
       [void]$cpKept.Add($cpRaw)
       $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "stale: queued $($cp.at), more than 7 days ago; not acted on" }
-      $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "stale entry, check by hand: retire of $($cp.name) queued job $($cp.jobId) (and worktrees: $($cpWorktrees -join ', ')) for cleanup at $($cp.at), more than 7 days ago; not acted on. Verify what still exists, finish by hand, then drop its line from state/sentinel/cleanup-pending.jsonl"; parent = 'dispatcher' }
+      $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "stale entry, check by hand: retire of $($cp.name) queued job $($cp.jobId) (and worktrees: $($cpWorktrees -join ', ')) for cleanup at $($cp.at), more than 7 days ago; not acted on. Verify what still exists, finish by hand, then drop its line from state/sentinel/cleanup-pending.jsonl"; parent = 'cory' }
       continue
     }
     if (-not $cleanupLive) {
@@ -1130,7 +1130,7 @@ if (Test-Path -LiteralPath $cleanupPendingPath) {
       # without acting (the report only; the watchdog dedupes by name + kind, so once per line). A read-only run with the flag on is
       # about to be acted on by the next -Apply and stays quiet.
       if (-not (Test-Path -LiteralPath "$FleetHome\state\flags\ic-cleanup-live")) {
-        $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and state/flags/ic-cleanup-live is off, so nothing will act on it: finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')) and drop its line from state/sentinel/cleanup-pending.jsonl, or turn the flag on"; parent = 'dispatcher' }
+        $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and state/flags/ic-cleanup-live is off, so nothing will act on it: finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')) and drop its line from state/sentinel/cleanup-pending.jsonl, or turn the flag on"; parent = 'cory' }
       }
       continue
     }
@@ -1198,7 +1198,7 @@ if (Test-Path -LiteralPath $cleanupPendingPath) {
     $cpChanged = $true
     $report.cleanupPending += [pscustomobject]@{ name = "$($cp.name)"; jobId = "$($cp.jobId)"; attempts = $cpAttempts; outcome = "failed: $cpFailure" }
     if ($cpAttempts -ge 3) {
-      $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and $cpAttempts attempts have not finished it: $cpFailure; finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')), then drop its line from state/sentinel/cleanup-pending.jsonl"; parent = 'dispatcher' }
+      $report.escalate += [pscustomobject]@{ name = "$($cp.name)"; kind = 'cleanup-pending'; detail = "retire of $($cp.name) left job $($cp.jobId) for cleanup (the claude CLI was missing) and $cpAttempts attempts have not finished it: $cpFailure; finish by hand (claude stop/rm $($cp.jobId), then its worktrees: $($cpWorktrees -join ', ')), then drop its line from state/sentinel/cleanup-pending.jsonl"; parent = 'cory' }
     }
   }
   if ($cpChanged) {

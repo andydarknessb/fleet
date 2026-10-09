@@ -116,6 +116,12 @@ if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and
   # no release: the same -FromRoster mix-up as the principal and arbiter checks above; a manifest launch is Role ic and never reaches this.
   Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live): bin\watchdog.ps1 is the supervisor now' } | ConvertTo-Json -Compress); exit 3
 }
+# WS5 (fleet #82, spec #194): while the dispatcher is retired the one door refuses to start it
+# again; bin\rollback-dispatcher.ps1 removes the flag first. A dry run still evaluates.
+if (($Role -eq 'dispatcher' -or $Name -eq 'dispatcher') -and (Test-DispatcherOff) -and -not $DryRun) {
+  # no release: the same -FromRoster mix-up as the Sentinel check above; a manifest launch is Role ic and never reaches this.
+  Write-Output (@{ launched = $false; reason = 'the dispatcher is retired by state/flags/dispatcher-off (WS5, fleet #82): pages and the daily summary carry its duties; bin\rollback-dispatcher.ps1 brings it back' } | ConvertTo-Json -Compress); exit 3
+}
 # Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
 # manifest (assignment.js assign, then launch). The legacy -Prompt launch of an IC is
 # retired for good, not merely gated: there is no flag and no -Force to bring it back

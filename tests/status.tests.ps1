@@ -44,6 +44,15 @@ try {
   Assert-True ($out2 -match 'supervisor: watchdog task') "status.ps1 must report the watchdog task as supervisor: $out2"
   Assert-True ($out2 -notmatch 'rollback-assignment' -and $out2 -notmatch 'rollback-sentinel') "status.ps1 must not print a rollback hint under either cutover flag: $out2"
 
+  # Case 3 (WS5, fleet #82): under dispatcher-off the retired dispatcher is not expected, so
+  # a roster.json row with no live session prints no dispatcher line (it was "absent" before).
+  Assert-True ($out2 -match 'dispatcher') "control: without the flag the missing dispatcher is listed: $out2"
+  Write-Utf8 "$testRoot\state\flags\dispatcher-off" 'cut over'
+  $out3 = Run-Status
+  Assert-True ($lastExit -eq 0) "status.ps1 must run clean under dispatcher-off: $out3"
+  Assert-True ($out3 -notmatch 'dispatcher') "status.ps1 must not list the retired dispatcher as a missing session: $out3"
+  Assert-True ($out3 -match 'live fleet sessions: 0 / cap 6') "status.ps1 must still report the fleet: $out3"
+
   Write-Output 'status tests passed'
 } finally {
   $env:PATH = $oldPath
