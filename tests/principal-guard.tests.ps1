@@ -463,6 +463,58 @@ try {
   Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 5 -b "the bounded-authority flag stands until Cory removes it"')) 'prose about the flag'
   Assert-Denied (Run-Guard -Role ic -Tool Write -ToolInput (WriteTo "$testRoot\state\triage::$([char]36)DATA")) 'a Write through an alternate data stream of the ledger directory' 'Cory'
 
+  # --- ADR 0017: a Verdict is the Arbiter's alone; the Arbiter itself posts only through the door ---
+  foreach ($r in 'project-lead','ic','dispatcher','principal','sentinel') {
+    foreach ($body in @('Endorsed', 'Endorsed with: tier haiku', 'Returned', 'Escalated: money - who pays', '## Verdict', '  endorsed')) {
+      Assert-Denied (Run-Guard -Role $r -Tool Bash -ToolInput (Bash "gh issue comment 1276 -b `"$body`"")) "a Verdict-shaped comment ($body) from $r" 'Verdict'
+    }
+    Assert-Denied (Run-Guard -Role $r -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Endorsed"') -AgentId 'w9') "an Endorsed comment from a sub-agent of $r" 'Verdict'
+  }
+  Assert-Denied (Run-Guard -Role ic -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1276/comments -f body="Returned: premise false"')) 'a Returned comment through gh api' 'Verdict'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "The Arbiter endorsed #1276 yesterday; assigning"')) 'the word endorsed later in a body'
+  Assert-Allowed (Run-Guard -Role project-lead -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Escalation: red CI twice"')) 'a body beginning Escalation (not Escalated:)'
+  # The Arbiter: every hand-posted comment is refused (the door posts), the owner's words stay refused, writes stay in its lane.
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Endorsed"')) 'an Endorsed comment posted by the Arbiter by hand' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh pr comment 42 -b "thanks"')) 'any PR comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1276/comments -f body="hello"')) 'a gh api comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Approved"')) 'an Approved comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Veto"')) 'a Veto comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue comment 1276 -b "Re-propose"')) 'a Re-propose comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue edit 1276 --add-label ready-for-agent')) 'a label edit by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue close 1276')) 'a close by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh pr merge 42')) 'a merge by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'git push origin docs/adr-0040')) 'a push by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'npm test')) 'the bare suite from the Arbiter' 'ONE named test file'
+  Assert-Denied (Run-Guard -Role arbiter -Tool 'mcp__claude_ai_Supabase__execute_sql' -ToolInput @{ query = 'select 1' }) 'a Supabase query from the Arbiter' 'triage.js verdict'
+  # The review's bypass payloads: wrappers, full paths, -R before the subcommand, api writes, nested interpreters.
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'bash -c "gh issue comment 1276 -b hello"')) 'a nested bash -c from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash '"/c/Program Files/GitHub CLI/gh.exe" issue comment 1276 -b hello')) 'a full-path gh.exe comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool PowerShell -ToolInput (Bash "& 'C:\Program Files\GitHub CLI\gh.exe' issue comment 1276 -b hello")) 'a PowerShell call-operator gh.exe comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue -R owner/repo comment 1276 -b hello')) 'a -R before comment from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api "repos/owner/repo/issues/1276/comment""s" -f body=hello')) 'a pieced comments endpoint from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api -X PATCH repos/owner/repo/issues/1276 -f state=closed')) 'a PATCH api close from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1276/labels -f "labels[]=ready-for-agent"')) 'an api label add from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api -X PUT repos/owner/repo/pulls/42/merge')) 'an api merge from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'timeout 30 gh pr merge 42')) 'a wrapped merge from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'git -C /e/Endzone-Empire push origin main')) 'a git -C push from the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api graphql -f query=''mutation { addComment(input:{subjectId:"x", body:"Endorsed"}) { clientMutationId } }''')) 'a graphql mutation from the Arbiter' 'ADR 0011'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh issue view 1276 -R owner/repo --comments')) 'an issue read from the Arbiter'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh pr diff 42')) 'a PR diff read from the Arbiter'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api repos/owner/repo/issues/1276/comments --paginate')) 'a GET api read of comments from the Arbiter'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'gh api -X GET repos/owner/repo/contents/src/x.js')) 'an explicit GET api read from the Arbiter'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash 'node --test tests/triage.tests.js')) 'one named test file from the Arbiter'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash "node $testRoot/bin/triage.js verdict --root $testRoot --tenant test --issue 1276 --kind endorsed")) 'the verdict door from the Arbiter'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Bash -ToolInput (Bash "node $testRoot/bin/triage.js frontier --root $testRoot --tenant test --role arbiter")) 'the arbiter frontier'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$testRoot\state\status\ar-test.md")) 'the Arbiter''s own status file'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$testRoot\profile\.claude\projects\x\memory\note.md")) 'the Arbiter''s memory'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$testRoot\state\status\pe-test.md")) 'the Principal''s status file written by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$repo\docs\adr\0040-x.md")) 'a tenant ADR written by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$testRoot\docs\adr\0040-x.md")) 'a fleet ADR written by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$repo\src\lib\thing.js")) 'product code written by the Arbiter' 'triage.js verdict'
+  Assert-Denied (Run-Guard -Role arbiter -Tool Write -ToolInput (WriteTo "$testRoot\state\triage\test.jsonl")) 'the ledger written by the Arbiter' 'Cory'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Read -ToolInput @{ file_path = "$repo\src\lib\thing.js" }) 'the Arbiter reading product code'
+  Assert-Allowed (Run-Guard -Role arbiter -Tool Agent -ToolInput @{ subagent_type = 'researcher'; prompt = 'x' }) 'the Arbiter spawning the researcher'
+
   # --- no fleet identity, rollback flag ---
   $env:FLEET_HOME = ''; $env:FLEET_ROLE = ''
   $payload = @{ tool_name = 'Bash'; tool_input = @{ command = 'gh issue comment 1 -b "Approved"' } } | ConvertTo-Json -Compress
