@@ -108,7 +108,7 @@
       "recordId": "endzone:issue-1599",
       "head": "f306bdb2b3b6d015c99b48a0089a1a19d27426f0",
       "pr": 1602,
-      "ruling": "Merged 2026-09-24 at the fix-up head f306bdb2 after formal-001 at 8dbdf69c; no formal review recorded at the merged head. Acknowledged by Cory 2026-10-09 (fleet optimization review)."
+      "ruling": "Merged 2026-09-24 at the fix-up head f306bdb2 after formal-001 at 8dbdf69c; no formal review recorded at the merged head. Ruling 2026-10-09 (Cory, fleet optimization review): acknowledged."
     }
   ]
 }
