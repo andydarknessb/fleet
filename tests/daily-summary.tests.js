@@ -271,6 +271,8 @@ test('#148: the daily run pages the due stale-premise notice once, quiet day or 
   const root = rootDir();
   const { recordEntry } = require('../bin/triage');
   recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 12, bodyHash: 'h', commentUrl: 'https://x/12', model: 'fable', reason: 'stale-premise', premise: 'src/b.js: b @0123456', now: '2026-09-01T00:00:00.000Z' });
+  // Spec fleet #194 (#299): a proposal still awaiting Approval pages the summary, so this quiet-day fixture's is decided.
+  recordEntry({ root, tenant: 'endzone', kind: 'rejected', issue: 12, by: 'cory', now: '2026-09-01T01:00:00.000Z' });
   const sent = [];
   const send = (message) => { sent.push(message); return { ok: true }; };
   const early = runDailySummary({ root, now: '2026-09-30T08:00:00.000Z', send });
@@ -462,4 +464,54 @@ test('ADR 0017: the Arbiter section runs from the last sent summary, not a fixed
   const next = sender();
   runDailySummary({ root, now: later, send: next });
   assert.doesNotMatch(next.calls[0].body, /Arbiter endzone/);
+});
+
+// Spec fleet #194 (WS5, #299): the summary carries what the dispatcher's digest did, plus pending
+// proposals and open waits. Proposals and waits are Cory's to answer, so each alone sends; counts never do.
+function seedToState(root, { issue, hops, enteredAt, tenant = 'endzone' }) {
+  const id = `${tenant}:issue-${issue}`;
+  workState.createRecord({ root, id, tenant, issue, state: 'implementing', github: { issueNumber: issue, prNumber: issue + 1000 }, actor: 'test', idempotencyKey: `c-${issue}`, now: minutesBefore(enteredAt, hops.length + 1) });
+  let revision = 1;
+  hops.forEach((state, index) => {
+    revision = workState.transitionRecord({ root, id, to: state, expectedRevision: revision, idempotencyKey: `t-${issue}-${state}`, actor: 'pr-watch', evidence: `to ${state}`, now: index === hops.length - 1 ? enteredAt : minutesBefore(enteredAt, hops.length - index), ...(state === 'merged' ? { testOnly: true, githubState: 'MERGED', githubMergedAt: enteredAt, githubEvidence: 'test' } : {}) }).revision;
+  });
+}
+
+test('#299: a proposal with no outcome is listed oldest first and sends on a quiet day', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  const proposed = (issue, at) => JSON.stringify({ schemaVersion: 1, kind: 'proposed', tenant: 'endzone', issue, at, bodyHash: 'h', commentUrl: 'u' });
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${[proposed(15, minutesAgo(20)), proposed(12, hoursAgo(3))].join('\n')}\n`);
+  const send = sender();
+  const result = runDailySummary({ root, now: NOW, send });
+  assert.equal(result.sent, true);
+  assert.equal(result.count, 0, 'count stays the number of waiting rows');
+  assert.match(send.calls[0].body, /^Proposals awaiting Approval, endzone: #12 \(since 3h\), #15 \(since 20m\)$/m);
+});
+
+test('#299: a human-wait condition with its paged detail sends one "Waiting on you" line; a missing paged entry costs the detail only', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state', 'watchdog'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'watchdog', 'last-run.json'), JSON.stringify({ at: NOW, mode: 'tick', conditions: ['human-wait:pl-endzone', 'human-wait:pl-other', 'stalled:x'] }));
+  fs.writeFileSync(path.join(root, 'state', 'watchdog', 'paged.json'), JSON.stringify({ 'human-wait:pl-endzone': { firstSeen: hoursAgo(2), lastSeen: NOW, detail: 'pl-endzone asked which branch to cut', deliveredAt: NOW } }));
+  const send = sender();
+  assert.equal(runDailySummary({ root, now: NOW, send }).sent, true);
+  const lines = send.calls[0].body.split('\n');
+  assert.deepEqual(lines, ['Waiting on you: pl-endzone (2h): pl-endzone asked which branch to cut', 'Waiting on you: pl-other (unknown): no detail recorded']);
+  const empty = rootDir();
+  fs.mkdirSync(path.join(empty, 'state', 'watchdog'), { recursive: true });
+  fs.writeFileSync(path.join(empty, 'state', 'watchdog', 'last-run.json'), 'not json');
+  assert.equal(buildSummary({ root: empty, now: NOW }), null, 'a torn watchdog file costs the line, never the summary');
+});
+
+test('#299: per-tenant in-flight and merged-in-24h counts ride the page but never send a quiet day', () => {
+  const root = rootDir();
+  seedToState(root, { issue: 21, hops: ['pr-open', 'ci-wait', 'review'], enteredAt: hoursAgo(5) });
+  seedToState(root, { issue: 22, hops: ['pr-open', 'ci-wait', 'review', 'merged'], enteredAt: hoursAgo(2) });
+  seedToState(root, { issue: 23, hops: ['pr-open', 'ci-wait', 'review', 'merged'], enteredAt: hoursAgo(30) });
+  assert.equal(buildSummary({ root, now: NOW }), null, 'counts alone send nothing');
+  seedDecision(root, { issue: 9, to: 'hold', enteredAt: hoursAgo(1) });
+  const summary = buildSummary({ root, now: NOW });
+  assert.equal(summary.count, 1);
+  assert.match(summary.body, /^endzone: 1 in flight, 1 merged in the last 24 h$/m);
 });

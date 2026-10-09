@@ -17,7 +17,7 @@ const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
-const { runStalePremiseNotice, readLedger, ARBITER_KINDS } = require('./triage');
+const { runStalePremiseNotice, readLedger, projectTriage, ARBITER_KINDS } = require('./triage');
 const { centralClock, scanTenants, standingSuspensions } = require('./bounded-authority');
 const { plannerInputs, vetoWindow } = require('./assignment');
 
@@ -181,6 +181,59 @@ function suspensionLine(entry) {
   return `Bounded authority is suspended for ${entry.tenant}${since}${why}. Removing state/flags/bounded-authority-suspended-${entry.tenant} lifts it.`;
 }
 
+// Spec fleet #194 (#299): per tenant, the triage proposals still awaiting an Approval or an Arbiter verdict, oldest first.
+function proposalLines({ root, now }) {
+  const base = baseOf(root);
+  const nowMs = new Date(now || Date.now()).getTime();
+  let names = [];
+  try { names = fs.readdirSync(path.join(base, 'state', 'triage')).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -'.jsonl'.length)).sort(); } catch { return []; }
+  const lines = [];
+  for (const tenant of names) {
+    try {
+      const pending = projectTriage({ entries: readLedger(base, tenant), now: new Date(nowMs).toISOString() }).pending
+        .sort((a, b) => String(a.since).localeCompare(String(b.since)));
+      if (pending.length) lines.push(`Proposals awaiting Approval, ${tenant}: ${pending.map((row) => `#${row.issue} (since ${formatAge(nowMs - new Date(row.since).getTime())})`).join(', ')}`);
+    } catch { /* a torn ledger costs this tenant's line, never the summary */ }
+  }
+  return lines;
+}
+
+// Spec fleet #194 (#299): the Watchdog's standing human-wait:<session> conditions, with the ask from paged.json.
+function waitLines({ root, now }) {
+  const base = baseOf(root);
+  const nowMs = new Date(now || Date.now()).getTime();
+  const readJson = (name) => JSON.parse(fs.readFileSync(path.join(base, 'state', 'watchdog', name), 'utf8').replace(/^﻿/, ''));
+  let conditions = [];
+  try { conditions = readJson('last-run.json').conditions || []; } catch { return []; }
+  let paged = {};
+  try { paged = readJson('paged.json') || {}; } catch { /* no detail recorded */ }
+  return conditions.filter((condition) => typeof condition === 'string' && condition.startsWith('human-wait:')).map((condition) => {
+    const entry = paged[condition] || {};
+    const firstMs = new Date(entry.firstSeen).getTime();
+    return `Waiting on you: ${condition.slice('human-wait:'.length)} (${formatAge(Number.isFinite(firstMs) ? nowMs - firstMs : NaN)}): ${entry.detail ? String(entry.detail).replace(/\s+/g, ' ').slice(0, 300) : 'no detail recorded'}`;
+  });
+}
+
+// Spec fleet #194 (#299): per tenant, records in flight and PRs merged in the last 24 h, from the same fold waitingRows reads.
+const IN_FLIGHT_STATES = Object.freeze(['assigned', 'implementing', 'pr-open', 'ci-wait', 'review', 'revision']);
+function countLines({ root, now }) {
+  const base = baseOf(root);
+  const nowMs = new Date(now || Date.now()).getTime();
+  let rows;
+  try { rows = [...foldLedger(workState.readEvents(base)).values()]; } catch { return []; }
+  const tenantNames = scopedTenantNames(base, rows);
+  const counts = {};
+  for (const row of rows) {
+    if (!row.tenant || !tenantNames.has(row.tenant)) continue;
+    const tally = counts[row.tenant] || (counts[row.tenant] = { inFlight: 0, merged: 0 });
+    if (IN_FLIGHT_STATES.includes(row.state)) tally.inFlight += 1;
+    const mergedMs = new Date(row.mergedAt).getTime();
+    if (row.state === 'merged' && Number.isFinite(mergedMs) && nowMs - mergedMs <= 86400000 && nowMs >= mergedMs) tally.merged += 1;
+  }
+  return Object.keys(counts).sort().filter((tenant) => counts[tenant].inFlight || counts[tenant].merged)
+    .map((tenant) => `${tenant}: ${counts[tenant].inFlight} in flight, ${counts[tenant].merged} merged in the last 24 h`);
+}
+
 // null when nothing is waiting: the caller's job is to send nothing at all,
 // not an empty page. Rows keep the ticket's plain "#issue state age" only
 // while every waiting row belongs to one tenant; once they span more than
@@ -196,10 +249,13 @@ function buildSummary({ root, now } = {}) {
   // ADR 0017: Arbiter activity is content, never a reason to page (the owner hears only high-level decisions, and an
   // escalation already paged through the door); a standing suspension is a decision only he can make, so it is.
   const { lines: arbiter, suspended: arbiterSuspended } = arbiterLines({ root, now });
-  if (!rows.length && !suspensions.length && !windowed.length && !arbiterSuspended) return null;
+  // Spec fleet #194 (#299): proposals and open waits are Cory's to answer, so they send; the counts are content only.
+  const proposals = proposalLines({ root, now });
+  const waits = waitLines({ root, now });
+  if (!rows.length && !suspensions.length && !windowed.length && !arbiterSuspended && !proposals.length && !waits.length) return null;
   const multiTenant = new Set(rows.map((row) => row.tenant)).size > 1;
   const shown = rows.slice(0, MAX_ROWS);
-  const lines = [...suspensions.map(suspensionLine), ...arbiter, ...windowed];
+  const lines = [...suspensions.map(suspensionLine), ...arbiter, ...windowed, ...proposals, ...waits, ...countLines({ root, now })];
   lines.push(...shown.map((row) => (multiTenant
     ? `${row.tenant} #${row.issue} ${row.state} ${formatAge(row.ageMs)}`
     : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`)));
