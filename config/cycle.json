@@ -108,7 +108,7 @@
     "defaultPriority": "normal",
     "minAgeMinutes": { "sync-unattested": 60 },
     "fleetDeadRepeatMinutes": 120,
-    "fleetDeadRepeatPriority": "emergency",
+    "fleetDeadRepeatPriority": "high",
     "maxAttempts": 3,
     "retryAfterMinutes": 60
   },
