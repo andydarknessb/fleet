@@ -99,17 +99,21 @@ if ($FromRoster) {
   $Role = $e.role; $Name = $e.name; $Tenant = $e.tenant; $Parent = $e.parent; $Prompt = $e.prompt; $cwd = $e.cwd
 }
 foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req -ValueOnly)) { $r = Release-ReservationOnRefusal "launch refused: the manifest gives no $req"; Write-Error "missing -$req$($r.note)"; exit 4 } }
-if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$') { $r = Release-ReservationOnRefusal "launch refused: name '$Name' does not match the fleet naming scheme"; Write-Error "name '$Name' does not match the fleet naming scheme$($r.note)"; exit 4 }
-# no release: a manifest launch is always Role ic, so the two principal checks below are reachable only by mixing -FromRoster into a manifest launch (caller mistake; the reservation stays valid for a correct launch).
+if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$') { $r = Release-ReservationOnRefusal "launch refused: name '$Name' does not match the fleet naming scheme"; Write-Error "name '$Name' does not match the fleet naming scheme$($r.note)"; exit 4 }
+# no release: a manifest launch is always Role ic, so the principal and arbiter checks below are reachable only by mixing -FromRoster into a manifest launch (caller mistake; the reservation stays valid for a correct launch).
 if ($Role -eq 'principal' -and $Name -notmatch '^pe-') { Write-Error "a principal session is named pe-<tenant> (ADR 0011)"; exit 4 }
 # no release: same -FromRoster mix-up as the principal name check above.
+if ($Role -eq 'arbiter' -and $Name -notmatch '^ar-') { Write-Error "an arbiter session is named ar-<tenant> (ADR 0017)"; exit 4 }
+# no release: same -FromRoster mix-up as the principal name check above.
 if ($Role -eq 'principal' -and -not $Tenant) { Write-Error "a principal needs -Tenant (one per tenant, ADR 0011)"; exit 4 }
+# no release: same -FromRoster mix-up as the principal name check above.
+if ($Role -eq 'arbiter' -and -not $Tenant) { Write-Error "an arbiter needs -Tenant (one per tenant, ADR 0017)"; exit 4 }
 # Ticket 08b: while the rostered Sentinel is cut over (permanent since ticket 89 retired
 # its roster entry, role file and rollback script), the one door refuses to start a
 # second supervisor (not even with -Force: two actors is the failure cutover exists to
 # prevent). A dry run still evaluates the other gates.
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
-  # no release: the same -FromRoster mix-up as the principal checks above; a manifest launch is Role ic and never reaches this.
+  # no release: the same -FromRoster mix-up as the principal and arbiter checks above; a manifest launch is Role ic and never reaches this.
   Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live): bin\watchdog.ps1 is the supervisor now' } | ConvertTo-Json -Compress); exit 3
 }
 # Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
@@ -283,8 +287,8 @@ if ($rosterEntry -and $rosterEntry.jobId) {
   }
 }
 # The cap bounds concurrent worktrees and PR churn, so it counts the sessions that
-# produce them. config/cycle.json `cap.exemptNamePrefixes` (the Principal, `pe-`;
-# ADR 0011 / grill Q28) lists the standing control-plane names that neither count
+# produce them. config/cycle.json `cap.exemptNamePrefixes` (the Principal, `pe-`, and
+# the Arbiter, `ar-`; ADR 0011 / grill Q28, ADR 0017) lists the standing control-plane names that neither count
 # toward the cap nor are refused by it. Absent config = nothing is exempt.
 $capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
 if (-not $Force -and -not (Test-CapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
@@ -365,11 +369,11 @@ if ($toolContractOn) {
     foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**', 'state/exclusions/**', 'state/status/DIGEST.md', 'state/status/*-status.md') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
     if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
   }
-  # The Principal (ADR 0011) is NOT on this list: settings deny rules cannot express an
+  # The Principal (ADR 0011) and the Arbiter (ADR 0017) are NOT on this list: settings deny rules cannot express an
   # allowlist, so its write boundary (docs/adr/*.md and CONTEXT.md in the tenant repo,
-  # its status file, the triage ledger, its memory) is enforced by hooks/principal-guard.ps1
+  # its status file, the triage ledger, its memory; the Arbiter's bounds mirror it) is enforced by hooks/principal-guard.ps1
   # (fleet #39), registered in fleet-settings.json for every fleet session.
-  if ($Role -in @('dispatcher', 'project-lead', 'sentinel')) {
+  if ($Role -in @('dispatcher', 'project-lead', 'sentinel', 'arbiter')) {
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
       $tenantRepo = $null
       try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
@@ -449,12 +453,13 @@ Write-Json $settingsPath $settings
 
 # The friendly -Model token is passed to `claude --model`, but the bare 'opus'
 # alias tracks the latest Opus (currently Opus 5). ICs must run Opus 4.8, so pin
-# 'opus' to the concrete id. 'fable' is pinned too (ADR 0011: the Principal is the
-# one Fable seat and a default-Fable bump must not move it silently; the installed
+# 'opus' to the concrete id. 'fable' is pinned too (ADR 0011, moved to the Arbiter by
+# ADR 0017: it is the one Fable seat and a default-Fable bump must not move it silently; the installed
 # CLI 2.1.269 admits claude-fable-5-1 to auto mode, verified in its model predicate
 # 2026-09-11, so no fleet #28-style refusal). Other tokens keep their CLI aliases.
-# A principal launched with no -Model runs the role file's `model: fable` alias;
-# pin that path too so the two spellings resolve to the same id.
+# An arbiter launched with no -Model runs the role file's `model: fable` alias (a
+# principal, since ADR 0017, runs Opus 5.5 like a lead); pin that path too so the two
+# spellings resolve to the same id.
 # A project lead launched with no -Model runs Opus 5.5 (owner ruling 2026-09-23),
 # pinned for the same reason; CLI 2.1.280 admits claude-opus-5-5 to auto mode.
 # An IC on sonnet runs pinned Sonnet 5.5 (owner ruling 2026-09-28): CLI 2.1.284's

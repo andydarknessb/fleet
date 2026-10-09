@@ -20,9 +20,9 @@ if ($inp) { $sid = $inp.session_id; $sha = [bool]$inp.stop_hook_active }
 $hb = @{ name = $name; role = $role; tenant = $tenant; sessionId = $sid; at = $now; stopHookActive = $sha }
 [IO.File]::WriteAllText("$home_\state\heartbeats\$name.json", ($hb | ConvertTo-Json -Compress), $utf8)
 
-if ($role -notin @('project-lead', 'principal')) { exit 0 }
+if ($role -notin @('project-lead', 'principal', 'arbiter')) { exit 0 }
 
-# --- project lead and principal continuation ---
+# --- project lead, principal and arbiter continuation ---
 function ConvertFrom-JsonArray { param($Raw) try { $o = ($Raw | Out-String | ConvertFrom-Json); if ($null -eq $o) { return @() }; return @($o) } catch { return @() } }
 $counterPath = "$home_\state\continue\$name.json"
 $count = 0; $lastReason = ''; $total = 0
@@ -42,7 +42,7 @@ function Continue-With {
   if ($key -eq $script:lastKey) { $script:count++ } else { $script:count = 1 }
   $script:total++
   [IO.File]::WriteAllText($counterPath, (@{ count = $script:count; total = $script:total; lastAt = $now; continuedBecause = $key } | ConvertTo-Json -Compress), $utf8)
-  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner, unless it carries Cory's own Re-propose, which you answer." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
+  $hint = if ($role -eq 'principal') { "If a ticket should not be triaged by you, say so in your status file; the frontier drops it once it is routed, held, or assigned to the owner, unless it carries Cory's own Re-propose, which you answer." } elseif ($role -eq 'arbiter') { "Every proposal on the frontier gets exactly one verdict through the door; a proposal you cannot decide is an 'escalated' verdict, never a skipped one." } else { "If you judge an issue not launchable, add it to state/skip/$tenant.json with a reason and this hook will stop asking." }
   [Console]::Error.WriteLine("[fleet stop hook] Keep working: $reason (same-reason continuation $script:count/30, total $script:total/100 since last natural stop). $hint")
   exit 2
 }
@@ -62,12 +62,14 @@ if (-not $t) { Stop-Now 'no tenant file' }
 # --- principal (ADR 0011, fleet #38): continue while the triage frontier is non-empty.
 # --- bin/triage.js computes it from GitHub facts, the outbox and the triage ledger; an
 # --- unreadable frontier stops the session (fail closed), never "frontier empty".
-if ($role -eq 'principal') {
+# --- The Arbiter (ADR 0017) reads the same script with --role arbiter: proposals awaiting a Verdict.
+if ($role -in @('principal', 'arbiter')) {
   $triageNode = $null
   if ($env:FLEET_NODE_PATH) { if (Test-Path -LiteralPath $env:FLEET_NODE_PATH -PathType Leaf) { $triageNode = $env:FLEET_NODE_PATH } }
   else { $triageCmd = Get-Command node -ErrorAction SilentlyContinue; if ($triageCmd) { $triageNode = $triageCmd.Source } }
   if (-not $triageNode) { Stop-Now 'node not found; the triage frontier cannot be computed, proposing nothing' }
   $triageArgs = @('frontier', '--root', $home_, '--tenant', $tenant)
+  if ($role -eq 'arbiter') { $triageArgs += @('--role', 'arbiter') }
   if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $triageArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
   $triageRaw = ''; $triageExit = 1; $frontierOut = $null
   try { $triageRaw = & $triageNode "$home_\bin\triage.js" @triageArgs 2>&1 | Out-String; $triageExit = $LASTEXITCODE } catch { $triageRaw = "$($_.Exception.Message)" }
@@ -78,12 +80,22 @@ if ($role -eq 'principal') {
     Stop-Now "triage frontier unreadable (triage.js exit ${triageExit}; $triageSnippet); proposing nothing"
   }
   $eligible = @($frontierOut.eligible)
+  if ($role -eq 'arbiter') {
+    if ($eligible.Count -gt 0) {
+      $verdicts = @($eligible | ForEach-Object { "#$($_.number)" })
+      Continue-With "verdict frontier: proposals awaiting your Verdict $($verdicts -join ', ') (oldest first). Re-read each cited premise, decide, post through 'node $($home_ -replace '\\', '/')/bin/triage.js verdict', then stop; the next turn re-reads the frontier"
+    }
+    $why = if ($frontierOut.suspended) { "the Arbiter is suspended (state/flags/arbiter-suspended-$tenant stands; only Cory removes it)" } elseif ($frontierOut.paused) { 'PAUSE set' } else { "verdict frontier empty (proposals=$($frontierOut.counts.proposals), skipped=$(@($frontierOut.skipped).Count))" }
+    Stop-Now "$why; the watchdog wakes you"
+  }
   if ($eligible.Count -gt 0) {
-    $approvals = @($eligible | Where-Object { $_.kind -eq 'approval' } | ForEach-Object { "#$($_.number)" })
+    $approvals = @($eligible | Where-Object { $_.kind -in @('approval', 'endorsement') } | ForEach-Object { "#$($_.number)" })
+    $returned = @($eligible | Where-Object { $_.kind -eq 'returned' } | ForEach-Object { "#$($_.number)" })
     $escalations = @($eligible | Where-Object { $_.kind -eq 'escalation' } | ForEach-Object { "#$($_.number)" })
     $proposeNow = @($frontierOut.proposeNow | ForEach-Object { "#$_" })
     $parts = @()
-    if ($approvals.Count -gt 0) { $parts += "finalize approved $($approvals -join ', ')" }
+    if ($approvals.Count -gt 0) { $parts += "finalize approved or endorsed $($approvals -join ', ')" }
+    if ($returned.Count -gt 0) { $parts += "re-propose returned $($returned -join ', ') (supersede, answer each numbered reason)" }
     if ($escalations.Count -gt 0) { $parts += "rule on escalation(s) $($escalations -join ', ')" }
     if ($proposeNow.Count -gt 0) { $parts += "propose triage for $($proposeNow -join ', ') (at most $($frontierOut.cap) this turn of $($frontierOut.counts.tickets) waiting)" }
     Continue-With "triage frontier: $($parts -join '; '). Post on the issue first, record it with 'node $home_\bin\triage.js record', then stop; the next turn re-reads the frontier"

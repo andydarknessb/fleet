@@ -85,13 +85,18 @@ if ($tenant -and (Test-Path "$home_\tenants\$tenant.json")) {
   Write-Output "Tenant file: $home_\tenants\$tenant.json"
 }
 if ($env:FLEET_ISSUE) { Write-Output "Your unit of work: issue #$($env:FLEET_ISSUE). Nothing else." }
-if ($role -in @('ic', 'project-lead', 'dispatcher', 'principal')) {
+if ($role -in @('ic', 'project-lead', 'dispatcher', 'principal', 'arbiter')) {
   $gateState = if (Test-Path "$home_\state\flags\research-gate-off") { 'off (state/flags/research-gate-off stands)' } else { 'on' }
   Write-Output "Researcher: the haiku researcher worker (Agent tool, subagent_type: researcher) is your official researcher (ADR 0010). Repo sweeps, git log, CI logs and web fetches from this session are refused by the research-gate hook (gate $gateState); give the researcher the one question and a line cap. Reading what was handed to you stays yours."
 }
 if ($role -eq 'principal') {
   $principalMode = if (Test-Path "$home_\state\flags\principal-live") { 'live' } else { 'shadow (state/flags/principal-live absent; you were launched by hand)' }
-  Write-Output "Principal (ADR 0011, $principalMode): your frontier is 'node $homeFwd/bin/triage.js frontier --root $homeFwd --tenant $tenant' (approvals to finalize, escalations to rule on, then at most cap tickets to propose, oldest first); your Stop hook runs it and continues you while it is non-empty. Record every proposal, outcome and finalizing with 'node $homeFwd/bin/triage.js record --root $homeFwd --tenant $tenant --kind <kind> ...' right after the gh call that made it true; 'triage.js state' shows the ledger. You are advisory: no routing label without the owner's Approved comment; closing, wontfix and duplicate are never yours."
+  Write-Output "Principal (ADR 0011, $principalMode): your frontier is 'node $homeFwd/bin/triage.js frontier --root $homeFwd --tenant $tenant' (endorsements and approvals to finalize, returned proposals to re-propose, escalations to rule on, then at most cap tickets to propose, oldest first); your Stop hook runs it and continues you while it is non-empty. Record every proposal, outcome and finalizing with 'node $homeFwd/bin/triage.js record --root $homeFwd --tenant $tenant --kind <kind> ...' right after the gh call that made it true; 'triage.js state' shows the ledger. You propose and the Arbiter decides (ADR 0017): no routing label before an Endorsement or the owner's Approved comment; closing, wontfix and duplicate are never yours."
+}
+if ($role -eq 'arbiter') {
+  $arbiterMode = if (Test-Path "$home_\state\flags\arbiter-live") { 'live' } else { 'shadow (state/flags/arbiter-live absent; you were launched by hand)' }
+  $arbiterSuspended = if ($tenant -and (Test-Path "$home_\state\flags\arbiter-suspended-$tenant")) { " SUSPENDED: state/flags/arbiter-suspended-$tenant stands; post no verdict until Cory removes it." } else { '' }
+  Write-Output "Arbiter (ADR 0017, $arbiterMode): your frontier is 'node $homeFwd/bin/triage.js frontier --root $homeFwd --tenant $tenant --role arbiter' (triage proposals awaiting a Verdict, oldest first); your Stop hook runs it and continues you while it is non-empty. Every verdict goes through the door 'node $homeFwd/bin/triage.js verdict --root $homeFwd --tenant $tenant --issue <n> --kind endorsed|endorsed-with-edits|returned|escalated ...', never gh issue comment. An Endorsement is a Ruling at once; escalate only product intent, money, a user-facing promise or a rule change, and when in doubt. You apply no label and post no Ruling.$arbiterSuspended"
 }
 # 02/03 cutover: a manifest-launched IC learns its manifest, Work record, and the
 # acknowledgment command here, with the record's current revision read at hook time

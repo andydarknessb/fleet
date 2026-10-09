@@ -13,8 +13,12 @@ function Test-AssignmentLive { Test-Path "$FleetHome\state\flags\assignment-live
 # the flag its roster entry is inert: nothing expects, launches, recovers or wakes it, and
 # the watchdog only records the triage frontier it would have woken it for.
 function Test-PrincipalLive { Test-Path "$FleetHome\state\flags\principal-live" }
+# ADR 0017: the same gate for the Arbiter (ar-<tenant>), the seat that decides the Principal's
+# proposals. Absent the flag its roster entry is inert: nothing expects, launches, recovers
+# or wakes it.
+function Test-ArbiterLive { Test-Path "$FleetHome\state\flags\arbiter-live" }
 # config/cycle.json cap.exemptNamePrefixes: standing control-plane names (the Principal,
-# `pe-`) that neither count toward the cap nor are refused by it; the cap bounds concurrent
+# `pe-`; the Arbiter, `ar-`) that neither count toward the cap nor are refused by it; the cap bounds concurrent
 # worktrees and PR churn, which these sessions never produce. Absent config = nothing exempt.
 function Get-CapExemptPrefixes {
   $prefixes = @()
@@ -193,6 +197,8 @@ function Get-ExpectedStaticSessions {
   if (Test-SentinelOff) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'sentinel' -and "$($_.name)" -ne 'sentinel' }) }
   # The inverse gate for the Principal: expected only while principal-live stands (ADR 0011).
   if (-not (Test-PrincipalLive)) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'principal' -and "$($_.name)" -notmatch '^pe-' }) }
+  # And for the Arbiter: expected only while arbiter-live stands (ADR 0017).
+  if (-not (Test-ArbiterLive)) { $sessions = @($sessions | Where-Object { "$($_.role)" -ne 'arbiter' -and "$($_.name)" -notmatch '^ar-' }) }
   return $sessions
 }
 function Get-LiveRoster {
@@ -255,15 +261,18 @@ function Test-PermissionPromptNeeds { param([string]$Needs) return ("$Needs" -cm
 # The --model and --effort a launch passes today, in one place (fleet #121): launch.ps1
 # builds its command from these, and sentinel-check.ps1 compares a daemon job's frozen
 # respawnFlags against them before `claude respawn` replays that job. 'opus' pins Opus
-# 4.8 for ICs, 'fable' the Principal's seat (ADR 0011), 'opus-5.5' the project-lead
-# default (owner ruling 2026-09-23); a principal or lead with no -Model gets its pin.
+# 4.8 for ICs, 'fable' the Arbiter's seat (ADR 0017: the fleet's one Fable seat; the
+# Principal held it under ADR 0011 and moved to opus-5.5), 'opus-5.5' the project-lead
+# default (owner ruling 2026-09-23) and, since ADR 0017, the principal's; a principal,
+# arbiter or lead with no -Model gets its pin.
 # An IC's sonnet pins Sonnet 5.5 (owner ruling 2026-09-28), with no -Model too; the pin
 # is the IC's alone, so an explicit -Model sonnet on another role keeps the CLI alias.
 $script:LaunchModelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5' }
 $script:IcSonnetPin = 'claude-sonnet-5-5'
 function Resolve-LaunchModel {
   param([string]$Role, [string]$Model)
-  if (-not $Model -and $Role -eq 'principal') { $Model = 'fable' }
+  if (-not $Model -and $Role -eq 'principal') { $Model = 'opus-5.5' }
+  if (-not $Model -and $Role -eq 'arbiter') { $Model = 'fable' }
   if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
   if (-not $Model -and $Role -eq 'ic') { $Model = 'sonnet' }
   $id = if (-not $Model) { '' } elseif ($script:LaunchModelPins.ContainsKey($Model)) { $script:LaunchModelPins[$Model] } else { $Model }
