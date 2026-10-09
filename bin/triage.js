@@ -614,6 +614,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
           if (failure) declined = failure.detail ? `${failure.code}: ${failure.detail}` : failure.code;
         }
       }
+      if (declined && (issue.labels.some((label) => NEVER_FINALIZED_LABELS.includes(label)) || held.has(issue.number))) { skipped.push({ number: issue.number, reason: 'endorsed, then put on hold; waiting on Cory' }); continue; }   // a hold the script would honor is not the Principal's to override
       if (row.outcome.kind === 'endorsed-with-edits' || declined || new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000) {
         // The owner commented after the Endorsement (the door's row comes just before its Verdict comment): his words may carry the edits.
         const spokeAfter = ownerComments.filter((comment) => comment.createdAt > (verdict ? verdict.comment.createdAt : row.outcome.at)).pop();
@@ -1034,12 +1035,12 @@ function activeWorkIssues(root, tenant) {
 //   4  the proposal comment is the ledger's and the newest `## Triage proposal` before the approval
 //   5  neither the proposal nor the approval comment was edited after the approval
 //   6  the issue body hash is unchanged and the body has a `## Premises` heading
-//   7  not an escalation ruling (fail closed, three independent checks); an ADR 0017 Endorsement of one passes (#305)
+//   7  not an escalation ruling (fail closed, three independent checks); an ADR 0017 Endorsement of one recorded against its wake (`--record-id`) passes (#305)
 //   8  proposal fields, each a whole FIELD (its line plus any continuation lines) that is
 //      exactly the word: Classification bug|feature, Open for Cory none, Blocked_by none,
 //      Tier haiku|sonnet; a Ruling field; and every premise line verified (none false)
 //   9  labels: no routing or escalation label, `held` or `haiku-rehearsal`, and no hold;
-//      the marker present (an endorsed escalation ruling may already carry the ready and escalation labels, #305)
+//      the marker present (an endorsed escalation ruling recorded against its wake (`--record-id`) may already carry the ready and escalation labels, #305)
 //   10 cap: at most FINALIZE_CAP new finalizes per run
 //
 // Clauses 1 and 4 to 9 are proposalGate(), one pure function the bounded-ready door
@@ -1188,10 +1189,11 @@ function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_
   if (issue.bodyHash !== proposed.bodyHash) fail('body-changed');   // clause 6
   else if (!PREMISES_HEADING_RE.test(issue.body)) fail('no-premises-heading');
   const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant: tenant || tenantConfig.name, outbox, consumedThrough, history });   // clause 7
-  if (escalation && !endorsed) fail('escalation', escalation);   // #305: the Arbiter's Endorsement of an escalation ruling is the decision
+  const answered = endorsed && Boolean(proposed.recordId);   // #305: only an Endorsement of a proposal recorded against its wake answers it
+  if (escalation && !answered) fail('escalation', escalation);
   if (identified) for (const code of proposalRefusals(proposal.body)) fail(code);   // clause 8
   const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
-  const relaxed = endorsed && escalation ? new Set([readyLabel, tenantConfig.escalationLabel]) : new Set();   // #305
+  const relaxed = answered && escalation ? new Set([readyLabel, tenantConfig.escalationLabel]) : new Set();   // #305
   const blocking = new Set([readyLabel, ...config.routingLabels, ...NEVER_FINALIZED_LABELS, ...(tenantConfig.escalationLabel ? [tenantConfig.escalationLabel] : [])]);   // clause 9
   const labels = new Set(issue.labels);
   const blocked = [...labels].filter((label) => blocking.has(label) && !relaxed.has(label));
@@ -1341,7 +1343,10 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
       const decided = verdict.comment;
       // Clause 3 differs from an Approval's: the claim is already ours, so a Ruling newer than the Verdict is a run that died
       // after posting it. complete() posts none when one stands and finishes the labels and the finalized row.
-      const ruled = issue.comments.some((comment) => comment.createdAt > decided.createdAt && RULING_HEADING_RE.test(comment.body));
+      // A Ruling the script did not write (no `Finalized by script`) is the Principal's, who records `finalized` himself: leave it alone.
+      const standing = issue.comments.filter((comment) => comment.createdAt > decided.createdAt && RULING_HEADING_RE.test(comment.body)).pop();
+      if (standing && !standing.body.includes('Finalized by script')) { leave('ruling-already-posted'); continue; }
+      const ruled = Boolean(standing);
       if (!ruled && issue.comments.some((comment) => comment.author === owner && comment.createdAt > decided.createdAt)) { leave('owner-commented-after-approval'); continue; }
       const proposal = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
       // A Ruling already stands: the gate passed in the run that posted it (and its relabel may have removed the marker), so only finish.

@@ -127,13 +127,20 @@ judgment.
 
 Decided:
 
-- An exact `Endorsed` on an escalation ruling is finalized by script. For the
-  `endorsed` branch alone, clause 7 does not refuse, and clause 9 accepts the
-  ready label and the escalation label on an escalation ruling (the ticket is
-  mid-work by design); every other clause stands. The owner's exact `Approved`
-  on an escalation ruling is unchanged: the Principal finalizes it and wakes
-  the lead.
+- An exact `Endorsed` on an escalation ruling recorded against its wake
+  (`--record-id`, the flag the Arbiter's frontier shows as `escalation: true`
+  and sends the lead's line on) is finalized by script. For the `endorsed`
+  branch alone, clause 7 does not refuse such a proposal, and clause 9 accepts
+  the ready label and the escalation label on it (the ticket is mid-work by
+  design); every other clause stands. An escalation ruling the wake checks
+  flag without a record id still fails closed to the Principal, who wakes the
+  lead. The owner's exact `Approved` on an escalation ruling is unchanged.
 - An exact Endorsement the script declines (a gate clause fails, or the owner
   spoke after the Verdict) is the Principal's at once: the frontier serves the
-  `endorsement` item naming the clause. The 30-minute return remains only for
-  a row the gate passes, a script that died.
+  `endorsement` item naming the clause, unless the ticket is on hold, which
+  waits on Cory. A Verdict not yet posted, a cap, and a Ruling already posted
+  wait their tick or the 30-minute return as before. A Ruling newer than the
+  Verdict that the script did not write is the Principal's: the script leaves
+  it.
+- A hold on a ticket after its Endorsement (`held`, `haiku-rehearsal`) is
+  Cory's; the Principal does not finalize over it.
