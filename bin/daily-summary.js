@@ -168,9 +168,10 @@ function scanArbiters({ root, now, scan }) {
   if (typeof run !== 'function') return [];
   const base = baseOf(root);
   const names = new Set(Object.keys(workState.readTenantConfigs(base)));
+  // A scan that returns null has nothing to report (tests inject one so the summary never reaches gh).
   return [...names].sort().map((tenant) => {
-    try { return { tenant, result: run({ root: base, tenant, now }) }; } catch (error) { return { tenant, error: String(error.message || error).split('\n')[0] }; }
-  });
+    try { const result = run({ root: base, tenant, now }); return result === null ? null : { tenant, result }; } catch (error) { return { tenant, error: String(error.message || error).split('\n')[0] }; }
+  }).filter(Boolean);
 }
 
 // One line per standing suspension: since when, why, and the one way to lift it.

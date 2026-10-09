@@ -5,7 +5,10 @@ const path = require('node:path');
 const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
-const { formatAge, buildSummary, runDailySummary, waitingRows, cli, exitCodeFor, DAILY_SUMMARY_FLAGS, DailySummaryError } = require('../bin/daily-summary');
+const summaryModule = require('../bin/daily-summary');
+const { formatAge, buildSummary, waitingRows, cli, exitCodeFor, DAILY_SUMMARY_FLAGS, DailySummaryError } = summaryModule;
+// bin/arbiter.js (PR C) is in the tree: every run here injects a null scan so no test reaches gh; the ADR 0017 cases inject their own.
+const runDailySummary = (options) => summaryModule.runDailySummary({ arbiterScan: () => null, ...options });
 const workState = require('../bin/work-state');
 
 function rootDir() {
@@ -418,7 +421,7 @@ test('ADR 0017: the summary reports the Arbiter\'s last 24 hours, each escalatio
   const result = runDailySummary({ root, now: NOW, send });
   assert.equal(result.sent, true);
   assert.match(send.calls[0].body, /Arbiter endzone, last 24 h[\s\S]*#9 hold 1h/);
-  assert.equal(result.arbiterScan, undefined, 'no bin/arbiter.js in the tree: nothing to scan');
+  assert.equal(result.arbiterScan, undefined, 'a null scan reports nothing');
 
   // The suspension flag stands until Cory removes it: it is a decision only he can make, so it pages on its own.
   const quiet = rootDir();
