@@ -61,7 +61,7 @@
   },
   "rotation": {
     "dispatcher": { "maxAgeHours": 24 },
-    "project-lead": { "maxAgeHours": 24, "maxMerges": 5, "maxJobTokens": 125000 },
+    "project-lead": { "maxAgeHours": null, "maxMerges": 5, "maxJobTokens": 125000 },
     "principal": { "maxAgeHours": 24, "maxJobTokens": 125000 },
     "arbiter": { "maxAgeHours": 24, "maxJobTokens": 125000 }
   },

@@ -238,6 +238,115 @@ try {
   Assert-True ($c5b.idle -eq $true -and -not (@($c5b.conditions) -contains 'fleet-dead')) "C5b: a pre-launch outbox line must not read as work waiting after a frontier-only wake (idle=$($c5b.idle) conditions=$(@($c5b.conditions) -join ','))"
   foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 2 }
 
+  # ===== fleet #311: an outbox line the lead cannot act on is not a wake. checks-settled counts only while its
+  # record is in `review`; any checks-* line whose record has left a readable active.json is dropped; checks-failed
+  # is otherwise never filtered; an unreadable or missing active.json filters nothing; resolution and
+  # decision-needed are never filtered. The same predicate feeds fleet-dead's work-waiting (case N7).
+  function Set-Active { param([string]$Json) Write-Utf8 "$testRoot\state\work\active.json" $Json }
+  function Get-ActiveJson { param([string]$Id, [int]$Issue, [string]$State) '{"schemaVersion":1,"records":{"test:' + $Id + '":{"tenant":"test","issue":' + $Issue + ',"state":"' + $State + '"}}}' }
+  function Start-WakeCase { param([int]$Ics = 2, [double]$LeadMinutes = 240)
+    Reset-Wake
+    Set-LiveRoster -LeadLaunchedMinutesAgo $LeadMinutes -Ics $Ics
+    Set-LeadRow -StartedMinutesAgo $LeadMinutes
+  }
+
+  # N1: checks-settled while the record is in ci-wait (a newer head walked it back) -> no wake.
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-30' 30 'ci-wait')
+  Set-Outbox @((New-OutboxLine 5 'issue-30' 'checks-settled' 'watch:test:issue-30:r2:aa:review' 'pr-watch'))
+  $n1 = Run-Watchdog; $wn1 = Get-TestWake $n1
+  Assert-True ($wn1.decision -eq 'none') "N1: a checks-settled line whose record is in ci-wait must not wake (got $($wn1.decision): $(@($wn1.evidence) -join '; '))"
+  Assert-True (@(Get-RotateCalls).Count -eq 0) 'N1: no rotate.ps1 call'
+
+  # N2: the same line with the record in review -> woken, and the rotate call names the record.
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-30' 30 'review')
+  $n2 = Run-Watchdog; $wn2 = Get-TestWake $n2
+  Assert-True ($wn2.decision -eq 'woken' -and ((@($wn2.evidence) -join '; ') -eq 'outbox checks-settled x1')) "N2: a checks-settled line whose record is in review must wake (got $($wn2.decision): $(@($wn2.evidence) -join '; '))"
+  $calls2 = @(Get-RotateCalls)
+  Assert-True ($calls2.Count -eq 1 -and ($calls2[0] -match '\[records: checks-settled test:issue-30\]$')) "N2: the rotate call must carry '[records: checks-settled test:issue-30]' (got '$($calls2 -join ' / ')')"
+  Assert-True ((Get-WakeState).digest -eq 'outbox checks-settled x1') "N2: the stored digest (and so the cooldown) stays counts-only (got '$((Get-WakeState).digest)')"
+
+  # N3: checks-failed is never filtered: an idle IC does not watch its own CI, so the lead's wake is what reaches it.
+  # Even with an active ic-<issue> row for the record's issue (ic-1, rostered by Start-WakeCase), it wakes.
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-1' 1 'ci-wait')
+  Set-Outbox @((New-OutboxLine 5 'issue-1' 'checks-failed' 'watch:test:issue-1:r2:cc:implementing' 'pr-watch'))
+  $n3 = Run-Watchdog; $wn3 = Get-TestWake $n3
+  Assert-True ($wn3.decision -eq 'woken' -and ((@($wn3.evidence) -join '; ') -eq 'outbox checks-failed x1')) "N3: checks-failed must wake even with an active IC on the issue (got $($wn3.decision): $(@($wn3.evidence) -join '; '))"
+  $calls3 = @(Get-RotateCalls)
+  Assert-True ($calls3.Count -eq 1 -and ($calls3[0] -match '\[records: checks-failed test:issue-1\]$')) "N3: the rotate call must carry '[records: checks-failed test:issue-1]' (got '$($calls3 -join ' / ')')"
+
+  # N4: checks-failed with no IC on the issue (ic-5 not rostered) -> woken, record named.
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-5' 5 'ci-wait')
+  Set-Outbox @((New-OutboxLine 5 'issue-5' 'checks-failed' 'watch:test:issue-5:r2:dd:implementing' 'pr-watch'))
+  $n4 = Run-Watchdog; $wn4 = Get-TestWake $n4
+  Assert-True ($wn4.decision -eq 'woken' -and ((@($wn4.evidence) -join '; ') -eq 'outbox checks-failed x1')) "N4: checks-failed with no active IC must wake (got $($wn4.decision): $(@($wn4.evidence) -join '; '))"
+  $calls4 = @(Get-RotateCalls)
+  Assert-True ($calls4.Count -eq 1 -and ($calls4[0] -match '\[records: checks-failed test:issue-5\]$')) "N4: the rotate call must carry '[records: checks-failed test:issue-5]' (got '$($calls4 -join ' / ')')"
+
+  # N5: a checks-* line whose record is absent from a READABLE active.json (merged or abandoned) is not a wake,
+  # whether the file holds other records (N5) or none (N5b).
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-99' 99 'review')
+  Set-Outbox @(
+    (New-OutboxLine 5 'issue-40' 'checks-settled' 'watch:test:issue-40:r2:ee:review' 'pr-watch'),
+    (New-OutboxLine 4 'issue-41' 'checks-failed' 'watch:test:issue-41:r2:ff:implementing' 'pr-watch'))
+  $n5 = Run-Watchdog; $wn5 = Get-TestWake $n5
+  Assert-True ($wn5.decision -eq 'none') "N5: checks-settled and checks-failed lines for records absent from active.json must not wake (got $($wn5.decision): $(@($wn5.evidence) -join '; '))"
+  Assert-True (@(Get-RotateCalls).Count -eq 0) 'N5: no rotate.ps1 call'
+  Start-WakeCase
+  Set-Active '{"schemaVersion":1,"records":{}}'
+  $n5b = Run-Watchdog; $wn5b = Get-TestWake $n5b
+  Assert-True ($wn5b.decision -eq 'none') "N5b: the same lines against an empty (readable) active.json must not wake (got $($wn5b.decision): $(@($wn5b.evidence) -join '; '))"
+
+  # N5c: resolution and decision-needed lines are never filtered by record presence: both wake for absent records,
+  # and only they are counted and named beside the dropped checks-* lines.
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-99' 99 'review')
+  $resolutionLine = ([ordered]@{ at = (Get-Iso 3); recordId = 'test:issue-42'; revision = 6; eventSequence = 6; wake = 'resolution'; idempotencyKey = 'k-issue-42:resolution'; actor = 'cory'; from = 'escalated'; to = 'revision'; raisedBy = 'pl-test'; evidence = 'Cory ruled' } | ConvertTo-Json -Compress)
+  Set-Outbox @(
+    (New-OutboxLine 5 'issue-40' 'checks-settled' 'watch:test:issue-40:r2:ee:review' 'pr-watch'),
+    (New-OutboxLine 4 'issue-41' 'checks-failed' 'watch:test:issue-41:r2:ff:implementing' 'pr-watch'),
+    $resolutionLine,
+    (New-OutboxLine 2 'issue-43' 'decision-needed' 'watch:test:issue-43:r2:gg:escalated' 'pr-watch'))
+  $n5c = Run-Watchdog; $wn5c = Get-TestWake $n5c
+  $ev5c = (@($wn5c.evidence) -join '; ')
+  Assert-True ($wn5c.decision -eq 'woken' -and $ev5c -match 'outbox decision-needed x1, resolution x1|outbox resolution x1, decision-needed x1' -and $ev5c -notmatch 'checks-') "N5c: resolution and decision-needed lines for absent records must wake, without the checks-* lines (got $($wn5c.decision): $ev5c)"
+  $calls5c = @(Get-RotateCalls)
+  Assert-True ($calls5c.Count -eq 1 -and ($calls5c[0] -match '\[records: resolution test:issue-42; decision-needed test:issue-43\]$')) "N5c: the rotate call must name only the resolution and decision-needed records (got '$($calls5c -join ' / ')')"
+
+  # N6: no active.json at all filters nothing (fail toward delivering).
+  Start-WakeCase
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+  Set-Outbox @((New-OutboxLine 5 'issue-30' 'checks-settled' 'watch:test:issue-30:r2:aa:review' 'pr-watch'))
+  $n6 = Run-Watchdog; $wn6 = Get-TestWake $n6
+  Assert-True ($wn6.decision -eq 'woken') "N6: a missing active.json must not filter the line (got $($wn6.decision): $($wn6.reason))"
+
+  # N7 (fleet-dead): every static heartbeat stale, a `hold` record (never waiting by itself) in active.json, and a
+  # checks-failed line for a record that has left active.json. The line is not work waiting -> an idle tick. N7b is
+  # the control: the same line for the `hold` record that IS in active.json still counts -> fleet-dead.
+  # The lead was launched after the line, so the frontier wake (bounded by that launch) stays out of it.
+  Start-WakeCase -Ics 1 -LeadMinutes 1; Set-LeadRow -StartedMinutesAgo 240   # door launch recent, daemon row old: not "freshly launched" for staleness
+  Set-Active (Get-ActiveJson 'issue-1' 1 'hold')
+  Set-Outbox @((New-OutboxLine 5 'issue-50' 'checks-failed' 'watch:test:issue-50:r2:cc:implementing' 'pr-watch'))
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 300 }
+  # A hold record is an active record, so the PR watcher's health file must be fresh; earlier stale-heartbeat ticks
+  # left respawn attempts that would trip launch-retry, so clear them before each tick.
+  Write-Utf8 "$testRoot\state\watch\health.json" ('{"at":"' + (Get-Iso 0) + '","ok":true}')
+  Remove-Item "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
+  $n7 = Run-Watchdog
+  Assert-True ($n7.idle -eq $true -and -not (@($n7.conditions) -contains 'fleet-dead')) "N7: a checks-failed line for a record absent from active.json must not read as work waiting (idle=$($n7.idle) conditions=$(@($n7.conditions) -join ','))"
+  Start-WakeCase -Ics 1 -LeadMinutes 1; Set-LeadRow -StartedMinutesAgo 240
+  Set-Outbox @((New-OutboxLine 5 'issue-1' 'checks-failed' 'watch:test:issue-1:r2:cc:implementing' 'pr-watch'))
+  Write-Utf8 "$testRoot\state\watch\health.json" ('{"at":"' + (Get-Iso 0) + '","ok":true}')
+  Remove-Item "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
+  $n7b = Run-Watchdog
+  Assert-True (@($n7b.conditions) -contains 'fleet-dead') "N7b: the same line for a record still in active.json is work waiting (idle=$($n7b.idle) conditions=$(@($n7b.conditions) -join ','))"
+  Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watch\health.json", "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 2 }
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
   Write-Output 'frontier-wake-respawn tests passed'
 } finally {
