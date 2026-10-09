@@ -111,3 +111,29 @@ asked to hear only high-level decisions.
   files, launch door, config, hook role lists), PR B (`triage.js`, watchdog,
   daily summary, Principal frontier), PR C (guard hook, suspension scan), and
   one docs PR per tenant.
+
+## Amendment 2026-10-09 - an exact Endorsed on an escalation ruling is the script's (fleet #305)
+
+Endzone #2139, an escalation ruling (the Principal's proposal answering
+`pl-endzone`'s `decision-needed` wake), was Endorsed exactly at 15:06Z and
+ruled only at 15:36Z, by the Principal's hand. Decision 2 says an exact
+`Endorsed` is finalized by script within a tick; the finalize gate's clause 7
+(#207) refused every escalation ruling, and the Principal's frontier treated
+the refusal as a script that had died, returning the item only after the
+30-minute claim expiry. Clause 7 guarded the one step the script cannot take
+on the owner's `Approved`: waking the lead. On an Endorsement the Arbiter sends
+that wake itself after its Verdict (`agents/arbiter.md`), so nothing is left to
+judgment.
+
+Decided:
+
+- An exact `Endorsed` on an escalation ruling is finalized by script. For the
+  `endorsed` branch alone, clause 7 does not refuse, and clause 9 accepts the
+  ready label and the escalation label on an escalation ruling (the ticket is
+  mid-work by design); every other clause stands. The owner's exact `Approved`
+  on an escalation ruling is unchanged: the Principal finalizes it and wakes
+  the lead.
+- An exact Endorsement the script declines (a gate clause fails, or the owner
+  spoke after the Verdict) is the Principal's at once: the frontier serves the
+  `endorsement` item naming the clause. The 30-minute return remains only for
+  a row the gate passes, a script that died.

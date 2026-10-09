@@ -602,15 +602,24 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     }
 
     // 0c. (ADR 0017) An Endorsement with edits is the Principal's to finalize at once; an exact Endorsement is the finalize
-    // script's, and returns here only when its claim is older than CLAIM_EXPIRY_MINUTES with no finalized row (the script
-    // died or declined). As for an Approval, the marker must still stand.
-    if (row && row.outcome && ['endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized && labels.has(marker)
-      && (row.outcome.kind === 'endorsed-with-edits' || new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000)) {
+    // script's, and returns here once its claim is older than CLAIM_EXPIRY_MINUTES with no finalized row (the script died), or at once
+    // when the script has DECLINED it (#305): the owner spoke after the Verdict with no Ruling, or the same gate the script runs fails. As for an Approval, the marker must still stand.
+    if (row && row.outcome && ['endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized && labels.has(marker)) {
       const verdict = newestVerdict(issue, fleetIdentity, row.proposed ? row.proposed.at : '');
-      // The owner commented after the Endorsement (the door's row comes just before its Verdict comment): his words may carry the edits.
-      const spokeAfter = ownerComments.filter((comment) => comment.createdAt > (verdict ? verdict.comment.createdAt : row.outcome.at)).pop();
-      endorsements.push({ kind: 'endorsement', ...(spokeAfter ? { ownerCommentUrl: spokeAfter.url } : {}), number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling only if none is newer than the Verdict, apply the labels, record finalized' });
-      continue;
+      let declined = null;
+      if (row.outcome.kind === 'endorsed' && verdict && verdict.exact && !issue.comments.some((comment) => comment.createdAt > verdict.comment.createdAt && RULING_HEADING_RE.test(comment.body))) {
+        if (ownerComments.some((comment) => comment.createdAt > verdict.comment.createdAt)) declined = 'owner-commented-after-approval';
+        else {
+          const [failure] = proposalGate({ issue, row: { ...row, outcome: null }, proposal: issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl), approval: verdict.comment, config, tenantConfig: { readyLabel, escalationLabel, name: tenant }, tenant, outbox, consumedThrough: projection.consumedThrough, endorsed: true });   // no holds: the script passes none, and the frontier must agree with it
+          if (failure) declined = failure.detail ? `${failure.code}: ${failure.detail}` : failure.code;
+        }
+      }
+      if (row.outcome.kind === 'endorsed-with-edits' || declined || new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000) {
+        // The owner commented after the Endorsement (the door's row comes just before its Verdict comment): his words may carry the edits.
+        const spokeAfter = ownerComments.filter((comment) => comment.createdAt > (verdict ? verdict.comment.createdAt : row.outcome.at)).pop();
+        endorsements.push({ kind: 'endorsement', ...(spokeAfter ? { ownerCommentUrl: spokeAfter.url } : {}), number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : declined ? `finalize script declined (${declined})` : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling only if none is newer than the Verdict, apply the labels, record finalized' });
+        continue;
+      }
     }
 
     // 1. An open proposal with the owner's Approved comment after it: finalize first.
@@ -1025,12 +1034,12 @@ function activeWorkIssues(root, tenant) {
 //   4  the proposal comment is the ledger's and the newest `## Triage proposal` before the approval
 //   5  neither the proposal nor the approval comment was edited after the approval
 //   6  the issue body hash is unchanged and the body has a `## Premises` heading
-//   7  not an escalation ruling (fail closed, three independent checks)
+//   7  not an escalation ruling (fail closed, three independent checks); an ADR 0017 Endorsement of one passes (#305)
 //   8  proposal fields, each a whole FIELD (its line plus any continuation lines) that is
 //      exactly the word: Classification bug|feature, Open for Cory none, Blocked_by none,
 //      Tier haiku|sonnet; a Ruling field; and every premise line verified (none false)
 //   9  labels: no routing or escalation label, `held` or `haiku-rehearsal`, and no hold;
-//      the marker present
+//      the marker present (an endorsed escalation ruling may already carry the ready and escalation labels, #305)
 //   10 cap: at most FINALIZE_CAP new finalizes per run
 //
 // Clauses 1 and 4 to 9 are proposalGate(), one pure function the bounded-ready door
@@ -1158,7 +1167,7 @@ function heldIn(holds, number) {
 // row, `proposal` the ledger's proposal comment. `approval` (the owner's comment) anchors clauses
 // 4 and 5; without one, the proposal must be the newest in the thread and never edited.
 // `holds` (a Map, Set or array of issue numbers: skip-file and exclusion holds) is optional.
-function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_CONFIG, tenantConfig = {}, tenant, outbox = [], consumedThrough = null, holds = null } = {}) {
+function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_CONFIG, tenantConfig = {}, tenant, outbox = [], consumedThrough = null, holds = null, endorsed = false } = {}) {
   const failures = [];
   const fail = (code, detail) => failures.push(detail ? { code, detail } : { code });
   const proposed = row && row.proposed && !row.outcome ? row.proposed : null;
@@ -1179,11 +1188,13 @@ function proposalGate({ issue, row, proposal, approval = null, config = DEFAULT_
   if (issue.bodyHash !== proposed.bodyHash) fail('body-changed');   // clause 6
   else if (!PREMISES_HEADING_RE.test(issue.body)) fail('no-premises-heading');
   const escalation = escalationReason({ proposed, issueNumber: issue.number, tenant: tenant || tenantConfig.name, outbox, consumedThrough, history });   // clause 7
-  if (escalation) fail('escalation', escalation);
+  if (escalation && !endorsed) fail('escalation', escalation);   // #305: the Arbiter's Endorsement of an escalation ruling is the decision
   if (identified) for (const code of proposalRefusals(proposal.body)) fail(code);   // clause 8
-  const blocking = new Set([tenantConfig.readyLabel || 'ready-for-agent', ...config.routingLabels, ...NEVER_FINALIZED_LABELS, ...(tenantConfig.escalationLabel ? [tenantConfig.escalationLabel] : [])]);   // clause 9
+  const readyLabel = tenantConfig.readyLabel || 'ready-for-agent';
+  const relaxed = endorsed && escalation ? new Set([readyLabel, tenantConfig.escalationLabel]) : new Set();   // #305
+  const blocking = new Set([readyLabel, ...config.routingLabels, ...NEVER_FINALIZED_LABELS, ...(tenantConfig.escalationLabel ? [tenantConfig.escalationLabel] : [])]);   // clause 9
   const labels = new Set(issue.labels);
-  const blocked = [...labels].filter((label) => blocking.has(label));
+  const blocked = [...labels].filter((label) => blocking.has(label) && !relaxed.has(label));
   if (blocked.length) fail('labels', `carries ${blocked.join(', ')}`);
   else if (!labels.has(config.markerLabel)) fail('labels', `no ${config.markerLabel}`);
   const hold = heldIn(holds, issue.number);
@@ -1334,7 +1345,7 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
       if (!ruled && issue.comments.some((comment) => comment.author === owner && comment.createdAt > decided.createdAt)) { leave('owner-commented-after-approval'); continue; }
       const proposal = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
       // A Ruling already stands: the gate passed in the run that posted it (and its relabel may have removed the marker), so only finish.
-      const failures = ruled ? (proposal ? [] : [{ code: 'stale-proposal', detail: 'recovery: proposal comment not found' }]) : proposalGate({ issue, row: { ...row, outcome: null }, proposal, approval: decided, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });   // clauses 1, 4-9
+      const failures = ruled ? (proposal ? [] : [{ code: 'stale-proposal', detail: 'recovery: proposal comment not found' }]) : proposalGate({ issue, row: { ...row, outcome: null }, proposal, approval: decided, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough, endorsed: true });   // clauses 1, 4-9
       if (failures.length) { leave(failures[0].code, failures[0].detail); continue; }
       if (claims >= FINALIZE_CAP) { leave('cap'); continue; }   // clause 10
       claims += 1;
