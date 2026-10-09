@@ -254,7 +254,7 @@ function criteriaDefects(body, issueBody, issue) {
 function defaultGh(args) {
   // FLEET_GH names another executable (tests), as in review-policy.js.
   return execFileSync(process.env.FLEET_GH || 'gh', args, {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000, maxBuffer: 16 * 1024 * 1024,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 20000, maxBuffer: 64 * 1024 * 1024,
   });
 }
 

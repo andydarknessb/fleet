@@ -2316,3 +2316,13 @@ test('ADR 0017 CLI: frontier --role arbiter and verdict run through cli(), princ
   const record = cli(['record', '--root', world.root, '--tenant', 'endzone', '--kind', 'escalated', '--issue', '40', '--body-hash', 'h', '--comment-url', 'https://x/1', '--reason', 'rule-change', '--question', 'Edit CLAUDE.md?']);
   assert.deepEqual([record.kind, record.actor, record.reason, record.question], ['escalated', 'arbiter', 'rule-change', 'Edit CLAUDE.md?']);
 });
+
+test('boundedScan reads the bug list with a 64 MiB maxBuffer (spawnSync gh ENOBUFS at the 1 MiB default)', () => {
+  const world = boundedRoot();
+  const seen = [];
+  const runner = (exe, args, options) => { seen.push({ exe, options }); return JSON.stringify({ data: { repository: { issues: { nodes: [] } } } }); };
+  bounded.boundedScan({ root: world.root, tenant: world.tenant, now: BNOW, runner });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].exe, 'gh');
+  assert.ok(seen[0].options.maxBuffer >= 64 * 1024 * 1024, 'the gh call must raise maxBuffer');
+});

@@ -104,7 +104,7 @@ function settingsOf(base) {
 }
 
 function defaultGh(args) {
-  return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000 });
+  return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 30000 });
 }
 
 // A dry run writes nothing under state/: its collector output goes to a temp directory.
