@@ -1984,3 +1984,13 @@ test('#210 minor 8: a Scope of more than 25 paths refuses scope-unresolved, so a
   const world = boundedRoot({ proposal: { Scope: 'lists exactly ' + ok.join(', ') } });
   assert.equal(world.door().readied, true);
 });
+
+test('boundedScan reads the bug list with a 64 MiB maxBuffer (spawnSync gh ENOBUFS at the 1 MiB default)', () => {
+  const world = boundedRoot();
+  const seen = [];
+  const runner = (exe, args, options) => { seen.push({ exe, options }); return JSON.stringify({ data: { repository: { issues: { nodes: [] } } } }); };
+  bounded.boundedScan({ root: world.root, tenant: world.tenant, now: BNOW, runner });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].exe, 'gh');
+  assert.ok(seen[0].options.maxBuffer >= 64 * 1024 * 1024, 'the gh call must raise maxBuffer');
+});

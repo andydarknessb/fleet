@@ -421,7 +421,7 @@ function linkagePhrase(linkage, issue, prNumber) {
 
 function ghJson(executable, args) {
   const raw = execFileSync(executable, args, {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 30000,
   });
   return JSON.parse(raw);
 }

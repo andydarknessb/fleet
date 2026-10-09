@@ -1097,7 +1097,7 @@ function reconcilePullRequest({ repo, prNumber, executable = 'gh' }) {
   }
   try {
     const raw = execFileSync(executable, ['pr', 'view', String(prNumber), '-R', String(repo), '--json', 'state,mergedAt,mergedBy,url,headRefOid'], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000,
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000,
     });
     const result = JSON.parse(raw);
     const mergedBy = result.mergedBy && typeof result.mergedBy === 'object' ? result.mergedBy.login || null : result.mergedBy || null;
