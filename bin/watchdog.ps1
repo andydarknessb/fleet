@@ -641,7 +641,7 @@ try {
   # --- stale; PAUSE suppresses it as it does all staleness paging.
   $busyStale = @()
   if (-not $paused) {
-    foreach ($row in @($daemon | Where-Object { $_.pid -and "$($_.status)" -eq 'busy' -and "$($_.name)" -match '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ic-[0-9]+)$' })) {
+    foreach ($row in @($daemon | Where-Object { $_.pid -and "$($_.status)" -eq 'busy' -and "$($_.name)" -match '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$' })) {
       $bsAge = Get-HeartbeatAgeMinutes "$($row.name)"
       if ($null -ne $bsAge -and $bsAge -le $busyStaleMinutes) { continue }
       $bsStart = ConvertTo-UtcDateTime $row.startedAt
@@ -825,7 +825,7 @@ try {
   # --- multi-hour outages where every session sat blocked and nothing ever tried again.
   # --- 2026-09-17 QA review #13: the decision runs in shadow too (proposed, never
   # --- acted on) so parity has visibility into what live would have done.
-  $controlPlaneHealRoles = @('dispatcher', 'sentinel', 'project-lead', 'principal')
+  $controlPlaneHealRoles = @('dispatcher', 'sentinel', 'project-lead', 'principal', 'arbiter')
   $healStatePath = "$FleetHome\state\watchdog\heal.json"
   $healState = $null; $healStateUnreadable = $false
   try { $healState = Read-Json $healStatePath } catch { $healStateUnreadable = $true }
@@ -1246,6 +1246,85 @@ try {
     try { Write-Json $triageStatePath $triageState } catch {}
   }
 
+  # --- arbiter wake (ADR 0017). The twin of the triage wake above: the Arbiter's frontier
+  # --- (`triage.js frontier --role arbiter`: open Triage proposals with no verdict) is computed
+  # --- every tick and written to state/watchdog/triage-frontier-arbiter.json, the shadow record
+  # --- Cory reads before creating state/flags/arbiter-live. Only while that flag stands, in live
+  # --- mode, with no PAUSE, is an idle ar-<tenant> rotated for a non-empty frontier, under the
+  # --- same guards: one per tenant per tick, the same cooldown on identical evidence
+  # --- (state/watchdog/triage-wake-arbiter.json), the boundary inside rotate.ps1, and
+  # --- state/flags/triage-wake-off as the rollback. A missing arbiter under the live flag is
+  # --- launchNeeded's job, not this block's. An unreadable frontier wakes nothing (fail closed).
+  # --- The frontier is empty under state/flags/arbiter-suspended-<tenant> (only Cory removes it).
+  $arbiterWakes = @()
+  if (-not $Verify -and -not $triageOff) {
+    $arbiterLive = Test-Path "$FleetHome\state\flags\arbiter-live"
+    $arbiterShadow = [ordered]@{ at = (Now-Iso); live = [bool]$arbiterLive; mode = $mode; tenants = @() }
+    $arbiterNode = $null; try { $arbiterNode = Get-NodeExe } catch {}
+    $arbiterStatePath = "$FleetHome\state\watchdog\triage-wake-arbiter.json"
+    $arbiterState = $null; try { $arbiterState = Read-Json $arbiterStatePath } catch {}
+    if (-not $arbiterState) { $arbiterState = [pscustomobject]@{ tenants = [pscustomobject]@{} } }
+    if ($null -eq $arbiterState.PSObject.Properties['tenants']) { $arbiterState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
+    foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
+      $tenant = $null; try { $tenant = Read-Json $tenantFile.FullName } catch {}
+      if (-not $tenant) { continue }
+      $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
+      $arbiterName = "ar-$tenantName"
+      $awake = [ordered]@{ tenant = $tenantName; arbiter = $arbiterName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null; frontierError = $null; counts = $null }
+      # Under PAUSE the Arbiter's frontier is empty by definition, so it is not computed: a wedged node must not double a paused tick's stall.
+      if ($paused) { $awake.reason = 'PAUSE set'; $arbiterShadow.tenants += [pscustomobject]@{ tenant = $tenantName; paused = $true; suspended = $false; eligible = @(); counts = $null; skipped = @() }; $arbiterWakes += [pscustomobject]$awake; continue }
+      $aFrontier = $null
+      if (-not $arbiterNode) { $awake.frontierError = 'node not found (FLEET_NODE_PATH or PATH)' }
+      else {
+        $aArgs = @("$PSScriptRoot\triage.js", 'frontier', '--root', $FleetHome, '--tenant', $tenantName, '--role', 'arbiter')
+        if ($env:FLEET_TRIAGE_ISSUES_FIXTURE) { $aArgs += @('--fixture', $env:FLEET_TRIAGE_ISSUES_FIXTURE) }
+        $ab = Invoke-BoundedExe -FilePath $arbiterNode -ArgumentList $aArgs -TimeoutSec $frontierTimeoutSec -Name "node triage.js frontier --role arbiter $tenantName"
+        if ($ab.startError) { $awake.frontierError = "triage.js could not start: $(Get-OneLine $ab.startError 200)" }
+        elseif ($ab.timedOut) { $awake.frontierError = "triage.js timed out after ${frontierTimeoutSec}s and was killed" }
+        elseif ($ab.exitCode -ne 0) { $awake.frontierError = "triage.js exited $($ab.exitCode)`: $(Get-OneLine (($ab.stdout + ' ' + $ab.stderr)) 200)" }
+        else { $aFrontier = ConvertFrom-LastJsonLine $ab.stdout; if (-not $aFrontier) { $awake.frontierError = "triage.js returned no JSON: $(Get-OneLine $ab.stdout 200)" } }
+      }
+      if ($aFrontier) {
+        $awake.counts = $aFrontier.counts
+        foreach ($item in @($aFrontier.eligible)) { $awake.evidence += "$($item.kind) #$($item.number)" }
+        $arbiterShadow.tenants += [pscustomobject]@{ tenant = $tenantName; counts = $aFrontier.counts; suspended = [bool]$aFrontier.suspended; paused = [bool]$aFrontier.paused; eligible = @($aFrontier.eligible | ForEach-Object { [pscustomobject]@{ kind = "$($_.kind)"; number = $_.number; escalation = [bool]$_.escalation } }); skipped = @($aFrontier.skipped) }
+      } else { $arbiterShadow.tenants += [pscustomobject]@{ tenant = $tenantName; error = $awake.frontierError } }
+      if (-not $arbiterLive) { $awake.decision = 'shadow'; $awake.reason = 'state/flags/arbiter-live absent: frontier recorded, nothing launched'; $arbiterWakes += [pscustomobject]$awake; continue }
+      if ($mode -ne 'live') { $awake.reason = "supervision mode is $mode, not live"; $arbiterWakes += [pscustomobject]$awake; continue }
+      if ($paused) { $awake.reason = 'PAUSE set'; $arbiterWakes += [pscustomobject]$awake; continue }
+      if ($awake.frontierError) { $awake.reason = 'frontier unreadable; waking nothing (fail closed)'; $arbiterWakes += [pscustomobject]$awake; continue }
+      if ($awake.evidence.Count -eq 0) { $awake.reason = if ($aFrontier -and $aFrontier.suspended) { 'arbiter suspended (state/flags/arbiter-suspended); waking nothing' } else { 'nothing to wake for' }; $arbiterWakes += [pscustomobject]$awake; continue }
+      $arbiterRow = $daemon | Where-Object { "$($_.name)" -eq $arbiterName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      if (-not $arbiterRow) { $awake.reason = 'no running arbiter session (launchNeeded covers a missing one)'; $arbiterWakes += [pscustomobject]$awake; continue }
+      $arbiterStanding = Get-BusyStanding $arbiterRow -QuietMinutes $busyQuietMinutes -Now $now   # fleet #149, as the wakes above
+      if (@('idle', 'background') -notcontains $arbiterStanding.standing) {
+        $awake.reason = "arbiter is $($arbiterRow.status), not idle"; if ("$($arbiterRow.status)" -eq 'busy') { $awake.reason += " ($($arbiterStanding.reason))" }
+        $arbiterWakes += [pscustomobject]$awake; continue
+      }
+      if ($arbiterStanding.standing -eq 'background') { $awake.boundary = $arbiterStanding.reason }
+      $adigest = ($awake.evidence -join '; ')
+      $aState = $null; if ($arbiterState.tenants.PSObject.Properties[$tenantName]) { $aState = $arbiterState.tenants.$tenantName }
+      if ($aState -and "$($aState.digest)" -eq $adigest -and $aState.lastAt) {
+        $aLast = ConvertTo-UtcDateTime $aState.lastAt
+        if ($aLast -and ($now - $aLast).TotalMinutes -lt $wakeCooldown) { $awake.decision = 'cooldown'; $awake.reason = "same evidence woken at $($aState.lastAt); cooldown $wakeCooldown min"; $arbiterWakes += [pscustomobject]$awake; continue }
+      }
+      $awake.decision = 'wake'
+      $aRotateRaw = ''; $aRotateOut = $null
+      try { $aRotateRaw = & "$PSScriptRoot\rotate.ps1" -Name $arbiterName -Wake $adigest 2>&1 | Out-String; $aRotateOut = ConvertFrom-LastJsonLine $aRotateRaw } catch { $awake.reason = "rotate.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
+      $aRotated = $false
+      if ($aRotateOut -and $aRotateOut.PSObject.Properties['rotated']) { $aRotated = (@($aRotateOut.rotated) -contains $arbiterName) }
+      $awake.outcome = if ($aRotateOut -and $aRotateOut.PSObject.Properties['outcomes']) { @($aRotateOut.outcomes | Where-Object { $_.name -eq $arbiterName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $aRotateRaw 200 }
+      if ($aRotated) {
+        $awake.decision = 'woken'
+        $arbiterState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $adigest }) -Force
+        try { $awake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: arbiter wake' -Body "$arbiterName relaunched for $adigest" -Detail ([pscustomobject]@{ tenant = $tenantName; arbiter = $arbiterName; evidence = $awake.evidence; outcome = $awake.outcome }) } catch { $awake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
+      } else { $awake.decision = 'deferred'; if (-not $awake.reason) { $awake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($aRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
+      $arbiterWakes += [pscustomobject]$awake
+    }
+    try { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; Write-Json "$FleetHome\state\watchdog\triage-frontier-arbiter.json" ([pscustomobject]$arbiterShadow) } catch {}
+    try { Write-Json $arbiterStatePath $arbiterState } catch {}
+  }
+
   # --- page conditions ---
   # Ticket 77 (ADR 0012): every condition now carries a `kind` (for Get-PagePriority)
   # separate from its dedupe `key`, and an optional `url` (escalation file path or PR
@@ -1282,6 +1361,7 @@ try {
   $actedOn = @()
   $actedOn += @($frontierWakes | Where-Object { $_.decision -eq 'woken' } | ForEach-Object { "$($_.lead)" })
   $actedOn += @($triageWakes | Where-Object { $_.decision -eq 'woken' } | ForEach-Object { "$($_.principal)" })
+  $actedOn += @($arbiterWakes | Where-Object { $_.decision -eq 'woken' } | ForEach-Object { "$($_.arbiter)" })
   if ($check) { $actedOn += @($check.respawned | ForEach-Object { "$($_.name)" }) }
   $actedOn += @($healed | Where-Object { $_.ok -eq $true } | ForEach-Object { "$($_.name)" })
   foreach ($bst in $busyStale) {
@@ -1661,7 +1741,7 @@ try {
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults; repeatPaged = $repeatPaged
     checkError = $checkError; proposed = $proposed
-    launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; triageWakes = $triageWakes
+    launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; triageWakes = $triageWakes; arbiterWakes = $arbiterWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
     healStateUnreadable = [bool]$healStateUnreadable; respawnFailStateUnreadable = [bool]$respawnFailStateUnreadable
     deadMan = $deadMan

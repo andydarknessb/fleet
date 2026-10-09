@@ -17,7 +17,7 @@ const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
-const { runStalePremiseNotice } = require('./triage');
+const { runStalePremiseNotice, readLedger, ARBITER_KINDS } = require('./triage');
 const { centralClock, scanTenants, standingSuspensions } = require('./bounded-authority');
 const { plannerInputs, vetoWindow } = require('./assignment');
 
@@ -113,6 +113,45 @@ function windowedReadies({ root, now }) {
   return lines;
 }
 
+// ADR 0017: the Arbiter's last 24 hours per tenant, from the triage ledger: how many it endorsed, endorsed with
+// edits, returned and escalated, each escalation with its class and question (the owner's to answer), and whether
+// state/flags/arbiter-suspended-<tenant> stands (only Cory removes it). A tenant the Arbiter did nothing for, and
+// is not suspended, adds no line. Endorsements reach the owner only here (ADR 0017, decision 4).
+function arbiterLines({ root, now }) {
+  const base = baseOf(root);
+  const sinceMs = new Date(now || Date.now()).getTime() - 86400000;
+  const names = new Set(Object.keys(workState.readTenantConfigs(base)));
+  try { for (const name of fs.readdirSync(path.join(base, 'state', 'triage'))) if (name.endsWith('.jsonl')) names.add(name.slice(0, -'.jsonl'.length)); } catch { /* no ledger yet */ }
+  const lines = [];
+  let anySuspended = false;
+  for (const tenant of [...names].sort()) {
+    let entries = [];
+    try { entries = readLedger(base, tenant); } catch { continue; }
+    const recent = entries.filter((entry) => ARBITER_KINDS.includes(entry.kind) && new Date(entry.at).getTime() >= sinceMs);
+    const count = (kind) => recent.filter((entry) => entry.kind === kind).length;
+    const suspended = fs.existsSync(path.join(base, 'state', 'flags', `arbiter-suspended-${tenant}`));
+    if (!recent.length && !suspended) continue;
+    if (suspended) anySuspended = true;
+    lines.push(`Arbiter ${tenant}, last 24 h: ${count('endorsed')} endorsed, ${count('endorsed-with-edits')} endorsed with edits, ${count('returned')} returned, ${count('escalated')} escalated.`);
+    for (const entry of recent.filter((row) => row.kind === 'escalated')) lines.push(`Arbiter escalated ${tenant} #${entry.issue} (${entry.reason}): ${String(entry.question || '').replace(/\s+/g, ' ').slice(0, 300)}`);
+    if (suspended) lines.push(`Arbiter is suspended for ${tenant}: it posts no verdict and proposals wait for an Approval. Removing state/flags/arbiter-suspended-${tenant} lifts it.`);
+  }
+  return { lines, suspended: anySuspended };
+}
+
+// bin/arbiter.js (fleet PR C) owns the suspension scan; this summary works without it. A scan that throws costs the
+// scan, never the summary. Its return value is reported as given under `arbiterScan`.
+function scanArbiters({ root, now, scan }) {
+  let run = scan;
+  if (!run) { try { run = require('./arbiter.js').arbiterScan; } catch { return []; } }
+  if (typeof run !== 'function') return [];
+  const base = baseOf(root);
+  const names = new Set(Object.keys(workState.readTenantConfigs(base)));
+  return [...names].sort().map((tenant) => {
+    try { return { tenant, result: run({ root: base, tenant, now }) }; } catch (error) { return { tenant, error: String(error.message || error).split('\n')[0] }; }
+  });
+}
+
 // One line per standing suspension: since when, why, and the one way to lift it.
 function suspensionLine(entry) {
   const since = entry.at ? ` since ${String(entry.at).slice(0, 10)}` : '';
@@ -132,10 +171,13 @@ function buildSummary({ root, now } = {}) {
   // heads the page and is reason enough to send one on a day nothing else waits.
   const suspensions = standingSuspensions(baseOf(root));
   const windowed = windowedReadies({ root, now });
-  if (!rows.length && !suspensions.length && !windowed.length) return null;
+  // ADR 0017: Arbiter activity is content, never a reason to page (the owner hears only high-level decisions, and an
+  // escalation already paged through the door); a standing suspension is a decision only he can make, so it is.
+  const { lines: arbiter, suspended: arbiterSuspended } = arbiterLines({ root, now });
+  if (!rows.length && !suspensions.length && !windowed.length && !arbiterSuspended) return null;
   const multiTenant = new Set(rows.map((row) => row.tenant)).size > 1;
   const shown = rows.slice(0, MAX_ROWS);
-  const lines = [...suspensions.map(suspensionLine), ...windowed];
+  const lines = [...suspensions.map(suspensionLine), ...arbiter, ...windowed];
   lines.push(...shown.map((row) => (multiTenant
     ? `${row.tenant} #${row.issue} ${row.state} ${formatAge(row.ageMs)}`
     : `#${row.issue} ${row.state} ${formatAge(row.ageMs)}`)));
@@ -146,7 +188,7 @@ function buildSummary({ root, now } = {}) {
   const card = latestScorecard(root);
   if (card && card.week) lines.push(headlineOf(card));
   return {
-    title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length, suspensions: suspensions.length, windowed: windowed.length,
+    title: 'Fleet daily summary', body: lines.join('\n'), priority: 'normal', kind: 'daily-summary', count: rows.length, suspensions: suspensions.length, windowed: windowed.length, arbiter: arbiter.length,
   };
 }
 
@@ -174,13 +216,16 @@ function runDailySummary(options = {}) {
     try { scanned = scanTenants({ root: base, now: options.now, loadTenantIssues: options.loadTenantIssues }); } catch (error) { scanned = [{ error: String(error.message || error).split('\n')[0] }]; }
   }
   const boundedScan = scanned.length ? { boundedScan: scanned } : {};
+  // ADR 0017: the Arbiter's own suspension scan (bin/arbiter.js), if that module is in the tree.
+  const arbiterScanned = options.dryRun ? [] : scanArbiters({ root: base, now: options.now, scan: options.arbiterScan });
+  const arbiterScan = arbiterScanned.length ? { arbiterScan: arbiterScanned } : {};
   const summary = buildSummary({ root: base, now: options.now });
-  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice, ...boundedScan };
+  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice, ...boundedScan, ...arbiterScan };
   if (options.dryRun) return { sent: false, attempted: false, count: summary.count, dryRun: true, summary, ...staleNotice };
   let result;
   try { result = send(summary); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
   const ok = Boolean(result && result.ok);
-  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice, ...boundedScan };
+  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice, ...boundedScan, ...arbiterScan };
 }
 
 function cli(argv) {

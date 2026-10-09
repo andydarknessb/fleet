@@ -1371,7 +1371,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   try {
     $t6a = Run-Watchdog
     $tw6a = @($t6a.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
-    $t6aCalls = @(Get-Content "$testRoot\mock-bin\fail-tick-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'triage\.js' } | ForEach-Object { if ($_ -match 'triage\.js"?\s+(\w+)') { $Matches[1] } })
+    $t6aCalls = @(Get-Content "$testRoot\mock-bin\fail-tick-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'triage\.js' -and $_ -notmatch '--role arbiter' } | ForEach-Object { if ($_ -match 'triage\.js"?\s+(\w+)') { $Matches[1] } })
     Assert-True ($t6aCalls.Count -eq 2 -and $t6aCalls[0] -eq 'tick' -and $t6aCalls[1] -eq 'frontier') "a failed tick must fall back to one plain frontier call (calls: $($t6aCalls -join ','); tick record: $(($tw6a | ConvertTo-Json -Compress -Depth 5)); log: $((Get-Content "$testRoot\mock-bin\fail-tick-calls.log" -ErrorAction SilentlyContinue) -join ' | '))"
     Assert-True ("$($tw6a.finalize.error)" -match 'did not complete' -and "$($tw6a.finalize.error)" -match 'exited 1') "the tick failure must be recorded as the finalize error (got $(($tw6a.finalize | ConvertTo-Json -Compress -Depth 4)))"
     Assert-True (-not $tw6a.frontierError) "the fallback frontier must clear the frontier error (got $($tw6a.frontierError))"
@@ -1392,7 +1392,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   try {
     $t6c = Run-Watchdog
     $tw6c = @($t6c.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
-    $t6cCalls = @(Get-Content "$testRoot\mock-bin\frontier-error-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'triage\.js' } | ForEach-Object { if ($_ -match 'triage\.js"?\s+(\w+)') { $Matches[1] } })
+    $t6cCalls = @(Get-Content "$testRoot\mock-bin\frontier-error-calls.log" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'triage\.js' -and $_ -notmatch '--role arbiter' } | ForEach-Object { if ($_ -match 'triage\.js"?\s+(\w+)') { $Matches[1] } })
     Assert-True ($t6cCalls.Count -eq 1 -and $t6cCalls[0] -eq 'tick') "a frontierError from the tick must not trigger a fallback frontier call (calls: $($t6cCalls -join ','))"
     Assert-True ((@($tw6c.finalize.finalized) | ForEach-Object { $_.issue }) -contains 777 -and -not $tw6c.finalize.error) "the finalize result must survive a frontier failure (got $(($tw6c.finalize | ConvertTo-Json -Compress -Depth 4)))"
     Assert-True ("$($tw6c.frontierError)" -match 'after the finalize' -and $tw6c.decision -eq 'none' -and $tw6c.reason -match 'fail closed') "a frontierError must be recorded and wake nothing (got $($tw6c.decision): $($tw6c.reason); $($tw6c.frontierError))"
@@ -1439,6 +1439,60 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@($t7.triageWakes).Count -eq 0) 'the flag must disable the triage wake'
   Remove-Item "$testRoot\state\flags\triage-wake-off"
   Remove-Item "$testRoot\state\flags\principal-live"
+
+  # Case T8 (ADR 0017): the arbiter wake is the triage wake's twin: `frontier --role arbiter`, behind
+  # state/flags/arbiter-live, name ar-<tenant>, its own cooldown record and shadow file.
+  $t8Issue = '{"number":620,"title":"T","url":"https://github.com/owner/repo/issues/620","body":"Body of the ticket\n\n## Premises\n\na.js: x @abcdef1","createdAt":"2026-09-02T00:00:00.000Z","labels":["triage-proposed"],"assignees":[],"comments":[{"id":"p620","url":"https://x/p620","author":"fleet-bot","body":"' + ($t5bProposal -replace "`n", '\n') + '","createdAt":"2026-09-10T00:00:00.000Z"}]}'
+  Write-Utf8 $triageFixture ('[' + $t8Issue + ']')
+  Write-Utf8 "$testRoot\state\triage\test.jsonl" ('{"schemaVersion":1,"kind":"proposed","tenant":"test","at":"2026-09-10T00:00:00.000Z","actor":"principal","issue":620,"bodyHash":"' + $t5bHash + '","commentUrl":"https://x/p620","model":"fable"}' + "`n")
+  Remove-Item "$testRoot\state\watchdog\triage-wake-arbiter.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\triage-frontier-arbiter.json" -ErrorAction SilentlyContinue
+  function Get-ArbiterRotateCalls { @(Get-RotateCalls | Where-Object { $_ -like 'ar-test|*' }) }
+  $arbiterRows = $principalRows.TrimEnd(']') + ',{"id":"job-ar","name":"ar-test","state":"working","status":"idle","pid":15,"startedAt":' + $leadStart + '}]'
+  Set-AgentsRows $arbiterRows
+  Set-Heartbeat 'ar-test' 5
+
+  # T8a: flag absent -> shadow: the frontier is recorded, nothing is rotated.
+  $t8a = Run-Watchdog
+  $aw8a = @($t8a.arbiterWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($null -ne $aw8a -and $aw8a.decision -eq 'shadow') "without arbiter-live the arbiter wake must be shadow (got $($aw8a | ConvertTo-Json -Compress -Depth 5))"
+  Assert-True ((@($aw8a.evidence) -join ' ') -match 'verdict #620') 'the shadow record must name the proposal awaiting a verdict'
+  $shadow8 = Get-Content "$testRoot\state\watchdog\triage-frontier-arbiter.json" -Raw | ConvertFrom-Json
+  Assert-True ($shadow8.live -eq $false -and @(@($shadow8.tenants)[0].eligible)[0].number -eq 620) 'the arbiter shadow file must carry the frontier'
+  Assert-True (@(Get-ArbiterRotateCalls).Count -eq 0) 'shadow must not rotate the arbiter'
+
+  # T8b: flag present, ar-test idle -> one wake through rotate.ps1 -Wake, one triage-wake alert, its own state file.
+  Write-Utf8 "$testRoot\state\flags\arbiter-live" 'x'
+  $alertsBefore8 = @(Get-AlertLines).Count
+  $t8b = Run-Watchdog
+  $aw8b = @($t8b.arbiterWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($aw8b.decision -eq 'woken') "an idle arbiter with a frontier must be woken (got $($aw8b.decision): $($aw8b.reason); error=$($aw8b.frontierError))"
+  Assert-True (@(Get-ArbiterRotateCalls) -contains 'ar-test|verdict #620') 'the arbiter wake must go through rotate.ps1 -Wake with the evidence'
+  Assert-True (@(Get-AlertLines).Count -eq $alertsBefore8 + 1) 'every executed arbiter wake must write one alert audit line'
+  Assert-True (Test-Path "$testRoot\state\watchdog\triage-wake-arbiter.json") 'the arbiter wake state must be recorded'
+  Assert-True (-not (@(Get-RotateCalls) -contains 'pe-test|verdict #620')) 'the principal is not woken for a verdict'
+
+  # T8c: the same evidence inside the cooldown -> no second wake.
+  $t8c = Run-Watchdog
+  $aw8c = @($t8c.arbiterWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($aw8c.decision -eq 'cooldown') "identical evidence inside the cooldown must not wake the arbiter again (got $($aw8c.decision))"
+
+  # T8d: the suspension flag empties the frontier: nothing to wake for, and the shadow file says it is suspended.
+  Remove-Item "$testRoot\state\watchdog\triage-wake-arbiter.json" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\state\flags\arbiter-suspended-test" 'x'
+  $t8d = Run-Watchdog
+  $aw8d = @($t8d.arbiterWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($aw8d.decision -eq 'none' -and $aw8d.reason -match 'suspended') "a suspended arbiter must not be woken (got $($aw8d.decision): $($aw8d.reason))"
+  Assert-True (@((Get-Content "$testRoot\state\watchdog\triage-frontier-arbiter.json" -Raw | ConvertFrom-Json).tenants)[0].suspended -eq $true) 'the shadow file must say the arbiter is suspended'
+  Remove-Item "$testRoot\state\flags\arbiter-suspended-test"
+
+  # T8e: the triage-wake-off rollback stops it too.
+  Write-Utf8 "$testRoot\state\flags\triage-wake-off" 'x'
+  $t8e = Run-Watchdog
+  Assert-True (@($t8e.arbiterWakes).Count -eq 0) 'triage-wake-off must disable the arbiter wake'
+  Remove-Item "$testRoot\state\flags\triage-wake-off"
+  Remove-Item "$testRoot\state\flags\arbiter-live"
+  Set-AgentsRows $principalRows
   Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE
 
   # ===== Ticket 77 (ADR 0012): conditions page through the door, by priority =====

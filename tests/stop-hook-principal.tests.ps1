@@ -12,7 +12,8 @@ $saved = @{}
 foreach ($k in 'FLEET_HOME','FLEET_NAME','FLEET_ROLE','FLEET_TENANT','FLEET_PARENT','FLEET_NODE_PATH','FLEET_TRIAGE_ISSUES_FIXTURE') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
 
 function Run-Stop {
-  $env:FLEET_HOME = $testRoot; $env:FLEET_NAME = 'pe-test'; $env:FLEET_ROLE = 'principal'; $env:FLEET_TENANT = 'test'; $env:FLEET_PARENT = 'dispatcher'
+  param([string]$Name = 'pe-test', [string]$Role = 'principal')
+  $env:FLEET_HOME = $testRoot; $env:FLEET_NAME = $Name; $env:FLEET_ROLE = $Role; $env:FLEET_TENANT = 'test'; $env:FLEET_PARENT = 'dispatcher'
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   Push-Location $testRoot
   try { $out = ('{"session_id":"s-test"}' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\stop.ps1" 2>&1 | Out-String) }
@@ -21,7 +22,7 @@ function Run-Stop {
   $script:lastOut = $out
   return $out
 }
-function Get-Continue { (Get-Content "$testRoot\state\continue\pe-test.json" -Raw) | ConvertFrom-Json }
+function Get-Continue { param([string]$Name = 'pe-test') (Get-Content "$testRoot\state\continue\$Name.json" -Raw) | ConvertFrom-Json }
 
 try {
   foreach ($dir in 'bin','hooks','tenants','config','state','state/heartbeats','state/continue','state/skip','state/escalations','state/work','state/events','state/flags','state/triage','state/watch','state/exclusions') {
@@ -68,6 +69,21 @@ try {
   Run-Stop | Out-Null
   Assert-True ($lastExit -eq 0 -and (Get-Continue).stoppedBecause -eq 'PAUSE set') 'PAUSE must stop the principal'
   Remove-Item "$testRoot\state\PAUSE"
+
+  # Case 5 (ADR 0017): the Arbiter's Stop hook reads `frontier --role arbiter`: an open proposal carrying
+  # triage-proposed with a `proposed` ledger row continues it, naming the issue; an empty frontier stops it.
+  $arbBody = 'Body of the ticket'
+  $arbHash = & node -e "process.stdout.write(require(process.argv[1]).normalizeIssue({ number: 1, body: 'Body of the ticket' }).bodyHash)" "$testRoot\bin\triage.js"
+  Write-Utf8 $fixture ('[{"number":710,"title":"Proposed","url":"https://github.com/owner/repo/issues/710","body":"' + $arbBody + '","createdAt":"2026-09-02T00:00:00.000Z","labels":["triage-proposed"],"assignees":[],"comments":[{"id":"p710","url":"https://x/p710","author":"fleet-bot","body":"## Triage proposal (advisory)","createdAt":"2026-09-10T00:00:00.000Z"}]}]')
+  & node "$testRoot\bin\triage.js" record --root $testRoot --tenant test --kind proposed --issue 710 --body-hash $arbHash --comment-url https://x/p710 --model fable | Out-Null
+  Assert-True ($LASTEXITCODE -eq 0) 'recording the proposal must succeed'
+  $out5 = Run-Stop -Name 'ar-test' -Role 'arbiter'
+  Assert-True ($lastExit -eq 2) "an open proposal must continue the arbiter: exit $lastExit :: $out5"
+  Assert-True ($out5 -match 'verdict frontier:' -and $out5 -match '#710') "the continuation must name the proposal :: $out5"
+  Write-Utf8 $fixture '[]'
+  $out5b = Run-Stop -Name 'ar-test' -Role 'arbiter'
+  Assert-True ($lastExit -eq 0) "an empty verdict frontier must stop the arbiter: exit $lastExit :: $out5b"
+  Assert-True ((Get-Continue -Name 'ar-test').stoppedBecause -match 'verdict frontier empty') "the stop reason must say the verdict frontier is empty (got $((Get-Continue -Name 'ar-test').stoppedBecause))"
 
   Write-Output 'stop hook principal tests passed'
 } finally {
