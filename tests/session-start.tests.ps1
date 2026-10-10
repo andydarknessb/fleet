@@ -148,6 +148,37 @@ try {
   $out5h3 = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-hand-launch","source":"startup"}'
   Assert-True ($out5h3 -notmatch 'ROTATION:') 'an empty-id launched intent older than the window must not hand off'
 
+  # Case 5i (#311): a lead the watchdog woke (a reason starting `frontier-wake:`) gets a wake brief, not a rebuild
+  # from canonical state; any other rotation reason keeps the old reconstruct line. Both open the same way.
+  $wakeReasons = '"reasons":["frontier-wake: outbox checks-settled x1 [records: checks-settled endzone:issue-30]"]'
+  $wakeIntent = '{"schemaVersion":1,"name":"pl-endzone","phase":"launched",' + $wakeReasons + ',"savedAt":"2026-09-02T10:00:00.000Z","newSessionId":"sess-wake","offset":{"totalEvents":41},"reconcile":{"at":"2026-09-02T10:01:00.000Z","ok":true}}'
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" $wakeIntent
+  $out5i = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-wake"}'
+  Assert-True ($out5i -match 'ROTATION: you replace a predecessor') 'a wake rotation keeps the common opening'
+  Assert-True ($out5i -match 'for a watchdog wake \(frontier-wake: outbox checks-settled x1 \[records: checks-settled endzone:issue-30\]\)') 'a wake rotation must name the wake reason, records included'
+  Assert-True ($out5i -match 'Wake brief: act on exactly these items first') 'a wake rotation must print the wake brief'
+  Assert-True ($out5i -match 'Do not re-read the status file, the tenant file, README\.md or CONTEXT\.md') 'the wake brief must tell the lead not to re-read the orientation files'
+  Assert-True ($out5i -notmatch 'reconstruct from canonical state only') 'a wake rotation must not print the rebuild line'
+  Write-Utf8 "$testRoot\state\rotation\pl-endzone.json" ($wakeIntent.Replace($wakeReasons, '"reasons":["age 25.0h >= 24h"]').Replace('sess-wake', 'sess-age'))
+  $out5j = Run-Hook 'pl-endzone' 'project-lead' 'endzone' '{"session_id":"sess-age"}'
+  Assert-True ($out5j -match 'ROTATION: you replace a predecessor') 'an age rotation keeps the common opening'
+  Assert-True ($out5j -match 'reconstruct from canonical state only') 'a non-wake rotation must keep the rebuild line'
+  Assert-True ($out5j -notmatch 'Wake brief') 'a non-wake rotation must not print a wake brief'
+  # The brief is for a project-lead woken for work, not for any role whose reason happens to start `frontier-wake:`.
+  # An arbiter and a principal are woken with `frontier-wake: endorsement #N` / verdict reasons; a heal is a
+  # `frontier-wake: heal:` reason for a stuck lead. All three keep the rebuild line.
+  foreach ($case in @(
+      @{ label = 'an arbiter'; name = 'ar-endzone'; role = 'arbiter'; reason = 'frontier-wake: endorsement #2175' },
+      @{ label = 'a principal'; name = 'pe-endzone'; role = 'principal'; reason = 'frontier-wake: endorsement #2175' },
+      @{ label = 'a project-lead healed for a blocked prompt'; name = 'pl-endzone'; role = 'project-lead'; reason = 'frontier-wake: heal: blocked on a permission prompt' })) {
+    $sid = 'sess-' + $case.name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6)
+    Write-Utf8 "$testRoot\state\rotation\$($case.name).json" ($wakeIntent.Replace($wakeReasons, '"reasons":["' + $case.reason + '"]').Replace('"name":"pl-endzone"', '"name":"' + $case.name + '"').Replace('sess-wake', $sid))
+    $outK = Run-Hook $case.name $case.role 'endzone' ('{"session_id":"' + $sid + '"}')
+    Assert-True ($outK -match 'ROTATION: you replace a predecessor') "$($case.label) keeps the common opening"
+    Assert-True ($outK -match 'reconstruct from canonical state only') "$($case.label) must keep the rebuild line"
+    Assert-True ($outK -notmatch 'Wake brief') "$($case.label) must not get a wake brief"
+  }
+
   # Case 6 (#218): the weekly review-category notice (bin/review-categories.js) is an
   # ordinary IC-board paragraph. A newly launched IC sees it; a lead does not; and it
   # drops out once the week it carries has passed. The notice is rendered by the script's

@@ -34,3 +34,7 @@ this ADR extends the property to the control plane.
 ## Status note - WS5 (2026-10-09)
 
 The standing Dispatcher session retired through `bin/cutover-dispatcher.ps1` behind `state/flags/dispatcher-off` (spec #194, ticket #82). Its duties moved to pages and the 08:00 daily summary; Cory now talks to the fleet by attaching to a tenant's project lead. Rollback is `bin/rollback-dispatcher.ps1` for one release, then the roster entry and role file go.
+
+## Status note - #311 (2026-10-09)
+
+The project lead's 24-hour limit is off (`config/cycle.json` `rotation.project-lead.maxAgeHours: null`). Every watchdog wake already rotates the lead, so the age limit only relaunched idle leads: 6 of the 22 lead sessions that did nothing in 2026-10-02..09, a third of their tokens. Five merges and 125K job tokens still bound a lead's transcript; the Principal, the Arbiter and the Dispatcher keep 24 hours.

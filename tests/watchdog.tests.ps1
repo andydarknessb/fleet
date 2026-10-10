@@ -594,12 +594,16 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","launchedAt":"' + (Get-Date).ToUniversalTime().AddHours(-2).ToString('o') + '"}]}')
   Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ('{"at":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '","recordId":"test:issue-7","wake":"checks-settled"}' + "`n" + '{"at":"' + (Get-Date).ToUniversalTime().AddHours(-5).ToString('o') + '","recordId":"test:issue-8","wake":"checks-settled"}' + "`n")
   Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  # #311: a checks-settled line counts only while its record is in active.json in `review`; give both lines their records.
+  $activeBeforeW6 = Get-Content "$testRoot\state\work\active.json" -Raw
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-7":{"tenant":"test","issue":7,"state":"review"},"test:issue-8":{"tenant":"test","issue":8,"state":"review"}}}'
   $w6 = Run-Watchdog
   $wake6 = @($w6.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($wake6.decision -eq 'woken' -and ((@($wake6.evidence) -join ' ') -match 'outbox checks-settled x1')) "an undelivered outbox wake must wake the lead, and only the one newer than the session counts (got $($wake6.decision): $(@($wake6.evidence) -join ' '))"
   $w6b = Run-Watchdog
   $wake6b = @($w6b.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($wake6b.decision -eq 'none') 'a consumed outbox wake must not wake again'
+  Write-Utf8 "$testRoot\state\work\active.json" $activeBeforeW6
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # Case W6r (#204): a resolution wake (a record left escalated or hold) wakes the idle lead that raised it, and the
@@ -620,7 +624,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $wake6rText = (@($wake6r.evidence) -join '; ')
   Assert-True ($wake6r.decision -eq 'woken' -and $wake6rText -match 'outbox resolution x2') "an idle lead must be woken by resolution wakes (got $($wake6r.decision): $wake6rText)"
   Assert-True ($wake6rText -match 'resolved test:issue-32 escalated -> review' -and $wake6rText -match 'resolved test:issue-33 hold -> merged') "the wake reason must name each record and both states (got $wake6rText)"
-  Assert-True (@(Get-RotateCalls) -contains "pl-test|$wake6rText") 'the resolution wake must go through rotate.ps1 -Wake carrying that reason'
+  # #311: the -Wake argument is the reason plus a brief naming each delivered line's record.
+  Assert-True (@(Get-RotateCalls) -contains "pl-test|$wake6rText [records: resolution test:issue-32; resolution test:issue-33]") 'the resolution wake must go through rotate.ps1 -Wake carrying that reason and the records brief'
   $w6rb = Run-Watchdog
   Assert-True (@($w6rb.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0].decision -eq 'none') 'a delivered resolution wake must not wake again'
   # PAUSE still stops it. The line is stamped after any watermark and the wake state is reset, so only PAUSE can be why nothing rotates;

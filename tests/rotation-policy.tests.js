@@ -195,6 +195,47 @@ test('evaluate falls back to spec thresholds when config/cycle.json is absent', 
   assert.equal(dispatcher.thresholds.maxAgeHours, 24);
 });
 
+// --- #311: the shipped config drops the project-lead age rotation ---------------------------
+// The lead is relaunched by the watchdog wake with a brief, so age alone no longer rotates it;
+// merges and job tokens still do. The dispatcher keeps its 24h age rule.
+test('#311: with the shipped config/cycle.json a 30h project-lead with few merges and tokens is not due, a 30h dispatcher is', async () => {
+  const root = rootDir();
+  write(root, 'config/cycle.json', fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  const launchedAt = '2026-09-01T06:00:00.000Z'; // 30 h before NOW
+  writeJson(root, 'roster.json', { cap: 6, sessions: [
+    { name: 'dispatcher', role: 'dispatcher', tenant: null, parent: 'cory' },
+    { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', parent: 'dispatcher' },
+  ] });
+  writeJson(root, 'state/roster.json', { sessions: [
+    { name: 'dispatcher', role: 'dispatcher', tenant: null, sessionId: 'sess-d', status: 'active', launchedAt },
+    { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', sessionId: 'sess-pl', status: 'active', launchedAt },
+  ] });
+  write(root, 'state/events/2026-09-02.jsonl', eventLine({ recordId: 'endzone:issue-1', at: '2026-09-02T08:00:00.000Z' }));
+  write(root, 'claude-home/projects/p/sess-pl.jsonl', JSON.stringify({ type: 'assistant', message: { id: 'msg_A', usage: { input_tokens: 1000, output_tokens: 500 } } }));
+  const result = await policy.evaluate({ root, claudeHome: path.join(root, 'claude-home'), now: NOW });
+  const lead = result.sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal(lead.metrics.ageHours, 30);
+  assert.equal(lead.thresholds.maxAgeHours, null, 'the shipped project-lead entry has no age threshold');
+  assert.equal(lead.metrics.merges, 1);
+  assert.equal(lead.metrics.jobTokens, 1500);
+  assert.equal(lead.due, false, `a 30h lead is not due on age alone (reasons: ${lead.reasons.join('; ')})`);
+  assert.deepEqual(lead.reasons, []);
+  const dispatcher = result.sessions.find((s) => s.name === 'dispatcher');
+  assert.equal(dispatcher.due, true, 'the dispatcher still rotates on age');
+  assert.match(dispatcher.reasons[0], /^age 30\.0h >= 24h/);
+});
+
+test('#311: the shipped project-lead entry still rotates on merges', async () => {
+  const root = rootDir();
+  write(root, 'config/cycle.json', fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  seedFleet(root, { launchedAt: '2026-09-01T06:00:00.000Z' });
+  write(root, 'state/events/2026-09-02.jsonl', [1, 2, 3, 4, 5].map((n) => eventLine({ recordId: `endzone:issue-${n}`, at: '2026-09-02T08:00:00.000Z' })).join(''));
+  const result = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
+  const lead = result.sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal(lead.due, true);
+  assert.match(lead.reasons.join(';'), /merges 5 >= 5/);
+});
+
 // --- fleet#4: adopt the parseArgs flag schema ---------------------------------------
 // Red-tell: with bin/rotation-policy.js reverted to its old hand-rolled parseArgs (no
 // schema, no per-command dispatch guard), the typo cases below stop throwing.

@@ -375,6 +375,12 @@ try {
     $kinds = @{}
     $outboxPath = "$FleetHome\state\watch\wake-outbox.jsonl"
     if (-not (Test-Path $outboxPath)) { return $kinds }
+    # #311: a PR-watcher line the lead cannot act on is not a wake (nor fleet-dead's work waiting). checks-settled
+    # counts only while its record is in review: pr-watch moves the record to review before it writes the line, and
+    # a newer head that walks it back to ci-wait earns its own settle. A checks-* line whose record has left
+    # active.json is about a merged or abandoned unit. checks-failed is never filtered (an idle IC does not watch
+    # its own CI; the lead's wake is what reaches it). An unreadable active.json filters nothing.
+    $wakeRecords = $null; try { $wakeRecords = (Read-Json "$FleetHome\state\work\active.json").records } catch {}
     foreach ($rawLine in (Get-Content $outboxPath -ErrorAction SilentlyContinue)) {
       if (-not $rawLine) { continue }
       $o = $null; try { $o = $rawLine | ConvertFrom-Json } catch { continue }
@@ -388,6 +394,11 @@ try {
       if ($Recipient -eq 'principal') { if ("$($o.wake)" -ne 'resolution' -or $raisedBy -notlike 'pe-*') { continue } }
       elseif ("$($o.wake)" -eq 'resolution' -and ($raisedBy -like 'pe-*' -or ($o.PSObject.Properties['to'] -and "$($o.to)" -eq 'ci-wait'))) { continue }
       if ($SelfActor -and @('decision-needed', 'resolution') -contains "$($o.wake)" -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
+      if ($wakeRecords -and "$($o.wake)" -like 'checks-*') {
+        $wakeRecord = $null; if ($wakeRecords.PSObject.Properties["$($o.recordId)"]) { $wakeRecord = $wakeRecords."$($o.recordId)" }
+        if (-not $wakeRecord) { continue }
+        if ("$($o.wake)" -eq 'checks-settled' -and "$($wakeRecord.state)" -ne 'review') { continue }
+      }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
       if ($null -ne $Lines) { [void]$Lines.Add([pscustomobject]@{ id = (Get-WakeLineId $o); at = $atUtc; wake = "$($o.wake)" }) }
       if ($null -ne $Details -and "$($o.wake)" -eq 'resolution') { [void]$Details.Add("$($o.recordId) $($o.from) -> $($o.to)") }
@@ -1073,7 +1084,11 @@ try {
       }
       $wake.decision = 'wake'
       $rotateRaw = ''; $rotateOut = $null
-      try { $rotateRaw = & "$PSScriptRoot\rotate.ps1" -Name $leadName -Wake $digest 2>&1 | Out-String; $rotateOut = ConvertFrom-LastJsonLine $rotateRaw } catch { $wake.reason = "rotate.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
+      # #311: the relaunched lead's brief names each delivered line's record, so it acts on those instead of
+      # re-deriving state; the digest (and the cooldown it feeds) stays counts-only.
+      $briefRecords = @($leadLines | ForEach-Object { "$($_.wake) $(("$($_.id)" -split '[#@]')[0])" } | Select-Object -Unique)
+      $wakeBrief = $digest; if ($briefRecords.Count -gt 0) { $wakeBrief += " [records: $($briefRecords -join '; ')]" }
+      try { $rotateRaw = & "$PSScriptRoot\rotate.ps1" -Name $leadName -Wake $wakeBrief 2>&1 | Out-String; $rotateOut = ConvertFrom-LastJsonLine $rotateRaw } catch { $wake.reason = "rotate.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
       $rotated = $false
       if ($rotateOut -and $rotateOut.PSObject.Properties['rotated']) { $rotated = (@($rotateOut.rotated) -contains $leadName) }
       $wake.outcome = if ($rotateOut -and $rotateOut.PSObject.Properties['outcomes']) { @($rotateOut.outcomes | Where-Object { $_.name -eq $leadName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $rotateRaw 200 }

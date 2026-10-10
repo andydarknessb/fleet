@@ -141,7 +141,13 @@ if ($rotation -and $windowPhase -and "$($rotation.name)" -eq "$name" -and "$hook
 if ($rotationExact -or $rotationWindow) {
   $why = (@($rotation.reasons) -join '; ')
   $reconciledAt = if ($rotation.reconcile) { $rotation.reconcile.at } else { 'not run; the scheduled pr-watch tick covers it' }
-  Write-Output "ROTATION: you replace a predecessor rotated at $($rotation.savedAt) ($why). Its transcript is gone by design; reconstruct from canonical state only - Work records (node $homeFwd/bin/work-state.js get/project), state/status/, the roster, and the skip file. Active records were reconciled against GitHub at: $reconciledAt. Event offset at rotation: $($rotation.offset.totalEvents) events. Re-read live GitHub state before your first action."
+  # #311: a lead woken by the watchdog gets a brief, not a rebuild: the wake reason names the frontier issues and
+  # each delivered line's record, and the Stop hook names whatever else is actionable when it ends the turn.
+  if ($role -eq 'project-lead' -and @($rotation.reasons | Where-Object { "$_" -like 'frontier-wake:*' -and "$_" -notlike 'frontier-wake: heal:*' }).Count -gt 0) {
+    Write-Output "ROTATION: you replace a predecessor rotated at $($rotation.savedAt) for a watchdog wake ($why). Wake brief: act on exactly these items first. For each record named, read only that record (node $homeFwd/bin/work-state.js get --root $homeFwd --id <record>) and its live PR or issue; for a frontier issue, assign and launch it. Do not re-read the status file, the tenant file, README.md or CONTEXT.md unless an item needs them. When the items are done, end your turn: the Stop hook names any other actionable work. Active records were reconciled against GitHub at: $reconciledAt."
+  } else {
+    Write-Output "ROTATION: you replace a predecessor rotated at $($rotation.savedAt) ($why). Its transcript is gone by design; reconstruct from canonical state only - Work records (node $homeFwd/bin/work-state.js get/project), state/status/, the roster, and the skip file. Active records were reconciled against GitHub at: $reconciledAt. Event offset at rotation: $($rotation.offset.totalEvents) events. Re-read live GitHub state before your first action."
+  }
 }
 if ($legacy -and (Test-Path "$home_\state\NOTICE.md")) {
   Write-Output "--- NOTICE from Cory (state/NOTICE.md; LEGACY PATH restored by state/flags/legacy-notice) ---"
