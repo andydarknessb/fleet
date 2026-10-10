@@ -500,10 +500,12 @@ function escapeEvidence({ tenant, live, events, issues }) {
     }
   }
   const oldest = [...live.values()].map((entry) => new Date(entry.at).getTime()).sort((a, b) => a - b)[0];
+  const { isReviewFollowUp } = require('./weekly-scorecard');
   const found = [];
   for (const bug of issues) {
     if (!bug.labels.includes('bug') || Date.parse(bug.createdAt) < oldest) continue;
     const pr = escapedPrOf(bug);
+    if (isReviewFollowUp(bug.body, pr)) continue; // caught by review of its own PR, not escaped (ruled 2026-10-09)
     const boundedIssue = pr === null ? null : prToIssue.get(pr);
     if (!boundedIssue || boundedIssue === bug.number) continue;
     found.push({ cause: 'escape', id: `escape:${bug.number}:${pr}`, at: bug.createdAt, issue: boundedIssue, bug: bug.number, pr, detail: `bug #${bug.number} escaped from PR #${pr}, which delivered bounded ticket #${boundedIssue}` });

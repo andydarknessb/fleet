@@ -7,14 +7,15 @@
 // issue is endorsed when its triage ledger holds an `endorsed` or `endorsed-with-edits` row (the kinds
 // bin/triage.js records). The criteria mark, the bug query, the page mechanism and the escape-line
 // parsers are imported; the two evidence walks are bounded-authority's private functions, restated
-// here over the endorsement time instead of a bounded ready.
+// here over the endorsement time instead of a bounded ready. A bug filed from a formal or risk review of
+// its own escaped-from PR is a review follow-up, not an escape (ruled 2026-10-09), here and in the scorecard.
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { WorkStateError, parseArgs, readEvents } = require('./work-state');
 const { CRITERIA_MARK, queryEscapeBugs } = require('./bounded-authority');
-const { parseEscapedFrom } = require('./weekly-scorecard');
+const { isReviewFollowUp, parseEscapedFrom } = require('./weekly-scorecard');
 
 const ENDORSED_KINDS = Object.freeze(['endorsed', 'endorsed-with-edits']);
 
@@ -102,6 +103,7 @@ function escapeEvidence({ tenant, endorsed, events, bugs }) {
   for (const bug of bugs) {
     if (!bug.labels.includes('bug') || Date.parse(bug.createdAt) < oldest) continue;
     const pr = escapedPrOf(bug);
+    if (isReviewFollowUp(bug.body, pr)) continue;
     const issue = pr === null ? null : prToIssue.get(pr);
     if (!issue || issue === bug.number) continue;
     found.push({ id: `escape:${bug.number}:${pr}`, at: bug.createdAt, issue, detail: `bug #${bug.number} escaped from PR #${pr}, which delivered endorsed ticket #${issue}` });

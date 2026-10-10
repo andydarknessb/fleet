@@ -458,7 +458,7 @@ Principal's standing permission, in a tenant whose proposals have earned it
 Approval: a bug with a reproducible red-tell that needs no Ruling and touches
 no carve-out or risk-trigger path. It is capped per day, and it suspends itself
 on evidence that the class is failing: criteria that sent work back or
-escalated it, or a defect that escaped. Only Cory lifts a suspension.
+escalated it, or a defect that escaped (a bug filed from a formal or risk review of its own escaped-from PR is a review follow-up, not an escape; ruled 2026-10-09). Only Cory lifts a suspension.
 _Avoid_: auto-approval, self-approval, graduation (the event that grants it)
 
 **Veto window**:
