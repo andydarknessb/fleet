@@ -12,6 +12,12 @@
 // may only go to `&1`/`&2` or to a file inside the working directory or an
 // additional directory, and a drive or /tmp path argument must be inside one.
 //
+// CLI 2.1.296 prompts on two shapes even when every command is covered (haiku
+// rehearsal 2026-10-10, four waits): a parameter expansion such as `echo "$?"`,
+// and a `cd <dir> && ...` chain. Both are refused here so the agent rewrites
+// the call: the session already runs in its worktree, and a failing command's
+// output already shows that it failed.
+//
 // Only sessions launched with FLEET_PERMISSIONS=allowlist are gated. Sub-agent
 // calls are gated too, because their prompts block the same way. A PowerShell call
 // is refused outright: the profile allows none. Output contract, as in
@@ -45,13 +51,16 @@ function stripHeredocs(command) {
 }
 
 // Split into segments on unquoted ; && || | |& & and newlines. Quoted text, and a
-// $( ... ) inside double quotes, is opaque. An unquoted $( or backtick is reported.
+// $( ... ) inside double quotes, is opaque. An unquoted $( or backtick is reported,
+// and so is a parameter expansion ($VAR, ${VAR}, $?) outside single quotes.
 function splitSegments(command) {
   const segments = [];
   let current = '';
   let quote = null;
   let substitutionDepth = 0;
   let unquotedSubstitution = false;
+  let expansion = false;
+  const isExpansion = (next) => /[A-Za-z_{?#@*!$0-9-]/.test(next || '');
   const text = stripHeredocs(command);
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
@@ -61,6 +70,7 @@ function splitSegments(command) {
       current += ch;
       if (ch === '\\') { current += next || ''; i += 1; continue; }
       if (ch === '$' && next === '(') { substitutionDepth += 1; current += next; i += 1; continue; }
+      if (ch === '$' && substitutionDepth === 0 && isExpansion(next)) expansion = true;
       if (ch === ')' && substitutionDepth > 0) { substitutionDepth -= 1; continue; }
       if (ch === '"' && substitutionDepth === 0) quote = null;
       continue;
@@ -68,6 +78,7 @@ function splitSegments(command) {
     if (ch === '\\') { current += ch + (next || ''); i += 1; continue; }
     if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
     if ((ch === '$' && next === '(') || ch === '`') unquotedSubstitution = true;
+    if (ch === '$' && isExpansion(next)) expansion = true;
     const two = ch + (next || '');
     if (two === '&&' || two === '||' || two === '|&') { segments.push(current); current = ''; i += 1; continue; }
     if (ch === ';' || ch === '\n' || ch === '|') { segments.push(current); current = ''; continue; }
@@ -75,7 +86,7 @@ function splitSegments(command) {
     current += ch;
   }
   segments.push(current);
-  return { segments: segments.map((s) => s.trim().replace(/^[({]\s*/, '').replace(/\s*[)}]$/, '').trim()).filter(Boolean), unquotedSubstitution };
+  return { segments: segments.map((s) => s.trim().replace(/^[({]\s*/, '').replace(/\s*[)}]$/, '').trim()).filter(Boolean), unquotedSubstitution, expansion };
 }
 
 // Quote-aware word split; returns the unquoted words.
@@ -147,8 +158,10 @@ function decide(command, context) {
   const rules = context.rules || [];
   const listed = `Allowed commands: ${allowedNames(rules).join(', ')}.`;
   const tail = 'One Bash call may chain allowed commands with |, &&, ; and 2>&1. Rewrite the call, or use the Read tool to read a file (ADR 0016, fleet #181; rollback flag state/flags/allowlist-gate-off).';
-  const { segments, unquotedSubstitution } = splitSegments(command);
+  const { segments, unquotedSubstitution, expansion } = splitSegments(command);
   if (unquotedSubstitution) return `the allowlist profile refuses command substitution outside quotes ($(...) or backticks): run the inner command as its own call. ${tail}`;
+  if (expansion) return `the allowlist profile refuses a variable expansion such as $? or $VAR outside single quotes (the CLI prompts on it): drop it, since a failing command's output already says so, or write the value out. ${tail}`;
+  if (segments.length > 1 && segments.some((s) => words(s)[0] === 'cd')) return `the allowlist profile refuses \`cd\` chained with other commands (the CLI prompts on it): drop the cd, since the session already runs in its worktree, and give paths relative to it. ${tail}`;
   for (const segment of segments) {
     const parts = words(segment);
     const commandWords = [];

@@ -31,9 +31,23 @@ const ALLOWED = [
   'npm run test:server 2>&1 | tail -100',
   `node ${FLEET}/bin/pr-ready-check.js --repo /e/Endzone-Empire/.claude/worktrees/ic-1730-assignment --base origin/integration --issue 1730 --body /e/Endzone-Empire/.claude/worktrees/ic-1730-assignment/.fleet-pr-body.md --tenant endzone`,
   'gh pr create --base integration --title "test: x" --body-file .fleet-pr-body.md',
-  `cd "${WORKTREE.replace(/\//g, '\\')}" && git diff origin/integration...HEAD`,
   `git -C ${WORKTREE} status`,
   'npm test -- --watchAll=false > test-output.txt',
+  // run unprompted on CLI 2.1.296 in the 2026-10-10 rehearsal (job be73d2b8)
+  'npm test 2>&1 | grep -E "Test Files|Tests |FAIL" | head -20',
+  'git status --short; git branch --show-current',
+  "grep -n 'DTSTART:0' tests/ics-expand.test.ts | head -30",
+];
+
+// Prompted on CLI 2.1.296 although every command is covered (2026-10-10 rehearsal,
+// job be73d2b8, four waits). A `cd <dir> && ...` chain ran unprompted on 2.1.28x.
+const PROMPTED_ON_2_1_296 = [
+  ['npm run typecheck 2>&1 | tail -5; echo "TYPECHECK_EXIT=$?"; npm run lint 2>&1 | tail -8', /variable expansion/],
+  [`cd ${WORKTREE} && ls node_modules/ical.js/dist; gh issue view 139 --json title,body`, /`cd` chained/],
+  [`cd ${WORKTREE} && ls -d node_modules 2>&1; node --version`, /`cd` chained/],
+  [`cd "${WORKTREE.replace(/\//g, '\\')}" && git diff origin/integration...HEAD`, /`cd` chained/],
+  ['echo $HOME', /variable expansion/],
+  ['echo "${PWD}"', /variable expansion/],
 ];
 
 const REFUSED = [
@@ -56,6 +70,20 @@ test('an off-list command, an outside redirect or path, and unquoted substitutio
     assert.ok(got, `passed: ${command}`);
     assert.match(got, reason, `wrong reason for ${command}: ${got}`);
     assert.match(got, /fleet #181/);
+  }
+});
+
+test('a variable expansion or a chained cd, which CLI 2.1.296 prompts on, is refused with a reason', () => {
+  for (const [command, reason] of PROMPTED_ON_2_1_296) {
+    const got = decide(command, CONTEXT);
+    assert.ok(got, `passed: ${command}`);
+    assert.match(got, reason, `wrong reason for ${command}: ${got}`);
+  }
+});
+
+test('a lone cd, a $ in single quotes, a regex anchor and $( in double quotes still pass', () => {
+  for (const command of [`cd ${WORKTREE}`, "grep -n 'x$HOME' f", 'grep -E "end$" f', 'grep -E "a$|b" f']) {
+    assert.equal(decide(command, CONTEXT), null, `refused: ${command}`);
   }
 });
 
