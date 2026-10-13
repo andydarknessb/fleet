@@ -224,6 +224,7 @@ exit $LASTEXITCODE
   }
   Assert-True ($haikuDeny -contains "Edit($rootFwd/**)") 'the profile denies edits across the fleet root it adds as a directory'
   Assert-True ($haikuDeny -contains 'Bash(git push origin integration:*)') 'the profile deny resolves <defaultBranch> from the tenant file'
+  Assert-True ($haikuDeny -contains 'Monitor') 'the profile denies the Monitor tool, whose shell loop bypasses the Bash gate and prompts under acceptEdits (rehearsal 2026-10-13)'
   Assert-True (-not (@(@($haikuSettings.permissions.allow) + $haikuDeny) | Where-Object { "$_" -match '<[a-zA-Z]+>' })) 'no unresolved token reaches the settings'
   foreach ($repoRule in "Edit($repoFwd/src/**)", "Write($repoFwd/package.json)", "NotebookEdit($repoFwd/.git/**)", "Edit($repoFwd/.claude/settings.json)", "Write($repoFwd/.claude/settings.json)") {
     Assert-True ($haikuDeny -contains $repoRule) "the <repo> denies cover the main checkout's entries: missing $repoRule"
