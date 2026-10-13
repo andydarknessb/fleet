@@ -47,6 +47,7 @@
     { "rule": "Bash(git stash:*)", "for": "soft_deny: no git stash in a tenant repo; commit work in progress to the branch" },
     { "rule": "Bash(git worktree remove:*)", "for": "soft_deny: removing a worktree is the retire door's job, not an IC's" },
     { "rule": "Bash(gh pr merge:*)", "for": "ic.md step 8 and Boundaries: an IC never merges; done is the project lead saying so" },
-    { "rule": "Bash(claude:*)", "for": "soft_deny: claude stop, rm and respawn are the supervisor's" }
+    { "rule": "Bash(claude:*)", "for": "soft_deny: claude stop, rm and respawn are the supervisor's" },
+    { "rule": "Monitor", "for": "soft_deny: a Monitor call runs a shell loop that hooks/allowlist-gate.js never sees (PreToolUse:Bash only), and acceptEdits prompts on it (rehearsal 2026-10-13, wait 1: an until-grep-sleep loop over a background suite's output); a run_in_background Bash call notifies the IC when it ends, so nothing is lost" }
   ]
 }
