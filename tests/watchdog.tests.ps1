@@ -759,6 +759,63 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   foreach ($n in 'dispatcher', 'pl-test') { Set-Heartbeat $n 90 }   # FD6 left them at 40 min, under the default 45-min threshold restored above
 
+  # ===== #302 (ADR 0012 amendment): a static session waiting on Cory counts as waiting, not dead =====
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-d") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-p") | Out-Null
+  $hwBlockedDisp = $dispRow.Replace('"state":"working"', '"state":"blocked"')
+  $hwBlockedPl = $plRow.Replace('"state":"working"', '"state":"blocked"')
+  Write-Utf8 $wakeFixture '[{"number":701,"title":"Ready","url":"https://github.com/owner/repo/issues/701","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD-HW1: work is waiting and EVERY stale static carries a human-wait -> no fleet-dead, waiting:true.
+  Set-AgentsRows "[$hwBlockedDisp,$hwBlockedPl]"
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-d\state.json" '{"needs":"reply go to merge PR #41","updatedAt":"2026-01-01T00:00:00Z"}'
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-p\state.json" '{"needs":"reply go to merge PR #42","updatedAt":"2026-01-01T00:00:00Z"}'
+  $fdhw1 = Run-Watchdog
+  Assert-True (@($fdhw1.conditions) -contains 'human-wait:dispatcher' -and @($fdhw1.conditions) -contains 'human-wait:pl-test') "both human-wait conditions must stand (got $(@($fdhw1.conditions) -join ','))"
+  Assert-True (-not (@($fdhw1.conditions) -contains 'fleet-dead')) 'every stale static in human-wait must not raise fleet-dead'
+  Assert-True ($fdhw1.waitingOnHuman -eq $true) 'a tick waiting on Cory must record waitingOnHuman:true on the shadow line'
+  Assert-True ($fdhw1.idle -ne $true) 'a waiting tick is not idle'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD-HW2 (control): one stale static with no human-wait keeps fleet-dead.
+  Set-AgentsRows "[$hwBlockedDisp,$plRow]"
+  $fdhw2 = Run-Watchdog
+  Assert-True (@($fdhw2.conditions) -contains 'human-wait:dispatcher') 'the dispatcher human-wait must still stand'
+  Assert-True (@($fdhw2.conditions) -contains 'fleet-dead') 'a stale static outside human-wait must still raise fleet-dead'
+  Assert-True ($fdhw2.waitingOnHuman -ne $true) 'a paging tick must not record waitingOnHuman'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Cases FD-HW3/4: principals and arbiters are wake-driven and count neither way (the real 2026-10-09 night:
+  # idle pe-/ar- statics with no ask kept fleet-dead firing over three human-waits).
+  $hwStaticRoster = Get-Content "$testRoot\roster.json" -Raw
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"},{"name":"pe-test","role":"principal","parent":"cory","tenant":"test"},{"name":"ar-test","role":"arbiter","parent":"cory","tenant":"test"}]}'
+  Write-Utf8 "$testRoot\state\flags\principal-live" 'x'
+  Write-Utf8 "$testRoot\state\flags\arbiter-live" 'x'
+
+  # Case FD-HW3: dispatcher and pl-test in human-wait, idle stale pe/ar with no ask -> no fleet-dead.
+  Set-AgentsRows "[$hwBlockedDisp,$hwBlockedPl]"
+  $fdhw3 = Run-Watchdog
+  Assert-True (@($fdhw3.staleStatics | Where-Object { $_.name -in @('pe-test', 'ar-test') }).Count -eq 2) "this case needs pe-test and ar-test stale (got $(@($fdhw3.staleStatics | ForEach-Object { $_.name }) -join ','))"
+  Assert-True (-not (@($fdhw3.conditions) -contains 'fleet-dead')) 'stale principals and arbiters must not keep fleet-dead alive over human-waits'
+  Assert-True ($fdhw3.waitingOnHuman -eq $true) 'a tick waiting on Cory with idle pe/ar must record waitingOnHuman:true'
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
+  # Case FD-HW4 (control): pe/ar stale, dispatcher in human-wait, pl-test working and stale -> fleet-dead.
+  Set-AgentsRows "[$hwBlockedDisp,$plRow]"
+  $fdhw4 = Run-Watchdog
+  Assert-True (@($fdhw4.conditions) -contains 'fleet-dead') 'a stale lead outside human-wait must still raise fleet-dead beside pe/ar'
+  Assert-True ($fdhw4.waitingOnHuman -ne $true) 'a paging tick must not record waitingOnHuman'
+  Write-Utf8 "$testRoot\roster.json" $hwStaticRoster
+  Remove-Item "$testRoot\state\flags\principal-live", "$testRoot\state\flags\arbiter-live" -ErrorAction SilentlyContinue
+  Write-Utf8 $wakeFixture '[]'
+  Set-AgentsRows $idleLeadRows
+  Remove-Item "$testRoot\profile\.claude\jobs\job-d\state.json", "$testRoot\profile\.claude\jobs\job-p\state.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\heal.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
   # ===== 2026-09-17 review (fleet #75-1): an unreadable tenant config, or zero =====
   # ===== readable tenants, counts as work waiting (fails CLOSED) =====
   $goodTenantJson = Get-Content "$testRoot\tenants\test.json" -Raw
@@ -1946,10 +2003,10 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ($null -ne $rp8.repeatPaged -and $rp8.repeatPaged.priority -eq 'high') "an unrecognized repeat priority must fall back to high (got $($rp8.repeatPaged | ConvertTo-Json -Compress))"
 
     # Case RP9: the shipped config's own pages block (config/cycle.json) yields a
-    # high first page and a high repeat (#206 flipped it to emergency; its one-week check reverted it, #302 re-flips), and names both keys explicitly.
+    # high first page and an emergency repeat (#206 flipped it, its one-week check reverted it, #302 re-flipped), and names both keys explicitly.
     $rp9Pages = (Get-Content "$sourceRoot\config\cycle.json" -Raw | ConvertFrom-Json).pages
     Assert-True ("$($rp9Pages.priority.'fleet-dead')" -eq 'high') "the real config's fleet-dead priority must be high"
-    Assert-True ("$($rp9Pages.fleetDeadRepeatPriority)" -eq 'high') "the real config's pages.fleetDeadRepeatPriority must be high until #302 lands (#206 check, 2026-10-09)"
+    Assert-True ("$($rp9Pages.fleetDeadRepeatPriority)" -eq 'emergency') "the real config's pages.fleetDeadRepeatPriority must be emergency (#302)"
     Assert-True ("$($rp9Pages.priority.'dead-man-silence')" -eq 'emergency') 'dead-man silence must stay emergency in the real config'
     Write-Utf8 "$testRoot\config\cycle.json" (@{ pages = $rp9Pages } | ConvertTo-Json -Depth 6)
     Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
@@ -1957,7 +2014,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ((@($rp9a.newlyPaged | Where-Object { $_.key -eq 'fleet-dead' })[0]).priority -eq 'high') 'the first fleet-dead page under the real config must be high'
     Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"fleet-dead":{"firstSeen":"' + $rp7Delivered + '","lastSeen":"' + $rp7Delivered + '","detail":"stale","deliveredAt":"' + $rp7Delivered + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
     $rp9 = Run-Watchdog
-    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'high') 'the repeat under the real config is high until #302 lands (#206 check, 2026-10-09)'
+    Assert-True ($null -ne $rp9.repeatPaged -and $rp9.repeatPaged.priority -eq 'emergency') 'the repeat under the real config is emergency (#302)'
     Remove-Item "$testRoot\config\cycle.json" -ErrorAction SilentlyContinue
     Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
   } finally {

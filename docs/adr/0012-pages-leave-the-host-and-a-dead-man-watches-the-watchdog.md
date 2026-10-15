@@ -98,3 +98,30 @@ that asked), `config/cycle.json` `pages.fleetDeadRepeatPriority` is
 ## Amendment 2026-09-30 - an invalid page priority falls back, and is reported
 
 A `pages.priority.<kind>` or `pages.defaultPriority` that is not `emergency`, `high` or `normal` is ignored: the kind keeps its built-in priority (a kind with no built-in falls back to a valid `pages.defaultPriority`, else `normal`), and the Watchdog pages once as `config-invalid:<key>` at normal priority. `bin/setup.ps1` refuses such a value up front. Source: fleet #232.
+
+## Amendment 2026-10-15 - a static in human-wait is waiting on Cory, not dead
+
+A static session whose `human-wait:<name>` condition stands this tick counts
+as waiting on Cory, the same as a `hold` or `escalated` record. `fleet-dead`
+now requires at least one stale lead (or dispatcher) that is not in human-wait.
+Principals and arbiters do not count either way: the Watchdog wakes them
+when there is something to triage or decide, so an idle one goes stale by
+design, and a wake that fails has its own heal, respawn and page. If every
+stale lead or dispatcher is in human-wait, the tick records `waitingOnHuman: true` on its shadow
+line and raises no `fleet-dead`. Each of those asks already has its own
+`human-wait` page. A static whose ask is a permission prompt is not covered by
+this rule: `permission-wait` pages it at high, and it still counts toward
+`fleet-dead`. The two-hour repeat returns to emergency
+(`pages.fleetDeadRepeatPriority`).
+
+Why: on 2026-10-09 the repeat went out at emergency at 02:32 Central for a
+fleet whose dispatcher and both leads had ended their turns with `needs` set
+(merge #2120, decide #2117, the Nidus asks). The 2026-09-30 amendment assumed
+those waits would become escalations or holds. The human-wait backstop (fleet
+#84, spec #192) catches the ones that do not, so this ADR's exclusion has to
+cover it too.
+
+On that night four of the seven stale statics were idle principals and
+arbiters with no ask at all. Counting them would have kept the page firing.
+
+Source: fleet #302.
