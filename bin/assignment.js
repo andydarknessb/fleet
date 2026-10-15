@@ -136,6 +136,8 @@ function deriveReservations(issue) {
       if (fenced || sentence.allowlist) matches.push(match);
     }
     for (const match of matches) {
+      // fleet#304: `server/services/<file>` was cut at the placeholder; the bare directory is not a path the author named.
+      if (/[\\/]$/.test(match[0]) &&sentence.text[match.index + match[0].length] === '<') continue;
       const rawValue = match[0].replaceAll('\\', '/').replace(/[.,;:!?]+$/, '');
       seen.add(rawValue.toLowerCase());
       const value = /^(?:entities|features|widgets|pages|shared)\//i.test(rawValue) ? `src/${rawValue}` : rawValue;
@@ -922,7 +924,10 @@ function cli(argv) {
     const config = readTenantConfig(args.root, args.tenant, args['tenant-config']);
     const tenant = args.tenant || config.name || 'endzone';
     const readyLabel = config.readyLabel || args['ready-label'] || 'ready-for-agent';
-    const issues = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github || args.repo, readyLabel, fetchDetails: true });
+    const fetched = args.fixture ? readFixture(args.fixture, []) : queryGithubIssues({ repo: config.github || args.repo, readyLabel, fetchDetails: true });
+    // fleet#304: with --issue, the explicit set replaces that issue's reservations before the frontier, so a wrong derivation cannot keep it off.
+    const explicitSet = args.issue ? explicitReservations(args.reservations) : undefined;
+    const issues = explicitSet ? fetched.map((entry) => (entry.number === Number(args.issue) ? { ...entry, reservations: explicitSet } : entry)) : fetched;
     const active = readStateFixture(args.active, [], args.root, path.join('state', 'work', 'active.json'));
     const reservationRecords = hydrateActiveReservations(active, issues, tenant);
     const skipIssues = readStateFixture(args.skip, {}, args.root, path.join('state', 'skip', `${tenant}.json`));

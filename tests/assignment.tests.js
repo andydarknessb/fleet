@@ -858,9 +858,8 @@ test('fleet#62: proof --reservations applies the explicit set to the candidate a
   assert.deepEqual(answered.proof.candidates, [1272, 1375, 1376]);
   assert.deepEqual(answered.reservations, { components: ['server/services/kickoffWaivers.js'], migrationPrefixes: [], schemaAreas: [], testResources: ['server/test/kickoffWaivers.test.js'] }, 'the candidate\'s reservations are drawn from the flag');
 
-  const conflicting = cli(['proof', ...common, '--issue', '1376', '--reservations', '{"components":["src/a.js"]}']);
-  assert.equal(conflicting.proof.independent, false);
-  assert.deepEqual(conflicting.proof.conflicts, [{ left: 1272, right: 1376, fields: ['components'] }], 'an explicit set is checked for conflicts like a derived one');
+  // fleet#304: the explicit set now replaces the derivation before the frontier, so a real overlap keeps the issue off it.
+  assert.throws(() => cli(['proof', ...common, '--issue', '1376', '--reservations', '{"components":["src/a.js"]}']), (error) => error.code === 'NO_FRONTIER', 'an explicit set is checked for conflicts like a derived one');
 });
 
 test('fleet#62: the printed proof passed verbatim satisfies assign with the same --reservations and is refused with a different set', () => {
@@ -1202,4 +1201,56 @@ test('#251: acknowledging a live manifest still works when the manifest path is 
   const acknowledged = acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:01:00.000Z' });
   assert.equal(acknowledged.record.state, 'implementing');
   assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
+});
+
+// fleet#304: a placeholder (`server/services/<file>:<line>`) cut the path match at
+// `<`, so the bare directory was reserved and overlapped everything under it; and
+// `--reservations` with `--issue` was applied after the frontier, so a wrong
+// derivation kept the issue off the frontier before the explicit set was read.
+test('fleet#304: a path cut short by a placeholder reserves nothing; a deliberate bare directory still reserves', () => {
+  const placeholder = normalizeIssue(issue(3041, { body: 'Each `server/services/<file>:<line>: calls x @abc1234`.' }));
+  assert.deepEqual(placeholder.reservations.components, []);
+
+  const allowlist = normalizeIssue(issue(3042, { body: 'Scope: lists exactly `server/services/<file>:<line>` and `src/a.js`.' }));
+  assert.deepEqual(allowlist.reservations.components, ['src/a.js']);
+  assert.ok(allowlist.unrecognizedPaths.some((item) => item.startsWith('server/services/')), 'the cut item is reported so assign refuses PARTIAL_RESERVATIONS');
+
+  const deliberate = normalizeIssue(issue(3043, { body: 'Touch `server/services/` only.' }));
+  assert.deepEqual(deliberate.reservations.components, ['server/services/']);
+
+  // A whole filename followed by markup is not cut short and still reserves.
+  const markup = normalizeIssue(issue(3045, { body: '| src/a.js<br>src/b.js | edit both |\n\nChange <code>src/c.js</code> to call x.' }));
+  assert.deepEqual(markup.reservations.components, ['src/a.js', 'src/b.js', 'src/c.js']);
+});
+
+function explicitIssueFixture() {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  const tenantFile = path.join(root, 'tenants', 'endzone.json');
+  fs.writeFileSync(tenantFile, JSON.stringify({ name: 'endzone', readyLabel: 'ready-for-agent', defaultBranch: 'integration' }));
+  const fixture = path.join(root, 'issues.json');
+  const activeFile = path.join(root, 'active.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(1272, { body: 'Change `src/a.js`.' }), issue(3044, { body: 'Change `src/a.js`.' })]));
+  fs.writeFileSync(activeFile, JSON.stringify([{ id: 'endzone:issue-1272', issue: 1272, state: 'implementing', manifestPath: 'm1272', reservations: { components: ['src/a.js'] } }]));
+  return ['--root', root, '--tenant', 'endzone', '--tenant-config', tenantFile, '--fixture', fixture, '--active', activeFile, '--issue', '3044'];
+}
+
+test('fleet#304: --issue with --reservations replaces the derived set before frontier selection, in proof and assign', () => {
+  const common = explicitIssueFixture();
+  const apart = '{"components":["src/b.js"]}';
+  assert.throws(() => cli(['proof', ...common]), (error) => error.code === 'NO_FRONTIER', 'the derived set conflicts with the active reservation');
+
+  const proof = cli(['proof', ...common, '--reservations', apart]);
+  assert.equal(proof.issue, 3044);
+  assert.equal(proof.proof.independent, true);
+  const assigned = cli(['assign', ...common, '--base-sha', 'e'.repeat(40), '--reservations', apart]);
+  assert.equal(assigned.manifest.issue.number, 3044);
+  assert.deepEqual(assigned.manifest.reservations.components, ['src/b.js']);
+});
+
+test('fleet#304: an explicit set that really overlaps an active reservation still keeps the issue off the frontier', () => {
+  const common = explicitIssueFixture();
+  const overlap = '{"components":["src/a.js"]}';
+  assert.throws(() => cli(['proof', ...common, '--reservations', overlap]), (error) => error.code === 'NO_FRONTIER');
+  assert.throws(() => cli(['assign', ...common, '--base-sha', 'e'.repeat(40), '--reservations', overlap]), (error) => error.code === 'NO_FRONTIER');
 });
