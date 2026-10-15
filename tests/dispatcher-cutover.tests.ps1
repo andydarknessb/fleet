@@ -1,8 +1,8 @@
-# WS5 (fleet #82, spec #194): cutover-dispatcher.ps1 and rollback-dispatcher.ps1 against a
+# WS5 (fleet #82, spec #194): cutover-dispatcher.ps1 against a
 # fixture fleet with a mock `claude`, a mock daemon list, and the real retire.ps1 and
 # launch.ps1, modeled on tests/sentinel-cutover.tests.ps1. The dispatcher is removed only past
 # the notifier, daily-summary-task and watchdog gates and only at a turn boundary, and cutover
-# touches no ledger. Rollback removes the flag and relaunches through the one door.
+# touches no ledger. The rollback script is gone (fleet #303): rollback is a git revert.
 $ErrorActionPreference = 'Stop'
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
@@ -32,7 +32,7 @@ try {
   foreach ($dir in 'bin','agents','tenants','state','state/heartbeats','state/skip','state/watchdog','state/escalations','state/events','state/sessions','state/flags','profile/.claude/jobs/job-d','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','cutover-dispatcher.ps1','rollback-dispatcher.ps1','retire.ps1','launch.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','cutover-dispatcher.ps1','retire.ps1','launch.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   Write-Utf8 "$testRoot\agents\dispatcher.md" "---`nname: dispatcher`nmodel: sonnet`neffort: low`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","tenant":null,"parent":"cory","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"You are the dispatcher."},{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":"' + $testRoot.Replace('\', '\\') + '","prompt":"p"}]}')
@@ -114,38 +114,19 @@ try {
   Assert-True (-not (Test-Path "$testRoot\state\heartbeats\dispatcher.json")) 'retirement removes the dispatcher heartbeat'
   $record = (Get-Content "$testRoot\state\dispatcher\cutover.json" -Raw) | ConvertFrom-Json
   Assert-True ($record.notifierLive -eq $true -and $record.forced -eq $false -and @($record.rollbacks).Count -eq 0) 'the cutover record must carry the gate evidence and no rollbacks'
-  Assert-True ($lastOut -match 'rollback-dispatcher') 'cutover must say what stays for the rollback'
-  $staticAfter = (Get-Content "$testRoot\roster.json" -Raw) | ConvertFrom-Json
-  Assert-True (@($staticAfter.sessions | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 1) 'the roster.json entry must survive as the rollback path'
+  Assert-True ($lastOut -match 'git revert' -and $lastOut -notmatch 'rollback-dispatcher') 'cutover must say the rollback window is closed'
   Assert-True ((Get-Hash "$testRoot\state\events\2026-09-01.jsonl") -eq $eventsHash) 'cutover must not touch the event ledger'
 
   # Case 6: cutover is idempotent.
   $callsBefore = @(Get-ClaudeCalls).Count
   $r6 = Run-Script 'cutover-dispatcher.ps1' @('-SkipTaskCheck')
-  Assert-True ($lastExit -eq 0 -and $r6.alreadyCutOver -eq $true) 'a second cutover must report already cut over'
+  Assert-True ($lastExit -eq 0 -and $r6.alreadyCutOver -eq $true -and $r6.hint -match 'git revert') 'a second cutover must report already cut over and that rollback is a git revert'
   Assert-True (@(Get-ClaudeCalls).Count -eq $callsBefore) 'a second cutover must call nothing'
 
-  # Case 7: the launch door refuses the dispatcher while the flag stands; a dry run still evaluates.
-  $r7 = Run-Script 'launch.ps1' @('-FromRoster', 'dispatcher')
-  Assert-True ($lastExit -eq 3 -and $r7.launched -eq $false -and $r7.reason -match 'dispatcher-off') 'launch.ps1 must refuse the dispatcher under the flag'
-  $r7b = Run-Script 'launch.ps1' @('-FromRoster', 'dispatcher', '-DryRun')
-  Assert-True ($lastExit -eq 0 -and $r7b.dryRun -eq $true) "a dry run of the dispatcher launch must still evaluate under the flag: $lastOut"
+  # Case 7: the launch door no longer knows the dispatcher at all (name scheme, exit 4), flag or not.
+  $null = Run-Script 'launch.ps1' @('-FromRoster', 'dispatcher')
+  Assert-True ($lastExit -eq 4 -and $lastOut -match 'naming scheme') "launch.ps1 must refuse the dispatcher name: $lastOut"
   Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^--bg' }).Count -eq 0) 'nothing may have launched'
-
-  # Case 8: rollback removes the flag, relaunches through the door, and records the rollback.
-  $r8 = Run-Script 'rollback-dispatcher.ps1' @('-Reason', 'test rollback')
-  Assert-True ($lastExit -eq 0 -and $r8.rolledBack -eq $true -and $r8.launched -eq $true) "rollback must relaunch: $lastOut"
-  Assert-True (-not (Test-Path $flag)) 'rollback must remove the flag'
-  Assert-True (@(Get-ClaudeCalls | Where-Object { $_ -match '^--bg' }).Count -eq 1) 'rollback must launch exactly once'
-  $record8 = (Get-Content "$testRoot\state\dispatcher\cutover.json" -Raw) | ConvertFrom-Json
-  Assert-True (@($record8.rollbacks).Count -eq 1 -and $record8.rollbacks[0].launched -eq $true -and $record8.rollbacks[0].reason -eq 'test rollback' -and $record8.rollbacks[0].at) 'rollback must append one record'
-  Assert-True ($record8.notifierLive -eq $true) 'rollback must keep the cutover record'
-
-  # Case 9: rollback without the flag is refused.
-  $callsBefore = @(Get-ClaudeCalls).Count
-  $r9 = Run-Script 'rollback-dispatcher.ps1'
-  Assert-True ($lastExit -eq 3 -and $r9.rolledBack -eq $false) 'rollback without the flag must exit 3'
-  Assert-True (@(Get-ClaudeCalls).Count -eq $callsBefore) 'a refused rollback must call nothing'
 
   Write-Output 'dispatcher cutover tests passed'
 } finally {

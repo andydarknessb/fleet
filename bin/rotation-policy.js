@@ -25,7 +25,6 @@ const ROTATION_POLICY_FLAGS = {
 
 // Spec fallbacks ("Outcomes and budgets"); config/cycle.json overrides.
 const DEFAULT_ROTATION = Object.freeze({
-  dispatcher: { maxAgeHours: 24 },
   'project-lead': { maxAgeHours: 24, maxMerges: 5, maxJobTokens: 125000 },
 });
 

@@ -603,7 +603,7 @@ try {
   # --- counting only rows started inside the window (daemon history never expires,
   # --- and a week-old storm re-paging after Cory lifts its hold would fight the human).
   $windowStart = $now.AddHours(-$retryWindowHours)
-  $fleetPattern = '^(dispatcher|sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$'
+  $fleetPattern = '^(sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$'
   $retryTrips = @()
   foreach ($g in ($daemon | Where-Object { "$($_.name)" -match $fleetPattern } | Group-Object name)) {
     $rows = @($g.Group | ForEach-Object {
@@ -652,7 +652,7 @@ try {
   # --- stale; PAUSE suppresses it as it does all staleness paging.
   $busyStale = @()
   if (-not $paused) {
-    foreach ($row in @($daemon | Where-Object { $_.pid -and "$($_.status)" -eq 'busy' -and "$($_.name)" -match '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$' })) {
+    foreach ($row in @($daemon | Where-Object { $_.pid -and "$($_.status)" -eq 'busy' -and "$($_.name)" -match '^(sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$' })) {
       $bsAge = Get-HeartbeatAgeMinutes "$($row.name)"
       if ($null -ne $bsAge -and $bsAge -le $busyStaleMinutes) { continue }
       $bsStart = ConvertTo-UtcDateTime $row.startedAt
@@ -836,7 +836,7 @@ try {
   # --- multi-hour outages where every session sat blocked and nothing ever tried again.
   # --- 2026-09-17 QA review #13: the decision runs in shadow too (proposed, never
   # --- acted on) so parity has visibility into what live would have done.
-  $controlPlaneHealRoles = @('dispatcher', 'sentinel', 'project-lead', 'principal', 'arbiter')
+  $controlPlaneHealRoles = @('sentinel', 'project-lead', 'principal', 'arbiter')
   $healStatePath = "$FleetHome\state\watchdog\heal.json"
   $healState = $null; $healStateUnreadable = $false
   try { $healState = Read-Json $healStatePath } catch { $healStateUnreadable = $true }

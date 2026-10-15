@@ -47,7 +47,7 @@ try {
   Assert-Denied (Run-Gate -Role ic -Tool PowerShell -Command 'Invoke-WebRequest https://example.com') 'an Invoke-WebRequest'
   Assert-Denied (Run-Gate -Role ic -Tool WebFetch) 'WebFetch'
   Assert-Denied (Run-Gate -Role project-lead -Tool WebSearch) 'WebSearch for a lead'
-  Assert-Denied (Run-Gate -Role dispatcher -Tool Bash -Command 'git blame bin/watchdog.ps1') 'git blame for the dispatcher'
+  Assert-Denied (Run-Gate -Role project-lead -Tool Bash -Command 'git blame bin/watchdog.ps1') 'git blame for a lead'
   # ADR 0011: the Principal reads tickets as judgment and hands every sweep to the researcher.
   Assert-Denied (Run-Gate -Role principal -Tool Bash -Command 'rg "getLineup" server src') 'a ripgrep sweep for the principal'
   Assert-Denied (Run-Gate -Role principal -Tool WebFetch) 'WebFetch for the principal'

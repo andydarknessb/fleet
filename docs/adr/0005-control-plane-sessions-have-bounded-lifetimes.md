@@ -33,7 +33,7 @@ this ADR extends the property to the control plane.
 
 ## Status note - WS5 (2026-10-09)
 
-The standing Dispatcher session retired through `bin/cutover-dispatcher.ps1` behind `state/flags/dispatcher-off` (spec #194, ticket #82). Its duties moved to pages and the 08:00 daily summary; Cory now talks to the fleet by attaching to a tenant's project lead. Rollback is `bin/rollback-dispatcher.ps1` for one release, then the roster entry and role file go.
+The standing Dispatcher session retired through `bin/cutover-dispatcher.ps1` behind `state/flags/dispatcher-off` (spec #194, ticket #82). Its duties moved to pages and the 08:00 daily summary; Cory now talks to the fleet by attaching to a tenant's project lead. The rollback window closed after one release (fleet #303 deleted the roster entry, role file and rollback script); rollback is a git revert.
 
 ## Status note - #311 (2026-10-09)
 

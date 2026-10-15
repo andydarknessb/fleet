@@ -41,8 +41,8 @@ until the 08b cutover, then the Watchdog task; a lead is never one)
 The retired lead that was Cory's interface to the fleet until the WS5 cutover
 (2026-10-09, spec #194): it relayed escalations upward and wrote the 07:57
 digest. Pages (ADR 0012) carry escalations now and the 08:00 daily summary
-carries the digest. Its roster entry and role file stay one release for the
-rollback script.
+carries the digest. Its roster entry, role file and rollback script were
+deleted after one release (fleet #303); rollback is a git revert.
 _Avoid_: lead A, main agent, coordinator
 
 **Sentinel**:

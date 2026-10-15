@@ -85,7 +85,7 @@ if ($tenant -and (Test-Path "$home_\tenants\$tenant.json")) {
   Write-Output "Tenant file: $home_\tenants\$tenant.json"
 }
 if ($env:FLEET_ISSUE) { Write-Output "Your unit of work: issue #$($env:FLEET_ISSUE). Nothing else." }
-if ($role -in @('ic', 'project-lead', 'dispatcher', 'principal', 'arbiter')) {
+if ($role -in @('ic', 'project-lead', 'principal', 'arbiter')) {
   $gateState = if (Test-Path "$home_\state\flags\research-gate-off") { 'off (state/flags/research-gate-off stands)' } else { 'on' }
   Write-Output "Researcher: the haiku researcher worker (Agent tool, subagent_type: researcher) is your official researcher (ADR 0010). Repo sweeps, git log, CI logs and web fetches from this session are refused by the research-gate hook (gate $gateState); give the researcher the one question and a line cap. Reading what was handed to you stays yours."
 }
@@ -173,9 +173,6 @@ if ($role -ne 'ic') {
 }
 if ($role -eq 'sentinel') {
   Write-Output "Sentinel: if you have no pending 15-minute cron job, create one now with CronCreate (cron '*/15 * * * *', prompt: 'Run the sentinel check: powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\sentinel-check.ps1 -Apply, then act on its report per your role'). Recurring jobs expire after 7 days; recreate when this message appears."
-}
-if ($role -eq 'dispatcher') {
-  Write-Output "Dispatcher: if you have no pending daily-digest cron job, create one with CronCreate (cron '57 7 * * *', prompt: 'Write the daily digest to C:\Users\Cory\fleet\state\STATUS.md and send it as a push notification'). Recreate when this message appears."
 }
 Write-Output "=== END FLEET CONTEXT ==="
 exit 0
