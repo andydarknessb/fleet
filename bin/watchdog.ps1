@@ -59,7 +59,7 @@ try {
   $pagesConfig = $null; try { $pagesConfig = (Read-Json "$FleetHome\config\cycle.json").pages } catch {}   # ticket 77: pages.priority / pages.defaultPriority
   $fleetDeadRepeatMinutes = 120   # ticket 78: pages.fleetDeadRepeatMinutes, default 120 (two hours)
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatMinutes'] -and $pagesConfig.fleetDeadRepeatMinutes) { $fleetDeadRepeatMinutes = [int]$pagesConfig.fleetDeadRepeatMinutes }
-  # #197: pages.fleetDeadRepeatPriority (emergency|high|normal), default high; anything else falls back to high so a typo never throws a tick.
+  # #197: pages.fleetDeadRepeatPriority (emergency|high|normal), default high (config/cycle.json ships emergency since #302); anything else falls back to high so a typo never throws a tick.
   $fleetDeadRepeatPriority = 'high'
   if ($pagesConfig -and $pagesConfig.PSObject.Properties['fleetDeadRepeatPriority'] -and @('emergency', 'high', 'normal') -contains "$($pagesConfig.fleetDeadRepeatPriority)") { $fleetDeadRepeatPriority = "$($pagesConfig.fleetDeadRepeatPriority)" }
   $fullCycleConfig = $null; try { $fullCycleConfig = Read-Json "$FleetHome\config\cycle.json" } catch {}   # ticket 81: recursive scan for keys ending in Until
@@ -133,8 +133,8 @@ try {
   # fleet #232: config-invalid (a pages.priority value that is not emergency|high|normal) is normal;
   # a bad priority is reported, never paged louder than the thing it broke.
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
-  # its one repeat reads pages.fleetDeadRepeatPriority (default high) so it can return to
-  # emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
+  # its one repeat reads pages.fleetDeadRepeatPriority (default high; the shipped config sets emergency, #302) so it can return to
+  # high or emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
   $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
@@ -1393,9 +1393,16 @@ try {
   # fleet is not self-healing" while it just did. A tick where healing was
   # attempted but capped/refused (no ok:true entries) still pages normally.
   $healedOkThisTick = @($healed | Where-Object { $_.ok -eq $true }).Count -gt 0
-  if ($fleetDead -and -not $healedOkThisTick) {
+  # #302 (ADR 0012 amendment): a static whose human-wait stands is waiting on Cory, not dead; fleet-dead needs a stale static outside that set.
+  # Principals and arbiters are wake-driven and count neither way; a static with no known role counts (fails toward paging).
+  $staticRoles = @{}; if ($static -and $static.sessions) { foreach ($s in @($static.sessions)) { $staticRoles["$($s.name)"] = "$($s.role)" } }
+  $countingStale = @($staleStatics | Where-Object { @('principal', 'arbiter') -notcontains $staticRoles["$($_.name)"] })
+  $waitingTick = $fleetDead -and $countingStale.Count -gt 0 -and (@($countingStale | Where-Object { @($humanWaits | ForEach-Object { $_.name }) -notcontains $_.name }).Count -eq 0)
+  if ($fleetDead -and -not $waitingTick -and -not $healedOkThisTick) {
     $names = (@($staleStatics | ForEach-Object { "$($_.name):$($_.ageMin)m" }) -join ', ')
     $conditions += [pscustomobject]@{ key = 'fleet-dead'; kind = 'fleet-dead'; detail = "every static heartbeat is stale ($names; threshold $staleMinutes m) and work is waiting; the fleet is not self-healing$pendingNote"; url = $null }
+  } elseif ($waitingTick) {
+    # Recorded via the shadow line's waitingOnHuman flag below, never a condition; the human-wait conditions carry the page.
   } elseif ($idleTick) {
     # Ticket 75: every static heartbeat is stale but nothing is waiting for any
     # tenant - a session with nothing to do takes no turns too. Recorded via the
@@ -1757,7 +1764,7 @@ try {
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults; repeatPaged = $repeatPaged
     checkError = $checkError; proposed = $proposed
     launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; triageWakes = $triageWakes; arbiterWakes = $arbiterWakes
-    staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick
+    staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick; waitingOnHuman = [bool]$waitingTick
     healStateUnreadable = [bool]$healStateUnreadable; respawnFailStateUnreadable = [bool]$respawnFailStateUnreadable
     deadMan = $deadMan
     # fleet #101: every bounded child that timed out this tick, by name - the tick's own and the check's.
