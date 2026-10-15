@@ -13,8 +13,9 @@
        launch door, watchdog, status) stops expecting the dispatcher.
     2. Retire the live dispatcher session through bin/retire.ps1 (roster marker, stop, rm).
     3. Record state/dispatcher/cutover.json and print the paperwork checklist.
-  The roster.json entry and agents/dispatcher.md stay for one release so
-  bin\rollback-dispatcher.ps1 can bring it back. Event ledgers are never touched.
+  The roster.json entry, agents/dispatcher.md and bin/rollback-dispatcher.ps1 were deleted by
+  fleet #303 after one release: the rollback window is closed, and rollback now means a git
+  revert. Event ledgers are never touched.
 .EXAMPLE   cutover-dispatcher.ps1 -DryRun          # evaluate the gates, change nothing
 .EXAMPLE   cutover-dispatcher.ps1                  # cut over when the gates hold
 .EXAMPLE   cutover-dispatcher.ps1 -Force           # Cory's hand: cut over past a failed gate (recorded)
@@ -36,7 +37,7 @@ function Emit { param($Obj, [int]$Code) Write-Output ($Obj | ConvertTo-Json -Com
 
 if (Test-DispatcherOff) {
   $existing = $null; try { $existing = Read-Json $cutoverPath } catch {}
-  Emit ([ordered]@{ cutover = $false; alreadyCutOver = $true; flag = $flagPath; record = $existing; hint = 'bin\rollback-dispatcher.ps1 brings the dispatcher back' }) 0
+  Emit ([ordered]@{ cutover = $false; alreadyCutOver = $true; flag = $flagPath; record = $existing; hint = 'the rollback window closed with fleet #303; rollback is now a git revert' }) 0
 }
 
 # --- gates ---
@@ -83,7 +84,7 @@ if ($DryRun) { Emit $plan 0 }
 
 # --- act ---
 [IO.Directory]::CreateDirectory("$FleetHome\state\flags") | Out-Null
-[IO.File]::WriteAllText($flagPath, "cut over $(Now-Iso) by bin\cutover-dispatcher.ps1 (forced=$([bool]$Force)). The dispatcher is retired (WS5, fleet #82); pages and the 08:00 daily summary carry its duties; bin\rollback-dispatcher.ps1 brings it back for one release.$([Environment]::NewLine)", $Utf8)
+[IO.File]::WriteAllText($flagPath, "cut over $(Now-Iso) by bin\cutover-dispatcher.ps1 (forced=$([bool]$Force)). The dispatcher is retired (WS5, fleet #82); pages and the 08:00 daily summary carry its duties. The rollback window closed with fleet #303; rollback is now a git revert.$([Environment]::NewLine)", $Utf8)
 
 $retired = [ordered]@{ path = 'none'; detail = 'no live dispatcher entry or session found' }
 $live = Get-LiveRoster
@@ -107,5 +108,5 @@ $record = [ordered]@{
 [IO.Directory]::CreateDirectory("$FleetHome\state\dispatcher") | Out-Null
 Write-Json $cutoverPath ([pscustomobject]$record)
 
-Write-Output 'Cut over. Watch bin\status.ps1: no dispatcher row and no absent-session line at the next tick. The roster.json entry and agents/dispatcher.md stay one release for bin\rollback-dispatcher.ps1 (fleet #303 deletes them).'
+Write-Output 'Cut over. Watch bin\status.ps1: no dispatcher row and no absent-session line at the next tick. The rollback window closed with fleet #303; rollback is now a git revert.'
 Emit ([ordered]@{ cutover = $true; forced = [bool]$Force; flag = $flagPath; retired = $retired; record = $cutoverPath }) 0

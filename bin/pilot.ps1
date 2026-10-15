@@ -1,4 +1,4 @@
-# Start the pilot: sentinel, dispatcher, pl-endzone. ICs are launched by pl-endzone.
+# Start the pilot: pl-endzone. ICs are launched by pl-endzone.
 param([switch]$DryRun)
 . "$PSScriptRoot\_common.ps1"
 # Every static roster entry, minus a cut-over Sentinel (state/flags/sentinel-off: the watchdog task supervises).

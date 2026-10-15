@@ -30,8 +30,7 @@ function seedFleet(root, { launchedAt, name = 'pl-endzone', role = 'project-lead
   writeJson(root, 'roster.json', {
     cap: 6,
     sessions: [
-      { name: 'dispatcher', role: 'dispatcher', tenant: null, parent: 'cory' },
-      { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', parent: 'dispatcher' },
+      { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', parent: 'cory' },
     ],
   });
   writeJson(root, 'state/roster.json', {
@@ -143,7 +142,7 @@ test('a partial config entry keeps the spec fallbacks for unnamed thresholds', (
   assert.equal(merged['project-lead'].maxAgeHours, 48);
   assert.equal(merged['project-lead'].maxMerges, 5);
   assert.equal(merged['project-lead'].maxJobTokens, 125000);
-  assert.equal(merged.dispatcher.maxAgeHours, 24);
+  assert.equal(merged.dispatcher, undefined, 'the retired dispatcher has no rotation default');
 });
 
 test('a torn roster file makes evaluate a no-op instead of a crash', async () => {
@@ -169,17 +168,17 @@ test('evaluate skips roles without a rotation policy and sessions off the static
 
 test('evaluate skips retired sessions and flags an unreadable launchedAt without marking it due', async () => {
   const root = rootDir();
-  writeJson(root, 'roster.json', { cap: 6, sessions: [{ name: 'dispatcher', role: 'dispatcher' }] });
+  writeJson(root, 'roster.json', { cap: 6, sessions: [{ name: 'pl-endzone', role: 'project-lead' }] });
   writeJson(root, 'state/roster.json', {
     sessions: [
-      { name: 'dispatcher', role: 'dispatcher', sessionId: 'd1', status: 'retired', launchedAt: '2026-08-01T00:00:00.000Z' },
+      { name: 'pl-endzone', role: 'project-lead', sessionId: 'd1', status: 'retired', launchedAt: '2026-08-01T00:00:00.000Z' },
     ],
   });
   const none = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
   assert.deepEqual(none.sessions, []);
 
   writeJson(root, 'state/roster.json', {
-    sessions: [{ name: 'dispatcher', role: 'dispatcher', sessionId: 'd1', status: 'active', launchedAt: 'garbage' }],
+    sessions: [{ name: 'pl-endzone', role: 'project-lead', sessionId: 'd1', status: 'active', launchedAt: 'garbage' }],
   });
   const bad = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
   assert.equal(bad.sessions[0].due, false);
@@ -188,26 +187,26 @@ test('evaluate skips retired sessions and flags an unreadable launchedAt without
 
 test('evaluate falls back to spec thresholds when config/cycle.json is absent', async () => {
   const root = rootDir();
-  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z', name: 'dispatcher', role: 'dispatcher', tenant: null, sessionId: 'd1' });
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z' });
   const result = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
-  const dispatcher = result.sessions.find((s) => s.name === 'dispatcher');
-  assert.equal(dispatcher.due, true);
-  assert.equal(dispatcher.thresholds.maxAgeHours, 24);
+  const lead = result.sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal(lead.due, true);
+  assert.equal(lead.thresholds.maxAgeHours, 24);
 });
 
 // --- #311: the shipped config drops the project-lead age rotation ---------------------------
 // The lead is relaunched by the watchdog wake with a brief, so age alone no longer rotates it;
-// merges and job tokens still do. The dispatcher keeps its 24h age rule.
-test('#311: with the shipped config/cycle.json a 30h project-lead with few merges and tokens is not due, a 30h dispatcher is', async () => {
+// merges and job tokens still do. The Principal keeps its 24h age rule.
+test('#311: with the shipped config/cycle.json a 30h project-lead with few merges and tokens is not due, a 30h principal is', async () => {
   const root = rootDir();
   write(root, 'config/cycle.json', fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
   const launchedAt = '2026-09-01T06:00:00.000Z'; // 30 h before NOW
   writeJson(root, 'roster.json', { cap: 6, sessions: [
-    { name: 'dispatcher', role: 'dispatcher', tenant: null, parent: 'cory' },
-    { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', parent: 'dispatcher' },
+    { name: 'pe-endzone', role: 'principal', tenant: 'endzone', parent: 'cory' },
+    { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', parent: 'cory' },
   ] });
   writeJson(root, 'state/roster.json', { sessions: [
-    { name: 'dispatcher', role: 'dispatcher', tenant: null, sessionId: 'sess-d', status: 'active', launchedAt },
+    { name: 'pe-endzone', role: 'principal', tenant: 'endzone', sessionId: 'sess-d', status: 'active', launchedAt },
     { name: 'pl-endzone', role: 'project-lead', tenant: 'endzone', sessionId: 'sess-pl', status: 'active', launchedAt },
   ] });
   write(root, 'state/events/2026-09-02.jsonl', eventLine({ recordId: 'endzone:issue-1', at: '2026-09-02T08:00:00.000Z' }));
@@ -220,9 +219,9 @@ test('#311: with the shipped config/cycle.json a 30h project-lead with few merge
   assert.equal(lead.metrics.jobTokens, 1500);
   assert.equal(lead.due, false, `a 30h lead is not due on age alone (reasons: ${lead.reasons.join('; ')})`);
   assert.deepEqual(lead.reasons, []);
-  const dispatcher = result.sessions.find((s) => s.name === 'dispatcher');
-  assert.equal(dispatcher.due, true, 'the dispatcher still rotates on age');
-  assert.match(dispatcher.reasons[0], /^age 30\.0h >= 24h/);
+  const principal = result.sessions.find((s) => s.name === 'pe-endzone');
+  assert.equal(principal.due, true, 'the principal still rotates on age');
+  assert.match(principal.reasons[0], /^age 30\.0h >= 24h/);
 });
 
 test('#311: the shipped project-lead entry still rotates on merges', async () => {
@@ -270,7 +269,8 @@ test('cli: an unknown command is a usage error naming the known commands', async
 
 test('cli: a correct invocation still works for both commands', async () => {
   const root = rootDir();
-  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z', name: 'dispatcher', role: 'dispatcher', tenant: null, sessionId: 'd1' });
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z' });
+  assert.ok((await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW })).sessions.length > 0, 'the comparison must cover a due session');
   const viaCli = await policy.cli(['evaluate', '--root', root, '--claude-home', path.join(root, 'no-claude'), '--now', NOW]);
   const direct = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
   assert.deepEqual(viaCli, direct);

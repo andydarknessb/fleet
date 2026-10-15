@@ -291,15 +291,15 @@ test('buildReport and renderSummary keep cache-read tokens separate and are dete
 
 test('buildCycleRecords and buildReport retain control-plane session metrics separately', () => {
   const ic = parseTranscript(fixtureTranscript(), 'fixture/ic-42.jsonl');
-  const dispatcher = parseTranscript([
-    { type: 'custom-title', customTitle: 'dispatcher', sessionId: 'dispatcher-1' },
-    { type: 'agent-setting', agentSetting: 'dispatcher', sessionId: 'dispatcher-1' },
+  const sentinel = parseTranscript([
+    { type: 'custom-title', customTitle: 'sentinel', sessionId: 'sentinel-1' },
+    { type: 'agent-setting', agentSetting: 'sentinel', sessionId: 'sentinel-1' },
     assistant({
       uuid: 'd1', timestamp: '2026-09-01T00:00:00.000Z',
       content: [{ type: 'text', text: 'Daily digest complete.' }],
       usage: { input: 20, output: 2, creation: 3, read: 4 }, model: 'claude-sonnet-5',
     }),
-  ].map(line).join('\n'), 'fixture/dispatcher-1.jsonl');
+  ].map(line).join('\n'), 'fixture/sentinel-1.jsonl');
   const roster = {
     sessions: [{
       name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42,
@@ -308,7 +308,7 @@ test('buildCycleRecords and buildReport retain control-plane session metrics sep
   };
   const cycles = buildCycleRecords({
     roster,
-    transcripts: [ic, dispatcher],
+    transcripts: [ic, sentinel],
     pullRequestStates: { 'endzone:77': { state: 'MERGED', mergedAt: '2026-09-01T00:00:04.000Z' } },
   });
   const report = buildReport(cycles.records, cycles.excluded, {
@@ -323,8 +323,8 @@ test('buildCycleRecords and buildReport retain control-plane session metrics sep
   assert.equal(report.metrics.controlPlaneCacheReadTokens, 4);
   assert.equal(report.metrics.freshTokens, 193);
   assert.equal(report.metrics.cacheReadTokens, 54);
-  assert.equal(report.roles.dispatcher.sessions, 1);
-  assert.equal(report.roles.dispatcher.metrics.freshTokens, 25);
+  assert.equal(report.roles.sentinel.sessions, 1);
+  assert.equal(report.roles.sentinel.metrics.freshTokens, 25);
 });
 
 test('collectFromFiles writes stable daily JSON and summary artifacts', () => {
@@ -375,7 +375,7 @@ test('buildReport computes per-unit ratios, the IC median, and budget verdicts',
   const units = [unitOf(1, 40000, 100000), unitOf(2, 55000, 120000), unitOf(3, 70000, 200000)];
   const sessions = [
     { sessionId: 'pl', name: 'pl-endzone', role: 'project-lead', metrics: { freshTokens: 60000, cacheReadInputTokens: 5 } },
-    { sessionId: 'd', name: 'dispatcher', role: 'dispatcher', metrics: { freshTokens: 30000, cacheReadInputTokens: 5 } },
+    { sessionId: 'd', name: 'sentinel', role: 'sentinel', metrics: { freshTokens: 30000, cacheReadInputTokens: 5 } },
   ];
   const report = buildReport(units, [{ reason: 'abandoned' }, { reason: 'abandoned' }, { reason: 'no-pr' }], {
     sessionMetrics: sessions,
@@ -608,10 +608,10 @@ test('#125: a retired session whose transcript has no role still counts under it
   const text = [assistant({ uuid: 'x', timestamp: '2026-09-01T06:00:00.000Z', content: [{ type: 'text', text: 'ok' }], usage: { input: 50, output: 0 } })].map((r) => line({ ...r, sessionId: 'd-old' })).join('\n');
   const result = rotationFixture({
     rosterSessions: [],
-    retiredLines: [{ name: 'dispatcher', role: 'dispatcher', sessionId: 'd-old', status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T07:00:00.000Z' }],
+    retiredLines: [{ name: 'sentinel', role: 'sentinel', sessionId: 'd-old', status: 'retired', launchedAt: '2026-09-01T00:00:00.000Z', retiredAt: '2026-09-01T07:00:00.000Z' }],
     transcripts: { 'd-old': text },
   });
-  assert.equal(result.dailyReport.roles.dispatcher.sessions, 1);
+  assert.equal(result.dailyReport.roles.sentinel.sessions, 1);
   assert.equal(result.dailyReport.metrics.controlPlaneFreshTokens, 50);
 });
 
@@ -838,8 +838,8 @@ function tripledResponseTranscript() {
   const a = { input: 10, output: 5, creation: 100, read: 50 };
   const b = { input: 20, output: 7, creation: 0, read: 60 };
   return [
-    { type: 'custom-title', customTitle: 'dispatcher', sessionId: 'session-1' },
-    { type: 'agent-setting', agentSetting: 'dispatcher', sessionId: 'session-1' },
+    { type: 'custom-title', customTitle: 'sentinel', sessionId: 'session-1' },
+    { type: 'agent-setting', agentSetting: 'sentinel', sessionId: 'session-1' },
     withMessageId(assistant({ uuid: 'a1', timestamp: '2026-09-01T00:00:00.000Z', content: [{ type: 'thinking', thinking: 'hm' }], usage: a }), 'msg_A'),
     withMessageId(assistant({ uuid: 'a2', timestamp: '2026-09-01T00:00:00.100Z', content: [{ type: 'text', text: 'Looking.' }], usage: a }), 'msg_A'),
     withMessageId(assistant({ uuid: 'a3', timestamp: '2026-09-01T00:00:00.200Z', content: [toolUse('t1', 'git status')], usage: a }), 'msg_A'),
@@ -893,14 +893,14 @@ test('#201: rows with no response id are counted as before and flagged in the ou
   assert.equal(parsed.usageRowsWithoutId, 2);
   assert.equal(parsed.usageResponses, 3);
   const cycles = buildCycleRecords({ roster: { sessions: [] }, transcripts: [parsed] });
-  const report = buildReport(cycles.records, cycles.excluded, { generatedAt: '2026-09-01T12:00:00.000Z', sessionMetrics: [{ role: 'dispatcher', metrics: { usageRowsWithoutId: 2, toolCallsByCommandClass: {} } }] });
+  const report = buildReport(cycles.records, cycles.excluded, { generatedAt: '2026-09-01T12:00:00.000Z', sessionMetrics: [{ role: 'sentinel', metrics: { usageRowsWithoutId: 2, toolCallsByCommandClass: {} } }] });
   assert.equal(report.metrics.usageRowsWithoutId, 2);
   assert.match(renderSummary(report), /usage rows with no response id \(counted as rows\): 2/);
 });
 
 test('#201: a void control-plane baseline reports no verdict, PASS or FAIL, against it', () => {
   const unitOf = (issue) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: 100000, jobTokens: 40000, cacheReadInputTokens: 0 } });
-  const sessions = [{ sessionId: 'd', name: 'dispatcher', role: 'dispatcher', metrics: { freshTokens: 900000, cacheReadInputTokens: 5 } }];
+  const sessions = [{ sessionId: 'd', name: 'sentinel', role: 'sentinel', metrics: { freshTokens: 900000, cacheReadInputTokens: 5 } }];
   const budgets = { baselineControlPlaneFreshPerCompletedUnit: 200000, controlPlaneFreshReduction: 0.7 };
   const live = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets });
   assert.equal(live.unitMetrics.budgets.controlPlaneFreshReduction.pass, false, 'control: without the void flag the same data fails');

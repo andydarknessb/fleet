@@ -34,7 +34,7 @@ function Set-Identity {
   Write-Utf8 "$testRoot\identity\hosts.yml" ("github.com:`n    users:`n        ${Login}:`n            oauth_token: ghp_launch_fixture`n    git_protocol: https`n    oauth_token: ghp_launch_fixture`n    user: $Login`n")
 }
 function Get-PageLines { if (Test-Path "$testRoot\state\pages\pages.jsonl") { return @(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object { $_.kind -eq 'fleet-identity' }) }; return @() }
-$dispatch = @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start your duties.')
+$dispatch = @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.')
 
 try {
   foreach ($dir in 'bin','hooks','agents','tenants','config','state','state/sessions','state/notices','state/work','state/flags','mock-bin','repo') {
@@ -43,7 +43,7 @@ try {
   foreach ($f in '_common.ps1','launch.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\dispatcher.md" "---`nname: dispatcher`nmodel: sonnet`neffort: low`n---`nRole body for dispatcher."
+  Write-Utf8 "$testRoot\agents\project-lead.md" "---`nname: project-lead`nmodel: sonnet`neffort: low`n---`nRole body for project-lead."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -57,7 +57,7 @@ try {
   $env:USERPROFILE = "$testRoot\profile"
   $env:FLEET_IDENTITY_DIR = "$testRoot\identity"
   $env:FLEET_NO_TOAST = '1'
-  $settingsFile = "$testRoot\state\sessions\dispatcher.settings.json"
+  $settingsFile = "$testRoot\state\sessions\pl-test.settings.json"
 
   # Case 1 (today, before #152 is run): the tenant still names the owner as the fleet and
   # no identity directory exists. The launch keeps the keyring: no GH_CONFIG_DIR, no refusal.

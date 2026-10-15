@@ -27,7 +27,7 @@ try {
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json")
-  foreach ($roleName in 'dispatcher','project-lead','ic') {
+  foreach ($roleName in 'project-lead','ic') {
     Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
   }
   Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: opus-5.5`neffort: high`n---`nRole body for principal."
@@ -48,20 +48,20 @@ try {
   $rootFwd = $testRoot.Replace('\', '/')
 
   # Case 1: a control-plane role gets the state-door and tenant-repo denials.
-  $r1 = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-DryRun')
+  $r1 = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-DryRun')
   Assert-True ($r1.dryRun -eq $true) 'the dry run must report itself'
-  $settings1 = Get-Content "$testRoot\state\sessions\dispatcher.settings.json" -Raw | ConvertFrom-Json
+  $settings1 = Get-Content "$testRoot\state\sessions\pl-test.settings.json" -Raw | ConvertFrom-Json
   $deny1 = @($settings1.permissions.deny)
-  Assert-True ($deny1 -contains "Edit($rootFwd/state/work/**)") 'the dispatcher must lose direct Edit on state/work'
-  Assert-True ($deny1 -contains "Write($rootFwd/state/events/**)") 'the dispatcher must lose direct Write on state/events'
-  Assert-True ($deny1 -contains "NotebookEdit($rootFwd/state/archive/**)") 'the dispatcher must lose direct NotebookEdit on state/archive'
-  Assert-True ($deny1 -contains "Write($rootFwd/state/exclusions/**)") 'the dispatcher must lose direct Write on the ticket-07 exclusion ledger'
-  Assert-True ($deny1 -contains "Edit($rootFwd/state/status/DIGEST.md)") 'the dispatcher must lose direct Edit on the digest projection'
-  Assert-True ($deny1 -contains "Write($rootFwd/state/status/*-status.md)") 'the dispatcher must lose direct Write on tenant status projections'
+  Assert-True ($deny1 -contains "Edit($rootFwd/state/work/**)") 'a project lead must lose direct Edit on state/work'
+  Assert-True ($deny1 -contains "Write($rootFwd/state/events/**)") 'a project lead must lose direct Write on state/events'
+  Assert-True ($deny1 -contains "NotebookEdit($rootFwd/state/archive/**)") 'a project lead must lose direct NotebookEdit on state/archive'
+  Assert-True ($deny1 -contains "Write($rootFwd/state/exclusions/**)") 'a project lead must lose direct Write on the ticket-07 exclusion ledger'
+  Assert-True ($deny1 -contains "Edit($rootFwd/state/status/DIGEST.md)") 'a project lead must lose direct Edit on the digest projection'
+  Assert-True ($deny1 -contains "Write($rootFwd/state/status/*-status.md)") 'a project lead must lose direct Write on tenant status projections'
   Assert-True ($deny1 -contains "Edit($repoFwd/**)") 'a control-plane role must lose engineering edits in tenant repos'
   Assert-True ($settings1.permissions.defaultMode -eq 'auto') 'existing permission settings must survive the merge'
   Assert-True ($null -ne $r1.budget -and $r1.budget.estimatedTokens -gt 0) 'the dry run must report the first-turn budget'
-  Assert-True ($r1.budget.ceiling -eq ((Get-Content "$testRoot\config\cycle.json" -Raw | ConvertFrom-Json).firstTurnCeilings.dispatcher)) 'the dispatcher ceiling must come from config/cycle.json'
+  Assert-True ($r1.budget.ceiling -eq ((Get-Content "$testRoot\config\cycle.json" -Raw | ConvertFrom-Json).firstTurnCeilings.'project-lead')) 'the project-lead ceiling must come from config/cycle.json'
 
   # Case 2: an IC keeps tenant-repo tools but loses every direct fleet-state write.
   $r2 = Run-Launch @('-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'Implement issue 42.', '-DryRun')
@@ -72,9 +72,9 @@ try {
 
   # Case 2b: the tool-contract rollback flag skips the deny injection only.
   Write-Utf8 "$testRoot\state\flags\tool-contract-off" 'rollback'
-  $r2b = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-DryRun')
+  $r2b = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-DryRun')
   Assert-True ($r2b.dryRun -eq $true) 'the flagged dry run must still pass the gates'
-  $settings2b = Get-Content "$testRoot\state\sessions\dispatcher.settings.json" -Raw | ConvertFrom-Json
+  $settings2b = Get-Content "$testRoot\state\sessions\pl-test.settings.json" -Raw | ConvertFrom-Json
   Assert-True (-not $settings2b.permissions.PSObject.Properties['deny']) 'tool-contract-off must skip the deny injection'
   Assert-True ($null -ne $r2b.budget) 'tool-contract-off must not disable the ceiling estimate'
   Remove-Item "$testRoot\state\flags\tool-contract-off"
@@ -89,7 +89,6 @@ try {
   Assert-True (@($srcEnv | Where-Object { $_ -match 'Nidus #14' -and $_ -match 'local stack' -and $_ -match 'supabase db push' -and $_ -match 'Cory''s' }).Count -eq 1) 'Nidus migrations must be stated local-only, with the remote commands left to Cory, once'
   [IO.File]::Copy("$sourceRoot\fleet-settings.json", "$testRoot\fleet-settings.json", $true)
   $envCases = @(
-    @{ Name = 'dispatcher'; Args = @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun') },
     @{ Name = 'pl-test'; Args = @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun') },
     @{ Name = 'pe-test'; Args = @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun') },
     @{ Name = 'ic-42'; Args = @('-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'Implement issue 42.', '-DryRun') }
@@ -110,14 +109,14 @@ try {
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
 
   # Case 3: an over-ceiling launch fails before assignment with a source breakdown.
-  # A 60K-char prompt (~15K tokens; dispatcher ceiling is 12K) exceeds the Windows
+  # A 60K-char prompt (~40K tokens; project-lead ceiling is 30K) exceeds the Windows
   # command line, so a runner reads it from a file inside the child process.
-  Write-Utf8 "$testRoot\big-prompt.txt" ('x' * 60000)
+  Write-Utf8 "$testRoot\big-prompt.txt" ('x' * 160000)
   Write-Utf8 "$testRoot\bin\run-big.ps1" @'
 param([switch]$WithForce, [switch]$WithFlag)
 $p = Get-Content "$PSScriptRoot\..\big-prompt.txt" -Raw
-if ($WithForce) { & "$PSScriptRoot\launch.ps1" -Role dispatcher -Name dispatcher -Parent cory -Prompt $p -DryRun -Force }
-else { & "$PSScriptRoot\launch.ps1" -Role dispatcher -Name dispatcher -Parent cory -Prompt $p -DryRun }
+if ($WithForce) { & "$PSScriptRoot\launch.ps1" -Role project-lead -Name pl-test -Tenant test -Parent cory -Prompt $p -DryRun -Force }
+else { & "$PSScriptRoot\launch.ps1" -Role project-lead -Name pl-test -Tenant test -Parent cory -Prompt $p -DryRun }
 exit $LASTEXITCODE
 '@
   function Run-Big {
@@ -130,7 +129,7 @@ exit $LASTEXITCODE
   $r3 = Run-Big
   Assert-True ($script:lastExit -eq 6) 'an over-ceiling launch must exit 6'
   Assert-True ($r3.launched -eq $false -and "$($r3.reason)" -match 'ceiling') 'the refusal must name the ceiling'
-  Assert-True ($r3.budget.sources.prompt -ge 15000) 'the breakdown must attribute the tokens to the prompt'
+  Assert-True ($r3.budget.sources.prompt -ge 30000) 'the breakdown must attribute the tokens to the prompt'
   Assert-True ($r3.budget.sources.roleFile -gt 0) 'the breakdown must list every source'
   Assert-True ($r3.budget.sources.sessionStartInjection -gt 0) 'the breakdown must count the hook injection'
 
@@ -144,26 +143,26 @@ exit $LASTEXITCODE
 
   # Case 5: an unreadable daemon list refuses the launch outright (fail closed).
   $env:MOCK_CLAUDE_FAIL = '1'
-  $r5 = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  $r5 = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
   Assert-True ($script:lastExit -eq 3) 'an unreadable daemon list must refuse with exit 3'
   Assert-True ($r5.launched -eq $false -and "$($r5.reason)" -match 'fail closed') 'the refusal must say it failed closed'
   Remove-Item Env:MOCK_CLAUDE_FAIL
 
   # Case 6: the CLI list reads empty while the roster's on-disk job state says the
   # session is alive and fresh: the independent source wins, no duplicate launches.
-  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","jobId":"job-disp","sessionId":"sess-disp"}]}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"pl-test","role":"project-lead","status":"active","jobId":"job-disp","sessionId":"sess-disp"}]}'
   $freshAt = (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o')
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-disp\state.json" ('{"state":"working","updatedAt":"' + $freshAt + '"}')
-  $r6 = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  $r6 = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and "$($r6.reason)" -match 'suspected bad read') 'a fresh working job state must refuse the duplicate'
 
   # Case 6b: a stale or stopped job state stays launchable (crash recovery).
   $staleAt = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o')
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-disp\state.json" ('{"state":"working","updatedAt":"' + $staleAt + '"}')
-  $r6b = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  $r6b = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
   Assert-True ($r6b.dryRun -eq $true) 'a stale working job state must not block recovery'
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-disp\state.json" ('{"state":"stopped","updatedAt":"' + $freshAt + '"}')
-  $r6c = Run-Launch @('-Role', 'dispatcher', '-Name', 'dispatcher', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
+  $r6c = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
   Assert-True ($r6c.dryRun -eq $true) 'a stopped job state must not block a relaunch'
 
   # Fleet #28: the CLI has no auto mode for claude-haiku-4-5; the one door refuses haiku

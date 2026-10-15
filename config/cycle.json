@@ -2,7 +2,6 @@
   "schemaVersion": 1,
   "firstTurnCeilings": {
     "baselineTokens": 10000,
-    "dispatcher": 22000,
     "project-lead": 30000,
     "ic": 35000,
     "principal": 30000,
@@ -60,7 +59,6 @@
     "patternExcludePaths": ["**/*.md", "**/*.txt", "docs/**"]
   },
   "rotation": {
-    "dispatcher": { "maxAgeHours": 24 },
     "project-lead": { "maxAgeHours": null, "maxMerges": 5, "maxJobTokens": 125000 },
     "principal": { "maxAgeHours": 24, "maxJobTokens": 125000 },
     "arbiter": { "maxAgeHours": 24, "maxJobTokens": 125000 }

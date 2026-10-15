@@ -12,7 +12,7 @@ $oldPath = $env:PATH
 $oldProfile = $env:USERPROFILE
 
 function Set-LiveRoster { param([string]$LaunchedAt, [string]$Status = 'active')
-  Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @(@{ name = 'dispatcher'; role = 'dispatcher'; tenant = $null; sessionId = 'sess-old'; jobId = 'job-old'; status = $Status; launchedAt = $LaunchedAt }) } | ConvertTo-Json -Depth 8)
+  Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @(@{ name = 'pe-test'; role = 'principal'; tenant = $null; sessionId = 'sess-old'; jobId = 'job-old'; status = $Status; launchedAt = $LaunchedAt }) } | ConvertTo-Json -Depth 8)
 }
 function Set-AgentsRows { param([string]$Json) Write-Utf8 "$testRoot\mock-agents.json" $Json }
 function Reset-Markers {
@@ -28,7 +28,7 @@ function Run-Rotate {
   finally { $script:lastExit = $LASTEXITCODE; $ErrorActionPreference = $eap }
   try { return ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $out }
 }
-$idleRow = '[{"id":"job-old","name":"dispatcher","state":"working","status":"idle","pid":11,"sessionId":"sess-old","startedAt":1786115823884}]'
+$idleRow = '[{"id":"job-old","name":"pe-test","state":"working","status":"idle","pid":11,"sessionId":"sess-old","startedAt":1786115823884}]'
 $busyRow = $idleRow.Replace('"status":"idle"', '"status":"busy"')
 
 try {
@@ -45,7 +45,7 @@ try {
   [IO.File]::Copy("$sourceRoot\bin\transcript-usage.js", "$testRoot\bin\transcript-usage.js")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
 
-  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"}]}'
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"pe-test","role":"principal","parent":"cory"}]}'
   Write-Utf8 "$testRoot\tenants\test.json" '{"name":"test","github":"owner/repo"}'
   Write-Utf8 "$testRoot\state\events\2026-09-01.jsonl" ('{"recordId":"test:issue-1","sequence":1,"type":"work-created","at":"2026-09-01T10:00:00.000Z"}' + "`n" + '{"recordId":"test:issue-1","sequence":2,"type":"state-merged","at":"2026-09-01T11:00:00.000Z"}' + "`n")
 
@@ -109,13 +109,13 @@ console.log(JSON.stringify({ ok: true }));
   # Case 2: age-due session at an idle boundary -> one offset, retire, reconcile, launch.
   Set-LiveRoster $old; Set-AgentsRows $idleRow; Reset-Markers
   $r2 = Run-Rotate @('-Auto')
-  Assert-True (@($r2.rotated) -contains 'dispatcher') 'an age-due idle session must rotate'
-  $intent = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  Assert-True (@($r2.rotated) -contains 'pe-test') 'an age-due idle session must rotate'
+  $intent = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ($intent.phase -eq 'launched') 'the completed rotation must record phase launched'
   Assert-True ($intent.offset.totalEvents -eq 2) 'the intent must carry the event offset'
   Assert-True (@($intent.reasons) -join ' ' -match 'age') 'the intent must record the threshold reason'
-  Assert-True ((Get-Content "$testRoot\retire-calls.log" -Raw) -match 'dispatcher\|rotation: age') 'retire.ps1 must be called with the rotation reason'
-  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'dispatcher') 'the replacement must launch through launch.ps1 -FromRoster'
+  Assert-True ((Get-Content "$testRoot\retire-calls.log" -Raw) -match 'pe-test\|rotation: age') 'retire.ps1 must be called with the rotation reason'
+  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'pe-test') 'the replacement must launch through launch.ps1 -FromRoster'
   Assert-True (Test-Path "$testRoot\reconcile-calls.log") 'active Work records must be reconciled before the replacement acts'
   Assert-True ($intent.newSessionId -eq 'sess-new') 'the intent must record the replacement session'
 
@@ -131,10 +131,10 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True ($atLaunch.offset.totalEvents -eq 2 -and (Test-Path "$testRoot\reconcile-calls.log")) 'the launching intent must already carry the offset and follow the reconcile'
   $hookHome = "$testRoot\hook-home"
   [IO.Directory]::CreateDirectory("$hookHome\state\rotation") | Out-Null
-  Copy-Item "$testRoot\intent-at-launch.json" "$hookHome\state\rotation\dispatcher.json" -Force
+  Copy-Item "$testRoot\intent-at-launch.json" "$hookHome\state\rotation\pe-test.json" -Force
   $savedFleetEnv = @{}
   foreach ($v in 'FLEET_HOME','FLEET_NAME','FLEET_ROLE','FLEET_TENANT','FLEET_PARENT') { $savedFleetEnv[$v] = [Environment]::GetEnvironmentVariable($v) }
-  $env:FLEET_HOME = $hookHome; $env:FLEET_NAME = 'dispatcher'; $env:FLEET_ROLE = 'dispatcher'; $env:FLEET_TENANT = ''; $env:FLEET_PARENT = 'cory'
+  $env:FLEET_HOME = $hookHome; $env:FLEET_NAME = 'pe-test'; $env:FLEET_ROLE = 'principal'; $env:FLEET_TENANT = ''; $env:FLEET_PARENT = 'cory'
   $eapH = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try { $hookOut = ('{"session_id":"sess-new","source":"startup"}' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$sourceRoot\hooks\session-start.ps1" 2>&1 | Out-String) }
   finally { $ErrorActionPreference = $eapH; foreach ($v in $savedFleetEnv.Keys) { [Environment]::SetEnvironmentVariable($v, $savedFleetEnv[$v]) } }
@@ -151,9 +151,9 @@ console.log(JSON.stringify({ ok: true }));
   $r2b = Run-Rotate @('-Auto')
   Assert-True (@($r2b.rotated).Count -eq 0) 'a session with a pending permission prompt must not rotate'
   Assert-True (@($r2b.deferred).Count -eq 1 -and "$($r2b.deferred)" -match 'approve') 'the deferral must name the pending permission prompt'
-  Assert-True (-not (Test-Path "$testRoot\state\rotation\dispatcher.json")) 'a deferred rotation must write no intent'
+  Assert-True (-not (Test-Path "$testRoot\state\rotation\pe-test.json")) 'a deferred rotation must write no intent'
   Assert-True (-not (Test-Path "$testRoot\retire-calls.log")) 'a deferred rotation must not stop the session'
-  $r2c = Run-Rotate @('-Name', 'dispatcher', '-Force')
+  $r2c = Run-Rotate @('-Name', 'pe-test', '-Force')
   Assert-True (@($r2c.rotated).Count -eq 0) '-Force must not override a pending permission prompt'
   Assert-True (@($r2c.outcomes | Where-Object { $_.status -eq 'deferred' }).Count -eq 1) '-Force still defers on a pending prompt, same standing as busy'
   Remove-Item "$testRoot\profile\.claude\jobs\job-old" -Recurse -Force
@@ -177,7 +177,7 @@ console.log(JSON.stringify({ ok: true }));
   $r3 = Run-Rotate @('-Auto')
   Assert-True (@($r3.rotated).Count -eq 0) 'a busy session must not rotate'
   Assert-True (@($r3.deferred).Count -eq 1) 'a busy session must be deferred'
-  Assert-True (-not (Test-Path "$testRoot\state\rotation\dispatcher.json")) 'a deferred rotation must write no intent'
+  Assert-True (-not (Test-Path "$testRoot\state\rotation\pe-test.json")) 'a deferred rotation must write no intent'
   Assert-True (-not (Test-Path "$testRoot\retire-calls.log")) 'a deferred rotation must not stop the session'
 
   # Case 4: a held work-state lock defers; so does a pending journal.
@@ -201,24 +201,24 @@ console.log(JSON.stringify({ ok: true }));
   $r5b = Run-Rotate @('-Auto')
   Assert-True ($script:lastExit -eq 3 -and "$($r5b.reason)" -match 'rotation-off') 'the rotation-off flag must disable auto rotation'
   Assert-True (-not (Test-Path "$testRoot\retire-calls.log")) 'a disabled rotation must not stop anything'
-  $r5c = Run-Rotate @('-Name', 'dispatcher', '-Force')
-  Assert-True (@($r5c.rotated) -contains 'dispatcher') '-Force -Name must rotate despite the flag'
-  Assert-True ((Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json).reasons -join ' ' -match 'forced') 'a forced rotation must record its reason'
-  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw) -match 'dispatcher\|force') 'a forced rotation must pass -Force through to launch.ps1'
+  $r5c = Run-Rotate @('-Name', 'pe-test', '-Force')
+  Assert-True (@($r5c.rotated) -contains 'pe-test') '-Force -Name must rotate despite the flag'
+  Assert-True ((Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json).reasons -join ' ' -match 'forced') 'a forced rotation must record its reason'
+  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw) -match 'pe-test\|force') 'a forced rotation must pass -Force through to launch.ps1'
   Remove-Item "$testRoot\state\flags\rotation-off"
 
   # Case 5d: -Force under PAUSE must not strand the role: the replacement launch
   # carries -Force too, so the gate the operator overrode cannot half-apply.
   Set-LiveRoster $old; Set-AgentsRows $idleRow; Reset-Markers
   Write-Utf8 "$testRoot\state\PAUSE" 'maintenance'
-  $r5d = Run-Rotate @('-Name', 'dispatcher', '-Force')
-  Assert-True (@($r5d.rotated) -contains 'dispatcher') '-Force must rotate under PAUSE'
-  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw) -match 'dispatcher\|force') 'the forced replacement must launch with -Force'
+  $r5d = Run-Rotate @('-Name', 'pe-test', '-Force')
+  Assert-True (@($r5d.rotated) -contains 'pe-test') '-Force must rotate under PAUSE'
+  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw) -match 'pe-test\|force') 'the forced replacement must launch with -Force'
   Remove-Item "$testRoot\state\PAUSE"
 
   # Case 5e: a young -Name without -Force is skipped; adding -Auto still sweeps.
   Set-LiveRoster $young; Set-AgentsRows $idleRow; Reset-Markers
-  $r5e = Run-Rotate @('-Name', 'dispatcher', '-Auto')
+  $r5e = Run-Rotate @('-Name', 'pe-test', '-Auto')
   Assert-True ($script:lastExit -eq 0) 'a skipped named rotation must not fail the run'
   Assert-True (@($r5e.rotated).Count -eq 0) 'a young named session must be skipped'
   Assert-True (@($r5e.outcomes | Where-Object { $_.status -eq 'skipped' }).Count -eq 1) 'the skip must be a typed outcome'
@@ -226,19 +226,19 @@ console.log(JSON.stringify({ ok: true }));
 
   # Case 6: crash between stop and launch -> resume completes from intent + offset.
   Set-LiveRoster $old 'retired'; Set-AgentsRows '[]'; Reset-Markers
-  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age 30.0h >= 24h'); savedAt = (Get-Date).ToUniversalTime().ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  Write-Utf8 "$testRoot\state\rotation\pe-test.json" (@{ schemaVersion = 1; name = 'pe-test'; phase = 'stopped'; reasons = @('age 30.0h >= 24h'); savedAt = (Get-Date).ToUniversalTime().ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
   $r6 = Run-Rotate @('-Resume')
-  Assert-True (@($r6.rotated) -contains 'dispatcher') 'a stopped intent with no live session must resume to launched'
-  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'dispatcher') 'resume must launch through launch.ps1'
-  $intent6 = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  Assert-True (@($r6.rotated) -contains 'pe-test') 'a stopped intent with no live session must resume to launched'
+  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'pe-test') 'resume must launch through launch.ps1'
+  $intent6 = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ($intent6.phase -eq 'launched') 'resume must complete the intent'
   Assert-True ($intent6.offset.totalEvents -eq 2) 'resume must keep the saved offset'
 
   # Case 6b: crash mid-stop (predecessor still alive) -> resume retires it first.
   Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
-  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopping'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  Write-Utf8 "$testRoot\state\rotation\pe-test.json" (@{ schemaVersion = 1; name = 'pe-test'; phase = 'stopping'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
   $r6b = Run-Rotate @('-Resume')
-  Assert-True (@($r6b.rotated) -contains 'dispatcher') 'a stopping intent must resume to launched'
+  Assert-True (@($r6b.rotated) -contains 'pe-test') 'a stopping intent must resume to launched'
   Assert-True ((Get-Content "$testRoot\retire-calls.log" -Raw) -match 'resumed') 'resume must finish retiring the live predecessor'
 
   # Case 6c (fleet #121): between stop and launch a job created BEFORE the rotation began
@@ -246,18 +246,18 @@ console.log(JSON.stringify({ ok: true }));
   # is a stale revival, not a hand relaunch: stop it and launch the replacement.
   Set-LiveRoster $old 'retired'; Reset-Markers
   Remove-Item "$testRoot\launch-running.marker", "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
-  Set-AgentsRows '[{"id":"job-stale","name":"dispatcher","state":"working","status":"idle","pid":21,"sessionId":"sess-stale","startedAt":1786115823884}]'
+  Set-AgentsRows '[{"id":"job-stale","name":"pe-test","state":"working","status":"idle","pid":21,"sessionId":"sess-stale","startedAt":1786115823884}]'
   [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-stale") | Out-Null
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-stale\state.json" '{"createdAt":"2026-08-25T00:00:00Z","respawnFlags":["--model","claude-opus-5"]}'
-  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  Write-Utf8 "$testRoot\state\rotation\pe-test.json" (@{ schemaVersion = 1; name = 'pe-test'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
   $env:MOCK_LAUNCH_RUNNING = '1'
   $r6c = Run-Rotate @('-Resume')
-  $intent6c = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  $intent6c = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ("$($intent6c.launchedBy)" -ne 'external') 'a stale revival must not be recorded as an external relaunch'
   Assert-True ((Test-Path "$testRoot\claude-calls.log") -and (Get-Content "$testRoot\claude-calls.log" -Raw) -match 'stop job-stale') 'the revived stale job must be stopped'
   Assert-True (@(Get-Content "$testRoot\launch-calls.log").Count -eq 2 -and $intent6c.phase -eq 'launched' -and "$($intent6c.newJobId)" -eq 'job-new') "the replacement must launch through launch.ps1 after the stop (intent: $($intent6c | ConvertTo-Json -Compress -Depth 4))"
   Assert-True ("$($intent6c.staleRevival.jobId)" -eq 'job-stale') 'the intent records the stale revival it replaced'
-  Assert-True (@($r6c.rotated) -contains 'dispatcher') 'the rotation completes'
+  Assert-True (@($r6c.rotated) -contains 'pe-test') 'the rotation completes'
   # fleet #230 QA: the stale-revival retry starts a fresh window: its snapshot is `launching`
   # with a launchingAt later than the first attempt's.
   $snap1 = Get-Content "$testRoot\intent-at-launch-1.json" -Raw | ConvertFrom-Json
@@ -268,23 +268,23 @@ console.log(JSON.stringify({ ok: true }));
   # Case 6d (control): a session started AFTER the rotation began is a genuine hand relaunch.
   Set-LiveRoster $old 'retired'; Reset-Markers
   Remove-Item "$testRoot\launch-running.marker", "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
-  Set-AgentsRows '[{"id":"job-hand","name":"dispatcher","state":"working","status":"idle","pid":22,"sessionId":"sess-hand","startedAt":1786115823884}]'
+  Set-AgentsRows '[{"id":"job-hand","name":"pe-test","state":"working","status":"idle","pid":22,"sessionId":"sess-hand","startedAt":1786115823884}]'
   [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-hand") | Out-Null
   Write-Utf8 "$testRoot\profile\.claude\jobs\job-hand\state.json" ('{"createdAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o') + '"}')
-  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  Write-Utf8 "$testRoot\state\rotation\pe-test.json" (@{ schemaVersion = 1; name = 'pe-test'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
   $r6d = Run-Rotate @('-Resume')
-  $intent6d = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  $intent6d = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ("$($intent6d.launchedBy)" -eq 'external' -and -not (Test-Path "$testRoot\claude-calls.log")) 'a session launched after the rotation began stays an external relaunch, untouched'
 
   # Case 6e (review of #121): the stale job survives its stop (the name still reads
   # "already running"). That is a failure that keeps the intent open, never external.
   Set-LiveRoster $old 'retired'; Reset-Markers
   Remove-Item "$testRoot\launch-running.marker", "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
-  Set-AgentsRows '[{"id":"job-stale","name":"dispatcher","state":"working","status":"idle","pid":21,"sessionId":"sess-stale","startedAt":1786115823884}]'
-  Write-Utf8 "$testRoot\state\rotation\dispatcher.json" (@{ schemaVersion = 1; name = 'dispatcher'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
+  Set-AgentsRows '[{"id":"job-stale","name":"pe-test","state":"working","status":"idle","pid":21,"sessionId":"sess-stale","startedAt":1786115823884}]'
+  Write-Utf8 "$testRoot\state\rotation\pe-test.json" (@{ schemaVersion = 1; name = 'pe-test'; phase = 'stopped'; reasons = @('age'); savedAt = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); oldSessionId = 'sess-old'; oldJobId = 'job-old'; offset = @{ totalEvents = 2 } } | ConvertTo-Json -Depth 8)
   $env:MOCK_LAUNCH_RUNNING = 'always'
   $r6e = Run-Rotate @('-Resume')
-  $intent6e = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  $intent6e = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ("$($intent6e.launchedBy)" -ne 'external' -and $intent6e.phase -ne 'launched') "a stale revival that survives its stop must not close the intent (intent: $($intent6e | ConvertTo-Json -Compress -Depth 4))"
   Assert-True ("$($intent6e.launchError.reason)" -match 'still running after claude stop') 'the launch error says the stale job survived its stop'
   Assert-True (@($r6e.outcomes | Where-Object { $_.status -eq 'failed' }).Count -eq 1) 'the rotation reports failed'
@@ -296,7 +296,7 @@ console.log(JSON.stringify({ ok: true }));
   $env:MOCK_LAUNCH_FAIL = '1'
   $r7 = Run-Rotate @('-Auto')
   Assert-True ($script:lastExit -eq 5) 'a failed replacement launch must exit nonzero'
-  $intent7 = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  $intent7 = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ($intent7.phase -eq 'stopped') 'a failed launch must leave the intent stopped'
   Assert-True ("$($intent7.launchError.reason)" -match 'cap') 'the launch error must be recorded'
   # fleet #230: the failed attempt was in the launching phase while launch.ps1 ran, and
@@ -306,7 +306,7 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True ("$($intent7.phase)" -ne 'launching') 'a failed launch must not leave the intent in the launching phase'
   Remove-Item Env:MOCK_LAUNCH_FAIL
   $r7b = Run-Rotate @('-Auto')
-  Assert-True (@($r7b.rotated) -contains 'dispatcher') 'the next auto run must complete the interrupted rotation'
+  Assert-True (@($r7b.rotated) -contains 'pe-test') 'the next auto run must complete the interrupted rotation'
 
   # Case 7a (fleet #230 QA): a launch.ps1 that THROWS must not strand the intent in
   # `launching`; it lands in the failure branch: `stopped` + launchError.
@@ -314,7 +314,7 @@ console.log(JSON.stringify({ ok: true }));
   $env:MOCK_LAUNCH_THROW = '1'
   $r7a = Run-Rotate @('-Auto')
   Remove-Item Env:MOCK_LAUNCH_THROW
-  $intent7a = Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw | ConvertFrom-Json
+  $intent7a = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ("$($intent7a.phase)" -eq 'stopped') "a launch.ps1 that throws must leave the intent stopped, not launching (intent: $($intent7a | ConvertTo-Json -Compress -Depth 4))"
   Assert-True ("$($intent7a.launchError.reason)" -match 'threw') 'the throw is recorded as the launch error'
   Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
@@ -333,7 +333,7 @@ console.log(JSON.stringify({ ok: true }));
   Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
   $r8 = Run-Rotate @('-Auto', '-DryRun')
   Assert-True ($r8.outcomes[0].wouldRotate -eq $true) '-DryRun must report the due rotation'
-  Assert-True (-not (Test-Path "$testRoot\state\rotation\dispatcher.json")) '-DryRun must write no intent'
+  Assert-True (-not (Test-Path "$testRoot\state\rotation\pe-test.json")) '-DryRun must write no intent'
   Assert-True (-not (Test-Path "$testRoot\retire-calls.log")) '-DryRun must not stop anything'
   $null = Run-Rotate @('-Name', 'nobody', '-Force')
   Assert-True ($script:lastExit -eq 4) 'a name off the static roster must be refused'
@@ -341,18 +341,18 @@ console.log(JSON.stringify({ ok: true }));
 
   # Ticket 09 ruling 2: -Wake rotates now for the given reason, at the boundary only, without -Force.
   Set-LiveRoster $young; Set-AgentsRows $idleRow; Reset-Markers
-  $rw = Run-Rotate @('-Name', 'dispatcher', '-Wake', 'frontier #501', '-NoReconcile')
-  Assert-True (@($rw.rotated) -contains 'dispatcher') "a -Wake must rotate a young idle session: $lastOut"
-  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'dispatcher') 'a wake must relaunch through launch.ps1 without -Force'
-  $intentW = (Get-Content "$testRoot\state\rotation\dispatcher.json" -Raw) | ConvertFrom-Json
+  $rw = Run-Rotate @('-Name', 'pe-test', '-Wake', 'frontier #501', '-NoReconcile')
+  Assert-True (@($rw.rotated) -contains 'pe-test') "a -Wake must rotate a young idle session: $lastOut"
+  Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'pe-test') 'a wake must relaunch through launch.ps1 without -Force'
+  $intentW = (Get-Content "$testRoot\state\rotation\pe-test.json" -Raw) | ConvertFrom-Json
   Assert-True ((@($intentW.reasons) -join ' ') -match 'frontier-wake: frontier #501') 'the intent must carry the wake reason'
   Set-LiveRoster $young; Set-AgentsRows $busyRow; Reset-Markers
-  $rwb = Run-Rotate @('-Name', 'dispatcher', '-Wake', 'frontier #501', '-NoReconcile')
+  $rwb = Run-Rotate @('-Name', 'pe-test', '-Wake', 'frontier #501', '-NoReconcile')
   Assert-True ((@($rwb.deferred) -join ' ') -match 'busy') 'a wake must defer at a busy boundary like any rotation'
   Write-Utf8 "$testRoot\state\flags\rotation-off" 'x'
   Set-LiveRoster $young; Set-AgentsRows $idleRow; Reset-Markers
   $eap2 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  $rwc = Run-Rotate @('-Name', 'dispatcher', '-Wake', 'frontier #501', '-NoReconcile')
+  $rwc = Run-Rotate @('-Name', 'pe-test', '-Wake', 'frontier #501', '-NoReconcile')
   $ErrorActionPreference = $eap2
   Assert-True (-not (Test-Path "$testRoot\launch-calls.log") -or (Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq '') 'rotation-off must stop a wake too'
   Remove-Item "$testRoot\state\flags\rotation-off"

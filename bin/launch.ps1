@@ -1,7 +1,6 @@
 <#
 .SYNOPSIS  The only door for starting a fleet session (ADR 0002).
 .EXAMPLE   launch.ps1 -Role ic -Name ic-118 -Tenant endzone -Parent pl-endzone -Issue 118 -Prompt "..."
-.EXAMPLE   launch.ps1 -FromRoster dispatcher
 .EXAMPLE   launch.ps1 -FromRoster pl-endzone -DryRun
 #>
 [CmdletBinding()]
@@ -99,7 +98,7 @@ if ($FromRoster) {
   $Role = $e.role; $Name = $e.name; $Tenant = $e.tenant; $Parent = $e.parent; $Prompt = $e.prompt; $cwd = $e.cwd
 }
 foreach ($req in 'Role','Name','Parent','Prompt') { if (-not (Get-Variable $req -ValueOnly)) { $r = Release-ReservationOnRefusal "launch refused: the manifest gives no $req"; Write-Error "missing -$req$($r.note)"; exit 4 } }
-if ($Name -notmatch '^(dispatcher|sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$') { $r = Release-ReservationOnRefusal "launch refused: name '$Name' does not match the fleet naming scheme"; Write-Error "name '$Name' does not match the fleet naming scheme$($r.note)"; exit 4 }
+if ($Name -notmatch '^(sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$') { $r = Release-ReservationOnRefusal "launch refused: name '$Name' does not match the fleet naming scheme"; Write-Error "name '$Name' does not match the fleet naming scheme$($r.note)"; exit 4 }
 # no release: a manifest launch is always Role ic, so the principal and arbiter checks below are reachable only by mixing -FromRoster into a manifest launch (caller mistake; the reservation stays valid for a correct launch).
 if ($Role -eq 'principal' -and $Name -notmatch '^pe-') { Write-Error "a principal session is named pe-<tenant> (ADR 0011)"; exit 4 }
 # no release: same -FromRoster mix-up as the principal name check above.
@@ -115,12 +114,6 @@ if ($Role -eq 'arbiter' -and -not $Tenant) { Write-Error "an arbiter needs -Tena
 if (($Role -eq 'sentinel' -or $Name -eq 'sentinel') -and (Test-SentinelOff) -and -not $DryRun) {
   # no release: the same -FromRoster mix-up as the principal and arbiter checks above; a manifest launch is Role ic and never reaches this.
   Write-Output (@{ launched = $false; reason = 'the rostered Sentinel is disabled by state/flags/sentinel-off (scheduled supervision is live): bin\watchdog.ps1 is the supervisor now' } | ConvertTo-Json -Compress); exit 3
-}
-# WS5 (fleet #82, spec #194): while the dispatcher is retired the one door refuses to start it
-# again; bin\rollback-dispatcher.ps1 removes the flag first. A dry run still evaluates.
-if (($Role -eq 'dispatcher' -or $Name -eq 'dispatcher') -and (Test-DispatcherOff) -and -not $DryRun) {
-  # no release: the same -FromRoster mix-up as the Sentinel check above; a manifest launch is Role ic and never reaches this.
-  Write-Output (@{ launched = $false; reason = 'the dispatcher is retired by state/flags/dispatcher-off (WS5, fleet #82): pages and the daily summary carry its duties; bin\rollback-dispatcher.ps1 brings it back' } | ConvertTo-Json -Compress); exit 3
 }
 # Ticket 89 (ADR 0006 paperwork after one release): an IC starts only from a reserved
 # manifest (assignment.js assign, then launch). The legacy -Prompt launch of an IC is
@@ -379,7 +372,7 @@ if ($toolContractOn) {
   # allowlist, so its write boundary (docs/adr/*.md and CONTEXT.md in the tenant repo,
   # its status file, the triage ledger, its memory; the Arbiter's bounds mirror it) is enforced by hooks/principal-guard.ps1
   # (fleet #39), registered in fleet-settings.json for every fleet session.
-  if ($Role -in @('dispatcher', 'project-lead', 'sentinel', 'arbiter')) {
+  if ($Role -in @('project-lead', 'sentinel', 'arbiter')) {
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
       $tenantRepo = $null
       try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
