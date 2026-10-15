@@ -71,3 +71,41 @@ can point it at any model. A pin is a decision the fleet owns, as the IC's
 sonnet pin (ruling 2026-09-28) and the project lead's `claude-opus-5-5` are.
 "Haiku researcher" in role files and hooks names the family and stands. The
 one sonnet re-dispatch rule (decision 4) is unchanged.
+
+## Amendment (2026-10-15): the researcher reads the code graph first
+
+A tenant can carry a code graph: a checked-in `.graphifyignore` at the repo
+root scopes `graphify update .`, which builds `graphify-out/graph.json` from
+syntax trees alone (no model, about 40 s for Endzone Empire's 1,900 code
+files) and is git-ignored. One `graphify query` answers a call-site or
+dependency question that otherwise costs the researcher a run of greps and
+reads.
+
+1. **Graph first, for code questions, where the tenant opts in.** In a
+   worktree whose root has a `.graphifyignore`, a researcher asked how
+   something works in the code, where it is called or required, or what
+   depends on it, first runs
+   `graphify query "<question naming the symbols>" --budget 8000 | head -c 40000`.
+   `graphify path` and `graphify explain` are allowed as well. Questions about
+   documents, git history, CI logs, threads or the web are unchanged.
+2. **The graph points; the file confirms.** The graph models only syntax: it
+   counts a lazy `require` inside a function as an import, it does not model
+   SQL, socket events or dynamic calls, and it can be older than the
+   worktree. Every `file:line` the researcher reports is one it has read. If
+   the graph has no node for the name, or the answer is thin, the researcher
+   falls back to grep as before.
+3. **The researcher builds a missing graph once.** If `graphify-out/graph.json`
+   is absent in the worktree, the researcher runs `graphify update .` once,
+   then queries. This is the only write the researcher makes: it lands in the
+   git-ignored `graphify-out/` and changes no tracked file. Never more than
+   once per question.
+4. **Sessions still hand the question over.** ICs, leads and dispatchers do not
+   run `graphify` themselves; decision 1 stands, and a graph answer filling
+   the session's context is the cost this ADR exists to avoid. The graph makes
+   the researcher's answer cheaper, not optional.
+5. **The allowlist profile admits graphify.** `config/permissions-allowlist.json`
+   allows `graphify query`, `graphify path`, `graphify explain` and
+   `graphify update .`, because the allowlist gate also gates sub-agents.
+6. **Opt-out is the tenant's.** Deleting the tenant's `.graphifyignore` turns
+   decisions 1 to 3 off for that tenant. A tenant without one (nidus today) is
+   unaffected.
