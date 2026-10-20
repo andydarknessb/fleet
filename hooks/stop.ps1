@@ -183,7 +183,7 @@ try {
 $liveNames = @($liveRows | ForEach-Object { $_.name })
 $rosterNames = @($static.sessions | ForEach-Object { $_.name })
 if ($roster) { $rosterNames += @($roster.sessions | Where-Object { $_.status -eq 'active' } | ForEach-Object { $_.name }) }
-$liveFleet = @($liveNames | Where-Object { $rosterNames -contains $_ })
+$liveFleet = @($liveNames | Where-Object { $rosterNames -contains $_ -and -not (Test-CapExempt "$_") })
 $capFree = $cap - $liveFleet.Count
 $icFree = [int]$t.maxIcs - $activeIcs.Count
 if ($capFree -le 0 -or $icFree -le 0) {

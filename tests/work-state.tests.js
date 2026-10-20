@@ -1729,7 +1729,7 @@ test('reserve scopes the conflict set and the third-assignment count to the reco
   assert.equal(nidus.record.tenant, 'nidus', 'endzone\'s three and its src/e40.js do not bind another repo');
   assert.throws(
     () => reserveRecord({ root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43, manifestPath: 'm43', reservations: { components: ['src/e43.js'] }, idempotencyKey: 'reserve-43', now: '2026-09-24T00:00:02.000Z' }),
-    (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF',
+    (error) => error.code === 'MAX_ICS_REACHED',
     'endzone\'s own count is unchanged by nidus joining',
   );
 });
@@ -2178,4 +2178,17 @@ test('#251 QA: a relative roster manifest resolves against the fleet root, not t
       (error) => error.code === 'RELEASE_CLAIMED',
     );
   } finally { process.chdir(previous); }
+});
+
+test('maxIcs lifts the ceiling in reserveRecord: a fourth assignment with a proof passes at maxIcs 6, and the ceiling is MAX_ICS_REACHED', () => {
+  const root = rootDir();
+  const subjects = [40, 41, 42].map((issue) => ({ issue, reservations: { components: [`bin/${issue}.js`] } }));
+  for (const [index, subject] of subjects.entries()) {
+    reserveRecord({ root, id: `endzone:issue-${subject.issue}`, tenant: 'endzone', issue: subject.issue, manifestPath: `m${subject.issue}`, reservations: subject.reservations, independenceProof: index === 2 ? proofFor(subjects) : undefined, idempotencyKey: `reserve-${subject.issue}`, now: '2026-09-01T00:00:00.000Z' });
+  }
+  const fourth = { issue: 43, reservations: { components: ['bin/43.js'] } };
+  const proof = proofFor([...subjects, fourth]);
+  const attempt = (extra) => () => reserveRecord({ root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43, manifestPath: 'm43', reservations: fourth.reservations, independenceProof: proof, idempotencyKey: 'reserve-43', now: '2026-09-01T00:00:01.000Z', ...extra });
+  assert.throws(attempt({}), (error) => error.code === 'MAX_ICS_REACHED' && /3\/3/.test(error.message), 'no maxIcs falls back to 3');
+  assert.equal(attempt({ maxIcs: 6 })().record.issue, 43);
 });

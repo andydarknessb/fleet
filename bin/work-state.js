@@ -829,8 +829,9 @@ function reserveRecord(options = {}) {
     const proofSubjects = reservationSubjects.filter((record) => record.manifestPath && record.state !== 'retired');
     const expectedProof = proofFor([...proofSubjects, { issue: Number(options.issue), reservations: options.reservations }]);
     const maxIcs = Number(options.maxIcs) || 3;
-    if (activeAssignments.length >= maxIcs || (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof))) {
-      throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', `an assignment past the second requires an independent machine-readable proof, and at most ${maxIcs} may be active`);
+    if (activeAssignments.length >= maxIcs) throw new WorkStateError('MAX_ICS_REACHED', `${activeAssignments.length}/${maxIcs} assignments are active; wait for one to finish`);
+    if (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof)) {
+      throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'an assignment past the second requires an independent machine-readable proof');
     }
     const conflicts = reservationConflicts(Object.fromEntries(reservationSubjects.map((record) => [record.id, record])), options.reservations);
     if (conflicts.length) {

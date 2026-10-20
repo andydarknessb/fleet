@@ -148,7 +148,8 @@ if ($Manifest) {
   # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
   # A record with no tenant is legacy and still counts, matching isForeignRecord.
   $activeAssignments = @($activeState.records.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.manifestPath -and $_.state -ne 'retired' -and $_.id -ne $WorkRecordId -and (-not $_.tenant -or [string]$_.tenant -eq [string]$Tenant) })
-  if ($activeAssignments.Count -ge 3) { $r = Release-ReservationOnRefusal 'launch refused: a fourth assignment is not permitted'; Write-Error "a fourth assignment is not permitted$($r.note)"; exit 4 }
+  $maxIcs = [int]$t.maxIcs; if ($maxIcs -le 0) { $maxIcs = 3 }
+  if ($activeAssignments.Count -ge $maxIcs) { $r = Release-ReservationOnRefusal "launch refused: $($activeAssignments.Count) assignments are active, at the tenant's maxIcs ($maxIcs)"; Write-Error "$($activeAssignments.Count) assignments are active, at the tenant's maxIcs ($maxIcs)$($r.note)"; exit 4 }
   if ($activeAssignments.Count -ge 2) {
     $proof = $assignment.independenceProof
     $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
@@ -158,7 +159,7 @@ if ($Manifest) {
     $missingReservationIssues = @($proof.missingReservations)
     $proofHasMissingReservations = $proof -and $proof.PSObject.Properties.Name -contains 'missingReservations'
     $proofValid = $proof -and $proofHasMissingReservations -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and $missingReservationIssues.Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
-    if (-not $proofValid) { $r = Release-ReservationOnRefusal 'launch refused: a third assignment requires a verified independent machine-readable proof'; Write-Error "a third assignment requires a verified independent machine-readable proof$($r.note)"; exit 4 }
+    if (-not $proofValid) { $r = Release-ReservationOnRefusal 'launch refused: an assignment past the second requires a verified independent machine-readable proof'; Write-Error "an assignment past the second requires a verified independent machine-readable proof$($r.note)"; exit 4 }
   }
 }
 
