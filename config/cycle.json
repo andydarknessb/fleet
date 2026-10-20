@@ -47,7 +47,7 @@
     "tailHours": 12,
     "waitTickMinutes": 15,
     "waitGapMinutes": 35,
-    "icCap": 3,
+    "icCap": 6,
     "sentBackRate": { "watch": 0.3, "weak": 0.45 },
     "escapedRate": { "weak": 0.05 },
     "fleetDeadRate": { "watch": 0.02, "weak": 0.1 },

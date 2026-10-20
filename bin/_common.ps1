@@ -266,7 +266,7 @@ function Test-PermissionPromptNeeds { param([string]$Needs) return ("$Needs" -cm
 # The --model and --effort a launch passes today, in one place (fleet #121): launch.ps1
 # builds its command from these, and sentinel-check.ps1 compares a daemon job's frozen
 # respawnFlags against them before `claude respawn` replays that job. 'opus' pins Opus
-# 4.8 for ICs, 'fable' the Arbiter's seat (ADR 0017: the fleet's one Fable seat; the
+# 4.8 for ICs, 'fable' an explicit -Model only (the Arbiter left Fable 2026-10-20; the
 # Principal held it under ADR 0011 and moved to opus-5.5), 'opus-5.5' the project-lead
 # default (owner ruling 2026-09-23) and, since ADR 0017, the principal's; a principal,
 # arbiter or lead with no -Model gets its pin.
@@ -277,7 +277,7 @@ $script:IcSonnetPin = 'claude-sonnet-5-5'
 function Resolve-LaunchModel {
   param([string]$Role, [string]$Model)
   if (-not $Model -and $Role -eq 'principal') { $Model = 'opus-5.5' }
-  if (-not $Model -and $Role -eq 'arbiter') { $Model = 'fable' }
+  if (-not $Model -and $Role -eq 'arbiter') { $Model = 'opus-5.5' }
   if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
   if (-not $Model -and $Role -eq 'ic') { $Model = 'sonnet' }
   $id = if (-not $Model) { '' } elseif ($script:LaunchModelPins.ContainsKey($Model)) { $script:LaunchModelPins[$Model] } else { $Model }

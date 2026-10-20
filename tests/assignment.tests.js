@@ -336,7 +336,7 @@ test('a third assignment requires and records an independence proof', () => {
 });
 
 test('a third assignment fails closed without reservation evidence', () => {
-  const frontier = { eligible: [issue(50, { body: 'Improve the experience.' }), issue(51), issue(52)] };
+  const frontier = { eligible: [issue(50, { body: 'Improve the experience.' })] };
   const active = [
     { id: 'endzone:issue-40', issue: 40, state: 'implementing', manifestPath: 'm40', reservations: {} },
     { id: 'endzone:issue-41', issue: 41, state: 'implementing', manifestPath: 'm41', reservations: {} },
@@ -1253,4 +1253,29 @@ test('fleet#304: an explicit set that really overlaps an active reservation stil
   const overlap = '{"components":["src/a.js"]}';
   assert.throws(() => cli(['proof', ...common, '--reservations', overlap]), (error) => error.code === 'NO_FRONTIER');
   assert.throws(() => cli(['assign', ...common, '--base-sha', 'e'.repeat(40), '--reservations', overlap]), (error) => error.code === 'NO_FRONTIER');
+});
+
+test('maxIcs is the ceiling: the launch plan fills past the third with independent candidates only', () => {
+  const act = (n) => ({ id: `endzone:issue-${n}`, issue: n, state: 'implementing', manifestPath: `m${n}`, reservations: { components: [`bin/a${n}.js`] } });
+  const active = [40, 41, 42, 43].map(act);
+  const frontier = { eligible: [issue(50, { components: ['bin/a40.js'] }), issue(51, { components: ['bin/c51.js'] }), issue(52, { components: ['bin/c52.js'] }), issue(53, { components: ['bin/c53.js'] })] };
+  const plan = buildLaunchPlan({ frontier, active, maxIcs: 6 });
+  assert.deepEqual(plan.assignments.map((entry) => entry.number), [51, 52], 'the conflicting candidate is skipped and the plan stops at six');
+  assert.equal(plan.thirdProof.independent, true);
+  assert.equal(buildLaunchPlan({ frontier, active, maxIcs: 3 }).assignments.length, 0, 'at three the same set adds nothing');
+  assert.equal(buildLaunchPlan({ frontier, active: active.slice(0, 3) }).assignments.length, 0, 'maxIcs defaults to 3');
+});
+
+test('reserveAssignment past the second needs the proof, and maxIcs is the ceiling', () => {
+  const act = (n) => ({ id: `endzone:issue-${n}`, issue: n, state: 'implementing', manifestPath: `m${n}`, reservations: { components: [`bin/a${n}.js`] } });
+  const base = { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) };
+  const reserve = (active, tenantConfig, extra = {}) => reserveAssignment({ root: rootDir(), issue: issue(60, { components: ['bin/new.js'] }), tenant: 'endzone', tenantConfig, active, readyLabel: 'ready-for-agent', base, ...extra });
+  const three = [40, 41, 42].map(act);
+  assert.throws(() => reserve(three, { maxIcs: 6 }), (error) => error.code === 'THIRD_ASSIGNMENT_REQUIRES_PROOF');
+  const proof = independenceProof([...three, normalizeIssue(issue(60, { components: ['bin/new.js'] }))]);
+  assert.ok(reserve(three, { maxIcs: 6 }, { independenceProof: proof }));
+  const six = [40, 41, 42, 43, 44, 45].map(act);
+  assert.throws(() => reserve(six, { maxIcs: 6 }), (error) => error.code === 'MAX_ICS_REACHED' && /6\/6/.test(error.message));
+  assert.throws(() => reserve(three, {}, { independenceProof: proof }), (error) => error.code === 'MAX_ICS_REACHED', 'no maxIcs falls back to 3');
+  assert.throws(() => reserve(three, { maxIcs: 3 }, { independenceProof: proof }), (error) => error.code === 'MAX_ICS_REACHED');
 });

@@ -146,3 +146,26 @@ Decided:
   frontier exclusion) is Cory's; the Principal does not finalize over it. The
   record id must name the issue it is recorded on; one naming another issue
   answers nothing and fails closed.
+
+## Amendment 2026-10-20 - the Arbiter on Opus at xhigh, role efforts, six ICs (owner ruling)
+
+Cory ruled, 2026-10-20, from a Nidus owner session: more ICs, cheaper efforts
+where judgment is light, and the most effort where a ruling is final.
+
+Decided:
+
+- Decision 9 is superseded. The Arbiter runs `claude-opus-5-5` at effort
+  xhigh; the fleet has no Fable seat. `_common.ps1` defaults `arbiter` to
+  `opus-5.5`; the `fable` pin stays so an explicit `-Model fable` still
+  resolves.
+- Role efforts, set in each role file and passed by the launch door with
+  `--effort`: researcher low, IC medium (haiku or sonnet alike), project lead
+  medium, Principal high, Arbiter xhigh. The qa-reviewer worker stays Opus at
+  high.
+- Six ICs. Each tenant's `maxIcs` is 6 and the static roster cap is 8, so the
+  two project leads and six ICs fit fleet-wide; the Principal and Arbiter stay
+  outside the cap. ADR 0006's ceiling of three concurrent assignments per
+  tenant becomes the tenant's `maxIcs`: every assignment past the second still
+  carries the independence proof over the whole set, and `reserveAssignment`
+  refuses one at the ceiling `MAX_ICS_REACHED`. `config/cycle.json`
+  `scorecard.icCap` (the fallback when the roster is unreadable) is 6.

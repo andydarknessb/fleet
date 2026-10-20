@@ -31,7 +31,7 @@ try {
     Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
   }
   Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: opus-5.5`neffort: high`n---`nRole body for principal."
-  Write-Utf8 "$testRoot\agents\arbiter.md" "---`nname: arbiter`nmodel: fable`neffort: high`n---`nRole body for arbiter."
+  Write-Utf8 "$testRoot\agents\arbiter.md" "---`nname: arbiter`nmodel: claude-opus-5-5`neffort: xhigh`n---`nRole body for arbiter."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -286,12 +286,12 @@ exit $LASTEXITCODE
   Assert-True ($denyP -contains "Edit($rootFwd/state/work/**)") 'a principal still loses the direct state-door writes'
   $rpf = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-Model', 'fable', '-DryRun')
   Assert-True ("$($rpf.command)" -match '--model claude-fable-5-1') 'an explicit -Model fable must resolve to the same pinned id'
-  # ADR 0017: the Arbiter comes through the door as ar-<tenant> on the pinned Fable id at
-  # effort high, with its own first-turn ceiling; it is named by scheme and needs a tenant.
+  # ADR 0017: the Arbiter comes through the door as ar-<tenant> on the pinned Opus 5.5 id at
+  # effort xhigh, with its own first-turn ceiling; it is named by scheme and needs a tenant.
   $rar = Run-Launch @('-Role', 'arbiter', '-Name', 'ar-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Decide triage.', '-DryRun')
   Assert-True ($rar.dryRun -eq $true) "an arbiter dry run must pass the gates (got: $rar)"
-  Assert-True ("$($rar.command)" -match '--model claude-fable-5-1') 'an arbiter with no -Model must run the pinned Fable id (ADR 0017)'
-  Assert-True ("$($rar.command)" -match '--effort high') 'an arbiter must run at the role file effort'
+  Assert-True ("$($rar.command)" -match '--model claude-opus-5-5') 'an arbiter with no -Model must run the pinned Opus 5.5 id (owner ruling 2026-10-20)'
+  Assert-True ("$($rar.command)" -match '--effort xhigh') 'an arbiter must run at the role file effort'
   Assert-True ($rar.budget.ceiling -eq 30000) 'the arbiter ceiling must come from config/cycle.json'
   Run-Launch @('-Role', 'arbiter', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
   Assert-True ($script:lastExit -eq 4) 'an arbiter not named ar-<tenant> must be refused as a usage error'

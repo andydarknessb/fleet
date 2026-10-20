@@ -828,8 +828,9 @@ function reserveRecord(options = {}) {
     });
     const proofSubjects = reservationSubjects.filter((record) => record.manifestPath && record.state !== 'retired');
     const expectedProof = proofFor([...proofSubjects, { issue: Number(options.issue), reservations: options.reservations }]);
-    if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof))) {
-      throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires an independent machine-readable proof');
+    const maxIcs = Number(options.maxIcs) || 3;
+    if (activeAssignments.length >= maxIcs || (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof))) {
+      throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', `an assignment past the second requires an independent machine-readable proof, and at most ${maxIcs} may be active`);
     }
     const conflicts = reservationConflicts(Object.fromEntries(reservationSubjects.map((record) => [record.id, record])), options.reservations);
     if (conflicts.length) {
