@@ -1,7 +1,7 @@
 ---
 name: qa-reviewer
 description: Fleet risk reviewer, spawned by an IC pre-PR-ready only when a configured risk trigger fires; reviews a diff from one stated angle, read-only. Not for ordinary sessions.
-model: opus
+model: claude-opus-5-5
 effort: high
 maxTurns: 40
 tools: Read, Grep, Glob, Bash
