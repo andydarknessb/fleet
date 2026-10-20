@@ -1279,3 +1279,14 @@ test('reserveAssignment past the second needs the proof, and maxIcs is the ceili
   assert.throws(() => reserve(three, {}, { independenceProof: proof }), (error) => error.code === 'MAX_ICS_REACHED', 'no maxIcs falls back to 3');
   assert.throws(() => reserve(three, { maxIcs: 3 }, { independenceProof: proof }), (error) => error.code === 'MAX_ICS_REACHED');
 });
+
+test('reserveAssignment hands maxIcs to the work-state lock: a fourth reservation over three real records under maxIcs 6', () => {
+  const root = rootDir();
+  const seeded = [40, 41, 42].map((n) => ({ id: `endzone:issue-${n}`, issue: n, state: 'reserved', manifestPath: `m${n}`, reservations: { components: [`bin/a${n}.js`] } }));
+  for (const [index, record] of seeded.entries()) {
+    reserveRecord({ root, id: record.id, tenant: 'endzone', issue: record.issue, manifestPath: record.manifestPath, reservations: record.reservations, independenceProof: index === 2 ? independenceProof(seeded) : undefined, idempotencyKey: `reserve-${record.issue}`, now: '2026-09-24T00:00:00.000Z' });
+  }
+  const proof = independenceProof([...seeded, normalizeIssue(issue(60, { components: ['bin/new.js'] }))]);
+  const reserved = reserveAssignment({ root, issue: issue(60, { components: ['bin/new.js'] }), tenant: 'endzone', tenantConfig: { maxIcs: 6 }, active: seeded, readyLabel: 'ready-for-agent', base: { remote: 'origin', ref: 'integration', sha: 'd'.repeat(40) }, independenceProof: proof });
+  assert.ok(reserved.reservation);
+});
