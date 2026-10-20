@@ -280,13 +280,13 @@ function buildLaunchPlan({ frontier, active = [], issues = [], maxIcs = 3, tenan
     if (activeAssignments.length + selected.length >= Math.min(2, maxIcs)) break;
     if (reservationConflicts(candidate, [...activeAssignments, ...selected]).length === 0) selected.push(candidate);
   }
+  // Past the second, each candidate joins only when the whole set stays independent, up to maxIcs.
   let thirdProof = null;
-  if (maxIcs >= 3 && activeAssignments.length + selected.length < 3) {
-    const third = candidates.find((candidate) => !selected.some((entry) => entry.number === candidate.number));
-    if (third) {
-      thirdProof = independenceProof([...activeAssignments, ...selected, third]);
-      if (thirdProof.independent) selected.push(third);
-    }
+  for (const candidate of candidates) {
+    if (activeAssignments.length + selected.length >= maxIcs) break;
+    if (selected.some((entry) => entry.number === candidate.number)) continue;
+    thirdProof = independenceProof([...activeAssignments, ...selected, candidate]);
+    if (thirdProof.independent) selected.push(candidate);
   }
   return { assignments: selected, thirdProof };
 }
@@ -727,13 +727,15 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
   const baseline = reservationBaseline({ root, id: workRecordId });
   const activeAssignments = proofRecords.filter((record) => record.manifestPath && record.state !== 'retired');
   const expectedProof = independenceProof([...activeAssignments, normalized]);
-  if (activeAssignments.length >= 3 || (activeAssignments.length >= 2 && !proofMatches(expectedProof, proof))) throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'a third assignment requires a verified independent machine-readable proof');
+  const maxIcs = Number(tenantConfig.maxIcs) || 3;
+  if (activeAssignments.length >= maxIcs) throw new WorkStateError('MAX_ICS_REACHED', `${activeAssignments.length}/${maxIcs} assignments are active; wait for one to finish`);
+  if (activeAssignments.length >= 2 && !proofMatches(expectedProof, proof)) throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'an assignment past the second requires a verified independent machine-readable proof');
   const manifest = buildManifest({ issue: normalized, tenant, tenantConfig, readyLabel, parent, model, permissions, risk, tokenBudget, base: resolvedBase, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, premiseCheck, now, workRecordId, workRecordRevision: baseline.revision });
   const manifestPath = writeManifest(root, manifest);
   try {
     const reserved = reserveRecord({
       root, id: workRecordId, tenant, issue: normalized.number, manifestPath, assignment: { manifestId: manifest.id, branch: manifest.branch, baseSha: manifest.base.sha, independenceProof: proof || null, premises: manifest.premises, premiseCheck: manifest.premiseCheck },
-      github: { issueNumber: normalized.number, issueUrl: normalized.url, bodyHash: normalized.bodyHash, criteriaHash: normalized.criteriaHash, commentCount: normalized.comments.length }, reservations: normalized.reservations, proofRecords: activeAssignments, independenceProof: proof,
+      github: { issueNumber: normalized.number, issueUrl: normalized.url, bodyHash: normalized.bodyHash, criteriaHash: normalized.criteriaHash, commentCount: normalized.comments.length }, reservations: normalized.reservations, proofRecords: activeAssignments, independenceProof: proof, maxIcs,
       evidence: { github: `gh issue view ${normalized.number}`, manifest: path.relative(path.resolve(root), manifestPath) },
       idempotencyKey: `assignment-reserved:${manifest.id}`, actor, now,
     });

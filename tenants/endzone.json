@@ -9,7 +9,7 @@
   "ownerLogin": "andydarknessb",
   "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",
-  "maxIcs": 3,
+  "maxIcs": 6,
   "carveOuts": [
     "server/db/migrations/**",
     "**/knexfile*",

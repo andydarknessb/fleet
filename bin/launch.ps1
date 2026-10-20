@@ -148,7 +148,8 @@ if ($Manifest) {
   # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
   # A record with no tenant is legacy and still counts, matching isForeignRecord.
   $activeAssignments = @($activeState.records.PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.manifestPath -and $_.state -ne 'retired' -and $_.id -ne $WorkRecordId -and (-not $_.tenant -or [string]$_.tenant -eq [string]$Tenant) })
-  if ($activeAssignments.Count -ge 3) { $r = Release-ReservationOnRefusal 'launch refused: a fourth assignment is not permitted'; Write-Error "a fourth assignment is not permitted$($r.note)"; exit 4 }
+  $maxIcs = [int]$t.maxIcs; if ($maxIcs -le 0) { $maxIcs = 3 }
+  if ($activeAssignments.Count -ge $maxIcs) { $r = Release-ReservationOnRefusal "launch refused: $($activeAssignments.Count) assignments are active, at the tenant's maxIcs ($maxIcs)"; Write-Error "$($activeAssignments.Count) assignments are active, at the tenant's maxIcs ($maxIcs)$($r.note)"; exit 4 }
   if ($activeAssignments.Count -ge 2) {
     $proof = $assignment.independenceProof
     $expectedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources')
@@ -158,7 +159,7 @@ if ($Manifest) {
     $missingReservationIssues = @($proof.missingReservations)
     $proofHasMissingReservations = $proof -and $proof.PSObject.Properties.Name -contains 'missingReservations'
     $proofValid = $proof -and $proofHasMissingReservations -and $proof.independent -and @($proof.conflicts).Count -eq 0 -and $missingReservationIssues.Count -eq 0 -and (($actualCandidates -join ',') -eq ($expectedCandidates -join ',')) -and (($actualFields -join ',') -eq (($expectedFields | Sort-Object) -join ','))
-    if (-not $proofValid) { $r = Release-ReservationOnRefusal 'launch refused: a third assignment requires a verified independent machine-readable proof'; Write-Error "a third assignment requires a verified independent machine-readable proof$($r.note)"; exit 4 }
+    if (-not $proofValid) { $r = Release-ReservationOnRefusal 'launch refused: an assignment past the second requires a verified independent machine-readable proof'; Write-Error "an assignment past the second requires a verified independent machine-readable proof$($r.note)"; exit 4 }
   }
 }
 
@@ -452,13 +453,12 @@ Write-Json $settingsPath $settings
 
 # The friendly -Model token is passed to `claude --model`, but the bare 'opus'
 # alias tracks the latest Opus (currently Opus 5). ICs must run Opus 4.8, so pin
-# 'opus' to the concrete id. 'fable' is pinned too (ADR 0011, moved to the Arbiter by
-# ADR 0017: it is the one Fable seat and a default-Fable bump must not move it silently; the installed
+# 'opus' to the concrete id. 'fable' stays pinned (ADR 0011) so an explicit -Model fable
+# resolves to claude-fable-5-1 and a default-Fable bump cannot move it silently; the installed
 # CLI 2.1.269 admits claude-fable-5-1 to auto mode, verified in its model predicate
-# 2026-09-11, so no fleet #28-style refusal). Other tokens keep their CLI aliases.
-# An arbiter launched with no -Model runs the role file's `model: fable` alias (a
-# principal, since ADR 0017, runs Opus 5.5 like a lead); pin that path too so the two
-# spellings resolve to the same id.
+# 2026-09-11, so no fleet #28-style refusal. Other tokens keep their CLI aliases.
+# An arbiter launched with no -Model runs pinned Opus 5.5 like the principal and project
+# lead (owner ruling 2026-10-20, ADR 0017 amendment); the role file's `model:` agrees.
 # A project lead launched with no -Model runs Opus 5.5 (owner ruling 2026-09-23),
 # pinned for the same reason; CLI 2.1.280 admits claude-opus-5-5 to auto mode.
 # An IC on sonnet runs pinned Sonnet 5.5 (owner ruling 2026-09-28): CLI 2.1.284's

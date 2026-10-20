@@ -77,6 +77,15 @@ try {
   Assert-True ((Get-Continue).stoppedBecause -match 'claude CLI unavailable' -and (Get-Continue).stoppedBecause -match 'empty') "the stop reason must name the unreadable read: $((Get-Continue).stoppedBecause)"
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
 
+  # QA on #322: the Principal and the Arbiter are cap-exempt, so live pe-/ar- sessions must not eat the lead's free slots.
+  # Cap 2 with both live and rostered: capFree must stay 2, so the hook still continues on the frontier.
+  Write-Utf8 "$testRoot\roster.json" '{"cap":2,"sessions":[{"name":"pe-test"},{"name":"ar-test"}]}'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo [{"name":"pe-test"},{"name":"ar-test"}]' + "`r`n" + 'exit /b 0' + "`r`n")
+  $out4b = Run-Stop
+  Assert-True ($lastExit -eq 2 -and $out4b -match 'assignment frontier #101' -and $out4b -notmatch 'no free slot') "live pe-/ar- sessions must not count against the cap: exit $lastExit :: $out4b"
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" echo []' + "`r`n" + 'exit /b 0' + "`r`n")
+
   # fleet#51: "CI settled" used to be read from live GitHub while `record --kind formal` reads
   # the Work record, which the watcher advances on a five-minute tick; the hook continued the
   # lead onto a PR the review gate then refused (INVALID_REVIEW_STATE). A PR awaits review only

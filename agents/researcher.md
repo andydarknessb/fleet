@@ -2,6 +2,7 @@
 name: researcher
 description: Read-only fact-finder on the cheapest tier. Spawn it from any session, fleet or ordinary, for documentation research and any non-coding lookup - reading docs, finding how something works in a repo, locating call sites, summarizing an issue thread or CI log. It edits nothing and decides nothing.
 model: claude-haiku-5-5
+effort: low
 maxTurns: 60
 tools: Read, Grep, Glob, Bash, WebFetch, WebSearch
 ---

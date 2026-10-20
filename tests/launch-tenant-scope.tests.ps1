@@ -8,7 +8,7 @@ $fleetHome = Split-Path -Parent $PSScriptRoot
 $utf8 = New-Object System.Text.UTF8Encoding $false
 
 function Invoke-ManifestDryRun {
-  param([string]$Label, [hashtable[]]$ActiveRecords, [string]$ManifestTenant)
+  param([string]$Label, [hashtable[]]$ActiveRecords, [string]$ManifestTenant, [int]$MaxIcs = 3, $Proof = $null)
   $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-tenant-scope-" + [guid]::NewGuid().ToString('N'))
   try {
     foreach ($dir in 'bin','tenants','repo','state','state/work') { [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null }
@@ -18,9 +18,10 @@ function Invoke-ManifestDryRun {
     [IO.File]::WriteAllText("$testRoot\roster.json", '{"cap":6,"sessions":[]}', $utf8)
     [IO.File]::WriteAllText("$testRoot\fleet-settings.json", '{}', $utf8)
     foreach ($tenant in 'endzone','nidus') {
-      [IO.File]::WriteAllText("$testRoot\tenants\$tenant.json", (@{ name = $tenant; repo = $repo; maxIcs = 3 } | ConvertTo-Json), $utf8)
+      [IO.File]::WriteAllText("$testRoot\tenants\$tenant.json", (@{ name = $tenant; repo = $repo; maxIcs = $MaxIcs } | ConvertTo-Json), $utf8)
     }
     $manifest = @{ status = 'pending-ack'; workRecordId = "${ManifestTenant}:issue-2"; issue = @{ number = 2 }; tenant = $ManifestTenant; parent = "pl-$ManifestTenant"; model = 'sonnet' }
+    if ($Proof) { $manifest.independenceProof = $Proof }
     $manifestPath = "$testRoot\assignment-2.json"
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
     $records = @{}
@@ -60,5 +61,13 @@ if ($r.output -match 'fourth') { throw "launch.ps1 refused nidus as a fourth ass
 # 3. Control: two nidus ICs active, a third nidus manifest without a proof is still refused.
 $r = Invoke-ManifestDryRun -Label 'same tenant third' -ActiveRecords $nidusTwo -ManifestTenant 'nidus'
 if ($r.exitCode -ne 4 -or $r.output -notmatch 'verified independent machine-readable proof') { throw "launch.ps1 stopped enforcing the same-tenant third-assignment proof: exit $($r.exitCode) $($r.output)" }
+
+# 4. maxIcs lifts the ceiling: three nidus ICs active, a fourth with a valid proof is admitted at maxIcs 6, refused at 3.
+$nidusThree = $nidusTwo + @(@{ id = 'nidus:issue-5'; tenant = 'nidus'; issue = 5 })
+$proof = @{ independent = $true; conflicts = @(); missingReservations = @(); candidates = @(2, 3, 4, 5); checkedFields = @('components', 'migrationPrefixes', 'schemaAreas', 'testResources') }
+$r = Invoke-ManifestDryRun -Label 'fourth, maxIcs 6' -ActiveRecords $nidusThree -ManifestTenant 'nidus' -MaxIcs 6 -Proof $proof
+if ($r.output -match "maxIcs|machine-readable proof|is not assigned") { throw "launch.ps1 refused a fourth assignment with a valid proof at maxIcs 6: exit $($r.exitCode) $($r.output)" }
+$r = Invoke-ManifestDryRun -Label 'fourth, maxIcs 3' -ActiveRecords $nidusThree -ManifestTenant 'nidus' -MaxIcs 3 -Proof $proof
+if ($r.exitCode -ne 4 -or $r.output -notmatch "maxIcs") { throw "launch.ps1 admitted a fourth assignment at maxIcs 3: exit $($r.exitCode) $($r.output)" }
 
 Write-Output 'launch tenant-scope tests passed'
