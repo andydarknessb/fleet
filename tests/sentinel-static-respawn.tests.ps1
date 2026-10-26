@@ -78,9 +78,9 @@ exit 0
   $env:USERPROFILE = "$testRoot\profile"
   $env:FLEET_RESPAWN_VERIFY_MS = '50'
   $env:FLEET_RESPAWN_VERIFY_POLL_MS = '10'
-  $currentFlags = @('--name', 'pl-test', '--agent', 'project-lead', '--settings', 'x', '--model', 'claude-opus-5-5', '--effort', 'high')
+  $currentFlags = @('--name', 'pl-test', '--agent', 'project-lead', '--settings', 'x', '--model', 'claude-sonnet-5-5', '--effort', 'high')
   $frozenFlags = @('--name', 'pl-test', '--agent', 'project-lead', '--settings', 'x', '--model', 'claude-opus-5', '--effort', 'xhigh')
-  $activeRow = '{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","jobId":"job-p","model":"opus-5.5"}]}'
+  $activeRow = '{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","jobId":"job-p","model":"sonnet-5.5"}]}'
 
   # S1 (control): the roster's own job, flags as launch.ps1 passes them today: claude respawn keeps its history.
   $env:MOCK_ROW_ID = 'job-p'
@@ -100,7 +100,7 @@ exit 0
   Assert-True ($calls2 -contains 'claude stop job-p' -and $calls2 -contains 'launch pl-test') "S2: the stale job is stopped and pl-test relaunched from the roster (calls: $($calls2 -join '; '))"
   Assert-True ([array]::IndexOf($calls2, 'claude stop job-p') -lt [array]::IndexOf($calls2, 'launch pl-test')) 'S2: stop comes before the launch'
   $r2 = @($s2.respawned | Where-Object { $_.name -eq 'pl-test' })[0]
-  Assert-True ($r2 -and "$($r2.via)" -eq 'launch' -and "$($r2.jobId)" -eq 'job-new' -and "$($r2.reason)" -match 'claude-opus-5\b' -and "$($r2.reason)" -match 'claude-opus-5-5') "S2: the report says it relaunched, names the new job and both flag sets: $($r2 | ConvertTo-Json -Compress)"
+  Assert-True ($r2 -and "$($r2.via)" -eq 'launch' -and "$($r2.jobId)" -eq 'job-new' -and "$($r2.reason)" -match 'claude-opus-5\b' -and "$($r2.reason)" -match 'claude-sonnet-5-5') "S2: the report says it relaunched, names the new job and both flag sets: $($r2 | ConvertTo-Json -Compress)"
 
   # S3 (the incident): no active live-roster row at all. The newest daemon row is a stale job; relaunch, never respawn.
   $env:MOCK_ROW_ID = 'job-old'

@@ -518,6 +518,7 @@ test('#124: modelFamily folds aliases and full ids onto one family key and keeps
   assert.deepEqual(modelFamily('claude-haiku-4-5-20251001'), { key: 'haiku', recognized: true });
   assert.deepEqual(modelFamily('claude-haiku-5-5'), { key: 'haiku', recognized: true });
   assert.deepEqual(modelFamily('fable'), { key: 'fable', recognized: true });
+  assert.deepEqual(modelFamily('deepseek-flash'), { key: 'deepseek', recognized: true });
   assert.deepEqual(modelFamily('claude-fable-5-1'), { key: 'fable', recognized: true });
   assert.deepEqual(modelFamily('gpt-9-turbo'), { key: 'gpt-9-turbo', recognized: false });
   assert.deepEqual(modelFamily(null), { key: 'unknown', recognized: false });
@@ -760,7 +761,7 @@ test('#126: with an empty roster, subagent transcripts are still not read as ses
 // no per-family figure.
 const familyUnit = (issue, model, job) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', model, merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: job, jobTokens: job, cacheReadInputTokens: 0 } });
 const familyUnits = [familyUnit(1, 'sonnet', 100000), familyUnit(2, 'sonnet', 140000), familyUnit(3, 'sonnet', 300000), familyUnit(4, 'haiku', 20000), familyUnit(5, 'haiku', 40000)];
-const nullTargets = { haiku: null, sonnet: null, opus: null, fable: null };
+const nullTargets = { haiku: null, sonnet: null, opus: null, fable: null, deepseek: null };
 
 test('#128: with every per-model target null, the median and p90 print per family with no verdict', () => {
   const report = buildReport(familyUnits, [], { budgets: { icJobTokensMedianReference: 60000, icJobTokensTargets: nullTargets } });

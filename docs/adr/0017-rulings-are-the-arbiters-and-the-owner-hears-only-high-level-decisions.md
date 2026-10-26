@@ -169,3 +169,31 @@ Decided:
   carries the independence proof over the whole set, and `reserveAssignment`
   refuses one at the ceiling `MAX_ICS_REACHED`. `config/cycle.json`
   `scorecard.icCap` (the fallback when the roster is unreadable) is 6.
+
+## Amendment 2026-10-26 - the project lead on Sonnet 5.5, ICs on DeepSeek V4.1 Flash, both at high (owner ruling)
+
+Cory ruled, 2026-10-26: the project lead moves to Sonnet 5.5 at effort high,
+and the IC's default model becomes DeepSeek V4.1 Flash at effort high, with
+sonnet and haiku kept as fallbacks.
+
+Decided:
+
+- The project lead runs `claude-sonnet-5-5` at effort high. `_common.ps1`
+  defaults `project-lead` to the new `sonnet-5.5` token; `opus-5.5` stays the
+  Principal's and the Arbiter's. A running lead moves at its next relaunch
+  through the door with no `-Model` (every rotation is one); a live-roster row
+  that still names `opus-5.5` keeps Opus on a sentinel relaunch until then.
+- Role efforts: IC high on every tier, project lead high. Researcher low,
+  Principal high, Arbiter xhigh and the qa-reviewer worker at high stand.
+- ICs gain the `deepseek` tier, the lead's default pick: DeepSeek V4.1 Flash
+  through DeepSeek's Anthropic-format API, under the allowlist profile only
+  (ADR 0016 Amendment 4), and closed until its rehearsal passes. The lead falls
+  back to haiku or sonnet, by the role file's existing ticket types, only when
+  the launch refuses the deepseek tier. Amendment 14's "never opus" stands.
+- Every worker a deepseek IC starts shares its API: DeepSeek serves the
+  qa-reviewer's `claude-opus-5-5` pin on its Pro model and the researcher on
+  Flash. The owner accepted this; the lead's formal review stays the one
+  Claude read of every PR.
+- Anthropic does not support Claude Code on non-Claude models. The fleet
+  carries that risk; the rehearsal gate is the check, and sonnet is the way
+  back.

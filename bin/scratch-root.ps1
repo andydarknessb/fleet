@@ -12,6 +12,7 @@
   here, one assign, one launch.
 .EXAMPLE   bin\scratch-root.ps1 -Path E:\fleet-scratch
 .EXAMPLE   bin\scratch-root.ps1 -Path E:\fleet-scratch -Tenant endzone -Issue 1650
+.EXAMPLE   bin\scratch-root.ps1 -Path E:\fleet-scratch -Issue 1650 -Model deepseek
 #>
 [CmdletBinding()]
 param(
@@ -19,6 +20,8 @@ param(
   [string]$Tenant = 'endzone',
   [int]$Issue,          # the rehearsal's chosen ticket; only fills in the printed commands
   [string]$Parent,      # the IC's parent in the printed assign (default pl-<tenant>)
+  [ValidateSet('haiku', 'deepseek')]
+  [string]$Model = 'haiku', # the allowlist tier the printed assign rehearses (deepseek: owner ruling 2026-10-26)
   [string]$LiveRoot     # the running fleet (default: the target of ~/.claude/agents, else ~/fleet)
 )
 $ErrorActionPreference = 'Stop'
@@ -127,7 +130,7 @@ if (-not $Parent) { $Parent = "pl-$Tenant" }
 $issueText = if ($Issue) { "$Issue" } else { '<n>' }
 $repoFwd = "$($tenantConfig.repo)".Replace('\', '/')
 $next = [ordered]@{
-  assign = "node $rootFwd/bin/assignment.js assign --root $rootFwd --tenant $Tenant --repo-path $repoFwd --parent $Parent --model haiku --permissions allowlist --risk standard --issue $issueText"
+  assign = "node $rootFwd/bin/assignment.js assign --root $rootFwd --tenant $Tenant --repo-path $repoFwd --parent $Parent --model $Model --permissions allowlist --risk standard --issue $issueText"
   launch = "node $rootFwd/bin/assignment.js launch --root $rootFwd --manifest <manifestPath from assign> --work-record-id ${Tenant}:issue-$issueText --repo-path $repoFwd --github-repo $($tenantConfig.github)"
   watch = "$($env:USERPROFILE.Replace('\', '/'))/.claude/jobs/<jobId from launch>/state.json"
 }

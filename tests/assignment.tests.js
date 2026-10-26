@@ -675,6 +675,25 @@ test('assign pins the permission profile: haiku only under allowlist, sonnet und
   );
 });
 
+// Owner ruling 2026-10-26: deepseek is the lead's default IC tier. The CLI has no auto
+// mode for a non-Claude model, so deepseek is reservable only under allowlist, like haiku.
+test('assign reserves deepseek only under the allowlist profile', () => {
+  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
+  const reserve = (number, extra) => reserveAssignment({ root: rootDir(), issue: issue(number), tenant: 'endzone', readyLabel: 'ready-for-agent', base, ...extra });
+
+  const deepseek = reserve(90, { model: 'DeepSeek', permissions: 'allowlist' });
+  assert.equal(deepseek.manifest.model, 'deepseek');
+  assert.equal(deepseek.manifest.permissions, 'allowlist');
+  for (const [number, extra, label] of [[91, { model: 'deepseek' }, 'no flag'], [92, { model: 'deepseek', permissions: 'auto' }, '--permissions auto']]) {
+    assert.throws(
+      () => reserve(number, extra),
+      (error) => error.code === 'INVALID_IC_MODEL' && /no auto mode for a non-Claude model/.test(error.message) && /--permissions allowlist/.test(error.message),
+      `deepseek with ${label} is refused with the auto-mode cause and the flag to pass`,
+    );
+  }
+  assert.equal(reserve(93, {}).manifest.model, 'sonnet', 'an assign with no --model still defaults to sonnet: the lead names deepseek');
+});
+
 test('assign CLI takes --permissions and the written manifest pins it', () => {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });

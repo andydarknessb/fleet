@@ -267,21 +267,26 @@ function Test-PermissionPromptNeeds { param([string]$Needs) return ("$Needs" -cm
 # builds its command from these, and sentinel-check.ps1 compares a daemon job's frozen
 # respawnFlags against them before `claude respawn` replays that job. 'opus' pins Opus
 # 4.8 for ICs, 'fable' an explicit -Model only (the Arbiter left Fable 2026-10-20; the
-# Principal held it under ADR 0011 and moved to opus-5.5), 'opus-5.5' the project-lead
-# default (owner ruling 2026-09-23) and, since ADR 0017, the principal's; a principal,
-# arbiter or lead with no -Model gets its pin.
+# Principal held it under ADR 0011 and moved to opus-5.5), 'opus-5.5' the principal's
+# and the arbiter's default (ADR 0017), 'sonnet-5.5' the project-lead default (owner
+# ruling 2026-10-26; Opus 5.5 from 2026-09-23 until then); a principal, arbiter or lead
+# with no -Model gets its pin.
 # An IC's sonnet pins Sonnet 5.5 (owner ruling 2026-09-28), with no -Model too; the pin
 # is the IC's alone, so an explicit -Model sonnet on another role keeps the CLI alias.
-$script:LaunchModelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5' }
+# An IC's deepseek pins DeepSeek V4.1 Flash (owner ruling 2026-10-26): the id DeepSeek's
+# Anthropic-format API serves it under, reached through config/deepseek.json's baseUrl.
+$script:LaunchModelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5'; 'sonnet-5.5' = 'claude-sonnet-5-5' }
 $script:IcSonnetPin = 'claude-sonnet-5-5'
+$script:IcDeepseekPin = 'deepseek-flash'
 function Resolve-LaunchModel {
   param([string]$Role, [string]$Model)
   if (-not $Model -and $Role -eq 'principal') { $Model = 'opus-5.5' }
   if (-not $Model -and $Role -eq 'arbiter') { $Model = 'opus-5.5' }
-  if (-not $Model -and $Role -eq 'project-lead') { $Model = 'opus-5.5' }
+  if (-not $Model -and $Role -eq 'project-lead') { $Model = 'sonnet-5.5' }
   if (-not $Model -and $Role -eq 'ic') { $Model = 'sonnet' }
   $id = if (-not $Model) { '' } elseif ($script:LaunchModelPins.ContainsKey($Model)) { $script:LaunchModelPins[$Model] } else { $Model }
   if ($Role -eq 'ic' -and $Model -eq 'sonnet') { $id = $script:IcSonnetPin }
+  if ($Role -eq 'ic' -and $Model -eq 'deepseek') { $id = $script:IcDeepseekPin }
   return [pscustomobject]@{ token = "$Model"; id = "$id" }
 }
 function Get-RoleEffort {
