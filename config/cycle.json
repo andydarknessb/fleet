@@ -45,10 +45,12 @@
   "scorecard": {
     "cycleTimeMedianHours": { "watch": 2, "weak": 6 },
     "tailHours": 12,
+    "tailWeakUnits": 3,
     "waitTickMinutes": 15,
     "waitGapMinutes": 35,
     "icCap": 6,
-    "sentBackRate": { "watch": 0.3, "weak": 0.45 },
+    "sentBackRate": { "watch": 0.4, "weak": 0.5 },
+    "rateMinUnits": 10,
     "escapedRate": { "weak": 0.05 },
     "fleetDeadRate": { "watch": 0.02, "weak": 0.1 },
     "maxPrLookups": 50
