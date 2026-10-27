@@ -16,8 +16,9 @@ function Run-Stop {
   $env:FLEET_HOME = $testRoot; $env:FLEET_NAME = $Name; $env:FLEET_ROLE = $Role; $env:FLEET_TENANT = 'test'; $env:FLEET_PARENT = 'dispatcher'
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   Push-Location $testRoot
-  try { $out = ('{"session_id":"s-test"}' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\stop.ps1" 2>&1 | Out-String) }
+  try { $out = ('{"session_id":"s-test"}' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\stop.ps1" 2>&1 | ForEach-Object { "$_" }) -join "`n" }
   finally { $script:lastExit = $LASTEXITCODE; $ErrorActionPreference = $eap; Pop-Location }
+  # Out-String width-wraps stderr lines mid-word; stringify per line instead, then compare on one line.
   $out = ($out -replace '\s+', ' ')
   $script:lastOut = $out
   return $out
