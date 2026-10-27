@@ -221,3 +221,40 @@ a scratch root (`bin/scratch-root.ps1 -Model deepseek`). `assign` refused
 - `config/deepseek.json` records `verifiedCliVersion` 2.1.311. The haiku tier
   stays on 2.1.296, so on this CLI a haiku launch is refused until its own
   rehearsal passes again; sonnet is the lead's fallback meanwhile.
+
+## Amendment 6 (2026-10-27, owner ruling, fleet #332): the deepseek tier runs auto
+
+Amendment 4's premise was wrong. Claude Code's auto mode is not limited to
+Claude models: it runs against DeepSeek's endpoint. Cory asked that a deepseek
+IC never wait on a permission prompt, and the evidence settles it.
+- ic-2536 (endzone #2536, deepseek-flash, allowlist profile, CLI 2.1.311)
+  waited 2,635 s (19:55:26Z to 20:39:21Z) on a grep whose pattern held
+  backticks (on server/services/homeStatus.service.js).
+  `allowlist-gate.js` let it through, so `acceptEdits` prompted with nobody
+  there. Cory approved it and switched the session to auto; it had no waits
+  after.
+- Probe 1 (CLI 2.1.312, `claude -p --model deepseek-flash`, the fleet
+  settings plus the deepseek base URL and `apiKeyHelper`): the transcript
+  records `permissionMode: auto` from the start, an out-of-cwd Bash and Read
+  ran with `permission_denials: []`, and the CLI reports that auto mode keeps
+  working for api.deepseek.com.
+- Probe 2 (CLI 2.1.312, `claude --bg --model deepseek-flash --effort high`,
+  same settings): auto from the first turn. An out-of-cwd Bash, an out-of-cwd
+  Read and a `researcher` worker ran with zero waits; the worker's transcript
+  has no Anthropic `msg_` id, so DeepSeek served it, as in Amendment 5.
+
+The rules:
+
+- `assign --model deepseek` with no `--permissions` pins `permissions:
+  "auto"`; `--permissions allowlist` stays accepted as the rollback. Haiku is
+  unchanged: allowlist only. A manifest written before this amendment that pins
+  `allowlist` on deepseek launches as written.
+- `launch.ps1` no longer refuses deepseek under auto. The base URL and
+  `apiKeyHelper` are written whatever the profile.
+- The tier gate stays per tier and now covers every deepseek launch, whatever
+  the profile: `config/deepseek.json` `verifiedCliVersion` guards the base URL
+  and `apiKeyHelper` path, which the profile does not change. Probes 1 and 2
+  count as its re-test, so the field moves to 2.1.312. Haiku stays gated only
+  under allowlist.
+- Out of scope: the allowlist gate let the backtick grep through. Haiku still
+  runs that profile, so that gap gets its own ticket.

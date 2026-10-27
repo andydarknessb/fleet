@@ -270,11 +270,10 @@ exit $LASTEXITCODE
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
   $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and "$($rms.reason)" -match 'allowlist') "a sonnet allowlist manifest is refused (got: $rms)"
-  # Owner ruling 2026-10-26: a deepseek IC runs DeepSeek V4.1 Flash under the allowlist
-  # profile against config/deepseek.json's base URL, its key read at call time by the
-  # apiKeyHelper. The tier needs the key file and its own rehearsal, and never runs auto.
-  $rda = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'deepseek', '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rda.reason)" -match 'no auto mode for a non-Claude model') "deepseek under auto is refused with the auto-mode cause (got: $rda)"
+  # Owner ruling 2026-10-26: a deepseek IC runs DeepSeek V4.1 Flash against
+  # config/deepseek.json's base URL, its key read at call time by the apiKeyHelper. The tier
+  # needs the key file and its own rehearsal. Owner ruling 2026-10-27 (fleet #332): the
+  # default profile is auto; a manifest pinning allowlist (the rollback) launches as written.
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"sonnet"', '"model":"deepseek"'))
   $env:MOCK_CLAUDE_VERSION = '2.1.282'
   $rdk = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
@@ -302,6 +301,18 @@ exit $LASTEXITCODE
   Assert-True ($deepseekSettings.apiKeyHelper -eq "node $rootFwd/bin/deepseek-key.js") "the apiKeyHelper reads the key at call time (got: $($deepseekSettings.apiKeyHelper))"
   Assert-True (-not ($deepseekText -match 'sk-test-launch')) 'no key lands in the settings file'
   Assert-True ($deepseekSettings.permissions.defaultMode -eq 'acceptEdits' -and $deepseekSettings.env.FLEET_PERMISSIONS -eq 'allowlist') 'a deepseek IC runs acceptEdits under the allowlist gate'
+  # Fleet #332: the same manifest under auto launches, carries the same base URL and
+  # apiKeyHelper, and runs defaultMode auto; the CLI-version gate still applies to it.
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"permissions":"allowlist"', '"permissions":"auto"'))
+  $rda = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rda.dryRun -eq $true -and $rda.model -eq 'deepseek' -and $rda.permissions -eq 'auto') "a deepseek manifest under auto dry-runs (got: $rda)"
+  $autoSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
+  Assert-True ($autoSettings.permissions.defaultMode -eq 'auto' -and $autoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a deepseek IC under auto runs defaultMode auto'
+  Assert-True ($autoSettings.env.ANTHROPIC_BASE_URL -eq 'https://api.deepseek.com/anthropic' -and $autoSettings.apiKeyHelper -eq "node $rootFwd/bin/deepseek-key.js") 'a deepseek IC under auto still gets the DeepSeek base URL and apiKeyHelper'
+  $env:MOCK_CLAUDE_VERSION = '2.1.999'
+  $rdg = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rdg.reason)" -match 'verified on Claude Code 2\.1\.282' -and $rdg.permissions -eq 'auto') "the deepseek version gate refuses a mismatched CLI under auto (got: $rdg)"
+  $env:MOCK_CLAUDE_VERSION = '2.1.282'
   Assert-True (-not $sonnetSettings.PSObject.Properties['apiKeyHelper'] -and -not $sonnetSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'a sonnet IC keeps the Anthropic API'
   [IO.File]::Copy("$sourceRoot\config\deepseek.json", "$testRoot\config\deepseek.json", $true)
   Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
