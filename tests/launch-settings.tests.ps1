@@ -281,6 +281,13 @@ exit $LASTEXITCODE
   Assert-True ($script:lastExit -eq 3 -and "$($rdk.reason)" -match 'no DeepSeek API key') "a deepseek launch with no key file is refused (got: $rdk)"
   [IO.Directory]::CreateDirectory("$testRoot\profile\.fleet-secrets") | Out-Null
   Write-Utf8 "$testRoot\profile\.fleet-secrets\deepseek-api-key" 'sk-test-launch'
+  # The checked-in config records the CLI the deepseek rehearsal passed on (2026-10-27,
+  # Endzone #1440 -> PR #2522); with no recorded version the tier stays closed.
+  $checkedInDeepseek = Get-Content "$sourceRoot\config\deepseek.json" -Raw | ConvertFrom-Json
+  Assert-True ("$($checkedInDeepseek.verifiedCliVersion)" -match '^\d+\.\d+\.\d+$') "the checked-in deepseek config records the rehearsed CLI version (got $($checkedInDeepseek.verifiedCliVersion))"
+  $unverifiedDeepseek = Get-Content "$testRoot\config\deepseek.json" -Raw | ConvertFrom-Json
+  $unverifiedDeepseek.verifiedCliVersion = $null
+  Write-Utf8 "$testRoot\config\deepseek.json" ($unverifiedDeepseek | ConvertTo-Json -Depth 6)
   $rdv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and "$($rdv.reason)" -match 'no deepseek rehearsal has passed' -and "$($rdv.reason)" -match 'config\\deepseek\.json' -and "$($rdv.reason)" -match '-Model deepseek') "the deepseek tier stays closed until its own rehearsal passes (got: $rdv)"
   $verifiedDeepseek = Get-Content "$testRoot\config\deepseek.json" -Raw | ConvertFrom-Json
