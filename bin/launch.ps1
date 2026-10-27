@@ -177,6 +177,13 @@ if ($Manifest) {
 # premise, that the CLI's auto mode covers Claude models only, was wrong (probes on 2.1.312),
 # so a deepseek IC runs auto by default and allowlist stays as the rollback.
 if (-not $Permissions) { $Permissions = 'auto' }
+# Deepseek is an IC tier only (owner ruling 2026-10-26, ADR 0017): no other role talks to DeepSeek's API.
+if ($Model -eq 'deepseek' -and $Role -ne 'ic') {
+  $nonIcReason = "deepseek is an IC tier only (owner ruling 2026-10-26, ADR 0017); a $Role runs a Claude model"
+  $released = $false
+  if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $nonIcReason; $released = $true } catch {} }
+  Write-Output (@{ launched = $false; reason = $nonIcReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+}
 if ($Model -eq 'haiku' -and $Permissions -ne 'allowlist') {
   $noAutoReason = "the installed Claude Code CLI ($(try { "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
   $released = $false

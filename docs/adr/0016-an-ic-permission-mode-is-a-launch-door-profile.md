@@ -254,7 +254,7 @@ The rules:
 - The tier gate stays per tier and now covers every deepseek launch, whatever
   the profile: `config/deepseek.json` `verifiedCliVersion` guards the base URL
   and `apiKeyHelper` path, which the profile does not change. Probes 1 and 2
-  count as its re-test, so the field moves to 2.1.312. Haiku stays gated only
+  count as its re-test, so the field moves to 2.1.312; the owner commits it and no code writes it. Haiku stays gated only
   under allowlist.
 - Out of scope: the allowlist gate let the backtick grep through. Haiku still
   runs that profile, so that gap gets its own ticket.

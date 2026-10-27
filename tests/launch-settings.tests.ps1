@@ -308,11 +308,23 @@ exit $LASTEXITCODE
   Assert-True ($rda.dryRun -eq $true -and $rda.model -eq 'deepseek' -and $rda.permissions -eq 'auto') "a deepseek manifest under auto dry-runs (got: $rda)"
   $autoSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
   Assert-True ($autoSettings.permissions.defaultMode -eq 'auto' -and $autoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a deepseek IC under auto runs defaultMode auto'
+  Assert-True ($rda.allowRules -eq 0 -and -not $autoSettings.permissions.PSObject.Properties['allow']) 'a deepseek IC under auto carries no allow list'
   Assert-True ($autoSettings.env.ANTHROPIC_BASE_URL -eq 'https://api.deepseek.com/anthropic' -and $autoSettings.apiKeyHelper -eq "node $rootFwd/bin/deepseek-key.js") 'a deepseek IC under auto still gets the DeepSeek base URL and apiKeyHelper'
   $env:MOCK_CLAUDE_VERSION = '2.1.999'
   $rdg = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and "$($rdg.reason)" -match 'verified on Claude Code 2\.1\.282' -and $rdg.permissions -eq 'auto') "the deepseek version gate refuses a mismatched CLI under auto (got: $rdg)"
   $env:MOCK_CLAUDE_VERSION = '2.1.282'
+  # Fleet #332: deepseek is an IC tier only, so a non-IC role is refused even for a dry run.
+  $rnd = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-Model', 'deepseek', '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rnd.reason)" -match 'IC tier only') "a project lead on deepseek is refused (got: $rnd)"
+  # A scratch root's rehearsalRoot flag also stands aside the deepseek version gate.
+  $rehearsalDs = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $rehearsalDs | Add-Member -NotePropertyName rehearsalRoot -NotePropertyValue $true -Force
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($rehearsalDs | ConvertTo-Json -Depth 6)
+  $env:MOCK_CLAUDE_VERSION = '2.1.999'
+  $rdr = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rdr.dryRun -eq $true -and $rdr.permissions -eq 'auto') "a rehearsal root launches deepseek under auto on a mismatched CLI (got: $rdr)"
+  [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
   Assert-True (-not $sonnetSettings.PSObject.Properties['apiKeyHelper'] -and -not $sonnetSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'a sonnet IC keeps the Anthropic API'
   [IO.File]::Copy("$sourceRoot\config\deepseek.json", "$testRoot\config\deepseek.json", $true)
   Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
