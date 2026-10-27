@@ -2157,7 +2157,7 @@ test('#118: a finding still open in the chain is not a repeat; repeats belongs t
       findings: [{ file: 'a.js', claim: 'x again', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
       idempotencyKey: 'o118-2', now: '2026-09-24T05:30:00.000Z',
     }),
-    (error) => error.code === 'INVALID_FINDING' && /resolved or not-real/.test(error.message),
+    (error) => error.code === 'INVALID_FINDING' && /resolved, not-real or ruled/.test(error.message),
   );
   const root2 = rootDir();
   const revision2 = seedRecord(root2, { state: 'implementing' });
@@ -2246,4 +2246,79 @@ test('#211: criteria-defect is a named finding category: it records as written, 
     () => formalAt(other, seedRecord(other), [{ file: 'a.js', claim: 'x', severity: 'minor', category: 'Criteria Defect' }]),
     (error) => error.code === 'INVALID_FINDING' && /criteria-defect/.test(error.message),
   );
+});
+
+// --- #324: a `ruled` resolution settles a finding a Ruling keeps --------------
+// A finding a Ruling accepts as it stands is real and unfixed; `still-open` carried
+// it and held `fleet-review` red until Cory posted the status by hand. `ruled`
+// settles it, and the Ruling's reference rides on the artifact as `ruling`.
+// Red-tell: with bin/review-policy.js reverted, `ruled` is INVALID_RESOLUTION.
+
+const RULING = 'https://github.com/owner/Endzone/issues/2491#issuecomment-1';
+
+function blockerChain(root) {
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'aaa1111', actor: 'pl-endzone',
+    classification: { tier: 'normal', triggers: [] },
+    findings: [{ file: 'a.js', claim: 'spec sets the hex', severity: 'major', category: 'correctness' }],
+    idempotencyKey: 'r324-1', now: '2026-09-24T04:00:00.000Z',
+  });
+  return { revision: cycleBackToReview(root, first.result.revision, 1), first };
+}
+
+test('#324: a formal re-review whose only blocker is resolved ruled posts success, carries nothing, and records the ruling', () => {
+  const root = rootDir();
+  const { revision, first } = blockerChain(root);
+  const { calls, gh } = stubGh();
+  const second = formalRecord(root, revision, gh, {
+    headSha: 'bbb2222'.padEnd(40, '2'), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'ruled' },
+    ruling: `  ${RULING}  `, noFindings: 'the Ruling keeps the finding; nothing new', idempotencyKey: 'r324-2',
+  });
+  assert.equal(statusField(calls[0], 'state'), 'success');
+  const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
+  assert.equal(stored.ruling, RULING);
+  assert.deepEqual(stored.findings, []);
+});
+
+test('#324: ruled without --ruling (missing or blank) is refused RULING_REQUIRED and writes nothing new', () => {
+  const root = rootDir();
+  const { revision, first } = blockerChain(root);
+  const { gh } = stubGh();
+  for (const ruling of [undefined, '', '   ']) {
+    assert.throws(
+      () => formalRecord(root, revision, gh, { headSha: 'b'.repeat(40), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'ruled' }, ruling, noFindings: 'x', idempotencyKey: 'r324-3' }),
+      (error) => error.code === 'RULING_REQUIRED',
+      `ruling ${JSON.stringify(ruling)}`,
+    );
+  }
+  assert.deepEqual(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')), ['formal-001.json']);
+});
+
+test('#324: --ruling with no ruled resolution is refused USAGE and writes nothing new', () => {
+  const root = rootDir();
+  const { revision, first } = blockerChain(root);
+  const { gh } = stubGh();
+  assert.throws(
+    () => formalRecord(root, revision, gh, { headSha: 'b'.repeat(40), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' }, ruling: RULING, noFindings: 'x', idempotencyKey: 'r324-4' }),
+    (error) => error.code === 'USAGE' && /--ruling/.test(error.message),
+  );
+  assert.deepEqual(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')), ['formal-001.json']);
+});
+
+test('#324: a finding that repeats a ruled finding is accepted and escalates, like a repeat of a resolved one', () => {
+  const root = rootDir();
+  const { revision, first } = blockerChain(root);
+  const { gh } = stubGh();
+  const second = formalRecord(root, revision, gh, {
+    headSha: 'b'.repeat(40), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'ruled' },
+    ruling: RULING, noFindings: 'ruled', idempotencyKey: 'r324-5',
+  });
+  const next = cycleBackToReview(root, second.result.revision, 3);
+  const third = formalRecord(root, next, gh, {
+    headSha: 'c'.repeat(40), priorArtifact: second.artifact, idempotencyKey: 'r324-6',
+    findings: [{ file: 'a.js', claim: 'the hex again', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
+  });
+  assert.equal(third.escalated.state, 'escalated');
 });
