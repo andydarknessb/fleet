@@ -590,23 +590,23 @@ function writeManifest(root, manifest) {
 // checked-in config/permissions-allowlist.json), and haiku under auto is still the
 // fleet #28 refusal. The manifest pins the profile beside the model.
 // Owner ruling 2026-10-26: deepseek (DeepSeek V4.1 Flash through DeepSeek's
-// Anthropic-format API, config/deepseek.json) is the lead's default IC tier. The CLI has
-// no auto mode for a non-Claude model, so deepseek runs only the allowlist profile too.
+// Anthropic-format API, config/deepseek.json) is the lead's default IC tier. Owner ruling
+// 2026-10-27, fleet #332: the CLI's auto mode does cover it (probes on 2.1.312), so a
+// deepseek IC runs auto by default and allowlist stays accepted as the rollback.
 const IC_MODELS = Object.freeze(['sonnet', 'haiku', 'deepseek']);
-const IC_PERMISSION_PROFILES = Object.freeze({ sonnet: Object.freeze(['auto']), haiku: Object.freeze(['allowlist']), deepseek: Object.freeze(['allowlist']) });
+const IC_PERMISSION_PROFILES = Object.freeze({ sonnet: Object.freeze(['auto']), haiku: Object.freeze(['allowlist']), deepseek: Object.freeze(['auto', 'allowlist']) });
 const PERMISSION_PROFILES = Object.freeze(['auto', 'allowlist']);
 const NO_AUTO_REFUSALS = Object.freeze({
   haiku: "the installed Claude Code CLI has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; pass --permissions allowlist to run it under the allowlist profile (ADR 0016), or launch it on sonnet",
-  deepseek: "the Claude Code CLI has no auto mode for a non-Claude model: a deepseek --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; pass --permissions allowlist to run it under the allowlist profile (ADR 0016, owner ruling 2026-10-26), or launch it on sonnet",
 });
 
 function icModel(model) {
   const value = String(model === undefined || model === null || model === '' ? 'sonnet' : model).toLowerCase();
-  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as deepseek, sonnet or haiku, not '${model}' (amendment 14; deepseek and haiku only under the allowlist profile, fleet #28; the risk reviewer is the only opus worker)`);
+  if (!IC_MODELS.includes(value)) throw new WorkStateError('INVALID_IC_MODEL', `an IC runs as deepseek, sonnet or haiku, not '${model}' (amendment 14; haiku only under the allowlist profile, fleet #28; the risk reviewer is the only opus worker)`);
   return value;
 }
 
-// An absent profile is the model's first (sonnet: auto). Haiku or deepseek under auto,
+// An absent profile is the model's first (sonnet and deepseek: auto). Haiku under auto,
 // asked for or defaulted, is the fleet #28 refusal: the CLI would downgrade it to default mode.
 function icPermissions(model, permissions) {
   const given = permissions === undefined || permissions === null || permissions === '' ? null : String(permissions).toLowerCase();
@@ -614,7 +614,7 @@ function icPermissions(model, permissions) {
   if (NO_AUTO_REFUSALS[model] && given !== 'allowlist') throw new WorkStateError('INVALID_IC_MODEL', NO_AUTO_REFUSALS[model]);
   const allowed = IC_PERMISSION_PROFILES[model];
   const value = given === null ? allowed[0] : given;
-  if (!allowed.includes(value)) throw new WorkStateError('INVALID_PERMISSION_PROFILE', `a ${model} IC runs the ${allowed.join(' or ')} profile, not '${value}' (ADR 0016: the allowlist profile is the haiku and deepseek profile)`);
+  if (!allowed.includes(value)) throw new WorkStateError('INVALID_PERMISSION_PROFILE', `a ${model} IC runs the ${allowed.join(' or ')} profile, not '${value}' (ADR 0016: the allowlist profile is the haiku profile and the deepseek rollback)`);
   return value;
 }
 

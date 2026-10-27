@@ -190,6 +190,7 @@ Decided:
   (ADR 0016 Amendment 4), and closed until its rehearsal passes. The lead falls
   back to haiku or sonnet, by the role file's existing ticket types, only when
   the launch refuses the deepseek tier. Amendment 14's "never opus" stands.
+  (ADR 0016 Amendment 6, 2026-10-27, moved deepseek to the auto profile.)
 - Every worker a deepseek IC starts shares its API: DeepSeek serves the
   qa-reviewer's `claude-opus-5-5` pin on its Pro model and the researcher on
   Flash. The owner accepted this; the lead's formal review stays the one
