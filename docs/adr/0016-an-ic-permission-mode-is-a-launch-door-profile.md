@@ -198,3 +198,21 @@ and block on its first out-of-cwd Read, fleet #28's failure.
   workers reach DeepSeek's mapped models.
 - `budgets.icJobTokensTargets.deepseek` in `config/cycle.json` is null, and
   `bin/measure-cycle.js` folds every `deepseek-*` id into a `deepseek` family.
+
+## Amendment 5 (2026-10-27, owner ruling): the deepseek tier opens on 2.1.311
+
+Rehearsal: 2026-10-27, Claude Code 2.1.311, Endzone #1440 -> PR #2522, from
+a scratch root (`bin/scratch-root.ps1 -Model deepseek`). `assign` refused
+`PREMISE_PATH_CHANGED` on three premises; each still held at base `1dd8b0f`
+(moved lines only) and the assign re-ran with `--premises-rechecked`.
+
+- The session ran `--model deepseek-flash --effort high` with the profile's
+  settings; its transcript records only `deepseek-flash`, so every call went to
+  DeepSeek's API through the settings' base URL and `apiKeyHelper`, not
+  Cory's login.
+- Zero permission waits. The IC acknowledged, sent its lookups through the
+  researcher worker, and opened PR #2522 with its tests green.
+- Cory turned the tier on with #2522's CI and his review still pending.
+- `config/deepseek.json` records `verifiedCliVersion` 2.1.311. The haiku tier
+  stays on 2.1.296, so on this CLI a haiku launch is refused until its own
+  rehearsal passes again; sonnet is the lead's fallback meanwhile.
