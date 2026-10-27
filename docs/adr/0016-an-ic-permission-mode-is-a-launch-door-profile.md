@@ -207,9 +207,12 @@ a scratch root (`bin/scratch-root.ps1 -Model deepseek`). `assign` refused
 (moved lines only) and the assign re-ran with `--premises-rechecked`.
 
 - The session ran `--model deepseek-flash --effort high` with the profile's
-  settings; its transcript records only `deepseek-flash`, so every call went to
-  DeepSeek's API through the settings' base URL and `apiKeyHelper`, not
-  Cory's login.
+  settings; its own transcript records only `deepseek-flash`. Its researcher
+  workers' transcripts name `claude-haiku-5-5`, the id their role file pins,
+  but none of their responses carries an Anthropic `msg_` id (an
+  Anthropic-served control transcript does), so DeepSeek's endpoint served
+  them too, under its model mapping. Every call went to DeepSeek's API through
+  the settings' base URL and `apiKeyHelper`, not Cory's login.
 - Zero permission waits. The IC acknowledged, sent its lookups through the
   researcher worker, and opened PR #2522 with its tests green.
 - #2522 passed its CI, was attested with no open findings (`fleet-review`,
