@@ -212,7 +212,9 @@ a scratch root (`bin/scratch-root.ps1 -Model deepseek`). `assign` refused
   Cory's login.
 - Zero permission waits. The IC acknowledged, sent its lookups through the
   researcher worker, and opened PR #2522 with its tests green.
-- Cory turned the tier on with #2522's CI and his review still pending.
+- #2522 passed its CI, was attested with no open findings (`fleet-review`,
+  `state/reviews/endzone_pr-2522/attest-001.json`) and merged the same day,
+  closing #1440.
 - `config/deepseek.json` records `verifiedCliVersion` 2.1.311. The haiku tier
   stays on 2.1.296, so on this CLI a haiku launch is refused until its own
   rehearsal passes again; sonnet is the lead's fallback meanwhile.
