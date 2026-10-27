@@ -59,10 +59,12 @@ const HOUR_MS = 60 * 60 * 1000;
 const DEFAULTS = Object.freeze({
   cycleTimeMedianHours: { watch: 2, weak: 6 },
   tailHours: 12,
+  tailWeakUnits: 3,
   waitTickMinutes: 15,
   waitGapMinutes: 35,
   icCap: 3,
-  sentBackRate: { watch: 0.3, weak: 0.45 },
+  sentBackRate: { watch: 0.4, weak: 0.5 },
+  rateMinUnits: 10,
   escapedRate: { weak: 0.05 },
   fleetDeadRate: { watch: 0.02, weak: 0.1 },
   maxPrLookups: 50,
@@ -229,14 +231,15 @@ function ledgerRows(base, events, week, settings) {
     result: merged ? `reserve to merge (n=${merged}): median ${Math.round(median * 10) / 10} h, p90 ${percentile(cycles, 0.9)} h, max ${hours(slowest.cycleMs)} h (#${slowest.issue})` : 'no unit merged',
     status: merged ? (median > settings.cycleTimeMedianHours.weak ? 'weak' : (median > settings.cycleTimeMedianHours.watch ? 'watch' : 'good')) : 'n/a',
   };
-  const tail = units.filter((unit) => unit.endToEndMs > settings.tailHours * HOUR_MS)
-    .map((unit) => ({ issue: unit.issue, hours: hours(unit.endToEndMs), decisionHours: hours(unit.decisionMs) }));
+  const tail = units.map((unit) => ({ unit, fleetMs: unit.endToEndMs - unit.decisionMs }))
+    .filter(({ fleetMs }) => fleetMs > settings.tailHours * HOUR_MS)
+    .map(({ unit, fleetMs }) => ({ issue: unit.issue, hours: hours(unit.endToEndMs), decisionHours: hours(unit.decisionMs), fleetHours: hours(fleetMs) }));
   rows.issueToMergeTail = {
-    figures: { thresholdHours: settings.tailHours, units: tail },
+    figures: { thresholdHours: settings.tailHours, weakUnits: settings.tailWeakUnits, units: tail },
     result: tail.length
-      ? `${plural(tail.length, 'unit')} over ${settings.tailHours} h from first ledger event to merge: ${tail.map((u) => `#${u.issue} ${u.hours} h, ${u.decisionHours} h waiting on a decision`).join('; ')}`
-      : `none over ${settings.tailHours} h from first ledger event to merge`,
-    status: tail.length ? 'watch' : 'good',
+      ? `${plural(tail.length, 'unit')} over ${settings.tailHours} fleet-owned h (first ledger event to merge, less time waiting on a decision): ${tail.map((u) => `#${u.issue} ${u.fleetHours} fleet-owned h of ${u.hours} h, ${u.decisionHours} h waiting on a decision`).join('; ')}`
+      : `none over ${settings.tailHours} fleet-owned h (first ledger event to merge, less time waiting on a decision)`,
+    status: tail.length >= settings.tailWeakUnits ? 'weak' : (tail.length ? 'watch' : 'good'),
   };
   const sentBack = units.filter((unit) => unit.sendBacks > 0);
   const most = sentBack.slice().sort((a, b) => b.sendBacks - a.sendBacks || a.issue - b.issue)[0] || null;
@@ -244,7 +247,7 @@ function ledgerRows(base, events, week, settings) {
   rows.sentBack = {
     figures: { units: sentBack.length, of: merged, rate, maxSendBacks: most ? most.sendBacks : 0, maxIssue: most ? most.issue : null },
     result: merged ? `${sentBack.length} of ${merged} units (${pct(rate)})${most ? `; most send-backs ${most.sendBacks} (#${most.issue})` : ''}` : 'no unit merged',
-    status: statusByThreshold(rate, settings.sentBackRate),
+    status: merged < settings.rateMinUnits ? 'n/a' : statusByThreshold(rate, settings.sentBackRate),
   };
   const reviews = events.filter((event) => event.type === 'review-recorded' && inWeek(week, event.at));
   const formal = reviews.filter((event) => event.changes?.kind === 'formal').length;
@@ -346,7 +349,7 @@ function escapedRow(base, week, merged, settings, gh) {
   const fromProposal = bugs.filter((entry) => entry.source === 'proposal' && (entry.pr !== null || entry.kind === 'none')).length;
   const rate = merged ? Math.round((escapedFromFleet.length / merged) * 1000) / 1000 : null;
   let status = 'good';
-  if (escapedFromFleet.length && (rate === null || rate > settings.escapedRate.weak)) status = 'weak';
+  if (escapedFromFleet.length && merged >= settings.rateMinUnits && rate > settings.escapedRate.weak) status = 'weak';
   else if (escapedFromFleet.length) status = 'watch';
   return {
     figures: { bugs: bugs.length, escapedFromFleet, reviewFollowUps, namedNonFleet, none, unknown, fromProposal, unclassified, merged, rate },

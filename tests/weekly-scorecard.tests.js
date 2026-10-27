@@ -659,7 +659,7 @@ test('#213: the escaped row counts the proposal\'s Escaped from line for bugs wi
   assert.match(row.result, /1 escaped from a fleet PR \(#910 from PR #112\)/);
   assert.match(row.result, /2 traced to no PR/);
   assert.match(row.result, /5 unclassified \(1 marked unknown\)/);
-  assert.equal(row.status, 'weak', 'an escape from a fleet PR is still counted against the merged units');
+  assert.equal(row.status, 'watch', 'an escape from a fleet PR is still counted; under 10 merged units it is watch, never weak (2026-10-27)');
   const list = stub.calls.find((args) => args[0] === 'issue' && args[1] === 'list');
   assert.match(list[list.indexOf('--json') + 1], /comments/, 'the collector asks GitHub for the comments');
 });
@@ -736,4 +736,61 @@ test('#211: a corrupt triage ledger makes the Bounded authority row unknown and 
   const card = build(root);
   assert.equal(card.rows.find((r) => r.key === 'boundedAuthority').status, 'unknown');
   assert.equal(card.rows.find((r) => r.key === 'throughput').status, 'good');
+});
+
+// #139 (ruled 2026-10-27): thresholds re-set from four weeks of scorecards.
+const at = (hour) => new Date(Date.parse('2026-09-22T00:00:00.000Z') + hour * 3600000).toISOString();
+// `n` quick units (issues 201..), the first `sentBack` of them sent back once, plus `extra` [issue, steps] units.
+function thresholdWeek(n, { sentBack = 0, extra = [] } = {}) {
+  const root = rootDir();
+  for (let i = 0; i < n; i += 1) {
+    const steps = [['implementing', at(i + 0.1)], ['pr-open', at(i + 0.2)], ['review', at(i + 0.3)]];
+    if (i < sentBack) steps.push(['revision', at(i + 0.4)], ['pr-open', at(i + 0.5)], ['review', at(i + 0.6)]);
+    steps.push(['merged', at(i + 1)]);
+    unit(root, 201 + i, at(i), steps);
+  }
+  extra.forEach(([issue, steps]) => unit(root, issue, at(0), steps));
+  return root;
+}
+const noBugs = { gh: () => '[]' };
+const rowOf = (card, key) => card.rows.find((r) => r.key === key);
+// merges at hour `total`, with `held` hours escalated (waiting on a decision) in between.
+const longUnit = (issue, total, held) => [issue, [['implementing', at(0.1)], ['escalated', at(1), { evidence: 'budget: 400000 job tokens >= 350000' }], ['implementing', at(1 + held), { evidence: 'ruling: resume' }], ['pr-open', at(total - 0.2)], ['review', at(total - 0.1)], ['merged', at(total)]]];
+
+test('#139: the tail line is on fleet-owned hours: one unit over is watch, three are weak, waiting on a decision does not count', () => {
+  const tail = (extra) => rowOf(build(thresholdWeek(0, { extra }), noBugs), 'issueToMergeTail');
+  assert.equal(tail([]).status, 'good');
+  const waiting = tail([longUnit(301, 20, 10)]);
+  assert.equal(waiting.status, 'good', '20 h total but 10 h fleet-owned');
+  assert.deepEqual(waiting.figures.units, []);
+  const one = tail([longUnit(301, 20, 10), longUnit(302, 14, 0)]);
+  assert.equal(one.status, 'watch');
+  assert.deepEqual(one.figures.units.map((u) => [u.issue, u.hours, u.decisionHours, u.fleetHours]), [[302, 14, 0, 14]]);
+  assert.match(one.result, /fleet-owned/);
+  assert.equal(tail([longUnit(301, 14, 0), longUnit(302, 15, 0)]).status, 'watch');
+  assert.equal(tail([longUnit(301, 14, 0), longUnit(302, 15, 0), longUnit(303, 16, 0)]).status, 'weak');
+});
+
+test('#139: sent back reads n/a below 10 merged units, and watch above 40% and weak at 50% from 10 up', () => {
+  const sb = (n, sentBack) => rowOf(build(thresholdWeek(n, { sentBack }), noBugs), 'sentBack');
+  const few = sb(9, 9);
+  assert.equal(few.status, 'n/a');
+  assert.deepEqual([few.figures.units, few.figures.of, few.figures.rate], [9, 9, 1]);
+  assert.match(few.result, /9 of 9 units/);
+  assert.equal(sb(10, 4).status, 'good', '40% is not over the watch line');
+  assert.equal(sb(10, 5).status, 'weak', '50% is weak');
+  assert.equal(sb(11, 5).status, 'watch', '5 of 11 is 45%');
+  assert.equal(sb(10, 0).status, 'good');
+});
+
+test('#139: escaped defects judge the rate only from 10 merged units; below that an escape is watch and none is good', () => {
+  const escaped = (n, bugs) => rowOf(build(thresholdWeek(n), { gh: (args) => {
+    if (args[0] === 'issue') return JSON.stringify(bugs.map((number) => ({ number, createdAt: '2026-09-24T00:00:00Z', body: '### Escaped from PR #\n\n201\n' })));
+    return JSON.stringify({ number: 201, headRefName: 'fleet/1-x' });
+  } }), 'escapedDefects');
+  assert.equal(escaped(4, []).status, 'good');
+  assert.equal(escaped(4, [900]).status, 'watch', '1 of 4 is 25% but under 10 units is never weak');
+  assert.equal(escaped(10, [900]).status, 'weak', '10% is over 5%');
+  assert.equal(escaped(20, [900]).status, 'watch', '5% is not over 5%');
+  assert.equal(escaped(10, []).status, 'good');
 });
