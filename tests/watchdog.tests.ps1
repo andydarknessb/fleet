@@ -1241,7 +1241,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   # whose frozen flags are current; give these statics that standing (restored after h14).
   $savedLiveRoster121 = Get-Content "$testRoot\state\roster.json" -Raw
   $savedJobStates121 = @{}
-  foreach ($pair in @(@('job-d', 'dispatcher', 'dispatcher', @()), @('job-p', 'pl-test', 'project-lead', @('--model', 'claude-opus-5-5')), @('job-pe2', 'pl-extra', 'project-lead', @('--model', 'claude-opus-5-5')))) {
+  foreach ($pair in @(@('job-d', 'dispatcher', 'dispatcher', @()), @('job-p', 'pl-test', 'project-lead', @('--model', 'claude-sonnet-5-5')), @('job-pe2', 'pl-extra', 'project-lead', @('--model', 'claude-sonnet-5-5')))) {
     $jobDir = "$testRoot\profile\.claude\jobs\$($pair[0])"
     [IO.Directory]::CreateDirectory($jobDir) | Out-Null
     $savedJobStates121[$pair[0]] = if (Test-Path "$jobDir\state.json") { Get-Content "$jobDir\state.json" -Raw } else { $null }

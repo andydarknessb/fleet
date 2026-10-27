@@ -1,0 +1,6 @@
+{
+  "$comment": "The deepseek IC tier (owner ruling 2026-10-26, ADR 0016 and 0017 amendments). launch.ps1 points a deepseek IC's session at baseUrl, DeepSeek's Anthropic-format API, and sets its apiKeyHelper to bin/deepseek-key.js, which prints the key from keyFile under %USERPROFILE% (outside the repo and state/; never commit the key). The model id is pinned in bin/_common.ps1 (IcDeepseekPin). The CLI has no auto mode for a non-Claude model, so a deepseek IC runs only under the allowlist profile (config/permissions-allowlist.json). verifiedCliVersion is the `claude --version` the deepseek rehearsal passed on, null until one does: launch.ps1 refuses a deepseek launch when it is null or names another CLI, and a clean rehearsal (bin/scratch-root.ps1 -Model deepseek) writes or bumps it.",
+  "baseUrl": "https://api.deepseek.com/anthropic",
+  "keyFile": ".fleet-secrets/deepseek-api-key",
+  "verifiedCliVersion": null
+}

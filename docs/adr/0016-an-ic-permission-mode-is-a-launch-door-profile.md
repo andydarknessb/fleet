@@ -170,3 +170,31 @@ a sonnet median of 133,209.
 - `budgets.icJobTokensTargets.haiku` in `config/cycle.json` stays null. One
   rehearsal unit is not a median; the target is set from the weekly
   scorecards once haiku units accumulate (fleet #139's method).
+
+## Amendment 4 (2026-10-26, owner ruling): the deepseek tier
+
+Cory ruled, 2026-10-26, that the IC's default model is DeepSeek V4.1 Flash
+(ADR 0017's amendment of the same date). Claude Code's auto mode covers Claude
+models only, so a deepseek `--bg` session under auto would run in default mode
+and block on its first out-of-cwd Read, fleet #28's failure.
+
+- `deepseek` is the second allowlist-profile model. `assign` refuses it
+  without `--permissions allowlist`, and `launch.ps1` refuses the pair at the
+  door, dry runs included.
+- The session reaches DeepSeek's Anthropic-format API through
+  `ANTHROPIC_BASE_URL` in its settings env (`config/deepseek.json` `baseUrl`),
+  on the model id `_common.ps1` pins (`deepseek-flash`). The key never enters
+  the settings: the session's `apiKeyHelper`, `bin/deepseek-key.js`, reads it
+  at call time from `keyFile` under `%USERPROFILE%`
+  (`.fleet-secrets/deepseek-api-key`), outside the repo and `state/` like the
+  fleet identity (ADR 0015). A missing key refuses the launch.
+- The tier has its own rehearsal gate, `config/deepseek.json`
+  `verifiedCliVersion`, null until a deepseek rehearsal passes
+  (`bin/scratch-root.ps1 -Model deepseek`). Amendment 3's rules hold: a null
+  field or another CLI refuses, the scratch root stands aside, a clean verdict
+  writes the field. That rehearsal also proves what the fleet repo cannot: that
+  a `--bg` session takes the settings' base URL and `apiKeyHelper` over Cory's
+  login, that DeepSeek accepts the role's `--effort high`, and that the IC's
+  workers reach DeepSeek's mapped models.
+- `budgets.icJobTokensTargets.deepseek` in `config/cycle.json` is null, and
+  `bin/measure-cycle.js` folds every `deepseek-*` id into a `deepseek` family.

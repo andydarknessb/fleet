@@ -27,6 +27,7 @@ try {
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json")
+  [IO.File]::Copy("$sourceRoot\config\deepseek.json", "$testRoot\config\deepseek.json")
   foreach ($roleName in 'project-lead','ic') {
     Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
   }
@@ -269,6 +270,34 @@ exit $LASTEXITCODE
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
   $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and "$($rms.reason)" -match 'allowlist') "a sonnet allowlist manifest is refused (got: $rms)"
+  # Owner ruling 2026-10-26: a deepseek IC runs DeepSeek V4.1 Flash under the allowlist
+  # profile against config/deepseek.json's base URL, its key read at call time by the
+  # apiKeyHelper. The tier needs the key file and its own rehearsal, and never runs auto.
+  $rda = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'deepseek', '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rda.reason)" -match 'no auto mode for a non-Claude model') "deepseek under auto is refused with the auto-mode cause (got: $rda)"
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"sonnet"', '"model":"deepseek"'))
+  $env:MOCK_CLAUDE_VERSION = '2.1.282'
+  $rdk = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rdk.reason)" -match 'no DeepSeek API key') "a deepseek launch with no key file is refused (got: $rdk)"
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.fleet-secrets") | Out-Null
+  Write-Utf8 "$testRoot\profile\.fleet-secrets\deepseek-api-key" 'sk-test-launch'
+  $rdv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rdv.reason)" -match 'no deepseek rehearsal has passed' -and "$($rdv.reason)" -match 'config\\deepseek\.json' -and "$($rdv.reason)" -match '-Model deepseek') "the deepseek tier stays closed until its own rehearsal passes (got: $rdv)"
+  $verifiedDeepseek = Get-Content "$testRoot\config\deepseek.json" -Raw | ConvertFrom-Json
+  $verifiedDeepseek.verifiedCliVersion = '2.1.282'
+  Write-Utf8 "$testRoot\config\deepseek.json" ($verifiedDeepseek | ConvertTo-Json -Depth 6)
+  $rd = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rd.dryRun -eq $true -and $rd.model -eq 'deepseek' -and $rd.permissions -eq 'allowlist') "a verified deepseek manifest dry-runs under the allowlist profile (got: $rd)"
+  Assert-True ("$($rd.command)" -match '--model deepseek-flash --effort low ') "a deepseek IC runs pinned deepseek-flash at the role file effort (got: $($rd.command))"
+  $deepseekText = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw
+  $deepseekSettings = $deepseekText | ConvertFrom-Json
+  Assert-True ($deepseekSettings.env.ANTHROPIC_BASE_URL -eq 'https://api.deepseek.com/anthropic') 'the env points a deepseek session at the DeepSeek Anthropic-format API'
+  Assert-True ($deepseekSettings.apiKeyHelper -eq "node $rootFwd/bin/deepseek-key.js") "the apiKeyHelper reads the key at call time (got: $($deepseekSettings.apiKeyHelper))"
+  Assert-True (-not ($deepseekText -match 'sk-test-launch')) 'no key lands in the settings file'
+  Assert-True ($deepseekSettings.permissions.defaultMode -eq 'acceptEdits' -and $deepseekSettings.env.FLEET_PERMISSIONS -eq 'allowlist') 'a deepseek IC runs acceptEdits under the allowlist gate'
+  Assert-True (-not $sonnetSettings.PSObject.Properties['apiKeyHelper'] -and -not $sonnetSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'a sonnet IC keeps the Anthropic API'
+  [IO.File]::Copy("$sourceRoot\config\deepseek.json", "$testRoot\config\deepseek.json", $true)
+  Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
   Remove-Item $manifestPath
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{}}'
 
@@ -298,7 +327,7 @@ exit $LASTEXITCODE
   Run-Launch @('-Role', 'arbiter', '-Name', 'ar-test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
   Assert-True ($script:lastExit -eq 4) 'an arbiter without -Tenant must be refused as a usage error'
   $rpl = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
-  Assert-True ("$($rpl.command)" -match '--model claude-opus-5-5') 'a project lead with no -Model must run the pinned Opus 5.5 id'
+  Assert-True ("$($rpl.command)" -match '--model claude-sonnet-5-5 ') 'a project lead with no -Model must run the pinned Sonnet 5.5 id (owner ruling 2026-10-26)'
   $rplo = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'sonnet', '-DryRun')
   Assert-True ("$($rplo.command)" -match '--model sonnet\b') 'an explicit -Model must still override the project lead default, and the IC sonnet pin stays the IC''s'
   Run-Launch @('-Role', 'principal', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null

@@ -96,8 +96,9 @@ $exitRows = @(
   @{ Anchor = 'but the manifest reserved revision'; Decision = 'keep' }         # fleet#264: assigned at another revision (escalate -> assigned round trip): not this manifest's reservation
   @{ Anchor = "at the tenant's maxIcs"; Decision = 'release' }
   @{ Anchor = 'assignment past the second requires'; Decision = 'release' }
-  @{ Anchor = 'reason = \$haikuReason'; Decision = 'release' }
+  @{ Anchor = 'reason = \$noAutoReason'; Decision = 'release' }             # haiku or deepseek under auto (fleet #28)
   @{ Anchor = 'reason = \$profileReason'; Decision = 'release' }
+  @{ Anchor = 'reason = \$deepseekReason'; Decision = 'release' }           # deepseek config or key file missing (owner ruling 2026-10-26)
   @{ Anchor = 'reason = \$versionReason'; Decision = 'release' }
   @{ Anchor = 'could not reconcile issue'; Decision = 'release' }
   @{ Anchor = 'returned invalid JSON'; Decision = 'release' }

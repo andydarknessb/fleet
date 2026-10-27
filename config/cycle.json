@@ -34,7 +34,7 @@
     "projectLeadFreshPerMergedPr": 25000,
     "projectLeadFreshPerMergedPrVoid": true,
     "icJobTokensMedianReference": 60000,
-    "icJobTokensTargets": { "haiku": null, "sonnet": null, "opus": null, "fable": null }
+    "icJobTokensTargets": { "haiku": null, "sonnet": null, "opus": null, "fable": null, "deepseek": null }
   },
   "secondRead": {
     "repo": "andydarknessb/fleet",

@@ -17,7 +17,7 @@ const GH_PR_REFERENCE = /\bgh\s+pr\s+(?:view|checks|merge|create)\s+#?(\d+)\b/gi
 // the same row. A string that matches no family is kept as written (never dropped or
 // lumped into "other") and reported under `unrecognizedModels`; no string at all is
 // `unknown`.
-const MODEL_FAMILIES = Object.freeze(['haiku', 'sonnet', 'opus', 'fable']);
+const MODEL_FAMILIES = Object.freeze(['haiku', 'sonnet', 'opus', 'fable', 'deepseek']);
 function modelFamily(model) {
   const raw = String(model || '').trim();
   if (!raw) return { key: 'unknown', recognized: false };
