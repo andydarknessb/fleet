@@ -2286,7 +2286,7 @@ test('#324: ruled without --ruling (missing or blank) is refused RULING_REQUIRED
   const root = rootDir();
   const { revision, first } = blockerChain(root);
   const { gh } = stubGh();
-  for (const ruling of [undefined, '', '   ']) {
+  for (const ruling of [undefined, '', '   ', 'true']) {
     assert.throws(
       () => formalRecord(root, revision, gh, { headSha: 'b'.repeat(40), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'ruled' }, ruling, noFindings: 'x', idempotencyKey: 'r324-3' }),
       (error) => error.code === 'RULING_REQUIRED',
@@ -2321,4 +2321,32 @@ test('#324: a finding that repeats a ruled finding is accepted and escalates, li
     findings: [{ file: 'a.js', claim: 'the hex again', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
   });
   assert.equal(third.escalated.state, 'escalated');
+});
+
+test('#324: RULING_REQUIRED exits 2 through the CLI and writes nothing', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const { repo, head } = commitIn(root);
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const run = spawnSync(process.execPath, [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
+    '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'project-lead', '--no-findings', 'clean',
+    '--classification', JSON.stringify({ tier: 'normal', triggers: [] }), '--resolutions', JSON.stringify({ 'formal-001-f1': 'ruled' }), '--ruling'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 2, run.stderr);
+  assert.equal(JSON.parse(run.stderr).code, 'RULING_REQUIRED');
+  assertNothingWritten(root);
+});
+
+test('#324: a risk finding can be ruled; the formal review posts success and plan-rereview lists nothing unresolved', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const { revision } = seedRiskThenReview(root);
+  const { calls, gh } = stubGh();
+  const formal = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK, gh,
+    resolutions: { 'risk-001-f1': 'ruled', 'risk-001-f2': 'resolved', 'risk-001-f3': 'resolved' }, ruling: RULING,
+    noFindings: 'the Ruling keeps the risk finding; nothing new', idempotencyKey: 'r324-risk', now: '2026-09-12T11:00:00.000Z',
+  });
+  assert.equal(statusField(calls[0], 'state'), 'success');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, formal.artifact), 'utf8')).ruling, RULING);
+  assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: '28ab0000' }).unresolved, []);
 });

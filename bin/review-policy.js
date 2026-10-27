@@ -748,7 +748,7 @@ function recordReviewArtifact(options = {}) {
   }
   const riskRuling = typeof options.riskRuling === 'string' && options.riskRuling.trim().length > 0 ? options.riskRuling.trim() : null;
   // #324: a `ruled` resolution cites the Ruling that keeps the finding; the citation belongs to no other resolution.
-  const ruling = typeof options.ruling === 'string' && options.ruling.trim().length > 0 ? options.ruling.trim() : null;
+  const ruling = typeof options.ruling === 'string' && options.ruling.trim().length > 0 && options.ruling !== 'true' ? options.ruling.trim() : null; // a bare --ruling parses to 'true'
   const anyRuled = Object.values(options.resolutions || {}).includes('ruled');
   if (anyRuled && !ruling) throw new ReviewPolicyError('RULING_REQUIRED', 'a ruled resolution cites the Ruling that keeps the finding: pass --ruling "<link or reference>"');
   if (ruling && !anyRuled) throw new ReviewPolicyError('USAGE', '--ruling belongs to a ruled resolution: it cites the Ruling that keeps the finding');
