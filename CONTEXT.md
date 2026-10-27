@@ -285,6 +285,13 @@ never one of the CI gates: review waits for the gates, so a gate that waited
 for the review would deadlock.
 _Avoid_: approval, review check, merge check
 
+**Ruled finding**:
+A real finding that a Ruling keeps as it stands. It is settled without being
+fixed, so it is no longer open and no longer blocks the Review gate. The Ruling
+is the tenant owner's or an Endorsement, never the reviewer's own, and raising
+the finding again needs a new Ruling.
+_Avoid_: accepted risk, waived finding, won't fix
+
 **Researcher**:
 A Worker spawned to find facts and report them: documentation, how a thing
 works, where it is called, what a log or thread says. It edits nothing and

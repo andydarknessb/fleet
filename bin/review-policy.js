@@ -47,7 +47,7 @@ const DEFAULT_REVIEW_CONFIG = Object.freeze({
   trivialMaxFiles: 3,
   patternExcludePaths: Object.freeze(['**/*.md', '**/*.txt', 'docs/**']),
 });
-const RESOLUTION_VALUES = Object.freeze(['resolved', 'still-open', 'not-real']);
+const RESOLUTION_VALUES = Object.freeze(['resolved', 'still-open', 'not-real', 'ruled']);
 const STALE_RETRY_LIMIT = 5;
 
 class ReviewPolicyError extends Error {
@@ -331,7 +331,7 @@ function buildFindings(stamp, suppliedFindings, priors, resolutions) {
   for (const { data, path: priorPath } of priors) {
     if (!data) continue;
     // Carry the still-open prior findings forward so the latest artifact is the
-    // complete unresolved set; resolved and not-real material is settled.
+    // complete unresolved set; resolved, not-real and ruled material is settled.
     for (const finding of openFindings(data)) {
       if (resolutions[finding.id] === 'still-open') {
         findings.push({ ...finding, status: 'open', carriedFrom: priorPath });
@@ -635,13 +635,13 @@ function attestPullRequest(options = {}) {
 // --- #118: re-review discipline at the door (ADR 0014 Consequences) ---------
 // On endzone #1240 one finding was re-raised five times at a cost of 569k
 // tokens. A finding may carry `repeats: <prior finding id>`, naming a finding
-// this record's formal chain settled as `resolved` or `not-real`; the review
+// this record's formal chain settled as `resolved`, `not-real` or `ruled`; the review
 // still records, and the record goes to `escalated` with a decision-needed
 // wake instead of back to the IC, because the lead and the IC disagree about
 // a settled point and another round will not settle it. The newest
 // resolution of an id wins while walking the chain back.
 
-const REPEATABLE_RESOLUTIONS = Object.freeze(['resolved', 'not-real']);
+const REPEATABLE_RESOLUTIONS = Object.freeze(['resolved', 'not-real', 'ruled']);
 
 function chainResolutions(root, newestArtifact) {
   const settled = new Map();
@@ -670,7 +670,7 @@ function validateRepeats({ root, recordId, kind, prior, repeating }) {
       throw new ReviewPolicyError('INVALID_FINDING', `a finding's repeats names the prior finding id it raises again (#118), got ${JSON.stringify(target)}`, { field: 'repeats' });
     }
     if (!REPEATABLE_RESOLUTIONS.includes(settled.get(target))) {
-      throw new ReviewPolicyError('INVALID_FINDING', `repeats '${target}' names no finding resolved or not-real earlier in ${recordId}'s review chain${settled.has(target) ? ` (it is ${settled.get(target)})` : ''}; an open finding is carried with --resolutions still-open, not repeated (#118)`, { field: 'repeats', repeats: target });
+      throw new ReviewPolicyError('INVALID_FINDING', `repeats '${target}' names no finding resolved, not-real or ruled earlier in ${recordId}'s review chain${settled.has(target) ? ` (it is ${settled.get(target)})` : ''}; an open finding is carried with --resolutions still-open, not repeated (#118)`, { field: 'repeats', repeats: target });
     }
   }
 }
@@ -747,6 +747,11 @@ function recordReviewArtifact(options = {}) {
     throw new ReviewPolicyError('CLASSIFICATION_REQUIRED', `a formal review records the head's classification: pass --classification '<json>' from review-policy.js classify at ${headSha}`, { headSha: String(headSha) });
   }
   const riskRuling = typeof options.riskRuling === 'string' && options.riskRuling.trim().length > 0 ? options.riskRuling.trim() : null;
+  // #324: a `ruled` resolution cites the Ruling that keeps the finding; the citation belongs to no other resolution.
+  const ruling = typeof options.ruling === 'string' && options.ruling.trim().length > 0 && options.ruling !== 'true' ? options.ruling.trim() : null; // a bare --ruling parses to 'true'
+  const anyRuled = Object.values(options.resolutions || {}).includes('ruled');
+  if (anyRuled && !ruling) throw new ReviewPolicyError('RULING_REQUIRED', 'a ruled resolution cites the Ruling that keeps the finding: pass --ruling "<link or reference>"');
+  if (ruling && !anyRuled) throw new ReviewPolicyError('USAGE', '--ruling belongs to a ruled resolution: it cites the Ruling that keeps the finding');
   if (riskRuling && kind !== 'formal') throw new ReviewPolicyError('USAGE', '--risk-ruling belongs to a formal review: it is the lead ruling on a trigger');
   // Ticket 09: with state/flags/review-dedup-off every review pass is written down (the
   // legacy behaviour). The default replay key is kind:record:head, which would make a
@@ -927,7 +932,7 @@ function recordReviewArtifact(options = {}) {
           // fleet#43 (formal only): the risk artifact whose open findings this
           // review accounted for; null when there was none or a prior formal
           // review already consumed it.
-          ...(kind === 'formal' ? { riskArtifact, riskArtifactMissing: riskArtifactMissing || undefined, riskRuling: riskRuling || undefined } : {}),
+          ...(kind === 'formal' ? { riskArtifact, riskArtifactMissing: riskArtifactMissing || undefined, riskRuling: riskRuling || undefined, ruling: ruling || undefined } : {}),
           resolutions,
           noFindings: noFindings ? noFindings.trim() : null,
           findings: buildFindings(stamp, options.findings, priors, resolutions),
@@ -1097,7 +1102,7 @@ function classifyCli(rest) {
 // `--no-findings`, and a typo'd `--no-finding` must not be a silent no-op):
 // each list is every flag its handler consumes; an unknown flag or command is
 // USAGE, exit 2, nothing on stdout.
-const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'repost'];
+const RECORD_FLAGS = ['root', 'id', 'expected-revision', 'kind', 'head-sha', 'reviewed-sha', 'repo-path', 'actor', 'now', 'idempotency-key', 'evidence', 'classification', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'ruling', 'repost'];
 const COMMAND_FLAGS = Object.freeze({
   classify: CLASSIFY_FLAGS,
   record: RECORD_FLAGS,
@@ -1127,7 +1132,7 @@ function cli(argv) {
   if (command === 'record' && args.repost !== undefined) {
     // #115: post the status again for the latest formal artifact; no new review.
     if (args.repost !== 'true') throw new ReviewPolicyError('USAGE', '--repost takes no value');
-    const content = ['kind', 'head-sha', 'reviewed-sha', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'classification', 'expected-revision', 'idempotency-key'].filter((flag) => args[flag] !== undefined);
+    const content = ['kind', 'head-sha', 'reviewed-sha', 'findings', 'no-findings', 'resolutions', 'prior-artifact', 'risk-ruling', 'ruling', 'classification', 'expected-revision', 'idempotency-key'].filter((flag) => args[flag] !== undefined);
     if (content.length) {
       throw new ReviewPolicyError('USAGE', `--repost posts the recorded formal review's status again and takes no review content: drop ${content.map((flag) => `--${flag}`).join(', ')}`);
     }
@@ -1149,6 +1154,7 @@ function cli(argv) {
       resolutions: args.resolutions ? JSON.parse(args.resolutions) : null,
       priorArtifact: args['prior-artifact'],
       riskRuling: args['risk-ruling'],
+      ruling: args.ruling,
       // #118: a repeats escalation pages through the notifier like `hold` does.
       notifier: require('./notify').spawnNotifier,
     });
@@ -1204,7 +1210,7 @@ if (require.main === module) {
     // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
     // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
     // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 
