@@ -314,3 +314,71 @@ The rules:
 - `bin/setup.ps1` leaves a `settings.json` that does not parse untouched and
   says so; the user environment is not set in that case either.
 - The door (`launch.ps1`'s version gate) does not change.
+
+## Amendment 9 (2026-10-27, owner ruling, fleet #337): a daily canary moves the CLI
+
+Cory asked that CLI updates be automated so nothing gets interrupted. With the
+global CLI frozen and `config/cli.json` naming the CLI the fleet runs (#336,
+Amendment 8), the probes that Amendments 5 and 6 ran by hand run on a schedule.
+
+- Probes count as the re-test for both tiers (Amendment 6 counted probes 1 and 2
+  for deepseek; this extends it to haiku). A full rehearsal
+  (`bin/scratch-root.ps1`) runs only after a probe fails.
+- `bin/cli-canary.ps1`, registered by `bin/install-cli-canary-task.ps1` (daily,
+  03:00; `bin/run-cli-canary.ps1` logs to `state/cli-canary/`), compares
+  `npm view @anthropic-ai/claude-code version` with `config/cli.json` `version`.
+  When they differ and no open PR or issue covers that version, it installs the
+  candidate side by side (`bin/install-cli.ps1 -Version <v>`, no `-Global`) and
+  probes every tier under `claude -p` with `FLEET_CLAUDE_CLI` set to it, in a
+  scratch cwd. A prompt becomes a denial under `-p`, so a missing allow rule
+  fails the probe.
+  - deepseek: the deepseek `baseUrl`, `apiKeyHelper` and the auto profile. Passes
+    on `permissionMode: auto`, an out-of-cwd Bash and Read with
+    `permission_denials: []`, and no Anthropic `msg_` id.
+  - haiku: the allowlist profile under `acceptEdits`, running a backtick `grep`,
+    `gh pr view`, `node --test` and `git -C <repo> log`. Passes on
+    `permissionMode: acceptEdits` and the denial rule below. Since #335 the
+    allowlist gate refuses a backtick anywhere in a Bash call, so the backtick
+    `grep` must be refused by an allowlist-gate PreToolUse `deny` (the tool
+    result reads `PreToolUse:Bash hook error: ...` and a hook response carries
+    `permissionDecision: deny`), every other listed command must succeed, and no
+    denial may come from the CLI itself (an approval request a background IC
+    would wait on). The hook's own refusal is the profile working; it still
+    shows in `permission_denials`.
+- A tier is open when its `verifiedCliVersion` equals `config/cli.json`
+  `version`. The PR (branch `fleet/cli-<v>`, temp worktree off `origin/master`)
+  opens only when every open tier passes. It sets `config/cli.json` to the
+  candidate and bumps `verifiedCliVersion` for every tier that passed, a closed
+  tier that passes included. A closed tier that fails stays closed and gets an
+  issue. If any open tier fails, nothing moves: an issue carries the probe
+  output and the fleet stays on its CLI. An open tier never closes because a new
+  CLI shipped.
+- With no newer release, the canary re-probes each closed tier on the version
+  `config/cli.json` names (installed side by side). A pass opens a PR on
+  `fleet/cli-<v>-<tier>` bumping only that tier's `verifiedCliVersion`; a fail
+  files one issue per tier and version. The duplicate guard is per tier: an open
+  PR on that branch or an open issue naming the version and the tier.
+- The PR body is the attest. Cory merges; the deploy ships `config/cli.json`, and the Watchdog's CLI step on that tick moves the CLI (Amendment 8).
+  The canary never merges and never touches the live checkout or `state/`.
+- The probe settings are the smallest equivalent of `launch.ps1`'s composition
+  (even its `-DryRun` needs a roster, tenant and manifest): fleet-settings.json,
+  hooks included, plus the tier profile and the IC env block. The hooks run as
+  launch.ps1 writes them (SessionStart, the research and allowlist gates,
+  principal-guard, Stop), from the checkout being canaried, with `FLEET_HOME`
+  set to the probe's scratch home so the Stop heartbeat and notice reads never
+  touch `state/`. No hook is left out. The tool-contract denies and the
+  repoDeny rules only deny and are not written.
+- A probe passes only on positive evidence: `permission_denials` present and
+  empty (haiku: see above), a result line with `is_error` false, the expected `permissionMode`, no
+  hook error, and the out-of-cwd Bash and Read returned successful tool results
+  (deepseek also needs no Anthropic `msg_` id). A timeout, a missing result line
+  or a missing field fails the probe.
+- Every failure path is loud. Bodies go through `--body-file`; every `gh` and
+  `git push` exit is checked, and a failed create exits 2 instead of reporting
+  `issue-filed` or `pr-opened`. The PR worktree is detached and pushed as
+  `HEAD:refs/heads/fleet/cli-<v>`, so a failed run leaves no local branch.
+  `run-cli-canary.ps1` sends a high-priority `Send-FleetPage` on any non-zero
+  exit, because a silent canary freezes the fleet on its current CLI.
+- The 2.1.312 dry run caught the gap Amendment 6 left out of scope: the haiku
+  allowlist profile denies the backtick `grep` under `acceptEdits`, so haiku
+  would stay closed on that CLI until the allowlist covers it.
