@@ -108,7 +108,8 @@ function Set-Probe { param($F, [string]$Tier, [bool]$Pass = $true, [bool]$MsgId 
   $calls = @(1..$want | ForEach-Object { @{ name = 'Bash'; id = "b$_"; err = $false; cmd = 'echo ok'; text = 'ok' } }) + @(@{ name = 'Read'; id = 'r1'; err = $ReadFails; cmd = ''; text = 'x' })
   if ($Tier -eq 'haiku') {
     $calls[0].cmd = $bt
-    if ($gate -eq 'refused') { $calls[0].err = $true; $calls[0].text = 'PreToolUse:Bash hook error: the allowlist profile refuses a backtick' }
+    if ($gate -eq 'refused') { $calls[0].err = $true; $calls[0].text = 'PreToolUse:Bash hook error: the allowlist profile refuses a backtick anywhere' }
+    if ($gate -eq 'other') { $calls[0].err = $true; $calls[0].text = 'PreToolUse:Bash hook error: a recursive grep sweep is research (research-gate)' }
     if ($gate -eq 'cli') { $calls[0].err = $true; $calls[0].text = 'requires approval' }
   }
   foreach ($c in $calls) {
@@ -119,7 +120,7 @@ function Set-Probe { param($F, [string]$Tier, [bool]$Pass = $true, [bool]$MsgId 
     $lines += '{"type":"assistant","message":{"id":"' + $id + '","content":[{"type":"tool_use","id":"' + $c.id + '","name":"' + $c.name + '","input":{"command":"' + $c.cmd.Replace('\', '\') + '"}}]}}'
     $lines += '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"' + $c.id + '","is_error":' + ([string]$c.err).ToLower() + ',"content":"' + $c.text + '"}]}}'
   }
-  $den = if ($Pass -and -not ($Tier -eq 'haiku' -and $gate -in @('refused', 'cli'))) { '[]' } elseif ($Tier -eq 'haiku') { '[{"tool_name":"Bash","tool_use_id":"b1","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' } else { '[{"tool_name":"Bash","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' }
+  $den = if ($Pass -and -not ($Tier -eq 'haiku' -and $gate -in @('refused', 'cli', 'other'))) { '[]' } elseif ($Tier -eq 'haiku') { '[{"tool_name":"Bash","tool_use_id":"b1","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' } else { '[{"tool_name":"Bash","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' }
   $field = if ($NoDenialsField) { '' } else { ',"permission_denials":' + $den }
   if (-not $NoResult) { $lines += '{"type":"system","subtype":"hook_response","hook_event":"Stop","hook_name":"Stop","outcome":"success"}'; $lines += '{"type":"result"' + $(if ($NoIsError) { '' } else { ',"is_error":' + ([string]$IsError).ToLower() }) + $field + ',"total_cost_usd":0.01}' }
   Write-Utf8 "$($F.fake)\$Tier.jsonl" ($lines -join "`n")
@@ -213,6 +214,9 @@ try {
   $f = New-Fixture 'gate-ran'; Set-Probe $f haiku -Gate ran; Set-Probe $f deepseek
   $r = Run $f
   Assert-True ($r.outcome -eq 'issue-filed' -and (Probe $r haiku).why -match 'did not refuse') "gate ran: an allowed backtick command must fail haiku, got '$((Probe $r haiku).why)'"
+  $f = New-Fixture 'gate-other'; Set-Probe $f haiku -Gate other; Set-Probe $f deepseek
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'issue-filed' -and (Probe $r haiku).why -match 'not refused by allowlist-gate') "gate other: another hook's refusal must not pass haiku, got '$((Probe $r haiku).why)'"
   $f = New-Fixture 'gate-ok'; Set-Probe $f haiku; Set-Probe $f deepseek
   $r = Run $f
   Assert-True ((Probe $r haiku).pass -and (Probe $r haiku).gateRefused -eq 1 -and (Probe $r haiku).cliDenials -eq 0) 'gate refused: the gate-refused backtick grep passes haiku'

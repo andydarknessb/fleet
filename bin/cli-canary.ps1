@@ -205,9 +205,9 @@ function Invoke-Probe { param($T)
       foreach ($c in @($e.message.content)) {
         if ($c.type -ne 'tool_result') { continue }
         $tn = $toolNames["$($c.tool_use_id)"]; $ok = -not $c.is_error
-        $isBacktick = $toolCmds["$($c.tool_use_id)"].Contains('`')
-        # the allowlist gate's refusal comes back as the tool result 'PreToolUse:<Tool> hook error: ...'
-        if ($tn -eq 'Bash' -and "$($c.content)" -match '^PreToolUse:\w+ hook error:') { $hookRefused["$($c.tool_use_id)"] = $true }
+        $isBacktick = "$($toolCmds["$($c.tool_use_id)"])".Contains('`')
+        # the gate's refusal comes back as that call's own tool result carrying its reason text; another hook's refusal does not count
+        if ($tn -eq 'Bash' -and "$($c.content)" -match 'the allowlist profile refuses a backtick') { $hookRefused["$($c.tool_use_id)"] = $true }
         if ($tn -eq 'Bash' -and $isBacktick) { if ($hookRefused["$($c.tool_use_id)"]) { $p.backtickRefused = $true } elseif ($ok) { $p.backtickRan = $true } }
         elseif ($tn -eq 'Bash' -and -not $ok) { $p.otherBashFail++ }
         if ($tn -eq 'Bash') { $p.bashResults++; if ($ok) { $p.bashOk++ } } elseif ($tn -eq 'Read' -and $ok) { $p.readOk++ }
@@ -235,7 +235,7 @@ function Invoke-Probe { param($T)
     # #335: the gate refuses the backtick grep (a PreToolUse deny); any other denial is the CLI's own approval request
     if ($p.cliDenials) { $why += "$($p.cliDenials) permission denial(s) raised by the CLI, not by a hook" }
     if ($p.backtickRan) { $why += 'the backtick command ran: allowlist-gate did not refuse it' }
-    elseif (-not $p.backtickRefused -or $p.denyHooks -lt 1) { $why += 'the backtick command was not refused by an allowlist-gate PreToolUse deny' }
+    elseif (-not $p.backtickRefused) { $why += 'the backtick command was not refused by allowlist-gate (its reason text is missing from that call tool result)' }
     if ($p.otherBashFail) { $why += "$($p.otherBashFail) other Bash command(s) did not succeed" }
   }
   if ($p.bashResults -lt $expect[$name].bash -or $p.readOk -lt $expect[$name].read) { $why += "got $($p.bashResults) Bash results and $($p.readOk) successful Read results, expected $($expect[$name].bash) and $($expect[$name].read)" }
