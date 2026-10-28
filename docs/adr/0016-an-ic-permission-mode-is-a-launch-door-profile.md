@@ -259,7 +259,7 @@ The rules:
 - Out of scope: the allowlist gate let the backtick grep through. Haiku still
   runs that profile, so that gap gets its own ticket.
 
-## Amendment 7 (2026-10-27, owner ruling, fleet #336): the CLI is frozen and the deploy moves it
+## Amendment 7 (2026-10-27, owner ruling, fleet #336): the CLI is frozen and the Watchdog moves it after a deploy
 
 A per-tier CLI pin cannot hold. `claude --bg` sessions run under one per-user
 supervisor (`claude.exe daemon run`, `~/.claude/daemon.json`), and after an
