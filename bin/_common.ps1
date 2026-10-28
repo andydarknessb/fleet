@@ -418,7 +418,7 @@ function ConvertTo-ProcessArgument {
   return '"' + $escaped + '"'
 }
 function Invoke-BoundedExe {
-  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '', $StdinText = $null)   # untyped: a [string] default of $null is '', and '' is not "no stdin"
+  param([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutSec, [string]$Name = '', $StdinText = $null, [switch]$KillTree)   # -KillTree (#336): a timeout takes the child's whole tree down (npm under install-cli.ps1); untyped $StdinText: a [string] default of $null is '', and '' is not "no stdin"
   $result = [pscustomobject]@{ timedOut = $false; exitCode = $null; stdout = ''; stderr = ''; startError = $null }
   $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName(); $childIn = $null
   try {
@@ -436,6 +436,7 @@ function Invoke-BoundedExe {
     # reads back $null even on a clean exit.
     $null = $p.Handle
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+      if ($KillTree) { try { $null = & taskkill.exe /PID $p.Id /T /F 2>&1 } catch {} }
       try { $p.Kill() } catch {}
       $result.timedOut = $true
       $label = if ($Name) { $Name } else { [IO.Path]::GetFileName($FilePath) }
@@ -485,12 +486,13 @@ function Invoke-BoundedCommand {
 # fleet #336 (ADR 0016 Amendment 7): the global CLI is frozen; config/cli.json names the version and the deploy installs it.
 # DISABLE_AUTOUPDATER=1 goes into the settings file's env (merged, the other keys kept) and the Windows user environment.
 function Set-ClaudeAutoUpdaterOff {
+  # Returns $false (and writes nothing, not even the user environment) when the settings file will not parse: overwriting
+  # it would clobber the user's keys. The caller reports it.
   param([string]$SettingsPath, [switch]$SkipUserEnv)
   $settings = [pscustomobject]@{}
   if (Test-Path -LiteralPath $SettingsPath) {
-    # A settings file that does not parse is left alone: overwriting it would clobber the user's keys.
-    $settings = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($null -eq $settings) { $settings = [pscustomobject]@{} }
+    try { $settings = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop } catch { return $false }
+    if ($null -eq $settings -or $settings -isnot [pscustomobject]) { return $false }
   }
   if (-not $settings.PSObject.Properties['env']) { $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) }
   if ($settings.env.PSObject.Properties['DISABLE_AUTOUPDATER']) { $settings.env.DISABLE_AUTOUPDATER = '1' }
@@ -498,6 +500,7 @@ function Set-ClaudeAutoUpdaterOff {
   [IO.Directory]::CreateDirectory((Split-Path -Parent $SettingsPath)) | Out-Null
   Write-Json $SettingsPath $settings
   if (-not $SkipUserEnv) { [Environment]::SetEnvironmentVariable('DISABLE_AUTOUPDATER', '1', 'User') }
+  return $true
 }
 function Get-ClaudeCliKnownPaths {
   $known = @()

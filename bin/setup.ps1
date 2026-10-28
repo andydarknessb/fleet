@@ -13,8 +13,8 @@ Write-Output "claude: $v"
 if ($v -notmatch '(\d+)\.(\d+)\.(\d+)') { Write-Error 'claude not found'; exit 1 }
 $ver = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
 if ($ver -lt [version]'2.1.234') { Write-Error "cross-session messaging on native Windows needs >= 2.1.234 (have $ver)"; exit 1 }
-Set-ClaudeAutoUpdaterOff -SettingsPath $ClaudeSettingsPath -SkipUserEnv:$SkipUserEnv
-Write-Output "DISABLE_AUTOUPDATER=1 set in $ClaudeSettingsPath$(if (-not $SkipUserEnv) { ' and the user environment' })"
+if (Set-ClaudeAutoUpdaterOff -SettingsPath $ClaudeSettingsPath -SkipUserEnv:$SkipUserEnv) { Write-Output "DISABLE_AUTOUPDATER=1 set in $ClaudeSettingsPath$(if (-not $SkipUserEnv) { ' and the user environment' })" }
+else { Write-Warning "$ClaudeSettingsPath does not parse as JSON; left untouched, DISABLE_AUTOUPDATER not set (fix the file and rerun)" }
 foreach ($d in 'heartbeats','status','escalations','sessions','sentinel','continue') { New-Item -ItemType Directory -Force "$FleetHome\state\$d" | Out-Null }
 if (-not (Test-Path "$FleetHome\state\roster.json")) { Write-Json "$FleetHome\state\roster.json" ([pscustomobject]@{ sessions = @() }) }
 $agentsLink = "$env:USERPROFILE\.claude\agents"

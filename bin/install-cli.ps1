@@ -2,7 +2,7 @@
 .SYNOPSIS  #336 (ADR 0016 Amendment 7): install one pinned claude CLI version.
   -Version x.y.z, no -Global: npm install --prefix %USERPROFILE%\.fleet-cli\<x.y.z> @anthropic-ai/claude-code@<x.y.z>
                               (a side-by-side copy for `claude -p` probes; it never touches the global CLI)
-  -Version x.y.z -Global:     npm install -g @anthropic-ai/claude-code@<x.y.z> (what bin/deploy-live.ps1 runs)
+  -Version x.y.z -Global:     npm install -g @anthropic-ai/claude-code@<x.y.z> (what the Watchdog's CLI step runs every tick)
   Idempotent: when the target package already holds that version and its claude.exe passes
   Test-ClaudeCliCandidate, npm does not run. Prints one JSON line {ok, version, path} (path is the
   package's bin\claude.exe), or {ok:false, reason} with exit 2. -NpmExe lets a test stand in for npm.
@@ -18,7 +18,7 @@ $ErrorActionPreference = 'Continue'
 
 function Fail { param([string]$Reason) Write-Output ([pscustomobject]@{ ok = $false; reason = $Reason } | ConvertTo-Json -Compress); exit 2 }
 
-if ($Version -notmatch '^\d+\.\d+\.\d+$') { Fail "-Version must be x.y.z, got '$Version'" }
+if ($Version -notmatch '\A\d+\.\d+\.\d+\z') { Fail "-Version must be x.y.z, got '$Version'" }
 $pkgRel = 'node_modules\@anthropic-ai\claude-code'
 if ($Global) {
   if (-not $env:APPDATA) { Fail 'APPDATA is not set; cannot place the global package' }

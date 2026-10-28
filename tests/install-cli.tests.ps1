@@ -84,9 +84,20 @@ try {
   Set-ClaudeAutoUpdaterOff -SettingsPath $sp -SkipUserEnv
   $s = Get-Content $sp -Raw | ConvertFrom-Json
   Assert-True ($s.model -eq 'opus' -and $s.env.DISABLE_AUTOUPDATER -eq '1') 'adds env when absent'
+  # An unparseable file is left untouched and reported, under the Continue preference setup.ps1 runs with.
   Write-Utf8 $sp '{not json'
-  $threw = $false; try { Set-ClaudeAutoUpdaterOff -SettingsPath $sp -SkipUserEnv } catch { $threw = $true }
-  Assert-True ($threw -and (Get-Content $sp -Raw) -eq '{not json') 'an unparseable file is left alone'
+  $ErrorActionPreference = 'Continue'
+  $did = Set-ClaudeAutoUpdaterOff -SettingsPath $sp -SkipUserEnv
+  $ErrorActionPreference = 'Stop'
+  Assert-True (-not $did -and (Get-Content $sp -Raw) -eq '{not json') 'an unparseable file is left alone and reported'
+
+  # -KillTree: a timeout takes the grandchild down too.
+  Write-Utf8 "$testRoot\child.ps1" ('$p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile","-Command","Start-Sleep 120"; Set-Content "' + $testRoot + '\grand.pid" $p.Id; Start-Sleep 120')
+  $r = Invoke-BoundedExe -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-File', "$testRoot\child.ps1") -TimeoutSec 8 -Name 'tree' -KillTree
+  Assert-True $r.timedOut 'the child timed out'
+  Start-Sleep -Milliseconds 500
+  $gp = [int](Get-Content "$testRoot\grand.pid")
+  Assert-True (-not (Get-Process -Id $gp -ErrorAction SilentlyContinue)) 'KillTree must kill the grandchild'
   Write-Output 'install-cli tests passed'
 } finally {
   $env:USERPROFILE = $savedProfile; $env:APPDATA = $savedAppData

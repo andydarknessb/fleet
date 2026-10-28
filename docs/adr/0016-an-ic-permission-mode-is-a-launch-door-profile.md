@@ -277,17 +277,28 @@ The rules:
   probes. A manual `claude update` still works and is Cory's call.
 - `config/cli.json` `{ "version": "<x.y.z>" }` names the CLI the fleet runs. It
   starts at 2.1.312. The owner commits it; no code writes it.
-- The deploy moves the CLI. When `bin/deploy-live.ps1` advances `live` and the
-  installed `claude --version` differs from `config/cli.json`, it runs
-  `bin/install-cli.ps1 -Version <v> -Global` (`npm install -g
-  @anthropic-ai/claude-code@<v>`) and reports `cli: { from, to, ok, detail }`
-  in its JSON line. The tier fields (`verifiedCliVersion`) and the binary change
-  on the same deploy, so the door never sees a gap. A failed install leaves
-  `live` advanced and the line names the failure.
+- The Watchdog moves the CLI, as its own step on every tick, right after the
+  deploy (a first draft put it inside `bin/deploy-live.ps1`; Opus QA found a
+  failed install invisible there, `npm install -g` unbounded inside deploy's
+  120 s budget with a kill orphaning npm, and no retry because the next tick
+  returns `current` first, so `deploy-live.ps1` carries no CLI step and does
+  not load `_common.ps1`). The step runs `bin/install-cli.ps1 -Version
+  <config/cli.json version> -Global` (`npm install -g
+  @anthropic-ai/claude-code@<v>`) bounded at no more than 300 s
+  (`watchdog.cliTimeoutSec` may only lower it); a timeout kills the whole
+  process tree, npm included. install-cli is idempotent, so a matching CLI
+  costs a file read, and a mismatch retries every tick until it matches. The
+  answer lands in `state/watchdog/cli.json`; `{ ok:false }` pages
+  `cli-install` (normal) through the Watchdog's paging on the next tick,
+  naming the reason, and the next ok clears it. Between a deploy and the end of
+  that step the door may refuse a haiku or deepseek launch and the lead falls
+  back to sonnet, as it does today; that lasts one tick, once per CLI move.
 - `bin/install-cli.ps1 -Version <v>` without `-Global` installs side by side
   under `%USERPROFILE%\.fleet-cli\<v>` with `npm install --prefix`. It is
   idempotent and prints one JSON line `{ ok, version, path }`, where `path` is
   the package's `bin\claude.exe` and passes `Test-ClaudeCliCandidate`. The
   #337 canary probes that copy under `claude -p`, which does not use the
   supervisor.
+- `bin/setup.ps1` leaves a `settings.json` that does not parse untouched and
+  says so; the user environment is not set in that case either.
 - The door (`launch.ps1`'s version gate) does not change.

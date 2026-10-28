@@ -1,4 +1,4 @@
 {
-  "$comment": "The claude CLI the fleet runs (owner ruling 2026-10-27, fleet #336, ADR 0016 Amendment 7). The global CLI is frozen: bin/setup.ps1 sets DISABLE_AUTOUPDATER=1 in ~/.claude/settings.json and the Windows user environment, so nothing updates it but this file. When bin/deploy-live.ps1 advances live and the installed `claude --version` differs from version, it runs bin/install-cli.ps1 -Version <version> -Global, so the binary and the tier fields (verifiedCliVersion) change on the same deploy. The owner commits it and no code writes it.",
+  "$comment": "The claude CLI the fleet runs (owner ruling 2026-10-27, fleet #336, ADR 0016 Amendment 7). The global CLI is frozen: bin/setup.ps1 sets DISABLE_AUTOUPDATER=1 in ~/.claude/settings.json and the Windows user environment, so nothing updates it but this file. On every tick, right after the deploy, the Watchdog runs bin/install-cli.ps1 -Version <version> -Global (idempotent, retried until it matches, and an ok:false pages cli-install), so the binary follows the tier fields (verifiedCliVersion) within a tick. The owner commits it and no code writes it.",
   "version": "2.1.312"
 }

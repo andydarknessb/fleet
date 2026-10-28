@@ -11,9 +11,6 @@
     5. the `fleet-ci` check run on that head (gh api .../commits/<sha>/check-runs):
        none or not completed -> master-pending; completed and not success -> master-red
     6. green -> git merge --ff-only origin/master -> advanced
-  7. after advanced (#336, ADR 0016 Amendment 7): when the installed `claude --version` differs
-     from the new config/cli.json version, bin/install-cli.ps1 -Version <v> -Global runs and the
-     line gains cli: {from, to, ok, detail}. A failed install never moves `live` back.
   Prints one JSON line: {from, to, outcome, detail, at}. Outcomes: advanced, current,
   held, master-red, master-pending, refused:<reason>. It never moves `live` backwards
   and never does a non-fast-forward. Rollback is Cory's hand (README): reset `live`
@@ -28,14 +25,10 @@ param(
   [string]$LiveRef = 'live',
   [string]$CheckName = 'fleet-ci',
   [string]$Repo = '',        # owner/name on GitHub; derived from the remote URL when empty
-  [string]$GhExe = 'gh',
-  [string]$InstallCliScript = ''   # the checked-out bin\install-cli.ps1 when empty; a test points it at a stub
+  [string]$GhExe = 'gh'
 )
 $ErrorActionPreference = 'Continue'
 if (-not $FleetHome) { $FleetHome = Split-Path -Parent $PSScriptRoot }
-$fleetHomeArg = $FleetHome
-. "$PSScriptRoot\_common.ps1"   # Invoke-ClaudeCli; it sets $FleetHome to its own checkout, so put the argument back
-$FleetHome = $fleetHomeArg
 
 $result = [ordered]@{ from = $null; to = $null; outcome = $null; detail = $null; at = (Get-Date).ToUniversalTime().ToString('o') }
 function Finish { param([string]$Outcome, [string]$Detail = $null)
@@ -97,24 +90,4 @@ $merge = Invoke-Git merge --ff-only --quiet "$Remote/$Branch"
 if ($script:gitExit -ne 0) { Finish 'refused:merge-failed' $merge }
 $now = Invoke-Git rev-parse HEAD
 if ($now -ne $head) { Finish 'refused:merge-failed' "HEAD is $now after the merge, expected $head" }
-
-# The CLI follows the deploy: live now carries config/cli.json, and the installed CLI is moved onto it.
-$cli = [ordered]@{ from = $null; to = $null; ok = $true; detail = $null }
-try {
-  $cliCfg = Read-Json (Join-Path $FleetHome 'config\cli.json')
-  $cli.to = if ($cliCfg) { "$($cliCfg.version)" } else { '' }
-  if ($cli.to -notmatch '^\d+\.\d+\.\d+$') { throw "config/cli.json has no x.y.z version ('$($cli.to)')" }
-  $ver = Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30
-  if ($ver.stdout -match '(\d+\.\d+\.\d+)') { $cli.from = $Matches[1] }
-  if ($cli.from -ne $cli.to) {
-    $installer = if ($InstallCliScript) { $InstallCliScript } else { Join-Path $FleetHome 'bin\install-cli.ps1' }
-    $inst = & powershell -NoProfile -ExecutionPolicy Bypass -File $installer -Version $cli.to -Global 2>&1
-    $instExit = $LASTEXITCODE
-    $instText = (@($inst | ForEach-Object { "$_" }) -join ' ')
-    $cli.ok = ($instExit -eq 0)
-    $cli.detail = if ($cli.ok) { "installed $($cli.to)" } else { "install-cli exited ${instExit}: $instText" }
-  }
-} catch { $cli.ok = $false; $cli.detail = "$($_.Exception.Message)" }
-if ($cli.detail) { $cli.detail = (($cli.detail -replace '\s+', ' ').Trim()); if ($cli.detail.Length -gt 200) { $cli.detail = $cli.detail.Substring(0, 200) } }
-$result.cli = [pscustomobject]$cli
 Finish 'advanced' "$LiveRef fast-forwarded to $head ($CheckName green)"

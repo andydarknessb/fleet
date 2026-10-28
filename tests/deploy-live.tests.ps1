@@ -36,18 +36,10 @@ function New-Fixture {
   G $live switch --quiet -c live origin/master
   $from = G $live rev-parse HEAD
   Write-Utf8 "$seed\a.txt" 'two'
-  [IO.Directory]::CreateDirectory("$seed\config") | Out-Null
-  Write-Utf8 "$seed\config\cli.json" '{"version":"2.1.500"}'
-  G $seed add config/cli.json
   G $seed commit --quiet -a -m two --no-gpg-sign; G $seed push --quiet origin master
   $to = G $seed rev-parse HEAD
   # A stub gh: prints whatever check-runs.json holds (the test writes it per case).
   Write-Utf8 "$root\gh.cmd" ('@type "' + $root + '\check-runs.json"' + "`r`n" + '@exit /b 0' + "`r`n")
-  # #336: a stub claude (version from claude-version.txt) and a stub install-cli.ps1 (logs, exits per install-exit.txt).
-  Write-Utf8 "$root\claude.cmd" ('@type "' + $root + '\claude-version.txt"' + "`r`n" + '@exit /b 0' + "`r`n")
-  Write-Utf8 "$root\claude-version.txt" '2.1.312 (Claude Code)'
-  Write-Utf8 "$root\install-exit.txt" '0'
-  Write-Utf8 "$root\install-stub.ps1" ('param([string]$Version, [switch]$Global)' + "`r`n" + 'Add-Content "' + $root + '\install.log" "$Version global=$Global"' + "`r`n" + '$c = [int](Get-Content "' + $root + '\install-exit.txt"); if ($c) { Write-Output "npm blew up" }; exit $c' + "`r`n")
   [pscustomobject]@{ root = $root; live = $live; seed = $seed; from = $from; to = $to; gh = "$root\gh.cmd" }
 }
 
@@ -57,8 +49,7 @@ function Set-Check { param($F, [string]$Status, [string]$Conclusion, [int]$Id = 
 }
 
 function Deploy { param($F)
-  $env:FLEET_CLAUDE_CLI = "$($F.root)\claude.cmd"
-  $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -FleetHome $F.live -Repo 'owner/fleet' -GhExe $F.gh -InstallCliScript "$($F.root)\install-stub.ps1" | Out-String
+  $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $script -FleetHome $F.live -Repo 'owner/fleet' -GhExe $F.gh | Out-String
   Assert-True ($LASTEXITCODE -eq 0) "deploy-live exits 0 whatever the outcome, got $LASTEXITCODE"
   ($out.Trim() -split "`n")[-1] | ConvertFrom-Json
 }
@@ -134,34 +125,6 @@ try {
   $f = New-Fixture 'ci-unreadable'
   Write-Utf8 "$($f.root)\check-runs.json" 'not json'
   Assert-True ((Deploy $f).outcome -eq 'refused:ci-unreadable') 'unparseable check-runs must refuse'
-
-  # #336: an advance moves the CLI to config/cli.json when the installed one differs.
-  $f = New-Fixture 'cli-differs'
-  Set-Check $f 'completed' 'success'
-  $r = Deploy $f
-  Assert-True ($r.outcome -eq 'advanced' -and $r.cli.from -eq '2.1.312' -and $r.cli.to -eq '2.1.500' -and $r.cli.ok) "cli step: $($r | ConvertTo-Json -Compress)"
-  Assert-True ((Get-Content "$($f.root)\install.log" -Raw).Trim() -eq '2.1.500 global=True') 'install-cli ran -Version 2.1.500 -Global'
-
-  # The same version installs nothing.
-  $f = New-Fixture 'cli-same'
-  Set-Check $f 'completed' 'success'
-  Write-Utf8 "$($f.root)\claude-version.txt" '2.1.500 (Claude Code)'
-  $r = Deploy $f
-  Assert-True ($r.outcome -eq 'advanced' -and $r.cli.ok -and -not (Test-Path "$($f.root)\install.log")) 'a matching CLI must not install'
-
-  # A failed install leaves live advanced, names the failure and still exits 0 with one JSON line.
-  $f = New-Fixture 'cli-fails'
-  Set-Check $f 'completed' 'success'
-  Write-Utf8 "$($f.root)\install-exit.txt" '2'
-  $r = Deploy $f
-  Assert-True ($r.outcome -eq 'advanced' -and -not $r.cli.ok -and "$($r.cli.detail)" -match 'npm blew up') "failed install: $($r | ConvertTo-Json -Compress)"
-  Assert-True ((G $f.live rev-parse HEAD) -eq $f.to) 'a failed install never moves live back'
-
-  # A red master does not touch the CLI and carries no cli field.
-  $f = New-Fixture 'cli-red'
-  Set-Check $f 'completed' 'failure'
-  $r = Deploy $f
-  Assert-True ($r.outcome -eq 'master-red' -and -not $r.PSObject.Properties['cli'] -and -not (Test-Path "$($f.root)\install.log")) 'no CLI step without an advance'
 
   Write-Output 'deploy-live.tests.ps1: all assertions passed'
 } finally {
