@@ -483,7 +483,7 @@ function Invoke-BoundedCommand {
 # that window threw CommandNotFound under `2>$null` and the caller read it as an empty
 # fleet or a finished job. Resolve-ClaudeCli waits that window out and, when the CLI is
 # still absent, throws a message that names every place it looked.
-# fleet #336 (ADR 0016 Amendment 7): the global CLI is frozen; config/cli.json names the version and the deploy installs it.
+# fleet #336 (ADR 0016 Amendment 8): the global CLI is frozen; config/cli.json names the version and the deploy installs it.
 # DISABLE_AUTOUPDATER=1 goes into the settings file's env (merged, the other keys kept) and the Windows user environment.
 function Set-ClaudeAutoUpdaterOff {
   # Returns $false (and writes nothing, not even the user environment) when the settings file will not parse: overwriting

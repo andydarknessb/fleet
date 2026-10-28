@@ -1,5 +1,5 @@
 <#
-.SYNOPSIS  #336 (ADR 0016 Amendment 7): install one pinned claude CLI version.
+.SYNOPSIS  #336 (ADR 0016 Amendment 8): install one pinned claude CLI version.
   -Version x.y.z, no -Global: npm install --prefix %USERPROFILE%\.fleet-cli\<x.y.z> @anthropic-ai/claude-code@<x.y.z>
                               (a side-by-side copy for `claude -p` probes; it never touches the global CLI)
   -Version x.y.z -Global:     npm install -g @anthropic-ai/claude-code@<x.y.z> (what the Watchdog's CLI step runs every tick)

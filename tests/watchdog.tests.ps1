@@ -2309,7 +2309,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
 
-  # ===== #336 (ADR 0016 Amendment 7): the Watchdog's CLI step =====
+  # ===== #336 (ADR 0016 Amendment 8): the Watchdog's CLI step =====
   # No config/cli.json (every other case): nothing spawns. With one, install-cli.ps1 -Version <v> -Global runs every
   # tick; {ok:false} pages cli-install on the next tick, naming the reason, and an ok answer clears it. -Verify spawns nothing.
   $cl0 = Run-Watchdog
