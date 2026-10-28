@@ -292,9 +292,25 @@ Amendment 7), the probes that Amendments 5 and 6 ran by hand run on a schedule.
   CLI shipped.
 - The PR body is the attest. Cory merges, and the next deploy moves the CLI.
   The canary never merges and never touches the live checkout or `state/`.
-- The probe settings are fleet-settings.json minus hooks plus the tier profile,
-  the smallest equivalent of `launch.ps1`'s composition; the tool-contract and
-  repoDeny rules only deny and are left out.
+- The probe settings are the smallest equivalent of `launch.ps1`'s composition
+  (even its `-DryRun` needs a roster, tenant and manifest): fleet-settings.json,
+  hooks included, plus the tier profile and the IC env block. The hooks run as
+  launch.ps1 writes them (SessionStart, the research and allowlist gates,
+  principal-guard, Stop), from the checkout being canaried, with `FLEET_HOME`
+  set to the probe's scratch home so the Stop heartbeat and notice reads never
+  touch `state/`. No hook is left out. The tool-contract denies and the
+  repoDeny rules only deny and are not written.
+- A probe passes only on positive evidence: `permission_denials` present and
+  empty, a result line with `is_error` false, the expected `permissionMode`, no
+  hook error, and the out-of-cwd Bash and Read returned successful tool results
+  (deepseek also needs no Anthropic `msg_` id). A timeout, a missing result line
+  or a missing field fails the probe.
+- Every failure path is loud. Bodies go through `--body-file`; every `gh` and
+  `git push` exit is checked, and a failed create exits 2 instead of reporting
+  `issue-filed` or `pr-opened`. The PR worktree is detached and pushed as
+  `HEAD:refs/heads/fleet/cli-<v>`, so a failed run leaves no local branch.
+  `run-cli-canary.ps1` sends a high-priority `Send-FleetPage` on any non-zero
+  exit, because a silent canary freezes the fleet on its current CLI.
 - The 2.1.312 dry run caught the gap Amendment 6 left out of scope: the haiku
   allowlist profile denies the backtick `grep` under `acceptEdits`, so haiku
   would stay closed on that CLI until the allowlist covers it.
