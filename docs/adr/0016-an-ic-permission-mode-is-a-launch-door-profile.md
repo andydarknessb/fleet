@@ -258,3 +258,43 @@ The rules:
   under allowlist.
 - Out of scope: the allowlist gate let the backtick grep through. Haiku still
   runs that profile, so that gap gets its own ticket.
+
+## Amendment 8 (2026-10-27, owner ruling, fleet #337): a daily canary moves the CLI
+
+Cory asked that CLI updates be automated so nothing gets interrupted. With the
+global CLI frozen and `config/cli.json` naming the CLI the fleet runs (#336,
+Amendment 7), the probes that Amendments 5 and 6 ran by hand run on a schedule.
+
+- Probes count as the re-test for both tiers (Amendment 6 counted probes 1 and 2
+  for deepseek; this extends it to haiku). A full rehearsal
+  (`bin/scratch-root.ps1`) runs only after a probe fails.
+- `bin/cli-canary.ps1`, registered by `bin/install-cli-canary-task.ps1` (daily,
+  03:00; `bin/run-cli-canary.ps1` logs to `state/cli-canary/`), compares
+  `npm view @anthropic-ai/claude-code version` with `config/cli.json` `version`.
+  When they differ and no open PR or issue covers that version, it installs the
+  candidate side by side (`bin/install-cli.ps1 -Version <v>`, no `-Global`) and
+  probes every tier under `claude -p` with `FLEET_CLAUDE_CLI` set to it, in a
+  scratch cwd. A prompt becomes a denial under `-p`, so a missing allow rule
+  fails the probe.
+  - deepseek: the deepseek `baseUrl`, `apiKeyHelper` and the auto profile. Passes
+    on `permissionMode: auto`, an out-of-cwd Bash and Read with
+    `permission_denials: []`, and no Anthropic `msg_` id.
+  - haiku: the allowlist profile under `acceptEdits`, running a backtick `grep`,
+    `gh pr view`, `node --test` and `git -C <repo> log`. Passes on
+    `permissionMode: acceptEdits` and `permission_denials: []`.
+- A tier is open when its `verifiedCliVersion` equals `config/cli.json`
+  `version`. The PR (branch `fleet/cli-<v>`, temp worktree off `origin/master`)
+  opens only when every open tier passes. It sets `config/cli.json` to the
+  candidate and bumps `verifiedCliVersion` for every tier that passed, a closed
+  tier that passes included. A closed tier that fails stays closed and gets an
+  issue. If any open tier fails, nothing moves: an issue carries the probe
+  output and the fleet stays on its CLI. An open tier never closes because a new
+  CLI shipped.
+- The PR body is the attest. Cory merges, and the next deploy moves the CLI.
+  The canary never merges and never touches the live checkout or `state/`.
+- The probe settings are fleet-settings.json minus hooks plus the tier profile,
+  the smallest equivalent of `launch.ps1`'s composition; the tool-contract and
+  repoDeny rules only deny and are left out.
+- The 2.1.312 dry run caught the gap Amendment 6 left out of scope: the haiku
+  allowlist profile denies the backtick `grep` under `acceptEdits`, so haiku
+  would stay closed on that CLI until the allowlist covers it.
