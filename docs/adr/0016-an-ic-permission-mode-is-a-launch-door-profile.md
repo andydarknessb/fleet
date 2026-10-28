@@ -315,11 +315,11 @@ The rules:
   says so; the user environment is not set in that case either.
 - The door (`launch.ps1`'s version gate) does not change.
 
-## Amendment 8 (2026-10-27, owner ruling, fleet #337): a daily canary moves the CLI
+## Amendment 9 (2026-10-27, owner ruling, fleet #337): a daily canary moves the CLI
 
 Cory asked that CLI updates be automated so nothing gets interrupted. With the
 global CLI frozen and `config/cli.json` naming the CLI the fleet runs (#336,
-Amendment 7), the probes that Amendments 5 and 6 ran by hand run on a schedule.
+Amendment 8), the probes that Amendments 5 and 6 ran by hand run on a schedule.
 
 - Probes count as the re-test for both tiers (Amendment 6 counted probes 1 and 2
   for deepseek; this extends it to haiku). A full rehearsal
@@ -337,7 +337,14 @@ Amendment 7), the probes that Amendments 5 and 6 ran by hand run on a schedule.
     `permission_denials: []`, and no Anthropic `msg_` id.
   - haiku: the allowlist profile under `acceptEdits`, running a backtick `grep`,
     `gh pr view`, `node --test` and `git -C <repo> log`. Passes on
-    `permissionMode: acceptEdits` and `permission_denials: []`.
+    `permissionMode: acceptEdits` and the denial rule below. Since #335 the
+    allowlist gate refuses a backtick anywhere in a Bash call, so the backtick
+    `grep` must be refused by an allowlist-gate PreToolUse `deny` (the tool
+    result reads `PreToolUse:Bash hook error: ...` and a hook response carries
+    `permissionDecision: deny`), every other listed command must succeed, and no
+    denial may come from the CLI itself (an approval request a background IC
+    would wait on). The hook's own refusal is the profile working; it still
+    shows in `permission_denials`.
 - A tier is open when its `verifiedCliVersion` equals `config/cli.json`
   `version`. The PR (branch `fleet/cli-<v>`, temp worktree off `origin/master`)
   opens only when every open tier passes. It sets `config/cli.json` to the
@@ -346,7 +353,12 @@ Amendment 7), the probes that Amendments 5 and 6 ran by hand run on a schedule.
   issue. If any open tier fails, nothing moves: an issue carries the probe
   output and the fleet stays on its CLI. An open tier never closes because a new
   CLI shipped.
-- The PR body is the attest. Cory merges; the deploy ships `config/cli.json`, and the Watchdog's CLI step on that tick moves the CLI (Amendment 7).
+- With no newer release, the canary re-probes each closed tier on the version
+  `config/cli.json` names (installed side by side). A pass opens a PR on
+  `fleet/cli-<v>-<tier>` bumping only that tier's `verifiedCliVersion`; a fail
+  files one issue per tier and version. The duplicate guard is per tier: an open
+  PR on that branch or an open issue naming the version and the tier.
+- The PR body is the attest. Cory merges; the deploy ships `config/cli.json`, and the Watchdog's CLI step on that tick moves the CLI (Amendment 8).
   The canary never merges and never touches the live checkout or `state/`.
 - The probe settings are the smallest equivalent of `launch.ps1`'s composition
   (even its `-DryRun` needs a roster, tenant and manifest): fleet-settings.json,
@@ -357,7 +369,7 @@ Amendment 7), the probes that Amendments 5 and 6 ran by hand run on a schedule.
   touch `state/`. No hook is left out. The tool-contract denies and the
   repoDeny rules only deny and are not written.
 - A probe passes only on positive evidence: `permission_denials` present and
-  empty, a result line with `is_error` false, the expected `permissionMode`, no
+  empty (haiku: see above), a result line with `is_error` false, the expected `permissionMode`, no
   hook error, and the out-of-cwd Bash and Read returned successful tool results
   (deepseek also needs no Anthropic `msg_` id). A timeout, a missing result line
   or a missing field fails the probe.

@@ -1,4 +1,4 @@
-# #337 (ADR 0016 Amendment 8): bin/cli-canary.ps1 against a fixture: a bare origin, a fleet
+# #337 (ADR 0016 Amendment 9): bin/cli-canary.ps1 against a fixture: a bare origin, a fleet
 # checkout with the tier configs, and fake npm / gh / install-cli / claude (no network, no real CLI).
 # Red-tell: all open tiers pass -> a PR branch bumps cli.json and the passing tiers (a closed
 # passing tier reopens); an open tier fails -> an issue, no branch, no PR; a closed tier that
@@ -98,18 +98,28 @@ function New-Fixture { param([string]$Name, [string]$Current = '1.0.0', [string]
 }
 
 # One transcript: init, N Bash calls + results, one Read + result, then the result line.
-function Set-Probe { param($F, [string]$Tier, [bool]$Pass = $true, [bool]$MsgId = $false, [string]$Mode = '', [bool]$IsError = $false, [bool]$NoDenialsField = $false, [bool]$NoResult = $false, [bool]$ReadFails = $false, [bool]$NoPre = $false, [bool]$NoIsError = $false)
+function Set-Probe { param($F, [string]$Tier, [bool]$Pass = $true, [bool]$MsgId = $false, [string]$Mode = '', [bool]$IsError = $false, [bool]$NoDenialsField = $false, [bool]$NoResult = $false, [bool]$ReadFails = $false, [bool]$NoPre = $false, [bool]$NoIsError = $false, [string]$Gate = 'refused')
   if (-not $Mode) { $Mode = if ($Tier -eq 'haiku') { 'acceptEdits' } else { 'auto' } }
   $want = if ($Tier -eq 'haiku') { 4 } else { 1 }
   $lines = @('{"type":"system","subtype":"init","permissionMode":"' + $Mode + '","model":"m"}')
   $id = if ($MsgId) { 'msg_01abc' } else { 'resp-1' }
-  $calls = @(1..$want | ForEach-Object { @{ name = 'Bash'; id = "b$_"; err = $false } }) + @(@{ name = 'Read'; id = 'r1'; err = $ReadFails })
-  foreach ($c in $calls) {
-    if (-not $NoPre) { $lines += '{"type":"system","subtype":"hook_response","hook_event":"PreToolUse","hook_name":"PreToolUse:' + $c.name + '","outcome":"success"}' }
-    $lines += '{"type":"assistant","message":{"id":"' + $id + '","content":[{"type":"tool_use","id":"' + $c.id + '","name":"' + $c.name + '","input":{}}]}}'
-    $lines += '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"' + $c.id + '","is_error":' + ([string]$c.err).ToLower() + ',"content":"x"}]}}'
+  $gate = $Gate; if ($Tier -eq 'haiku' -and -not $Pass) { $gate = 'cli' }
+  $bt = "grep -n 'a``b' notes.txt"
+  $calls = @(1..$want | ForEach-Object { @{ name = 'Bash'; id = "b$_"; err = $false; cmd = 'echo ok'; text = 'ok' } }) + @(@{ name = 'Read'; id = 'r1'; err = $ReadFails; cmd = ''; text = 'x' })
+  if ($Tier -eq 'haiku') {
+    $calls[0].cmd = $bt
+    if ($gate -eq 'refused') { $calls[0].err = $true; $calls[0].text = 'PreToolUse:Bash hook error: the allowlist profile refuses a backtick' }
+    if ($gate -eq 'cli') { $calls[0].err = $true; $calls[0].text = 'requires approval' }
   }
-  $den = if ($Pass) { '[]' } else { '[{"tool_name":"Bash","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' }
+  foreach ($c in $calls) {
+    if (-not $NoPre) {
+      $out = if ($Tier -eq 'haiku' -and $c.id -eq 'b1' -and $gate -eq 'refused') { '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\"}}' } else { '' }
+      $lines += '{"type":"system","subtype":"hook_response","hook_event":"PreToolUse","hook_name":"PreToolUse:' + $c.name + '","output":"' + $out + '","outcome":"success"}'
+    }
+    $lines += '{"type":"assistant","message":{"id":"' + $id + '","content":[{"type":"tool_use","id":"' + $c.id + '","name":"' + $c.name + '","input":{"command":"' + $c.cmd.Replace('\', '\') + '"}}]}}'
+    $lines += '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"' + $c.id + '","is_error":' + ([string]$c.err).ToLower() + ',"content":"' + $c.text + '"}]}}'
+  }
+  $den = if ($Pass -and -not ($Tier -eq 'haiku' -and $gate -in @('refused', 'cli'))) { '[]' } elseif ($Tier -eq 'haiku') { '[{"tool_name":"Bash","tool_use_id":"b1","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' } else { '[{"tool_name":"Bash","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' }
   $field = if ($NoDenialsField) { '' } else { ',"permission_denials":' + $den }
   if (-not $NoResult) { $lines += '{"type":"system","subtype":"hook_response","hook_event":"Stop","hook_name":"Stop","outcome":"success"}'; $lines += '{"type":"result"' + $(if ($NoIsError) { '' } else { ',"is_error":' + ([string]$IsError).ToLower() }) + $field + ',"total_cost_usd":0.01}' }
   Write-Utf8 "$($F.fake)\$Tier.jsonl" ($lines -join "`n")
@@ -195,6 +205,44 @@ try {
   # a stale remote branch from an older run is replaced
   $f = New-Fixture 'stale-remote'; Set-Probe $f haiku; Set-Probe $f deepseek; G $f.fleet push --quiet origin master:refs/heads/fleet/cli-1.1.0
   Assert-True ((Run $f).outcome -eq 'pr-opened') 'a stale remote branch with no open PR does not block the push'
+
+  # haiku is gate-aware (#335): a CLI-raised denial fails, a backtick command that ran fails
+  $f = New-Fixture 'gate-cli'; Set-Probe $f haiku -Gate cli; Set-Probe $f deepseek
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'issue-filed' -and (Probe $r haiku).why -match 'raised by the CLI') "gate cli: a CLI-originated denial must fail haiku, got '$((Probe $r haiku).why)'"
+  $f = New-Fixture 'gate-ran'; Set-Probe $f haiku -Gate ran; Set-Probe $f deepseek
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'issue-filed' -and (Probe $r haiku).why -match 'did not refuse') "gate ran: an allowed backtick command must fail haiku, got '$((Probe $r haiku).why)'"
+  $f = New-Fixture 'gate-ok'; Set-Probe $f haiku; Set-Probe $f deepseek
+  $r = Run $f
+  Assert-True ((Probe $r haiku).pass -and (Probe $r haiku).gateRefused -eq 1 -and (Probe $r haiku).cliDenials -eq 0) 'gate refused: the gate-refused backtick grep passes haiku'
+
+  # closed-tier reprobe (no newer release): haiku closed, deepseek open, latest equals cli.json
+  $f = New-Fixture 'reprobe-pass' -Latest '1.0.0' -HaikuV 'null'; Set-Probe $f haiku
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'reprobe:pr-opened' -and $r.exit -eq 0 -and $r.probes.Count -eq 1) "reprobe pass: got $($r.outcome) $($r.detail)"
+  Assert-True ((Get-Content "$($f.fake)\installs.log" -Raw).Trim() -eq '1.0.0 global=False') 'reprobe: installs the current version side by side'
+  Assert-True ((G $f.origin show 'fleet/cli-1.0.0-haiku:config/permissions-allowlist.json') -match '"verifiedCliVersion":1.0.0|"verifiedCliVersion":"1.0.0"') 'reprobe: the tier is bumped'
+  Assert-True ((G $f.origin show 'fleet/cli-1.0.0-haiku:config/cli.json') -match '"1.0.0"' -and (G $f.origin show 'fleet/cli-1.0.0-haiku:config/deepseek.json') -match '"verifiedCliVersion":"1.0.0"') 'reprobe: nothing but that tier changes'
+  Assert-True ((G $f.fleet branch --list 'fleet/cli-*') -eq '') 'reprobe: no local branch'
+  $f = New-Fixture 'reprobe-fail' -Latest '1.0.0' -HaikuV 'null'; Set-Probe $f haiku -Gate cli
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'reprobe:issue-filed' -and (Calls $f) -match 'issue create' -and (Calls $f) -notmatch 'pr create') "reprobe fail: got $($r.outcome)"
+  Assert-True ((G $f.origin branch --list 'fleet/cli-*') -eq '') 'reprobe fail: no branch'
+  $f = New-Fixture 'reprobe-mixed' -Latest '1.0.0' -HaikuV 'null' -DeepV 'null'; Set-Probe $f haiku; Set-Probe $f deepseek -Pass $false
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'reprobe:pr-opened,issue-filed' -and $r.probes.Count -eq 2) "reprobe mixed: one PR, one issue; got $($r.outcome)"
+  Assert-True (((Calls $f) -split "`n" | Where-Object { $_ -match 'issue create' }).Count -eq 1) 'reprobe mixed: one issue per failing tier'
+  $f = New-Fixture 'reprobe-duppr' -Latest '1.0.0' -HaikuV 'null'; Write-Utf8 "$($f.fake)\prs.json" '[{"number":7}]'
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'duplicate' -and -not (Test-Path "$($f.fake)\installs.log")) 'reprobe: an open PR for the tier stops the run'
+  $f = New-Fixture 'reprobe-dupissue' -Latest '1.0.0' -HaikuV 'null'; Write-Utf8 "$($f.fake)\issues.json" '[{"number":8,"title":"cli-canary: Claude Code 1.0.0 failed the probe for haiku"}]'
+  Assert-True ((Run $f).outcome -eq 'duplicate') 'reprobe: an open issue for the tier and version stops the run'
+  $f = New-Fixture 'reprobe-otherissue' -Latest '1.0.0' -HaikuV 'null'; Set-Probe $f haiku; Write-Utf8 "$($f.fake)\issues.json" '[{"number":8,"title":"cli-canary: Claude Code 1.0.0 failed the probe for deepseek"}]'
+  Assert-True ((Run $f).outcome -eq 'reprobe:pr-opened') 'reprobe: an issue for another tier is no duplicate'
+  $f = New-Fixture 'reprobe-dry' -Latest '1.0.0' -HaikuV 'null'; Set-Probe $f haiku
+  $r = Run $f -DryRun
+  Assert-True ($r.outcome -eq 'dry-run:reprobe' -and (Calls $f) -notmatch 'create' -and (G $f.origin branch --list 'fleet/cli-*') -eq '') 'reprobe dry run: probes, writes nothing'
 
   # a closed tier (null) that passes reopens in the same PR
   $f = New-Fixture 'reopen' -HaikuV 'null'; Set-Probe $f haiku; Set-Probe $f deepseek
