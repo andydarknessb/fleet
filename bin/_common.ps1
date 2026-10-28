@@ -476,12 +476,29 @@ function Invoke-BoundedCommand {
   return Invoke-BoundedExe -FilePath $exe -ArgumentList $ArgumentList -TimeoutSec $TimeoutSec -Name $Name
 }
 # fleet #265: the claude CLI is resolved once per process, never by a bare `& claude`.
-# The CLI auto-updates itself through `npm install -g` about twice an hour (daemon.log:
-# "binary changed, self-restarting for upgrade"), and npm deletes the package dir and the
+# Before #336 the CLI auto-updated itself through `npm install -g` about twice an hour (daemon.log:
+# "binary changed, self-restarting for upgrade"); now only the deploy or a manual `claude update` does, and npm deletes the package dir and the
 # bin shims before it relinks, so for some seconds `claude` exists nowhere. A bare call in
 # that window threw CommandNotFound under `2>$null` and the caller read it as an empty
 # fleet or a finished job. Resolve-ClaudeCli waits that window out and, when the CLI is
 # still absent, throws a message that names every place it looked.
+# fleet #336 (ADR 0016 Amendment 7): the global CLI is frozen; config/cli.json names the version and the deploy installs it.
+# DISABLE_AUTOUPDATER=1 goes into the settings file's env (merged, the other keys kept) and the Windows user environment.
+function Set-ClaudeAutoUpdaterOff {
+  param([string]$SettingsPath, [switch]$SkipUserEnv)
+  $settings = [pscustomobject]@{}
+  if (Test-Path -LiteralPath $SettingsPath) {
+    # A settings file that does not parse is left alone: overwriting it would clobber the user's keys.
+    $settings = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($null -eq $settings) { $settings = [pscustomobject]@{} }
+  }
+  if (-not $settings.PSObject.Properties['env']) { $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) }
+  if ($settings.env.PSObject.Properties['DISABLE_AUTOUPDATER']) { $settings.env.DISABLE_AUTOUPDATER = '1' }
+  else { $settings.env | Add-Member -NotePropertyName DISABLE_AUTOUPDATER -NotePropertyValue '1' }
+  [IO.Directory]::CreateDirectory((Split-Path -Parent $SettingsPath)) | Out-Null
+  Write-Json $SettingsPath $settings
+  if (-not $SkipUserEnv) { [Environment]::SetEnvironmentVariable('DISABLE_AUTOUPDATER', '1', 'User') }
+}
 function Get-ClaudeCliKnownPaths {
   $known = @()
   if ($env:APPDATA) {

@@ -1091,7 +1091,7 @@ foreach ($tf in (Get-ChildItem "$FleetHome\tenants" -Filter *.json)) {
 }
 
 # --- fleet #265: cleanup-pending ---
-# retire.ps1 writes one line here when the claude CLI was missing (an npm auto-update window) and so could
+# retire.ps1 writes one line here when the claude CLI was missing (an npm reinstall window) and so could
 # not stop/rm the job: the roster already says retired, the job and its worktrees were left untouched.
 # Acting needs -Apply AND state/flags/ic-cleanup-live, like the other cleanup passes (shadow-first): the job is
 # stopped and removed (each verified by a strict re-read), then each listed worktree is removed only when

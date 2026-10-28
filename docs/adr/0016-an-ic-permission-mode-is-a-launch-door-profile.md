@@ -258,3 +258,36 @@ The rules:
   under allowlist.
 - Out of scope: the allowlist gate let the backtick grep through. Haiku still
   runs that profile, so that gap gets its own ticket.
+
+## Amendment 7 (2026-10-27, owner ruling, fleet #336): the CLI is frozen and the deploy moves it
+
+A per-tier CLI pin cannot hold. `claude --bg` sessions run under one per-user
+supervisor (`claude.exe daemon run`, `~/.claude/daemon.json`), and after an
+update the supervisor restarts itself onto the new version and moves idle
+sessions over (code.claude.com/docs/en/agent-view). The job records on this
+machine show `cliVersion` values from 2.1.233 to 2.1.312: whichever binary
+starts a session, it ends up on the global one.
+
+The rules:
+
+- The global CLI is frozen. `bin/setup.ps1` writes `DISABLE_AUTOUPDATER=1`
+  into `~/.claude/settings.json` `env` (merged; the other keys stay) and into
+  the Windows user environment. Cory's interactive sessions move with the
+  fleet, at most about a day behind, and only onto versions that passed the
+  probes. A manual `claude update` still works and is Cory's call.
+- `config/cli.json` `{ "version": "<x.y.z>" }` names the CLI the fleet runs. It
+  starts at 2.1.312. The owner commits it; no code writes it.
+- The deploy moves the CLI. When `bin/deploy-live.ps1` advances `live` and the
+  installed `claude --version` differs from `config/cli.json`, it runs
+  `bin/install-cli.ps1 -Version <v> -Global` (`npm install -g
+  @anthropic-ai/claude-code@<v>`) and reports `cli: { from, to, ok, detail }`
+  in its JSON line. The tier fields (`verifiedCliVersion`) and the binary change
+  on the same deploy, so the door never sees a gap. A failed install leaves
+  `live` advanced and the line names the failure.
+- `bin/install-cli.ps1 -Version <v>` without `-Global` installs side by side
+  under `%USERPROFILE%\.fleet-cli\<v>` with `npm install --prefix`. It is
+  idempotent and prints one JSON line `{ ok, version, path }`, where `path` is
+  the package's `bin\claude.exe` and passes `Test-ClaudeCliCandidate`. The
+  #337 canary probes that copy under `claude -p`, which does not use the
+  supervisor.
+- The door (`launch.ps1`'s version gate) does not change.

@@ -1,4 +1,8 @@
 # One-time setup. Idempotent. Run: powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\Cory\fleet\bin\setup.ps1
+param(
+  [string]$ClaudeSettingsPath = "$env:USERPROFILE\.claude\settings.json",
+  [switch]$SkipUserEnv   # tests: leave the Windows user environment alone
+)
 . "$PSScriptRoot\_common.ps1"
 . "$PSScriptRoot\check-policy.ps1"
 # FLEET_CLAUDE_CLI (optional) pins the claude executable, like FLEET_NODE_PATH pins node; unset, the resolver
@@ -9,6 +13,8 @@ Write-Output "claude: $v"
 if ($v -notmatch '(\d+)\.(\d+)\.(\d+)') { Write-Error 'claude not found'; exit 1 }
 $ver = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
 if ($ver -lt [version]'2.1.234') { Write-Error "cross-session messaging on native Windows needs >= 2.1.234 (have $ver)"; exit 1 }
+Set-ClaudeAutoUpdaterOff -SettingsPath $ClaudeSettingsPath -SkipUserEnv:$SkipUserEnv
+Write-Output "DISABLE_AUTOUPDATER=1 set in $ClaudeSettingsPath$(if (-not $SkipUserEnv) { ' and the user environment' })"
 foreach ($d in 'heartbeats','status','escalations','sessions','sentinel','continue') { New-Item -ItemType Directory -Force "$FleetHome\state\$d" | Out-Null }
 if (-not (Test-Path "$FleetHome\state\roster.json")) { Write-Json "$FleetHome\state\roster.json" ([pscustomobject]@{ sessions = @() }) }
 $agentsLink = "$env:USERPROFILE\.claude\agents"
