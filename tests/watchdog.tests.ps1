@@ -2329,6 +2329,21 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ($cl3.cli.ok -eq $true) 'an ok answer is recorded'
   $cl4 = Run-Watchdog
   Assert-True (-not (@($cl4.conditions) -contains 'cli-install')) 'the next ok clears the page'
+  # A tick with under 60 s of its budget left defers the step: no npm, the last answer stands (neither pages nor clears).
+  Write-Utf8 "$testRoot\cli-answer.txt" '{"ok":false,"reason":"npm exited 1: boom"}'
+  $null = Run-Watchdog
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  $dfBefore = @(Get-Content "$testRoot\cli-calls.log").Count
+  Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"tickBudgetSec":30}}'
+  $df1 = Run-Watchdog
+  Assert-True ($df1.cli.deferred -eq $true -and $df1.cli.ok -eq $false -and @(Get-Content "$testRoot\cli-calls.log").Count -eq $dfBefore) 'a short budget defers: no install, the prior failure stands'
+  Assert-True (@($df1.conditions) -contains 'cli-install') 'a deferred tick does not clear an existing page'
+  Write-Utf8 "$testRoot\state\watchdog\cli.json" '{"ok":true,"version":"2.1.500"}'
+  $df2 = Run-Watchdog
+  Assert-True ($df2.cli.deferred -eq $true -and $df2.cli.ok -eq $true -and -not (@($df2.conditions) -contains 'cli-install')) 'a deferred tick after an ok pages nothing'
+  Remove-Item "$testRoot\config\cycle.json"
+  Write-Utf8 "$testRoot\cli-answer.txt" '{"ok":true,"version":"2.1.500","path":"x"}'
+  $null = Run-Watchdog
   $callsBefore = @(Get-Content "$testRoot\cli-calls.log").Count
   $clVerify = Run-Watchdog -Verify
   Assert-True ($null -eq $clVerify.cli -and @(Get-Content "$testRoot\cli-calls.log").Count -eq $callsBefore) '-Verify spawns nothing'
