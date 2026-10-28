@@ -360,8 +360,8 @@ try {
     param($Daemon, [string]$Name, $QuietMinutes, $Now)
     $row = $Daemon | Where-Object { "$($_.name)" -eq $Name -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
     if ($row) { return [pscustomobject]@{ row = $row; standing = (Get-BusyStanding $row -QuietMinutes $QuietMinutes -Now $Now) } }
-    $row = $Daemon | Where-Object { "$($_.name)" -eq $Name -and -not $_.pid -and "$($_.state)" -eq 'blocked' } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
-    if ($row) { return [pscustomobject]@{ row = $row; standing = [pscustomobject]@{ standing = 'reaped'; reason = 'blocked, process reaped (no pid)'; quietMin = $null } } }
+    $row = $Daemon | Where-Object { "$($_.name)" -eq $Name -and -not $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+    if ($row -and "$($row.state)" -eq 'blocked') { return [pscustomobject]@{ row = $row; standing = [pscustomobject]@{ standing = 'reaped'; reason = 'blocked, process reaped (no pid)'; quietMin = $null } } }
     return $null
   }
 

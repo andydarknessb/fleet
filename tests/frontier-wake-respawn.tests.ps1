@@ -378,6 +378,15 @@ try {
   Set-Outbox @($resolution341)
   $b3 = Run-Watchdog; $wb3 = Get-TestWake $b3
   Assert-True ($wb3.decision -eq 'none' -and "$($wb3.reason)" -match 'no running lead session' -and @(Get-RotateCalls).Count -eq 0) "B3: a pid-less done lead is respawned, never rotated by the wake (got $($wb3.decision): $($wb3.reason))"
+
+  # B4 (control): the newest pid-less row decides, as sentinel-check's Latest-Row does. An older leftover blocked
+  # row behind a newer pid-less done row is the respawn's, never a wake target.
+  Start-WakeCase
+  Set-ReapedLeadRow 'blocked'
+  Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"blocked","status":"","startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '},{"id":"job-p2","name":"pl-test","state":"done","status":"","startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-60)) + '}]')
+  Set-Outbox @($resolution341)
+  $b4 = Run-Watchdog; $wb4 = Get-TestWake $b4
+  Assert-True ($wb4.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "B4: an older blocked row behind a newer pid-less done row must not be woken (got $($wb4.decision): $($wb4.reason))"
   Remove-Item "$testRoot\profile\.claude\jobs\job-p" -Recurse -ErrorAction SilentlyContinue
 
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
