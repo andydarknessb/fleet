@@ -67,6 +67,12 @@ try {
   $retryWindowHours = 24    # daemon job history is forever; only recent failures are a storm
   $checkTimeoutSec = 180    # live check measures ~4s; gh/git slowness gets margin, a wedge gets a page
   $deployTimeoutSec = 120   # #113: fetch + one gh call + a fast-forward; bounded so a wedged network cannot wedge the tick
+  $cliTimeoutSec = 300      # #336: npm install -g of the pinned CLI; at most 300 s, config/cycle.json watchdog.cliTimeoutSec may only lower it
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['cliTimeoutSec'] -and [int]$watchdogConfig.cliTimeoutSec -gt 0) { $cliTimeoutSec = [Math]::Min(300, [int]$watchdogConfig.cliTimeoutSec) }
+  # The scheduled task stops watchdog.ps1 at 600 s (install-watchdog-task.ps1); a stop mid-npm would orphan it, so the CLI step
+  # gets whatever is left of this budget (config watchdog.tickBudgetSec lowers it; tests do) and defers under 60 s.
+  $tickBudgetSec = 540
+  if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['tickBudgetSec'] -and [int]$watchdogConfig.tickBudgetSec -gt 0) { $tickBudgetSec = [Math]::Min(540, [int]$watchdogConfig.tickBudgetSec) }
   $frontierTimeoutSec = 15  # ticket 75 review: assignment.js frontier normally answers in ~1-2s; bounded so a wedged gh call cannot wedge the tick
   $permissionWaitMinutes = $PermissionWaitMinutes  # fleet #28: a permission prompt in a --bg session has no approver; ic-1208 sat 12 min unseen
 
@@ -1451,6 +1457,12 @@ try {
     $deployDetail = "the live checkout did not advance ($reason): $(Get-OneLine "$($lastDeploy.detail)" 250)"
     $conditions += [pscustomobject]@{ key = "deploy-refused:$reason"; kind = 'deploy-refused'; detail = $deployDetail; url = $null }
   }
+  # #336 (ADR 0016 Amendment 8): the previous tick's CLI step could not put the claude CLI on config/cli.json's
+  # version. One page, normal priority, naming the reason; the next ok tick rewrites cli.json and the page clears.
+  $lastCli = $null; try { $lastCli = Read-Json "$FleetHome\state\watchdog\cli.json" } catch {}
+  if ($lastCli -and $lastCli.PSObject.Properties['ok'] -and -not $lastCli.ok) {
+    $conditions += [pscustomobject]@{ key = 'cli-install'; kind = 'cli-install'; detail = "the claude CLI is not on config/cli.json's version $($lastCli.version): $(Get-OneLine "$($lastCli.reason)" 250)"; url = $null }
+  }
   # fleet #136: the PR watcher is the only thing that advances a Work record past
   # `implementing` and the only thing that wakes a lead for review; when it dies the fleet
   # looks idle, not broken (2026-09-24: 2h20m of failed ticks, no page). Two conditions,
@@ -1749,6 +1761,39 @@ try {
     } catch {}
   }
 
+  # #336 (ADR 0016 Amendment 8): the CLI step, right after the deploy and on every tick. The global CLI is frozen
+  # (DISABLE_AUTOUPDATER=1) and config/cli.json names the version the fleet runs; bin/install-cli.ps1 -Global is
+  # idempotent, so a matching CLI costs a file read and a mismatch retries each tick until it matches. Bounded at
+  # 300 s at most (less when the tick has used its 540 s budget; under 60 s left it defers), and a timeout kills the whole tree (npm included). state/watchdog/cli.json records the answer;
+  # the next tick pages {ok:false} as cli-install (normal) and an ok answer clears it. No config/cli.json
+  # (a fixture) or -Verify spawns nothing.
+  $cliStep = $null
+  if (-not $Verify -and (Test-Path -LiteralPath "$FleetHome\config\cli.json")) {
+    $cliVersion = ''
+    try { $cliVersion = "$((Read-Json "$FleetHome\config\cli.json").version)" } catch {}
+    $cliBudgetSec = [Math]::Min($cliTimeoutSec, [int][Math]::Floor($tickBudgetSec - ((Get-Date).ToUniversalTime() - $now).TotalSeconds))
+    if ($cliVersion -notmatch '\A\d+\.\d+\.\d+\z') {
+      $cliStep = [pscustomobject]@{ ok = $false; version = $cliVersion; reason = 'config/cli.json has no x.y.z version' }
+    } elseif ($cliBudgetSec -lt 60) {
+      # Too little of the task's 600 s left to run npm safely: keep the last answer (neither page nor clear) and retry next tick.
+      $prior = $null; try { $prior = Read-Json "$FleetHome\state\watchdog\cli.json" } catch {}
+      $priorOk = if ($prior -and $prior.PSObject.Properties['ok']) { [bool]$prior.ok } else { $true }
+      $cliStep = [pscustomobject]@{ ok = $priorOk; version = $cliVersion; reason = $(if ($prior) { $prior.reason } else { $null }); deferred = $true }
+    } else {
+      $cliBounded = Invoke-BoundedExe -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$PSScriptRoot\install-cli.ps1", '-Version', $cliVersion, '-Global') -TimeoutSec $cliBudgetSec -Name 'install-cli.ps1' -KillTree
+      $cliAnswer = if ($cliBounded.stdout) { ConvertFrom-LastJsonLine $cliBounded.stdout } else { $null }
+      if ($cliBounded.timedOut) { $cliStep = [pscustomobject]@{ ok = $false; version = $cliVersion; reason = "install-cli.ps1 did not finish within $cliBudgetSec s" } }
+      elseif ($cliBounded.startError) { $cliStep = [pscustomobject]@{ ok = $false; version = $cliVersion; reason = (Get-OneLine $cliBounded.startError 200) } }
+      elseif (-not $cliAnswer -or -not $cliAnswer.PSObject.Properties['ok']) { $cliStep = [pscustomobject]@{ ok = $false; version = $cliVersion; reason = (Get-OneLine "exit $($cliBounded.exitCode): $($cliBounded.stdout) $($cliBounded.stderr)" 200) } }
+      elseif ($cliAnswer.ok) { $cliStep = [pscustomobject]@{ ok = $true; version = $cliVersion; reason = $null } }
+      else { $cliStep = [pscustomobject]@{ ok = $false; version = $cliVersion; reason = (Get-OneLine "$($cliAnswer.reason)" 250) } }
+    }
+    try {
+      [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null
+      Write-Json "$FleetHome\state\watchdog\cli.json" ([pscustomobject]@{ at = (Now-Iso); version = $cliStep.version; ok = $cliStep.ok; reason = $cliStep.reason; deferred = [bool]$cliStep.PSObject.Properties['deferred'] })
+    } catch {}
+  }
+
   # --- shadow log for the 08b parity comparison ---
   $proposed = $null
   if ($check) {
@@ -1770,6 +1815,7 @@ try {
     # fleet #101: every bounded child that timed out this tick, by name - the tick's own and the check's.
     timeouts = @(@($script:BoundedTimeouts) + @(if ($check -and $check.PSObject.Properties['timeouts']) { $check.timeouts }) | Where-Object { $_ })
     invalidPagePriority = @($invalidPagePriority)
+    cli = $(if ($cliStep) { [pscustomobject]@{ version = $cliStep.version; ok = $cliStep.ok; deferred = [bool]$cliStep.PSObject.Properties['deferred'] } } else { $null })
     deploy = $(if ($deploy) { [pscustomobject]@{ from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome } } else { $null })
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

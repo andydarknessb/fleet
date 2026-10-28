@@ -270,3 +270,47 @@ pattern, or use the Grep tool. Heredoc bodies are exempt, so a commit message
 written through a heredoc keeps its backticks. `$(` keeps its own reason. Only a quoted-delimiter heredoc
 body is exempt: bash runs a backtick or `$(` in an unquoted `<<EOF` body, so the
 gate refuses that too, and `<<<` is not a heredoc.
+
+## Amendment 8 (2026-10-27, owner ruling, fleet #336): the CLI is frozen and the Watchdog moves it after a deploy
+
+A per-tier CLI pin cannot hold. `claude --bg` sessions run under one per-user
+supervisor (`claude.exe daemon run`, `~/.claude/daemon.json`), and after an
+update the supervisor restarts itself onto the new version and moves idle
+sessions over (code.claude.com/docs/en/agent-view). The job records on this
+machine show `cliVersion` values from 2.1.233 to 2.1.312: whichever binary
+starts a session, it ends up on the global one.
+
+The rules:
+
+- The global CLI is frozen. `bin/setup.ps1` writes `DISABLE_AUTOUPDATER=1`
+  into `~/.claude/settings.json` `env` (merged; the other keys stay) and into
+  the Windows user environment. Cory's interactive sessions move with the
+  fleet, at most about a day behind, and only onto versions that passed the
+  probes. A manual `claude update` still works and is Cory's call.
+- `config/cli.json` `{ "version": "<x.y.z>" }` names the CLI the fleet runs. It
+  starts at 2.1.312. The owner commits it; no code writes it.
+- The Watchdog moves the CLI, as its own step on every tick, right after the
+  deploy (a first draft put it inside `bin/deploy-live.ps1`; Opus QA found a
+  failed install invisible there, `npm install -g` unbounded inside deploy's
+  120 s budget with a kill orphaning npm, and no retry because the next tick
+  returns `current` first, so `deploy-live.ps1` carries no CLI step and does
+  not load `_common.ps1`). The step runs `bin/install-cli.ps1 -Version
+  <config/cli.json version> -Global` (`npm install -g
+  @anthropic-ai/claude-code@<v>`) bounded at no more than 300 s
+  (`watchdog.cliTimeoutSec` may only lower it); a timeout kills the whole
+  process tree, npm included. install-cli is idempotent, so a matching CLI
+  costs a file read, and a mismatch retries every tick until it matches. The
+  answer lands in `state/watchdog/cli.json`; `{ ok:false }` pages
+  `cli-install` (normal) through the Watchdog's paging on the next tick,
+  naming the reason, and the next ok clears it. Between a deploy and the end of
+  that step the door may refuse a haiku or deepseek launch and the lead falls
+  back to sonnet, as it does today; that lasts one tick, once per CLI move.
+- `bin/install-cli.ps1 -Version <v>` without `-Global` installs side by side
+  under `%USERPROFILE%\.fleet-cli\<v>` with `npm install --prefix`. It is
+  idempotent and prints one JSON line `{ ok, version, path }`, where `path` is
+  the package's `bin\claude.exe` and passes `Test-ClaudeCliCandidate`. The
+  #337 canary probes that copy under `claude -p`, which does not use the
+  supervisor.
+- `bin/setup.ps1` leaves a `settings.json` that does not parse untouched and
+  says so; the user environment is not set in that case either.
+- The door (`launch.ps1`'s version gate) does not change.

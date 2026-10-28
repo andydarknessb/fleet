@@ -2309,6 +2309,46 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\deploy.json" -ErrorAction SilentlyContinue
 
+  # ===== #336 (ADR 0016 Amendment 8): the Watchdog's CLI step =====
+  # No config/cli.json (every other case): nothing spawns. With one, install-cli.ps1 -Version <v> -Global runs every
+  # tick; {ok:false} pages cli-install on the next tick, naming the reason, and an ok answer clears it. -Verify spawns nothing.
+  $cl0 = Run-Watchdog
+  Assert-True ($null -eq $cl0.cli) 'no config/cli.json, no CLI step'
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  Write-Utf8 "$testRoot\config\cli.json" '{"version":"2.1.500"}'
+  Write-Utf8 "$testRoot\bin\install-cli.ps1" ('param([string]$Version, [switch]$Global)' + "$([char]13)$([char]10)" + 'Add-Content "' + $testRoot + '\cli-calls.log" "$Version $Global"; Get-Content "' + $testRoot + '\cli-answer.txt" -Raw')
+  Write-Utf8 "$testRoot\cli-answer.txt" '{"ok":false,"reason":"npm exited 1: boom"}'
+  $cl1 = Run-Watchdog
+  Assert-True ($cl1.cli.ok -eq $false -and $cl1.cli.version -eq '2.1.500') 'a failed install is recorded'
+  Assert-True ((Get-Content "$testRoot\cli-calls.log" -Raw).Trim() -eq '2.1.500 True') 'the step runs -Version <cli.json> -Global'
+  $cl2 = Run-Watchdog
+  $cl2Entry = @($cl2.newlyPaged | Where-Object { $_.key -eq 'cli-install' })[0]
+  Assert-True ($null -ne $cl2Entry -and $cl2Entry.priority -eq 'normal' -and (Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'npm exited 1: boom') 'the failure pages cli-install, naming the reason'
+  Write-Utf8 "$testRoot\cli-answer.txt" '{"ok":true,"version":"2.1.500","path":"x"}'
+  $cl3 = Run-Watchdog
+  Assert-True ($cl3.cli.ok -eq $true) 'an ok answer is recorded'
+  $cl4 = Run-Watchdog
+  Assert-True (-not (@($cl4.conditions) -contains 'cli-install')) 'the next ok clears the page'
+  # A tick with under 60 s of its budget left defers the step: no npm, the last answer stands (neither pages nor clears).
+  Write-Utf8 "$testRoot\cli-answer.txt" '{"ok":false,"reason":"npm exited 1: boom"}'
+  $null = Run-Watchdog
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  $dfBefore = @(Get-Content "$testRoot\cli-calls.log").Count
+  Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"tickBudgetSec":30}}'
+  $df1 = Run-Watchdog
+  Assert-True ($df1.cli.deferred -eq $true -and $df1.cli.ok -eq $false -and @(Get-Content "$testRoot\cli-calls.log").Count -eq $dfBefore) 'a short budget defers: no install, the prior failure stands'
+  Assert-True (@($df1.conditions) -contains 'cli-install') 'a deferred tick does not clear an existing page'
+  Write-Utf8 "$testRoot\state\watchdog\cli.json" '{"ok":true,"version":"2.1.500"}'
+  $df2 = Run-Watchdog
+  Assert-True ($df2.cli.deferred -eq $true -and $df2.cli.ok -eq $true -and -not (@($df2.conditions) -contains 'cli-install')) 'a deferred tick after an ok pages nothing'
+  Remove-Item "$testRoot\config\cycle.json"
+  Write-Utf8 "$testRoot\cli-answer.txt" '{"ok":true,"version":"2.1.500","path":"x"}'
+  $null = Run-Watchdog
+  $callsBefore = @(Get-Content "$testRoot\cli-calls.log").Count
+  $clVerify = Run-Watchdog -Verify
+  Assert-True ($null -eq $clVerify.cli -and @(Get-Content "$testRoot\cli-calls.log").Count -eq $callsBefore) '-Verify spawns nothing'
+  Remove-Item "$testRoot\config\cli.json", "$testRoot\bin\install-cli.ps1", "$testRoot\state\watchdog\cli.json", "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
+
   # ===== Ticket 85: Do-Respawn verifies the pid actually changed =====
   # The 2026-09-05 incident: ~120 consecutive "applied" respawns of a wedged
   # dispatcher were logged applied and did nothing, because Do-Respawn trusted

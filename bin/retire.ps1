@@ -59,7 +59,7 @@ $ownedBefore = @(Get-OwnedWorktrees)
 $stillThere = $false
 $daemonListOk = $true
 # fleet #265: resolve the claude CLI before touching the job. The CLI is briefly absent while
-# its own npm auto-update reinstalls it (about twice an hour); Resolve-ClaudeCli waits that out.
+# a deploy-time CLI install (bin/install-cli.ps1) or a manual `claude update` reinstalls it; Resolve-ClaudeCli waits that out.
 # When it is still missing the roster side below still completes (a retired row releases the
 # Work record's claim) but the job and its worktrees are left for the Sentinel's cleanup-pending
 # pass: a live job may be writing in that directory, and nothing here could tell.
