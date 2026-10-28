@@ -73,7 +73,7 @@ try {
   # gets whatever is left of this budget (config watchdog.tickBudgetSec lowers it; tests do) and defers under 60 s.
   $tickBudgetSec = 540
   if ($watchdogConfig -and $watchdogConfig.PSObject.Properties['tickBudgetSec'] -and [int]$watchdogConfig.tickBudgetSec -gt 0) { $tickBudgetSec = [Math]::Min(540, [int]$watchdogConfig.tickBudgetSec) }
-  $frontierTimeoutSec = 15 # ticket 75 review: assignment.js frontier normally answers in ~1-2s; bounded so a wedged gh call cannot wedge the tick
+  $frontierTimeoutSec = 15  # ticket 75 review: assignment.js frontier normally answers in ~1-2s; bounded so a wedged gh call cannot wedge the tick
   $permissionWaitMinutes = $PermissionWaitMinutes  # fleet #28: a permission prompt in a --bg session has no approver; ic-1208 sat 12 min unseen
 
   function Get-HeartbeatAgeMinutes {
