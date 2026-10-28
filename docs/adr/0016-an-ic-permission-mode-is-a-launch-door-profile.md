@@ -258,3 +258,13 @@ The rules:
   under allowlist.
 - Out of scope: the allowlist gate let the backtick grep through. Haiku still
   runs that profile, so that gap gets its own ticket.
+
+## Amendment 7 (2026-10-27, fleet #333): a backtick anywhere is refused
+
+ic-2536 waited 2,635 s on a prompt for `grep -n "id: \`\|type:" ...`. The gate's
+double-quote branch took `\`` as an escaped character, so it passed the call
+while the CLI prompted on the backtick. `hooks/allowlist-gate.js` now refuses a
+backtick anywhere in a Bash call, unquoted, double-quoted, escaped or
+single-quoted, with a reason that names the rewrite: match it with `.` in the
+pattern, or use the Grep tool. Heredoc bodies are exempt, so a commit message
+written through a heredoc keeps its backticks. `$(` keeps its own reason.

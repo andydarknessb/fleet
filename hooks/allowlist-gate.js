@@ -51,7 +51,7 @@ function stripHeredocs(command) {
 }
 
 // Split into segments on unquoted ; && || | |& & and newlines. Quoted text, and a
-// $( ... ) inside double quotes, is opaque. An unquoted $( or backtick is reported,
+// $( ... ) inside double quotes, is opaque. An unquoted $( is reported,
 // and so is a parameter expansion ($VAR, ${VAR}, $?) outside single quotes.
 function splitSegments(command) {
   const segments = [];
@@ -77,7 +77,7 @@ function splitSegments(command) {
     }
     if (ch === '\\') { current += ch + (next || ''); i += 1; continue; }
     if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
-    if ((ch === '$' && next === '(') || ch === '`') unquotedSubstitution = true;
+    if (ch === '$' && next === '(') unquotedSubstitution = true;
     if (ch === '$' && isExpansion(next)) expansion = true;
     const two = ch + (next || '');
     if (two === '&&' || two === '||' || two === '|&') { segments.push(current); current = ''; i += 1; continue; }
@@ -159,7 +159,8 @@ function decide(command, context) {
   const listed = `Allowed commands: ${allowedNames(rules).join(', ')}.`;
   const tail = 'One Bash call may chain allowed commands with |, &&, ; and 2>&1. Rewrite the call, or use the Read tool to read a file (ADR 0016, fleet #181; rollback flag state/flags/allowlist-gate-off).';
   const { segments, unquotedSubstitution, expansion } = splitSegments(command);
-  if (unquotedSubstitution) return `the allowlist profile refuses command substitution outside quotes ($(...) or backticks): run the inner command as its own call. ${tail}`;
+  if (stripHeredocs(command).includes('`')) return `the allowlist profile refuses a backtick anywhere in a Bash call, even escaped or quoted (the CLI prompts on it, fleet #333): match it with \`.\` in the pattern, or use the Grep tool. ${tail}`;
+  if (unquotedSubstitution) return `the allowlist profile refuses command substitution outside quotes ($(...)): run the inner command as its own call. ${tail}`;
   if (expansion) return `the allowlist profile refuses a variable expansion such as $? or $VAR outside single quotes (the CLI prompts on it): drop it, since a failing command's output already says so, or write the value out. ${tail}`;
   if (segments.length > 1 && segments.some((s) => words(s)[0] === 'cd')) return `the allowlist profile refuses \`cd\` chained with other commands (the CLI prompts on it): drop the cd, since the session already runs in its worktree, and give paths relative to it. ${tail}`;
   for (const segment of segments) {
