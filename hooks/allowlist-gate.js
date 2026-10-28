@@ -32,26 +32,31 @@ const path = require('node:path');
 const READ_ONLY = Object.freeze(['cat', 'cut', 'diff', 'echo', 'grep', 'head', 'jq', 'ls', 'pwd', 'sort', 'tail', 'tr', 'true', 'uniq', 'wc']);
 
 // Drop every heredoc body: the delimiter line and the body are data, not commands.
-function stripHeredocs(command) {
+// A body with an unquoted delimiter is run by bash: a line of one holding a backtick
+// or $( is pushed onto `unquotedBodies` when the caller passes an array.
+function stripHeredocs(command, unquotedBodies) {
   const lines = String(command).split(/\r?\n/);
   const out = [];
   let delimiter = null;
   let dashed = false;
+  let quoted = true;
   for (const line of lines) {
     if (delimiter !== null) {
       const probe = dashed ? line.replace(/^\t+/, '') : line;
       if (probe.trim() === delimiter) delimiter = null;
+      else if (!quoted && unquotedBodies && /`|\$\(/.test(line)) unquotedBodies.push(line);
       continue;
     }
     out.push(line);
-    const match = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(line);
-    if (match) { dashed = match[1] === '-'; delimiter = match[3]; }
+    // shortcut: a << inside quotes is still read as a heredoc and hides the lines after it; it fails toward a CLI prompt, so upgrade to quote tracking if an IC ever waits on one.
+    const match = /(?<!<)<<(?!<)(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(line);
+    if (match) { dashed = match[1] === '-'; quoted = match[2] !== ''; delimiter = match[3]; }
   }
   return out.join('\n');
 }
 
 // Split into segments on unquoted ; && || | |& & and newlines. Quoted text, and a
-// $( ... ) inside double quotes, is opaque. An unquoted $( or backtick is reported,
+// $( ... ) inside double quotes, is opaque. An unquoted $( is reported,
 // and so is a parameter expansion ($VAR, ${VAR}, $?) outside single quotes.
 function splitSegments(command) {
   const segments = [];
@@ -77,7 +82,7 @@ function splitSegments(command) {
     }
     if (ch === '\\') { current += ch + (next || ''); i += 1; continue; }
     if (ch === "'" || ch === '"') { quote = ch; current += ch; continue; }
-    if ((ch === '$' && next === '(') || ch === '`') unquotedSubstitution = true;
+    if (ch === '$' && next === '(') unquotedSubstitution = true;
     if (ch === '$' && isExpansion(next)) expansion = true;
     const two = ch + (next || '');
     if (two === '&&' || two === '||' || two === '|&') { segments.push(current); current = ''; i += 1; continue; }
@@ -159,7 +164,10 @@ function decide(command, context) {
   const listed = `Allowed commands: ${allowedNames(rules).join(', ')}.`;
   const tail = 'One Bash call may chain allowed commands with |, &&, ; and 2>&1. Rewrite the call, or use the Read tool to read a file (ADR 0016, fleet #181; rollback flag state/flags/allowlist-gate-off).';
   const { segments, unquotedSubstitution, expansion } = splitSegments(command);
-  if (unquotedSubstitution) return `the allowlist profile refuses command substitution outside quotes ($(...) or backticks): run the inner command as its own call. ${tail}`;
+  const unquotedBodies = [];
+  if (stripHeredocs(command, unquotedBodies).includes('`')) return `the allowlist profile refuses a backtick anywhere in a Bash call, even escaped or quoted (the CLI prompts on it, fleet #333): match it with \`.\` in the pattern, use the Grep tool, or put a commit message in a quoted heredoc (<<'EOF') or a -F file. ${tail}`;
+  if (unquotedBodies.length) return `the allowlist profile refuses a backtick or $( in an unquoted heredoc body (bash runs it, fleet #333): quote the delimiter, <<'EOF'. ${tail}`;
+  if (unquotedSubstitution) return `the allowlist profile refuses command substitution outside quotes ($(...)): run the inner command as its own call. ${tail}`;
   if (expansion) return `the allowlist profile refuses a variable expansion such as $? or $VAR outside single quotes (the CLI prompts on it): drop it, since a failing command's output already says so, or write the value out. ${tail}`;
   if (segments.length > 1 && segments.some((s) => words(s)[0] === 'cd')) return `the allowlist profile refuses \`cd\` chained with other commands (the CLI prompts on it): drop the cd, since the session already runs in its worktree, and give paths relative to it. ${tail}`;
   for (const segment of segments) {

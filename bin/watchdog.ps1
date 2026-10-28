@@ -1457,7 +1457,7 @@ try {
     $deployDetail = "the live checkout did not advance ($reason): $(Get-OneLine "$($lastDeploy.detail)" 250)"
     $conditions += [pscustomobject]@{ key = "deploy-refused:$reason"; kind = 'deploy-refused'; detail = $deployDetail; url = $null }
   }
-  # #336 (ADR 0016 Amendment 7): the previous tick's CLI step could not put the claude CLI on config/cli.json's
+  # #336 (ADR 0016 Amendment 8): the previous tick's CLI step could not put the claude CLI on config/cli.json's
   # version. One page, normal priority, naming the reason; the next ok tick rewrites cli.json and the page clears.
   $lastCli = $null; try { $lastCli = Read-Json "$FleetHome\state\watchdog\cli.json" } catch {}
   if ($lastCli -and $lastCli.PSObject.Properties['ok'] -and -not $lastCli.ok) {
@@ -1761,7 +1761,7 @@ try {
     } catch {}
   }
 
-  # #336 (ADR 0016 Amendment 7): the CLI step, right after the deploy and on every tick. The global CLI is frozen
+  # #336 (ADR 0016 Amendment 8): the CLI step, right after the deploy and on every tick. The global CLI is frozen
   # (DISABLE_AUTOUPDATER=1) and config/cli.json names the version the fleet runs; bin/install-cli.ps1 -Global is
   # idempotent, so a matching CLI costs a file read and a mismatch retries each tick until it matches. Bounded at
   # 300 s at most (less when the tick has used its 540 s budget; under 60 s left it defers), and a timeout kills the whole tree (npm included). state/watchdog/cli.json records the answer;

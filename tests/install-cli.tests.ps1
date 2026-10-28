@@ -1,4 +1,4 @@
-# #336 (ADR 0016 Amendment 7): bin/install-cli.ps1 and Set-ClaudeAutoUpdaterOff, against a fake npm.
+# #336 (ADR 0016 Amendment 8): bin/install-cli.ps1 and Set-ClaudeAutoUpdaterOff, against a fake npm.
 # Red-tell: the side-by-side install runs `npm install --prefix <USERPROFILE>\.fleet-cli\<v>` and the global one
 # `npm install -g`; a second run skips npm; the printed path passes Test-ClaudeCliCandidate; a bad version, a failing
 # npm and an npm that leaves a stub each print {ok:false} and exit 2; the settings merge keeps the other keys.
