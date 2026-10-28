@@ -94,10 +94,19 @@ test('a backtick anywhere outside a heredoc body is refused, and $( keeps its ow
   const ic2536 = 'grep -n "id: \\`\\|type:" server/services/homeStatus.service.js | head -40';
   assert.ok(ic2536.includes('\\`'));
   for (const command of [ic2536, "grep -n 'a`b' src/x.js", 'echo `date`']) {
-    assert.match(decide(command, CONTEXT) || '', /backtick anywhere/, `wrong reason for ${command}`);
+    assert.match(decide(command, CONTEXT) || '', /backtick anywhere.*Grep tool/,`wrong reason for ${command}`);
   }
   assert.match(decide('cd $(git rev-parse --show-toplevel)', CONTEXT), /command substitution outside quotes \(\$\(\.\.\.\)\)/);
   assert.equal(decide("git commit -F - <<'EOF'\nfix `code` path\nEOF", CONTEXT), null);
+});
+
+test('only a quoted-delimiter heredoc body is exempt, and <<< is not a heredoc', () => {
+  const body = (open) => `git commit -F - <<${open}\nfix \`code\` path\nEOF`;
+  assert.match(decide(body('EOF'), CONTEXT) || '', /unquoted heredoc.*<<'EOF'/);
+  assert.equal(decide(body("'EOF'"), CONTEXT), null);
+  assert.equal(decide(body('"EOF"'), CONTEXT), null);
+  assert.equal(decide('git commit -F - <<EOF\nfix the path\nEOF', CONTEXT), null);
+  assert.match(decide('grep x <<< foo\npython3 evil.py', CONTEXT) || '', /`python3`/);
 });
 
 test('the python3 refusal names the commands the IC may use instead', () => {
