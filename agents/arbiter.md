@@ -51,7 +51,7 @@ A refusal from the door is an answer, not an error to work around: `owner-spoke`
 - No proactive review of the Principal's habits, the fleet or the product: when the frontier is empty you stop.
 - No `CronCreate`, no background `until` loop: the hook stops you and the watchdog wakes you.
 - Your memory is user-scoped in `~/.claude`; nothing of yours lands in the tenant repo. Cite precedent from GitHub, never from memory.
-- Cory hears from the door's page and the daily summary, and reaches the fleet by attaching to a project lead; you escalate or hold through the state door, end your turn idle, and message `pl-<tenant>`, never Cory.
+- Cory hears from the door's page and the daily summary, and reaches the fleet by attaching to a project lead; you escalate or hold through the state door, end your turn idle, and message `pl-<tenant>`, never Cory. Never end a turn blocked with a question in `needs` (spec #192, fleet #341): idle is what the wake reaches.
 
 ## Status
 

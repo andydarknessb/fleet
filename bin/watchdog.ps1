@@ -355,6 +355,16 @@ try {
     return "$($Line.recordId)@$($Line.at)"
   }
 
+  function Get-WakeTarget {
+    # fleet #341: a reaped blocked row (no pid) is at a turn boundary (nothing runs to interrupt) and sentinel-check never respawns blocked, the heal refuses a non-empty needs, and launchNeeded sees the job, so the wake is the only path; any other pid-less state is sentinel-check's respawn.
+    param($Daemon, [string]$Name, $QuietMinutes, $Now)
+    $row = $Daemon | Where-Object { "$($_.name)" -eq $Name -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+    if ($row) { return [pscustomobject]@{ row = $row; standing = (Get-BusyStanding $row -QuietMinutes $QuietMinutes -Now $Now) } }
+    $row = $Daemon | Where-Object { "$($_.name)" -eq $Name -and -not $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+    if ($row -and "$($row.state)" -eq 'blocked') { return [pscustomobject]@{ row = $row; standing = [pscustomobject]@{ standing = 'reaped'; reason = 'blocked, process reaped (no pid)'; quietMin = $null } } }
+    return $null
+  }
+
   function Get-UnconsumedWakes {
     # $Since bounds "before this lead was launched through the door" (the frontier
     # wake's own use); fleet-dead has no lead session to bound by and passes
@@ -1029,15 +1039,15 @@ try {
       $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
       $leadName = "pl-$tenantName"
       $wake = [ordered]@{ tenant = $tenantName; lead = $leadName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null }
-      $leadRow = $daemon | Where-Object { "$($_.name)" -eq $leadName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      $leadTarget = Get-WakeTarget $daemon $leadName $busyQuietMinutes $now; $leadRow = if ($leadTarget) { $leadTarget.row }
       if (-not $leadRow) { $wake.reason = 'no running lead session (launchNeeded covers a missing one)'; $frontierWakes += [pscustomobject]$wake; continue }
       # fleet #149: busy with only a background task in flight, and quiet, is a turn boundary.
-      $leadStanding = Get-BusyStanding $leadRow -QuietMinutes $busyQuietMinutes -Now $now
-      if (@('idle', 'background') -notcontains $leadStanding.standing) {
+      $leadStanding = $leadTarget.standing
+      if (@('idle', 'background', 'reaped') -notcontains $leadStanding.standing) {
         $wake.reason = "lead is $($leadRow.status), not idle"; if ("$($leadRow.status)" -eq 'busy') { $wake.reason += " ($($leadStanding.reason))" }
         $frontierWakes += [pscustomobject]$wake; continue
       }
-      if ($leadStanding.standing -eq 'background') { $wake.boundary = $leadStanding.reason }
+      if (@('background', 'reaped') -contains $leadStanding.standing) { $wake.boundary = $leadStanding.reason }
       # fleet #141: the outbox bound is the door launch (live roster launchedAt), never the
       # daemon row's startedAt. A `claude respawn` keeps the job but refreshes startedAt,
       # and a respawned idle session does not re-run its role prompt, so a wake recorded
@@ -1236,14 +1246,14 @@ try {
       if ($paused) { $twake.reason = 'PAUSE set'; $triageWakes += [pscustomobject]$twake; continue }
       if ($twake.frontierError) { $twake.reason = 'frontier unreadable; waking nothing (fail closed)'; $triageWakes += [pscustomobject]$twake; continue }
       if ($twake.evidence.Count -eq 0) { $twake.reason = 'nothing to wake for'; $triageWakes += [pscustomobject]$twake; continue }
-      $principalRow = $daemon | Where-Object { "$($_.name)" -eq $principalName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      $principalTarget = Get-WakeTarget $daemon $principalName $busyQuietMinutes $now; $principalRow = if ($principalTarget) { $principalTarget.row }
       if (-not $principalRow) { $twake.reason = 'no running principal session (launchNeeded covers a missing one)'; $triageWakes += [pscustomobject]$twake; continue }
-      $principalStanding = Get-BusyStanding $principalRow -QuietMinutes $busyQuietMinutes -Now $now   # fleet #149, as the lead wake above
-      if (@('idle', 'background') -notcontains $principalStanding.standing) {
+      $principalStanding = $principalTarget.standing   # fleet #149, as the lead wake above
+      if (@('idle', 'background', 'reaped') -notcontains $principalStanding.standing) {
         $twake.reason = "principal is $($principalRow.status), not idle"; if ("$($principalRow.status)" -eq 'busy') { $twake.reason += " ($($principalStanding.reason))" }
         $triageWakes += [pscustomobject]$twake; continue
       }
-      if ($principalStanding.standing -eq 'background') { $twake.boundary = $principalStanding.reason }
+      if (@('background', 'reaped') -contains $principalStanding.standing) { $twake.boundary = $principalStanding.reason }
       $tdigest = ($twake.evidence -join '; ')
       $tState = $null; if ($triageState.tenants.PSObject.Properties[$tenantName]) { $tState = $triageState.tenants.$tenantName }
       if ($tState -and "$($tState.digest)" -eq $tdigest -and $tState.lastAt) {
@@ -1315,14 +1325,14 @@ try {
       if ($paused) { $awake.reason = 'PAUSE set'; $arbiterWakes += [pscustomobject]$awake; continue }
       if ($awake.frontierError) { $awake.reason = 'frontier unreadable; waking nothing (fail closed)'; $arbiterWakes += [pscustomobject]$awake; continue }
       if ($awake.evidence.Count -eq 0) { $awake.reason = if ($aFrontier -and $aFrontier.suspended) { 'arbiter suspended (state/flags/arbiter-suspended); waking nothing' } else { 'nothing to wake for' }; $arbiterWakes += [pscustomobject]$awake; continue }
-      $arbiterRow = $daemon | Where-Object { "$($_.name)" -eq $arbiterName -and $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1
+      $arbiterTarget = Get-WakeTarget $daemon $arbiterName $busyQuietMinutes $now; $arbiterRow = if ($arbiterTarget) { $arbiterTarget.row }
       if (-not $arbiterRow) { $awake.reason = 'no running arbiter session (launchNeeded covers a missing one)'; $arbiterWakes += [pscustomobject]$awake; continue }
-      $arbiterStanding = Get-BusyStanding $arbiterRow -QuietMinutes $busyQuietMinutes -Now $now   # fleet #149, as the wakes above
-      if (@('idle', 'background') -notcontains $arbiterStanding.standing) {
+      $arbiterStanding = $arbiterTarget.standing   # fleet #149, as the wakes above
+      if (@('idle', 'background', 'reaped') -notcontains $arbiterStanding.standing) {
         $awake.reason = "arbiter is $($arbiterRow.status), not idle"; if ("$($arbiterRow.status)" -eq 'busy') { $awake.reason += " ($($arbiterStanding.reason))" }
         $arbiterWakes += [pscustomobject]$awake; continue
       }
-      if ($arbiterStanding.standing -eq 'background') { $awake.boundary = $arbiterStanding.reason }
+      if (@('background', 'reaped') -contains $arbiterStanding.standing) { $awake.boundary = $arbiterStanding.reason }
       $adigest = ($awake.evidence -join '; ')
       $aState = $null; if ($arbiterState.tenants.PSObject.Properties[$tenantName]) { $aState = $arbiterState.tenants.$tenantName }
       if ($aState -and "$($aState.digest)" -eq $adigest -and $aState.lastAt) {

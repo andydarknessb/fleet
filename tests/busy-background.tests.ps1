@@ -165,6 +165,18 @@ try {
   Assert-True ((Get-TenantEntry $b7.triageWakes).decision -eq 'none') "B7: nothing to wake the principal for (got $((Get-TenantEntry $b7.triageWakes).decision))"
   Assert-True (@($b7.conditions) -contains 'busy-stale:pe-test') "B7: a stale session between turns that nothing acted on must raise busy-stale (got $(@($b7.conditions) -join ','))"
 
+  # Case B8 (fleet #341): the principal's row is blocked and reaped (no pid) on a needs-Cory job.
+  # Nothing runs to interrupt and sentinel-check never respawns blocked, so the triage wake is the only path.
+  Reset-Wake
+  Write-Utf8 $env:FLEET_TRIAGE_ISSUES_FIXTURE '[{"number":601,"title":"Unrouted","url":"https://github.com/owner/repo/issues/601","body":"Something is off.","createdAt":"2026-09-02T00:00:00.000Z","labels":[],"assignees":[],"comments":[]}]'
+  New-Job 'job-pe' 'blocked' 480 0 @()
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-pe\state.json" ('{"state":"blocked","needs":"Cory: approve the #2604 extension","detail":"fixture","tempo":"idle","inFlight":{"tasks":0,"queued":0,"kinds":[]},"updatedAt":"' + (Get-Iso 480) + '"}')
+  Set-AgentsRows ('[' + $dispRow + ',' + (New-Row 'job-p' 'pl-test' 'busy' 13) + ',{"id":"job-pe","name":"pe-test","state":"blocked","status":"","startedAt":' + (Get-EpochMs (Get-Date).AddHours(-10)) + '}]')
+  $b8 = Run-Watchdog
+  $t8 = Get-TenantEntry $b8.triageWakes
+  Assert-True ($t8.decision -eq 'woken') "B8: a reaped blocked principal with evidence must get the triage wake (got $($t8.decision): $($t8.reason))"
+  Assert-True (@(Get-RotateCalls | Where-Object { $_ -like 'pe-test|*' }).Count -eq 1) "B8: one rotate.ps1 -Wake for the reaped principal (got $(@(Get-RotateCalls) -join '; '))"
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) busy-background assertion(s) failed" }
   Write-Output 'busy-background tests passed'
 } finally {

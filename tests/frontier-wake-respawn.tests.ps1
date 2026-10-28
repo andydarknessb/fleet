@@ -347,6 +347,48 @@ try {
   Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watch\health.json", "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\respawn-failed.json" -ErrorAction SilentlyContinue
   foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 2 }
 
+  # ===== fleet #341: a lead that ended blocked on Cory and whose process was reaped (daemon row kept: state
+  # blocked, status blank, no pid). Cory answers through the door and a resolution line lands. The respawn
+  # escalates blocked, the heal refuses on needs and launchNeeded sees the job, so the wake must rotate it.
+  function Set-ReapedLeadRow { param([string]$State)
+    Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"' + $State + '","status":"","startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '}]')
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-p") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-p\state.json" '{"needs":"Cory: grant the budget extension for #2604"}'
+  }
+  $resolution341 = ([ordered]@{ at = (Get-Iso 3); recordId = 'test:issue-2604'; revision = 7; eventSequence = 7; wake = 'resolution'; idempotencyKey = 'cory-2604-r7:resolution'; actor = 'cory'; from = 'escalated'; to = 'implementing'; raisedBy = 'pl-test'; evidence = 'budget extended' } | ConvertTo-Json -Compress)
+
+  # B1: the resolution wakes the reaped blocked lead.
+  Start-WakeCase
+  Set-ReapedLeadRow 'blocked'
+  Set-Outbox @($resolution341)
+  $b1 = Run-Watchdog; $wb1 = Get-TestWake $b1
+  Assert-True ($wb1.decision -eq 'woken') "B1: a resolution must wake a blocked lead whose process was reaped (got $($wb1.decision): reason '$($wb1.reason)', evidence '$(@($wb1.evidence) -join '; ')')"
+  Assert-True (@(Get-RotateCalls).Count -eq 1) "B1: exactly one rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count))"
+
+  # B2 (control): nothing to wake for leaves the reaped blocked lead alone; it is still waiting on Cory.
+  Start-WakeCase
+  Set-ReapedLeadRow 'blocked'
+  Set-Outbox @()
+  $b2 = Run-Watchdog; $wb2 = Get-TestWake $b2
+  Assert-True ($wb2.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "B2: a reaped blocked lead with no evidence must not be woken (got $($wb2.decision): $($wb2.reason))"
+
+  # B3 (control): any other pid-less state is sentinel-check's respawn, not a wake target.
+  Start-WakeCase
+  Set-ReapedLeadRow 'done'
+  Set-Outbox @($resolution341)
+  $b3 = Run-Watchdog; $wb3 = Get-TestWake $b3
+  Assert-True ($wb3.decision -eq 'none' -and "$($wb3.reason)" -match 'no running lead session' -and @(Get-RotateCalls).Count -eq 0) "B3: a pid-less done lead is respawned, never rotated by the wake (got $($wb3.decision): $($wb3.reason))"
+
+  # B4 (control): the newest pid-less row decides, as sentinel-check's Latest-Row does. An older leftover blocked
+  # row behind a newer pid-less done row is the respawn's, never a wake target.
+  Start-WakeCase
+  Set-ReapedLeadRow 'blocked'
+  Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"blocked","status":"","startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '},{"id":"job-p2","name":"pl-test","state":"done","status":"","startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-60)) + '}]')
+  Set-Outbox @($resolution341)
+  $b4 = Run-Watchdog; $wb4 = Get-TestWake $b4
+  Assert-True ($wb4.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "B4: an older blocked row behind a newer pid-less done row must not be woken (got $($wb4.decision): $($wb4.reason))"
+  Remove-Item "$testRoot\profile\.claude\jobs\job-p" -Recurse -ErrorAction SilentlyContinue
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
   Write-Output 'frontier-wake-respawn tests passed'
 } finally {
