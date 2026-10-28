@@ -44,7 +44,7 @@ const flag = (n) => a[a.indexOf(n) + 1];
 const model = flag('--model');
 const tier = model === 'haiku' ? 'haiku' : model === 'deepseek-flash' ? 'deepseek' : null;
 if (!tier) bad.push('unexpected --model ' + model);
-for (const f of ['-p', '--strict-mcp-config', '--no-session-persistence', '--verbose']) if (!a.includes(f)) bad.push('missing ' + f);
+for (const f of ['--include-hook-events', '-p', '--strict-mcp-config', '--no-session-persistence', '--verbose']) if (!a.includes(f)) bad.push('missing ' + f);
 if (flag('--output-format') !== 'stream-json') bad.push('output-format is not stream-json');
 if (!process.env.FLEET_CLAUDE_CLI) bad.push('FLEET_CLAUDE_CLI is not set');
 let s = {};
@@ -98,19 +98,20 @@ function New-Fixture { param([string]$Name, [string]$Current = '1.0.0', [string]
 }
 
 # One transcript: init, N Bash calls + results, one Read + result, then the result line.
-function Set-Probe { param($F, [string]$Tier, [bool]$Pass = $true, [bool]$MsgId = $false, [string]$Mode = '', [bool]$IsError = $false, [bool]$NoDenialsField = $false, [bool]$NoResult = $false, [bool]$ReadFails = $false)
+function Set-Probe { param($F, [string]$Tier, [bool]$Pass = $true, [bool]$MsgId = $false, [string]$Mode = '', [bool]$IsError = $false, [bool]$NoDenialsField = $false, [bool]$NoResult = $false, [bool]$ReadFails = $false, [bool]$NoPre = $false, [bool]$NoIsError = $false)
   if (-not $Mode) { $Mode = if ($Tier -eq 'haiku') { 'acceptEdits' } else { 'auto' } }
   $want = if ($Tier -eq 'haiku') { 4 } else { 1 }
   $lines = @('{"type":"system","subtype":"init","permissionMode":"' + $Mode + '","model":"m"}')
   $id = if ($MsgId) { 'msg_01abc' } else { 'resp-1' }
   $calls = @(1..$want | ForEach-Object { @{ name = 'Bash'; id = "b$_"; err = $false } }) + @(@{ name = 'Read'; id = 'r1'; err = $ReadFails })
   foreach ($c in $calls) {
+    if (-not $NoPre) { $lines += '{"type":"system","subtype":"hook_response","hook_event":"PreToolUse","hook_name":"PreToolUse:' + $c.name + '","outcome":"success"}' }
     $lines += '{"type":"assistant","message":{"id":"' + $id + '","content":[{"type":"tool_use","id":"' + $c.id + '","name":"' + $c.name + '","input":{}}]}}'
     $lines += '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"' + $c.id + '","is_error":' + ([string]$c.err).ToLower() + ',"content":"x"}]}}'
   }
   $den = if ($Pass) { '[]' } else { '[{"tool_name":"Bash","tool_input":{"command":"grep sk-abcdefghijklmnop \"C:/x\"}]"}}]' }
   $field = if ($NoDenialsField) { '' } else { ',"permission_denials":' + $den }
-  if (-not $NoResult) { $lines += '{"type":"result","is_error":' + ([string]$IsError).ToLower() + $field + ',"total_cost_usd":0.01}' }
+  if (-not $NoResult) { $lines += '{"type":"system","subtype":"hook_response","hook_event":"Stop","hook_name":"Stop","outcome":"success"}'; $lines += '{"type":"result"' + $(if ($NoIsError) { '' } else { ',"is_error":' + ([string]$IsError).ToLower() }) + $field + ',"total_cost_usd":0.01}' }
   Write-Utf8 "$($F.fake)\$Tier.jsonl" ($lines -join "`n")
 }
 
@@ -169,6 +170,8 @@ try {
     @{ n = 'iserror'; a = @{ IsError = $true }; m = 'is_error' }
     @{ n = 'nodenials'; a = @{ NoDenialsField = $true }; m = 'permission_denials' }
     @{ n = 'noresult'; a = @{ NoResult = $true }; m = 'no result line' }
+    @{ n = 'nopre'; a = @{ NoPre = $true }; m = 'hook evidence' }
+    @{ n = 'noiserror'; a = @{ NoIsError = $true }; m = 'is_error' }
     @{ n = 'readfails'; a = @{ ReadFails = $true }; m = 'Read' }
   )
   foreach ($c in $cases) {
@@ -182,6 +185,16 @@ try {
   $f = New-Fixture 'timeout'; Set-Probe $f haiku; Set-Probe $f deepseek; Write-Utf8 "$($f.fake)\hang.txt" 'x'
   $r = Run $f -Timeout 3
   Assert-True ($r.outcome -eq 'issue-filed' -and (Probe $r deepseek).why -match 'timed out') "timeout: expected a timeout failure, got '$((Probe $r deepseek).why)'"
+
+  # a pr-create failure leaves no remote branch, so the next run opens the PR
+  $f = New-Fixture 'stale-branch'; Set-Probe $f haiku; Set-Probe $f deepseek; Write-Utf8 "$($f.fake)\fail.txt" 'pr create'
+  $r = Run $f
+  Assert-True ($r.outcome -eq 'pr-failed' -and -not (Branch-Exists $f)) 'pr create failure: the pushed remote branch is deleted'
+  Remove-Item "$($f.fake)\fail.txt"
+  Assert-True ((Run $f).outcome -eq 'pr-opened') 'after a pr-create failure the next run opens the PR'
+  # a stale remote branch from an older run is replaced
+  $f = New-Fixture 'stale-remote'; Set-Probe $f haiku; Set-Probe $f deepseek; G $f.fleet push --quiet origin master:refs/heads/fleet/cli-1.1.0
+  Assert-True ((Run $f).outcome -eq 'pr-opened') 'a stale remote branch with no open PR does not block the push'
 
   # a closed tier (null) that passes reopens in the same PR
   $f = New-Fixture 'reopen' -HaikuV 'null'; Set-Probe $f haiku; Set-Probe $f deepseek

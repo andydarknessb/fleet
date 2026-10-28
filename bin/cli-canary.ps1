@@ -155,14 +155,14 @@ $expect = @{ deepseek = @{ mode = 'auto'; bash = 1; read = 1 }; haiku = @{ mode 
 function Invoke-Probe { param($T)
   $name = $T.tier
   $open = ("$($T.cfg.verifiedCliVersion)" -eq $current)
-  $p = [ordered]@{ tier = $name; open = $open; pass = $false; permissionMode = $null; expectedMode = $expect[$name].mode; denials = @(); bash = 0; read = 0; anthropicMsgId = $false; hooks = 0; hookErrors = 0; bashResults = 0; bashOk = 0; readOk = 0; resultLine = $false; hasDenialsField = $false; model = $null; costUsd = $null; error = $null }
+  $p = [ordered]@{ tier = $name; open = $open; pass = $false; permissionMode = $null; expectedMode = $expect[$name].mode; denials = @(); bash = 0; read = 0; anthropicMsgId = $false; hooks = 0; hookErrors = 0; preBash = 0; preRead = 0; stopHooks = 0; hasIsError = $false; bashResults = 0; bashOk = 0; readOk = 0; resultLine = $false; hasDenialsField = $false; model = $null; costUsd = $null; error = $null }
   $dir = Join-Path $scratch "cwd-$name"; [IO.Directory]::CreateDirectory($dir) | Out-Null
   $settingsPath = Join-Path $probeHome "state\sessions\ic-canary-$name.settings.json"   # where allowlist-gate.js looks
   [IO.File]::WriteAllText($settingsPath, ((New-ProbeSettings $T) | ConvertTo-Json -Depth 8), $utf8)
   $promptPath = Join-Path $scratch "$name.prompt.txt"; [IO.File]::WriteAllText($promptPath, $prompts[$name], $utf8)
   $outPath = Join-Path $scratch "$name.out.jsonl"; $errPath = Join-Path $scratch "$name.err.txt"
   $model = if ($name -eq 'deepseek') { $deepseekPin } else { 'haiku' }
-  $argString = "-p --model $model --settings `"$settingsPath`" --setting-sources project --strict-mcp-config --no-session-persistence --output-format stream-json --verbose --max-budget-usd 1"
+  $argString = "-p --model $model --settings `"$settingsPath`" --setting-sources project --strict-mcp-config --no-session-persistence --output-format stream-json --verbose --include-hook-events --max-budget-usd 1"
   $saved = $env:FLEET_CLAUDE_CLI
   try {
     $env:FLEET_CLAUDE_CLI = $candidatePath
@@ -173,7 +173,7 @@ function Invoke-Probe { param($T)
   foreach ($line in @(Get-Content -LiteralPath $outPath -Encoding UTF8 -ErrorAction SilentlyContinue)) {
     $e = try { $line | ConvertFrom-Json } catch { $null }
     if (-not $e) { continue }
-    if ($e.type -eq 'system' -and $e.subtype -eq 'hook_response') { $p.hooks++; if ("$($e.outcome)" -eq 'error') { $p.hookErrors++ } }
+    if ($e.type -eq 'system' -and $e.subtype -eq 'hook_response') { $p.hooks++; if ("$($e.outcome)" -eq 'error') { $p.hookErrors++ }; switch -Regex ("$($e.hook_name)") { '^PreToolUse:Bash' { $p.preBash++ } '^PreToolUse:Read' { $p.preRead++ } '^Stop' { $p.stopHooks++ } } }
     elseif ($e.type -eq 'system' -and $e.subtype -eq 'init') { $p.permissionMode = "$($e.permissionMode)"; if ($e.model) { $p.model = "$($e.model)" } }
     elseif ($e.type -eq 'assistant' -and $e.message) {
       if ("$($e.message.id)" -match '^msg_') { $p.anthropicMsgId = $true }
@@ -187,7 +187,7 @@ function Invoke-Probe { param($T)
       }
     }
     elseif ($e.type -eq 'result') {
-      $sawResult = $true; $p.hasDenialsField = [bool]$e.PSObject.Properties['permission_denials']
+      $sawResult = $true; $p.hasIsError = [bool]$e.PSObject.Properties['is_error']; $p.hasDenialsField = [bool]$e.PSObject.Properties['permission_denials']
       $p.denials = @($e.permission_denials | Where-Object { $_ } | ForEach-Object { Remove-Secret ("$($_.tool_name) " + ($_.tool_input | ConvertTo-Json -Compress -Depth 4)) })
       $p.costUsd = $e.total_cost_usd
       if ($e.is_error) { $p.error = Remove-Secret "result is_error: $($e.result)" }
@@ -196,6 +196,8 @@ function Invoke-Probe { param($T)
   if (-not $sawResult -and -not $p.error) { $tail = (Get-Content -LiteralPath $errPath -Raw -ErrorAction SilentlyContinue); $p.error = Remove-Secret "no result line; stderr: $("$tail".Trim())" }
   $why = @()
   if ($p.error) { $why += $p.error }
+  if ($sawResult -and -not $p.hasIsError) { $why += 'the result line carries no is_error field' }
+  if ($p.preBash -lt $p.bash -or $p.preRead -lt $p.read -or $p.stopHooks -lt 1) { $why += "hook evidence missing: PreToolUse responses Bash $($p.preBash)/$($p.bash), Read $($p.preRead)/$($p.read), Stop $($p.stopHooks)" }
   if ($p.hookErrors) { $why += "$($p.hookErrors) hook(s) errored" }
   if ($sawResult -and -not $p.hasDenialsField) { $why += 'the result line carries no permission_denials field' }
   if ($p.permissionMode -ne $p.expectedMode) { $why += "permissionMode '$($p.permissionMode)', expected '$($p.expectedMode)'" }
@@ -237,13 +239,15 @@ if ($willPr) {
     if ($script:exeExit -ne 0) { Finish 'worktree-failed' "git add failed: $script:exeErr" 2 }
     $null = Exe $GitExe @('-c', 'user.email=fleet@example.invalid', '-c', 'user.name=fleet cli-canary', 'commit', '--quiet', '--no-gpg-sign', '-m', "cli: move the fleet to Claude Code $latest (canary probes passed)") $wt
     if ($script:exeExit -ne 0) { Finish 'worktree-failed' "git commit failed: $script:exeErr" 2 }
+    # a stale remote branch (an earlier run that failed after its push) would reject this push; the guard above saw no open PR for it
+    if (Exe $GitExe @('ls-remote', '--heads', $Remote, "refs/heads/$branchName") $FleetHome) { $null = Exe $GitExe @('push', '--quiet', $Remote, '--delete', $branchName) $FleetHome }
     $null = Exe $GitExe @('push', '--quiet', $Remote, "HEAD:refs/heads/$branchName") $wt
     if ($script:exeExit -ne 0) { Finish 'push-failed' "git push $branchName failed: $script:exeErr" 2 }
     $body = "Fleet #337 canary: Claude Code $latest passed every open tier's probe under ``claude -p`` (candidate installed side by side, FLEET_CLAUDE_CLI set to it). Merging bumps config/cli.json from $current and verifiedCliVersion for: $((@($passing | ForEach-Object { $_.tier })) -join ', '). The next deploy moves the CLI (#336). This body is the attest.`n`nProbe output:`n$report"
     if ($closedFail.Count) { $body += "`n`nA closed tier failed and stays closed: $((@($closedFail | ForEach-Object { $_.tier })) -join ', '); an issue carries the detail." }
     $bodyPath = Join-Path $scratchOut 'pr-body.txt'; [IO.File]::WriteAllText($bodyPath, $body, $utf8)
     $prOut = Exe $GhExe (@('pr', 'create', '--base', $Branch, '--head', $branchName, '--title', "cli: Claude Code $latest passed the canary", '--body-file', $bodyPath) + $ghRepo)
-    if ($script:exeExit -ne 0) { Finish 'pr-failed' "gh pr create failed: $script:exeErr $prOut" 2 }
+    if ($script:exeExit -ne 0) { $ghErr = "$script:exeErr $prOut"; $null = Exe $GitExe @('push', '--quiet', $Remote, '--delete', $branchName) $FleetHome; Finish 'pr-failed' "gh pr create failed: $ghErr" 2 }
     $result.pr = ($prOut -split "`n")[-1]
   } catch { Finish 'pr-failed' "$($_.Exception.Message)" 2 }
 }
