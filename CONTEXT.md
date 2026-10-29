@@ -113,6 +113,10 @@ A session whose process the daemon ended while it sat at a turn boundary; its
 job and transcript remain. Reaping is not a fault and loses no work.
 _Avoid_: died, down, retired (the fleet ending a session on purpose)
 
+**Stall**:
+A Work record in `implementing` or `revision` whose IC has sat at a turn boundary, idle or reaped, for two hours. It wakes the project lead; a stall that outlasts that wake by two more hours is an escalation.
+_Avoid_: stuck (a busy session making no progress), hung
+
 **Page**:
 One off-host push to Cory. In-fleet condition pages come from a decision event
 (through the Notifier) or a Watchdog condition and share one delivery function;

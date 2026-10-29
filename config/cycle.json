@@ -27,6 +27,7 @@
     "cooldownMinutes": 60,
     "sources": ["frontier", "outbox"]
   },
+  "stall": { "thresholdMinutes": 120, "escalateAfterMinutes": 120 },
   "budgets": {
     "baselineControlPlaneFreshPerCompletedUnit": 201505,
     "baselineControlPlaneVoid": true,
@@ -103,7 +104,8 @@
       "respawn-loop": "normal",
       "respawn-loop-down": "high",
       "cleanup-pending": "normal",
-      "ic-first-turn-stale": "normal"
+      "ic-first-turn-stale": "normal",
+      "stall": "normal"
     },
     "defaultPriority": "normal",
     "minAgeMinutes": { "sync-unattested": 60 },

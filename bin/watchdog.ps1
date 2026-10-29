@@ -141,7 +141,7 @@ try {
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high; the shipped config sets emergency, #302) so it can return to
   # high or emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal'; 'stall' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -1027,6 +1027,11 @@ try {
   # --- session is logged and never paged); Write-FleetWakeAudit keeps the same line
   # --- shape Send-FleetAlert used to write, with paged:false.
   $frontierWakes = @()
+  # fleet #346: a Stall is wake evidence for the lead and, if it outlasts the wake, one `stall` page condition.
+  $stallLedger = @(); $stallConditions = @(); $stallsEvaluated = $false
+  $stallConfig = $null; try { $stallConfig = (Read-Json "$FleetHome\config\cycle.json").stall } catch {}
+  $stallThreshold = 120; if ($stallConfig -and $stallConfig.PSObject.Properties['thresholdMinutes']) { $stallThreshold = [int]$stallConfig.thresholdMinutes }
+  $stallEscalateAfter = 120; if ($stallConfig -and $stallConfig.PSObject.Properties['escalateAfterMinutes']) { $stallEscalateAfter = [int]$stallConfig.escalateAfterMinutes }
   $wakeConfig = $null; try { $wakeConfig = (Read-Json "$FleetHome\config\cycle.json").frontierWake } catch {}
   $wakeCooldown = 60; if ($wakeConfig -and $wakeConfig.PSObject.Properties['cooldownMinutes']) { $wakeCooldown = [int]$wakeConfig.cooldownMinutes }
   $wakeSources = @('frontier', 'outbox'); if ($wakeConfig -and $wakeConfig.PSObject.Properties['sources']) { $wakeSources = @($wakeConfig.sources | ForEach-Object { "$_" }) }
@@ -1034,8 +1039,11 @@ try {
   $wakeState = $null; try { $wakeState = Read-Json $wakeStatePath } catch {}
   if (-not $wakeState) { $wakeState = [pscustomobject]@{ tenants = [pscustomobject]@{} } }
   if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
+  if ($null -eq $wakeState.PSObject.Properties['stalls']) { $wakeState | Add-Member -NotePropertyName stalls -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
-  if ($mode -eq 'live' -and -not $Verify -and -not $paused -and -not $wakeOff) {
+  # fleet #346: an empty or lead-less roster is a read glitch (Save-LiveRoster is not atomic), never "every IC left": no stall evaluation or pruning on it.
+  $rosterOk = [bool]($liveRoster -and @($liveRoster.sessions | Where-Object { $_.role -eq 'project-lead' -and $_.status -eq 'active' }).Count -gt 0)
+  if ($mode -eq 'live' -and -not $Verify -and -not $paused) {
     # nodeExe, liveRoster, cap and liveCount are computed once above (ticket 75:
     # fleet-dead's Test-WorkWaiting needs them too, before this block even runs).
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
@@ -1044,6 +1052,40 @@ try {
       $tenantName = "$($tenant.name)"; if (-not $tenantName) { $tenantName = $tenantFile.BaseName }
       $leadName = "pl-$tenantName"
       $wake = [ordered]@{ tenant = $tenantName; lead = $leadName; evidence = @(); decision = 'none'; reason = ''; outcome = $null; alert = $null }
+      # fleet #346: each rostered IC owed work (implementing/revision) at a turn boundary with no heartbeat or record change for the threshold is a stall.
+      $tenantStalls = @()
+      $stallRecords = $null; try { $stallRecords = (Read-Json "$FleetHome\state\work\active.json").records } catch {}
+      if ($stallRecords -and $rosterOk) {
+        foreach ($sp in $stallRecords.PSObject.Properties) {
+          $sr = $sp.Value
+          if ("$($sr.tenant)" -ne $tenantName -or @('implementing', 'revision') -notcontains "$($sr.state)") { continue }
+          $icName = "ic-$(if ($sr.PSObject.Properties['issue'] -and $sr.issue) { $sr.issue } else { $sp.Name -replace '^.*issue-', '' })"
+          if (-not @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $icName -and $_.role -eq 'ic' -and $_.status -eq 'active' -and "$($_.tenant)" -eq $tenantName })) { continue }
+          $icTarget = Get-WakeTarget $daemon $icName $busyQuietMinutes $now
+          $icStanding = if ($icTarget) { $icTarget.standing.standing } else { $icGone = $daemon | Where-Object { "$($_.name)" -eq $icName -and -not $_.pid } | Sort-Object { ConvertTo-UtcDateTime $_.startedAt } -Descending | Select-Object -First 1; if ($icGone -and "$($icGone.state)" -eq 'done') { 'reaped' } else { '' } }
+          if (@('idle', 'background', 'reaped') -notcontains $icStanding) { continue }
+          # fleet #346: a heartbeat file that exists but cannot be read skips this IC for the tick (no new identity, wake, escalation or pruning).
+          $icBeat = $null; $icBeatPath = "$FleetHome\state\heartbeats\$icName.json"
+          if (Test-Path $icBeatPath) { try { $icBeat = ConvertTo-UtcDateTime (Read-Json $icBeatPath).at } catch {}; if (-not $icBeat) { continue } }
+          $icUpdated = $null; if ($sr.PSObject.Properties['updatedAt']) { $icUpdated = ConvertTo-UtcDateTime $sr.updatedAt }
+          $since = @($icBeat, $icUpdated | Where-Object { $_ } | Sort-Object -Descending)[0]
+          if (-not $since -or ($now - $since).TotalMinutes -lt $stallThreshold) { continue }
+          $stall = [pscustomobject]@{ tenant = $tenantName; ic = $icName; recordId = "$($sp.Name)"; state = "$($sr.state)"; since = $since.ToString('o'); id = "stall:$($sp.Name):$($since.ToString('o'))"; outcome = 'none'; isNew = $false }
+          $stallEntry = $null; if ($wakeState.stalls.PSObject.Properties[$stall.id]) { $stallEntry = $wakeState.stalls.($stall.id) }
+          $deliveredAt = $null; if ($stallEntry -and $stallEntry.deliveredAt) { $deliveredAt = ConvertTo-UtcDateTime $stallEntry.deliveredAt }
+          $escalated = [bool]($stallEntry -and $stallEntry.escalatedAt)
+          $stall.isNew = -not $deliveredAt
+          $due = if ($deliveredAt) { ($now - $deliveredAt).TotalMinutes -ge $stallEscalateAfter } else { ($now - $since).TotalMinutes -ge ($stallThreshold + $stallEscalateAfter) }
+          if ($due -and -not $escalated) {
+            $stall.outcome = 'escalated'
+            $wakeState.stalls | Add-Member -NotePropertyName $stall.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = $(if ($deliveredAt) { $deliveredAt.ToString('o') }); escalatedAt = (Now-Iso) }) -Force
+            $escalated = $true
+          }
+          $tenantStalls += $stall
+        }
+      }
+      $stallLedger += $tenantStalls
+      if ($wakeOff) { continue }  # fleet #346: frontier-wake-off stops the wake only; the stall evaluation above and its escalation still run
       $leadTarget = Get-WakeTarget $daemon $leadName $busyQuietMinutes $now; $leadRow = if ($leadTarget) { $leadTarget.row }
       if (-not $leadRow) { $wake.reason = 'no running lead session (launchNeeded covers a missing one)'; $frontierWakes += [pscustomobject]$wake; continue }
       # fleet #149: busy with only a background task in flight, and quiet, is a turn boundary.
@@ -1078,6 +1120,9 @@ try {
         # #204: the wake reason names each record that left escalated or hold, so the lead resumes from what changed.
         foreach ($r in $leadResolved) { $wake.evidence += "resolved $r" }
       }
+      # Stalls not yet woken for: a delivered identity is never woken twice, the escalation takes over.
+      $newStalls = @($tenantStalls | Where-Object { -not $wakeState.stalls.PSObject.Properties[$_.id] -or -not $wakeState.stalls.($_.id).deliveredAt })
+      foreach ($ns in $newStalls) { $wake.evidence += "stall $($ns.ic) ($($ns.recordId) $($ns.state), no turn since $($ns.since))" }
       if ($wake.evidence.Count -eq 0) { if (-not $wake.reason) { $wake.reason = 'nothing to wake for' }; $frontierWakes += [pscustomobject]$wake; continue }
       # Cooldown (fleet #231): defer only when EVERY item of this tick's evidence was carried by the last
       # wake, by identity: each current frontier issue is in its `frontierIssues` and each unconsumed outbox
@@ -1086,7 +1131,7 @@ try {
       # digest-equality rule and is upgraded by its next wake.
       $digest = ($wake.evidence -join '; ')
       $frontierIssues = @(); if ($fw -and $fw.PSObject.Properties['issues']) { $frontierIssues = @($fw.issues) }
-      $lineIds = @($leadLines | ForEach-Object { $_.id })
+      $lineIds = @($leadLines | ForEach-Object { $_.id }) + @($newStalls | ForEach-Object { $_.id })
       $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
       $alreadyCarried = $false
       if ($tenantState -and $tenantState.lastAt) {
@@ -1127,13 +1172,54 @@ try {
         if ($tenantState -and $tenantState.outboxConsumedThrough) { $priorWm = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough; if ($priorWm) { $wmCandidates += $priorWm } }
         $newWatermark = if ($wmCandidates.Count -gt 0) { (@($wmCandidates | Sort-Object -Descending)[0]).ToString('o') } else { Now-Iso }
         $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = $newWatermark; delivered = @($lineIds); frontierIssues = @($frontierIssues) }) -Force
+        foreach ($ns in $newStalls) {
+          $prior = $null; if ($wakeState.stalls.PSObject.Properties[$ns.id]) { $prior = $wakeState.stalls.($ns.id) }
+          $wakeState.stalls | Add-Member -NotePropertyName $ns.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = (Now-Iso); escalatedAt = $(if ($prior) { $prior.escalatedAt }) }) -Force
+        }
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
         try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $frontierWakes += [pscustomobject]$wake
     }
-    try { Write-Json $wakeStatePath $wakeState } catch {}
+    # A stall's outcome is its tenant's wake outcome unless it escalated this tick.
+    foreach ($st in $stallLedger) {
+      if ($st.outcome -eq 'escalated') { continue }
+      $tw = @($frontierWakes | Where-Object { $_.tenant -eq $st.tenant })[-1]
+      # Only a stall that was new evidence this tick and not delivered is deferred; one already delivered logs none.
+      $st.outcome = if (-not $st.isNew) { 'none' } elseif ($wakeOff) { 'deferred: frontier-wake-off' } elseif ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "deferred: $($tw.reason)" } else { 'none' }
+    }
+    $stallsEvaluated = $true
   }
+  # fleet #346: every tick (paused or not) keeps the `stall` condition standing for each escalated entry until its identity is truly gone:
+  # the IC start time changed, the record left implementing/revision or active.json, or the IC left the roster. A tick that merely could
+  # not see the stall (IC busy, unlisted, unreadable, paused) never drops the condition or prunes the entry.
+  $goneRecords = $null; try { $goneRecords = (Read-Json "$FleetHome\state\work\active.json").records } catch {}
+  foreach ($sid in @($wakeState.stalls.PSObject.Properties.Name | Where-Object { $_ })) {
+    $se = $wakeState.stalls.$sid
+    if ($sid -notmatch '^stall:(.+?):(\d{4}-\d\d-\d\dT.+)$') { continue }
+    $seRecord = $Matches[1]; $seSince = ConvertTo-UtcDateTime $Matches[2]
+    $gone = $false; $seIc = "ic-$($seRecord -replace '^.*issue-', '')"  # fleet #346: persisted state names the IC, so a read glitch keeps the condition standing
+    if ($goneRecords -and $rosterOk) {
+      $gr = $null; if ($goneRecords.PSObject.Properties[$seRecord]) { $gr = $goneRecords.$seRecord }
+      if (-not $gr -or @('implementing', 'revision') -notcontains "$($gr.state)") { $gone = $true }
+      else {
+        $seIc = "ic-$(if ($gr.PSObject.Properties['issue'] -and $gr.issue) { $gr.issue } else { $seRecord -replace '^.*issue-', '' })"
+        if ($liveRoster -and -not @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $seIc -and $_.role -eq 'ic' -and $_.status -eq 'active' })) { $gone = $true }
+        else {
+          $geBeat = $null; $geBeatPath = "$FleetHome\state\heartbeats\$seIc.json"; $geReadable = $true
+          if (Test-Path $geBeatPath) { try { $geBeat = ConvertTo-UtcDateTime (Read-Json $geBeatPath).at } catch {}; if (-not $geBeat) { $geReadable = $false } }
+          $geUpdated = $null; if ($gr.PSObject.Properties['updatedAt']) { $geUpdated = ConvertTo-UtcDateTime $gr.updatedAt }
+          $geSince = @($geBeat, $geUpdated | Where-Object { $_ } | Sort-Object -Descending)[0]
+          if ($geReadable -and $geSince -and $seSince -and $geSince.ToString('o') -ne $seSince.ToString('o')) { $gone = $true }
+        }
+      }
+    }
+    if ($gone) { if ($stallsEvaluated) { $wakeState.stalls.PSObject.Properties.Remove($sid) }; continue }
+    if ($se.escalatedAt -and $seIc -and $seSince) {
+      $stallDetail = "$seIc has taken no turn for $([int]($now - $seSince).TotalMinutes) min on $seRecord; idle since $($seSince.ToString('o'))"
+      $stallConditions += [pscustomobject]@{ key = $sid; kind = 'stall'; detail = $stallDetail; escalation = [pscustomobject]@{ name = $seIc; kind = 'stall'; detail = $stallDetail; parent = "pl-$(($seRecord -split ':')[0])" }; url = $null }
+    }
+  }  if ($stallsEvaluated) { try { Write-Json $wakeStatePath $wakeState } catch {} }
 
   # --- triage wake (ADR 0011, fleet #38). The Principal's frontier (bin/triage.js) is
   # --- computed every tick and written to state/watchdog/triage-frontier.json: that file
@@ -1378,6 +1464,7 @@ try {
       $conditions += [pscustomobject]@{ key = "escalation:$($e.name):$($e.kind)"; kind = "$($e.kind)"; detail = (Get-OneLine $e.detail 300); escalation = $e; url = $(if ($e.PSObject.Properties['url'] -and $e.url) { "$($e.url)" } else { $null }) }
     }
   }
+  $conditions += $stallConditions
   foreach ($pw in $permissionWaits) {
     $pwDetail = "$($pw.name) (job $($pw.job)) has waited $($pw.waitMin) min on a permission prompt no one can answer in a --bg session: $($pw.needs). Stop it (claude stop $($pw.job)) and relaunch on a model the CLI runs in auto mode, or attach and answer (claude attach $($pw.job))"
     # Keyed by job, not name: a stale daemon row and its relaunch can share a name, and one
@@ -1824,7 +1911,7 @@ try {
     at = (Now-Iso); mode = $mode; modeReason = $modeReason
     conditions = @($conditions | ForEach-Object { $_.key }); newlyPaged = $newlyPagedResults; repeatPaged = $repeatPaged
     checkError = $checkError; proposed = $proposed
-    launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; triageWakes = $triageWakes; arbiterWakes = $arbiterWakes
+    launches = $launches; notified = $notified; waiting = $waiting; healed = $healed; frontierWakes = $frontierWakes; stalls = @($stallLedger | ForEach-Object { [pscustomobject]@{ ic = $_.ic; recordId = $_.recordId; state = $_.state; since = $_.since; outcome = $_.outcome } }); triageWakes = $triageWakes; arbiterWakes = $arbiterWakes
     staleStatics = $staleStatics; retryTrips = $tripEvals; skipWrites = $skipWrites; permissionWaits = $permissionWaits; paused = [bool]$paused; verify = [bool]$Verify; idle = [bool]$idleTick; waitingOnHuman = [bool]$waitingTick
     healStateUnreadable = [bool]$healStateUnreadable; respawnFailStateUnreadable = [bool]$respawnFailStateUnreadable
     deadMan = $deadMan
