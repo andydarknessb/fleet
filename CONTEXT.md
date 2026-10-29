@@ -108,6 +108,11 @@ and a leaked task would otherwise hold the session busy forever. A busy
 session with a subagent in flight, or one that reported recently, is mid-turn.
 _Avoid_: idle (for the busy-between-turns case), safe point
 
+**Reaped**:
+A session whose process the daemon ended while it sat at a turn boundary; its
+job and transcript remain. Reaping is not a fault and loses no work.
+_Avoid_: died, down, retired (the fleet ending a session on purpose)
+
 **Stall**:
 A Work record in `implementing` or `revision` whose IC has sat at a turn boundary, idle or reaped, for two hours. It wakes the project lead; a stall that outlasts that wake by two more hours is an escalation.
 _Avoid_: stuck (a busy session making no progress), hung
@@ -139,7 +144,13 @@ is enabled the Watchdog's out-of-band page exists solely for when that line
 itself is down; after the 08b cutover the Watchdog is the top of the
 mechanical line and files the check's escalations itself, one page per new
 one, never a repeat.
-_Avoid_: alert, error, blocker, "off the rails"
+_Avoid_: alert, error, blocker, "off the rails", hold or holding (a parked PR)
+
+**Resolution**:
+A Work record leaving `escalated` or `hold`. It wakes the project lead (the
+Principal, for an escalation it raised), who carries it down the reporting
+line.
+_Avoid_: unblock, release
 
 **Reporting line**:
 The fixed path a message takes: IC to project lead; project lead to Cory
@@ -175,6 +186,12 @@ id, or, because its start hook can run before the launch returns that id, by a
 same-name startup within 120 s of the launch beginning. A respawn is not a
 rotation: it re-pins the old flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
+
+**Wake**:
+The Watchdog's relaunch of an idle lead or Principal through the one door, at
+its turn boundary, with a brief naming what changed. Never a page; a message
+between sessions is not a wake.
+_Avoid_: nudge, ping, poke
 
 **Watchdog**:
 The scheduled task, never a session, that runs the mechanical check every
@@ -382,7 +399,7 @@ _Avoid_: status report (when the projection is meant), summary, board
 A pull request reviewed clean and parked for Cory's merge, recorded under
 `prs` in `state/skip/<tenant>.json` with its reason. A hold pages Cory once,
 through an escalation, and then waits; the IC that opened it waits with it
-and is neither retried nor respawned for being idle. Lifting the hold is
+and is neither retried nor respawned for being idle; a reaped one is respawned only to stay reachable. Lifting the hold is
 Cory's merge, or Cory's instruction to the project lead.
 _Avoid_: blocked (a GitHub issue dependency), escalation (the page, not the
 state), parked

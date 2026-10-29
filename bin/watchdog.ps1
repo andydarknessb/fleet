@@ -367,7 +367,8 @@ try {
 
   function Get-UnconsumedWakes {
     # $Since bounds "before this lead was launched through the door" (the frontier
-    # wake's own use); fleet-dead has no lead session to bound by and passes
+    # wake's own use), except a resolution line still in its `to` state (fleet #344);
+    # fleet-dead has no lead session to bound by and passes
     # $null. $ConsumedThrough is the frontier wake's delivery watermark for the
     # tenant, shared so a wake that already woke the lead is not double-counted
     # as fresh work waiting. $SelfActor (fleet #141) drops the decision-needed
@@ -403,7 +404,11 @@ try {
       if (-not $o -or -not $o.at -or "$($o.recordId)" -notlike "$TenantName`:*") { continue }
       $atUtc = ConvertTo-UtcDateTime $o.at
       if (-not $atUtc) { continue }
-      if ($Since -and $atUtc -le $Since) { continue }
+      # fleet #344: a launch is not delivery of a resolution (a fresh session cannot rebuild it); an older one counts while its record is still in `to`.
+      if ($Since -and $atUtc -le $Since) {
+        $sinceRecord = $null; if ($wakeRecords -and $wakeRecords.PSObject.Properties["$($o.recordId)"]) { $sinceRecord = $wakeRecords."$($o.recordId)" }
+        if ("$($o.wake)" -ne 'resolution' -or -not $sinceRecord -or "$($sinceRecord.state)" -ne "$($o.to)") { continue }
+      }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
       if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
       $raisedBy = ''; if ($o.PSObject.Properties['raisedBy']) { $raisedBy = "$($o.raisedBy)" }
@@ -783,7 +788,7 @@ try {
       $key = "respawned:$($r.name):$($r.jobId)"
       $currentRespawnKeys += $key
       if ($previouslyNotified -contains $key) { $waiting += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned-again'; detail = "job $($r.jobId) respawned again ($($r.reason)); already notified" }; continue }
-      $detail = "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task."
+      $detail = if ("$($r.reason)" -eq 'process reaped while still on roster') { "$($r.name) was reaped at a turn boundary and respawned (job $($r.jobId)). Parent $($r.parent) must message it if work is waiting." } else { "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task." }
       Write-Escalation -From 'supervisor' -Kind 'respawned' -Detail $detail -Name "$($r.name)" -Parent "$($r.parent)" | Out-Null
       # Ticket 77 (ADR 0012): a fault the fleet healed by itself is not a page - the
       # dispatcher-respawn toast that used to fire here is gone. The escalation file
@@ -1157,7 +1162,8 @@ try {
         $wake.decision = 'woken'
         # fleet #231: the watermark is the newest DELIVERED line's `at` (a line written while rotate.ps1
         # ran is no longer consumed undelivered); with no line delivered the prior watermark stands.
-        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, and
+        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, bar the
+        # #344 resolutions this tick just delivered, and
         # fleet-dead/heal, which pass no -Since, would otherwise keep counting them) nor the prior watermark.
         # Assumes Windows PowerShell 5.1: ConvertFrom-Json leaves ISO strings as strings; under pwsh 7 they become
         # DateTime and sub-second precision would be lost.
