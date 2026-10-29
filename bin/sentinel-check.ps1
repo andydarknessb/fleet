@@ -387,8 +387,9 @@ function Test-RespawnStreakHold {
   # $true when this respawn / relaunch must not run. Evaluated in read-only runs too; it writes nothing.
   param($row, $entry, [string]$reason, [string]$via = '')
   # Liveness first: only a row WITH a live pid can be in the "respawn verified, no turn follows" loop this bound exists for.
-  # A row with no pid (reaped, stopped, failed) is always respawned / relaunched as before, and still counted; once it has
+  # A row with no pid (stopped, failed) is always respawned / relaunched as before, and still counted; once it has
   # gone down cap times with no heartbeat in between, respawn-loop-down says the session keeps going down.
+  # A reaped row (done, no pid) never gets here: Do-Respawn -Reaped skips the streak (fleet #345).
   $hasPid = [bool]$row.pid
   if ($script:RespawnStreakUnreadable) {
     if (-not $hasPid) { return $false }   # the file is left as found and this respawn is not counted; the read already escalated
