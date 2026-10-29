@@ -1036,7 +1036,7 @@ try {
   if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
   if ($null -eq $wakeState.PSObject.Properties['stalls']) { $wakeState | Add-Member -NotePropertyName stalls -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
-  if ($mode -eq 'live' -and -not $Verify -and -not $paused -and -not $wakeOff) {
+  if ($mode -eq 'live' -and -not $Verify -and -not $paused) {
     # nodeExe, liveRoster, cap and liveCount are computed once above (ticket 75:
     # fleet-dead's Test-WorkWaiting needs them too, before this block even runs).
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
@@ -1080,6 +1080,7 @@ try {
         }
       }
       $stallLedger += $tenantStalls
+      if ($wakeOff) { continue }  # fleet #346: frontier-wake-off stops the wake only; the stall evaluation above and its escalation still run
       $leadTarget = Get-WakeTarget $daemon $leadName $busyQuietMinutes $now; $leadRow = if ($leadTarget) { $leadTarget.row }
       if (-not $leadRow) { $wake.reason = 'no running lead session (launchNeeded covers a missing one)'; $frontierWakes += [pscustomobject]$wake; continue }
       # fleet #149: busy with only a background task in flight, and quiet, is a turn boundary.
@@ -1174,12 +1175,15 @@ try {
       } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
       $frontierWakes += [pscustomobject]$wake
     }
+    # fleet #346: a cleared stall never returns under its identity (it carries the start time), so drop entries not in this tick's set.
+    $stallIds = @($stallLedger | ForEach-Object { $_.id })
+    foreach ($sn in @($wakeState.stalls.PSObject.Properties.Name | Where-Object { $_ })) { if ($stallIds -notcontains $sn) { $wakeState.stalls.PSObject.Properties.Remove($sn) } }
     try { Write-Json $wakeStatePath $wakeState } catch {}
     # A stall's outcome is its tenant's wake outcome unless it escalated this tick.
     foreach ($st in $stallLedger) {
       if ($st.outcome -eq 'escalated') { continue }
       $tw = @($frontierWakes | Where-Object { $_.tenant -eq $st.tenant })[-1]
-      $st.outcome = if ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "deferred: $($tw.reason)" } else { 'none' }
+      $st.outcome = if ($wakeOff) { 'deferred: frontier-wake-off' } elseif ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "deferred: $($tw.reason)" } else { 'none' }
     }
   }
 

@@ -481,6 +481,16 @@ try {
   Set-Heartbeat 'ic-1' 5
   $t5 = Run-Watchdog; $wt5 = Get-TestWake $t5
   Assert-True (@($t5.stalls).Count -eq 0 -and $wt5.decision -eq 'none' -and (Get-StallEscalations).Count -eq 0) "T5: a newer heartbeat must clear the stall (got $($wt5.decision), $(@($t5.stalls).Count) stalls)"
+  Assert-True (-not ((Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw) -match 'stall:')) 'T5: the cleared stall entry is pruned from frontier-wake.json'
+
+  # T6: frontier-wake-off stops the wake but not the safety net: no rotate, exactly one stall escalation at threshold + delay.
+  Set-StallCase -HbMin 241 -UpdatedMin 300
+  Write-Utf8 "$testRoot\state\flags\frontier-wake-off" 'fixture'
+  $t6 = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq 0 -and (Get-StallEscalations).Count -eq 1 -and @($t6.stalls).Count -eq 1) "T6: frontier-wake-off, stall 241 min old: no rotate and one escalation (got $(@(Get-RotateCalls).Count) rotates, $((Get-StallEscalations).Count) escalations)"
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1) 'T6: the next tick files none'
+  Remove-Item "$testRoot\state\flags\frontier-wake-off"
   Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\profile\.claude\jobs\job-i" -Recurse -ErrorAction SilentlyContinue
