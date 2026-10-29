@@ -1420,6 +1420,30 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-TriageRotateCalls).Count -eq $t5rDelivered) 'a delivered Principal resolution must not wake again (watermark)'
   Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ''
 
+  # Case T5r2 (#344): a Principal-raised resolution older than the Principal's launch still wakes it while its record
+  # is in the line's `to` state, once; a record that moved on does not.
+  $savedRoster344 = if (Test-Path "$testRoot\state\roster.json") { Get-Content "$testRoot\state\roster.json" -Raw } else { $null }
+  $savedActive344 = if (Test-Path "$testRoot\state\work\active.json") { Get-Content "$testRoot\state\work\active.json" -Raw } else { $null }
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"pe-test","role":"principal","tenant":"test","status":"active","launchedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o') + '"}]}')
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ((New-ResolutionLine 60 'issue-42' 'escalated' 'implementing' 'pe-test' 'cory') + "`n")
+  foreach ($t5r2 in @(@{ state = 'review'; woken = $false }, @{ state = 'implementing'; woken = $true })) {
+    Write-Utf8 "$testRoot\state\work\active.json" ('{"schemaVersion":1,"records":{"test:issue-42":{"tenant":"test","issue":42,"state":"' + $t5r2.state + '"}}}')
+    Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+    $t5r2Before = @(Get-TriageRotateCalls).Count
+    $t5r2Run = Run-Watchdog
+    $t5r2Wake = @($t5r2Run.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+    if ($t5r2.woken) {
+      Assert-True ($t5r2Wake.decision -eq 'woken' -and ((@($t5r2Wake.evidence) -join '; ') -match 'resolved test:issue-42 escalated -> implementing') -and @(Get-TriageRotateCalls).Count -eq $t5r2Before + 1) "T5r2: a pe- resolution older than the Principal's launch must wake it while its record is still in the to state (got $($t5r2Wake.decision): $($t5r2Wake.reason))"
+      [void](Run-Watchdog)
+      Assert-True (@(Get-TriageRotateCalls).Count -eq $t5r2Before + 1) 'T5r2: the next tick must not wake the Principal again'
+    } else {
+      Assert-True (@(Get-TriageRotateCalls).Count -eq $t5r2Before) "T5r2: an older pe- resolution whose record moved on must not wake the Principal (got $($t5r2Wake.decision))"
+    }
+  }
+  if ($null -ne $savedRoster344) { Write-Utf8 "$testRoot\state\roster.json" $savedRoster344 } else { Remove-Item "$testRoot\state\roster.json" -ErrorAction SilentlyContinue }
+  if ($null -ne $savedActive344) { Write-Utf8 "$testRoot\state\work\active.json" $savedActive344 } else { Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue }
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+
   # Case T6a (#233): the single `tick` call dies outright on the live principal-live path (a node shim
   # refuses `tick` and runs every other command for real). The finalize failure is recorded and the
   # plain `frontier` still runs once as a fallback, so the wake evidence is not lost: the frontier is

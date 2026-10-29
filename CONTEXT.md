@@ -108,6 +108,11 @@ and a leaked task would otherwise hold the session busy forever. A busy
 session with a subagent in flight, or one that reported recently, is mid-turn.
 _Avoid_: idle (for the busy-between-turns case), safe point
 
+**Reaped**:
+A session whose process the daemon ended while it sat at a turn boundary; its
+job and transcript remain. Reaping is not a fault and loses no work.
+_Avoid_: died, down, retired (the fleet ending a session on purpose)
+
 **Page**:
 One off-host push to Cory. In-fleet condition pages come from a decision event
 (through the Notifier) or a Watchdog condition and share one delivery function;
@@ -135,7 +140,13 @@ is enabled the Watchdog's out-of-band page exists solely for when that line
 itself is down; after the 08b cutover the Watchdog is the top of the
 mechanical line and files the check's escalations itself, one page per new
 one, never a repeat.
-_Avoid_: alert, error, blocker, "off the rails"
+_Avoid_: alert, error, blocker, "off the rails", hold or holding (a parked PR)
+
+**Resolution**:
+A Work record leaving `escalated` or `hold`. It wakes the project lead (the
+Principal, for an escalation it raised), who carries it down the reporting
+line.
+_Avoid_: unblock, release
 
 **Reporting line**:
 The fixed path a message takes: IC to project lead; project lead to Cory
@@ -171,6 +182,12 @@ id, or, because its start hook can run before the launch returns that id, by a
 same-name startup within 120 s of the launch beginning. A respawn is not a
 rotation: it re-pins the old flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
+
+**Wake**:
+The Watchdog's relaunch of an idle lead or Principal through the one door, at
+its turn boundary, with a brief naming what changed. Never a page; a message
+between sessions is not a wake.
+_Avoid_: nudge, ping, poke
 
 **Watchdog**:
 The scheduled task, never a session, that runs the mechanical check every

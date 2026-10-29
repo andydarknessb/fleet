@@ -403,7 +403,11 @@ try {
       if (-not $o -or -not $o.at -or "$($o.recordId)" -notlike "$TenantName`:*") { continue }
       $atUtc = ConvertTo-UtcDateTime $o.at
       if (-not $atUtc) { continue }
-      if ($Since -and $atUtc -le $Since) { continue }
+      # fleet #344: a launch is not delivery of a resolution (a fresh session cannot rebuild it); an older one counts while its record is still in `to`.
+      if ($Since -and $atUtc -le $Since) {
+        $sinceRecord = $null; if ($wakeRecords -and $wakeRecords.PSObject.Properties["$($o.recordId)"]) { $sinceRecord = $wakeRecords."$($o.recordId)" }
+        if ("$($o.wake)" -ne 'resolution' -or -not $sinceRecord -or "$($sinceRecord.state)" -ne "$($o.to)") { continue }
+      }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
       if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
       $raisedBy = ''; if ($o.PSObject.Properties['raisedBy']) { $raisedBy = "$($o.raisedBy)" }
