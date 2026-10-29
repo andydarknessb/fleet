@@ -491,6 +491,51 @@ try {
   $null = Run-Watchdog
   Assert-True ((Get-StallEscalations).Count -eq 1) 'T6: the next tick files none'
   Remove-Item "$testRoot\state\flags\frontier-wake-off"
+
+  # T7 (QA): one escalation and one page per identity over ANY sequence of ticks.
+  function Get-StallPages { @(Get-Content "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue | Where-Object { $_ -match '"kind":"stall"' }) }
+  function Set-IcRow { param([string]$Status) Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '},{"id":"job-i","name":"ic-1","state":"working","status":"' + $Status + '","pid":14,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-300)) + '}]') }
+  # A local Pushover stand-in so a page counts as delivered (an undelivered page is retried, and logged, every tick).
+  $pushPort = Get-Random -Minimum 20000 -Maximum 40000; $oldPushUrl = $env:FLEET_PUSHOVER_URL; $env:FLEET_PUSHOVER_URL = "http://127.0.0.1:$pushPort/"
+  [IO.Directory]::CreateDirectory("$testRoot\state\pages") | Out-Null
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-346","user":"usr-346"}'
+  $pushJob = Start-Job -ScriptBlock { param($Prefix) $l = New-Object System.Net.HttpListener; $l.Prefixes.Add($Prefix); $l.Start(); for ($i = 0; $i -lt 20; $i++) { $c = $l.GetContext(); $b = [Text.Encoding]::UTF8.GetBytes('{"status":1}'); $c.Response.ContentLength64 = $b.Length; $c.Response.OutputStream.Write($b, 0, $b.Length); $c.Response.OutputStream.Close() }; $l.Stop() } -ArgumentList $env:FLEET_PUSHOVER_URL
+  Start-Sleep -Milliseconds 500
+  Set-StallCase; Remove-Item "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue; Set-StallDelivered 121
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1 -and (Get-StallPages).Count -eq 1) "T7: escalation filed once with one page (got $((Get-StallEscalations).Count) files, $((Get-StallPages).Count) pages)"
+  $pg = @(Get-StallPages)[0] | ConvertFrom-Json
+  Assert-True ($pg.kind -eq 'stall' -and $pg.priority -eq 'normal') "T7: the page has kind stall and priority normal (got $(@(Get-StallPages)[0]))"
+  Write-Utf8 "$testRoot\state\PAUSE" 'fixture'; $null = Run-Watchdog; Remove-Item "$testRoot\state\PAUSE"
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1 -and (Get-StallPages).Count -eq 1) "T7: escalate, PAUSE tick, unpause: still one escalation and one page (got $((Get-StallEscalations).Count), $((Get-StallPages).Count))"
+  Set-IcRow 'busy'; $null = Run-Watchdog; Set-IcRow 'idle'; $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1 -and (Get-StallPages).Count -eq 1) "T7: escalate, IC busy one tick, idle again: still one escalation and one page (got $((Get-StallEscalations).Count), $((Get-StallPages).Count))"
+  # T7b: a cleared stall (newer heartbeat) is truly gone: pruned, and a later stall is a new identity.
+  Set-Heartbeat 'ic-1' 5; $null = Run-Watchdog
+  Assert-True (-not ((Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw) -match 'stall:')) 'T7b: a cleared escalated stall is pruned'
+  Stop-Job $pushJob -ErrorAction SilentlyContinue; Remove-Job $pushJob -Force -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  if ($null -eq $oldPushUrl) { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue } else { $env:FLEET_PUSHOVER_URL = $oldPushUrl }
+
+  # T8: after delivery, a quiet tick logs outcome none (not the frontier wake's reason).
+  Set-StallCase; Set-StallDelivered 60
+  $t8 = Run-Watchdog
+  Assert-True (@($t8.stalls).Count -eq 1 -and @($t8.stalls)[0].outcome -eq 'none') "T8: an already-delivered, non-escalating stall logs none (got $($t8.stalls | ConvertTo-Json -Compress))"
+
+  # T9: an unreadable heartbeat skips the IC: no stall, no wake, entry kept.
+  Set-StallCase; Set-StallDelivered 121
+  $null = Run-Watchdog
+  Write-Utf8 "$testRoot\state\heartbeats\ic-1.json" '{not json'
+  $t9 = Run-Watchdog
+  Assert-True (@($t9.stalls).Count -eq 0 -and (Get-StallEscalations).Count -eq 1 -and ((Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw) -match 'stall:')) 'T9: an unparseable heartbeat keeps the existing entry and files nothing new'
+  Set-StallCase
+  Write-Utf8 "$testRoot\state\heartbeats\ic-1.json" '{not json'
+  $t9b = Run-Watchdog
+  Assert-True (@($t9b.stalls).Count -eq 0 -and @(Get-RotateCalls).Count -eq 0) 'T9: an unparseable heartbeat makes no stall and no wake'
+  Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watchdog\paged.json", "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\profile\.claude\jobs\job-i" -Recurse -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\profile\.claude\jobs\job-i" -Recurse -ErrorAction SilentlyContinue
