@@ -367,7 +367,8 @@ try {
 
   function Get-UnconsumedWakes {
     # $Since bounds "before this lead was launched through the door" (the frontier
-    # wake's own use); fleet-dead has no lead session to bound by and passes
+    # wake's own use), except a resolution line still in its `to` state (fleet #344);
+    # fleet-dead has no lead session to bound by and passes
     # $null. $ConsumedThrough is the frontier wake's delivery watermark for the
     # tenant, shared so a wake that already woke the lead is not double-counted
     # as fresh work waiting. $SelfActor (fleet #141) drops the decision-needed
@@ -1116,7 +1117,8 @@ try {
         $wake.decision = 'woken'
         # fleet #231: the watermark is the newest DELIVERED line's `at` (a line written while rotate.ps1
         # ran is no longer consumed undelivered); with no line delivered the prior watermark stands.
-        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, and
+        # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, bar the
+        # #344 resolutions this tick just delivered, and
         # fleet-dead/heal, which pass no -Since, would otherwise keep counting them) nor the prior watermark.
         # Assumes Windows PowerShell 5.1: ConvertFrom-Json leaves ISO strings as strings; under pwsh 7 they become
         # DateTime and sub-second precision would be lost.

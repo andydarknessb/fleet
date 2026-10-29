@@ -402,8 +402,10 @@ try {
   $l1 = Run-Watchdog; $wl1 = Get-TestWake $l1
   Assert-True ($wl1.decision -eq 'woken' -and (@($wl1.evidence) -join '; ') -match 'resolved test:issue-2604 escalated -> implementing') "L1: a resolution older than the lead's launch must wake while its record is still in the to state (got $($wl1.decision): '$($wl1.reason)'; $(@($wl1.evidence) -join '; '))"
   Assert-True (@(Get-RotateCalls).Count -eq 1) "L1: exactly one rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count))"
-  $l1b = Run-Watchdog
+  $l1b = Run-Watchdog; $wl1b = Get-TestWake $l1b
   Assert-True (@(Get-RotateCalls).Count -eq 1) "L1b: the next tick must not wake again (got $(@(Get-RotateCalls).Count) rotate calls)"
+  # The watermark, not the 60-minute cooldown, must keep the delivered line out (QA on #349: the cooldown masked a re-count).
+  Assert-True ($wl1b.decision -eq 'none' -and (@($wl1b.evidence) -join '; ') -notmatch 'resolved') "L1b: the delivered line must not be counted again (got $($wl1b.decision): $(@($wl1b.evidence) -join '; '))"
 
   # L2/L3/L4: the record moved on, is absent, or active.json is unreadable -> the old line is spent.
   foreach ($case in @(@{ id = 'L2 record moved to review'; json = (Get-ActiveJson 'issue-2604' 2604 'review') }, @{ id = 'L3 record absent'; json = (Get-ActiveJson 'issue-9' 9 'implementing') }, @{ id = 'L4 active.json unreadable'; json = '{not json' })) {
