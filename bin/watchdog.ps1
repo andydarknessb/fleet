@@ -783,7 +783,7 @@ try {
       $key = "respawned:$($r.name):$($r.jobId)"
       $currentRespawnKeys += $key
       if ($previouslyNotified -contains $key) { $waiting += [pscustomobject]@{ name = "$($r.name)"; kind = 'respawned-again'; detail = "job $($r.jobId) respawned again ($($r.reason)); already notified" }; continue }
-      $detail = "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task."
+      $detail = if ("$($r.reason)" -eq 'process reaped while still on roster') { "$($r.name) was reaped at a turn boundary and respawned (job $($r.jobId)). Parent $($r.parent) must message it if work is waiting." } else { "$($r.name) respawned ($($r.reason); job $($r.jobId)). Parent $($r.parent) must re-send its assignment if it was mid-task." }
       Write-Escalation -From 'supervisor' -Kind 'respawned' -Detail $detail -Name "$($r.name)" -Parent "$($r.parent)" | Out-Null
       # Ticket 77 (ADR 0012): a fault the fleet healed by itself is not a page - the
       # dispatcher-respawn toast that used to fire here is gone. The escalation file
