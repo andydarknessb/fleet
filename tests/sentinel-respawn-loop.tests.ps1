@@ -72,7 +72,8 @@ if ($Mode -eq 'respawn') {
 $id = if ($env:MOCK_ROW_ID) { $env:MOCK_ROW_ID } else { 'job-900' }
 if ($env:MOCK_ROW_DOWN -eq '1' -and $n -eq 0) {
   # reaped: no process until the first respawn brings one back
-  Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"stopped","status":"idle","pid":null,"startedAt":"2026-08-28T00:00:00Z"}]')
+  $st = if ($env:MOCK_ROW_STATE) { $env:MOCK_ROW_STATE } else { 'stopped' }
+  Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"' + $st + '","status":"idle","pid":null,"startedAt":"2026-08-28T00:00:00Z"}]')
   exit 0
 }
 Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"idle","pid":' + (900 + $n) + ',"startedAt":"2026-08-28T00:00:00Z"}]')
@@ -252,12 +253,29 @@ Write-Output ('[{"id":"' + $id + '","name":"ic-900","state":"working","status":"
   Remove-Item Env:MOCK_ROW_DOWN
   Assert-True (@($b13.respawned).Count -eq 1 -and @($b13.respawnDeferred).Count -eq 0 -and (Get-Content $streakPath -Raw) -eq '{oops' -and @($b13.escalate | Where-Object { $_.name -eq 'fleet' -and $_.kind -eq 'respawn-loop' }).Count -eq 1) 'B13: a no-pid row is respawned even with an unreadable streak file, which is left as found'
 
+  # fleet #345: a done row with no pid was reaped by the daemon at a turn boundary, not dead. Its respawn (still performed
+  # and verified) is neither a streak attempt nor a death; a stopped no-pid row (B10, B10b) still counts.
+  Reset-Case
+  $env:MOCK_ROW_DOWN = '1'; $env:MOCK_ROW_STATE = 'done'
+  $c345 = @(1..5 | ForEach-Object { Remove-Item "$testRoot\mock-respawn-counter.txt" -ErrorAction SilentlyContinue; Run-Check -Apply })
+  Remove-Item Env:MOCK_ROW_DOWN, Env:MOCK_ROW_STATE
+  Assert-True (@($c345 | Where-Object { @($_.respawned).Count -eq 1 }).Count -eq 5) 'B14 (#345): five applying ticks on a done no-pid row respawn it every time'
+  Assert-True (@($c345 | ForEach-Object { $_.escalate } | Where-Object { $_.kind -like 'respawn-loop*' }).Count -eq 0 -and @($c345 | Where-Object { @($_.respawnHeld).Count -gt 0 }).Count -eq 0) 'B14 (#345): and raise no respawn-loop-down, no respawn-loop, no hold'
+  Assert-True (-not (Test-Path $streakPath) -or $null -eq (Read-Streak).'ic-900') 'B14 (#345): and leave no streak entry'
+
+  Reset-Case
+  Write-Streak 'job-900' @(30, 20, 10) -Down @(30, 20, 10)
+  $before345 = Get-Content $streakPath -Raw
+  $env:MOCK_ROW_DOWN = '1'; $env:MOCK_ROW_STATE = 'done'
+  $c345b = Run-Check -Apply
+  Remove-Item Env:MOCK_ROW_DOWN, Env:MOCK_ROW_STATE
+  Assert-True (@($c345b.respawned).Count -eq 1 -and @($c345b.respawnHeld).Count -eq 0 -and @($c345b.escalate | Where-Object { $_.kind -like 'respawn-loop*' }).Count -eq 0 -and (Get-Content $streakPath -Raw) -eq $before345) 'B15 (#345): a done no-pid row with an at-cap streak is still respawned, raises nothing and leaves the streak as found'
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) respawn-loop assertion(s) failed" }
   Write-Output 'sentinel respawn-loop tests passed'
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
-  foreach ($v in 'FLEET_RESPAWN_VERIFY_MS', 'FLEET_RESPAWN_VERIFY_POLL_MS', 'MOCK_ROW_ID', 'MOCK_RESPAWN_NOOP', 'MOCK_ROW_DOWN') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+  foreach ($v in 'FLEET_RESPAWN_VERIFY_MS', 'FLEET_RESPAWN_VERIFY_POLL_MS', 'MOCK_ROW_ID', 'MOCK_RESPAWN_NOOP', 'MOCK_ROW_DOWN', 'MOCK_ROW_STATE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-sentinel-loop-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

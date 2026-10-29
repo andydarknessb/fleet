@@ -387,8 +387,9 @@ function Test-RespawnStreakHold {
   # $true when this respawn / relaunch must not run. Evaluated in read-only runs too; it writes nothing.
   param($row, $entry, [string]$reason, [string]$via = '')
   # Liveness first: only a row WITH a live pid can be in the "respawn verified, no turn follows" loop this bound exists for.
-  # A row with no pid (reaped, stopped, failed) is always respawned / relaunched as before, and still counted; once it has
+  # A row with no pid (stopped, failed) is always respawned / relaunched as before, and still counted; once it has
   # gone down cap times with no heartbeat in between, respawn-loop-down says the session keeps going down.
+  # A reaped row (done, no pid) never gets here: Do-Respawn -Reaped skips the streak (fleet #345).
   $hasPid = [bool]$row.pid
   if ($script:RespawnStreakUnreadable) {
     if (-not $hasPid) { return $false }   # the file is left as found and this respawn is not counted; the read already escalated
@@ -467,7 +468,7 @@ function Do-Relaunch {
 }
 function Get-OneLineText { param([string]$Text) $t = ("$Text" -replace '\s+', ' ').Trim(); if ($t.Length -gt 200) { $t = $t.Substring(0, 200) }; return $t }
 function Do-Respawn {
-  param($row, $entry, $reason)
+  param($row, $entry, $reason, [switch]$Reaped)
   if (-not $entry.static) {
     $current = Get-LiveRoster
     $currentEntry = $current.sessions | Where-Object { $_.name -eq $entry.name } | Select-Object -First 1
@@ -481,7 +482,8 @@ function Do-Respawn {
     if ($refusal) { Do-Relaunch $row $entry "$reason; not respawned because $refusal"; return }
   }
   # fleet #257 Gap B: the (cap+1)th verified respawn of one job with no heartbeat in between is held (read-only runs report it too).
-  if (Test-RespawnStreakHold $row $entry $reason) { return }
+  # fleet #345: a Reaped respawn (state done, no pid) is a turn-boundary reap, not a death: it is never held nor recorded in the streak.
+  if (-not $Reaped -and (Test-RespawnStreakHold $row $entry $reason)) { return }
   if (-not $Apply) {
     # Shadow: nothing to verify against, since nothing was run.
     $script:report.respawned += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
@@ -501,7 +503,7 @@ function Do-Respawn {
   }
   $verifyId = if ($entry.static) { '' } else { "$($row.id)" }
   if (Test-RespawnVerified -Name $row.name -PreviousPid $row.pid -JobId $verifyId) {
-    Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($row.id)" $reason -Down:(-not $row.pid)
+    if (-not $Reaped) { Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($row.id)" $reason -Down:(-not $row.pid) }
     $script:report.respawned +=[pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = $reason }
   } else {
     # Feeds the existing launch-retry cap exactly as a failed launch would: this
@@ -808,7 +810,7 @@ foreach ($x in $expected) {
         continue
       }
     }
-    if (-not $row.pid) { Do-Respawn $row $x 'process reaped while still on roster'; continue }
+    if (-not $row.pid) { Do-Respawn $row $x 'process reaped while still on roster' -Reaped; continue }
     $report.ok += $x.name
     continue
   }

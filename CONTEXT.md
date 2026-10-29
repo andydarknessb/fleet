@@ -378,7 +378,7 @@ _Avoid_: status report (when the projection is meant), summary, board
 A pull request reviewed clean and parked for Cory's merge, recorded under
 `prs` in `state/skip/<tenant>.json` with its reason. A hold pages Cory once,
 through an escalation, and then waits; the IC that opened it waits with it
-and is neither retried nor respawned for being idle. Lifting the hold is
+and is neither retried nor respawned for being idle; a reaped one is respawned only to stay reachable. Lifting the hold is
 Cory's merge, or Cory's instruction to the project lead.
 _Avoid_: blocked (a GitHub issue dependency), escalation (the page, not the
 state), parked
