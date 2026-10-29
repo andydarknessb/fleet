@@ -1036,6 +1036,8 @@ try {
   if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
   if ($null -eq $wakeState.PSObject.Properties['stalls']) { $wakeState | Add-Member -NotePropertyName stalls -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
+  # fleet #346: an empty or lead-less roster is a read glitch (Save-LiveRoster is not atomic), never "every IC left": no stall evaluation or pruning on it.
+  $rosterOk = [bool]($liveRoster -and @($liveRoster.sessions | Where-Object { $_.role -eq 'project-lead' -and $_.status -eq 'active' }).Count -gt 0)
   if ($mode -eq 'live' -and -not $Verify -and -not $paused) {
     # nodeExe, liveRoster, cap and liveCount are computed once above (ticket 75:
     # fleet-dead's Test-WorkWaiting needs them too, before this block even runs).
@@ -1048,7 +1050,7 @@ try {
       # fleet #346: each rostered IC owed work (implementing/revision) at a turn boundary with no heartbeat or record change for the threshold is a stall.
       $tenantStalls = @()
       $stallRecords = $null; try { $stallRecords = (Read-Json "$FleetHome\state\work\active.json").records } catch {}
-      if ($stallRecords -and $liveRoster) {
+      if ($stallRecords -and $rosterOk) {
         foreach ($sp in $stallRecords.PSObject.Properties) {
           $sr = $sp.Value
           if ("$($sr.tenant)" -ne $tenantName -or @('implementing', 'revision') -notcontains "$($sr.state)") { continue }
@@ -1190,8 +1192,8 @@ try {
     $se = $wakeState.stalls.$sid
     if ($sid -notmatch '^stall:(.+?):(\d{4}-\d\d-\d\dT.+)$') { continue }
     $seRecord = $Matches[1]; $seSince = ConvertTo-UtcDateTime $Matches[2]
-    $gone = $false; $seIc = ''
-    if ($goneRecords) {
+    $gone = $false; $seIc = "ic-$($seRecord -replace '^.*issue-', '')"  # fleet #346: persisted state names the IC, so a read glitch keeps the condition standing
+    if ($goneRecords -and $rosterOk) {
       $gr = $null; if ($goneRecords.PSObject.Properties[$seRecord]) { $gr = $goneRecords.$seRecord }
       if (-not $gr -or @('implementing', 'revision') -notcontains "$($gr.state)") { $gone = $true }
       else {

@@ -533,6 +533,31 @@ try {
   Write-Utf8 "$testRoot\state\heartbeats\ic-1.json" '{not json'
   $t9b = Run-Watchdog
   Assert-True (@($t9b.stalls).Count -eq 0 -and @(Get-RotateCalls).Count -eq 0) 'T9: an unparseable heartbeat makes no stall and no wake'
+
+  # T10 (QA): a read glitch is never a disappearance. active.json garbled for one tick, then an empty roster.json for one tick:
+  # the entry survives, still one escalation and one page, no second wake for the identity.
+  $pushPort = Get-Random -Minimum 20000 -Maximum 40000; $oldPushUrl = $env:FLEET_PUSHOVER_URL; $env:FLEET_PUSHOVER_URL = "http://127.0.0.1:$pushPort/"
+  Write-Utf8 "$testRoot\state\pages\pushover.json" '{"token":"tok-346","user":"usr-346"}'
+  $pushJob = Start-Job -ScriptBlock { param($Prefix) $l = New-Object System.Net.HttpListener; $l.Prefixes.Add($Prefix); $l.Start(); for ($i = 0; $i -lt 20; $i++) { $c = $l.GetContext(); $b = [Text.Encoding]::UTF8.GetBytes('{"status":1}'); $c.Response.ContentLength64 = $b.Length; $c.Response.OutputStream.Write($b, 0, $b.Length); $c.Response.OutputStream.Close() }; $l.Stop() } -ArgumentList $env:FLEET_PUSHOVER_URL
+  Start-Sleep -Milliseconds 500
+  Set-StallCase; Remove-Item "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue; Set-StallDelivered 121
+  $null = Run-Watchdog
+  $activeGood = Get-Content "$testRoot\state\work\active.json" -Raw
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"rec'
+  $t10a = Run-Watchdog
+  Write-Utf8 "$testRoot\state\work\active.json" $activeGood
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1 -and @(Get-StallPages).Count -eq 1 -and (@($t10a.conditions) -join ',') -match 'stall:') "T10: garbled active.json for one tick: still one escalation and one page (got $((Get-StallEscalations).Count), $(@(Get-StallPages).Count); mid conditions '$(@($t10a.conditions) -join ',')')"
+  $rosterGood = Get-Content "$testRoot\state\roster.json" -Raw
+  Write-Utf8 "$testRoot\state\roster.json" ''
+  $null = Run-Watchdog
+  $keptMid = (Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw) -match 'stall:'
+  Write-Utf8 "$testRoot\state\roster.json" $rosterGood
+  $null = Run-Watchdog
+  Assert-True ($keptMid -and (Get-StallEscalations).Count -eq 1 -and @(Get-StallPages).Count -eq 1 -and @(Get-RotateCalls).Count -eq 0) "T10: empty roster for one tick: entry survives, one escalation and page, no second wake (kept=$keptMid, $((Get-StallEscalations).Count) esc, $(@(Get-StallPages).Count) pages, $(@(Get-RotateCalls).Count) rotates)"
+  Stop-Job $pushJob -ErrorAction SilentlyContinue; Remove-Job $pushJob -Force -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\pages\pushover.json" -ErrorAction SilentlyContinue
+  if ($null -eq $oldPushUrl) { Remove-Item Env:FLEET_PUSHOVER_URL -ErrorAction SilentlyContinue } else { $env:FLEET_PUSHOVER_URL = $oldPushUrl }
   Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watchdog\paged.json", "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\profile\.claude\jobs\job-i" -Recurse -ErrorAction SilentlyContinue
