@@ -389,6 +389,102 @@ try {
   Assert-True ($wb4.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "B4: an older blocked row behind a newer pid-less done row must not be woken (got $($wb4.decision): $($wb4.reason))"
   Remove-Item "$testRoot\profile\.claude\jobs\job-p" -Recurse -ErrorAction SilentlyContinue
 
+  # ===== fleet #346: a Stall (an IC owed work, at a turn boundary, no turn for 2 h) wakes the lead; one that
+  # outlasts the wake by 2 h more files one `stall` escalation (and page). Config defaults: 120 / 120.
+  function Get-StallEscalations { @(Get-ChildItem "$testRoot\state\escalations" -Filter *-stall.json -ErrorAction SilentlyContinue) }
+  function Set-StallCase { param([double]$HbMin = 130, [double]$UpdatedMin = 200, [string]$State = 'implementing', [string]$IcStatus = 'idle', [string]$IcState = 'working', [int]$IcPid = 14)
+    Start-WakeCase
+    Set-Outbox @()
+    Remove-Item "$testRoot\state\PAUSE", "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+    Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
+    $pidField = if ($IcPid) { ',"pid":' + $IcPid } else { '' }
+    Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '},{"id":"job-i","name":"ic-1","state":"' + $IcState + '","status":"' + $IcStatus + '"' + $pidField + ',"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-300)) + '}]')
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-i") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-i\state.json" '{}'
+    Set-Heartbeat 'ic-1' $HbMin
+    Set-Active ('{"schemaVersion":1,"records":{"test:issue-1":{"tenant":"test","issue":1,"state":"' + $State + '","updatedAt":"' + (Get-Iso $UpdatedMin) + '"}}}')
+  }
+  # The identity the watchdog derives: the record id plus the later of the heartbeat and the record's updatedAt (here the heartbeat).
+  function Get-StallId { 'stall:test:issue-1:' + (ConvertTo-UtcDateTimeTest (Get-Content "$testRoot\state\heartbeats\ic-1.json" -Raw | ConvertFrom-Json).at).ToString('o') }
+  function Set-StallDelivered { param([double]$MinutesAgo) Write-Utf8 "$testRoot\state\watchdog\frontier-wake.json" ('{"tenants":{},"stalls":{"' + (Get-StallId) + '":{"deliveredAt":"' + (Get-Iso $MinutesAgo) + '"}}}') }
+  $stallRecord = 'test:issue-1'
+
+  # T1: heartbeat 130 min old, record unchanged for 200: wakes the idle lead with the stall evidence, one rotate call.
+  Set-StallCase
+  $t1 = Run-Watchdog; $wt1 = Get-TestWake $t1
+  Assert-True ($wt1.decision -eq 'woken' -and ((@($wt1.evidence) -join '; ') -match "stall ic-1 \($stallRecord implementing, no turn since ")) "T1: a stalled IC must wake the lead with stall evidence (got $($wt1.decision): '$($wt1.reason)' '$(@($wt1.evidence) -join '; ')')"
+  Assert-True (@(Get-RotateCalls).Count -eq 1) "T1: exactly one rotate.ps1 call (got $(@(Get-RotateCalls).Count))"
+  $st1 = @($t1.stalls)[0]
+  Assert-True ($st1.ic -eq 'ic-1' -and $st1.recordId -eq $stallRecord -and $st1.state -eq 'implementing' -and $st1.since -and $st1.outcome -eq 'woken') "T1: the tick line must carry the stall with outcome woken (got $($t1.stalls | ConvertTo-Json -Compress))"
+  Assert-True ((Get-StallEscalations).Count -eq 0) 'T1: no escalation yet'
+  $t1b = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq 1 -and @($t1b.stalls)[0].outcome -ne 'woken') 'T1: the same identity is not woken twice'
+
+  # T2: not stalled.
+  foreach ($case in @(
+    @{ n = 'heartbeat 100 min old'; a = @{ HbMin = 100 } },
+    @{ n = 'record changed 30 min ago'; a = @{ UpdatedMin = 30 } },
+    @{ n = 'record in escalated'; a = @{ State = 'escalated' } },
+    @{ n = 'record in hold'; a = @{ State = 'hold' } },
+    @{ n = 'record in ci-wait'; a = @{ State = 'ci-wait' } },
+    @{ n = 'record in review'; a = @{ State = 'review' } },
+    @{ n = 'IC mid-turn'; a = @{ IcStatus = 'busy' } })) {
+    $splat = $case.a; Set-StallCase @splat
+    $t2 = Run-Watchdog; $wt2 = Get-TestWake $t2
+    Assert-True ($wt2.decision -eq 'none' -and @($t2.stalls).Count -eq 0 -and @(Get-RotateCalls).Count -eq 0) "T2: $($case.n) is not a stall (got $($wt2.decision): '$(@($wt2.evidence) -join '; ')')"
+  }
+  Set-StallCase
+  Write-Utf8 "$testRoot\state\PAUSE" 'fixture'
+  $t2p = Run-Watchdog
+  Assert-True (@($t2p.stalls).Count -eq 0 -and @(Get-RotateCalls).Count -eq 0 -and (Get-StallEscalations).Count -eq 0) 'T2: no stall is evaluated while paused'
+  Remove-Item "$testRoot\state\PAUSE"
+
+  # T2b: a reaped IC (no pid, state done) is at a turn boundary.
+  Set-StallCase -IcStatus '' -IcState 'done' -IcPid 0
+  $t2b = Run-Watchdog; $wt2b = Get-TestWake $t2b
+  Assert-True ($wt2b.decision -eq 'woken' -and ((@($wt2b.evidence) -join '; ') -match 'stall ic-1')) "T2b: a reaped IC on an implementing record is a stall (got $($wt2b.decision): '$($wt2b.reason)')"
+
+  # T3: a wake delivered 121 min ago for this identity: one stall escalation, none on the next tick, no second wake.
+  Set-StallCase
+  Set-StallDelivered 121
+  $t3b = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1) "T3: 121 min after the wake, exactly one stall escalation (got $((Get-StallEscalations).Count))"
+  Assert-True (@($t3b.stalls)[0].outcome -eq 'escalated' -and @(Get-RotateCalls).Count -eq 0) "T3: outcome escalated and no second wake (got $(@($t3b.stalls)[0].outcome), $(@(Get-RotateCalls).Count) rotates)"
+  $esc = Get-Content (Get-StallEscalations)[0].FullName -Raw | ConvertFrom-Json
+  Assert-True ($esc.name -eq 'ic-1' -and $esc.detail -match 'ic-1' -and $esc.detail -match $stallRecord -and $esc.detail -match '\d+ min') "T3: the escalation names the IC, the record and the idle time (got $($esc.detail))"
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 1) 'T3: the next tick files none'
+
+  # T3c: 119 min after the wake is too early.
+  Set-StallCase
+  Set-StallDelivered 119
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 0) 'T3c: 119 min after the wake files no escalation'
+
+  # T4: the lead was never idle (mid-turn): a stall 241 min old files the escalation; 200 min does not.
+  function Set-BusyLead { Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"busy","pid":13,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '},{"id":"job-i","name":"ic-1","state":"working","status":"idle","pid":14,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-300)) + '}]')
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-p") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\job-p\state.json" '{}' }
+  Set-StallCase -HbMin 241 -UpdatedMin 300
+  Set-BusyLead
+  $null = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq 0 -and (Get-StallEscalations).Count -eq 1) "T4: a never-woken stall 241 min old files one escalation (got $((Get-StallEscalations).Count))"
+  Set-StallCase -HbMin 200 -UpdatedMin 300
+  Set-BusyLead
+  $null = Run-Watchdog
+  Assert-True ((Get-StallEscalations).Count -eq 0) 'T4: a never-woken stall 200 min old files none'
+  Remove-Item "$testRoot\profile\.claude\jobs\job-p" -Recurse -ErrorAction SilentlyContinue
+
+  # T5: a newer heartbeat clears the stall: no evidence, no escalation (even with an old delivery recorded).
+  Set-StallCase
+  Set-StallDelivered 300
+  Set-Heartbeat 'ic-1' 5
+  $t5 = Run-Watchdog; $wt5 = Get-TestWake $t5
+  Assert-True (@($t5.stalls).Count -eq 0 -and $wt5.decision -eq 'none' -and (Get-StallEscalations).Count -eq 0) "T5: a newer heartbeat must clear the stall (got $($wt5.decision), $(@($t5.stalls).Count) stalls)"
+  Remove-Item "$testRoot\state\work\active.json", "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\profile\.claude\jobs\job-i" -Recurse -ErrorAction SilentlyContinue
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
   Write-Output 'frontier-wake-respawn tests passed'
 } finally {

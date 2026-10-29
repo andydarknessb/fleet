@@ -108,6 +108,10 @@ and a leaked task would otherwise hold the session busy forever. A busy
 session with a subagent in flight, or one that reported recently, is mid-turn.
 _Avoid_: idle (for the busy-between-turns case), safe point
 
+**Stall**:
+A Work record in `implementing` or `revision` whose IC has sat at a turn boundary, idle or reaped, for two hours. It wakes the project lead; a stall that outlasts that wake by two more hours is an escalation.
+_Avoid_: stuck (a busy session making no progress), hung
+
 **Page**:
 One off-host push to Cory. In-fleet condition pages come from a decision event
 (through the Notifier) or a Watchdog condition and share one delivery function;
