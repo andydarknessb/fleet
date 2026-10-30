@@ -263,3 +263,7 @@ Verdict on each Triage proposal, and an Endorsement is a Ruling at once.
 - Decisions 5 and 6 and the two 2026-09-12 amendments stand: the frontier is
   still computed by script, the write boundary is still a hook, and `Approved`,
   `Re-propose` and `Veto` keep their shapes and their guard-hook refusal.
+
+## Amendment 2026-10-30 (owner ruling, fleet #351)
+
+The Principal's tenant-repo glossary is `CONTEXT.md` or `GLOSSARY.md`, whichever the tenant uses; `hooks/principal-guard.ps1` allows either at the repo root.

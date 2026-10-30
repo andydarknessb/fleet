@@ -1,0 +1,38 @@
+{
+  "name": "statelite",
+  "repo": "E:\\Stat-Elite",
+  "github": "andydarknessb/stat-elite",
+  "defaultBranch": "integration",
+  "releaseBranch": "main",
+  "readyLabel": "ready-for-agent",
+  "fleetIdentity": "andydarknessb-fleet",
+  "ownerLogin": "andydarknessb",
+  "escalationLabel": "fleet-escalation",
+  "branchPrefix": "fleet/",
+  "maxIcs": 1,
+  "carveOuts": [
+    ".github/workflows/**",
+    ".env*",
+    "supabase/config.toml"
+  ],
+  "checks": {},
+  "riskTriggers": {
+    "data-integrity": {
+      "paths": ["supabase/migrations/**", "docs/schema.sql"],
+      "patterns": ["ON DELETE", "delete_my_account", "DROP "]
+    },
+    "security": {
+      "paths": [],
+      "patterns": ["dangerouslySetInnerHTML", "eval\\(", "innerHTML", "service_role"]
+    }
+  },
+  "heavySuites": {},
+  "reviewStatus": "fleet-review",
+  "ciGates": [],
+  "watchedChecks": [],
+  "ignoredChecks": [],
+  "notes": [
+    "No app code yet: the first ticket scaffolds the Vite + React + TypeScript PWA from docs/plan.md with npm test and npm run lint scripts; checks and maxIcs are revisited after it merges (fleet #351).",
+    "GLOSSARY.md is the glossary; there is no CONTEXT.md. docs/adr/ holds accepted decisions; docs/schema.sql is the planned Supabase schema."
+  ]
+}

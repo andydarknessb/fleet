@@ -189,7 +189,7 @@ finish() {
 
 TOTAL_STAGES=6
 FLEET_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPOS=(andydarknessb/Endzone-Empire andydarknessb/Nidus andydarknessb/fleet)
+REPOS=(andydarknessb/Endzone-Empire andydarknessb/Nidus andydarknessb/stat-elite andydarknessb/fleet)
 SCOPES_WANTED=(repo workflow read:org)
 _win() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 _unix() { if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
@@ -281,7 +281,7 @@ if [[ "$AFTER" == "$CORY_LOGIN" ]]; then ok "your own shell still acts as ${CORY
 pause
 
 # ── 4 ─────────────────────────────────────────────────────────────────────
-stage "Invite ${FLEET_LOGIN} to the three repos, and accept as ${FLEET_LOGIN}"
+stage "Invite ${FLEET_LOGIN} to the tenant repos and the fleet repo, and accept as ${FLEET_LOGIN}"
 note "Invites are sent as ${CORY_LOGIN}; they are accepted with the fleet's own token. No browser needed."
 for repo in "${REPOS[@]}"; do
   if as_cory gh api -X PUT "repos/$repo/collaborators/$FLEET_LOGIN" -f permission=push >/dev/null 2>&1; then ok "invited to $repo (write)"; else fail "could not invite ${FLEET_LOGIN} to $repo"; fi
