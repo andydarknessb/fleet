@@ -53,7 +53,7 @@ try {
   foreach ($f in '_common.ps1','launch.ps1','identity.js','work-state.js','assignment.js','premises.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body for ic."
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
   Write-Utf8 "$testRoot\agents\project-lead.md" "---`nname: project-lead`nmodel: sonnet`neffort: low`n---`nRole body for project-lead."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
@@ -85,7 +85,7 @@ try {
     schemaVersion = 1; status = 'pending-ack'; id = 'assignment-test-101'; workRecordId = 'test:issue-101'; workRecordRevision = 1
     issue = [ordered]@{ number = 101; bodyHash = $bodyHash; criteriaHash = $bodyHash; commentCount = 0 }
     base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = $baseSha }
-    branch = 'fleet/101-fixture'; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
+    branch = 'fleet/101-fixture'; tenant = 'test'; parent = 'pl-test'; model = 'haiku'
   }
   Write-Utf8 $manifestPath ($manifest | ConvertTo-Json -Depth 8)
   $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id test:issue-101 --tenant test --issue 101 --manifest $manifestPath --idempotency-key reserve-101

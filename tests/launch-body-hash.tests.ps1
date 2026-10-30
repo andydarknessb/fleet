@@ -25,7 +25,7 @@ try {
   }
   foreach ($f in '_common.ps1','launch.ps1','identity.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body."
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -53,7 +53,7 @@ exit /b %errorlevel%
   $manifest = [ordered]@{
     schemaVersion = 1; status = 'pending-ack'; id = 'assignment-test-1098'; workRecordId = 'test:issue-1098'; workRecordRevision = 1
     issue = [ordered]@{ number = 1098; bodyHash = $bodyHash; criteriaHash = $bodyHash; commentCount = 0 }; base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = ('a' * 40) }
-    branch = 'fleet/1098-test'; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
+    branch = 'fleet/1098-test'; tenant = 'test'; parent = 'pl-test'; model = 'haiku'
   }
   Write-Utf8 $manifestPath ($manifest | ConvertTo-Json -Depth 8)
   $active = @{ records = @{ 'test:issue-1098' = @{ id = 'test:issue-1098'; issue = 1098; state = 'assigned'; revision = 1; manifestPath = $manifestPath } } }

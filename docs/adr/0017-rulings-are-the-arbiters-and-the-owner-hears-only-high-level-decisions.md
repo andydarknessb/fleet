@@ -198,3 +198,26 @@ Decided:
 - Anthropic does not support Claude Code on non-Claude models. The fleet
   carries that risk; the rehearsal gate is the check, and sonnet is the way
   back.
+
+## Amendment 2026-10-30 - ICs run Haiku 5.5 only, at effort xhigh or max (fleet #350, owner ruling)
+
+Cory ruled, 2026-10-30, in an owner session: the IC runs `claude-haiku-5-5`
+and nothing else. This supersedes the IC part of the 2026-10-26 amendment. Its
+project-lead part stands.
+
+Decided:
+
+- ICs run on Haiku 5.5 only. The DeepSeek and Sonnet IC tiers are retired, in
+  code, config, tests, the canary and docs. Opus never.
+- The lead picks effort, not a model. `assignment.js assign --effort xhigh|max`:
+  `xhigh` is the default and the code fallback, and `max` is for a ticket the
+  lead judges too hard for xhigh. `--model` is gone. No other effort is given
+  to an IC.
+- A ticket a max IC cannot finish goes up the existing escalation path
+  (`fleet-escalation`, the lead, then Cory). It never goes to a bigger model.
+- ICs run under the auto profile (ADR 0016 Amendment 10). The allowlist profile
+  stays as the rollback. The fallback to haiku or sonnet in the 2026-10-26
+  amendment goes with the tiers.
+- The project lead stays on `claude-sonnet-5-5` at effort high. Workers keep
+  their own definitions: `qa-reviewer` on Opus 5.5 at high, `researcher` on
+  Haiku 5.5.

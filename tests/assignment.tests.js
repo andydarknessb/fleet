@@ -136,7 +136,7 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
     readyLabel: 'ready-for-agent',
     base: { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) },
     parent: 'pl-endzone',
-    model: 'sonnet',
+    model: 'haiku',
     risk: 'standard',
     tokenBudget: 25000,
     contextHeadings: ['Draft workflow'],
@@ -175,7 +175,7 @@ test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and
     readyLabel: 'ready-for-agent',
     base: { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) },
     parent: 'pl-endzone',
-    model: 'sonnet',
+    model: 'haiku',
     risk: 'standard',
     tokenBudget: 25000,
     contextHeadings: [],
@@ -622,88 +622,84 @@ test('frontier excludes an issue assigned to someone else, not one the fleet ass
   assert.deepEqual(unscoped.eligible.map((entry) => entry.number), [], 'without a fleet identity every assignee still excludes');
 });
 
-// Amendment 14 (2026-09-09): an IC is haiku or sonnet at effort high, never opus. The
-// planner is the live launch path, so the rule is enforced where the manifest is made.
-// Fleet #28 (2026-09-11): the CLI has no auto mode for claude-haiku-4-5, so the haiku
-// tier is suspended at the planner (the refusal names the cause, not just the list).
-test('assignment refuses an IC model outside sonnet, refuses haiku by name, and defaults to sonnet', () => {
-  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
-  assert.throws(
-    () => reserveAssignment({ root: rootDir(), issue: issue(70), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'opus' }),
-    (error) => error.code === 'INVALID_IC_MODEL' && /haiku|sonnet/.test(error.message),
-  );
-  assert.throws(
-    () => reserveAssignment({ root: rootDir(), issue: issue(71), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'haiku' }),
-    (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message),
-    'haiku is refused with the CLI auto-mode cause named',
-  );
-  const defaulted = reserveAssignment({ root: rootDir(), issue: issue(72), tenant: 'endzone', readyLabel: 'ready-for-agent', base });
-  assert.equal(defaulted.manifest.model, 'sonnet');
-  assert.equal(reserveAssignment({ root: rootDir(), issue: issue(73), tenant: 'endzone', readyLabel: 'ready-for-agent', base, model: 'Sonnet' }).manifest.model, 'sonnet', 'case is not a distinction');
-});
-
-// Spec #94 (#162): the permission profile is a launch-door choice per model. The
-// planner pins it in the manifest beside the model so launch.ps1 writes the matching
-// settings; haiku is reservable only under the allowlist profile (auto is fleet #28).
-test('assign pins the permission profile: haiku only under allowlist, sonnet under auto', () => {
+// Owner ruling 2026-10-30 (fleet #350): every IC runs Claude Haiku 5.5, and the lead picks the
+// effort per ticket (xhigh by default, max when the ticket is too hard for xhigh). The planner
+// is the live launch path, so the rule is enforced where the manifest is made.
+test('assign runs every IC on Haiku 5.5: no --model defaults to haiku, any other model is refused', () => {
   const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
   const reserve = (number, extra) => reserveAssignment({ root: rootDir(), issue: issue(number), tenant: 'endzone', readyLabel: 'ready-for-agent', base, ...extra });
-
-  const haiku = reserve(80, { model: 'haiku', permissions: 'allowlist' });
-  assert.equal(haiku.manifest.model, 'haiku');
-  assert.equal(haiku.manifest.permissions, 'allowlist', 'the manifest pins the profile beside the model');
-
-  for (const [number, extra, label] of [[81, { model: 'haiku' }, 'no flag'], [82, { model: 'haiku', permissions: 'auto' }, '--permissions auto']]) {
+  assert.equal(reserve(70, {}).manifest.model, 'haiku', 'an assign with no --model defaults to haiku');
+  assert.equal(reserve(71, { model: 'haiku' }).manifest.model, 'haiku');
+  assert.equal(reserve(72, { model: 'Haiku' }).manifest.model, 'haiku', 'case is not a distinction');
+  for (const [number, model] of [[73, 'sonnet'], [74, 'deepseek'], [75, 'opus']]) {
     assert.throws(
-      () => reserve(number, extra),
-      (error) => error.code === 'INVALID_IC_MODEL' && /auto mode/.test(error.message) && /fleet #28/.test(error.message) && /--permissions allowlist/.test(error.message),
-      `haiku with ${label} is refused with the fleet #28 cause and the flag to pass`,
+      () => reserve(number, { model }),
+      (error) => error.code === 'INVALID_IC_MODEL' && error.message === 'ICs run on Haiku 5.5 only (fleet #350); choose --effort xhigh|max',
+      `--model ${model} is refused`,
     );
   }
+});
 
-  assert.equal(reserve(83, { model: 'sonnet' }).manifest.permissions, 'auto', 'sonnet with no flag pins the auto profile');
-  assert.equal(reserve(84, {}).manifest.permissions, 'auto', 'the default model pins auto too');
+test('assign takes --effort: xhigh by default, max allowed, anything else refused by name', () => {
+  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
+  const reserve = (number, extra) => reserveAssignment({ root: rootDir(), issue: issue(number), tenant: 'endzone', readyLabel: 'ready-for-agent', base, ...extra });
+  assert.equal(reserve(76, {}).manifest.effort, 'xhigh', 'no --effort pins xhigh');
+  assert.equal(reserve(77, { effort: 'max' }).manifest.effort, 'max');
+  assert.equal(reserve(78, { effort: 'XHIGH' }).manifest.effort, 'xhigh', 'case is not a distinction');
+  for (const [number, effort] of [[79, 'high'], [80, 'low'], [81, 'medium'], [82, 'sonnet']]) {
+    assert.throws(
+      () => reserve(number, { effort }),
+      (error) => error.code === 'INVALID_IC_EFFORT' && /xhigh or max/.test(error.message) && error.message.includes(`'${effort}'`),
+      `--effort ${effort} is refused, naming the value and the two allowed`,
+    );
+  }
+});
+
+// Spec #94 (#162) and fleet #350: the permission profile is a launch-door choice. Haiku runs
+// auto by default; allowlist is the rollback. The planner pins it in the manifest beside the model.
+test('assign pins the permission profile: haiku under auto by default, allowlist as the rollback', () => {
+  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
+  const reserve = (number, extra) => reserveAssignment({ root: rootDir(), issue: issue(number), tenant: 'endzone', readyLabel: 'ready-for-agent', base, ...extra });
+  assert.equal(reserve(80, {}).manifest.permissions, 'auto', 'no flag pins auto');
+  assert.equal(reserve(81, { permissions: 'auto' }).manifest.permissions, 'auto');
+  const rollback = reserve(82, { model: 'haiku', permissions: 'allowlist' });
+  assert.equal(rollback.manifest.model, 'haiku');
+  assert.equal(rollback.manifest.permissions, 'allowlist', 'the manifest pins the rollback profile beside the model');
   assert.throws(
-    () => reserve(85, { model: 'sonnet', permissions: 'allowlist' }),
-    (error) => error.code === 'INVALID_PERMISSION_PROFILE' && /sonnet/.test(error.message),
-    'sonnet stays on auto: the allowlist profile is the haiku profile',
-  );
-  assert.throws(
-    () => reserve(86, { model: 'haiku', permissions: 'bypass' }),
+    () => reserve(83, { permissions: 'bypass' }),
     (error) => error.code === 'INVALID_PERMISSION_PROFILE' && /allowlist/.test(error.message),
     'an unknown profile is refused, naming the known ones',
   );
 });
 
-// Owner ruling 2026-10-27 (fleet #332): deepseek runs the auto profile by default;
-// --permissions allowlist stays accepted as the rollback. Haiku stays allowlist-only.
-test('assign reserves deepseek under auto by default and still accepts allowlist', () => {
-  const base = { remote: 'origin', ref: 'integration', sha: 'e'.repeat(40) };
-  const reserve = (number, extra) => reserveAssignment({ root: rootDir(), issue: issue(number), tenant: 'endzone', readyLabel: 'ready-for-agent', base, ...extra });
-
-  const deepseek = reserve(90, { model: 'DeepSeek', permissions: 'allowlist' });
-  assert.equal(deepseek.manifest.model, 'deepseek');
-  assert.equal(deepseek.manifest.permissions, 'allowlist');
-  assert.equal(reserve(91, { model: 'deepseek' }).manifest.permissions, 'auto', 'no --permissions pins auto');
-  assert.equal(reserve(92, { model: 'deepseek', permissions: 'auto' }).manifest.permissions, 'auto');
-  assert.throws(
-    () => reserve(94, { model: 'haiku', permissions: 'auto' }),
-    (error) => error.code === 'INVALID_IC_MODEL' && /no auto mode for claude-haiku-4-5/.test(error.message),
-    'haiku under auto is still refused',
-  );
-  assert.equal(reserve(93, {}).manifest.model, 'sonnet', 'an assign with no --model still defaults to sonnet: the lead names deepseek');
-});
-
-test('assign CLI takes --permissions and the written manifest pins it', () => {
+// The assign CLI is the door the lead types into: each call gets its own fixture tenant,
+// so it reserves its own issue.
+function assignCli(extra, number = 90) {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', readyLabel: 'ready-for-agent', maxIcs: 3, defaultBranch: 'integration' }));
   const fixture = path.join(root, 'issues.json');
-  fs.writeFileSync(fixture, JSON.stringify([issue(90)]));
-  const result = cli(['assign', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--base-sha', 'f'.repeat(40), '--model', 'haiku', '--permissions', 'allowlist']);
-  const written = JSON.parse(fs.readFileSync(result.manifestPath, 'utf8'));
+  fs.writeFileSync(fixture, JSON.stringify([issue(number)]));
+  return cli(['assign', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--base-sha', 'f'.repeat(40), ...extra]);
+}
+
+test('assign CLI takes --model haiku, --effort and --permissions, and the written manifest pins them', () => {
+  const written = JSON.parse(fs.readFileSync(assignCli(['--model', 'haiku', '--effort', 'max', '--permissions', 'allowlist']).manifestPath, 'utf8'));
   assert.equal(written.model, 'haiku');
+  assert.equal(written.effort, 'max');
   assert.equal(written.permissions, 'allowlist');
+});
+
+test('assign CLI: no --effort writes xhigh, --effort max is accepted, --effort high is refused', () => {
+  assert.equal(JSON.parse(fs.readFileSync(assignCli([]).manifestPath, 'utf8')).effort, 'xhigh');
+  assert.equal(JSON.parse(fs.readFileSync(assignCli(['--effort', 'max']).manifestPath, 'utf8')).effort, 'max');
+  assert.throws(() => assignCli(['--effort', 'high']), (error) => error.code === 'INVALID_IC_EFFORT' && /xhigh or max/.test(error.message));
+});
+
+test('assign CLI refuses --model sonnet and --model deepseek', () => {
+  for (const model of ['sonnet', 'deepseek']) {
+    assert.throws(() => assignCli(['--model', model]), (error) => error.code === 'INVALID_IC_MODEL' && /Haiku 5\.5 only/.test(error.message), `--model ${model}`);
+  }
 });
 
 // Spec #94 (#163/#164): a rehearsal reserves one chosen ticket, not the frontier head.

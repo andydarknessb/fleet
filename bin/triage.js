@@ -228,7 +228,7 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
     entry.by = requireText(by, 'by');
     if (commentUrl) entry.commentUrl = String(commentUrl);
   }
-  // `fields` is the door's own detail (scope, tier, cause...); it never overrides a core key.
+  // `fields` is the door's own detail (scope, cause...); it never overrides a core key.
   if (fields && BOUNDED_KINDS.includes(kind)) for (const [key, value] of Object.entries(fields)) if (!(key in entry)) entry[key] = value;
   if (kind === 'finalized') {
     const applied = String(labels || '').split(',').map((label) => label.trim()).filter(Boolean);
@@ -1037,8 +1037,9 @@ function activeWorkIssues(root, tenant) {
 //   6  the issue body hash is unchanged and the body has a `## Premises` heading
 //   7  not an escalation ruling (fail closed, three independent checks); an ADR 0017 Endorsement of one recorded against its wake (`--record-id`) passes (#305)
 //   8  proposal fields, each a whole FIELD (its line plus any continuation lines) that is
-//      exactly the word: Classification bug|feature, Open for Cory none, Blocked_by none,
-//      Tier haiku|sonnet; a Ruling field; and every premise line verified (none false)
+//      exactly the word: Classification bug|feature, Open for Cory none, Blocked_by none;
+//      a Ruling field; and every premise line verified (none false). A Tier line is retired
+//      (fleet #350): it is ignored, so a leftover one neither passes nor fails.
 //   9  labels: no routing or escalation label, `held` or `haiku-rehearsal`, and no hold;
 //      the marker present (an endorsed escalation ruling recorded against its wake (`--record-id`) may already carry the ready and escalation labels, #305)
 //   10 cap: at most FINALIZE_CAP new finalizes per run
@@ -1123,8 +1124,6 @@ function proposalRefusals(text) {
   const open = ['Open', 'Open for Cory'].map((name) => exactField(parsed, name)).filter((value) => value !== null);
   if (!open.length || open.some((value) => value !== 'none')) codes.push('open-for-cory');
   if (exactField(parsed, 'Blocked_by') !== 'none') codes.push('blocked-by');
-  const tier = exactField(parsed, 'Tier');
-  if (tier !== 'haiku' && tier !== 'sonnet') codes.push('tier');
   if (!Object.prototype.hasOwnProperty.call(parsed.fields, 'Ruling')) codes.push('no-ruling-line');
   if (!parsed.premises || !parsed.premises.length || !parsed.premises.every((line) => !/ false:/.test(line) && VERIFIED_PREMISE_RE.test(line))) codes.push('premises');
   return codes;

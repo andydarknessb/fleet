@@ -27,10 +27,9 @@ try {
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json")
-  [IO.File]::Copy("$sourceRoot\config\deepseek.json", "$testRoot\config\deepseek.json")
-  foreach ($roleName in 'project-lead','ic') {
-    Write-Utf8 "$testRoot\agents\$roleName.md" ("---`nname: $roleName`nmodel: sonnet`neffort: low`n---`nRole body for $roleName.")
-  }
+  Write-Utf8 "$testRoot\agents\project-lead.md" "---`nname: project-lead`nmodel: sonnet`neffort: low`n---`nRole body for project-lead."
+  # Fleet #350: the IC role file names Haiku 5.5 at xhigh, the effort the planner defaults to.
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
   Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: opus-5.5`neffort: high`n---`nRole body for principal."
   Write-Utf8 "$testRoot\agents\arbiter.md" "---`nname: arbiter`nmodel: claude-opus-5-5`neffort: xhigh`n---`nRole body for arbiter."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
@@ -166,22 +165,27 @@ exit $LASTEXITCODE
   $r6c = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start.', '-DryRun')
   Assert-True ($r6c.dryRun -eq $true) 'a stopped job state must not block a relaunch'
 
-  # Fleet #28: the CLI has no auto mode for claude-haiku-4-5; the one door refuses haiku
-  # even on a dry run, names the cause, and never reaches the claude command.
-  $rh = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'haiku', '-DryRun')
-  Assert-True ($script:lastExit -eq 3) "a haiku launch must exit 3 (got $script:lastExit)"
-  Assert-True ($rh.launched -eq $false -and -not $rh.dryRun) 'a haiku launch must be refused before the dry-run report'
-  Assert-True ("$($rh.reason)" -match 'auto mode' -and "$($rh.reason)" -match 'fleet #28') 'the haiku refusal must name the CLI auto-mode cause'
-  $rs = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
-  Assert-True ($rs.dryRun -eq $true -and $rs.model -eq 'sonnet') 'a sonnet launch still dry-runs'
-  Assert-True ("$($rs.command)" -match '--model claude-sonnet-5-5 ') "a sonnet IC runs pinned Sonnet 5.5 (got: $($rs.command))"
-  Assert-True ($rs.permissions -eq 'auto' -and $rs.allowRules -eq 0) "a sonnet launch reports the auto profile with no allow rules (got $($rs.permissions)/$($rs.allowRules))"
-  $sonnetSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.json" -Raw | ConvertFrom-Json
-  Assert-True ($sonnetSettings.permissions.defaultMode -eq 'auto') 'the sonnet settings keep defaultMode auto'
-  Assert-True ($sonnetSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a sonnet session is marked auto, so the allowlist gate passes it (fleet #181)'
-  Assert-True (-not $sonnetSettings.permissions.PSObject.Properties['allow'] -and -not $sonnetSettings.permissions.PSObject.Properties['additionalDirectories']) 'the sonnet settings carry no allow list and no additional directories'
-  $rha = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'haiku', '-Permissions', 'auto', '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rha.reason)" -match 'fleet #28') 'haiku under an explicit auto profile is still the fleet #28 refusal'
+  # Fleet #350 (owner ruling 2026-10-30): every IC runs Claude Haiku 5.5. An IC with no -Model
+  # resolves to the pinned id under the auto profile, at the role file's effort.
+  $rh = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-DryRun')
+  Assert-True ($rh.dryRun -eq $true -and $rh.model -eq 'haiku' -and $rh.permissions -eq 'auto' -and $rh.allowRules -eq 0) "an IC with no -Model dry-runs on Haiku under auto (got: $rh)"
+  Assert-True ("$($rh.command)" -match '--model claude-haiku-5-5 --effort xhigh ') "an IC runs pinned claude-haiku-5-5 at the role file effort (got: $($rh.command))"
+  $haikuAutoSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.json" -Raw | ConvertFrom-Json
+  Assert-True ($haikuAutoSettings.permissions.defaultMode -eq 'auto' -and $haikuAutoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a haiku IC under auto runs defaultMode auto, marked auto so the allowlist gate passes it (fleet #181)'
+  Assert-True (-not $haikuAutoSettings.permissions.PSObject.Properties['allow'] -and -not $haikuAutoSettings.permissions.PSObject.Properties['additionalDirectories']) 'the haiku IC under auto carries no allow list and no additional directories'
+  Assert-True (-not $haikuAutoSettings.PSObject.Properties['apiKeyHelper'] -and -not $haikuAutoSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'an IC keeps the Anthropic API: no base URL and no apiKeyHelper'
+  $rhx = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'haiku', '-Permissions', 'auto', '-DryRun')
+  Assert-True ($rhx.dryRun -eq $true -and $rhx.permissions -eq 'auto') "an explicit -Permissions auto on a haiku IC dry-runs (got: $rhx)"
+  # Any other model is refused at the door on an IC, dry runs included, before the claude command.
+  foreach ($otherModel in 'sonnet', 'opus') {
+    $ro = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', $otherModel, '-DryRun')
+    Assert-True ($script:lastExit -eq 3 -and $ro.launched -eq $false -and -not $ro.dryRun -and "$($ro.reason)" -match 'Haiku 5\.5 only') "an IC on $otherModel is refused (got: $ro)"
+  }
+  # The role file's effort is the IC's fallback, and only xhigh or max launches.
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: high`n---`nRole body for ic."
+  $rhe = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and $rhe.launched -eq $false -and "$($rhe.reason)" -match 'xhigh or max') "an IC whose role file says high is refused (got: $rhe)"
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
 
   # Spec #94 (#162, ADR 0016): an allowlist manifest launches haiku under acceptEdits with
   # the checked-in profile as its allow list, the fleet root as an additional directory,
@@ -246,8 +250,9 @@ exit $LASTEXITCODE
   $rmv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($script:lastExit -eq 3 -and $rmv.launched -eq $false) "a haiku launch on an unverified CLI must refuse with exit 3 (got $script:lastExit): $rmv"
   Assert-True ("$($rmv.reason)" -match '9\.9\.999' -and "$($rmv.reason)" -match '2\.1\.282' -and "$($rmv.reason)" -match 'scratch-root\.ps1') "the version refusal names both versions and the rehearsal command: $($rmv.reason)"
-  $rsv = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-Model', 'sonnet', '-DryRun')
-  Assert-True ($rsv.dryRun -eq $true) 'a sonnet launch is unaffected by the recorded CLI version'
+  # Fleet #350: the recorded CLI version gates the allowlist rollback only; haiku under auto is not gated.
+  $rsv = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-DryRun')
+  Assert-True ($rsv.dryRun -eq $true) "a haiku IC under auto is unaffected by the recorded CLI version (got: $rsv)"
   # The checked-in profile records the CLI the clean rehearsal ran on (spec #94: 2026-09-29,
   # Endzone #1773, .scratch/haiku-rehearsal-2026-09-29/).
   Assert-True ("$($profile.verifiedCliVersion)" -match '^\d+\.\d+\.\d+$') "the checked-in profile records the rehearsed CLI version (got $($profile.verifiedCliVersion))"
@@ -266,67 +271,40 @@ exit $LASTEXITCODE
   Assert-True ($rmr.dryRun -eq $true) "a rehearsal root launches haiku on the installed CLI: $rmr"
   [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
   Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
-  # A sonnet manifest pinning allowlist is refused at the door too (the planner refuses it first).
+  # Fleet #350: a sonnet IC manifest is refused at the door (every IC is Haiku 5.5 now), and the
+  # refusal names that rule before any allowlist or version gate runs.
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"haiku"', '"model":"sonnet"'))
   $rms = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rms.reason)" -match 'allowlist') "a sonnet allowlist manifest is refused (got: $rms)"
-  # Owner ruling 2026-10-26: a deepseek IC runs DeepSeek V4.1 Flash against
-  # config/deepseek.json's base URL, its key read at call time by the apiKeyHelper. The tier
-  # needs the key file and its own rehearsal. Owner ruling 2026-10-27 (fleet #332): the
-  # default profile is auto; a manifest pinning allowlist (the rollback) launches as written.
-  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"sonnet"', '"model":"deepseek"'))
-  $env:MOCK_CLAUDE_VERSION = '2.1.282'
-  $rdk = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rdk.reason)" -match 'no DeepSeek API key') "a deepseek launch with no key file is refused (got: $rdk)"
-  [IO.Directory]::CreateDirectory("$testRoot\profile\.fleet-secrets") | Out-Null
-  Write-Utf8 "$testRoot\profile\.fleet-secrets\deepseek-api-key" 'sk-test-launch'
-  # The checked-in config records the CLI the deepseek rehearsal passed on (2026-10-27,
-  # Endzone #1440 -> PR #2522); with no recorded version the tier stays closed.
-  $checkedInDeepseek = Get-Content "$sourceRoot\config\deepseek.json" -Raw | ConvertFrom-Json
-  Assert-True ("$($checkedInDeepseek.verifiedCliVersion)" -match '^\d+\.\d+\.\d+$') "the checked-in deepseek config records the rehearsed CLI version (got $($checkedInDeepseek.verifiedCliVersion))"
-  $unverifiedDeepseek = Get-Content "$testRoot\config\deepseek.json" -Raw | ConvertFrom-Json
-  $unverifiedDeepseek.verifiedCliVersion = $null
-  Write-Utf8 "$testRoot\config\deepseek.json" ($unverifiedDeepseek | ConvertTo-Json -Depth 6)
-  $rdv = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rdv.reason)" -match 'no deepseek rehearsal has passed' -and "$($rdv.reason)" -match 'config\\deepseek\.json' -and "$($rdv.reason)" -match '-Model deepseek') "the deepseek tier stays closed until its own rehearsal passes (got: $rdv)"
-  $verifiedDeepseek = Get-Content "$testRoot\config\deepseek.json" -Raw | ConvertFrom-Json
-  $verifiedDeepseek.verifiedCliVersion = '2.1.282'
-  Write-Utf8 "$testRoot\config\deepseek.json" ($verifiedDeepseek | ConvertTo-Json -Depth 6)
-  $rd = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($rd.dryRun -eq $true -and $rd.model -eq 'deepseek' -and $rd.permissions -eq 'allowlist') "a verified deepseek manifest dry-runs under the allowlist profile (got: $rd)"
-  Assert-True ("$($rd.command)" -match '--model deepseek-flash --effort low ') "a deepseek IC runs pinned deepseek-flash at the role file effort (got: $($rd.command))"
-  $deepseekText = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw
-  $deepseekSettings = $deepseekText | ConvertFrom-Json
-  Assert-True ($deepseekSettings.env.ANTHROPIC_BASE_URL -eq 'https://api.deepseek.com/anthropic') 'the env points a deepseek session at the DeepSeek Anthropic-format API'
-  Assert-True ($deepseekSettings.apiKeyHelper -eq "node $rootFwd/bin/deepseek-key.js") "the apiKeyHelper reads the key at call time (got: $($deepseekSettings.apiKeyHelper))"
-  Assert-True (-not ($deepseekText -match 'sk-test-launch')) 'no key lands in the settings file'
-  Assert-True ($deepseekSettings.permissions.defaultMode -eq 'acceptEdits' -and $deepseekSettings.env.FLEET_PERMISSIONS -eq 'allowlist') 'a deepseek IC runs acceptEdits under the allowlist gate'
-  # Fleet #332: the same manifest under auto launches, carries the same base URL and
-  # apiKeyHelper, and runs defaultMode auto; the CLI-version gate still applies to it.
+  Assert-True ($script:lastExit -eq 3 -and "$($rms.reason)" -match 'Haiku 5\.5 only') "a sonnet IC manifest is refused at the door (got: $rms)"
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"model":"sonnet"', '"model":"haiku"'))
+  # Fleet #350: a haiku manifest under auto launches on any CLI version: the recorded version
+  # gates the allowlist rollback only. The IC keeps the Anthropic API, with no allow list.
   Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"permissions":"allowlist"', '"permissions":"auto"'))
+  $env:MOCK_CLAUDE_VERSION = '2.1.999'
   $rda = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($rda.dryRun -eq $true -and $rda.model -eq 'deepseek' -and $rda.permissions -eq 'auto') "a deepseek manifest under auto dry-runs (got: $rda)"
+  Assert-True ($rda.dryRun -eq $true -and $rda.model -eq 'haiku' -and $rda.permissions -eq 'auto') "a haiku manifest under auto dry-runs on any CLI (got: $rda)"
+  Assert-True ("$($rda.command)" -match '--model claude-haiku-5-5 --effort xhigh ') "a manifest without an effort runs at the role file effort (got: $($rda.command))"
   $autoSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
-  Assert-True ($autoSettings.permissions.defaultMode -eq 'auto' -and $autoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a deepseek IC under auto runs defaultMode auto'
-  Assert-True ($rda.allowRules -eq 0 -and -not $autoSettings.permissions.PSObject.Properties['allow']) 'a deepseek IC under auto carries no allow list'
-  Assert-True ($autoSettings.env.ANTHROPIC_BASE_URL -eq 'https://api.deepseek.com/anthropic' -and $autoSettings.apiKeyHelper -eq "node $rootFwd/bin/deepseek-key.js") 'a deepseek IC under auto still gets the DeepSeek base URL and apiKeyHelper'
-  $env:MOCK_CLAUDE_VERSION = '2.1.999'
-  $rdg = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rdg.reason)" -match 'verified on Claude Code 2\.1\.282' -and $rdg.permissions -eq 'auto') "the deepseek version gate refuses a mismatched CLI under auto (got: $rdg)"
-  $env:MOCK_CLAUDE_VERSION = '2.1.282'
-  # Fleet #332: deepseek is an IC tier only, so a non-IC role is refused even for a dry run.
-  $rnd = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-Model', 'deepseek', '-DryRun')
-  Assert-True ($script:lastExit -eq 3 -and "$($rnd.reason)" -match 'IC tier only') "a project lead on deepseek is refused (got: $rnd)"
-  # A scratch root's rehearsalRoot flag also stands aside the deepseek version gate.
-  $rehearsalDs = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
-  $rehearsalDs | Add-Member -NotePropertyName rehearsalRoot -NotePropertyValue $true -Force
-  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($rehearsalDs | ConvertTo-Json -Depth 6)
-  $env:MOCK_CLAUDE_VERSION = '2.1.999'
+  Assert-True ($autoSettings.permissions.defaultMode -eq 'auto' -and $autoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a haiku IC under auto runs defaultMode auto'
+  Assert-True ($rda.allowRules -eq 0 -and -not $autoSettings.permissions.PSObject.Properties['allow']) 'a haiku IC under auto carries no allow list'
+  Assert-True (-not $autoSettings.PSObject.Properties['apiKeyHelper'] -and -not $autoSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'a haiku IC keeps the Anthropic API'
+  # Fleet #350: the manifest's effort is the IC's --effort; a value other than xhigh or max is refused.
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"permissions":"auto"', '"permissions":"auto","effort":"max"'))
+  $rme = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($rme.dryRun -eq $true -and $rme.effort -eq 'max' -and "$($rme.command)" -match '--effort max ') "the manifest effort max is passed as --effort (got: $rme)"
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"effort":"max"', '"effort":"high"'))
+  $rhi = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and "$($rhi.reason)" -match 'xhigh or max') "a manifest effort of high is refused (got: $rhi)"
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"effort":"high"', '"effort":"xhigh"'))
+  # The rollback profile: a haiku manifest under allowlist still needs the recorded version, and the
+  # allowlist settings are the ones written above. A rehearsal root stands aside that gate, as before.
+  $rehearsal2 = Get-Content "$testRoot\config\permissions-allowlist.json" -Raw | ConvertFrom-Json
+  $rehearsal2 | Add-Member -NotePropertyName rehearsalRoot -NotePropertyValue $true -Force
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" ($rehearsal2 | ConvertTo-Json -Depth 6)
+  Write-Utf8 $manifestPath ((Get-Content $manifestPath -Raw).Replace('"permissions":"auto"', '"permissions":"allowlist"'))
   $rdr = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
-  Assert-True ($rdr.dryRun -eq $true -and $rdr.permissions -eq 'auto') "a rehearsal root launches deepseek under auto on a mismatched CLI (got: $rdr)"
+  Assert-True ($rdr.dryRun -eq $true -and $rdr.permissions -eq 'allowlist') "a rehearsal root launches the allowlist rollback on a mismatched CLI (got: $rdr)"
   [IO.File]::Copy("$sourceRoot\config\permissions-allowlist.json", "$testRoot\config\permissions-allowlist.json", $true)
-  Assert-True (-not $sonnetSettings.PSObject.Properties['apiKeyHelper'] -and -not $sonnetSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'a sonnet IC keeps the Anthropic API'
-  [IO.File]::Copy("$sourceRoot\config\deepseek.json", "$testRoot\config\deepseek.json", $true)
   Remove-Item Env:MOCK_CLAUDE_VERSION -ErrorAction SilentlyContinue
   Remove-Item $manifestPath
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{}}'
@@ -359,7 +337,7 @@ exit $LASTEXITCODE
   $rpl = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
   Assert-True ("$($rpl.command)" -match '--model claude-sonnet-5-5 ') 'a project lead with no -Model must run the pinned Sonnet 5.5 id (owner ruling 2026-10-26)'
   $rplo = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'sonnet', '-DryRun')
-  Assert-True ("$($rplo.command)" -match '--model sonnet\b') 'an explicit -Model must still override the project lead default, and the IC sonnet pin stays the IC''s'
+  Assert-True ("$($rplo.command)" -match '--model sonnet\b') 'an explicit -Model must still override the project lead default (ICs take no sonnet: fleet #350)'
   Run-Launch @('-Role', 'principal', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
   Assert-True ($script:lastExit -eq 4) 'a principal not named pe-<tenant> must be refused as a usage error'
   Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
