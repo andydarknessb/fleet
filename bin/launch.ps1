@@ -383,7 +383,7 @@ if ($toolContractOn) {
     if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
   }
   # The Principal (ADR 0011) and the Arbiter (ADR 0017) are NOT on this list: settings deny rules cannot express an
-  # allowlist, so its write boundary (docs/adr/*.md and CONTEXT.md in the tenant repo,
+  # allowlist, so its write boundary (docs/adr/*.md and its glossary, CONTEXT.md or GLOSSARY.md, in the tenant repo,
   # its status file, the triage ledger, its memory; the Arbiter's bounds mirror it) is enforced by hooks/principal-guard.ps1
   # (fleet #39), registered in fleet-settings.json for every fleet session.
   if ($Role -in @('project-lead', 'sentinel', 'arbiter')) {

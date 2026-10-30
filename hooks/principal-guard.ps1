@@ -3,7 +3,7 @@
 #
 #   1. role principal (main session AND its sub-agents; a worker it spawns is still it):
 #      - Edit/Write/NotebookEdit/MultiEdit only under: the tenant repo's docs/adr/ and
-#        CONTEXT.md (also inside .claude/worktrees/<x>/ for a docs PR), the fleet's
+#        CONTEXT.md or GLOSSARY.md (also inside .claude/worktrees/<x>/ for a docs PR), the fleet's
 #        docs/adr/ and CONTEXT.md, its own status file state/status/pe-<tenant>.md,
 #        the user's ~/.claude (memory, plans) and the temp directory. The triage
 #        ledger is NOT writable here: it is written only through node bin/triage.js,
@@ -724,6 +724,7 @@ if (-not $reason -and $role -eq 'principal') {
   if ($repoN) {
     $insideRules += "^$(Escape-Rx $repoN)/(\.claude/worktrees/[^/]+/)?docs/adr/[^/]+\.md$"
     $insideRules += "^$(Escape-Rx $repoN)/(\.claude/worktrees/[^/]+/)?context\.md$"
+    $insideRules += "^$(Escape-Rx $repoN)/(\.claude/worktrees/[^/]+/)?glossary\.md$"
   }
   $insideRules += "^$(Escape-Rx $homeN)/docs/adr/[^/]+\.md$"
   $insideRules += "^$(Escape-Rx $homeN)/context\.md$"
@@ -742,7 +743,7 @@ if (-not $reason -and $role -eq 'principal') {
     $allowed = if ($inside) { $insideRules } else { $outsideRules }
     foreach ($rx in $allowed) { if ($ok) { break }; if ($targetN -match $rx) { $ok = $true; break } }
     if (-not $ok) {
-      $reason = "the Principal writes only ADR and glossary proposals (docs/adr/*.md, CONTEXT.md in the tenant repo or the fleet), its own status file (state/status/pe-<tenant>.md) and its own memory (the triage ledger is written through bin/triage.js only); '$target' is none of those. Product code is an IC's: put the change in the proposal's Scope and Red-tell for the IC $cite"
+      $reason = "the Principal writes only ADR and glossary proposals (docs/adr/*.md, CONTEXT.md or GLOSSARY.md in the tenant repo, CONTEXT.md in the fleet), its own status file (state/status/pe-<tenant>.md) and its own memory (the triage ledger is written through bin/triage.js only); '$target' is none of those. Product code is an IC's: put the change in the proposal's Scope and Red-tell for the IC $cite"
     }
   } elseif ($tool -in @('Bash', 'PowerShell')) {
     $cmd = "$($inp.tool_input.command)"
