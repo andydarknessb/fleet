@@ -56,7 +56,7 @@ try {
   foreach ($f in '_common.ps1','launch.ps1','identity.js','recover.ps1','cutover-assignment.ps1','assignment.js','premises.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body for ic."
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -161,7 +161,7 @@ try {
   # and the manifest carries the tenant's checks and CI gates as pointers.
   $fixture = "$testRoot\issues.json"
   Write-Utf8 $fixture '[{"number":101,"title":"Fixture issue","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
-  $r8 = Run-Node @("$testRoot\bin\assignment.js", 'assign', '--root', $testRoot, '--tenant', 'test', '--tenant-config', "$testRoot\tenants\test.json", '--fixture', $fixture, '--base-sha', ('a' * 40), '--parent', 'pl-test', '--model', 'sonnet', '--adr-paths', 'docs/adr/0002-one-launch-door.md')
+  $r8 = Run-Node @("$testRoot\bin\assignment.js", 'assign', '--root', $testRoot, '--tenant', 'test', '--tenant-config', "$testRoot\tenants\test.json", '--fixture', $fixture, '--base-sha', ('a' * 40), '--parent', 'pl-test', '--model', 'haiku', '--adr-paths', 'docs/adr/0002-one-launch-door.md')
   Assert-True ($lastExit -eq 0 -and $r8.manifestPath) "assign must reserve a manifest: $lastOut"
   $manifest = (Get-Content $r8.manifestPath -Raw) | ConvertFrom-Json
   Assert-True ($manifest.status -eq 'pending-ack' -and $manifest.workRecordId -eq 'test:issue-101') 'the manifest must be pending acknowledgment for its Work record'

@@ -69,7 +69,7 @@ function standingSuspensions(root) {
 //
 // proposalGate is #207's clauses 1 and 4 to 9, one function: open proposal, proposal identity,
 // not edited, body hash and \`## Premises\` heading, not an escalation ruling (fail closed),
-// whole-field Classification/Open for Cory/Blocked_by/Tier, a Ruling field, labels, holds.
+// whole-field Classification/Open for Cory/Blocked_by, a Ruling field, labels, holds.
 // The bounded-only clauses, each a whole field (trimmed, one trailing full stop allowed):
 //   Classification exactly bug; Ruling exactly \`none needed\`; a Red-tell and a Repro that are
 //   not placeholders (the mechanical proxy for "reproducible"; the Principal's judgement is
@@ -302,8 +302,6 @@ function centralClock(ms) {
   return `${assignment.chicagoDay(ms)} ${String(p.hour).padStart(2, '0')}:${String(p.minute).padStart(2, '0')} Central`;
 }
 
-function tierWord(value) { return String(value || '').split('\n')[0].trim().split(/\s+/)[0].toLowerCase(); }
-
 // Order (rulings m2, m3): page, then the ledger row, then the label. A page that fails records
 // nothing and the next tick retries (a ready Cory was never told of is no Veto window at all).
 // The row must exist before the label, since the planner reads it to hold the ticket. A label
@@ -359,7 +357,7 @@ function boundedReady({ root, tenant, issue: issueValue, tenantConfigPath, fixtu
   const proposalHash = assignment.sha256(failures.proposalComment.body);
   const paths = failures.scopeFiles;
   const result = { tenant, issue: number, readied: true, at, windowUntil: window.until, windowRule: window.rule, source: fixture ? 'fixture' : 'github', labelApplied: false, paged: false };
-  const detail = { scope: paths, tier: tierWord(failures.proposal.fields.Tier), proposalHash };
+  const detail = { scope: paths, proposalHash };
   // With effects off (a fixture run) NOTHING is recorded: a row written by a rehearsal is a row a live run could act on (QA B-1). The entry it would have written is returned.
   if (!effects) return { ...result, recorded: false, entry: { schemaVersion: 1, kind: 'bounded-ready', tenant, at, actor: 'principal', issue: number, bodyHash: found.bodyHash, commentUrl: open.commentUrl, ...detail, paged: false } };
   const page = {

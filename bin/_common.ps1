@@ -271,22 +271,18 @@ function Test-PermissionPromptNeeds { param([string]$Needs) return ("$Needs" -cm
 # and the arbiter's default (ADR 0017), 'sonnet-5.5' the project-lead default (owner
 # ruling 2026-10-26; Opus 5.5 from 2026-09-23 until then); a principal, arbiter or lead
 # with no -Model gets its pin.
-# An IC's sonnet pins Sonnet 5.5 (owner ruling 2026-09-28), with no -Model too; the pin
-# is the IC's alone, so an explicit -Model sonnet on another role keeps the CLI alias.
-# An IC's deepseek pins DeepSeek V4.1 Flash (owner ruling 2026-10-26): the id DeepSeek's
-# Anthropic-format API serves it under, reached through config/deepseek.json's baseUrl.
+# Every IC runs Claude Haiku 5.5, pinned (owner ruling 2026-10-30, fleet #350), with or without
+# -Model: launch.ps1 refuses any other IC model before it gets here. The sonnet pin that
+# covered ICs before #350 went with the sonnet IC tier; sonnet-5.5 stays the project lead's.
 $script:LaunchModelPins = @{ opus = 'claude-opus-4-8'; fable = 'claude-fable-5-1'; 'opus-5.5' = 'claude-opus-5-5'; 'sonnet-5.5' = 'claude-sonnet-5-5' }
-$script:IcSonnetPin = 'claude-sonnet-5-5'
-$script:IcDeepseekPin = 'deepseek-flash'
+$script:IcHaikuPin = 'claude-haiku-5-5'
 function Resolve-LaunchModel {
   param([string]$Role, [string]$Model)
+  if ($Role -eq 'ic') { return [pscustomobject]@{ token = 'haiku'; id = $script:IcHaikuPin } }
   if (-not $Model -and $Role -eq 'principal') { $Model = 'opus-5.5' }
   if (-not $Model -and $Role -eq 'arbiter') { $Model = 'opus-5.5' }
   if (-not $Model -and $Role -eq 'project-lead') { $Model = 'sonnet-5.5' }
-  if (-not $Model -and $Role -eq 'ic') { $Model = 'sonnet' }
   $id = if (-not $Model) { '' } elseif ($script:LaunchModelPins.ContainsKey($Model)) { $script:LaunchModelPins[$Model] } else { $Model }
-  if ($Role -eq 'ic' -and $Model -eq 'sonnet') { $id = $script:IcSonnetPin }
-  if ($Role -eq 'ic' -and $Model -eq 'deepseek') { $id = $script:IcDeepseekPin }
   return [pscustomobject]@{ token = "$Model"; id = "$id" }
 }
 function Get-RoleEffort {
