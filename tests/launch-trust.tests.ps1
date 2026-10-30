@@ -1,6 +1,6 @@
 # fleet #104: Claude Code 2.1.281 refuses `claude --bg` in an untrusted workspace and
 # creates no session. launch.ps1 now checks ~/.claude.json trust (inherited from an
-# ancestor, either slash, any case) before the assignment worktree and branch exist,
+# ancestor, either slash, exact case: fleet #356) before the assignment worktree and branch exist,
 # deletes both when a launch produces no session, and puts the CLI's own output into the
 # invalidation reason. Uses a real git repo for the tenant, manifests reserved through the
 # real assignment.js, a mock `gh` for the issue read and a mock `claude` whose --bg either
@@ -106,9 +106,19 @@ try {
   $r2 = Run-Launch @('-Manifest', $m, '-WorkRecordId', 'test:issue-7')
   Assert-True ($lastExit -eq 7 -and "$($r2.reason)" -match 'not trusted' -and $r2.reservationReleased -eq $true) "trust elsewhere must not admit the tenant: $lastOut"
 
-  # Case 3: trusted through an ancestor written with backslashes in another case; the CLI
-  # then refuses (no session): exit 5, worktree AND branch gone, CLI text in the reason.
+  # Case 2b (fleet #356): a trusted key that differs only in case does not admit the tenant,
+  # because --bg matches exactly. The refusal names the exact-case key to copy.
   Set-Trust @{ ($testRoot.ToUpperInvariant()) = @{ hasTrustDialogAccepted = $true } }
+  $m = Reserve-Manifest 12 $baseSha; $branch12 = (Get-Manifest $m).branch
+  $r2b = Run-Launch @('-Manifest', $m, '-WorkRecordId', 'test:issue-12')
+  $exactKey = $repoPath.Replace('\', '/')
+  Assert-True ($lastExit -eq 7 -and "$($r2b.reason)" -match 'not trusted' -and "$($r2b.reason)".Contains($exactKey) -and $r2b.reservationReleased -eq $true) "a case-variant trusted key must not admit the tenant (fleet #356): $lastOut"
+  Assert-True (-not (Test-Path "$repoPath\.claude\worktrees\ic-12-assignment")) 'a case-variant refusal must create no worktree'
+  Assert-True (-not (Test-Branch $branch12)) 'a case-variant refusal must create no branch'
+
+  # Case 3: trusted through an exact-case ancestor written with backslashes; the CLI then
+  # refuses (no session): exit 5, worktree AND branch gone, CLI text in the reason.
+  Set-Trust @{ ($testRoot) = @{ hasTrustDialogAccepted = $true } }
   $m = Reserve-Manifest 7 $baseSha
   $r3 = Run-Launch @('-Manifest', $m, '-WorkRecordId', 'test:issue-7')
   Assert-True ($lastExit -eq 5 -and $r3.launched -eq $false -and "$($r3.reason)" -match 'did not produce a session') "a trusted tenant must reach the CLI and report its no-session failure: $lastOut"
@@ -164,6 +174,22 @@ try {
   Assert-True ($t7 -eq 'True') "case-duplicate keys in ~/.claude.json must not hide a trusted ancestor: $t7"
   $t7b = (& $check 'D:\not\trusted').Trim()
   Assert-True ($t7b -eq 'False') "an untrusted path stays untrusted when the file has case-duplicate keys: $t7b"
+  # fleet #356: the drive letter is part of the key, so the same path with a lower-case drive is not trusted.
+  Assert-True ($lowerDrive -cne $upperDrive) 'fixture: the temp path needs a drive letter for the drive-case check'
+  $t7c = (& $check "$lowerDrive/repo/.claude/worktrees/ic-11-assignment").Trim()
+  Assert-True ($t7c -eq 'False') "a lower-case drive letter is a different key and must stay untrusted (fleet #356): $t7c"
+
+  # Case 8 (fleet #356): the watchdog's launch reason keeps the CLI's own refusal text (the
+  # exit-5 `output`) on one line, capped at 300 characters plus '...'.
+  . "$testRoot\bin\_common.ps1"
+  $launchedText = Format-LaunchReason ([pscustomobject]@{ launched = $true; reason = $null })
+  Assert-True ($launchedText -eq 'launched') "a launched result must read 'launched': $launchedText"
+  $plainText = Format-LaunchReason ([pscustomobject]@{ launched = $false; reason = 'workspace not trusted: x' })
+  Assert-True ($plainText -eq 'workspace not trusted: x') "a reason with no output must pass through: $plainText"
+  $outputText = Format-LaunchReason ([pscustomobject]@{ launched = $false; reason = "claude --bg did not produce a session named 'pl-x'"; output = "Workspace not trusted.`nRun claude there once." })
+  Assert-True ($outputText -eq "claude --bg did not produce a session named 'pl-x': Workspace not trusted. Run claude there once.") "the CLI output must follow the reason on one line: $outputText"
+  $longText = Format-LaunchReason ([pscustomobject]@{ launched = $false; reason = 'r'; output = ('a' * 1000) })
+  Assert-True ($longText.Length -eq 303 -and $longText.EndsWith('...')) "a long reason must be capped at 300 characters plus '...': $($longText.Length)"
 
   Write-Output 'launch trust tests passed'
 } finally {

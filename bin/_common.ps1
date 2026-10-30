@@ -347,7 +347,9 @@ function Get-BusyStanding {
 # and inherits from a trusted ancestor (verified 2026-09-23: a fresh subdirectory of the
 # trusted C: repo launched, the untrusted E: repo root did not, and three #1579 launches
 # into a fresh worktree under it produced no session). Paths compare with either slash
-# and without case; a missing or unreadable config is untrusted (fail closed).
+# and in exact case, drive letter included (fleet #356: the CLI keeps `C:/x` and `c:/x` as
+# separate keys, and `--bg` matches case-sensitively); a missing or unreadable config is
+# untrusted (fail closed).
 function Test-WorkspaceTrusted {
   param([string]$Path)
   # Node, not ConvertFrom-Json: the CLI writes project keys that differ only in case
@@ -362,7 +364,7 @@ function Test-WorkspaceTrusted {
   $trusted = @($lines | Where-Object { $_ } | ForEach-Object { ("$_" -replace '\\', '/').TrimEnd('/') })
   $probe = ("$Path" -replace '\\', '/').TrimEnd('/')
   while ($probe) {
-    foreach ($tp in $trusted) { if ([string]::Equals($tp, $probe, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    foreach ($tp in $trusted) { if ([string]::Equals($tp, $probe, [StringComparison]::Ordinal)) { return $true } }
     $idx = $probe.LastIndexOf('/')
     if ($idx -le 0) { break }
     $probe = $probe.Substring(0, $idx)
@@ -614,6 +616,16 @@ function Invoke-ClaudeCli {
 function ConvertFrom-LastJsonLine {
   param($Text)
   try { return ("$Text".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $null }
+}
+# fleet #356: the exit-5 JSON's `output` holds the CLI's own refusal text, so the reason keeps it.
+function Format-LaunchReason {
+  param($Parsed, [int]$Max = 300)
+  if ($Parsed.launched) { return 'launched' }
+  $text = "$($Parsed.reason)"
+  if ($Parsed.PSObject.Properties['output'] -and "$($Parsed.output)".Trim()) { $text = "$($text): $($Parsed.output)" }
+  $s = ($text -replace '\s+', ' ').Trim()
+  if ($s.Length -gt $Max) { $s = $s.Substring(0, $Max) + '...' }
+  return $s
 }
 function Write-Escalation {
   # -Name / -Parent (ticket 08b) name the session the escalation is about and who owns

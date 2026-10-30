@@ -551,7 +551,8 @@ if ($DryRun) {
 # tenant repo's trust, so the repo path is what has to be trusted.
 # state/flags/launch-trust-check-off is the rollback if a later CLI changes the rule.
 if (-not (Test-Path "$FleetHome\state\flags\launch-trust-check-off") -and -not (Test-WorkspaceTrusted $cwd)) {
-  $trustReason = "workspace not trusted: Claude Code 2.1.281+ refuses ``claude --bg`` in '$cwd' until its trust prompt is accepted; run ``claude`` there once as Cory, accept the prompt, and relaunch (state/flags/launch-trust-check-off skips this check)"
+  $trustKey = "$cwd".Replace('\', '/')
+  $trustReason = "workspace not trusted: Claude Code 2.1.281+ refuses ``claude --bg`` in '$cwd' unless ~/.claude.json has a trusted projects key spelled exactly '$trustKey' (or an exact-case ancestor); interactive ``claude`` accepts a key that differs only in case without prompting, so if one exists, copy that entry to the exact-case key; otherwise run ``claude`` there once as Cory, accept the prompt, and relaunch (state/flags/launch-trust-check-off skips this check)"
   $released = $false
   if ($Manifest) { try { Invalidate-Manifest "launch refused: $trustReason"; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $trustReason; cwd = $cwd; reservationReleased = $released } | ConvertTo-Json -Compress); exit 7

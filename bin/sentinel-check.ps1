@@ -462,7 +462,7 @@ function Do-Relaunch {
     Add-RespawnStreakAttempt "$($entry.name)" "$($row.id)" "$($launch.jobId)" $reason -Down:(-not $row.pid)
     $script:report.respawned +=[pscustomobject]@{ name = $row.name; jobId = "$($launch.jobId)"; previousJobId = $row.id; parent = $entry.parent; reason = $reason; via = 'launch' }
   } else {
-    $why = if ($launch -and $launch.reason) { "$($launch.reason)" } else { Get-OneLineText $out }
+    $why = if ($launch -and $launch.reason) { Format-LaunchReason $launch } else { Get-OneLineText $out }   # fleet #356: keeps the CLI's exit-5 output
     $script:report.respawnFailed += [pscustomobject]@{ name = $row.name; jobId = $row.id; parent = $entry.parent; reason = "relaunch through launch.ps1 -FromRoster failed ($why): $reason"; via = 'launch' }
   }
 }
