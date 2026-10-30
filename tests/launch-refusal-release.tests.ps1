@@ -306,6 +306,19 @@ try {
   [void](Run-Launch @('-Manifest', $m30, '-WorkRecordId', 'test:issue-30'))
   Assert-True ((Get-BgCalls) -eq 1) "control: an untouched reservation still reaches claude --bg: $lastOut"
 
+  # Fleet #350 (ruling 12): a manifest naming the retired deepseek tier is refused at the door and its
+  # reservation released. The -Model ValidateSet has no deepseek, so the manifest's model must not go through it.
+  Clear-ActiveRecords
+  $m35 = Reserve-Manifest 35 $baseSha
+  $doc35 = (Get-Content $m35 -Raw) | ConvertFrom-Json
+  $doc35.model = 'deepseek'
+  Write-Utf8 $m35 ($doc35 | ConvertTo-Json -Depth 20)
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $r35 = Run-Launch @('-Manifest', $m35, '-WorkRecordId', 'test:issue-35')
+  Assert-True ($lastExit -eq 3 -and $r35 -and $r35.launched -eq $false -and "$($r35.reason)" -match "'deepseek' is refused" -and $r35.reservationReleased -eq $true) "a deepseek manifest is refused at the door with its reservation released: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 35) -ne 'assigned' -and (Get-Marker $m35) -and "$((Get-Marker $m35).reason)" -match "'deepseek' is refused") 'the deepseek refusal leaves no assigned record and writes the invalidation marker with its reason'
+  Assert-True ((Get-BgCalls) -eq 0) 'a deepseek manifest never reaches claude --bg'
+
   Write-Output 'launch refusal release tests passed'
 } finally {
   $env:PATH = $oldPath

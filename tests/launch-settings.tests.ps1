@@ -338,6 +338,10 @@ exit $LASTEXITCODE
   Assert-True ("$($rpl.command)" -match '--model claude-sonnet-5-5 ') 'a project lead with no -Model must run the pinned Sonnet 5.5 id (owner ruling 2026-10-26)'
   $rplo = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'sonnet', '-DryRun')
   Assert-True ("$($rplo.command)" -match '--model sonnet\b') 'an explicit -Model must still override the project lead default (ICs take no sonnet: fleet #350)'
+  # Fleet #350 (ruling 13): haiku is the IC's model alone. A control-plane role runs its role file's model,
+  # so -Model haiku on one is refused at the door, dry runs included.
+  $rplh = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'haiku', '-DryRun')
+  Assert-True ($script:lastExit -eq 3 -and $rplh.launched -eq $false -and "$($rplh.reason)" -match 'haiku is the IC model') "a project lead on -Model haiku must be refused (got: $rplh)"
   Run-Launch @('-Role', 'principal', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null
   Assert-True ($script:lastExit -eq 4) 'a principal not named pe-<tenant> must be refused as a usage error'
   Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Parent', 'dispatcher', '-Prompt', 'x', '-DryRun') | Out-Null

@@ -21,7 +21,7 @@ param(
                     # -Prompt (read from that same roster row): recovery restarts the crashed
                     # process with its own history, it does not re-run manifest preconditions or
                     # create a new worktree, so a validated -Recover does not set -Manifest here
-                    # either - it only lifts the no-manifest IC refusal below. A -Recover for any
+                    # either - it lifts the no-manifest IC refusal below and takes the IC's effort from its roster row. A -Recover for any
                     # other name (or one with no manifest on its row) gets no exemption at all
                     # (QA fix, fleet #89: it used to accept any name unconditionally). Cap, PAUSE
                     # and maxIcs still apply regardless.
@@ -75,7 +75,7 @@ if ($Manifest) {
   $Tenant = $assignment.tenant
   $Parent = $assignment.parent
   $Issue = [int]$assignment.issue.number
-  $Model = [string]$assignment.model
+  $manifestModel = [string]$assignment.model # a plain local: -Model's ValidateSet has no retired tier and would throw here (fleet #350, ruling 12)
   # A manifest written before spec #94 has no `permissions`; it launches auto as it always did.
   $Permissions = [string]$assignment.permissions
   # A slash command at the head of a launch prompt is a user invocation in the new
@@ -171,15 +171,26 @@ if ($Manifest) {
 if (-not $Permissions) { $Permissions = 'auto' }
 $icReason = $null
 if ($Role -eq 'ic') {
-  if (-not $Model) { $Model = 'haiku' }
-  if ($Model -ne 'haiku') { $icReason = "an IC runs Claude Haiku 5.5 only (fleet #350); '$Model' is refused" }
-  $icEffort = if ($Manifest -and "$($assignment.effort)") { "$($assignment.effort)" } else { Get-RoleEffort $Role }
+  # The manifest's model (empty means haiku) or -Model. $Model becomes haiku only once this passes.
+  $icModel = if ($Manifest) { $manifestModel } else { $Model }
+  if (-not $icModel) { $icModel = 'haiku' }
+  if ($icModel -ne 'haiku') { $icReason = "an IC runs Claude Haiku 5.5 only (fleet #350); '$icModel' is refused" }
+  # A validated -Recover takes the effort its live roster row recorded, so a max IC comes back at max (ruling 14).
+  $icEffort = if ($Manifest -and "$($assignment.effort)") { "$($assignment.effort)" } elseif ($recoverValidated -and "$($recoverableRow.effort)") { "$($recoverableRow.effort)" } else { Get-RoleEffort $Role }
   if (-not $icReason -and $icEffort -notin @('xhigh', 'max')) { $icReason = "an IC runs at effort xhigh or max (fleet #350), not '$icEffort': the manifest's effort, or the role file's when the manifest names none, must be xhigh or max" }
+  if (-not $icReason) { $Model = 'haiku' }
 }
 if ($icReason) {
   $released = $false
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $icReason; $released = $true } catch {} }
-  Write-Output (@{ launched = $false; reason = $icReason; model = $Model; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+  Write-Output (@{ launched = $false; reason = $icReason; model = $icModel; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+}
+# Fleet #350 (ruling 13): haiku is the IC's model alone. A control-plane role runs its role file's model,
+# so -Model haiku on one is refused here, releasing its reservation like the other pre-launch refusals.
+if ($Role -ne 'ic' -and $Model -eq 'haiku') {
+  $roleModelReason = "haiku is the IC model (fleet #350); a $Role runs its role file's model, so -Model haiku is refused"
+  $r = Release-ReservationOnRefusal $roleModelReason
+  Write-Output (@{ launched = $false; reason = $roleModelReason; model = $Model; permissions = $Permissions; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
 }
 # The allowlist profile is the haiku IC's rollback and nothing else: a control-plane role never
 # trades its classifier for a fixed list (ADR 0016, amended by fleet #350).

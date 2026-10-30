@@ -211,7 +211,7 @@ Decided:
   code, config, tests, the canary and docs. Opus never.
 - The lead picks effort, not a model. `assignment.js assign --effort xhigh|max`:
   `xhigh` is the default and the code fallback, and `max` is for a ticket the
-  lead judges too hard for xhigh. `--model` is gone. No other effort is given
+  lead judges too hard for xhigh. `--model` other than `haiku` is refused. No other effort is given
   to an IC.
 - A ticket a max IC cannot finish goes up the existing escalation path
   (`fleet-escalation`, the lead, then Cory). It never goes to a bigger model.

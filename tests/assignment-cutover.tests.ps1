@@ -145,9 +145,11 @@ try {
   # that archived roster row, never -Manifest; it restarts the crashed process with its own
   # history, it does not re-run manifest preconditions or create a new worktree. The row's
   # `manifest` field is the credential checked, not something re-launched from.
-  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-101","role":"ic","tenant":"test","parent":"pl-test","issue":101,"status":"active","manifest":"state/manifests/assignment-101.json","workRecordId":"test:issue-101"}]}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-101","role":"ic","tenant":"test","parent":"pl-test","issue":101,"status":"active","manifest":"state/manifests/assignment-101.json","workRecordId":"test:issue-101","effort":"max"}]}'
   $r7e = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover', '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r7e.dryRun -eq $true -and $r7e.name -eq 'ic-101') "a genuine -Recover relaunch must pass the no-manifest guard: $lastOut"
+  # Fleet #350 (ruling 14): a -Recover relaunch keeps the effort its roster row recorded (max), not the role file's.
+  Assert-True ($r7e.effort -eq 'max') "a -Recover relaunch keeps the effort its live roster row records: $lastOut"
   Assert-True ($r7e.prompt -eq 'legacy') "-Recover must relaunch with the roster's own original -Prompt, unchanged, not a manifest-derived one: $lastOut"
   Assert-True ((Get-Content "$testRoot\bin\recover.ps1" -Raw) -match '-Prompt \$e\.prompt -Recover') 'recover.ps1 must pass -Recover when it relaunches an IC'
   # -Recover exempts ONLY this guard: PAUSE still stops it, even for a genuine recovery.
