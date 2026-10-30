@@ -28,7 +28,7 @@ try {
   }
   foreach ($file in '_common.ps1','launch.ps1','identity.js','work-state.js') { [IO.File]::Copy("$sourceRoot\bin\$file", "$testRoot\bin\$file") }
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body."
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body."
   Write-Utf8 "$testRoot\fleet-settings.json" '{}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -57,7 +57,7 @@ exit /b %errorlevel%
       schemaVersion = 1; status = 'pending-ack'; id = "assignment-test-$Issue"; workRecordId = "test:issue-$Issue"; workRecordRevision = 1
       issue = [ordered]@{ number = $Issue; bodyHash = (Criteria-Hash $body @()); criteriaHash = (Criteria-Hash $body $comments); commentCount = 1 }
       base = [ordered]@{ remote = 'origin'; ref = 'integration'; sha = ('a' * 40) }
-      branch = "fleet/$Issue-test"; tenant = 'test'; parent = 'pl-test'; model = 'sonnet'
+      branch = "fleet/$Issue-test"; tenant = 'test'; parent = 'pl-test'; model = 'haiku'
     }
     Write-Utf8 $script:manifestPath ($manifest | ConvertTo-Json -Depth 8)
     $null = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id "test:issue-$Issue" --tenant test --issue $Issue --manifest $script:manifestPath --idempotency-key "reserve-$Issue"

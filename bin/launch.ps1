@@ -9,8 +9,8 @@ param(
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
   [ValidateSet('', 'auto', 'allowlist')]
   [string]$Permissions, # the permission profile (ADR 0016); an assignment manifest's own `permissions` wins. Empty = auto.
-  [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5', 'sonnet-5.5', 'deepseek')]
-  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5, 'sonnet-5.5' to Sonnet 5.5 (the project-lead default), 'deepseek' (ICs only) to DeepSeek V4.1 Flash, see $modelArgs below
+  [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5', 'sonnet-5.5')]
+  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5, 'sonnet-5.5' to Sonnet 5.5 (the project-lead default); an IC runs 'haiku' only (fleet #350), see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
   [switch]$Recover, # bin\recover.ps1's reboot-recovery relaunch of an IC ONLY: honoured only when
                     # the live roster already holds a row of that exact -Name, role ic, status
@@ -21,7 +21,7 @@ param(
                     # -Prompt (read from that same roster row): recovery restarts the crashed
                     # process with its own history, it does not re-run manifest preconditions or
                     # create a new worktree, so a validated -Recover does not set -Manifest here
-                    # either - it only lifts the no-manifest IC refusal below. A -Recover for any
+                    # either - it lifts the no-manifest IC refusal below and takes the IC's effort from its roster row. A -Recover for any
                     # other name (or one with no manifest on its row) gets no exemption at all
                     # (QA fix, fleet #89: it used to accept any name unconditionally). Cap, PAUSE
                     # and maxIcs still apply regardless.
@@ -75,7 +75,7 @@ if ($Manifest) {
   $Tenant = $assignment.tenant
   $Parent = $assignment.parent
   $Issue = [int]$assignment.issue.number
-  $Model = [string]$assignment.model
+  $manifestModel = [string]$assignment.model # a plain local: -Model's ValidateSet has no retired tier and would throw here (fleet #350, ruling 12)
   # A manifest written before spec #94 has no `permissions`; it launches auto as it always did.
   $Permissions = [string]$assignment.permissions
   # A slash command at the head of a launch prompt is a user invocation in the new
@@ -163,83 +163,63 @@ if ($Manifest) {
   }
 }
 
-# Fleet #28 (2026-09-11): the installed Claude Code CLI keeps a per-model auto-mode
-# list and claude-haiku-4-5 is not on it (verified on 2.1.267, both 2.1.268 builds and
-# 2.1.282; an explicit --permission-mode auto is downgraded the same way). A haiku --bg
-# session under auto therefore runs in permission-mode default and blocks on its first
-# out-of-cwd Read with nobody to approve it. Spec #94 (#162, ADR 0016): the permission
-# mode is a launch-door profile per model, so haiku launches only under the allowlist
-# profile (acceptEdits plus config/permissions-allowlist.json, applied below) and haiku
-# under auto is still refused here, even under -Force (the CLI cannot be forced) and even
-# for a dry run, so a rehearsal reports the truth. assignment.js refuses the same pair at
-# reservation time.
-# Owner ruling 2026-10-27 (fleet #332): deepseek is not refused under auto. Amendment 4's
-# premise, that the CLI's auto mode covers Claude models only, was wrong (probes on 2.1.312),
-# so a deepseek IC runs auto by default and allowlist stays as the rollback.
+# Owner ruling 2026-10-30 (fleet #350): every IC runs Claude Haiku 5.5 (claude-haiku-5-5), and
+# the lead picks its effort per ticket: the manifest's effort, xhigh by default or max, else the
+# role file's. Anything else is refused here, dry runs included, before any gate or write.
+# The permission profile is a launch-door choice (ADR 0016): an IC runs the auto profile unless
+# the manifest pins allowlist, the rollback. A release goes through Invalidate-Manifest.
 if (-not $Permissions) { $Permissions = 'auto' }
-# Deepseek is an IC tier only (owner ruling 2026-10-26, ADR 0017): no other role talks to DeepSeek's API.
-if ($Model -eq 'deepseek' -and $Role -ne 'ic') {
-  $nonIcReason = "deepseek is an IC tier only (owner ruling 2026-10-26, ADR 0017); a $Role runs a Claude model"
-  $released = $false
-  if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $nonIcReason; $released = $true } catch {} }
-  Write-Output (@{ launched = $false; reason = $nonIcReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+$icReason = $null
+if ($Role -eq 'ic') {
+  # The manifest's model (empty means haiku) or -Model. $Model becomes haiku only once this passes.
+  $icModel = if ($Manifest) { $manifestModel } else { $Model }
+  if (-not $icModel) { $icModel = 'haiku' }
+  if ($icModel -ne 'haiku') { $icReason = "an IC runs Claude Haiku 5.5 only (fleet #350); '$icModel' is refused" }
+  # A validated -Recover takes the effort its live roster row recorded, so a max IC comes back at max (ruling 14).
+  $icEffort = if ($Manifest -and "$($assignment.effort)") { "$($assignment.effort)" } elseif ($recoverValidated -and "$($recoverableRow.effort)") { "$($recoverableRow.effort)" } else { Get-RoleEffort $Role }
+  if (-not $icReason -and $icEffort -notin @('xhigh', 'max')) { $icReason = "an IC runs at effort xhigh or max (fleet #350), not '$icEffort': the manifest's effort, or the role file's when the manifest names none, must be xhigh or max" }
+  if (-not $icReason) { $Model = 'haiku' }
 }
-if ($Model -eq 'haiku' -and $Permissions -ne 'allowlist') {
-  $noAutoReason = "the installed Claude Code CLI ($(try { "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch { 'version unknown' })) has no auto mode for claude-haiku-4-5 (fleet #28): a haiku --bg session runs in permission-mode default and blocks on its first out-of-cwd Read; launch it on sonnet"
+if ($icReason) {
   $released = $false
-  if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $noAutoReason; $released = $true } catch {} }
-  Write-Output (@{ launched = $false; reason = $noAutoReason; model = $Model; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
+  if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $icReason; $released = $true } catch {} }
+  Write-Output (@{ launched = $false; reason = $icReason; model = $icModel; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
 }
-# The allowlist profile is the haiku IC profile and the deepseek rollback, nothing else: sonnet keeps
-# auto, and a control-plane role never trades its classifier for a fixed list.
-if ($Permissions -eq 'allowlist' -and ($Role -ne 'ic' -or $Model -notin @('haiku', 'deepseek'))) {
-  $profileReason = "the allowlist permission profile is the haiku and deepseek IC profile (ADR 0016); a $Role on '$(if ($Model) { $Model } else { 'its role model' })' runs the auto profile"
+# Fleet #350 (ruling 13): haiku is the IC's model alone. A control-plane role runs its role file's model,
+# so -Model haiku on one is refused here, releasing its reservation like the other pre-launch refusals.
+if ($Role -ne 'ic' -and $Model -eq 'haiku') {
+  $roleModelReason = "haiku is the IC model (fleet #350); a $Role runs its role file's model, so -Model haiku is refused"
+  $r = Release-ReservationOnRefusal $roleModelReason
+  Write-Output (@{ launched = $false; reason = $roleModelReason; model = $Model; permissions = $Permissions; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
+}
+# The allowlist profile is the haiku IC's rollback and nothing else: a control-plane role never
+# trades its classifier for a fixed list (ADR 0016, amended by fleet #350).
+if ($Permissions -eq 'allowlist' -and ($Role -ne 'ic' -or $Model -ne 'haiku')) {
+  $profileReason = "the allowlist permission profile is the haiku IC's rollback profile (ADR 0016); a $Role on '$(if ($Model) { $Model } else { 'its role model' })' runs the auto profile"
   $released = $false
   if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $profileReason; $released = $true } catch {} }
   Write-Output (@{ launched = $false; reason = $profileReason; model = $Model; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
 }
-# Owner ruling 2026-10-26: config/deepseek.json names DeepSeek's base URL, the key file
-# under the user profile (outside the repo and state/, like the fleet identity), and the
-# CLI the deepseek rehearsal passed on. A missing config or key refuses here, dry runs
-# included, rather than at the IC's first model call.
-$deepseekConfig = $null
-if ($Model -eq 'deepseek') {
-  try { $deepseekConfig = Read-Json "$FleetHome\config\deepseek.json" } catch {}
-  $deepseekReason = $null
-  if (-not $deepseekConfig -or -not "$($deepseekConfig.baseUrl)" -or -not "$($deepseekConfig.keyFile)") { $deepseekReason = "config\deepseek.json is missing or names no baseUrl or keyFile (owner ruling 2026-10-26); launch this ticket on sonnet" }
-  elseif (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE "$($deepseekConfig.keyFile)") -PathType Leaf)) { $deepseekReason = "no DeepSeek API key at %USERPROFILE%\$($deepseekConfig.keyFile) (config\deepseek.json keyFile, owner ruling 2026-10-26): save the key there, or launch this ticket on sonnet" }
-  if ($deepseekReason) {
-    $released = $false
-    if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $deepseekReason; $released = $true } catch {} }
-    Write-Output (@{ launched = $false; reason = $deepseekReason; model = $Model; permissions = $Permissions; reservationReleased = $released } | ConvertTo-Json -Compress); exit 3
-  }
-}
-# Spec #94 (#165): the haiku tier is open only on the CLI the rehearsal passed on. The
-# profile records that version; any other `claude --version` refuses a haiku launch
-# (dry runs included) until the rehearsal passes again and the owner commits the new version. No recorded
-# version means no rehearsal has passed yet, which refuses too: the tier opens only when a
-# clean rehearsal is followed by the owner committing the field. A scratch root (bin\scratch-root.ps1) marks its copy
-# `rehearsalRoot: true`, the one place a haiku launch runs on an unverified CLI, because
-# that launch IS the rehearsal. Sonnet never reads the field. The deepseek tier is gated
-# the same way on its own rehearsal, recorded in config/deepseek.json (owner ruling
-# 2026-10-26): until one passes, the lead's default tier stays closed and sonnet runs.
-# Owner ruling 2026-10-27 (fleet #332): the deepseek gate guards the base URL and
-# apiKeyHelper path, which no profile changes, so it covers every deepseek launch; haiku
-# is gated only under allowlist, its one profile.
-if ($Model -eq 'deepseek' -or ($Model -eq 'haiku' -and $Permissions -eq 'allowlist')) {
+# Spec #94 (#165), the allowlist rollback's gate (fleet #350): the haiku allowlist profile is open
+# only on the CLI the rehearsal passed on. The profile records that version; any other
+# `claude --version` refuses an allowlist launch (dry runs included) until the rehearsal passes
+# again and the owner commits the new version. No recorded version means no rehearsal has passed
+# yet, which refuses too. A scratch root (bin\scratch-root.ps1) marks its copy `rehearsalRoot: true`,
+# the one place an allowlist launch runs on an unverified CLI, because that launch IS the rehearsal.
+# The auto profile is not gated here: the CLI's auto mode covers Haiku 5.5 (probe on 2.1.312).
+if ($Model -eq 'haiku' -and $Permissions -eq 'allowlist') {
   $haikuProfile = $null
   try { $haikuProfile = Read-Json "$FleetHome\config\permissions-allowlist.json" } catch {}
   if (-not ($haikuProfile -and $haikuProfile.rehearsalRoot -eq $true)) {
-    $tierFile = if ($Model -eq 'deepseek') { 'config\deepseek.json' } else { 'config\permissions-allowlist.json' }
-    $tierConfig = if ($Model -eq 'deepseek') { $deepseekConfig } else { $haikuProfile }
-    $verifiedCli = if ($tierConfig) { "$($tierConfig.verifiedCliVersion)".Trim() } else { '' }
+    $tierFile = 'config\permissions-allowlist.json'
+    $verifiedCli = if ($haikuProfile) { "$($haikuProfile.verifiedCliVersion)".Trim() } else { '' }
     $installedCli = ''
     try { $installedCli = "$((Invoke-ClaudeCli -Arguments @('--version') -TimeoutSec 30).stdout)".Trim() } catch {}
     $installedVersion = if ($installedCli -match '(\d+\.\d+\.\d+)') { $Matches[1] } else { $installedCli }
-    $rehearsalHow = "(bin\scratch-root.ps1 -Path <dir> -Issue <n>$(if ($Model -eq 'deepseek') { ' -Model deepseek' }), then its printed assign and launch); the owner commits verifiedCliVersion in $tierFile after a clean rehearsal. Launch this ticket on sonnet meanwhile"
+    $rehearsalHow = "(bin\scratch-root.ps1 -Path <dir> -Issue <n>, then its printed assign and launch); the owner commits verifiedCliVersion in $tierFile after a clean rehearsal"
     $versionReason = $null
     if (-not $verifiedCli) { $versionReason = "no $Model rehearsal has passed yet ($tierFile records no verifiedCliVersion; spec #94, ADR 0016): run the rehearsal first $rehearsalHow" }
-    elseif ($installedVersion -ne $verifiedCli) { $versionReason = "the $Model tier was verified on Claude Code $verifiedCli, but the installed CLI is $(if ($installedVersion) { $installedVersion } else { 'unknown' }) (spec #94, ADR 0016): re-run the rehearsal before a $Model launch $rehearsalHow" }
+    elseif ($installedVersion -ne $verifiedCli) { $versionReason = "the $Model allowlist profile was verified on Claude Code $verifiedCli, but the installed CLI is $(if ($installedVersion) { $installedVersion } else { 'unknown' }) (spec #94, ADR 0016): re-run the rehearsal before a $Model allowlist launch $rehearsalHow" }
     if ($versionReason) {
       $released = $false
       if ($Manifest -and -not $DryRun) { try { Invalidate-Manifest $versionReason; $released = $true } catch {} }
@@ -384,15 +364,6 @@ if ($Manifest) {
   $envBlock.FLEET_BASE_SHA = [string]$assignment.base.sha
   $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
 }
-# Owner ruling 2026-10-26: a deepseek IC's model calls go to DeepSeek's Anthropic-format
-# API. The base URL rides the env block; the key never does: the session's apiKeyHelper
-# (bin/deepseek-key.js) reads it from the key file at call time, so no key lands in
-# state/. Every worker the IC starts shares the URL: DeepSeek serves the qa-reviewer's
-# claude-opus-* pin on its Pro model and the researcher's haiku pin on Flash.
-if ($deepseekConfig) {
-  $envBlock.ANTHROPIC_BASE_URL = "$($deepseekConfig.baseUrl)"
-  $settings | Add-Member -NotePropertyName apiKeyHelper -NotePropertyValue "node $($FleetHome.Replace('\', '/'))/bin/deepseek-key.js" -Force
-}
 $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
 
 # --- role tool contract (ticket 06). work-state.js stays the one validated door to
@@ -502,12 +473,9 @@ Write-Json $settingsPath $settings
 # An arbiter launched with no -Model runs pinned Opus 5.5 like the principal and project
 # lead (owner ruling 2026-10-20, ADR 0017 amendment); the role file's `model:` agrees.
 # A project lead launched with no -Model runs Sonnet 5.5 (owner ruling 2026-10-26; Opus
-# 5.5 from 2026-09-23 until then), pinned for the same reason; the ICs' sonnet tier
-# already runs claude-sonnet-5-5 under auto.
-# An IC on sonnet runs pinned Sonnet 5.5 (owner ruling 2026-09-28): CLI 2.1.284's
-# sonnet alias already resolves to claude-sonnet-5-5; the pin stops a silent bump.
-# An IC on deepseek runs pinned deepseek-flash, DeepSeek V4.1 Flash (owner ruling
-# 2026-10-26), against the base URL the env block above sets.
+# 5.5 from 2026-09-23 until then), pinned for the same reason.
+# Every IC runs pinned Haiku 5.5 (owner ruling 2026-10-30, fleet #350), whatever the manifest
+# names: the door refuses any other IC model above.
 # The pins and role defaults live in _common.ps1 (Resolve-LaunchModel) since fleet
 # #121: sentinel-check compares a daemon job's frozen respawnFlags against them.
 $launchModel = Resolve-LaunchModel -Role $Role -Model $Model
@@ -520,7 +488,8 @@ if ($launchModel.id) { $modelArgs = @('--model', $launchModel.id) }
 # e.g. sentinel.md says low yet ran at high). So parse the role file ourselves and
 # pass the declared effort with --effort, the only lever that sticks for --bg.
 $roleFile = "$FleetHome\agents\$Role.md"
-$effort = Get-RoleEffort $Role
+# Fleet #350: an IC's effort is the one the door checked above (its manifest's, else the role file's).
+$effort = if ($Role -eq 'ic') { $icEffort } else { Get-RoleEffort $Role }
 $effortArgs = @()
 if (Test-LaunchEffort $effort) { $effortArgs = @('--effort', $effort) }
 

@@ -382,3 +382,24 @@ Amendment 8), the probes that Amendments 5 and 6 ran by hand run on a schedule.
 - The 2.1.312 dry run caught the gap Amendment 6 left out of scope: the haiku
   allowlist profile denies the backtick `grep` under `acceptEdits`, so haiku
   would stay closed on that CLI until the allowlist covers it.
+
+## Amendment 10 (2026-10-30, owner ruling, fleet #350): Haiku 5.5 ICs run under auto
+
+Fleet #28 (2026-09-11) was about `claude-haiku-4-5`, which is not on the
+CLI's auto-mode list. ICs run `claude-haiku-5-5` now. The official
+permission-modes docs (code.claude.com/docs/en/permission-modes) list Haiku
+5.5 as auto-supported. A live probe on 2026-10-30, CLI 2.1.312, ran
+`claude -p --model claude-haiku-5-5 --permission-mode auto --effort xhigh`:
+init reported `permissionMode: auto`, an out-of-cwd Read ran, and
+`permission_denials` was empty.
+
+- **Haiku ICs run under auto.** Amendment 3's "only under the allowlist
+  profile" and the first bullet of Decisions no longer hold for haiku. With
+  no `--permissions`, `assign` pins `permissions: "auto"` on a haiku manifest,
+  as it does for deepseek under Amendment 6.
+- **The allowlist profile stays as the haiku rollback.** `assign --permissions
+  allowlist` is still accepted, and `config/permissions-allowlist.json` and
+  its rules stand unchanged.
+- **The deepseek tier and its rehearsal gate are removed**, in code, config,
+  tests, the canary tier and docs. The sonnet IC tier is retired with it (ADR
+  0017, the same date), so every IC is haiku.

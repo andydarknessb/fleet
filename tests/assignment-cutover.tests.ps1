@@ -56,7 +56,7 @@ try {
   foreach ($f in '_common.ps1','launch.ps1','identity.js','recover.ps1','cutover-assignment.ps1','assignment.js','premises.js','assignment-parity.js','work-state.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body for ic."
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -145,9 +145,11 @@ try {
   # that archived roster row, never -Manifest; it restarts the crashed process with its own
   # history, it does not re-run manifest preconditions or create a new worktree. The row's
   # `manifest` field is the credential checked, not something re-launched from.
-  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-101","role":"ic","tenant":"test","parent":"pl-test","issue":101,"status":"active","manifest":"state/manifests/assignment-101.json","workRecordId":"test:issue-101"}]}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-101","role":"ic","tenant":"test","parent":"pl-test","issue":101,"status":"active","manifest":"state/manifests/assignment-101.json","workRecordId":"test:issue-101","effort":"max"}]}'
   $r7e = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover', '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r7e.dryRun -eq $true -and $r7e.name -eq 'ic-101') "a genuine -Recover relaunch must pass the no-manifest guard: $lastOut"
+  # Fleet #350 (ruling 14): a -Recover relaunch keeps the effort its roster row recorded (max), not the role file's.
+  Assert-True ($r7e.effort -eq 'max') "a -Recover relaunch keeps the effort its live roster row records: $lastOut"
   Assert-True ($r7e.prompt -eq 'legacy') "-Recover must relaunch with the roster's own original -Prompt, unchanged, not a manifest-derived one: $lastOut"
   Assert-True ((Get-Content "$testRoot\bin\recover.ps1" -Raw) -match '-Prompt \$e\.prompt -Recover') 'recover.ps1 must pass -Recover when it relaunches an IC'
   # -Recover exempts ONLY this guard: PAUSE still stops it, even for a genuine recovery.
@@ -161,7 +163,7 @@ try {
   # and the manifest carries the tenant's checks and CI gates as pointers.
   $fixture = "$testRoot\issues.json"
   Write-Utf8 $fixture '[{"number":101,"title":"Fixture issue","url":"https://github.com/owner/repo/issues/101","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
-  $r8 = Run-Node @("$testRoot\bin\assignment.js", 'assign', '--root', $testRoot, '--tenant', 'test', '--tenant-config', "$testRoot\tenants\test.json", '--fixture', $fixture, '--base-sha', ('a' * 40), '--parent', 'pl-test', '--model', 'sonnet', '--adr-paths', 'docs/adr/0002-one-launch-door.md')
+  $r8 = Run-Node @("$testRoot\bin\assignment.js", 'assign', '--root', $testRoot, '--tenant', 'test', '--tenant-config', "$testRoot\tenants\test.json", '--fixture', $fixture, '--base-sha', ('a' * 40), '--parent', 'pl-test', '--model', 'haiku', '--adr-paths', 'docs/adr/0002-one-launch-door.md')
   Assert-True ($lastExit -eq 0 -and $r8.manifestPath) "assign must reserve a manifest: $lastOut"
   $manifest = (Get-Content $r8.manifestPath -Raw) | ConvertFrom-Json
   Assert-True ($manifest.status -eq 'pending-ack' -and $manifest.workRecordId -eq 'test:issue-101') 'the manifest must be pending acknowledgment for its Work record'

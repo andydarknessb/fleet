@@ -12,7 +12,6 @@
   here, one assign, one launch.
 .EXAMPLE   bin\scratch-root.ps1 -Path E:\fleet-scratch
 .EXAMPLE   bin\scratch-root.ps1 -Path E:\fleet-scratch -Tenant endzone -Issue 1650
-.EXAMPLE   bin\scratch-root.ps1 -Path E:\fleet-scratch -Issue 1650 -Model deepseek
 #>
 [CmdletBinding()]
 param(
@@ -20,8 +19,8 @@ param(
   [string]$Tenant = 'endzone',
   [int]$Issue,          # the rehearsal's chosen ticket; only fills in the printed commands
   [string]$Parent,      # the IC's parent in the printed assign (default pl-<tenant>)
-  [ValidateSet('haiku', 'deepseek')]
-  [string]$Model = 'haiku', # the tier the printed assign rehearses (haiku: allowlist; deepseek: auto, owner ruling 2026-10-27, fleet #332)
+  [ValidateSet('haiku')]
+  [string]$Model = 'haiku', # the IC model the printed assign rehearses: every IC runs Haiku 5.5 (fleet #350)
   [string]$LiveRoot     # the running fleet (default: the target of ~/.claude/agents, else ~/fleet)
 )
 $ErrorActionPreference = 'Stop'
@@ -128,7 +127,7 @@ Write-Utf8 $settingsFile (($settings | ConvertTo-Json -Depth 20) + "`n")
 # --- what to run next ---
 if (-not $Parent) { $Parent = "pl-$Tenant" }
 $issueText = if ($Issue) { "$Issue" } else { '<n>' }
-$permissionsArg = if ($Model -eq 'haiku') { ' --permissions allowlist' } else { '' }  # deepseek takes the auto default
+$permissionsArg = ''   # the printed assign takes the IC default, auto (fleet #350), so the rehearsal runs what launches; --permissions allowlist is the rollback
 $repoFwd = "$($tenantConfig.repo)".Replace('\', '/')
 $next = [ordered]@{
   assign = "node $rootFwd/bin/assignment.js assign --root $rootFwd --tenant $Tenant --repo-path $repoFwd --parent $Parent --model $Model$permissionsArg --risk standard --issue $issueText"

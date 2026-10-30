@@ -50,7 +50,7 @@ function Reserve-Manifest {
   $fixture = "$testRoot\issues-$Issue.json"
   Write-Utf8 $fixture ('[{"number":' + $Issue + ',"title":"Refusal fixture","url":"https://github.com/owner/repo/issues/' + $Issue + '","body":' + ("Change ``src/fixture-$Issue.js``." | ConvertTo-Json) + ',"createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]')
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $out = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant test --tenant-config "$testRoot\tenants\test.json" --fixture $fixture --base-sha $Sha --parent pl-test --model sonnet 2>&1 | Out-String; $code = $LASTEXITCODE }
+  try { $out = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant test --tenant-config "$testRoot\tenants\test.json" --fixture $fixture --base-sha $Sha --parent pl-test --model haiku 2>&1 | Out-String; $code = $LASTEXITCODE }
   finally { $ErrorActionPreference = $eap }
   $r = $null; try { $r = ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch {}
   if ($code -ne 0 -or -not $r -or -not $r.manifestPath) { throw "assign for issue $Issue failed: $out" }
@@ -73,7 +73,7 @@ try {
   foreach ($f in '_common.ps1','launch.ps1','identity.js','work-state.js','assignment.js','premises.js','assignment-parity.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
-  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: sonnet`neffort: low`n---`nRole body for ic."
+  Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
@@ -305,6 +305,19 @@ try {
   Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
   [void](Run-Launch @('-Manifest', $m30, '-WorkRecordId', 'test:issue-30'))
   Assert-True ((Get-BgCalls) -eq 1) "control: an untouched reservation still reaches claude --bg: $lastOut"
+
+  # Fleet #350 (ruling 12): a manifest naming the retired deepseek tier is refused at the door and its
+  # reservation released. The -Model ValidateSet has no deepseek, so the manifest's model must not go through it.
+  Clear-ActiveRecords
+  $m35 = Reserve-Manifest 35 $baseSha
+  $doc35 = (Get-Content $m35 -Raw) | ConvertFrom-Json
+  $doc35.model = 'deepseek'
+  Write-Utf8 $m35 ($doc35 | ConvertTo-Json -Depth 20)
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $r35 = Run-Launch @('-Manifest', $m35, '-WorkRecordId', 'test:issue-35')
+  Assert-True ($lastExit -eq 3 -and $r35 -and $r35.launched -eq $false -and "$($r35.reason)" -match "'deepseek' is refused" -and $r35.reservationReleased -eq $true) "a deepseek manifest is refused at the door with its reservation released: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 35) -ne 'assigned' -and (Get-Marker $m35) -and "$((Get-Marker $m35).reason)" -match "'deepseek' is refused") 'the deepseek refusal leaves no assigned record and writes the invalidation marker with its reason'
+  Assert-True ((Get-BgCalls) -eq 0) 'a deepseek manifest never reaches claude --bg'
 
   Write-Output 'launch refusal release tests passed'
 } finally {

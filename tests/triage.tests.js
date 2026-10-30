@@ -793,6 +793,17 @@ function finalizeWorld({ numbers = [40], each = () => ({}), history, afterPropos
 
 const rulingsOn = (fixtureIssue) => fixtureIssue.comments.filter((c) => /^## Ruling/.test(c.body));
 
+// Fleet #350 (owner ruling 2026-10-30): the Tier line is retired (the lead picks effort at assign).
+// A proposal with no Tier line finalizes, and a leftover Tier line is ignored, not refused.
+test('fleet #350: a finalize takes a proposal with no Tier line, or a leftover one, and finalizes it', () => {
+  for (const proposal of [PROPOSAL.replace('Tier: sonnet\n', ''), PROPOSAL.replace('Tier: sonnet', 'Tier: opus')]) {
+    const world = finalizeWorld({ each: () => ({ thread: { approval: 'Approved', proposal } }) });
+    const result = world.finalize();
+    assert.deepEqual(result.left, [], 'nothing is left to the Principal over a Tier line');
+    assert.deepEqual(result.finalized.map((row) => row.issue), [40]);
+  }
+});
+
 test('#207: an eligible exact Approved is claimed, ruled, labelled and finalized', () => {
   const world = finalizeWorld({ each: () => ({ thread: { approval: '  Approved \n' } }) });
   const result = world.finalize();
@@ -872,7 +883,6 @@ test('#207: each clause that fails leaves the issue to the Principal, named in l
     ['Open for Cory: none. On Approval ...', 'open-for-cory', () => ({ thread: { proposal: PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none. On Approval, please also decide the caption.') } })],
     ['Open for Cory with a question', 'open-for-cory', () => ({ thread: { proposal: PROPOSAL.replace('Open for Cory: none', 'Open for Cory: is the caption in scope?') } })],
     ['Blocked_by: #N', 'blocked-by', () => ({ thread: { proposal: PROPOSAL.replace('Blocked_by: none', 'Blocked_by: #12') } })],
-    ['a Tier of opus', 'tier', () => ({ thread: { proposal: PROPOSAL.replace('Tier: sonnet', 'Tier: opus') } })],
     ['no Ruling line', 'no-ruling-line', () => ({ thread: { proposal: PROPOSAL.replace('Ruling: none needed\n', '') } })],
     ['an unverified premise', 'premises', () => ({ thread: { proposal: PROPOSAL.replace(' verified @abcdef2', '') } })],
     ['a false premise', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('verified @abcdef2', 'false: the slice is already correct') } })],
@@ -880,10 +890,8 @@ test('#207: each clause that fails leaves the issue to the Principal, named in l
     ['an empty Premises block', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('  src/list.js: slices one short @abcdef1 verified @abcdef2\n', '') } })],
     // clause 8, whole FIELD: a continuation line under an exact-valued field fails it
     ['Open for Cory: none with an indented question under it', 'open-for-cory', () => ({ thread: { proposal: PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none\n  Is the caption in scope?') } })],
-    ['Tier: sonnet with a continuation', 'tier', () => ({ thread: { proposal: PROPOSAL.replace('Tier: sonnet', 'Tier: sonnet\n  (opus if the migration is needed)') } })],
     ['Blocked_by: none with a continuation', 'blocked-by', () => ({ thread: { proposal: PROPOSAL.replace('Blocked_by: none', 'Blocked_by: none\n  once #12 lands') } })],
     ['Classification: bug with a continuation', 'classification', () => ({ thread: { proposal: PROPOSAL.replace('Classification: bug', 'Classification: bug\n  (ready-for-human: run the migration)') } })],
-    ['a duplicated Tier line', 'tier', () => ({ thread: { proposal: PROPOSAL.replace('Tier: sonnet', 'Tier: sonnet\nTier: opus') } })],
     // clause 8, premises: every line, no false, not stopped by a blank line
     ['a false premise that also says verified', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('slices one short @abcdef1 verified @abcdef2', 'slices one short @abcdef1 false: not so, verified @abcdef2') } })],
     ['two premises, one unverified', 'premises', () => ({ thread: { proposal: PROPOSAL.replace('  src/list.js: slices one short @abcdef1 verified @abcdef2', '  src/list.js: slices one short @abcdef1 verified @abcdef2\n  src/util.js: exports pad @abcdef1') } })],
@@ -1204,7 +1212,10 @@ test('#207: proposalGate is one pure predicate over clauses 1 and 4 to 9 and par
   assert.deepEqual(noHold, []);
   const failing = eligible();
   failing.proposal = { ...failing.proposal, body: PROPOSAL.replace('Tier: sonnet', 'Tier: opus').replace('Blocked_by: none', 'Blocked_by: #3') };
-  assert.deepEqual(triage.proposalGate(failing).map((failure) => failure.code), ['blocked-by', 'tier']);
+  assert.deepEqual(triage.proposalGate(failing).map((failure) => failure.code), ['blocked-by'], 'a leftover Tier: opus line is ignored (fleet #350)');
+  const tierless = eligible();
+  tierless.proposal = { ...tierless.proposal, body: PROPOSAL.replace('Tier: sonnet\n', '') };
+  assert.deepEqual(triage.proposalGate(tierless), [], 'a proposal with no Tier line passes the gate');
   const parsed = triage.parseProposal(PROPOSAL.replace('Open for Cory: none', 'Open for Cory: none\n  and a second thought\n\n  after a blank'));
   assert.equal(parsed.fields['Open for Cory'], 'none\nand a second thought\nafter a blank');
   assert.equal(parsed.fields.Classification, 'bug');
@@ -1409,8 +1420,6 @@ const LEAVES = [
   ['Classification feature', { proposal: { Classification: 'feature' } }, 'classification'],
   ['Ruling holding a fix sentence', { proposal: { Ruling: 'Guard the null read in foo.js and keep the column' } }, 'ruling-needed'],
   ['Ruling with a continuation line', { proposal: { Ruling: 'none needed\n  but the IC must also drop the legacy column' } }, 'ruling-needed'],
-  ['Tier with a suffix', { proposal: { Tier: 'sonnet (opus if the lock path is involved)' } }, 'tier'],
-  ['Tier opus', { proposal: { Tier: 'opus' } }, 'tier'],
   ['Open for Cory continuation line', { proposal: { 'Open for Cory': 'none\n  On Approval I edit the body Premises to the three lines above.' } }, 'open-for-cory'],
   ['Open for Cory a question', { proposal: { 'Open for Cory': 'Should the foo page show ties?' } }, 'open-for-cory'],
   ['Blocked_by an issue', { proposal: { Blocked_by: '#1745' } }, 'blocked-by'],
@@ -1502,8 +1511,19 @@ test('#210: a ticket with a closed blocked-by edge, or a body whose Premises sec
 test('#210: every refusal names all of its failing conditions, and the first is the machine-readable one', () => {
   const world = boundedRoot({ proposal: { Tier: 'opus', Repro: 'none' }, labels: ['bug', 'triage-proposed', 'held'] });
   const codes = codesOf(world);
-  for (const code of ['labels', 'tier', 'no-repro']) assert.ok(codes.includes(code), code);
+  for (const code of ['labels', 'no-repro']) assert.ok(codes.includes(code), code);
   assert.equal(new Set(codes).size, codes.length, 'each listed once');
+});
+
+// Fleet #350: the Tier line is retired. A bounded ready does not need one, a leftover one is ignored,
+// and the page and the ledger row carry no tier field.
+test('fleet #350: a bounded ready takes a proposal with no Tier line or a leftover one, and records no tier', () => {
+  for (const proposal of [{ Tier: null }, { Tier: 'opus' }]) {
+    const world = boundedRoot({ proposal });
+    assert.equal(world.door().readied, true, `Tier ${JSON.stringify(proposal)}`);
+    const row = readLedger(world.root, world.tenant).find((entry) => entry.kind === 'bounded-ready');
+    assert.equal(Object.prototype.hasOwnProperty.call(row, 'tier'), false, 'the row records no tier');
+  }
 });
 
 test('#210: at most 5 bounded readies per tenant per Central day; the sixth is refused, and a vetoed one still counts', () => {

@@ -5,14 +5,15 @@
   2. Duplicate guard: an open PR on fleet/cli-<latest> or an open issue titled for that
      version -> outcome "duplicate", nothing else runs.
   3. Installs the candidate side by side (bin/install-cli.ps1 -Version <v>, no -Global; #336)
-     and probes every tier under `claude -p` with FLEET_CLAUDE_CLI set to it, in a scratch cwd:
-       deepseek: config/deepseek.json base URL + apiKeyHelper + the auto profile; passes on
-                 permissionMode auto, permission_denials [] after an out-of-cwd Bash and Read,
-                 and no Anthropic msg_ id in the transcript (DeepSeek served it).
-       haiku:    config/permissions-allowlist.json under acceptEdits, running the IC's fixed
+     and probes every tier under `claude -p` with FLEET_CLAUDE_CLI set to it, in a scratch cwd,
+     on claude-haiku-5-5, the IC model (fleet #350):
+       auto:     the IC default profile: fleet-settings.json as launch.ps1 writes it, FLEET_PERMISSIONS
+                 auto; passes on permissionMode auto and permission_denials [] after an out-of-cwd Bash and Read.
+       haiku:    config/permissions-allowlist.json under acceptEdits (the rollback), running the IC's fixed
                  command list; passes when allowlist-gate refused the backtick grep (a PreToolUse deny, #335),
                  every other command succeeded, and no denial came from the CLI itself.
-  4. A tier is OPEN when its verifiedCliVersion equals cli.json's version. Every open tier
+  4. A tier is OPEN when its verifiedCliVersion equals cli.json's version; auto has no pin and is always
+     open, so every candidate must pass the default profile. Every open tier
      passes -> a PR on a temp worktree off origin/master, branch fleet/cli-<v>, bumping
      cli.json and every passing tier's verifiedCliVersion (a closed tier that passes reopens).
      Any open tier fails -> nothing moves; an issue carries the probe output. A closed tier
@@ -83,10 +84,10 @@ $target = $latest
 
 function Read-Cfg { param([string]$Rel) Get-Content -LiteralPath (Join-Path $FleetHome $Rel) -Raw -Encoding UTF8 | ConvertFrom-Json }
 $tiers = @(
+  [ordered]@{ tier = 'auto'; file = $null; open = $true }   # the IC default (fleet #350): no pin, always open
   [ordered]@{ tier = 'haiku'; file = 'config\permissions-allowlist.json'; cfg = (Read-Cfg 'config\permissions-allowlist.json') }
-  [ordered]@{ tier = 'deepseek'; file = 'config\deepseek.json'; cfg = (Read-Cfg 'config\deepseek.json') }
 )
-foreach ($t in $tiers) { $t.open = ("$($t.cfg.verifiedCliVersion)" -eq $current) }
+foreach ($t in @($tiers | Where-Object { $_.file })) { $t.open = ("$($t.cfg.verifiedCliVersion)" -eq $current) }
 $branchName = "fleet/cli-$latest"
 function Get-TierBranch { param([string]$Tier) "fleet/cli-$current-$Tier" }
 
@@ -140,19 +141,18 @@ $probeHome = Join-Path $scratch 'home'   # FLEET_HOME for the hooks
 foreach ($d in 'state\sessions', 'state\heartbeats') { [IO.Directory]::CreateDirectory((Join-Path $probeHome $d)) | Out-Null }
 $probeHomeFwd = $probeHome.Replace('\', '/')
 
-$deepseekPin = if ((Get-Content (Join-Path $FleetHome 'bin\_common.ps1') -Raw -ErrorAction SilentlyContinue) -match "IcDeepseekPin\s*=\s*'([^']+)'") { $Matches[1] } else { 'deepseek-flash' }
+# The IC model (fleet #350): launch.ps1 pins it from _common.ps1's IcHaikuPin, and so does every probe.
+$icModel = if ((Get-Content (Join-Path $FleetHome 'bin\_common.ps1') -Raw -ErrorAction SilentlyContinue) -match "IcHaikuPin\s*=\s*'([^']+)'") { $Matches[1] } else { 'claude-haiku-5-5' }
 
 function New-ProbeSettings { param($T)
   $s = Get-Content -LiteralPath (Join-Path $FleetHome 'fleet-settings.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   # The IC's hooks as launch.ps1 writes them (fleet-settings.json unchanged), run from this checkout
   # with FLEET_HOME at the scratch home so the Stop heartbeat and notice reads never touch state/.
   $envBlock = [ordered]@{ FLEET_HOME = $probeHomeFwd; FLEET_NAME = "ic-canary-$($T.tier)"; FLEET_ROLE = 'ic'; FLEET_TENANT = 'canary'; FLEET_PARENT = 'canary'; PONYTAIL_DEFAULT_MODE = 'off'; PONYTAIL_SUBAGENT_MATCHER = '(?!)' }
-  if ($T.tier -eq 'haiku') { $envBlock.FLEET_PERMISSIONS = 'allowlist' }
+  $envBlock.FLEET_PERMISSIONS = if ($T.tier -eq 'haiku') { 'allowlist' } else { 'auto' }
   if ($s.PSObject.Properties['hooks']) { $s.hooks = ((ConvertTo-Json $s.hooks -Depth 10 -Compress).Replace('C:/Users/Cory/fleet/', "$fleetFwd/")) | ConvertFrom-Json }
-  if ($T.tier -eq 'deepseek') {
-    $envBlock.ANTHROPIC_BASE_URL = "$($T.cfg.baseUrl)"
-    $s | Add-Member -NotePropertyName apiKeyHelper -NotePropertyValue "node $fleetFwd/bin/deepseek-key.js" -Force
-  } else {
+  if ($T.tier -eq 'haiku') {
+    # the rollback: the allowlist profile's settings, as launch.ps1 composes them
     $tokens = @{ '<fleet>' = $fleetFwd; '<repo>' = $repoFwd; '<defaultBranch>' = 'master'; '<releaseBranch>' = 'main' }
     $res = { param([string]$x) foreach ($k in $tokens.Keys) { $x = $x.Replace($k, $tokens[$k]) }; $x }
     $dirs = @($T.cfg.additionalDirectories | Where-Object { $_ } | ForEach-Object { & $res $(if ($_ -is [string]) { $_ } else { "$($_.dir)" }) })
@@ -169,22 +169,21 @@ function New-ProbeSettings { param($T)
 }
 
 $prompts = @{
-  deepseek = "This is a permission probe. Use the Bash tool to run exactly: ls $fleetFwd/config`nThen use the Read tool on $fleetFwd/config/cycle.json (limit 1 line). Then reply with the single word done."
+  auto = "This is a permission probe. Use the Bash tool to run exactly: ls $fleetFwd/config`nThen use the Read tool on $fleetFwd/config/cycle.json (limit 1 line). Then reply with the single word done."
   haiku = "This is a permission probe. Use the Bash tool to run each of these commands exactly as written, one per call, then use the Read tool on $repoFwd/notes.txt. Reply with the single word done.`n1. grep -n 'a``b' $repoFwd/notes.txt`n2. gh pr view 1 --repo andydarknessb/fleet --json number`n3. node --test $repoFwd/probe.test.js`n4. git -C $repoFwd log --oneline -1"
 }
-$expect = @{ deepseek = @{ mode = 'auto'; bash = 1; read = 1 }; haiku = @{ mode = 'acceptEdits'; bash = 4; read = 1 } }
+$expect = @{ auto = @{ mode = 'auto'; bash = 1; read = 1 }; haiku = @{ mode = 'acceptEdits'; bash = 4; read = 1 } }
 
 function Invoke-Probe { param($T)
   $name = $T.tier
   $open = [bool]$T.open
-  $p = [ordered]@{ tier = $name; open = $open; pass = $false; permissionMode = $null; expectedMode = $expect[$name].mode; denials = @(); bash = 0; read = 0; anthropicMsgId = $false; hooks = 0; hookErrors = 0; preBash = 0; preRead = 0; stopHooks = 0; hasIsError = $false; gateRefused = 0; cliDenials = 0; denyHooks = 0; backtickRefused = $false; backtickRan = $false; otherBashFail = 0; bashResults = 0; bashOk = 0; readOk = 0; resultLine = $false; hasDenialsField = $false; model = $null; costUsd = $null; error = $null }
+  $p = [ordered]@{ tier = $name; open = $open; pass = $false; permissionMode = $null; expectedMode = $expect[$name].mode; denials = @(); bash = 0; read = 0; hooks = 0; hookErrors = 0; preBash = 0; preRead = 0; stopHooks = 0; hasIsError = $false; gateRefused = 0; cliDenials = 0; denyHooks = 0; backtickRefused = $false; backtickRan = $false; otherBashFail = 0; bashResults = 0; bashOk = 0; readOk = 0; resultLine = $false; hasDenialsField = $false; model = $null; costUsd = $null; error = $null }
   $dir = Join-Path $scratch "cwd-$name"; [IO.Directory]::CreateDirectory($dir) | Out-Null
   $settingsPath = Join-Path $probeHome "state\sessions\ic-canary-$name.settings.json"   # where allowlist-gate.js looks
   [IO.File]::WriteAllText($settingsPath, ((New-ProbeSettings $T) | ConvertTo-Json -Depth 8), $utf8)
   $promptPath = Join-Path $scratch "$name.prompt.txt"; [IO.File]::WriteAllText($promptPath, $prompts[$name], $utf8)
   $outPath = Join-Path $scratch "$name.out.jsonl"; $errPath = Join-Path $scratch "$name.err.txt"
-  $model = if ($name -eq 'deepseek') { $deepseekPin } else { 'haiku' }
-  $argString = "-p --model $model --settings `"$settingsPath`" --setting-sources project --strict-mcp-config --no-session-persistence --output-format stream-json --verbose --include-hook-events --max-budget-usd 1"
+  $argString = "-p --model $icModel --settings `"$settingsPath`" --setting-sources project --strict-mcp-config --no-session-persistence --output-format stream-json --verbose --include-hook-events --max-budget-usd 1"
   $saved = $env:FLEET_CLAUDE_CLI
   try {
     $env:FLEET_CLAUDE_CLI = $candidatePath
@@ -198,7 +197,6 @@ function Invoke-Probe { param($T)
     if ($e.type -eq 'system' -and $e.subtype -eq 'hook_response') { $p.hooks++; if ("$($e.outcome)" -eq 'error') { $p.hookErrors++ }; if ($e.hook_event -eq 'PreToolUse' -and "$($e.output)" -match '"permissionDecision"\s*:\s*"deny"') { $p.denyHooks++ }; switch -Regex ("$($e.hook_name)") { '^PreToolUse:Bash' { $p.preBash++ } '^PreToolUse:Read' { $p.preRead++ } '^Stop' { $p.stopHooks++ } } }
     elseif ($e.type -eq 'system' -and $e.subtype -eq 'init') { $p.permissionMode = "$($e.permissionMode)"; if ($e.model) { $p.model = "$($e.model)" } }
     elseif ($e.type -eq 'assistant' -and $e.message) {
-      if ("$($e.message.id)" -match '^msg_') { $p.anthropicMsgId = $true }
       foreach ($c in @($e.message.content)) { if ($c.type -eq 'tool_use') { $toolNames["$($c.id)"] = "$($c.name)"; $toolCmds["$($c.id)"] = "$($c.input.command)"; if ($c.name -eq 'Bash') { $p.bash++ } elseif ($c.name -eq 'Read') { $p.read++ } } }
     }
     elseif ($e.type -eq 'user' -and $e.message) {
@@ -230,7 +228,7 @@ function Invoke-Probe { param($T)
   if ($p.hookErrors) { $why += "$($p.hookErrors) hook(s) errored" }
   if ($sawResult -and -not $p.hasDenialsField) { $why += 'the result line carries no permission_denials field' }
   if ($p.permissionMode -ne $p.expectedMode) { $why += "permissionMode '$($p.permissionMode)', expected '$($p.expectedMode)'" }
-  if ($name -eq 'deepseek' -and @($p.denials).Count) { $why += "$(@($p.denials).Count) permission denial(s)" }
+  if ($name -eq 'auto' -and @($p.denials).Count) { $why += "$(@($p.denials).Count) permission denial(s)" }
   if ($name -eq 'haiku') {
     # #335: the gate refuses the backtick grep (a PreToolUse deny); any other denial is the CLI's own approval request
     if ($p.cliDenials) { $why += "$($p.cliDenials) permission denial(s) raised by the CLI, not by a hook" }
@@ -239,8 +237,7 @@ function Invoke-Probe { param($T)
     if ($p.otherBashFail) { $why += "$($p.otherBashFail) other Bash command(s) did not succeed" }
   }
   if ($p.bashResults -lt $expect[$name].bash -or $p.readOk -lt $expect[$name].read) { $why += "got $($p.bashResults) Bash results and $($p.readOk) successful Read results, expected $($expect[$name].bash) and $($expect[$name].read)" }
-  if ($name -eq 'deepseek' -and $p.bashOk -lt 1) { $why += 'the out-of-cwd Bash did not return a successful result' }
-  if ($name -eq 'deepseek' -and $p.anthropicMsgId) { $why += 'an Anthropic msg_ id appears: DeepSeek did not serve the reply' }
+  if ($name -eq 'auto' -and $p.bashOk -lt 1) { $why += 'the out-of-cwd Bash did not return a successful result' }
   $p.pass = ($why.Count -eq 0)
   $p.why = $why -join '; '
   return [pscustomobject]$p
@@ -250,7 +247,7 @@ try { $probes = @($probeTiers | ForEach-Object { Invoke-Probe $_ }) } finally { 
 $result.probes = $probes
 
 # --- 5. verdict
-$report = (($probes | ForEach-Object { "- $($_.tier) ($(if ($_.open) { 'open' } else { 'closed' })): $(if ($_.pass) { 'PASS' } else { "FAIL: $($_.why)" }); permissionMode=$($_.permissionMode); permission_denials=[$((@($_.denials) -join ' | '))] (gate-refused $($_.gateRefused), CLI-raised $($_.cliDenials)); Bash ok=$($_.bashOk)/$($_.bashResults) Read ok=$($_.readOk); hooks: PreToolUse Bash $($_.preBash) Read $($_.preRead), Stop $($_.stopHooks); anthropic msg_ id=$($_.anthropicMsgId); cost=`$$($_.costUsd)" }) -join "`n")
+$report = (($probes | ForEach-Object { "- $($_.tier) ($(if ($_.open) { 'open' } else { 'closed' })): $(if ($_.pass) { 'PASS' } else { "FAIL: $($_.why)" }); permissionMode=$($_.permissionMode); permission_denials=[$((@($_.denials) -join ' | '))] (gate-refused $($_.gateRefused), CLI-raised $($_.cliDenials)); Bash ok=$($_.bashOk)/$($_.bashResults) Read ok=$($_.readOk); hooks: PreToolUse Bash $($_.preBash) Read $($_.preRead), Stop $($_.stopHooks); cost=`$$($_.costUsd)" }) -join "`n")
 
 # Opens PR $Branch from a detached worktree off the fetched Remote/Branch, applying $Edits ({rel; pattern; with}).
 function Open-Pr { param([string]$PrBranch, $Edits, [string]$Title, [string]$Body)
@@ -316,8 +313,9 @@ if ($DryRun) { Finish $(if ($willPr) { 'dry-run:would-open-pr' } else { 'dry-run
 
 if ($willPr) {
   $edits = @(@{ rel = ((Resolve-Path -LiteralPath $CliConfig).Path.Substring((Resolve-Path -LiteralPath $FleetHome).Path.Length).TrimStart('\')); pattern = '("version"\s*:\s*")[^"]*(")'; with = "`${1}$latest`${2}" })
-  foreach ($p in $passing) { $edits += Bump-Tier ($tiers | Where-Object { $_.tier -eq $p.tier }) }
-  $body = "Fleet #337 canary: Claude Code $latest passed every open tier's probe under ``claude -p`` (candidate installed side by side, FLEET_CLAUDE_CLI set to it). Merging bumps config/cli.json from $current and verifiedCliVersion for: $((@($passing | ForEach-Object { $_.tier })) -join ', '). The next deploy moves the CLI (#336). This body is the attest.`n`nProbe output:`n$report"
+  $pinned = @($tiers | Where-Object { $_.file -and ($passing.tier -contains $_.tier) })   # auto has no pin to move
+  foreach ($t in $pinned) { $edits += Bump-Tier $t }
+  $body = "Fleet #337 canary: Claude Code $latest passed every open tier's probe under ``claude -p`` (candidate installed side by side, FLEET_CLAUDE_CLI set to it). Merging bumps config/cli.json from $current$(if ($pinned) { " and verifiedCliVersion for: $((@($pinned | ForEach-Object { $_.tier })) -join ', ')" }). The next deploy moves the CLI (#336). This body is the attest.`n`nProbe output:`n$report"
   if ($closedFail.Count) { $body += "`n`nA closed tier failed and stays closed: $((@($closedFail | ForEach-Object { $_.tier })) -join ', '); an issue carries the detail." }
   $result.pr = Open-Pr $branchName $edits "cli: move the fleet to Claude Code $latest (canary probes passed)" $body
 }

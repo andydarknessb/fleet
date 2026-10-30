@@ -78,7 +78,8 @@ try {
   $liveFwd = $liveRoot.Replace('\', '/')
   $scratchDeny = @(($settingsText | ConvertFrom-Json).permissions.deny)
   Assert-True ($scratchDeny -contains "Write($liveFwd/**)" -and $scratchDeny -contains "Edit($liveFwd/**)") 'the scratch settings fence off the live root'
-  Assert-True ("$($built.next.assign)" -match 'assignment\.js assign' -and "$($built.next.assign)" -match '--permissions allowlist' -and "$($built.next.assign)" -match [regex]::Escape($scratchFwd)) "the builder prints the assign command against the scratch root: $($built.next.assign)"
+  # Fleet #350: the printed assign is the IC default, a haiku reservation under auto (no --permissions flag), so the rehearsal runs what launches.
+  Assert-True ("$($built.next.assign)" -match 'assignment\.js assign' -and "$($built.next.assign)" -match '--model haiku' -and "$($built.next.assign)" -notmatch '--permissions' -and "$($built.next.assign)" -match [regex]::Escape($scratchFwd)) "the builder prints the assign command against the scratch root: $($built.next.assign)"
   Assert-True ("$($built.next.launch)" -match 'assignment\.js launch') 'the builder prints the launch command'
   Assert-True ("$($built.next.watch)" -match 'state\.json') 'the builder prints the state.json path to watch'
   Assert-True ("$($built.remove)" -match [regex]::Escape($scratch)) 'the builder prints the one command that removes the root'
