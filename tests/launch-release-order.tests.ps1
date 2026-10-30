@@ -97,6 +97,7 @@ $exitRows = @(
   @{ Anchor = "at the tenant's maxIcs"; Decision = 'release' }
   @{ Anchor = 'assignment past the second requires'; Decision = 'release' }
   @{ Anchor = 'reason = \$icReason'; Decision = 'release' }                 # an IC on a model but Haiku 5.5, or at an effort but xhigh or max (fleet #350)
+  @{ Anchor = 'reason = \$roleModelReason'; Decision = 'release' }          # a control-plane role given -Model haiku (fleet #350, ruling 13)
   @{ Anchor = 'reason = \$profileReason'; Decision = 'release' }
   @{ Anchor = 'reason = \$versionReason'; Decision = 'release' }
   @{ Anchor = 'could not reconcile issue'; Decision = 'release' }
