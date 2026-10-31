@@ -94,6 +94,7 @@
       "sync-stalled": "normal",
       "sync-blocked": "high",
       "watcher-stale": "high",
+      "wake-failed": "high",
       "state-escalated": "normal",
       "state-hold": "normal",
       "dated": "normal",
@@ -119,7 +120,7 @@
     "pairWindowMinutes": 10,
     "maxGapMinutes": 35,
     "tickMinutes": 15,
-    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "sync-stalled", "human-wait", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded", "respawn-loop", "respawn-loop-down", "cleanup-pending", "ic-first-turn-stale"]
+    "pageKinds": ["stray", "cap-exceeded", "ic-vanished", "pr-lookup-failed", "branch-diverged", "sync-refused", "sync-unattested", "sync-blocked", "sync-stalled", "human-wait", "wake-failed", "orphan-late-session", "ic-dead-before-ack", "reservation-stranded", "respawn-loop", "respawn-loop-down", "cleanup-pending", "ic-first-turn-stale"]
   },
   "assignment": {
     "parityEvaluations": 20,

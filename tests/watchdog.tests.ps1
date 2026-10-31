@@ -529,7 +529,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   [IO.Directory]::CreateDirectory("$testRoot\state\watch") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
   Write-Utf8 "$testRoot\config\cycle.json" '{"supervisor":{"pageKinds":["stray"]},"frontierWake":{"cooldownMinutes":60,"sources":["frontier","outbox"]}}'
-  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'if ($env:MOCK_ROTATE_DEFER -eq "1") { Write-Output (@{ rotated = @(); deferred = @("$Name`: session is mid-turn (status busy)"); outcomes = @(@{ name = $Name; status = "deferred"; reason = "session is mid-turn (status busy)" }) } | ConvertTo-Json -Compress -Depth 6); exit 0 }' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
+  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'if ($env:MOCK_ROTATE_DEFER -eq "1") { Write-Output (@{ rotated = @(); deferred = @("$Name`: session is mid-turn (status busy)"); outcomes = @(@{ name = $Name; status = "deferred"; reason = "session is mid-turn (status busy)" }) } | ConvertTo-Json -Compress -Depth 6); exit 0 }' + "`r`n" + 'if ($env:MOCK_ROTATE_FAIL -eq "1") { Write-Output (@{ rotated = @(); deferred = @(); outcomes = @(@{ name = $Name; status = "failed"; reason = "no active live-roster entry" }) } | ConvertTo-Json -Compress -Depth 6); exit 5 }' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
   function Get-RotateCalls { if (Test-Path "$testRoot\rotate-calls.txt") { @(Get-Content "$testRoot\rotate-calls.txt") } else { @() } }
   function Get-AlertLines { if (Test-Path "$testRoot\state\alerts\alerts.jsonl") { @(Get-Content "$testRoot\state\alerts\alerts.jsonl" | Where-Object { $_ }) } else { @() } }
   $wakeFixture = "$testRoot\issues-fixture.json"
@@ -580,6 +580,16 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $wake4 = @($w4.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($wake4.decision -eq 'deferred') "a deferred rotation must be recorded as deferred (got $($wake4.decision))"
   Assert-True (@(Get-AlertLines).Count -eq 1) 'a deferred wake must not alert'
+
+  # Case W4b (fleet #359): a failed rotation (no live-roster entry for the lead) is failed, not deferred, and pages wake-failed:pl-test at high.
+  $env:MOCK_ROTATE_FAIL = '1'
+  $w4b = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_FAIL
+  $wake4b = @($w4b.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($wake4b.decision -eq 'failed' -and "$($wake4b.reason)" -match 'no active live-roster entry') "a failed rotation must be recorded as failed, not deferred (got $($wake4b.decision): $($wake4b.reason))"
+  Assert-True (@($w4b.conditions) -contains 'wake-failed:pl-test') 'a failed lead wake must raise wake-failed:pl-test'
+  Assert-True (@($w4b.newlyPaged | Where-Object { $_.key -eq 'wake-failed:pl-test' })[0].priority -eq 'high') 'wake-failed must page at high'
+  Assert-True (@(Get-AlertLines).Count -eq 1) 'a failed wake must not alert'
 
   # Case W5: no slot -> no wake even with a frontier.
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[{"name":"ic-1","role":"ic","tenant":"test","status":"active"},{"name":"ic-2","role":"ic","tenant":"test","status":"active"}]}'
@@ -1354,6 +1364,24 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $tw3 = @($t3.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ($tw3.decision -eq 'cooldown') "identical evidence inside the cooldown must not wake again (got $($tw3.decision))"
 
+  # Case T3b (fleet #359): a failed principal wake (no live-roster entry for the Principal) is failed, not deferred, and pages wake-failed:pe-test at high.
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  $env:MOCK_ROTATE_FAIL = '1'
+  $t3b = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_FAIL
+  $tw3b = @($t3b.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw3b.decision -eq 'failed' -and "$($tw3b.reason)" -match 'no active live-roster entry') "a failed principal rotation must be recorded as failed, not deferred (got $($tw3b.decision): $($tw3b.reason))"
+  Assert-True (@($t3b.conditions) -contains 'wake-failed:pe-test') 'a failed principal wake must raise wake-failed:pe-test'
+  Assert-True (@($t3b.newlyPaged | Where-Object { $_.key -eq 'wake-failed:pe-test' })[0].priority -eq 'high') 'wake-failed must page at high'
+
+  # Case T3c (fleet #359): the same board with a deferred outcome (a boundary wait) stays deferred and raises no wake-failed.
+  Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  $env:MOCK_ROTATE_DEFER = '1'
+  $t3c = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_DEFER
+  $tw3c = @($t3c.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($tw3c.decision -eq 'deferred' -and -not (@($t3c.conditions) -contains 'wake-failed:pe-test')) "a deferred principal rotation must stay deferred and raise no wake-failed (got $($tw3c.decision); conditions $(@($t3c.conditions) -join ','))"
+
   # Case T4: a busy principal is not woken.
   Remove-Item "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
   Set-AgentsRows ($principalRows.Replace('"status":"idle","pid":14', '"status":"busy","pid":14'))
@@ -1571,6 +1599,14 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ($aw8d.decision -eq 'none' -and $aw8d.reason -match 'suspended') "a suspended arbiter must not be woken (got $($aw8d.decision): $($aw8d.reason))"
   Assert-True (@((Get-Content "$testRoot\state\watchdog\triage-frontier-arbiter.json" -Raw | ConvertFrom-Json).tenants)[0].suspended -eq $true) 'the shadow file must say the arbiter is suspended'
   Remove-Item "$testRoot\state\flags\arbiter-suspended-test"
+
+  # T8f (fleet #359): a failed arbiter wake is failed and pages wake-failed:ar-test.
+  Remove-Item "$testRoot\state\watchdog\triage-wake-arbiter.json" -ErrorAction SilentlyContinue
+  $env:MOCK_ROTATE_FAIL = '1'
+  $t8f = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_FAIL
+  $aw8f = @($t8f.arbiterWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ($aw8f.decision -eq 'failed' -and @($t8f.conditions) -contains 'wake-failed:ar-test') "a failed arbiter wake must be recorded as failed and raise wake-failed:ar-test (got $($aw8f.decision): $($aw8f.reason))"
 
   # T8e: the triage-wake-off rollback stops it too.
   Write-Utf8 "$testRoot\state\flags\triage-wake-off" 'x'
