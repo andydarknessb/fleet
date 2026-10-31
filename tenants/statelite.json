@@ -9,13 +9,13 @@
   "ownerLogin": "andydarknessb",
   "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",
-  "maxIcs": 1,
+  "maxIcs": 3,
   "carveOuts": [
     ".github/workflows/**",
     ".env*",
     "supabase/config.toml"
   ],
-  "checks": {},
+  "checks": { "unit": "npx vitest run", "lint": "npm run typecheck" },
   "riskTriggers": {
     "data-integrity": {
       "paths": ["supabase/migrations/**", "docs/schema.sql"],
@@ -28,11 +28,11 @@
   },
   "heavySuites": {},
   "reviewStatus": "fleet-review",
-  "ciGates": [],
+  "ciGates": ["test"],
   "watchedChecks": [],
   "ignoredChecks": [],
   "notes": [
-    "No app code yet: the first ticket scaffolds the Vite + React + TypeScript PWA from docs/plan.md with npm test and npm run lint scripts; checks and maxIcs are revisited after it merges (fleet #351).",
+    "The Vite + React + TypeScript PWA is scaffolded (stat-elite PR #32). checks.unit runs Vitest (App Core tests and the schema SQL self-check); the Playwright smoke at 390x844 runs only in CI (ciGates `test`), because its webServer binds port 4173 with --strictPort and reuses a running server outside CI, so concurrent ICs would test each other's builds. There is no ESLint yet; checks.lint is tsc (fleet #354).",
     "GLOSSARY.md is the glossary; there is no CONTEXT.md. docs/adr/ holds accepted decisions; docs/schema.sql is the planned Supabase schema."
   ]
 }
