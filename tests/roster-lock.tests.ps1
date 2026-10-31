@@ -17,8 +17,13 @@ foreach ($n in 'FLEET_CLAUDE_CLI', 'FLEET_CLAUDE_RESOLVE_TRIES', 'FLEET_CLAUDE_R
 
 # Each child writer adds 15 distinct rows, one Update-LiveRoster per row, with the sleep held inside the lock.
 $writerSource = @'
-param([string]$Tag, [int]$Count)
+param([string]$Tag, [int]$Count, [string]$Dir)
 . "$PSScriptRoot\_common.ps1"
+[IO.File]::WriteAllText("$Dir\ready-$Tag", '')
+# Start barrier: no write starts until the parent has seen both writers ready and written the go file.
+$gateBy = (Get-Date).AddSeconds(30)
+while (-not (Test-Path "$Dir\go") -and (Get-Date) -lt $gateBy) { Start-Sleep -Milliseconds 20 }
+if (-not (Test-Path "$Dir\go")) { throw "go file $Dir\go not written within 30 s" }
 for ($i = 1; $i -le $Count; $i++) {
   $rowName = "$Tag-$i"
   Update-LiveRoster {
@@ -29,6 +34,7 @@ for ($i = 1; $i -le $Count; $i++) {
 }
 '@
 
+$writers = @()
 try {
   # Case 1: two overlapping writers on one FleetHome: all 30 rows survive.
   foreach ($dir in 'bin', 'state') { [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null }
@@ -36,12 +42,18 @@ try {
   Write-Utf8 "$testRoot\bin\writer.ps1" $writerSource
   Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
-  $writers = @(foreach ($tag in 'a', 'b') {
-    $p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$testRoot\bin\writer.ps1`" -Tag $tag -Count 15" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$testRoot\writer-$tag.out" -RedirectStandardError "$testRoot\writer-$tag.err"
+  # Each writer is recorded as soon as it starts, so a failed later spawn still leaves the earlier child for the finally to kill.
+  foreach ($tag in 'a', 'b') {
+    $p = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$testRoot\bin\writer.ps1`" -Tag $tag -Count 15 -Dir `"$testRoot`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$testRoot\writer-$tag.out" -RedirectStandardError "$testRoot\writer-$tag.err"
+    $writers += [pscustomobject]@{ tag = $tag; process = $p }
     $null = $p.Handle # PS 5.1 keeps the exit code only when the handle is read before the child exits
-    [pscustomobject]@{ tag = $tag; process = $p }
-  })
-  foreach ($w in $writers) { $w.process.WaitForExit() }
+  }
+  # Start barrier: the go file is written only once both writers are ready, so their first writes overlap. Bounded at 30 s.
+  $readyBy = (Get-Date).AddSeconds(30)
+  foreach ($w in $writers) { while (-not (Test-Path "$testRoot\ready-$($w.tag)") -and (Get-Date) -lt $readyBy) { Start-Sleep -Milliseconds 20 } }
+  foreach ($w in $writers) { Assert-True (Test-Path "$testRoot\ready-$($w.tag)") "writer $($w.tag) not ready within 30 s: $(Get-Content "$testRoot\writer-$($w.tag).err" -Raw)" }
+  Write-Utf8 "$testRoot\go" ''
+  foreach ($w in $writers) { Assert-True ($w.process.WaitForExit(120000)) "writer $($w.tag) still running after 120 s" }
   foreach ($w in $writers) { Assert-True ($w.process.ExitCode -eq 0) "writer $($w.tag) exited $($w.process.ExitCode): $(Get-Content "$testRoot\writer-$($w.tag).err" -Raw)" }
   $rows = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions)
   $distinct = @($rows | ForEach-Object { $_.name } | Sort-Object -Unique)
@@ -91,6 +103,7 @@ try {
 
   Write-Output 'roster-lock tests passed'
 } finally {
+  foreach ($w in $writers) { if (-not $w.process.HasExited) { try { $w.process.Kill(); $w.process.WaitForExit(5000) | Out-Null } catch {} } }
   foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
   Remove-Item $testRoot, $retireRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
