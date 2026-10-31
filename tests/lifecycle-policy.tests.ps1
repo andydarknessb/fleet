@@ -27,8 +27,9 @@ $reread = $sentinel.IndexOf('$current = Get-LiveRoster')
 $respawn = $sentinel.IndexOf("@('respawn'")   # fleet #265: the call goes through Invoke-ClaudeCli
 Assert-True ($reread -ge 0 -and $respawn -gt $reread) 'Sentinel must re-read the live roster before an IC respawn'
 
-$retiring = $retire.IndexOf("`$e.status = 'retiring'")
+$retiring = $retire.IndexOf('if ($row) { & $markRetiring $row }')   # fleet #359: the marker is published by the locked roster write
 $stop = $retire.IndexOf("@('stop'")   # fleet #265: the call goes through Invoke-ClaudeCli
+Assert-True ($retire.Contains('$markRetiring = { param($row) $row.status = ''retiring''')) 'Retirement must mark the row retiring (#359)'
 Assert-True ($retiring -ge 0 -and $stop -gt $retiring) 'Retirement must publish the retiring marker before stopping the job'
 Assert-Match $retire 'worktreesRemaining' 'Retirement output must report still-registered owned worktrees'
 Assert-Match $retire "worktreeCleanup = if .*'none-owned'.*'removed'.*'remaining'" 'Retirement output must distinguish no worktree, removed worktree, and remaining worktree'
