@@ -2343,6 +2343,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True ("$($realConfig.pages.priority.'respawn-loop')" -eq 'normal' -and "$($realConfig.pages.priority.'respawn-loop-down')" -eq 'high' -and @($realConfig.supervisor.pageKinds) -contains 'respawn-loop' -and @($realConfig.supervisor.pageKinds) -contains 'respawn-loop-down') "the real config must page respawn-loop at normal and respawn-loop-down at high (#257)"
   Assert-True ([int]$realConfig.watchdog.respawnLoopCap -eq 3 -and [double]$realConfig.watchdog.respawnLoopWindowHours -eq 24) "the real config's respawn loop bound is 3 per 24 h (#257)"
   Assert-True ("$($realConfig.pages.priority.'ic-first-turn-stale')" -eq 'normal' -and @($realConfig.supervisor.pageKinds) -contains 'ic-first-turn-stale' -and [double]$realConfig.watchdog.firstTurnStaleMinutes -eq 120) "the real config must page ic-first-turn-stale at normal with a 120 min threshold (#257)"
+  Assert-True ("$($realConfig.pages.priority.'wake-failed')" -eq 'high') "the real config must page wake-failed at high (#359)"
+  Assert-True (@($realConfig.supervisor.pageKinds) -contains 'wake-failed') "the real config must list wake-failed in supervisor.pageKinds (#359)"
 
   # ===== #113 (ADR 0013): the deploy step =====
   # The fixture home is not a git checkout, so the step is `unmanaged` and spawns

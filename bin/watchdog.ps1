@@ -1184,6 +1184,7 @@ try {
       } else {
         # fleet #359: a failed outcome means the lead was not woken (no live-roster entry, a failed replacement launch, a retire that did not confirm), not a boundary wait: it pages wake-failed until it clears.
         $wake.decision = if ($wake.outcome -and "$($wake.outcome.status)" -eq 'failed') { 'failed' } else { 'deferred' }
+        if ($wake.decision -eq 'failed') { $wake.reason = "rotate.ps1 failed: $(Get-OneLine "$($wake.outcome.reason)" 200)$(if ($wake.reason) { "; $($wake.reason)" })" }
         if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" }
         if ($wake.decision -eq 'failed') { $wakeConditions += [pscustomobject]@{ key = "wake-failed:$leadName"; kind = 'wake-failed'; detail = "$leadName was not woken ($digest): rotate.ps1 failed: $(Get-OneLine "$($wake.outcome.reason)" 200)"; url = $null } }
       }
@@ -1194,7 +1195,7 @@ try {
       if ($st.outcome -eq 'escalated') { continue }
       $tw = @($frontierWakes | Where-Object { $_.tenant -eq $st.tenant })[-1]
       # Only a stall that was new evidence this tick and not delivered is deferred; one already delivered logs none.
-      $st.outcome = if (-not $st.isNew) { 'none' } elseif ($wakeOff) { 'deferred: frontier-wake-off' } elseif ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "deferred: $($tw.reason)" } else { 'none' }
+      $st.outcome = if (-not $st.isNew) { 'none' } elseif ($wakeOff) { 'deferred: frontier-wake-off' } elseif ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "$(if ($tw.decision -eq 'failed') { 'failed' } else { 'deferred' }): $($tw.reason)" } else { 'none' }
     }
     $stallsEvaluated = $true
   }
