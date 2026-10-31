@@ -215,6 +215,29 @@ function Get-LiveRoster {
   return $r
 }
 function Save-LiveRoster { param($R) Write-Json "$FleetHome\state\roster.json" $R }
+# fleet #359: a roster write is read-modify-write, and overlapping launch/retire runs each lost the other's
+# rows. Every writer goes through here: $Mutate runs on a fresh read under a mutex named per FleetHome (a test
+# home never contends with live), and a wait that times out throws rather than saving a copy that may be stale.
+# Locals are lock-prefixed so they cannot shadow a caller's $Name or $entry that $Mutate reads.
+function Update-LiveRoster {
+  param([scriptblock]$Mutate)
+  $lockSha = [System.Security.Cryptography.SHA1]::Create()
+  $lockKey = [BitConverter]::ToString($lockSha.ComputeHash([Text.Encoding]::UTF8.GetBytes($FleetHome.ToLowerInvariant()))).Replace('-', '').ToLowerInvariant()
+  $lockName = "Global\fleet-roster-$lockKey"
+  $lockMutex = New-Object System.Threading.Mutex $false, $lockName
+  $lockHeld = $false
+  try {
+    # An abandoned mutex (a writer died holding it) is ours now: taking it over is the correct outcome.
+    try { $lockHeld = $lockMutex.WaitOne(30000) } catch [System.Threading.AbandonedMutexException] { $lockHeld = $true }
+    if (-not $lockHeld) { throw "roster lock $lockName not acquired within 30 s (another launch or retire holds it); nothing was written" }
+    $lockFresh = Get-LiveRoster
+    $null = & $Mutate $lockFresh
+    Save-LiveRoster $lockFresh
+  } finally {
+    if ($lockHeld) { $lockMutex.ReleaseMutex() }
+    $lockMutex.Dispose()
+  }
+}
 function Get-DaemonSessions {
   # A failed read and an empty fleet are different facts. Without -Strict both still
   # collapse to @() (read-only callers tolerate it); with -Strict a nonzero exit,

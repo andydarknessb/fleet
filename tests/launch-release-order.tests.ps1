@@ -1,6 +1,6 @@
 # fleet#251: launch.ps1's ordering around the manifest release, pinned against its source.
 #
-# 1. The roster row is written by `Save-LiveRoster $live` after the session exists. Every
+# 1. The roster row is written by `Update-LiveRoster` (fleet #359; was `Save-LiveRoster $live`) after the session exists. Every
 #    Invalidate-Manifest call (a release) must come before that write, because work-state's
 #    release now refuses a record a live roster row claims (RELEASE_CLAIMED): a call after
 #    the write would deadlock launch's own release.
@@ -17,10 +17,10 @@ $lines = @(Get-Content -LiteralPath $launch)
 $rosterWrite = -1
 $lastInvalidate = -1
 for ($i = 0; $i -lt $lines.Count; $i++) {
-  if ($lines[$i] -match '^\s*Save-LiveRoster \$live\s*$') { $rosterWrite = $i }
+  if ($lines[$i] -match '^\s*Update-LiveRoster\s*\{') { $rosterWrite = $i }
   if ($lines[$i] -match 'Invalidate-Manifest\s+["''$]') { $lastInvalidate = $i }
 }
-Assert-True ($rosterWrite -ge 0) 'found the Save-LiveRoster $live line that writes the roster row'
+Assert-True ($rosterWrite -ge 0) 'found the Update-LiveRoster call that writes the roster row'
 Assert-True ($lastInvalidate -ge 0) 'found at least one Invalidate-Manifest call'
 Assert-True ($lastInvalidate -lt $rosterWrite) "the last Invalidate-Manifest call (line $($lastInvalidate + 1)) must come before the roster row is written (line $($rosterWrite + 1)): a release after that write is refused as claimed"
 

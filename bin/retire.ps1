@@ -4,6 +4,9 @@ param([Parameter(Mandatory)][string]$Name, [string]$Reason = 'done')
 $live = Get-LiveRoster
 $e = $live.sessions | Where-Object { $_.name -eq $Name }
 if (-not $e) { Write-Error "no live roster entry named '$Name'"; exit 4 }
+# fleet #359: the row this retire owns is the fresh one with its name AND jobId. A row that is gone, or that now
+# holds a newer launch's job, matches nothing, so a retire never revives or overwrites it.
+function Find-OwnRow { param($R) @($R.sessions | Where-Object { $_.name -eq $e.name -and "$($_.jobId)" -eq "$($e.jobId)" }) | Select-Object -First 1 }
 
 function Get-OwnedWorktrees {
   if (-not $e.cwd -or -not (Test-Path $e.cwd)) { return @() }
@@ -23,10 +26,10 @@ function Get-OwnedWorktrees {
 # Close the active -> stopped race before touching the daemon. A Sentinel check
 # that already snapshotted this IC re-reads the live roster immediately before
 # respawning and observes this marker.
-$e.status = 'retiring'
-$e | Add-Member -NotePropertyName retiringAt -NotePropertyValue (Now-Iso) -Force
-$e | Add-Member -NotePropertyName retiredBecause -NotePropertyValue $Reason -Force
-Save-LiveRoster $live
+$retiringAt = Now-Iso
+$markRetiring = { param($row) $row.status = 'retiring'; $row | Add-Member -NotePropertyName retiringAt -NotePropertyValue $retiringAt -Force; $row | Add-Member -NotePropertyName retiredBecause -NotePropertyValue $Reason -Force }
+& $markRetiring $e
+Update-LiveRoster { param($r) $row = Find-OwnRow $r; if ($row) { & $markRetiring $row } }
 
 # git's record of a removed worktree goes, but on Windows its directory can survive
 # empty (a handle the stopped job still held), and launch.ps1 then refuses a relaunch of
@@ -126,22 +129,22 @@ if ($e.jobId -and -not $cliMissing) {
   elseif ($stillThere) { Write-Warning "job $($e.jobId) still exists after claude rm; inspect with: claude agents --json --all" }
 }
 if ($cliMissing -and -not $script:ClaudeCliMissing) { $script:ClaudeCliMissing = [pscustomobject]@{ tried = @("$($script:ClaudeCli)"); waitedSec = 0 } }
-$e.status = 'retired'
-$e | Add-Member -NotePropertyName retiredAt -NotePropertyValue (Now-Iso) -Force
-if ($cliMissing) {
-  $e | Add-Member -NotePropertyName jobRemoval -NotePropertyValue 'cli-missing' -Force
-  $e | Add-Member -NotePropertyName cleanupPending -NotePropertyValue $true -Force
-}
+$retiredAt = Now-Iso
+$markRetired = { param($row) $row.status = 'retired'; $row | Add-Member -NotePropertyName retiredAt -NotePropertyValue $retiredAt -Force; if ($cliMissing) { $row | Add-Member -NotePropertyName jobRemoval -NotePropertyValue 'cli-missing' -Force; $row | Add-Member -NotePropertyName cleanupPending -NotePropertyValue $true -Force } }
+& $markRetired $e
 # A retired entry's prompt has no reader (recovery replays active ICs only); archive the full row, then drop it so the roster stays small.
 # Strip only after the archive append succeeded; a re-retire (prompt already gone) appends nothing.
+$promptArchived = $false
 if ($e.PSObject.Properties['prompt']) {
   try {
     [IO.Directory]::CreateDirectory("$FleetHome\state\archive") | Out-Null
     [IO.File]::AppendAllText("$FleetHome\state\archive\roster-retired-full.jsonl", (($e | ConvertTo-Json -Compress -Depth 8) + [Environment]::NewLine), $Utf8)
     $e.PSObject.Properties.Remove('prompt')
+    $promptArchived = $true
   } catch { Write-Warning "prompt archive failed ($_); prompt kept on the roster row" }
 }
-Save-LiveRoster $live
+# fleet #359: the same marks land on the fresh row for this job; its prompt goes only once the archive append succeeded.
+Update-LiveRoster { param($r) $row = Find-OwnRow $r; if ($row) { & $markRetired $row; if ($promptArchived -and $row.PSObject.Properties['prompt']) { $row.PSObject.Properties.Remove('prompt') } } }
 Remove-Item "$FleetHome\state\heartbeats\$Name.json" -ErrorAction SilentlyContinue
 $ownedAfter = @(Get-OwnedWorktrees)
 $afterPaths = @($ownedAfter | ForEach-Object { $_.path })

@@ -712,8 +712,8 @@ $entry = [pscustomobject]@{
   jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $rosterManifest; workRecordId = $WorkRecordId
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }
-$live.sessions = @($live.sessions | Where-Object { $_.name -ne $Name }) + @($entry)
-Save-LiveRoster $live
+# fleet #359: the splice runs on the fresh roster under the lock; the $live read above only feeds the checks.
+Update-LiveRoster { param($r) $r.sessions = @($r.sessions | Where-Object { $_.name -ne $Name }) + @($entry) }
 
 # 02/03: reserve the unit before returning. The roster entry now exists, so the projection
 # derives the Work record from it immediately instead of leaving it to the next pr-watch
