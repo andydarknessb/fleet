@@ -777,7 +777,8 @@ try {
           $parsed = ConvertFrom-LastJsonLine $raw
           if ($parsed -and $parsed.PSObject.Properties['launched']) {
             $result.launched = [bool]$parsed.launched
-            $result.reason = if ($parsed.launched) { 'launched' } else { Get-OneLine $parsed.reason 200 }
+            # fleet #356: the exit-5 JSON's output holds the CLI's own refusal text, which the shadow log used to drop.
+            $result.reason = Format-LaunchReason $parsed
             if ($parsed.jobId) { $result.jobId = $parsed.jobId }
           } else { $result.reason = "launch.ps1 returned no JSON: $(Get-OneLine $raw 200)" }
         } catch { $result.reason = "launch.ps1 threw: $(Get-OneLine $_.Exception.Message 200)" }
