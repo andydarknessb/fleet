@@ -60,7 +60,7 @@ try {
 
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'exit /b 0' + "`r`n")
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'echo []' + "`r`n" + 'exit /b 0' + "`r`n")
-  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
+  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'if ($env:MOCK_ROTATE_FAIL -eq "1") { Write-Output (@{ rotated = @(); deferred = @(); outcomes = @(@{ name = $Name; status = "failed"; reason = "no active live-roster entry" }) } | ConvertTo-Json -Compress -Depth 6); exit 5 }' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   $env:USERPROFILE = "$testRoot\profile"
   [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))
@@ -550,6 +550,14 @@ try {
   Set-StallCase; Set-StallDelivered 60
   $t8 = Run-Watchdog
   Assert-True (@($t8.stalls).Count -eq 1 -and @($t8.stalls)[0].outcome -eq 'none') "T8: an already-delivered, non-escalating stall logs none (got $($t8.stalls | ConvertTo-Json -Compress))"
+
+  # T8b (fleet #359): a stall whose lead wake fails (rotate.ps1 reports the lead `failed`) logs failed, not deferred.
+  Set-StallCase
+  $env:MOCK_ROTATE_FAIL = '1'
+  $t8b = Run-Watchdog
+  Remove-Item Env:MOCK_ROTATE_FAIL
+  Assert-True (@($t8b.stalls).Count -eq 1 -and @($t8b.stalls)[0].outcome -like 'failed: rotate.ps1 failed: no active live-roster entry*') "T8b: a stall whose lead wake failed must log failed: <reason> (got $($t8b.stalls | ConvertTo-Json -Compress))"
+  Reset-Wake
 
   # T9: an unreadable heartbeat skips the IC: no stall, no wake, entry kept.
   Set-StallCase; Set-StallDelivered 121

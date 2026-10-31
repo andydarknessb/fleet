@@ -132,6 +132,7 @@ try {
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
+  # fleet #359: wake-failed (a wake whose rotate.ps1 outcome is failed: no live-roster entry, a replacement launch that failed) is high: a stopped control-plane session stalls its tenant.
   # fleet #274: sync-unattested (a release tip that only lacks the fleet-review status; normal, and held
   # back by pages.minAgeMinutes until it has stood 60 min) and sync-blocked (a required check failed on the
   # release tip; high), sync-stalled (one sha waited on checks past watchdog.syncStallMinutes; normal).
@@ -141,7 +142,7 @@ try {
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high; the shipped config sets emergency, #302) so it can return to
   # high or emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal'; 'stall' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'wake-failed' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal'; 'stall' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -498,7 +499,7 @@ try {
   # so a bare fixture with no config/cycle.json supervisor.pageKinds override
   # still pages a refused push, the same reasoning ticket 77's Get-PagePriority
   # default already documents for its own hardcoded map.
-  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'sync-unattested', 'sync-blocked', 'sync-stalled', 'human-wait', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded', 'respawn-loop', 'respawn-loop-down', 'cleanup-pending', 'ic-first-turn-stale')
+  $pageKinds = @('stray', 'cap-exceeded', 'ic-vanished', 'pr-lookup-failed', 'branch-diverged', 'sync-refused', 'sync-unattested', 'sync-blocked', 'sync-stalled', 'human-wait', 'wake-failed', 'orphan-late-session', 'ic-dead-before-ack', 'reservation-stranded', 'respawn-loop', 'respawn-loop-down', 'cleanup-pending', 'ic-first-turn-stale')
   if ($supervisorConfig -and $null -ne $supervisorConfig.PSObject.Properties['pageKinds']) { $pageKinds = @($supervisorConfig.pageKinds | ForEach-Object { "$_" }) }
   # The mode decision reads the daemon STRICTLY: a glitched (empty) read must not look
   # like "no Sentinel running" and hand the fleet a second actor. Staleness paging
@@ -1028,6 +1029,7 @@ try {
   # --- session is logged and never paged); Write-FleetWakeAudit keeps the same line
   # --- shape Send-FleetAlert used to write, with paged:false.
   $frontierWakes = @()
+  $wakeConditions = @()  # fleet #359: a wake whose rotate.ps1 outcome is failed pages wake-failed; the conditions list is built after the wakes
   # fleet #346: a Stall is wake evidence for the lead and, if it outlasts the wake, one `stall` page condition.
   $stallLedger = @(); $stallConditions = @(); $stallsEvaluated = $false
   $stallConfig = $null; try { $stallConfig = (Read-Json "$FleetHome\config\cycle.json").stall } catch {}
@@ -1179,7 +1181,13 @@ try {
         }
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
         try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
-      } else { $wake.decision = 'deferred'; if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
+      } else {
+        # fleet #359: a failed outcome means the lead was not woken (no live-roster entry, a failed replacement launch, a retire that did not confirm), not a boundary wait: it pages wake-failed until it clears.
+        $wake.decision = if ($wake.outcome -and "$($wake.outcome.status)" -eq 'failed') { 'failed' } else { 'deferred' }
+        if ($wake.decision -eq 'failed') { $wake.reason = "rotate.ps1 failed: $(Get-OneLine "$($wake.outcome.reason)" 200)$(if ($wake.reason) { "; $($wake.reason)" })" }
+        if (-not $wake.reason) { $wake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($rotateOut | ConvertTo-Json -Compress -Depth 6) 200)" }
+        if ($wake.decision -eq 'failed') { $wakeConditions += [pscustomobject]@{ key = "wake-failed:$leadName"; kind = 'wake-failed'; detail = "$leadName was not woken ($digest): rotate.ps1 failed: $(Get-OneLine "$($wake.outcome.reason)" 200)"; url = $null } }
+      }
       $frontierWakes += [pscustomobject]$wake
     }
     # A stall's outcome is its tenant's wake outcome unless it escalated this tick.
@@ -1187,7 +1195,7 @@ try {
       if ($st.outcome -eq 'escalated') { continue }
       $tw = @($frontierWakes | Where-Object { $_.tenant -eq $st.tenant })[-1]
       # Only a stall that was new evidence this tick and not delivered is deferred; one already delivered logs none.
-      $st.outcome = if (-not $st.isNew) { 'none' } elseif ($wakeOff) { 'deferred: frontier-wake-off' } elseif ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "deferred: $($tw.reason)" } else { 'none' }
+      $st.outcome = if (-not $st.isNew) { 'none' } elseif ($wakeOff) { 'deferred: frontier-wake-off' } elseif ($tw -and $tw.decision -eq 'woken' -and @($tw.evidence) -like "stall $($st.ic) *") { 'woken' } elseif ($tw -and $tw.decision -ne 'woken' -and $tw.reason) { "$(if ($tw.decision -eq 'failed') { 'failed' } else { 'deferred' }): $($tw.reason)" } else { 'none' }
     }
     $stallsEvaluated = $true
   }
@@ -1363,7 +1371,12 @@ try {
         $twake.decision = 'woken'
         $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest; outboxConsumedThrough = (Now-Iso) }) -Force
         try { $twake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: triage wake' -Body "$principalName relaunched for $tdigest" -Detail ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
-      } else { $twake.decision = 'deferred'; if (-not $twake.reason) { $twake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($tRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
+      } else {
+        # fleet #359: a failed outcome means the Principal was not woken, not a boundary wait: it pages wake-failed until it clears.
+        $twake.decision = if ($twake.outcome -and "$($twake.outcome.status)" -eq 'failed') { 'failed' } else { 'deferred' }
+        if (-not $twake.reason) { $twake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($tRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" }
+        if ($twake.decision -eq 'failed') { $wakeConditions += [pscustomobject]@{ key = "wake-failed:$principalName"; kind = 'wake-failed'; detail = "$principalName was not woken ($tdigest): rotate.ps1 failed: $(Get-OneLine "$($twake.outcome.reason)" 200)"; url = $null } }
+      }
       $triageWakes += [pscustomobject]$twake
     }
     try { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; Write-Json "$FleetHome\state\watchdog\triage-frontier.json" ([pscustomobject]$triageShadow) } catch {}
@@ -1442,7 +1455,12 @@ try {
         $awake.decision = 'woken'
         $arbiterState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $adigest }) -Force
         try { $awake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: arbiter wake' -Body "$arbiterName relaunched for $adigest" -Detail ([pscustomobject]@{ tenant = $tenantName; arbiter = $arbiterName; evidence = $awake.evidence; outcome = $awake.outcome }) } catch { $awake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
-      } else { $awake.decision = 'deferred'; if (-not $awake.reason) { $awake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($aRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" } }
+      } else {
+        # fleet #359: a failed outcome means the Arbiter was not woken, not a boundary wait: it pages wake-failed until it clears.
+        $awake.decision = if ($awake.outcome -and "$($awake.outcome.status)" -eq 'failed') { 'failed' } else { 'deferred' }
+        if (-not $awake.reason) { $awake.reason = "rotate.ps1 did not rotate: $(Get-OneLine ($aRotateOut | ConvertTo-Json -Compress -Depth 6) 200)" }
+        if ($awake.decision -eq 'failed') { $wakeConditions += [pscustomobject]@{ key = "wake-failed:$arbiterName"; kind = 'wake-failed'; detail = "$arbiterName was not woken ($adigest): rotate.ps1 failed: $(Get-OneLine "$($awake.outcome.reason)" 200)"; url = $null } }
+      }
       $arbiterWakes += [pscustomobject]$awake
     }
     try { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; Write-Json "$FleetHome\state\watchdog\triage-frontier-arbiter.json" ([pscustomobject]$arbiterShadow) } catch {}
@@ -1466,6 +1484,7 @@ try {
     }
   }
   $conditions += $stallConditions
+  $conditions += $wakeConditions  # fleet #359: the failed wakes above, one wake-failed:<session> each
   foreach ($pw in $permissionWaits) {
     $pwDetail = "$($pw.name) (job $($pw.job)) has waited $($pw.waitMin) min on a permission prompt no one can answer in a --bg session: $($pw.needs). Stop it (claude stop $($pw.job)) and relaunch on a model the CLI runs in auto mode, or attach and answer (claude attach $($pw.job))"
     # Keyed by job, not name: a stale daemon row and its relaunch can share a name, and one
