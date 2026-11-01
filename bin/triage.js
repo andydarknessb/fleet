@@ -278,6 +278,8 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
 // (wx) and marked fired only on a delivered page, so a replay never pages twice.
 
 const STALE_NOTICE_DAYS = 30;
+// fleet #367: after #362 a lead's lift-only exclusion goes back to holding once its proposal is finalized, and nothing else tells anyone the lead never lifted it.
+const LEAD_HOLD_NOTICE_HOURS = 24;
 const PROPOSAL_REASONS = Object.freeze(['stale-premise']);
 
 function staleNoticePath(root) {
@@ -332,6 +334,61 @@ function runStalePremiseNotice({ root, now, send, dryRun = false } = {}) {
   fs.writeFileSync(temporary, `${JSON.stringify(fired, null, 2)}\n`, 'utf8');
   fs.renameSync(temporary, file);
   return { armed: true, due: true, sent: true, attempted: true, firedAt: at, tally: counts };
+}
+
+// fleet #367: a lead's lift-only exclusion still standing a day after a finalize newer than it. Only the lead lifts it
+// (#362: its reason may be unrelated), so this flags and pages; it never lifts. An unreadable ledger throws.
+function leadHoldNoticePath(root) {
+  return path.join(baseOf(root), 'state', 'triage', 'lead-hold-notice.json');
+}
+
+function unliftedLeadHolds({ root, tenant, now } = {}) {
+  const { activeExclusions, LIFT_ONLY_RECHECK_EVENTS } = require('./exclusions');
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const byIssue = projectTriage({ entries: readLedger(root, tenant), now: at }).byIssue;
+  const holds = [];
+  for (const entry of activeExclusions({ root, tenant, now: at })) {
+    if (entry.owner !== `pl-${tenant}` || !entry.recheck.event || !LIFT_ONLY_RECHECK_EVENTS.includes(entry.recheck.event.type)) continue;
+    const row = byIssue[Number(entry.issue)];
+    if (!row || !row.finalized || !(row.finalized.at > entry.at)) continue;
+    if (Date.parse(at) - Date.parse(row.finalized.at) < LEAD_HOLD_NOTICE_HOURS * 3600000) continue;
+    holds.push({ tenant, issue: entry.issue, id: entry.id, owner: entry.owner, reason: entry.reason, finalizedAt: row.finalized.at });
+  }
+  return holds;
+}
+
+// fleet #367: one dated page per flagged exclusion, once. Recorded only on a delivered send, so a failure retries next run.
+function runLeadHoldNotice({ root, now, send, dryRun = false } = {}) {
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const file = leadHoldNoticePath(root);
+  const notice = readJsonFile(file, { schemaVersion: 1, fired: {} });
+  const dir = path.join(baseOf(root), 'state', 'triage');
+  const tenants = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -6)).sort() : [];
+  const flagged = [];
+  const errors = [];
+  for (const tenant of tenants) {
+    try { flagged.push(...unliftedLeadHolds({ root, tenant, now: at })); } catch (error) { errors.push({ tenant, detail: String(error.message || error).split('\n')[0] }); }
+  }
+  const sent = [];
+  const failed = [];
+  const messages = [];
+  for (const hold of flagged) {
+    if (notice.fired[hold.id]) continue;
+    const message = {
+      kind: 'dated', priority: 'normal', title: `Fleet: ${hold.tenant} #${hold.issue} hold never lifted`,
+      body: `${hold.owner} still holds ${hold.tenant} #${hold.issue} under exclusion ${hold.id} (reason: ${hold.reason}). The ticket was finalized at ${hold.finalizedAt} and shows ready-for-agent, but it cannot launch while the hold stands. If the hold is done, the lead lifts it: node C:/Users/Cory/fleet/bin/exclusions.js lift --tenant ${hold.tenant} --id ${hold.id} --actor ${hold.owner} --evidence "<why>"`,
+    };
+    if (dryRun) { messages.push(message); continue; }
+    let result;
+    try { result = send(message); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
+    if (!result || !result.ok) { failed.push({ id: hold.id, detail: (result && result.detail) || null }); continue; }
+    sent.push(hold.id);
+    notice.fired[hold.id] = at;
+    const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(temporary, `${JSON.stringify(notice, null, 2)}\n`, 'utf8');
+    fs.renameSync(temporary, file);
+  }
+  return { flagged: flagged.length, sent, failed, errors, ...(dryRun ? { messages } : {}) };
 }
 
 // One row per stale-premise proposal: the premise, when it was proposed, and
@@ -1572,6 +1629,8 @@ module.exports = {
   readTenantConfig,
   readTriageConfig,
   recordEntry,
+  runLeadHoldNotice,
+  leadHoldNoticePath,
   runStalePremiseNotice,
   staleNoticePath,
   selectTriageFrontier,

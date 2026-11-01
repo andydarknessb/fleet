@@ -2759,3 +2759,126 @@ test('fleet #362 I: an unreadable triage ledger keeps the lead-owned exclusion h
   fs.writeFileSync(file, `not json\n${fs.readFileSync(file, 'utf8')}`);
   assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).get(40), 'frontier exclusion endzone:excl-40-1');
 });
+
+// fleet #367: a lead's lift-only hold still standing 24 hours after a finalize newer than it pages once from the daily run.
+// The finalize runs at NOW, so the page is due a day later; the notice never lifts anything.
+const { liftExclusion } = require('../bin/exclusions');
+const LEAD_HOLD_DUE = '2026-09-13T12:00:00.000Z';
+const holdSends = () => { const sent = []; return { sent, send: (message) => { sent.push(message); return { ok: true, detail: 'sent' }; } }; };
+const holdWith = (root, recheck, owner = 'pl-endzone') => addExclusion({ root, tenant: 'endzone', issue: 40, reason: 'waiting on a restated premise', evidence: 'lead note', owner, recheck, actor: owner, now: '2026-09-01T00:00:00.000Z' });
+const NOTHING = { flagged: 0, sent: [], failed: [], errors: [] };
+
+test('fleet #367 1: a lead lift-only hold still standing 24 hours after its finalize pages once, names the exclusion and the lift, and is never lifted', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  assert.deepEqual(world.finalize().finalized.map((row) => row.issue), [40]);
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), { flagged: 1, sent: ['endzone:excl-40-1'], failed: [], errors: [] });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, 'dated');
+  assert.equal(sent[0].priority, 'normal');
+  assert.equal(sent[0].title, 'Fleet: endzone #40 hold never lifted');
+  assert.match(sent[0].body, /pl-endzone still holds endzone #40 under exclusion endzone:excl-40-1/);
+  assert.match(sent[0].body, /finalized at 2026-09-12T12:00:00\.000Z/);
+  assert.match(sent[0].body, /node C:\/Users\/Cory\/fleet\/bin\/exclusions\.js lift --tenant endzone --id endzone:excl-40-1 --actor pl-endzone --evidence "<why>"/);
+  assert.deepEqual(activeExclusions({ root: world.root, tenant: 'endzone', now: LEAD_HOLD_DUE }).map((entry) => entry.id), ['endzone:excl-40-1'], 'the notice never lifts');
+  assert.equal(JSON.parse(fs.readFileSync(triage.leadHoldNoticePath(world.root), 'utf8')).fired['endzone:excl-40-1'], LEAD_HOLD_DUE);
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: '2026-09-14T12:00:00.000Z', send }).sent, []);
+  assert.equal(sent.length, 1, 'a second run never pages the same hold twice');
+});
+
+test('fleet #367 2: no page before 24 hours after the finalize, and nothing recorded', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  world.finalize();
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: '2026-09-13T11:59:00.000Z', send }), NOTHING);
+  assert.equal(sent.length, 0);
+  assert.equal(fs.existsSync(triage.leadHoldNoticePath(world.root)), false);
+});
+
+test('fleet #367 3: a refused or thrown page is reported as failed, records nothing, and the next run pages', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  world.finalize();
+  const refused = triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send: () => ({ ok: false, detail: 'down' }) });
+  assert.deepEqual(refused.failed, [{ id: 'endzone:excl-40-1', detail: 'down' }]);
+  assert.deepEqual(refused.sent, []);
+  const thrown = triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send: () => { throw new Error('boom'); } });
+  assert.deepEqual(thrown.failed, [{ id: 'endzone:excl-40-1', detail: 'send threw: boom' }]);
+  assert.equal(fs.existsSync(triage.leadHoldNoticePath(world.root)), false, 'a failed send records nothing');
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: '2026-09-14T08:00:00.000Z', send }).sent, ['endzone:excl-40-1']);
+  assert.equal(sent.length, 1);
+});
+
+test('fleet #367 4: a hold with a state-merged recheck is not a lift-only hold and is not paged', () => {
+  const world = finalizeWorld({ afterPropose: (root) => holdWith(root, { event: { type: 'state-merged', issue: 40 } }) });
+  world.finalize();
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), NOTHING);
+  assert.equal(sent.length, 0);
+});
+
+test('fleet #367 5: a hold with an expiry recheck is not a lift-only hold and is not paged', () => {
+  const world = finalizeWorld({ afterPropose: (root) => holdWith(root, { expiresAt: '2026-12-01T00:00:00.000Z' }) });
+  world.finalize();
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), NOTHING);
+  assert.equal(sent.length, 0);
+});
+
+test('fleet #367 6: a hold Cory owns is not paged, even lift-only and finalized', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root, { owner: 'cory' }) });
+  world.finalize();
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), NOTHING);
+  assert.equal(sent.length, 0);
+});
+
+test('fleet #367 7: a hold added after the finalize it would be paged for is not paged', () => {
+  const world = finalizeWorld();
+  world.finalize();
+  leadHold(world.root, { now: '2026-09-13T00:00:00.000Z' });
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), NOTHING);
+  assert.equal(sent.length, 0);
+});
+
+test('fleet #367 8: a hold over an open proposal, with no finalized row, is not paged', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), NOTHING);
+  assert.equal(sent.length, 0);
+});
+
+test('fleet #367 9: a lifted hold is not paged', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  world.finalize();
+  liftExclusion({ root: world.root, tenant: 'endzone', id: 'endzone:excl-40-1', actor: 'pl-endzone', evidence: 'premise restated', now: '2026-09-12T13:00:00.000Z' });
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send }), NOTHING);
+  assert.equal(sent.length, 0);
+});
+
+test('fleet #367 10: a dry run returns the page and sends and writes nothing', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  world.finalize();
+  const { sent, send } = holdSends();
+  const result = triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send, dryRun: true });
+  assert.equal(result.flagged, 1);
+  assert.deepEqual(result.sent, []);
+  assert.equal(result.messages.length, 1);
+  assert.match(result.messages[0].body, /endzone:excl-40-1/);
+  assert.equal(sent.length, 0);
+  assert.equal(fs.existsSync(triage.leadHoldNoticePath(world.root)), false);
+});
+
+test('fleet #367 11: an unreadable ledger for one tenant is reported and does not stop a hold on another tenant', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  world.finalize();
+  fs.writeFileSync(triage.ledgerPath(world.root, 'alpha'), 'not json\n{"kind":"proposed"}\n');
+  const { sent, send } = holdSends();
+  const result = triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send });
+  assert.deepEqual(result.errors.map((error) => error.tenant), ['alpha'], 'alpha sorts first, so the hold on endzone is read after it');
+  assert.match(result.errors[0].detail, /invalid triage JSON/);
+  assert.deepEqual(result.sent, ['endzone:excl-40-1']);
+  assert.equal(sent.length, 1);
+});

@@ -17,7 +17,7 @@ const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
-const { runStalePremiseNotice, readLedger, projectTriage, ARBITER_KINDS } = require('./triage');
+const { runStalePremiseNotice, runLeadHoldNotice, readLedger, projectTriage, ARBITER_KINDS } = require('./triage');
 const { centralClock, scanTenants, standingSuspensions } = require('./bounded-authority');
 const { plannerInputs, vetoWindow } = require('./assignment');
 
@@ -291,11 +291,16 @@ function buildSummary({ root, now } = {}) {
 // Spec fleet #92 (#148): the daily run is also the clock for the stale-premise
 // revisit notice (bin/triage.js), a page of its own that fires once when due,
 // quiet day or not; once armed it reports under `staleNotice` beside the summary's result.
+// fleet #367: the same run also pages a lead's lift-only hold that stands a day after its finalize (`leadHoldNotice`).
 function runDailySummary(options = {}) {
   const base = baseOf(options.root);
   const send = options.send || pageSender({ root: base });
   const notice = runStalePremiseNotice({ root: base, now: options.now, send, dryRun: Boolean(options.dryRun) });
   const staleNotice = notice.armed ? { staleNotice: notice } : {};
+  // fleet #367: a thrown lead-hold scan costs that notice, never the summary (as the Bounded scan below).
+  let leadHold;
+  try { leadHold = runLeadHoldNotice({ root: base, now: options.now, send, dryRun: Boolean(options.dryRun) }); } catch (error) { leadHold = { flagged: 0, sent: [], failed: [], errors: [{ detail: String(error.message || error).split('\n')[0] }] }; }
+  const leadHoldNotice = leadHold.flagged || leadHold.errors.length ? { leadHoldNotice: leadHold } : {};
   // Spec fleet #193 (#211): scan for Bounded-authority failure evidence before summarizing, so a
   // suspension the scan writes is on this morning's page. A dry run writes nothing, so it scans
   // nothing; a scan that fails costs the scan, never the summary.
@@ -308,13 +313,13 @@ function runDailySummary(options = {}) {
   const arbiterScanned = options.dryRun ? [] : scanArbiters({ root: base, now: options.now, scan: options.arbiterScan });
   const arbiterScan = arbiterScanned.length ? { arbiterScan: arbiterScanned } : {};
   const summary = buildSummary({ root: base, now: options.now });
-  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice, ...boundedScan, ...arbiterScan };
-  if (options.dryRun) return { sent: false, attempted: false, count: summary.count, dryRun: true, summary, ...staleNotice };
+  if (!summary) return { sent: false, attempted: false, count: 0, ...staleNotice, ...leadHoldNotice, ...boundedScan, ...arbiterScan };
+  if (options.dryRun) return { sent: false, attempted: false, count: summary.count, dryRun: true, summary, ...staleNotice, ...leadHoldNotice };
   let result;
   try { result = send(summary); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
   const ok = Boolean(result && result.ok);
   if (ok) recordSent(base, options.now);
-  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice, ...boundedScan, ...arbiterScan };
+  return { sent: ok, attempted: true, count: summary.count, detail: (result && result.detail) || null, ...staleNotice, ...leadHoldNotice, ...boundedScan, ...arbiterScan };
 }
 
 function cli(argv) {
@@ -337,7 +342,9 @@ function cli(argv) {
 // must never do).
 function exitCodeFor(result) {
   const failedNotice = Boolean(result.staleNotice && result.staleNotice.attempted && !result.staleNotice.sent);
-  return ((result.attempted && !result.sent) || failedNotice) ? 1 : 0;
+  // fleet #367: a lead-hold page that failed to send is a failed notice too (it retries next run).
+  const failedLeadHold = Boolean(result.leadHoldNotice && result.leadHoldNotice.failed.length);
+  return ((result.attempted && !result.sent) || failedNotice || failedLeadHold) ? 1 : 0;
 }
 
 function main(argv) {
