@@ -2192,3 +2192,23 @@ test('maxIcs lifts the ceiling in reserveRecord: a fourth assignment with a proo
   assert.throws(attempt({}), (error) => error.code === 'MAX_ICS_REACHED' && /3\/3/.test(error.message), 'no maxIcs falls back to 3');
   assert.equal(attempt({ maxIcs: 6 })().record.issue, 43);
 });
+
+// fleet #362: a create refused on a released or abandoned record names the door that reuses it (the id, tenant and issue).
+test('fleet #362: RECORD_RELEASED and RECORD_ABANDONED name the reserve door', () => {
+  const root = rootDir();
+  const id = 'endzone:issue-1762';
+  const reserved = reserveRecord({ root, id, tenant: 'endzone', issue: 1762, manifestPath: 'm1762', reservations: { components: ['src/x'] }, idempotencyKey: 'reserve-1762', now: '2026-09-28T10:00:00.000Z' });
+  releaseRecord({ root, id, expectedRevision: reserved.revision, idempotencyKey: 'release-1762', now: '2026-09-28T10:01:00.000Z' });
+  assert.throws(
+    () => createRecord({ root, id, tenant: 'endzone', issue: 1762, state: 'assigned', idempotencyKey: 'create-1762', now: '2026-09-28T10:02:00.000Z' }),
+    { code: 'RECORD_RELEASED', message: "record 'endzone:issue-1762' was released; only reserve can reuse it: work-state.js reserve --id endzone:issue-1762 --tenant endzone --issue 1762" },
+  );
+  const other = 'endzone:issue-1763';
+  const held = reserveRecord({ root, id: other, tenant: 'endzone', issue: 1763, manifestPath: 'm1763', reservations: { components: ['src/y'] }, idempotencyKey: 'reserve-1763', now: '2026-09-28T10:00:00.000Z' });
+  const escalated = transitionRecord({ root, id: other, expectedRevision: held.revision, to: 'escalated', idempotencyKey: 'esc-1763', evidence: 'x', actor: 'test', now: '2026-09-28T10:01:00.000Z' });
+  abandonRecord({ root, id: other, expectedRevision: escalated.revision, idempotencyKey: 'abandon-1763', reason: 'x', now: '2026-09-28T10:05:00.000Z' });
+  assert.throws(
+    () => createRecord({ root, id: other, state: 'assigned', idempotencyKey: 'create-1763', now: '2026-09-28T10:06:00.000Z' }),
+    { code: 'RECORD_ABANDONED', message: "record 'endzone:issue-1763' was abandoned; only reserve can reuse it: work-state.js reserve --id endzone:issue-1763 --tenant endzone --issue 1763" },
+  );
+});
