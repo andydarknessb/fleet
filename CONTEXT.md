@@ -373,7 +373,7 @@ its owner's lift, its expiry, or the named Fleet event, keeping its history.
 The fleet records one itself when it observes a merged PR whose linkage is an
 explained `Refs` (prose after it on the line, or on the next non-empty line): owned by the fleet, its recheck event is the issue closing,
 which the watcher observes and lifts.
-A lead's exclusion older than an open stale-premise restatement is a launch hold only: the Principal and the Arbiter still see the restatement (fleet #362).
+A lead's lift-only exclusion older than an open proposal, or any lead's exclusion older than a stale-premise restatement, is a launch hold only: the Principal and the Arbiter still see the proposal (fleet #362, #366).
 GitHub labels, assignees, dependencies, and sub-issue structure take
 precedence whenever they can express the condition.
 _Avoid_: hold (a reviewed PR waiting for Cory), skip, blocked

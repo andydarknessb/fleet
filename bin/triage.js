@@ -527,18 +527,25 @@ function parseRecordIssue(recordId) {
 
 // ------------------------------------------------------------- held sets ----
 
-// fleet #362: a lead's lift-only exclusion older than an open stale-premise restatement is a launch hold only: the
-// restatement it waits on must reach the Arbiter and the door. A superseded or rejected one no longer waits, so it holds again.
-// An unreadable ledger keeps the hold (fail safe).
-function restatementOpenUnder(root, tenant, entry, now) {
+// fleet #362, #366: a lead's lift-only exclusion older than an open proposal, or any lead exclusion older than a stale-premise
+// restatement, is a launch hold only: assignment.js still honours it, and the Principal and the Arbiter must see the proposal.
+// A state-merged or expiry hold keeps holding an ordinary proposal: it ends on its own. A superseded, rejected or finalized
+// proposal holds again. An unreadable ledger keeps the hold (fail safe).
+function proposalOpenUnder(root, tenant, entry, now, { restatementsOnly = false } = {}) {
   if (entry.owner !== `pl-${tenant}`) return false;
   try {
+    const { LIFT_ONLY_RECHECK_EVENTS } = require('./exclusions');
     const row = projectTriage({ entries: readLedger(root, tenant), now }).byIssue[Number(entry.issue)];
-    return Boolean(row && row.proposed && row.proposed.reason === 'stale-premise' && row.proposed.at > entry.at && !row.finalized && !(row.outcome && ['superseded', 'rejected'].includes(row.outcome.kind)));
+    return Boolean(row && row.proposed && (row.proposed.reason === 'stale-premise' || (!restatementsOnly && LIFT_ONLY_RECHECK_EVENTS.includes(entry.recheck && entry.recheck.event && entry.recheck.event.type))) && row.proposed.at > entry.at && !row.finalized && !(row.outcome && ['superseded', 'rejected'].includes(row.outcome.kind)));
   } catch { return false; }
 }
 
-function readHeldIssues(root, tenant, now) {
+// fleet #366: the issues under a lead's exclusion, for the Arbiter's escalation flag (not a hold).
+function leadHeldIssues(root, tenant, now) {
+  try { return new Set(require('./exclusions').activeExclusions({ root, tenant, now }).filter((entry) => entry.owner === `pl-${tenant}`).map((entry) => Number(entry.issue))); } catch { return new Set(); }
+}
+
+function readHeldIssues(root, tenant, now, { restatementsOnly = false } = {}) {
   const held = new Map();
   try {
     const skip = readJsonFile(path.join(baseOf(root), 'state', 'skip', `${tenant}.json`), null);
@@ -547,7 +554,7 @@ function readHeldIssues(root, tenant, now) {
   try {
     const { activeExclusions } = require('./exclusions');
     for (const entry of activeExclusions({ root, tenant, now }) || []) {
-      if (!restatementOpenUnder(root, tenant, entry, now)) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
+      if (!proposalOpenUnder(root, tenant, entry, now, { restatementsOnly })) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
     }
   } catch { /* no exclusions ledger or module: nothing held there */ }
   return held;
@@ -839,7 +846,7 @@ function verdictBlockers({ issue, row, config = DEFAULT_CONFIG, owner, fleetIden
 }
 
 // `frontier --role arbiter`: the open proposals the Arbiter should rule on, oldest first.
-function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, config = DEFAULT_CONFIG, entries = [], held = new Map(), tenant, now, paused = false, suspended = false, why = '' } = {}) {
+function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, config = DEFAULT_CONFIG, entries = [], held = new Map(), leadHolds = new Set(), tenant, now, paused = false, suspended = false, why = '' } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const owner = requireText(ownerLogin, 'ownerLogin');
   const base = { role: 'arbiter', tenant: tenant ? String(tenant) : null, at, ownerLogin: owner, suspended: Boolean(suspended), paused: Boolean(paused) };
@@ -855,8 +862,9 @@ function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, 
     const failures = verdictBlockers({ issue, row, config, owner, fleetIdentity, held });
     if (!failures.length && newestVerdict(issue, fleetIdentity, proposed.at)) failures.push({ code: 'verdict-posted', detail: 'a Verdict comment from the fleet identity is newer than the proposal' });
     if (failures.length) { skipped.push({ number: issue.number, reason: `${failures[0].code}: ${failures[0].detail}` }); continue; }
-    // fleet #362: a stale-premise restatement's Verdict is the line its lead waits on, as an escalation's is.
-    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId || proposed.reason === 'stale-premise'), reason: 'open proposal with no verdict' });
+    // fleet #362: a stale-premise restatement's Verdict is the line its lead waits on, as an escalation's is. fleet #366: so is any
+    // proposal's with a lead's hold under it.
+    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId || proposed.reason === 'stale-premise' || leadHolds.has(issue.number)), reason: 'open proposal with no verdict' });
   }
   eligible.sort((left, right) => left.proposedAt.localeCompare(right.proposedAt) || left.number - right.number);
   return { ...base, eligible, counts: { proposals: eligible.length, issues: issues.length }, skipped };
@@ -871,7 +879,7 @@ function computeArbiterFrontier({ root, tenant, tenantConfigPath, fixture, now, 
   const source = fixture ? 'fixture' : 'github';
   // Suspended or paused: nothing is eligible, so GitHub is not read at all.
   const issues = standing.paused || standing.suspended ? [] : (given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner: runner || execFileSync })));
-  return { source, ...selectArbiterFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, config, entries: readLedger(root, tenant), held: readHeldIssues(root, tenant, at), tenant, now: at, ...standing }) };
+  return { source, ...selectArbiterFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, config, entries: readLedger(root, tenant), held: readHeldIssues(root, tenant, at), leadHolds: leadHeldIssues(root, tenant, at), tenant, now: at, ...standing }) };
 }
 
 function verdictRefused(conditions) {

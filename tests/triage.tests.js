@@ -2585,11 +2585,11 @@ test('fleet #305: an exact Endorsed put on hold afterwards is not served to the 
 });
 
 // fleet #362: a lead's lift-only exclusion ("waiting on a restated Premises") holds the ticket from launch, not from triage.
-// While a stale-premise restatement is open, the Arbiter's frontier and verdict door see it; Cory's holds and later ones still hold.
+// fleet #366: a lift-only hold is dropped for any open proposal, and any lead hold for a stale-premise restatement; state-merged and expiry holds still hold an ordinary proposal, and Cory's holds and later ones still hold.
 const { activeExclusions } = require('../bin/exclusions');
 const { selectFrontier: assignmentFrontier } = require('../bin/assignment');
 const STALE = { reason: 'stale-premise', premise: 'src/list.js: slices one short @abcdef1' };
-const leadHold = (root, { owner = 'pl-endzone', now = '2026-09-01T00:00:00.000Z' } = {}) => addExclusion({ root, tenant: 'endzone', issue: 40, reason: 'waiting on a restated premise', evidence: 'lead note', owner, recheck: { event: { type: 'exclusion-lifted' } }, actor: owner, now });
+const leadHold = (root, { owner = 'pl-endzone', now = '2026-09-01T00:00:00.000Z', recheck = { event: { type: 'exclusion-lifted' } } } = {}) => addExclusion({ root, tenant: 'endzone', issue: 40, reason: 'waiting on a restated premise', evidence: 'lead note', owner, recheck, actor: owner, now });
 
 test('fleet #362 A: a lead-owned lift-only exclusion older than a stale-premise restatement does not hold it from the Arbiter or the door', () => {
   const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
@@ -2609,10 +2609,101 @@ test('fleet #362 C: a lead-owned exclusion added after the stale-premise restate
   refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
 });
 
-test('fleet #362 D: a lead-owned exclusion over an ordinary proposal still holds it', () => {
+test('fleet #366 D: a lead-owned exclusion older than an ordinary proposal does not hold it from the Arbiter or the door', () => {
   const world = arbiterWorld({ afterPropose: (root) => leadHold(root) });
+  assert.deepEqual(computeFrontierArbiter(world).eligible.map((item) => [item.number, item.escalation]), [[40, true]]);
+  assert.equal(world.door({ kind: 'endorsed' }).recorded, true);
+});
+
+test('fleet #366 Return: a stale-premise proposal under a lead hold, Returned, superseded and re-proposed with no reason, is the Arbiter\'s escalation', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  world.door({ kind: 'returned', reasons: '1. no', text: '1. no' });
+  assert.match(computeFrontierArbiter(world).skipped[0].reason, /returned/);
+  const hash = triage.normalizeIssue(world.fixtureIssue()).bodyHash;
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: hash, now: '2026-09-12T12:01:00.000Z' });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', '2026-09-12T12:01:00.000Z').get(40), 'frontier exclusion endzone:excl-40-1');
+  const second = '2026-09-12T12:02:00.000Z';
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: hash, commentUrl: 'https://github.com/owner/repo/issues/40#issuecomment-second', model: 'opus-5.5', now: second });
+  const issues = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
+  issues[0].comments.push({ id: 'second', url: 'https://github.com/owner/repo/issues/40#issuecomment-second', author: FLEET, body: OPEN_PROPOSAL, createdAt: second });
+  fs.writeFileSync(world.fixture, JSON.stringify(issues));
+  assert.deepEqual(computeFrontierArbiter(world, '2026-09-12T12:03:00.000Z').eligible.map((item) => [item.commentUrl, item.escalation]), [['https://github.com/owner/repo/issues/40#issuecomment-second', true]]);
+});
+
+test('fleet #366 criteria-defect: an ordinary proposal answering a criteria-defect escalation under a lead hold is not held, and records no such reason', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root) });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).has(40), false);
+  assert.deepEqual(computeFrontierArbiter(world).eligible.map((item) => [item.number, item.escalation]), [[40, true]]);
+  assert.throws(() => recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: triage.normalizeIssue(world.fixtureIssue()).bodyHash, commentUrl: proposalUrl(40), model: 'opus-5.5', reason: 'criteria-defect', now: NOW }), { code: 'TRIAGE_INVALID', message: /--reason must be one of stale-premise/ });
+});
+
+test('fleet #366 Cory: a Cory-owned exclusion still holds an ordinary proposal from the Arbiter and the door', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root, { owner: 'cory' }) });
+  assert.deepEqual(computeFrontierArbiter(world).skipped.map((entry) => [entry.number, entry.reason.split(':')[0]]), [[40, 'held']]);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #366 skip: a skip-file entry still holds an ordinary proposal from the Arbiter and the door', () => {
+  const world = arbiterWorld({ afterPropose: (root) => { fs.mkdirSync(path.join(root, 'state', 'skip'), { recursive: true }); fs.writeFileSync(path.join(root, 'state', 'skip', 'endzone.json'), '{ "issues": { "40": "reason" } }'); } });
+  assert.deepEqual(computeFrontierArbiter(world).skipped.map((entry) => [entry.number, entry.reason.split(':')[0]]), [[40, 'held']]);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /skip file/);
+});
+
+test('fleet #366 newer: a lead-owned exclusion added after the ordinary proposal still holds it', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root, { now: '2026-09-11T00:00:00.000Z' }) });
   assert.deepEqual(computeFrontierArbiter(world).eligible, []);
   refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #366 G: the launch frontier still excludes the issue under the lead-owned exclusion with an ordinary proposal', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root) });
+  const active = activeExclusions({ root: world.root, tenant: 'endzone', now: NOW });
+  assert.deepEqual(active.map((entry) => entry.issue), [40]);
+  const launch = assignmentFrontier({ issues: [{ number: 40, state: 'OPEN', labels: ['ready-for-agent'], createdAt: '2026-09-01T00:00:00.000Z' }], readyLabel: 'ready-for-agent', exclusions: active });
+  assert.deepEqual(launch.eligible, []);
+  assert.equal(launch.excluded[0].reasons[0].code, 'frontier-exclusion');
+});
+
+test('fleet #366 plain: an ordinary proposal with no lead hold is eligible with escalation false', () => {
+  const world = arbiterWorld();
+  assert.deepEqual(computeFrontierArbiter(world).eligible.map((item) => [item.number, item.escalation]), [[40, false]]);
+});
+
+test('fleet #366 superseded: a superseded ordinary proposal with no successor holds the lead-owned exclusion again', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root) });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).has(40), false);
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: triage.normalizeIssue(world.fixtureIssue()).bodyHash, now: '2026-09-11T00:00:00.000Z' });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).get(40), 'frontier exclusion endzone:excl-40-1');
+});
+
+test('fleet #366 finalized: a finalized ordinary proposal holds the lead-owned exclusion again', () => {
+  const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).has(40), false, 'an open proposal is not held');
+  assert.deepEqual(world.finalize().finalized.map((row) => row.issue), [40]);
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', '2026-09-12T12:05:00.000Z').get(40), 'frontier exclusion endzone:excl-40-1');
+});
+
+test('fleet #366 state-merged: a lead-owned state-merged hold older than an ordinary proposal still holds it from the Arbiter and the door', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root, { recheck: { event: { type: 'state-merged', issue: 41 } } }) });
+  assert.deepEqual(computeFrontierArbiter(world).skipped.map((entry) => [entry.number, entry.reason.split(':')[0]]), [[40, 'held']]);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #366 expiry: a lead-owned expiry hold older than an ordinary proposal still holds it from the Arbiter and the door', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root, { recheck: { expiresAt: '2026-12-01T00:00:00.000Z' } }) });
+  assert.deepEqual(computeFrontierArbiter(world).skipped.map((entry) => [entry.number, entry.reason.split(':')[0]]), [[40, 'held']]);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #366 restatement: a stale-premise restatement under a lead-owned state-merged hold is still dropped, as #362 has it', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root, { recheck: { event: { type: 'state-merged', issue: 41 } } }) });
+  assert.deepEqual(computeFrontierArbiter(world).eligible.map((item) => [item.number, item.escalation]), [[40, true]]);
+  assert.equal(world.door({ kind: 'endorsed' }).recorded, true);
+});
+
+test('fleet #366 bounded: the bounded door refuses an ordinary proposal under a lead-owned lift-only hold older than it, with held', () => {
+  const world = boundedRoot({ seed: (root) => addExclusion({ root, tenant: 'endzone', issue: 7, reason: 'parked', evidence: 'lead note', owner: 'pl-endzone', recheck: { event: { type: 'exclusion-lifted' } }, actor: 'pl-endzone', now: '2026-09-01T00:00:00.000Z' }) });
+  refusal(world, 'held', /frontier exclusion/);
 });
 
 test('fleet #362 E: a finalized row after the restatement holds the lead-owned exclusion again', () => {
