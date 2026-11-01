@@ -145,9 +145,11 @@ Decided:
   it.
 - A hold on a ticket after its Endorsement (`held`, `haiku-rehearsal`, a
   frontier exclusion) is Cory's; the Principal does not finalize over it. A
-  lead's exclusion older than an open stale-premise restatement is a launch
-  hold only (fleet #362). The record id must name the issue it is recorded on;
-  one naming another issue answers nothing and fails closed.
+  lead's lift-only exclusion older than an open proposal, or any lead's
+  exclusion older than a stale-premise restatement, is a launch hold only: the
+  Principal and the Arbiter still see the proposal (fleet #362, #366). The
+  record id must name the issue it is recorded on; one naming another issue
+  answers nothing and fails closed.
 
 ## Amendment 2026-10-20 - the Arbiter on Opus at xhigh, role efforts, six ICs (owner ruling)
 

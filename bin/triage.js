@@ -357,15 +357,28 @@ function unliftedLeadHolds({ root, tenant, now } = {}) {
   return holds;
 }
 
+// fleet #367 (QA): an unreadable or wrong-shaped state file reads as an empty map and is reported, so the holds page again (a repeat is the safe direction).
+function readLeadHoldState(file) {
+  const empty = { schemaVersion: 1, fired: {} };
+  try {
+    const state = readJsonFile(file, empty);
+    const plain = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    if (plain(state) && plain(state.fired)) return { state, error: null };
+    return { state: empty, error: 'not a { fired: {} } object' };
+  } catch (error) {
+    return { state: empty, error: String(error.message || error).split('\n')[0] };
+  }
+}
+
 // fleet #367: one dated page per flagged exclusion, once. Recorded only on a delivered send, so a failure retries next run.
 function runLeadHoldNotice({ root, now, send, dryRun = false } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const file = leadHoldNoticePath(root);
-  const notice = readJsonFile(file, { schemaVersion: 1, fired: {} });
+  const { state: notice, error: stateError } = readLeadHoldState(file);
   const dir = path.join(baseOf(root), 'state', 'triage');
   const tenants = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -6)).sort() : [];
   const flagged = [];
-  const errors = [];
+  const errors = stateError ? [{ file, detail: `unreadable state, paging again: ${stateError}` }] : [];
   for (const tenant of tenants) {
     try { flagged.push(...unliftedLeadHolds({ root, tenant, now: at })); } catch (error) { errors.push({ tenant, detail: String(error.message || error).split('\n')[0] }); }
   }
@@ -376,7 +389,7 @@ function runLeadHoldNotice({ root, now, send, dryRun = false } = {}) {
     if (notice.fired[hold.id]) continue;
     const message = {
       kind: 'dated', priority: 'normal', title: `Fleet: ${hold.tenant} #${hold.issue} hold never lifted`,
-      body: `${hold.owner} still holds ${hold.tenant} #${hold.issue} under exclusion ${hold.id} (reason: ${hold.reason}). The ticket was finalized at ${hold.finalizedAt} and shows ready-for-agent, but it cannot launch while the hold stands. If the hold is done, the lead lifts it: node C:/Users/Cory/fleet/bin/exclusions.js lift --tenant ${hold.tenant} --id ${hold.id} --actor ${hold.owner} --evidence "<why>"`,
+      body: `${hold.owner} still holds ${hold.tenant} #${hold.issue} under exclusion ${hold.id} (reason: ${hold.reason}). The ticket was finalized at ${hold.finalizedAt} and cannot launch while the hold stands. If the hold is done, the lead lifts it: node C:/Users/Cory/fleet/bin/exclusions.js lift --tenant ${hold.tenant} --id ${hold.id} --actor ${hold.owner} --evidence "<why>"`,
     };
     if (dryRun) { messages.push(message); continue; }
     let result;
@@ -384,9 +397,12 @@ function runLeadHoldNotice({ root, now, send, dryRun = false } = {}) {
     if (!result || !result.ok) { failed.push({ id: hold.id, detail: (result && result.detail) || null }); continue; }
     sent.push(hold.id);
     notice.fired[hold.id] = at;
-    const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(temporary, `${JSON.stringify(notice, null, 2)}\n`, 'utf8');
-    fs.renameSync(temporary, file);
+    // The page went out; a write that fails is reported, and the hold pages again next run.
+    try {
+      const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(temporary, `${JSON.stringify(notice, null, 2)}\n`, 'utf8');
+      fs.renameSync(temporary, file);
+    } catch (error) { errors.push({ file, detail: `state write failed: ${String(error.message || error).split('\n')[0]}` }); }
   }
   return { flagged: flagged.length, sent, failed, errors, ...(dryRun ? { messages } : {}) };
 }

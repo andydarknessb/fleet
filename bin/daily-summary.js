@@ -342,8 +342,8 @@ function cli(argv) {
 // must never do).
 function exitCodeFor(result) {
   const failedNotice = Boolean(result.staleNotice && result.staleNotice.attempted && !result.staleNotice.sent);
-  // fleet #367: a lead-hold page that failed to send is a failed notice too (it retries next run).
-  const failedLeadHold = Boolean(result.leadHoldNotice && result.leadHoldNotice.failed.length);
+  // fleet #367: a lead-hold page that failed to send, or a notice error (a corrupt ledger or state file, a failed write), is a failed notice too.
+  const failedLeadHold = Boolean(result.leadHoldNotice && (result.leadHoldNotice.failed.length || result.leadHoldNotice.errors.length));
   return ((result.attempted && !result.sent) || failedNotice || failedLeadHold) ? 1 : 0;
 }
 

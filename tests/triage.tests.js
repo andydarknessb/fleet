@@ -2882,3 +2882,35 @@ test('fleet #367 11: an unreadable ledger for one tenant is reported and does no
   assert.deepEqual(result.sent, ['endzone:excl-40-1']);
   assert.equal(sent.length, 1);
 });
+
+test('fleet #367 12: a bad state file reads as empty, reports one error naming the file, pages the due hold once, and the repaired file never repeats it', () => {
+  const bad = ['', '{"schemaVersion":1,"fired":{"endzone:excl-40-1":"2026-09-13T12:00:00.000Z"', '{}', '[]', 'null', '{"fired":null}', '{"fired":[]}'];
+  for (const content of bad) {
+    const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+    world.finalize();
+    const file = triage.leadHoldNoticePath(world.root);
+    fs.writeFileSync(file, content);
+    const { sent, send } = holdSends();
+    const first = triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send });
+    assert.deepEqual(first.sent, ['endzone:excl-40-1'], `${JSON.stringify(content)}: the due hold pages`);
+    assert.deepEqual(first.errors.map((error) => error.file), [file], `${JSON.stringify(content)}: one error, naming the file`);
+    const second = triage.runLeadHoldNotice({ root: world.root, now: '2026-09-14T12:00:00.000Z', send });
+    assert.deepEqual([second.sent, second.errors], [[], []], `${JSON.stringify(content)}: the repaired file pages nothing and reports nothing`);
+    assert.equal(sent.length, 1, `${JSON.stringify(content)}: never twice`);
+  }
+});
+
+test('fleet #367 13: a page that fails to send is not recorded, and only that hold pages on the next run', () => {
+  const holdOn = (root, issue) => addExclusion({ root, tenant: 'endzone', issue, reason: 'waiting on a restated premise', evidence: 'lead note', owner: 'pl-endzone', recheck: { event: { type: 'exclusion-lifted' } }, actor: 'pl-endzone', now: '2026-09-01T00:00:00.000Z' });
+  const world = finalizeWorld({ numbers: [40, 41, 42], afterPropose: (root) => [40, 41, 42].forEach((issue) => holdOn(root, issue)) });
+  assert.deepEqual(world.finalize().finalized.map((row) => row.issue), [40, 41, 42]);
+  const flaky = (message) => (message.title.includes(' #41 ') ? { ok: false, detail: 'down' } : { ok: true });
+  const first = triage.runLeadHoldNotice({ root: world.root, now: LEAD_HOLD_DUE, send: flaky });
+  assert.deepEqual(first.sent, ['endzone:excl-40-1', 'endzone:excl-42-1']);
+  assert.deepEqual(first.failed, [{ id: 'endzone:excl-41-1', detail: 'down' }]);
+  assert.deepEqual(first.errors, []);
+  const { sent, send } = holdSends();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: world.root, now: '2026-09-14T08:00:00.000Z', send }).sent, ['endzone:excl-41-1']);
+  assert.equal(sent.length, 1, 'only the failed hold pages again');
+  assert.match(sent[0].title, / #41 /);
+});

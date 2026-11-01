@@ -325,6 +325,21 @@ test('#367: the daily run pages a lead hold a day after its finalize on a quiet 
   assert.equal(cli(['--root', leadHeldRoot(), '--now', DUE, '--dry-run']).leadHoldNotice.messages.length, 1);
 });
 
+// fleet #367 (QA): a lead-hold scan that throws costs that notice, never the summary; the run exits non-zero for it.
+test('#367: a lead-hold scan that throws still sends the summary, reports the error, and exits non-zero', () => {
+  const root = rootDir();
+  seedDecision(root, { issue: 33, to: 'escalated', enteredAt: hoursAgo(1) });
+  // state/triage as a file, not a directory: the tenant listing itself throws (ENOTDIR), outside the per-tenant catch.
+  fs.mkdirSync(path.join(root, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'triage'), 'not a directory');
+  const send = sender();
+  const result = runDailySummary({ root, now: NOW, send });
+  assert.equal(result.sent, true);
+  assert.equal(send.calls.length, 1, 'the summary still pages');
+  assert.equal(result.leadHoldNotice.errors.length, 1);
+  assert.equal(exitCodeFor(result), 1, 'a notice error is a failed notice: non-zero');
+});
+
 // Spec fleet #193 (#211): the daily summary shows a standing Bounded-authority suspension
 // until Cory removes its flag, and runs the suspension scan first so the morning page is
 // current. A standing suspension is a reason to page even on a day nothing else waits.
