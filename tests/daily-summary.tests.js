@@ -293,6 +293,53 @@ test('#148: the daily run pages the due stale-premise notice once, quiet day or 
   assert.equal(dry.staleNotice.dryRun, true);
 });
 
+// fleet #367: a lead's lift-only hold standing a day after its finalize pages on the daily run, quiet day or not, under `leadHoldNotice`;
+// a failed page exits non-zero (cli() takes no injected sender, so the exit decision is tested through exitCodeFor, as above).
+test('#367: the daily run pages a lead hold a day after its finalize on a quiet day, reports it, and a failed page exits non-zero', () => {
+  const { recordEntry } = require('../bin/triage');
+  const { addExclusion } = require('../bin/exclusions');
+  const DUE = '2026-09-13T02:00:00.000Z';
+  const leadHeldRoot = () => {
+    const root = rootDir();
+    recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 40, bodyHash: 'h', commentUrl: 'https://x/40', model: 'fable', now: '2026-09-12T00:00:00.000Z' });
+    recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 40, by: 'cory', now: '2026-09-12T01:00:00.000Z' });
+    recordEntry({ root, tenant: 'endzone', kind: 'finalized', issue: 40, labels: 'ready-for-agent', now: '2026-09-12T02:00:00.000Z' });
+    addExclusion({ root, tenant: 'endzone', issue: 40, reason: 'waiting on a restated premise', evidence: 'lead note', owner: 'pl-endzone', recheck: { event: { type: 'exclusion-lifted' } }, actor: 'pl-endzone', now: '2026-09-01T00:00:00.000Z' });
+    return root;
+  };
+  const root = leadHeldRoot();
+  const sent = [];
+  const send = (message) => { sent.push(message); return { ok: true }; };
+  const result = runDailySummary({ root, now: DUE, send });
+  assert.equal(result.attempted, false, 'a quiet day: no summary page');
+  assert.equal(result.leadHoldNotice.flagged, 1);
+  assert.deepEqual(result.leadHoldNotice.sent, ['endzone:excl-40-1']);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].kind, 'dated');
+  assert.equal(exitCodeFor(result), 0);
+  assert.equal(runDailySummary({ root, now: '2026-09-14T02:00:00.000Z', send }).leadHoldNotice.sent.length, 0);
+  assert.equal(sent.length, 1, 'never twice');
+  const failing = runDailySummary({ root: leadHeldRoot(), now: DUE, send: () => ({ ok: false, detail: 'down' }) });
+  assert.equal(failing.leadHoldNotice.failed.length, 1);
+  assert.equal(exitCodeFor(failing), 1, 'a failed lead-hold page exits non-zero');
+  assert.equal(cli(['--root', leadHeldRoot(), '--now', DUE, '--dry-run']).leadHoldNotice.messages.length, 1);
+});
+
+// fleet #367 (QA): a lead-hold scan that throws costs that notice, never the summary; the run exits non-zero for it.
+test('#367: a lead-hold scan that throws still sends the summary, reports the error, and exits non-zero', () => {
+  const root = rootDir();
+  seedDecision(root, { issue: 33, to: 'escalated', enteredAt: hoursAgo(1) });
+  // state/triage as a file, not a directory: the tenant listing itself throws (ENOTDIR), outside the per-tenant catch.
+  fs.mkdirSync(path.join(root, 'state'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'triage'), 'not a directory');
+  const send = sender();
+  const result = runDailySummary({ root, now: NOW, send });
+  assert.equal(result.sent, true);
+  assert.equal(send.calls.length, 1, 'the summary still pages');
+  assert.equal(result.leadHoldNotice.errors.length, 1);
+  assert.equal(exitCodeFor(result), 1, 'a notice error is a failed notice: non-zero');
+});
+
 // Spec fleet #193 (#211): the daily summary shows a standing Bounded-authority suspension
 // until Cory removes its flag, and runs the suspension scan first so the morning page is
 // current. A standing suspension is a reason to page even on a day nothing else waits.

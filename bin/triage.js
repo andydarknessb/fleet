@@ -278,6 +278,8 @@ function recordEntry({ root, tenant, kind, issue, bodyHash, commentUrl, model, b
 // (wx) and marked fired only on a delivered page, so a replay never pages twice.
 
 const STALE_NOTICE_DAYS = 30;
+// fleet #367: after #362 a lead's lift-only exclusion goes back to holding once its proposal is finalized, and nothing else tells anyone the lead never lifted it.
+const LEAD_HOLD_NOTICE_HOURS = 24;
 const PROPOSAL_REASONS = Object.freeze(['stale-premise']);
 
 function staleNoticePath(root) {
@@ -332,6 +334,77 @@ function runStalePremiseNotice({ root, now, send, dryRun = false } = {}) {
   fs.writeFileSync(temporary, `${JSON.stringify(fired, null, 2)}\n`, 'utf8');
   fs.renameSync(temporary, file);
   return { armed: true, due: true, sent: true, attempted: true, firedAt: at, tally: counts };
+}
+
+// fleet #367: a lead's lift-only exclusion still standing a day after a finalize newer than it. Only the lead lifts it
+// (#362: its reason may be unrelated), so this flags and pages; it never lifts. An unreadable ledger throws.
+function leadHoldNoticePath(root) {
+  return path.join(baseOf(root), 'state', 'triage', 'lead-hold-notice.json');
+}
+
+function unliftedLeadHolds({ root, tenant, now } = {}) {
+  const { activeExclusions, LIFT_ONLY_RECHECK_EVENTS } = require('./exclusions');
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const byIssue = projectTriage({ entries: readLedger(root, tenant), now: at }).byIssue;
+  const holds = [];
+  for (const entry of activeExclusions({ root, tenant, now: at })) {
+    if (entry.owner !== `pl-${tenant}` || !entry.recheck.event || !LIFT_ONLY_RECHECK_EVENTS.includes(entry.recheck.event.type)) continue;
+    const row = byIssue[Number(entry.issue)];
+    if (!row || !row.finalized || !(row.finalized.at > entry.at)) continue;
+    if (Date.parse(at) - Date.parse(row.finalized.at) < LEAD_HOLD_NOTICE_HOURS * 3600000) continue;
+    holds.push({ tenant, issue: entry.issue, id: entry.id, owner: entry.owner, reason: entry.reason, finalizedAt: row.finalized.at });
+  }
+  return holds;
+}
+
+// fleet #367 (QA): an unreadable or wrong-shaped state file reads as an empty map and is reported, so the holds page again (a repeat is the safe direction).
+function readLeadHoldState(file) {
+  const empty = { schemaVersion: 1, fired: {} };
+  try {
+    const state = readJsonFile(file, empty);
+    const plain = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    if (plain(state) && plain(state.fired)) return { state, error: null };
+    return { state: empty, error: 'not a { fired: {} } object' };
+  } catch (error) {
+    return { state: empty, error: String(error.message || error).split('\n')[0] };
+  }
+}
+
+// fleet #367: one dated page per flagged exclusion, once. Recorded only on a delivered send, so a failure retries next run.
+function runLeadHoldNotice({ root, now, send, dryRun = false } = {}) {
+  const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  const file = leadHoldNoticePath(root);
+  const { state: notice, error: stateError } = readLeadHoldState(file);
+  const dir = path.join(baseOf(root), 'state', 'triage');
+  const tenants = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -6)).sort() : [];
+  const flagged = [];
+  const errors = stateError ? [{ file, detail: `unreadable state, paging again: ${stateError}` }] : [];
+  for (const tenant of tenants) {
+    try { flagged.push(...unliftedLeadHolds({ root, tenant, now: at })); } catch (error) { errors.push({ tenant, detail: String(error.message || error).split('\n')[0] }); }
+  }
+  const sent = [];
+  const failed = [];
+  const messages = [];
+  for (const hold of flagged) {
+    if (notice.fired[hold.id]) continue;
+    const message = {
+      kind: 'dated', priority: 'normal', title: `Fleet: ${hold.tenant} #${hold.issue} hold never lifted`,
+      body: `${hold.owner} still holds ${hold.tenant} #${hold.issue} under exclusion ${hold.id} (reason: ${hold.reason}). The ticket was finalized at ${hold.finalizedAt} and cannot launch while the hold stands. If the hold is done, the lead lifts it: node C:/Users/Cory/fleet/bin/exclusions.js lift --tenant ${hold.tenant} --id ${hold.id} --actor ${hold.owner} --evidence "<why>"`,
+    };
+    if (dryRun) { messages.push(message); continue; }
+    let result;
+    try { result = send(message); } catch (error) { result = { ok: false, detail: `send threw: ${String(error.message || error).slice(0, 200)}` }; }
+    if (!result || !result.ok) { failed.push({ id: hold.id, detail: (result && result.detail) || null }); continue; }
+    sent.push(hold.id);
+    notice.fired[hold.id] = at;
+    // The page went out; a write that fails is reported, and the hold pages again next run.
+    try {
+      const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+      fs.writeFileSync(temporary, `${JSON.stringify(notice, null, 2)}\n`, 'utf8');
+      fs.renameSync(temporary, file);
+    } catch (error) { errors.push({ file, detail: `state write failed: ${String(error.message || error).split('\n')[0]}` }); }
+  }
+  return { flagged: flagged.length, sent, failed, errors, ...(dryRun ? { messages } : {}) };
 }
 
 // One row per stale-premise proposal: the premise, when it was proposed, and
@@ -527,18 +600,25 @@ function parseRecordIssue(recordId) {
 
 // ------------------------------------------------------------- held sets ----
 
-// fleet #362: a lead's lift-only exclusion older than an open stale-premise restatement is a launch hold only: the
-// restatement it waits on must reach the Arbiter and the door. A superseded or rejected one no longer waits, so it holds again.
-// An unreadable ledger keeps the hold (fail safe).
-function restatementOpenUnder(root, tenant, entry, now) {
+// fleet #362, #366: a lead's lift-only exclusion older than an open proposal, or any lead exclusion older than a stale-premise
+// restatement, is a launch hold only: assignment.js still honours it, and the Principal and the Arbiter must see the proposal.
+// A state-merged or expiry hold keeps holding an ordinary proposal: it ends on its own. A superseded, rejected or finalized
+// proposal holds again. An unreadable ledger keeps the hold (fail safe).
+function proposalOpenUnder(root, tenant, entry, now, { restatementsOnly = false } = {}) {
   if (entry.owner !== `pl-${tenant}`) return false;
   try {
+    const { LIFT_ONLY_RECHECK_EVENTS } = require('./exclusions');
     const row = projectTriage({ entries: readLedger(root, tenant), now }).byIssue[Number(entry.issue)];
-    return Boolean(row && row.proposed && row.proposed.reason === 'stale-premise' && row.proposed.at > entry.at && !row.finalized && !(row.outcome && ['superseded', 'rejected'].includes(row.outcome.kind)));
+    return Boolean(row && row.proposed && (row.proposed.reason === 'stale-premise' || (!restatementsOnly && LIFT_ONLY_RECHECK_EVENTS.includes(entry.recheck && entry.recheck.event && entry.recheck.event.type))) && row.proposed.at > entry.at && !row.finalized && !(row.outcome && ['superseded', 'rejected'].includes(row.outcome.kind)));
   } catch { return false; }
 }
 
-function readHeldIssues(root, tenant, now) {
+// fleet #366: the issues under a lead's exclusion, for the Arbiter's escalation flag (not a hold).
+function leadHeldIssues(root, tenant, now) {
+  try { return new Set(require('./exclusions').activeExclusions({ root, tenant, now }).filter((entry) => entry.owner === `pl-${tenant}`).map((entry) => Number(entry.issue))); } catch { return new Set(); }
+}
+
+function readHeldIssues(root, tenant, now, { restatementsOnly = false } = {}) {
   const held = new Map();
   try {
     const skip = readJsonFile(path.join(baseOf(root), 'state', 'skip', `${tenant}.json`), null);
@@ -547,7 +627,7 @@ function readHeldIssues(root, tenant, now) {
   try {
     const { activeExclusions } = require('./exclusions');
     for (const entry of activeExclusions({ root, tenant, now }) || []) {
-      if (!restatementOpenUnder(root, tenant, entry, now)) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
+      if (!proposalOpenUnder(root, tenant, entry, now, { restatementsOnly })) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
     }
   } catch { /* no exclusions ledger or module: nothing held there */ }
   return held;
@@ -839,7 +919,7 @@ function verdictBlockers({ issue, row, config = DEFAULT_CONFIG, owner, fleetIden
 }
 
 // `frontier --role arbiter`: the open proposals the Arbiter should rule on, oldest first.
-function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, config = DEFAULT_CONFIG, entries = [], held = new Map(), tenant, now, paused = false, suspended = false, why = '' } = {}) {
+function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, config = DEFAULT_CONFIG, entries = [], held = new Map(), leadHolds = new Set(), tenant, now, paused = false, suspended = false, why = '' } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const owner = requireText(ownerLogin, 'ownerLogin');
   const base = { role: 'arbiter', tenant: tenant ? String(tenant) : null, at, ownerLogin: owner, suspended: Boolean(suspended), paused: Boolean(paused) };
@@ -855,8 +935,9 @@ function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, 
     const failures = verdictBlockers({ issue, row, config, owner, fleetIdentity, held });
     if (!failures.length && newestVerdict(issue, fleetIdentity, proposed.at)) failures.push({ code: 'verdict-posted', detail: 'a Verdict comment from the fleet identity is newer than the proposal' });
     if (failures.length) { skipped.push({ number: issue.number, reason: `${failures[0].code}: ${failures[0].detail}` }); continue; }
-    // fleet #362: a stale-premise restatement's Verdict is the line its lead waits on, as an escalation's is.
-    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId || proposed.reason === 'stale-premise'), reason: 'open proposal with no verdict' });
+    // fleet #362: a stale-premise restatement's Verdict is the line its lead waits on, as an escalation's is. fleet #366: so is any
+    // proposal's with a lead's hold under it.
+    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId || proposed.reason === 'stale-premise' || leadHolds.has(issue.number)), reason: 'open proposal with no verdict' });
   }
   eligible.sort((left, right) => left.proposedAt.localeCompare(right.proposedAt) || left.number - right.number);
   return { ...base, eligible, counts: { proposals: eligible.length, issues: issues.length }, skipped };
@@ -871,7 +952,7 @@ function computeArbiterFrontier({ root, tenant, tenantConfigPath, fixture, now, 
   const source = fixture ? 'fixture' : 'github';
   // Suspended or paused: nothing is eligible, so GitHub is not read at all.
   const issues = standing.paused || standing.suspended ? [] : (given || (fixture ? readFixtureIssues(fixture) : queryGithubIssues({ repo: tenantConfig.github, runner: runner || execFileSync })));
-  return { source, ...selectArbiterFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, config, entries: readLedger(root, tenant), held: readHeldIssues(root, tenant, at), tenant, now: at, ...standing }) };
+  return { source, ...selectArbiterFrontier({ issues, ownerLogin, fleetIdentity: tenantConfig.fleetIdentity || null, config, entries: readLedger(root, tenant), held: readHeldIssues(root, tenant, at), leadHolds: leadHeldIssues(root, tenant, at), tenant, now: at, ...standing }) };
 }
 
 function verdictRefused(conditions) {
@@ -1564,6 +1645,8 @@ module.exports = {
   readTenantConfig,
   readTriageConfig,
   recordEntry,
+  runLeadHoldNotice,
+  leadHoldNoticePath,
   runStalePremiseNotice,
   staleNoticePath,
   selectTriageFrontier,

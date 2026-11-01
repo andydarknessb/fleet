@@ -253,7 +253,8 @@ function boundedFailures({ root, tenant, number, issue, row, open, entries, proj
   const owner = ownerLoginOf(tenantConfig);
   const proposalComment = issue.comments.find((comment) => comment.url && comment.url === open.commentUrl) || null;
   const outbox = readOutbox(outboxPath ? path.resolve(outboxPath) : path.join(baseOf(root), 'state', 'watch', 'wake-outbox.jsonl'));
-  const gate = proposalGate({ issue, row, proposal: proposalComment, approval: null, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough, holds: readHeldIssues(root, tenant, at) });
+  // fleet #366: no human reads a bounded ready, and it writes no finalized row for #367 to page on, so only a restatement drops a lead's hold here.
+  const gate = proposalGate({ issue, row, proposal: proposalComment, approval: null, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough, holds: readHeldIssues(root, tenant, at, { restatementsOnly: true }) });
   for (const failure of gate) {
     // The gate's own "premises" (a block of at least one verified line) is replaced by the stricter
     // body-matching check below. Its edited-after-approval code stays (with no approval it means the comment was edited
