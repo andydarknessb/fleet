@@ -527,6 +527,17 @@ function parseRecordIssue(recordId) {
 
 // ------------------------------------------------------------- held sets ----
 
+// fleet #362: a lead's lift-only exclusion older than an open stale-premise restatement is a launch hold only: the
+// restatement it waits on must reach the Arbiter and the door. A superseded or rejected one no longer waits, so it holds again.
+// An unreadable ledger keeps the hold (fail safe).
+function restatementOpenUnder(root, tenant, entry, now) {
+  if (entry.owner !== `pl-${tenant}`) return false;
+  try {
+    const row = projectTriage({ entries: readLedger(root, tenant), now }).byIssue[Number(entry.issue)];
+    return Boolean(row && row.proposed && row.proposed.reason === 'stale-premise' && row.proposed.at > entry.at && !row.finalized && !(row.outcome && ['superseded', 'rejected'].includes(row.outcome.kind)));
+  } catch { return false; }
+}
+
 function readHeldIssues(root, tenant, now) {
   const held = new Map();
   try {
@@ -535,7 +546,9 @@ function readHeldIssues(root, tenant, now) {
   } catch { /* an unreadable skip file holds nothing; exclusions below are the structured record */ }
   try {
     const { activeExclusions } = require('./exclusions');
-    for (const entry of activeExclusions({ root, tenant, now }) || []) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
+    for (const entry of activeExclusions({ root, tenant, now }) || []) {
+      if (!restatementOpenUnder(root, tenant, entry, now)) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
+    }
   } catch { /* no exclusions ledger or module: nothing held there */ }
   return held;
 }
@@ -842,7 +855,8 @@ function selectArbiterFrontier({ issues = [], ownerLogin, fleetIdentity = null, 
     const failures = verdictBlockers({ issue, row, config, owner, fleetIdentity, held });
     if (!failures.length && newestVerdict(issue, fleetIdentity, proposed.at)) failures.push({ code: 'verdict-posted', detail: 'a Verdict comment from the fleet identity is newer than the proposal' });
     if (failures.length) { skipped.push({ number: issue.number, reason: `${failures[0].code}: ${failures[0].detail}` }); continue; }
-    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId), reason: 'open proposal with no verdict' });
+    // fleet #362: a stale-premise restatement's Verdict is the line its lead waits on, as an escalation's is.
+    eligible.push({ kind: 'verdict', number: issue.number, issue: issue.number, title: issue.title, url: issue.url, bodyHash: proposed.bodyHash, commentUrl: proposed.commentUrl, proposedAt: proposed.at, escalation: Boolean(proposed.recordId || proposed.reason === 'stale-premise'), reason: 'open proposal with no verdict' });
   }
   eligible.sort((left, right) => left.proposedAt.localeCompare(right.proposedAt) || left.number - right.number);
   return { ...base, eligible, counts: { proposals: eligible.length, issues: issues.length }, skipped };

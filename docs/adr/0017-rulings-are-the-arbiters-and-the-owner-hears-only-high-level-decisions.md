@@ -128,7 +128,8 @@ judgment.
 Decided:
 
 - An exact `Endorsed` on an escalation ruling recorded against its wake
-  (`--record-id`, the flag the Arbiter's frontier shows as `escalation: true`
+  (`--record-id`, the flag the Arbiter's frontier shows as `escalation: true`;
+  a stale-premise restatement also shows it, fleet #362,
   and sends the lead's line on) is finalized by script. For the `endorsed`
   branch alone, clause 7 does not refuse such a proposal, and clause 9 accepts
   the ready label and the escalation label on it (the ticket is mid-work by
@@ -143,9 +144,10 @@ Decided:
   Verdict that the script did not write is the Principal's: the script leaves
   it.
 - A hold on a ticket after its Endorsement (`held`, `haiku-rehearsal`, a
-  frontier exclusion) is Cory's; the Principal does not finalize over it. The
-  record id must name the issue it is recorded on; one naming another issue
-  answers nothing and fails closed.
+  frontier exclusion) is Cory's; the Principal does not finalize over it. A
+  lead's exclusion older than an open stale-premise restatement is a launch
+  hold only (fleet #362). The record id must name the issue it is recorded on;
+  one naming another issue answers nothing and fails closed.
 
 ## Amendment 2026-10-20 - the Arbiter on Opus at xhigh, role efforts, six ICs (owner ruling)
 

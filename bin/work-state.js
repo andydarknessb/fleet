@@ -1009,8 +1009,10 @@ function createRecord(options = {}) {
       throw new WorkStateError('RECORD_EXISTS', `record '${options.id}' already exists`);
     }
     if (fs.existsSync(archiveFile(p, options.id))) throw new WorkStateError('RECORD_ARCHIVED', `record '${options.id}' is archived and cannot be reused`);
-    if (fs.existsSync(releaseFile(p, options.id))) throw new WorkStateError('RECORD_RELEASED', `record '${options.id}' was released; only reserve can reuse it`);
-    if (fs.existsSync(abandonFile(p, options.id))) throw new WorkStateError('RECORD_ABANDONED', `record '${options.id}' was abandoned; only reserve can reuse it`);
+    // fleet #362: the refusal names the door that reuses the record (a lead reads it, it does not guess the tenant or issue).
+    const reuse = () => { const [, tenant, issue] = /^(.+):issue-(\d+)$/.exec(String(options.id)) || []; return `work-state.js reserve --id ${options.id} --tenant ${options.tenant || tenant} --issue ${options.issue || issue}`; };
+    if (fs.existsSync(releaseFile(p, options.id))) throw new WorkStateError('RECORD_RELEASED', `record '${options.id}' was released; only reserve can reuse it: ${reuse()}`);
+    if (fs.existsSync(abandonFile(p, options.id))) throw new WorkStateError('RECORD_ABANDONED', `record '${options.id}' was abandoned; only reserve can reuse it: ${reuse()}`);
     const now = isoNow(options.now);
     const record = baseRecord({ ...options, now });
     record.idempotency[key] = { revision: 1, eventSequence: 1, type: options.shadow ? 'shadow-projected' : 'work-created' };

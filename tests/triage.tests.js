@@ -779,7 +779,7 @@ function finalizeWorld({ numbers = [40], each = () => ({}), history, afterPropos
   const issues = numbers.map((number) => {
     const options = each(number);
     const body = options.body || BODY;
-    recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: number, bodyHash: triage.normalizeIssue(issue(number, { body: options.proposedBody || body })).bodyHash, commentUrl: proposalUrl(number), model: 'fable', recordId: options.recordId || recordId, now: PROPOSED_AT });
+    recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: number, bodyHash: triage.normalizeIssue(issue(number, { body: options.proposedBody || body })).bodyHash, commentUrl: proposalUrl(number), model: 'fable', recordId: options.recordId || recordId, reason: options.reason, premise: options.premise, now: PROPOSED_AT });
     return issue(number, { body, labels: options.labels || ['needs-triage', 'triage-proposed'], comments: options.comments || thread(number, options.thread) });
   });
   if (afterPropose) afterPropose(root);
@@ -2582,4 +2582,89 @@ test('fleet #305: an exact Endorsed put on hold afterwards is not served to the 
   const frontier = computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: '2026-09-12T12:01:00.000Z' });
   assert.deepEqual(frontier.eligible, []);
   assert.ok(frontier.skipped.some((entry) => entry.number === 40 && /on hold/.test(entry.reason)));
+});
+
+// fleet #362: a lead's lift-only exclusion ("waiting on a restated Premises") holds the ticket from launch, not from triage.
+// While a stale-premise restatement is open, the Arbiter's frontier and verdict door see it; Cory's holds and later ones still hold.
+const { activeExclusions } = require('../bin/exclusions');
+const { selectFrontier: assignmentFrontier } = require('../bin/assignment');
+const STALE = { reason: 'stale-premise', premise: 'src/list.js: slices one short @abcdef1' };
+const leadHold = (root, { owner = 'pl-endzone', now = '2026-09-01T00:00:00.000Z' } = {}) => addExclusion({ root, tenant: 'endzone', issue: 40, reason: 'waiting on a restated premise', evidence: 'lead note', owner, recheck: { event: { type: 'exclusion-lifted' } }, actor: owner, now });
+
+test('fleet #362 A: a lead-owned lift-only exclusion older than a stale-premise restatement does not hold it from the Arbiter or the door', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  assert.deepEqual(computeFrontierArbiter(world).eligible.map((item) => [item.number, item.escalation]), [[40, true]]);
+  assert.equal(world.door({ kind: 'endorsed' }).recorded, true);
+});
+
+test('fleet #362 B: a Cory-owned exclusion still holds a stale-premise restatement from the Arbiter and the door', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root, { owner: 'cory' }) });
+  assert.deepEqual(computeFrontierArbiter(world).skipped.map((entry) => [entry.number, entry.reason.split(':')[0]]), [[40, 'held']]);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #362 C: a lead-owned exclusion added after the stale-premise restatement still holds it', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root, { now: '2026-09-11T00:00:00.000Z' }) });
+  assert.deepEqual(computeFrontierArbiter(world).eligible, []);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #362 D: a lead-owned exclusion over an ordinary proposal still holds it', () => {
+  const world = arbiterWorld({ afterPropose: (root) => leadHold(root) });
+  assert.deepEqual(computeFrontierArbiter(world).eligible, []);
+  refusedWith(() => world.door({ kind: 'endorsed' }), 'held', /frontier exclusion/);
+});
+
+test('fleet #362 E: a finalized row after the restatement holds the lead-owned exclusion again', () => {
+  const world = finalizeWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).has(40), false, 'an open restatement is not held');
+  assert.deepEqual(world.finalize().finalized.map((row) => row.issue), [40]);
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', '2026-09-12T12:05:00.000Z').get(40), 'frontier exclusion endzone:excl-40-1');
+});
+
+test('fleet #362 F: a declined Endorsement under the lead-owned exclusion reaches the Principal; under a Cory hold it still waits on Cory', () => {
+  // The Endorsement is declined by its gate: the ready label is still on the issue (clause 9).
+  const endorsedWorld = (owner) => {
+    const world = arbiterWorld({ each: () => ({ ...STALE, labels: ['needs-triage', 'triage-proposed', 'ready-for-agent'], comments: [...thread(40, { approval: null, proposal: OPEN_PROPOSAL }), verdictComment(40, '## Verdict\nEndorsed', '2026-09-11T00:00:00.000Z')] }), afterPropose: (root) => leadHold(root, { owner }) });
+    recordEntry({ root: world.root, tenant: 'endzone', kind: 'endorsed', issue: 40, bodyHash: triage.normalizeIssue(world.fixtureIssue()).bodyHash, commentUrl: proposalUrl(40), now: '2026-09-11T00:00:00.000Z' });
+    return world;
+  };
+  const leadWorld = endorsedWorld('pl-endzone');
+  const served = computeFrontier({ root: leadWorld.root, tenant: 'endzone', fixture: leadWorld.fixture, now: NOW });
+  assert.deepEqual(served.eligible.map((item) => item.kind), ['endorsement']);
+  assert.match(served.eligible[0].reason, /finalize script declined \(labels/);
+  const ownerWorld = endorsedWorld('cory');
+  const waiting = computeFrontier({ root: ownerWorld.root, tenant: 'endzone', fixture: ownerWorld.fixture, now: NOW });
+  assert.deepEqual(waiting.eligible, []);
+  assert.match(waiting.skipped.find((entry) => entry.number === 40).reason, /endorsed, then put on hold; waiting on Cory/);
+});
+
+test('fleet #362 G: the launch frontier still excludes the issue under the lead-owned exclusion', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  const active = activeExclusions({ root: world.root, tenant: 'endzone', now: NOW });
+  assert.deepEqual(active.map((entry) => entry.issue), [40]);
+  const launch = assignmentFrontier({ issues: [{ number: 40, state: 'OPEN', labels: ['ready-for-agent'], createdAt: '2026-09-01T00:00:00.000Z' }], readyLabel: 'ready-for-agent', exclusions: active });
+  assert.deepEqual(launch.eligible, []);
+  assert.equal(launch.excluded[0].reasons[0].code, 'frontier-exclusion');
+});
+
+test('fleet #362 H: a superseded stale-premise proposal with no successor holds the lead-owned exclusion again', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).has(40), false);
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 40, bodyHash: triage.normalizeIssue(world.fixtureIssue()).bodyHash, now: '2026-09-11T00:00:00.000Z' });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).get(40), 'frontier exclusion endzone:excl-40-1');
+});
+
+test('fleet #362 H2: a rejected stale-premise proposal holds the lead-owned exclusion again', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).has(40), false);
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'rejected', issue: 40, by: OWNER, now: '2026-09-11T00:00:00.000Z' });
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).get(40), 'frontier exclusion endzone:excl-40-1');
+});
+
+test('fleet #362 I: an unreadable triage ledger keeps the lead-owned exclusion holding', () => {
+  const world = arbiterWorld({ each: () => ({ ...STALE }), afterPropose: (root) => leadHold(root) });
+  const file = triage.ledgerPath(world.root, 'endzone');
+  fs.writeFileSync(file, `not json\n${fs.readFileSync(file, 'utf8')}`);
+  assert.equal(triage.readHeldIssues(world.root, 'endzone', NOW).get(40), 'frontier exclusion endzone:excl-40-1');
 });
