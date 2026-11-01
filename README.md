@@ -10,7 +10,7 @@ cory
  └─ Fleet watchdog (task)  the supervisor: keeps the roster alive and under the cap; never reasons about work (cut over from the sentinel session 2026-09-04; rollback path retired by ticket 89)
      └─ pl-<tenant> (sonnet-5.5, high)   one per tenant; turns ready issues into ICs; reviews and merges; where you attach (`claude attach`) to talk to the fleet
          └─ ic-<issue> (haiku 5.5; xhigh, or max) one per issue, up to the tenant's `maxIcs` (6) and six fleet-wide under the roster cap of 8; launched from a manifest with /implement; opens a PR; talks only to its project lead
-             └─ qa-reviewer (opus worker, high)   risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
+             └─ qa-reviewer (sonnet worker, high) risk reviewer, spawned by the IC pre-PR-ready only on a configured risk trigger (ticket 05)
      └─ pe-<tenant> (opus-5.5, high)  the Principal (ADR 0011): reads unrouted tickets and decision-needed escalations, posts triage proposals; the Arbiter decides each one, or Cory's `Approved` comment does. Outside the cap. Inert until `state/flags/principal-live`.
      └─ ar-<tenant> (opus-5.5, xhigh)  the Arbiter (ADR 0017): reads each triage proposal and posts a Verdict; an Endorsement is a ruling. Outside the cap. Inert until `state/flags/arbiter-live`.
 ```

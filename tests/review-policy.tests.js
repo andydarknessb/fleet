@@ -133,7 +133,7 @@ test('a larger diff with no triggers is normal and still gets no risk reviewer',
   assert.equal(classification.reviewPlan.risk, null);
 });
 
-test('a carve-out path is high-risk, cory-only to merge, and books the IC-hosted opus risk reviewer', () => {
+test('a carve-out path is high-risk, cory-only to merge, and books the IC-hosted sonnet risk reviewer', () => {
   const classification = classifyChange({
     files: ['server/db/migrations/20260901_add_thing.js', 'server/services/thing.js'],
     changedLines: 40,
@@ -147,7 +147,7 @@ test('a carve-out path is high-risk, cory-only to merge, and books the IC-hosted
   assert.ok(carveOut);
   assert.equal(carveOut.matches[0].file, 'server/db/migrations/20260901_add_thing.js');
   assert.deepEqual(classification.reviewPlan.risk, {
-    host: 'ic', role: 'qa-reviewer', model: 'opus', readOnly: true, timing: 'pre-pr-ready',
+    host: 'ic', role: 'qa-reviewer', model: 'sonnet', readOnly: true, timing: 'pre-pr-ready',
   });
 });
 
