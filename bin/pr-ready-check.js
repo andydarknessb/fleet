@@ -302,7 +302,7 @@ function riskDefects({ repo, base, head, issue, tenant, root, classify, getRecor
   if (risk && risk.headSha === classified.headSha) return [];
   const names = (classified.classification.triggers || []).map((trigger) => trigger.class || trigger).join(', ');
   const where = risk ? `the recorded risk review ${risk.artifact} is at ${String(risk.headSha).slice(0, 8)}, not this head` : `${id} records no risk review`;
-  return [{ kind: 'risk-review', detail: `the diff trips risk trigger(s) ${names} at ${String(classified.headSha).slice(0, 8)} and ${where}. Spawn one qa-reviewer (opus) with those classes as its angle, verify its findings, and record it with review-policy.js record --kind risk at this head before the PR (ic.md step 5)` }];
+  return [{ kind: 'risk-review', detail: `the diff trips risk trigger(s) ${names} at ${String(classified.headSha).slice(0, 8)} and ${where}. Spawn one qa-reviewer (sonnet) with those classes as its angle, verify its findings, and record it with review-policy.js record --kind risk at this head before the PR (ic.md step 5)` }];
 }
 
 // --- the check ----------------------------------------------------------------------

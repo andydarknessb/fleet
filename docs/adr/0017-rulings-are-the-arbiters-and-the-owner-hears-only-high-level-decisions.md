@@ -221,3 +221,13 @@ Decided:
 - The project lead stays on `claude-sonnet-5-5` at effort high. Workers keep
   their own definitions: `qa-reviewer` on Opus 5.5 at high, `researcher` on
   Haiku 5.5.
+
+## Amendment 2026-11-01 - the qa-reviewer on Sonnet 5.5 at high (fleet #363, owner ruling)
+
+The `qa-reviewer` worker moves from Opus 5.5 to Sonnet 5.5, still at effort
+high. This replaces the worker lines in the amendments of 2026-10-20 and
+2026-10-30. An IC still spawns it only when a configured risk trigger fires,
+and the lead's formal review is unchanged.
+
+`bin/second-read.js` keeps its explicit `model: "opus"`: the weekly reviewer
+audit is a separate ruling (2026-09-24) and passes its own override.

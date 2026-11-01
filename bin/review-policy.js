@@ -6,7 +6,7 @@
 //                 (tenant carveOuts + tenant riskTriggers paths/patterns), and
 //                 therefore who reviews what: every PR gets the project lead's
 //                 ONE independent Standards+Spec review; only a configured
-//                 trigger books the IC-hosted, read-only, Opus risk reviewer
+//                 trigger books the IC-hosted, read-only, Sonnet risk reviewer
 //                 (amendment 5: the risk reviewer is spawned by the IC,
 //                 pre-PR-ready, because a worker bills to its spawner and the
 //                 lead is the context under budget). Patterns fire on added
@@ -193,7 +193,7 @@ function classifyChange(options = {}) {
     reviewPlan: {
       formal: { owner: 'project-lead', count: 1 },
       risk: riskReview
-        ? { host: 'ic', role: 'qa-reviewer', model: 'opus', readOnly: true, timing: 'pre-pr-ready' }
+        ? { host: 'ic', role: 'qa-reviewer', model: 'sonnet', readOnly: true, timing: 'pre-pr-ready' }
         : null,
     },
   };
