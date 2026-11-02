@@ -235,3 +235,16 @@ and the lead's formal review is unchanged.
 
 `bin/second-read.js` keeps its explicit `model: "opus"`: the weekly reviewer
 audit is a separate ruling (2026-09-24) and passes its own override.
+
+## Amendment 2026-11-02 - six ICs on statelite, roster cap 9 (fleet #370, owner ruling)
+
+Cory ruled, 2026-11-02: the IC limit goes from three to six. statelite was the
+one tenant still at 3 (fleet #354), so its `maxIcs` becomes 6.
+
+The owner session ruled the consequence. The 2026-10-20 arithmetic counted two
+project leads, and statelite brought a third (fleet #351), which left the cap of
+8 with room for five ICs. The static roster cap becomes 9: three project leads
+and six ICs. The Principal and Arbiter stay outside the cap. `scorecard.icCap`
+stays 6, and `icCapOf` now derives the same number from the roster. The
+fallbacks of 3 for a tenant with no `maxIcs` are unchanged, since every tenant
+sets it.
