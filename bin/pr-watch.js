@@ -320,11 +320,14 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   const evaluation = evaluateChecks(policy, livePr.statusCheckRollup);
 
   if (state === 'pr-open') {
+    // A gate already red wakes only on this first look: the digest cached here silences the next ci-wait tick.
     return {
       actions: [{
         kind: 'transition', to: 'ci-wait', observe: { pr: livePr, evaluation, closing: null },
-        evidence: `CI ${evaluation.settled ? 'already settled' : `incomplete: ${[...evaluation.gatePending, ...evaluation.gateFailures.map((f) => f.name)].join(', ') || 'no gates observed'}`}`,
-        wake: null,
+        evidence: evaluation.failed
+          ? `gate failure on PR #${prNumber}: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}`
+          : `CI ${evaluation.settled ? 'already settled' : `incomplete: ${evaluation.gatePending.join(', ') || 'no gates observed'}`}`,
+        wake: evaluation.failed ? 'checks-failed' : null,
       }],
     };
   }
