@@ -573,6 +573,60 @@ test('fleet#34: a gate failure at a re-readied head wakes checks-failed instead 
   assert.equal(wakes[0].wake, 'checks-failed');
 });
 
+const RED_G1 = [check('g1', 'COMPLETED', 'FAILURE'), check('g2', 'COMPLETED', 'SUCCESS')];
+function reviewTick(root, rollup) {
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: rollup })], viewResult: view({ body: 'Closes #42' }) }));
+}
+
+test('#376: a gate going red at the same head while review wakes checks-failed once; the next identical tick adds nothing', () => {
+  const root = rootDir();
+  seed(root);
+  reviewTick(root, GREEN);
+  assert.equal(record(root).state, 'review');
+  reviewTick(root, [check('g1', 'IN_PROGRESS', ''), check('g2', 'COMPLETED', 'SUCCESS')]);
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
+  reviewTick(root, RED_G1);
+  assert.equal(record(root).state, 'review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled', 'checks-failed']);
+  const observed = events(root).filter((e) => e.type === 'pr-observed').pop();
+  assert.equal(observed.changes.wake, 'checks-failed');
+  assert.equal(observed.evidence, 'gate failure on PR #77 while review: g1=FAILURE');
+  const before = events(root).length;
+  reviewTick(root, RED_G1);
+  assert.equal(outbox(root).length, 2);
+  assert.equal(events(root).length, before);
+});
+
+test('#376: a gate that goes red between two ticks while review wakes checks-failed with no pending tick first', () => {
+  const root = rootDir();
+  seed(root);
+  reviewTick(root, GREEN);
+  reviewTick(root, RED_G1);
+  assert.equal(record(root).state, 'review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled', 'checks-failed']);
+});
+
+test('#376: a change with no failed gate while review writes an observation and no wake', () => {
+  const root = rootDir();
+  seed(root);
+  reviewTick(root, GREEN);
+  const before = events(root).length;
+  reviewTick(root, [...GREEN, { __typename: 'StatusContext', context: 'fleet-review', state: 'SUCCESS', startedAt: '2026-11-05T18:11:52Z' }]);
+  assert.equal(events(root).length, before + 1);
+  assert.equal(events(root).filter((e) => e.type === 'pr-observed').pop().evidence, 'PR #77 changed while review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
+});
+
+test('#376: a gate going red at the same head while hold is observed with no wake; the PR is parked for the merge', () => {
+  const root = rootDir();
+  seed(root, { state: 'hold' });
+  const lines = outbox(root).length;
+  reviewTick(root, RED_G1);
+  assert.equal(record(root).state, 'hold');
+  assert.equal(events(root).filter((e) => e.type === 'pr-observed').pop().evidence, 'PR #77 changed while hold');
+  assert.equal(outbox(root).length, lines);
+});
+
 test('an implementing record discovers its PR by branch prefix and moves to pr-open', () => {
   const root = rootDir();
   seed(root, { state: 'implementing', prNumber: null });
