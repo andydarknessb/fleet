@@ -133,7 +133,8 @@ function stableStringify(value) {
 }
 
 function buildObservation(pr, evaluation, closing) {
-  const checks = (pr.statusCheckRollup || []).map((c) => `${checkName(c)}:${c.status || ''}:${c.conclusion || ''}`).sort();
+  // startedAt tells a rerun from the attempt already seen (#377). A StatusContext has no status, and its startedAt moves with every post, so it stays out.
+  const checks = (pr.statusCheckRollup || []).map((c) => `${checkName(c)}:${c.status || ''}:${c.conclusion || ''}:${c.status ? c.startedAt || '' : ''}`).sort();
   const body = {
     prNumber: pr.number, prState: String(pr.state || 'OPEN'), headSha: pr.headRefOid || null,
     mergedAt: pr.mergedAt || null, checks, closingVerified: closing === null ? null : Boolean(closing),

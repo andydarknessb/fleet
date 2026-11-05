@@ -194,6 +194,42 @@ test('one hundred identical polls append no event and touch no record after the 
   assert.equal(record(root).revision, rev);
 });
 
+function gateAttempt(startedAt) { return { ...check('g1', 'COMPLETED', 'FAILURE'), startedAt }; }
+const G2_GREEN = check('g2', 'COMPLETED', 'SUCCESS');
+
+test('#377: a rerun that fails again between two ticks writes a second checks-failed line', () => {
+  const root = rootDir();
+  seed(root);
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: [gateAttempt('2026-11-05T21:10:00Z'), G2_GREEN] })] }));
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: [gateAttempt('2026-11-05T21:32:58Z'), G2_GREEN] })] }));
+  assert.equal(record(root).state, 'ci-wait');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-failed', 'checks-failed']);
+});
+
+test('#377: one attempt polled repeatedly adds no event', () => {
+  const root = rootDir();
+  seed(root);
+  const f = fetchers({ open: [pr({ statusCheckRollup: [gateAttempt('2026-11-05T21:10:00Z'), G2_GREEN] })] });
+  watch(root, f);
+  const before = events(root).length;
+  for (let i = 0; i < 5; i += 1) watch(root, f);
+  assert.equal(events(root).length, before);
+  assert.equal(outbox(root).length, 1);
+});
+
+test('#377: a StatusContext never moves the digest, even when it posts again', () => {
+  const root = rootDir();
+  seed(root);
+  const status = (startedAt) => ({ __typename: 'StatusContext', context: 'netlify/deploy-preview', state: 'SUCCESS', startedAt });
+  const tick = (startedAt) => watch(root, fetchers({ open: [pr({ statusCheckRollup: [gateAttempt('2026-11-05T21:10:00Z'), G2_GREEN, status(startedAt)] })] }));
+  tick('2026-11-05T18:12:02Z');
+  const before = events(root).length;
+  tick('2026-11-05T18:12:02Z');
+  tick('2026-11-05T18:12:42Z');
+  assert.equal(events(root).length, before);
+  assert.equal(outbox(root).length, 1);
+});
+
 test('a changed gate state appends exactly one ordered event; an identical retry appends none', () => {
   const root = rootDir();
   seed(root);
