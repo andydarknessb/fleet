@@ -417,6 +417,58 @@ try {
   }
   Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
 
+  # ===== fleet #374: a `checks-failed` line is exempt from the lead's launch bound, like #344's resolution. The lead's
+  # door launch used to read as delivery of a red PR, so a relaunched lead never heard of it. An older line counts only
+  # while its record is still in ci-wait and its observation still lists a failed gate; a rerun (no failure listed), a
+  # record that moved on or is absent, or an unreadable active.json leaves it spent.
+  function Get-GatedActiveJson { param([string]$Id, [int]$Issue, [string]$State, [string]$FailuresJson) '{"schemaVersion":1,"records":{"test:' + $Id + '":{"tenant":"test","issue":' + $Issue + ',"state":"' + $State + '","github":{"observation":{"gates":{"failures":' + $FailuresJson + '}}}}}}' }
+  $lintFailed = '[{"name":"lint","conclusion":"FAILURE"}]'
+  $checksFailed374 = ([ordered]@{ at = (Get-Iso 30); recordId = 'test:issue-2605'; revision = 8; eventSequence = 8; wake = 'checks-failed'; idempotencyKey = 'watch:test:issue-2605:r8:aa:ci-wait'; actor = 'pr-watch'; evidence = 'gate failed on head aa' } | ConvertTo-Json -Compress)
+
+  # F1: the lead launched after the line, record still ci-wait with one failed gate -> woken, naming the record, once.
+  Start-WakeCase -LeadMinutes 23
+  Set-Active (Get-GatedActiveJson 'issue-2605' 2605 'ci-wait' $lintFailed)
+  Set-Outbox @($checksFailed374)
+  $f1 = Run-Watchdog; $wf1 = Get-TestWake $f1
+  Assert-True ($wf1.decision -eq 'woken' -and (@($wf1.evidence) -join '; ') -match 'checks-failed') "F1: a checks-failed line older than the lead's launch must wake while its record is in ci-wait with a failed gate (got $($wf1.decision): '$($wf1.reason)'; $(@($wf1.evidence) -join '; '))"
+  $callsF1 = @(Get-RotateCalls)
+  Assert-True ($callsF1.Count -eq 1 -and $callsF1[0] -match 'test:issue-2605') "F1: exactly one rotate.ps1 -Wake call, naming test:issue-2605 (got '$($callsF1 -join ' / ')')"
+  # F1b: the next tick must not wake again. The watermark, not the 60-minute cooldown, must keep the delivered line out (mirrors L1b).
+  $f1b = Run-Watchdog; $wf1b = Get-TestWake $f1b
+  Assert-True (@(Get-RotateCalls).Count -eq 1) "F1b: the next tick must not wake again (got $(@(Get-RotateCalls).Count) rotate calls)"
+  Assert-True ($wf1b.decision -eq 'none' -and (@($wf1b.evidence) -join '; ') -notmatch 'checks-failed') "F1b: the delivered checks-failed line must not be counted again (got $($wf1b.decision): $(@($wf1b.evidence) -join '; '))"
+
+  # F2-F6: the line is older than the launch and its record does not stand (a rerun pending, no observation, moved on,
+  # absent, or active.json unreadable) -> spent, no wake. F3 is the @($null) trap: without the Where-Object filter a
+  # missing failures list counts as one failure.
+  foreach ($case in @(
+      @{ id = 'F2 rerun pending (failures empty)'; json = (Get-GatedActiveJson 'issue-2605' 2605 'ci-wait' '[]') },
+      @{ id = 'F3 no github observation'; json = (Get-ActiveJson 'issue-2605' 2605 'ci-wait') },
+      @{ id = 'F4 record moved to review'; json = (Get-GatedActiveJson 'issue-2605' 2605 'review' $lintFailed) },
+      @{ id = 'F5 record absent'; json = (Get-GatedActiveJson 'issue-9' 9 'ci-wait' $lintFailed) },
+      @{ id = 'F6 active.json unreadable'; json = '{not json' })) {
+    Start-WakeCase -LeadMinutes 23
+    Set-Active $case.json
+    Set-Outbox @($checksFailed374)
+    $rf = Run-Watchdog; $wrf = Get-TestWake $rf
+    Assert-True ($wrf.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "$($case.id): an older checks-failed line must not wake (got $($wrf.decision): '$($wrf.reason)')"
+  }
+
+  # F7 (control): a checks-settled line older than the launch stays bound by it; the exemption is no wider than the ruling.
+  Start-WakeCase -LeadMinutes 23
+  Set-Active (Get-ActiveJson 'issue-2605' 2605 'review')
+  Set-Outbox @((New-OutboxLine 30 'issue-2605' 'checks-settled' 'watch:test:issue-2605:r8:aa:review' 'pr-watch'))
+  $f7 = Run-Watchdog; $wf7 = Get-TestWake $f7
+  Assert-True ($wf7.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "F7: an older checks-settled line must not wake while its record is in review (got $($wf7.decision): '$($wf7.reason)')"
+
+  # F8 (control): a checks-failed line newer than the launch still wakes, unchanged.
+  Start-WakeCase -LeadMinutes 240
+  Set-Active (Get-GatedActiveJson 'issue-2605' 2605 'ci-wait' $lintFailed)
+  Set-Outbox @($checksFailed374)
+  $f8 = Run-Watchdog; $wf8 = Get-TestWake $f8
+  Assert-True ($wf8.decision -eq 'woken' -and (@($wf8.evidence) -join '; ') -eq 'outbox checks-failed x1') "F8: a checks-failed line newer than the lead's launch must still wake (got $($wf8.decision): $(@($wf8.evidence) -join '; '))"
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+
   # ===== fleet #346: a Stall (an IC owed work, at a turn boundary, no turn for 2 h) wakes the lead; one that
   # outlasts the wake by 2 h more files one `stall` escalation (and page). Config defaults: 120 / 120.
   function Get-StallEscalations { @(Get-ChildItem "$testRoot\state\escalations" -Filter *-stall.json -ErrorAction SilentlyContinue) }
