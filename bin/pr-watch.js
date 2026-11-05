@@ -413,7 +413,17 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   }
   const observation = buildObservation(livePr, evaluation, linked);
   if (observation.digest === prevDigest) return { actions: [] };
-  return { actions: [{ kind: 'observe', observation, evidence: `PR #${prNumber} changed while ${state}`, wake: null }] };
+  // #376: a gate going red at the same head wakes the lead in review. hold stays parked for Cory's merge (ADR 0009).
+  const redInReview = state === 'review' && evaluation.failed;
+  return {
+    actions: [{
+      kind: 'observe', observation,
+      evidence: redInReview
+        ? `gate failure on PR #${prNumber} while review: ${evaluation.gateFailures.map((f) => `${f.name}=${f.conclusion}`).join(', ')}`
+        : `PR #${prNumber} changed while ${state}`,
+      wake: redInReview ? 'checks-failed' : null,
+    }],
+  };
 }
 
 function linkagePhrase(linkage, issue, prNumber) {
