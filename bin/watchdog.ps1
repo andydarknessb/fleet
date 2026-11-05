@@ -368,7 +368,8 @@ try {
 
   function Get-UnconsumedWakes {
     # $Since bounds "before this lead was launched through the door" (the frontier
-    # wake's own use), except a resolution line still in its `to` state (fleet #344);
+    # wake's own use), except a resolution line still in its `to` state (fleet #344) or a
+    # checks-failed line whose record is still in `ci-wait` with a failed gate (fleet #374);
     # fleet-dead has no lead session to bound by and passes
     # $null. $ConsumedThrough is the frontier wake's delivery watermark for the
     # tenant, shared so a wake that already woke the lead is not double-counted
@@ -405,10 +406,15 @@ try {
       if (-not $o -or -not $o.at -or "$($o.recordId)" -notlike "$TenantName`:*") { continue }
       $atUtc = ConvertTo-UtcDateTime $o.at
       if (-not $atUtc) { continue }
-      # fleet #344: a launch is not delivery of a resolution (a fresh session cannot rebuild it); an older one counts while its record is still in `to`.
+      # fleet #344, #374: a launch is not delivery of a resolution or a failed gate (a fresh session cannot rebuild either); an older line counts while what it reported still stands.
       if ($Since -and $atUtc -le $Since) {
         $sinceRecord = $null; if ($wakeRecords -and $wakeRecords.PSObject.Properties["$($o.recordId)"]) { $sinceRecord = $wakeRecords."$($o.recordId)" }
-        if ("$($o.wake)" -ne 'resolution' -or -not $sinceRecord -or "$($sinceRecord.state)" -ne "$($o.to)") { continue }
+        $stands = $false
+        if ($sinceRecord) {
+          if ("$($o.wake)" -eq 'resolution') { $stands = "$($sinceRecord.state)" -eq "$($o.to)" }
+          elseif ("$($o.wake)" -eq 'checks-failed') { $stands = "$($sinceRecord.state)" -eq 'ci-wait' -and @($sinceRecord.github.observation.gates.failures | Where-Object { $_ }).Count -gt 0 }
+        }
+        if (-not $stands) { continue }
       }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
       if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
@@ -1166,7 +1172,7 @@ try {
         # fleet #231: the watermark is the newest DELIVERED line's `at` (a line written while rotate.ps1
         # ran is no longer consumed undelivered); with no line delivered the prior watermark stands.
         # QA: also never behind the lead's door launch (lines before it are not the frontier wake's to deliver, bar the
-        # #344 resolutions this tick just delivered, and
+        # #344 resolutions and #374 checks-failed lines this tick just delivered, and
         # fleet-dead/heal, which pass no -Since, would otherwise keep counting them) nor the prior watermark.
         # Assumes Windows PowerShell 5.1: ConvertFrom-Json leaves ISO strings as strings; under pwsh 7 they become
         # DateTime and sub-second precision would be lost.
