@@ -109,6 +109,36 @@ try {
   $out51d = Run-Stop
   Assert-True ($lastExit -eq 2 -and $out51d -match 'awaiting your review with CI settled: #7' -and $out51d -match 'no Work record') "a PR without a Work record keeps the live verdict and says so: exit $lastExit :: $out51d"
 
+  # fleet#380: a PR whose gate failed, with nothing pending, used to fall into the settled set and read as
+  # "awaiting your review with CI settled" (record in review) or as lagging (record in ci-wait). It is named
+  # with its failed gate whatever its record state, with no record, and under pr-watch-off. It continues the lead
+  # where a green PR would (record in review, no record, pr-watch-off: the hook is its only lasting pointer); in
+  # ci-wait it is named only, since the checks-failed wake (#372, kept across a relaunch by #374) points the lead at it.
+  $recReview = '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"review","revision":8,"github":{"issueNumber":101,"prNumber":7}}}}'
+  $recCiWait = '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"ci-wait","revision":6,"github":{"issueNumber":101,"prNumber":7}}}}'
+  Write-Utf8 "$testRoot\gh-pr.json" '[{"number":7,"isDraft":false,"headRefName":"fleet/101-fixture","statusCheckRollup":[{"name":"test-build","status":"COMPLETED","conclusion":"FAILURE"}]}]'
+  foreach ($case in @(@{ label = 'review'; records = $recReview; continues = $true }, @{ label = 'ci-wait'; records = $recCiWait; continues = $false }, @{ label = 'no record'; records = '{"schemaVersion":1,"records":{}}'; continues = $true }, @{ label = 'pr-watch-off'; records = $recCiWait; watchOff = $true; continues = $true })) {
+    Write-Utf8 "$testRoot\state\work\active.json" $case.records
+    if ($case.watchOff) { Write-Utf8 "$testRoot\state\flags\pr-watch-off" 'test' }
+    $out380 = Run-Stop
+    if ($case.watchOff) { Remove-Item "$testRoot\state\flags\pr-watch-off" }
+    Assert-True ($out380 -match 'failed gate[^#]*#7 \(test-build=FAILURE') "a red PR ($($case.label)) must be named with its failed gate: exit $lastExit :: $out380"
+    Assert-True ($out380 -notmatch 'CI settled|settled on GitHub|record still') "a red PR ($($case.label)) is never called settled or lagging: $out380"
+    if ($case.continues) { Assert-True ($lastExit -eq 2 -and $out380 -notmatch 'assignment frontier') "a red PR ($($case.label)) must continue the lead itself, ahead of the frontier: exit $lastExit :: $out380" }
+    else { Assert-True ($lastExit -eq 2 -and $out380 -match 'assignment frontier #101') "a red PR ($($case.label)) is named only; the frontier decides the turn: exit $lastExit :: $out380" }
+  }
+  # A failed gate with another gate still pending is waiting on CI, not failed (the frontier is emptied so the stop reason lists the waiting PRs).
+  Write-Utf8 "$testRoot\tenants\test.json" '{"name":"test","github":"owner/repo","readyLabel":"ready-for-agent","defaultBranch":"integration","branchPrefix":"fleet/","maxIcs":2,"ciGates":["test-build","lint"],"watchedChecks":[],"ignoredChecks":[],"repo":"C:/nowhere"}'
+  Write-Utf8 "$testRoot\gh-pr.json" '[{"number":7,"isDraft":false,"headRefName":"fleet/101-fixture","statusCheckRollup":[{"name":"test-build","status":"COMPLETED","conclusion":"FAILURE"},{"name":"lint","status":"IN_PROGRESS","conclusion":""}]}]'
+  Write-Utf8 "$testRoot\state\work\active.json" $recCiWait
+  Write-Utf8 "$testRoot\no-issues.json" '[]'
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\no-issues.json"
+  $out380w = Run-Stop
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-fixture.json"
+  $why380w = "$((Get-Continue).stoppedBecause)"
+  Assert-True ($lastExit -eq 0 -and $why380w -match 'waiting on CI gates, nothing to do yet: #7' -and $why380w -notmatch 'failed gate') "a red PR with another gate pending still waits on CI: exit $lastExit :: $why380w :: $out380w"
+  Write-Utf8 "$testRoot\tenants\test.json" '{"name":"test","github":"owner/repo","readyLabel":"ready-for-agent","defaultBranch":"integration","branchPrefix":"fleet/","maxIcs":2,"ciGates":["test-build"],"watchedChecks":[],"ignoredChecks":[],"repo":"C:/nowhere"}'
+
   # A PR held for Cory (state/skip/<tenant>.json "prs") is out of the awaiting-review list, but a held PR whose Work
   # record is still `review` reads as fleet work to the watchdog (fleet-dead): the lead parks the record with
   # review-policy.js hold, so the hook continues it and names the PR, the record and the command.

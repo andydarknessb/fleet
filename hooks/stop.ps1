@@ -108,7 +108,7 @@ $owner, $repoName = $t.github -split '/'
 
 # --- PRs awaiting review (checked first: cheapest, highest value) ---
 # Actionable = open, non-draft, fleet-prefixed, NOT held by the lead (state/skip/<tenant>.json "prs"), with no
-# ciGates check still pending, AND (fleet#51) whose Work record is in `review`. `review-policy.js record --kind
+# ciGates check still pending or failed (fleet#380), AND (fleet#51) whose Work record is in `review`. `review-policy.js record --kind
 # formal` reads the record, which the PR watcher advances on its tick, so a PR that is green on live GitHub while
 # its record is still `ci-wait` is one the gate refuses (INVALID_REVIEW_STATE); the hook and the gate now share
 # one clock. Such a PR is named as lagging, never offered. Under state/flags/pr-watch-off the records do not
@@ -130,7 +130,7 @@ if (-not $watchOff) {
   } catch {}
 }
 $prRaw = & gh pr list -R $t.github --state open --limit 100 --json number,isDraft,headRefName,statusCheckRollup 2>$null
-$unparked = @(); $awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @(); $recordLag = @(); $noRecord = @()
+$unparked = @(); $awaiting = @(); $waitingOnCi = @(); $held = @(); $watchedFindings = @(); $recordLag = @(); $noRecord = @(); $failed = @(); $failedNamed = @()
 foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   if ($pr.isDraft -or -not $pr.headRefName.StartsWith($t.branchPrefix)) { continue }
   $n = [int]$pr.number
@@ -143,6 +143,15 @@ foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   $checkState = Get-CheckPolicyEvaluation $checkPolicy @($pr.statusCheckRollup)
   foreach ($finding in $checkState.WatchedFindings) { $watchedFindings += "#$n/$($finding.Name)=$($finding.Conclusion)" }
   if ($checkState.GatePending.Count -gt 0) { $waitingOnCi += $n; continue }
+  # fleet#380: a failed gate with nothing pending is not settled, so it never joins the settled or lagging lists. It
+  # continues the lead where a green PR would (record in review, no record, pr-watch-off: the hook is its only lasting
+  # pointer); in any other record state it is named only (in ci-wait the checks-failed wake points the lead at it).
+  if ($checkState.GateFailures.Count -gt 0) {
+    $gates = @($checkState.GateFailures | ForEach-Object { "$($_.Name)=$($_.Conclusion)" }) -join ', '
+    if ($watchOff -or -not $recordsByPr.ContainsKey($n) -or "$($recordsByPr[$n].state)" -eq 'review') { $failed += "#$n ($gates)" }
+    else { $failedNamed += "#$n ($gates, record $($recordsByPr[$n].state))" }
+    continue
+  }
   if (-not $watchOff) {
     if ($recordsByPr.ContainsKey($n)) {
       $recordState = "$($recordsByPr[$n].state)"
@@ -152,12 +161,18 @@ foreach ($pr in (ConvertFrom-JsonArray $prRaw)) {
   $awaiting += $n
 }
 $lagNote = ''
-if ($recordLag.Count -gt 0) { $lagNote = "; PR(s) settled on GitHub whose Work record is not yet in review, not reviewable until the watcher's next tick moves it: $($recordLag -join ', ')" }
-if ($awaiting.Count -gt 0) {
-  $reason = "PR(s) awaiting your review with CI settled: #$($awaiting -join ', #')"
-  if ($noRecord.Count -gt 0) { $reason += " (no Work record for #$($noRecord -join ', #'): live GitHub verdict, record --kind formal will not find it)" }
-  if ($watchedFindings.Count -gt 0) { $reason += "; watched finding(s), not gates: $($watchedFindings -join ', ')" }
-  Continue-With "$reason$lagNote"
+if ($failedNamed.Count -gt 0) { $lagNote += "; PR(s) with a failed gate whose Work record is not in review: $($failedNamed -join ', ')" }
+if ($recordLag.Count -gt 0) { $lagNote += "; PR(s) settled on GitHub whose Work record is not yet in review, not reviewable until the watcher's next tick moves it: $($recordLag -join ', ')" }
+if ($awaiting.Count -gt 0 -or $failed.Count -gt 0) {
+  $parts = @()
+  if ($awaiting.Count -gt 0) {
+    $reason = "PR(s) awaiting your review with CI settled: #$($awaiting -join ', #')"
+    if ($noRecord.Count -gt 0) { $reason += " (no Work record for #$($noRecord -join ', #'): live GitHub verdict, record --kind formal will not find it)" }
+    $parts += $reason
+  }
+  if ($failed.Count -gt 0) { $parts += "PR(s) with a failed gate: $($failed -join ', '), not reviewable: send each back to its IC (gh pr ready --undo) or escalate a second red (agents/project-lead.md)" }
+  if ($watchedFindings.Count -gt 0) { $parts += "watched finding(s), not gates: $($watchedFindings -join ', ')" }
+  Continue-With "$($parts -join '; ')$lagNote"
 }
 if ($unparked.Count -gt 0) { Continue-With "held PR(s) whose Work record is still in review: $($unparked -join ', '). If it is reviewed clean and waits only on Cory's merge, park it with 'node $home_\bin\review-policy.js hold --id <record> --expected-revision <revision> --reason <why>' (one-way: it leaves only by his merge); otherwise escalate it with 'work-state.js transition --to escalated' (agents/project-lead.md, Hold and the escalation door), then stop" }
 
