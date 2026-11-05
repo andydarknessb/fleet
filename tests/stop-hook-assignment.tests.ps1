@@ -134,9 +134,19 @@ try {
   Write-Utf8 "$testRoot\no-issues.json" '[]'
   $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\no-issues.json"
   $out380w = Run-Stop
-  $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-fixture.json"
   $why380w = "$((Get-Continue).stoppedBecause)"
   Assert-True ($lastExit -eq 0 -and $why380w -match 'waiting on CI gates, nothing to do yet: #7' -and $why380w -notmatch 'failed gate') "a red PR with another gate pending still waits on CI: exit $lastExit :: $why380w :: $out380w"
+  # QA on #380: a named-only red PR (record ci-wait) is named on both stop paths too: the frontier empty, then no free slot.
+  Write-Utf8 "$testRoot\gh-pr.json" '[{"number":7,"isDraft":false,"headRefName":"fleet/101-fixture","statusCheckRollup":[{"name":"test-build","status":"COMPLETED","conclusion":"FAILURE"},{"name":"lint","status":"COMPLETED","conclusion":"SUCCESS"}]}]'
+  $null = Run-Stop
+  $why380e = "$((Get-Continue).stoppedBecause)"
+  Assert-True ($lastExit -eq 0 -and $why380e -match 'assignment frontier empty' -and $why380e -match 'failed gate[^#]*#7 \(test-build=FAILURE, record ci-wait\)') "a red ci-wait PR must be named when the frontier is empty: exit $lastExit :: $why380e"
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-fixture.json"
+  Write-Utf8 "$testRoot\roster.json" '{"cap":0,"sessions":[]}'
+  $null = Run-Stop
+  $why380s = "$((Get-Continue).stoppedBecause)"
+  Assert-True ($lastExit -eq 0 -and $why380s -match 'no free slot' -and $why380s -match 'failed gate[^#]*#7 \(test-build=FAILURE, record ci-wait\)') "a red ci-wait PR must be named when no slot is free: exit $lastExit :: $why380s"
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
   Write-Utf8 "$testRoot\tenants\test.json" '{"name":"test","github":"owner/repo","readyLabel":"ready-for-agent","defaultBranch":"integration","branchPrefix":"fleet/","maxIcs":2,"ciGates":["test-build"],"watchedChecks":[],"ignoredChecks":[],"repo":"C:/nowhere"}'
 
   # A PR held for Cory (state/skip/<tenant>.json "prs") is out of the awaiting-review list, but a held PR whose Work
