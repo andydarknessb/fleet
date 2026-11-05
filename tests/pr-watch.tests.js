@@ -145,6 +145,43 @@ test('pr-open moves to ci-wait on first observation without a wake', () => {
   assert.equal(outbox(root).length, 0);
 });
 
+test('a pr-open first look with a gate already red wakes checks-failed once; the next identical tick adds nothing', () => {
+  const root = rootDir();
+  seed(root, { state: 'pr-open' });
+  const red = fetchers({ open: [pr({ statusCheckRollup: [check('g1', 'COMPLETED', 'FAILURE'), check('g2', 'COMPLETED', 'SUCCESS')] })] });
+  watch(root, red);
+  assert.equal(record(root).state, 'ci-wait');
+  const wakes = outbox(root);
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].wake, 'checks-failed');
+  const transition = events(root).find((e) => e.type === 'state-ci-wait');
+  assert.match(transition.evidence, /^wake:checks-failed; /);
+  assert.ok(transition.evidence.includes('g1=FAILURE'));
+  const before = events(root).length;
+  watch(root, red);
+  assert.equal(outbox(root).length, 1);
+  assert.equal(events(root).length, before);
+});
+
+test('a pr-open first look with one gate red and another pending wakes checks-failed and names only the failed gate', () => {
+  const root = rootDir();
+  seed(root, { state: 'pr-open' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: [check('g1', 'COMPLETED', 'FAILURE'), check('g2', 'IN_PROGRESS', '')] })] }));
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-failed']);
+  const transition = events(root).find((e) => e.type === 'state-ci-wait');
+  assert.equal(transition.evidence, 'wake:checks-failed; gate failure on PR #77: g1=FAILURE');
+});
+
+test('a pr-open first look with every gate green moves to ci-wait with no wake', () => {
+  const root = rootDir();
+  seed(root, { state: 'pr-open' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })] }));
+  assert.equal(record(root).state, 'ci-wait');
+  assert.equal(outbox(root).length, 0);
+  const transition = events(root).find((e) => e.type === 'state-ci-wait');
+  assert.equal(transition.evidence, 'CI already settled');
+});
+
 test('one hundred identical polls append no event and touch no record after the first', () => {
   const root = rootDir();
   seed(root);
