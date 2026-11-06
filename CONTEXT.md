@@ -277,7 +277,8 @@ _Avoid_: project (when the distinction from the fleet itself matters), workspace
 **Dormant tenant**:
 A Tenant none of whose roles has anything to do: nothing on its Frontier, no
 ticket awaiting Triage, no Triage proposal awaiting a Verdict, no open fleet
-pull request, and no Escalation pending. While it is dormant, neither Rotation
+pull request, no Escalation pending, no Unit of work in flight, and no
+undelivered wake for its project lead. While it is dormant, neither Rotation
 nor respawn relaunches its control-plane sessions; the first new piece of work
 brings them back by Wake.
 _Avoid_: idle (a session with nothing waiting), paused (the fleet-wide Pause),
