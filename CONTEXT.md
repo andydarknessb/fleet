@@ -166,6 +166,14 @@ signal; sessions finish their current turn and go idle. It is the only way to
 stop the fleet without hunting sessions.
 _Avoid_: kill switch, freeze, stop-the-world, maintenance mode
 
+**Usage limit**:
+The account-wide ceiling on Claude use set by Cory's subscription, measured
+over a five-hour window and a weekly window and shared by the fleet and Cory's
+own sessions. Reaching it raises the rate-limit signal that sets a Pause. It is
+not the Cap, which counts sessions, nor a Budget, which measures one Unit of
+work.
+_Avoid_: quota, rate limit (the signal, not the ceiling), budget, cap
+
 **Notice**:
 One paragraph of operator instruction on a scoped board -
 `state/notices/all.md`, `<role>.md`, or `tenant-<tenant>.md` - injected at
@@ -188,9 +196,10 @@ rotation: it re-pins the old flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
 
 **Wake**:
-The Watchdog's relaunch of an idle lead or Principal through the one door, at
-its turn boundary, with a brief naming what changed. Never a page; a message
-between sessions is not a wake.
+The Watchdog's relaunch of an idle lead, Principal or Arbiter through the one
+door, at its turn boundary, with a brief naming what changed. It is also how a
+Dormant tenant's sessions come back. Never a page; a message between sessions
+is not a wake.
 _Avoid_: nudge, ping, poke
 
 **Watchdog**:
@@ -263,6 +272,15 @@ _Avoid_: management work, overhead (when the measured category is meant)
 **Tenant**:
 A project the fleet runs: one repository, one issue tracker, one project lead.
 _Avoid_: project (when the distinction from the fleet itself matters), workspace
+
+**Dormant tenant**:
+A Tenant none of whose roles has anything to do: nothing on its Frontier, no
+ticket awaiting Triage, no Triage proposal awaiting a Verdict, no open fleet
+pull request, and no Escalation pending. While it is dormant, neither Rotation
+nor respawn relaunches its control-plane sessions; the first new piece of work
+brings them back by Wake.
+_Avoid_: idle (a session with nothing waiting), paused (the fleet-wide Pause),
+parked
 
 **Unit of work**:
 A GitHub Issue carrying the tenant's ready-for-agent label. The only thing an
@@ -338,6 +356,13 @@ threshold set to null it is warning-only (the soak ruled 2026-09-09), and
 `state/budget/summary.md` is the one place to read it.
 _Avoid_: quota, allowance, token limit (unqualified), cost
 
+**Blocker**:
+An open issue named by another issue's GitHub "blocked by" link. Only that link
+makes an issue blocked; a "Blocked by #N" line in a ticket body is commentary,
+and the fleet flags one that has no matching link.
+_Avoid_: dependency (unqualified), prerequisite, blocked (for an Escalation or
+a Hold)
+
 **Frontier**:
 The ordered set of ready Units of work the fleet may launch next: open,
 carrying the tenant's ready label, unassigned, with no open blockers, not a
@@ -405,6 +430,13 @@ and is neither retried nor respawned for being idle; a reaped one is respawned o
 Cory's merge, or Cory's instruction to the project lead.
 _Avoid_: blocked (a GitHub issue dependency), escalation (the page, not the
 state), parked
+
+**Reconcile PR**:
+A pull request that merges a tenant's main branch into the integration branch
+the fleet works on, so integration carries everything main has. The fleet
+merges one itself, as a merge commit, when it has no conflicts and its checks
+are green; one with conflicts goes to Cory.
+_Avoid_: sync PR, back-merge, catch-up
 
 **Triage**:
 Classifying a ticket and deciding what it needs before it can be worked: a

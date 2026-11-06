@@ -37,6 +37,10 @@ rules, does not depend on which models the CLI admits to auto.
 
 ## Decisions
 
+> Superseded in part by Amendment 10 (2026-10-30): ICs run Haiku 5.5 only, under
+> the auto profile (ADR 0017, fleet #350). The bullets below record the decision
+> as it was taken.
+
 - **Haiku runs only under allowlist.** `assign --model haiku` without
   `--permissions allowlist`, or with `--permissions auto`, is refused with the
   fleet #28 code and message (`INVALID_IC_MODEL`), at the planner and again at

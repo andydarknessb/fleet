@@ -38,3 +38,17 @@ The standing Dispatcher session retired through `bin/cutover-dispatcher.ps1` beh
 ## Status note - #311 (2026-10-09)
 
 The project lead's 24-hour limit is off (`config/cycle.json` `rotation.project-lead.maxAgeHours: null`). Every watchdog wake already rotates the lead, so the age limit only relaunched idle leads: 6 of the 22 lead sessions that did nothing in 2026-10-02..09, a third of their tokens. Five merges and 125K job tokens still bound a lead's transcript; the Principal, the Arbiter and the Dispatcher keep 24 hours.
+
+## Amendment 2026-11-06 - a Dormant tenant's control plane is not relaunched (fleet #382, owner ruling)
+
+Cory ruled, 2026-11-06: a Dormant tenant (CONTEXT.md) spends nothing on its
+control plane while it waits. While a tenant is dormant, Rotation retires a
+lead, Principal or Arbiter that reaches its boundary without launching a
+replacement, and the Sentinel does not respawn them. When work appears, the
+Watchdog Wakes all three through the one door within one tick; a delay of up
+to fifteen minutes on the first new piece of work is accepted.
+
+The audit behind it: in the week to 2026-11-06, endzone and nidus spent about a
+tenth of the fleet's control-plane usage on 3 Units of work, and their
+Principals and Arbiters rotated on age 43 times in two weeks whether or not
+there was work. Implemented by fleet #386.
