@@ -177,12 +177,16 @@ Cory ruled, 2026-11-06:
 - The control-plane baseline is the week 2026-10-30T12:45Z to
   2026-11-06T12:45Z: control-plane fresh tokens per completed unit 468,687,
   project-lead fresh tokens per merged PR 238,504, IC job-token median 59,256.
-  The voids that waited on the #139 re-baseline end and scorecard verdicts
-  resume: a week passes when it is at or below its baseline, and the report
-  shows the change in percent. The 70% reduction target, set on double-counted
-  units, is retired (owner-session decision).
-- This corrects the stale figures above. The escalation line was armed at
-  350,000 on 2026-09-17 and cut to 175,000 on 2026-09-29, when the warning went
-  from 50,000 to 25,000; the 50,000 and 75,000 in Consequences predate both.
+  The voids that waited on the #139 re-baseline end, and scorecard verdicts
+  resume.
+
+The owner session ruled the consequence: a week passes when it is at or below
+its baseline, and the report shows the change in percent. The 70% reduction
+target was set on double-counted units, so it is retired rather than applied
+to the new baseline.
+
+This also explains the stale figures above. The escalation line was armed at
+350,000 on 2026-09-17 and cut to 175,000 on 2026-09-29, when the warning went
+from 50,000 to 25,000; the 50,000 and 75,000 in Consequences predate both.
 
 Implemented by fleet #387.

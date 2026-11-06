@@ -125,13 +125,14 @@ session is not a page and never reaches Cory's phone, and neither is a fault
 the fleet healed by itself. A condition page never repeats, with two
 exceptions: a dead fleet that self-healing could not revive pages once more at
 higher urgency, and one scheduled daily Page lists the decisions still waiting
-on Cory with their ages.
+on Cory with their ages. The Usage limit Page fires at most once per weekly
+window (ADR 0018): a new window is a new condition, not a repeat.
 _Avoid_: alert, notification, toast (the on-host echo of a page), ping
 
 **Cap**:
 The maximum number of fleet sessions allowed to exist at once. Workers do not
 count. Launching past the cap is refused, never queued.
-_Avoid_: limit, quota, concurrency
+_Avoid_: limit (unqualified), quota, concurrency
 
 **Escalation**:
 A condition an IC or project lead may not resolve on its own, handed one level
@@ -196,10 +197,10 @@ rotation: it re-pins the old flags and keeps the old transcript.
 _Avoid_: restart, refresh, recycle
 
 **Wake**:
-The Watchdog's relaunch of an idle lead, Principal or Arbiter through the one
-door, at its turn boundary, with a brief naming what changed. It is also how a
-Dormant tenant's sessions come back. Never a page; a message between sessions
-is not a wake.
+The Watchdog's relaunch, through the one door and with a brief naming what
+changed, of a project lead, Principal or Arbiter that is idle at its turn
+boundary, or of a Dormant tenant's retired sessions when work appears. Never a
+page; a message between sessions is not a wake.
 _Avoid_: nudge, ping, poke
 
 **Watchdog**:
@@ -359,7 +360,8 @@ _Avoid_: quota, allowance, token limit (unqualified), cost
 **Blocker**:
 An open issue named by another issue's GitHub "blocked by" link. Only that link
 makes an issue blocked; a "Blocked by #N" line in a ticket body is commentary,
-and the fleet flags one that has no matching link.
+and the fleet flags one that has no matching link. A finding's `blocker`
+severity is a different thing.
 _Avoid_: dependency (unqualified), prerequisite, blocked (for an Escalation or
 a Hold)
 

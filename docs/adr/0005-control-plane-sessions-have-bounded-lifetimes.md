@@ -43,10 +43,10 @@ The project lead's 24-hour limit is off (`config/cycle.json` `rotation.project-l
 
 Cory ruled, 2026-11-06: a Dormant tenant (CONTEXT.md) spends nothing on its
 control plane while it waits. While a tenant is dormant, Rotation retires a
-lead, Principal or Arbiter that reaches its boundary without launching a
-replacement, and the Sentinel does not respawn them. When work appears, the
-Watchdog Wakes all three through the one door within one tick; a delay of up
-to fifteen minutes on the first new piece of work is accepted.
+project lead, Principal or Arbiter that reaches its boundary without launching
+a replacement, and no respawn relaunches them. When work appears, the Watchdog
+Wakes all three through the one door within one tick; a delay of up to fifteen
+minutes on the first new piece of work is accepted.
 
 The audit behind it: in the week to 2026-11-06, endzone and nidus spent about a
 tenth of the fleet's control-plane usage on 3 Units of work, and their
