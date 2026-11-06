@@ -27,21 +27,25 @@ function usageWindow(value) {
     : null;
 }
 
-// The last rate_limit_event of a stream-json stream. Lines that are not JSON (the CLI's own
-// warnings, a torn line) are skipped.
+// The last rate_limit_event of a stream-json stream that has both windows numeric: a later event
+// missing one window does not hide the complete one before it. Lines that are not JSON (the CLI's
+// own warnings, a torn line) are skipped.
 function parseUsageReading(text, at) {
-  let event = null;
+  let seen = false;
+  let complete = null;
   for (const line of String(text).split(/\r?\n/)) {
     let row = null;
     try { row = JSON.parse(line); } catch { continue; }
-    if (row && row.type === 'rate_limit_event') event = row;
+    if (!row || row.type !== 'rate_limit_event') continue;
+    seen = true;
+    const windows = row.rate_limit_info?.unifiedWindows;
+    const fiveHour = usageWindow(windows?.five_hour);
+    const weekly = usageWindow(windows?.seven_day);
+    if (fiveHour && weekly) complete = { fiveHour, weekly, status: row.rate_limit_info.status ?? null };
   }
-  if (!event) throw new UsageLimitError('NO_RATE_LIMIT_EVENT', 'the stream has no rate_limit_event line');
-  const info = event.rate_limit_info || {};
-  const fiveHour = usageWindow(info.unifiedWindows?.five_hour);
-  const weekly = usageWindow(info.unifiedWindows?.seven_day);
-  if (!fiveHour || !weekly) throw new UsageLimitError('NO_WINDOWS', 'the rate_limit_event has no numeric five_hour and seven_day window');
-  return { fiveHour, weekly, status: info.status ?? null, at };
+  if (!seen) throw new UsageLimitError('NO_RATE_LIMIT_EVENT', 'the stream has no rate_limit_event line');
+  if (!complete) throw new UsageLimitError('NO_WINDOWS', 'no rate_limit_event has a numeric five_hour and seven_day window');
+  return { ...complete, at };
 }
 
 // Due with no reading, when the latest is PROBE_MIN_AGE_MS old or more, and when its time cannot be

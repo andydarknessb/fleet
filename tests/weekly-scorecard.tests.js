@@ -819,7 +819,7 @@ test('#388: weekly-limit points per Unit of work is the rise in the week over th
   ]);
   const row = build(root).rows.find((r) => r.key === 'usageLimit');
   assert.deepEqual(row.figures, { readings: 5, steps: 3, risePoints: 50, units: 4, pointsPerUnit: 12.5 });
-  assert.equal(row.result, '50.0 points over 4 units: 12.5 points per unit');
+  assert.equal(row.result, '50.0 account-wide points over 4 units: 12.5 points per unit');
   assert.equal(row.status, 'n/a', 'reported, not judged');
 });
 
@@ -832,5 +832,5 @@ test('#388: points per unit reads n/a with too few readings, and with no unit me
   assert.match(one.result, /^n\/a: /);
   const noUnits = build(withReadings(rootDir(), [usageReading('2026-09-21T06:00:00Z', 0.10, WEEK_A), usageReading('2026-09-22T06:00:00Z', 0.25, WEEK_A)])).rows.find((r) => r.key === 'usageLimit');
   assert.deepEqual([noUnits.figures.risePoints, noUnits.figures.pointsPerUnit], [15, null]);
-  assert.equal(noUnits.result, '15.0 points, no unit merged in the week');
+  assert.equal(noUnits.result, '15.0 account-wide points, no unit merged in the week');
 });

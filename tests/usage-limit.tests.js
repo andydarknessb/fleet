@@ -29,9 +29,16 @@ test('#388: the sample rate_limit_event reads as the five-hour and weekly window
   });
 });
 
-test('#388: the parser takes the last rate_limit_event, skips lines that are not JSON, and reads CRLF streams', () => {
+test('#388: the parser takes the last complete rate_limit_event, skips lines that are not JSON, and reads CRLF streams', () => {
   const stream = ['{"type":"system","subtype":"init"}', 'warning: not json', withWeekly(0.1), '{"type":"assistant","message":{}}', '{"truncated":', SAMPLE, '{"type":"result","is_error":false}'].join('\r\n');
   assert.equal(parseUsageReading(stream, AT).weekly.utilization, 0.32);
+});
+
+test('#388: a later rate_limit_event missing seven_day does not hide the complete one before it', () => {
+  const partial = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.07,"resetsAt":1793995200}}}}';
+  const got = parseUsageReading([SAMPLE, partial].join('\n'), AT);
+  assert.equal(got.weekly.utilization, 0.32);
+  assert.equal(got.fiveHour.utilization, 0.05, 'the complete event, not the partial one after it');
 });
 
 test('#388: a stream with no rate_limit_event is a clear error, malformed lines included', () => {

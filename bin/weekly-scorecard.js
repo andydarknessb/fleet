@@ -760,8 +760,8 @@ function usageLimitRow(base, week, merged) {
   const figures = { readings: readings.length, steps, risePoints: steps ? risePoints : null, units: merged, pointsPerUnit };
   let result;
   if (!steps) result = `n/a: no weekly window has two readings in the week (${plural(readings.length, 'reading')})`;
-  else if (!merged) result = `${risePoints.toFixed(1)} points, no unit merged in the week`;
-  else result = `${risePoints.toFixed(1)} points over ${plural(merged, 'unit')}: ${pointsPerUnit.toFixed(1)} points per unit`;
+  else if (!merged) result = `${risePoints.toFixed(1)} account-wide points, no unit merged in the week`;
+  else result = `${risePoints.toFixed(1)} account-wide points over ${plural(merged, 'unit')}: ${pointsPerUnit.toFixed(1)} points per unit`;
   return { figures, result, status: 'n/a' };
 }
 

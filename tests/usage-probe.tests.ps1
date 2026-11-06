@@ -65,6 +65,7 @@ try {
   $pageRecord = Get-Content -LiteralPath $paged -Raw | ConvertFrom-Json
   Assert-True ($pageRecord.weeklyResetsAt -eq 1794290400 -and $pageRecord.delivered -eq $false -and $pageRecord.attempts -eq 1) "the attempt is recorded against its window: $(Get-Content -LiteralPath $paged -Raw)"
   Assert-True ((Get-Content -LiteralPath "$testRoot\state\pages\pages.jsonl" -Raw) -match '"kind":"usage-limit"') 'the page goes through Send-FleetPage, kind usage-limit'
+  Assert-True ((Get-Content -LiteralPath "$testRoot\state\pages\pages.jsonl" -Raw) -match 'The week resets 2026-11-10 00:00 CT\.') 'the page gives the reset in Central time (06:00 UTC is 00:00 CT)'
 
   # E: the next hourly probe, same window, still undelivered: retried, a second attempt.
   Remove-Item -LiteralPath $latest

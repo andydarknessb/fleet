@@ -1924,13 +1924,13 @@ try {
   }
 
   # --- usage limit (#388, spec #382 ruling 6): bin/usage-probe.ps1 takes the hourly reading of the account-wide windows (it probes
-  # only when the latest reading is 55 minutes old or more) and pages Cory once per weekly window at 80%. The CLI step's guard applies:
+  # only when its last attempt, successful or not, is 55 minutes old or more) and pages Cory once per weekly window at 80%. The CLI step's guard applies:
   # no config/cli.json (a fixture) and -Verify spawn nothing. Its answer is the tick's `usage` field; a probe that cannot run or fails
-  # is recorded there and never thrown. Under 60 s of the tick budget left it defers to the next tick, as the CLI step does.
+  # is recorded there and never thrown. Under 90 s of the tick budget left it defers to the next tick.
   $usageStep = $null
   if (-not $Verify -and (Test-Path -LiteralPath "$FleetHome\config\cli.json")) {
     $usageBudgetSec = [Math]::Min(120, [int][Math]::Floor($tickBudgetSec - ((Get-Date).ToUniversalTime() - $now).TotalSeconds))
-    if ($usageBudgetSec -lt 60) { $usageStep = [pscustomobject]@{ ran = $false; reason = 'deferred: under 60 s of the tick budget left' } }
+    if ($usageBudgetSec -lt 90) { $usageStep = [pscustomobject]@{ ran = $false; reason = 'deferred: under 90 s of the tick budget left' } }
     else {
       try {
         $usageRaw = & "$PSScriptRoot\usage-probe.ps1" -NoToast:$NoToast -TimeoutSec $usageBudgetSec 2>&1 | Out-String

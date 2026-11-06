@@ -45,7 +45,7 @@ try {
     if ($due.ok -eq $false) { Fail $due.error }
     if (-not $due.due) { Finish ([pscustomobject]@{ ran = $false; reason = 'fresh'; at = $now }) }
   }
-  $cliArgs = @('-p', 'Reply with the single word OK.', '--model', 'claude-haiku-5-5', '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--no-session-persistence', '--setting-sources', 'project', '--strict-mcp-config')
+  $cliArgs = @('-p', 'Reply with the single word OK.', '--model', $script:IcHaikuPin, '--output-format', 'stream-json', '--verbose', '--max-turns', '1', '--no-session-persistence', '--setting-sources', 'project', '--strict-mcp-config')
   # The call runs from a scratch directory, never a checkout: the claude process takes its project settings and CLAUDE.md
   # from its working directory, which would otherwise be whatever directory the Watchdog or a shell runs in (cli-canary's scratch cwd).
   $probeCwd = Join-Path ([IO.Path]::GetTempPath()) ('usage-probe-' + [guid]::NewGuid().ToString('N'))
@@ -53,7 +53,8 @@ try {
   Push-Location -LiteralPath $probeCwd
   try {
     # The stream is read whatever the exit code: a rate-limited account can still print its window event.
-    $cli = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec $TimeoutSec -Name 'claude usage probe' -StdinText ''
+    # -NoRetry: a CLI that does not resolve fails this run at once; the next hourly probe is the retry.
+    $cli = Invoke-ClaudeCli -Arguments $cliArgs -TimeoutSec $TimeoutSec -Name 'claude usage probe' -StdinText '' -NoRetry
   } finally {
     Pop-Location
     Remove-Item -LiteralPath $probeCwd -Recurse -Force -ErrorAction SilentlyContinue
@@ -64,9 +65,10 @@ try {
   $page = $null
   if ($rec.pageDue) {
     $weekly = $rec.reading.weekly
-    $resets = [DateTimeOffset]::FromUnixTimeSeconds([long]$weekly.resetsAt).UtcDateTime.ToString('yyyy-MM-dd HH:mm')
+    $resetsUtc = [DateTimeOffset]::FromUnixTimeSeconds([long]$weekly.resetsAt).UtcDateTime
+    $resets = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId($resetsUtc, 'Central Standard Time').ToString('yyyy-MM-dd HH:mm')
     $percent = [int][Math]::Floor($weekly.utilization * 100 + 1e-9)
-    $page = Send-FleetPage -Kind 'usage-limit' -Title 'Fleet usage limit' -Body "Weekly Usage limit at $percent%. The week resets $resets UTC." -Priority 'normal' -Detail ([pscustomobject]@{ weeklyResetsAt = $weekly.resetsAt }) -NoToast:$NoToast
+    $page = Send-FleetPage -Kind 'usage-limit' -Title 'Fleet usage limit' -Body "Weekly Usage limit at $percent%. The week resets $resets CT." -Priority 'normal' -Detail ([pscustomobject]@{ weeklyResetsAt = $weekly.resetsAt }) -NoToast:$NoToast
     if ($page.pushover -is [bool]) { $null = Invoke-Node @('page-attempt', $FleetHome, $(if ($page.pushover) { 'true' } else { 'false' }), $now) }
   }
   Finish ([pscustomobject]@{ ran = $true; ok = $true; reading = $rec.reading; paged = $(if ($page) { $page.pushover } else { $null }); at = $now })
