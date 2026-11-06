@@ -19,15 +19,15 @@ function rootDir(config) {
   fs.mkdirSync(path.join(root, 'config'), { recursive: true });
   fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
   fs.mkdirSync(path.join(root, 'claude-home', 'projects', 'p'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ ic: { warnTokens: 50000, escalateTokens: 75000, ...(config || {}) } }));
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ ic: { warnTokens: 50000, escalateTokens: 75000, byModel: { haiku: { warnTokens: 120000, escalateTokens: 350000 } }, ...(config || {}) } }));
   fs.writeFileSync(path.join(root, 'state', 'roster.json'), JSON.stringify({ sessions: [] }));
   return root;
 }
 function claudeHome(root) { return path.join(root, 'claude-home'); }
-function rosterIc(root, issue, sessionId, status = 'active') {
+function rosterIc(root, issue, sessionId, status = 'active', model = undefined) {
   const p = path.join(root, 'state', 'roster.json');
   const roster = JSON.parse(fs.readFileSync(p, 'utf8'));
-  roster.sessions.push({ name: `ic-${issue}`, role: 'ic', tenant: 'endzone', issue, sessionId, status });
+  roster.sessions.push({ name: `ic-${issue}`, role: 'ic', tenant: 'endzone', issue, sessionId, status, model });
   fs.writeFileSync(p, JSON.stringify(roster));
 }
 function transcript(root, sessionId, usages) {
@@ -342,4 +342,104 @@ test('#201: last.json carries usageRowsWithoutId for each measured record', asyn
   assert.equal(result.records[0].usageRowsWithoutId, 2, 'the two id-less rows are flagged');
   const last = JSON.parse(fs.readFileSync(path.join(root, 'state', 'budget', 'last.json'), 'utf8'));
   assert.equal(last.records[0].usageRowsWithoutId, 2);
+});
+
+// --- spec #382 ruling 7: the budget line is per model -----------------------------------
+// Haiku warns at 120K and escalates at 350K job tokens. Every other model keeps the default
+// line (50K and 75K in these fixtures, 25K and 175K in the shipped config). A unit's line
+// follows its IC session's roster model, the same source budget-report.js reads.
+test('per-model lines: budgetConfig gives a family its own line, and any other model the default', () => {
+  const root = rootDir();
+  assert.deepEqual(budgetConfig(root, 'haiku'), { warnTokens: 120000, escalateTokens: 350000 });
+  assert.deepEqual(budgetConfig(root, 'claude-haiku-5-5'), { warnTokens: 120000, escalateTokens: 350000 }, 'a transcript id folds to its family');
+  assert.deepEqual(budgetConfig(root, 'sonnet-5.5'), { warnTokens: 50000, escalateTokens: 75000 });
+  assert.deepEqual(budgetConfig(root, undefined), { warnTokens: 50000, escalateTokens: 75000 }, 'no recorded model: the default line');
+});
+
+test('haiku: 100K job tokens is under the 120K line and records nothing, where the 50K default would warn', async () => {
+  const root = rootDir();
+  rosterIc(root, 80, 's80', 'active', 'haiku'); transcript(root, 's80', [[90000, 10000]]);
+  unit(root, 80);
+  const result = await run(root);
+  assert.equal(result.records[0].jobTokens, 100000);
+  assert.equal(result.records[0].decision, 'none');
+  assert.equal(result.records[0].threshold, null);
+  const last = JSON.parse(fs.readFileSync(path.join(root, 'state', 'budget', 'last.json'), 'utf8'));
+  assert.deepEqual(last.config.byModel.haiku, { warnTokens: 120000, escalateTokens: 350000 }, 'the summary names the Haiku line');
+});
+
+test('haiku: 130K warns at the 120K line, and 360K escalates at the 350K line', async () => {
+  const root = rootDir();
+  rosterIc(root, 81, 's81', 'active', 'haiku'); transcript(root, 's81', [[120000, 10000]]);
+  rosterIc(root, 82, 's82', 'active', 'haiku'); transcript(root, 's82', [[350000, 10000]]);
+  const warn = unit(root, 81); const esc = unit(root, 82);
+  const result = await run(root);
+  const byId = Object.fromEntries(result.records.map((r) => [r.id, r]));
+  assert.equal(byId[warn].decision, 'warn');
+  assert.equal(byId[warn].threshold, 120000);
+  assert.equal(byId[esc].decision, 'escalate');
+  assert.equal(byId[esc].threshold, 350000);
+});
+
+test('haiku, live: the escalation at 350K is recorded with the Haiku line as its threshold', async () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'budget-live'), 'x');
+  rosterIc(root, 83, 's83', 'active', 'haiku'); transcript(root, 's83', [[350000, 10000]]);
+  const id = unit(root, 83, 'review');
+  await run(root);
+  const record = getRecord({ root, id });
+  assert.equal(record.state, 'escalated');
+  assert.match(record.decisionEvidence, /budget: 360000 job tokens >= 350000/);
+});
+
+test('a non-Haiku unit keeps the default line: 60K warns at 50K and 80K escalates at 75K', async () => {
+  const root = rootDir();
+  rosterIc(root, 84, 's84', 'active', 'sonnet'); transcript(root, 's84', [[50000, 10000]]);
+  rosterIc(root, 85, 's85', 'active', 'opus-5.5'); transcript(root, 's85', [[70000, 10000]]);
+  const warn = unit(root, 84); const esc = unit(root, 85);
+  const result = await run(root);
+  const byId = Object.fromEntries(result.records.map((r) => [r.id, r]));
+  assert.equal(byId[warn].decision, 'warn');
+  assert.equal(byId[warn].threshold, 50000);
+  assert.equal(byId[esc].decision, 'escalate');
+  assert.equal(byId[esc].threshold, 75000);
+});
+
+test('haiku: an approved extension is the new absolute escalation line, above the 350K default', async () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'budget-live'), 'x');
+  rosterIc(root, 86, 's86', 'active', 'haiku'); transcript(root, 's86', [[350000, 10000]]);
+  const id = unit(root, 86);
+  recordBudget({ root, id, expectedRevision: 1, phase: 'extend', tokens: 400000, by: 'cory', reason: 'long migration', idempotencyKey: 'ext-86', now: '2026-09-09T00:30:00.000Z' });
+  const first = await run(root);
+  assert.equal(first.records[0].decision, 'warn', '360K is over the 120K warning line and under the 400K extension');
+  assert.equal(getRecord({ root, id }).state, 'implementing', 'covered by the extension');
+  transcript(root, 's86', [[410000, 10000]]);
+  const second = await run(root, { now: '2026-09-09T01:05:00.000Z' });
+  assert.equal(second.records[0].decision, 'escalate');
+  assert.equal(second.records[0].threshold, 400000);
+  const record = getRecord({ root, id });
+  assert.equal(record.state, 'escalated');
+  assert.match(record.decisionEvidence, /extension 400000 by cory/);
+});
+
+test('haiku: an extension at or below 350K is ineffective, and the escalation stays at the Haiku line', async () => {
+  const root = rootDir();
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'budget-live'), 'x');
+  rosterIc(root, 87, 's87', 'active', 'haiku'); transcript(root, 's87', [[350000, 10000]]);
+  const id = unit(root, 87);
+  recordBudget({ root, id, expectedRevision: 1, phase: 'extend', tokens: 300000, by: 'cory', reason: 'meant as an increment', idempotencyKey: 'ext-87', now: '2026-09-09T00:30:00.000Z' });
+  const result = await run(root);
+  assert.equal(result.records[0].decision, 'escalate');
+  assert.equal(result.records[0].extensionIneffective, true);
+  assert.equal(result.records[0].threshold, 350000);
+  assert.match(getRecord({ root, id }).decisionEvidence, /ineffective: at or below the configured line/);
+});
+
+test('spec #382 ruling 7: the shipped config gives Haiku its own line and every other model the default', () => {
+  const repo = path.join(__dirname, '..');
+  const shipped = JSON.parse(fs.readFileSync(path.join(repo, 'config', 'cycle.json'), 'utf8'));
+  assert.deepEqual(shipped.ic.byModel, { haiku: { warnTokens: 120000, escalateTokens: 350000 } });
+  assert.deepEqual(budgetConfig(repo, 'haiku'), { warnTokens: 120000, escalateTokens: 350000 });
+  assert.deepEqual(budgetConfig(repo, 'sonnet'), { warnTokens: 25000, escalateTokens: 175000 });
 });

@@ -42,7 +42,7 @@ test('the summary folds crossings by day and model with the live and completed p
   recordBudget({ root, id: b, expectedRevision: 1, phase: 'warn', tokens: 70000, idempotencyKey: 'w-2', now: '2026-09-08T03:00:00.000Z' });
   recordBudget({ root, id: b, expectedRevision: 2, phase: 'extend', tokens: 120000, by: 'cory', reason: 'wide', idempotencyKey: 'x-2', now: '2026-09-09T01:00:00.000Z' });
   transitionRecord({ root, id: b, expectedRevision: 3, to: 'escalated', idempotencyKey: 'e-2', now: '2026-09-09T02:00:00.000Z', evidence: 'wake:decision-needed; budget: 130000 job tokens >= 120000' });
-  fs.writeFileSync(path.join(root, 'state', 'budget', 'last.json'), JSON.stringify({ at: '2026-09-09T03:00:00.000Z', mode: 'live', config: { warnTokens: 50000, escalateTokens: null }, records: [
+  fs.writeFileSync(path.join(root, 'state', 'budget', 'last.json'), JSON.stringify({ at: '2026-09-09T03:00:00.000Z', mode: 'live', config: { warnTokens: 50000, escalateTokens: null, byModel: { haiku: { warnTokens: 120000, escalateTokens: 350000 } } }, records: [
     { id: a, jobTokens: 61000, decision: 'warn' }, { id: 'endzone:issue-3', jobTokens: 20000, decision: 'none' }, { id: 'endzone:issue-9', jobTokens: null, decision: 'unmeasured' },
   ] }));
   fs.writeFileSync(path.join(root, 'state', 'metrics', 'seven-day-2026-09-09.json'), JSON.stringify({ period: { since: 's', until: 'u' }, units: [
@@ -64,6 +64,7 @@ test('the summary folds crossings by day and model with the live and completed p
   assert.equal(s.completed.byModel.opus.medianJobTokens, 200000);
   const md = fs.readFileSync(path.join(root, 'state', 'budget', 'summary.md'), 'utf8');
   assert.match(md, /escalate OFF \(warning-only soak\)/);
+  assert.match(md, /^thresholds: warn 50000, escalate OFF \(warning-only soak\) job tokens; haiku warn 120000, escalate 350000$/m, 'the summary names the Haiku line too');
   assert.match(md, /- 2026-09-08: warnings 2, extensions 0, escalations 0 \(/);
   assert.match(md, /- sonnet: 2 unit\(s\); median job tokens 50000/);
   assert.equal(fs.existsSync(path.join(root, 'state', 'budget', 'summary.json')), true);

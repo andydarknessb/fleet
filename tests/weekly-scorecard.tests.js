@@ -231,6 +231,40 @@ test('#131: IC cost shows the collector whole-life figures and the budget.js esc
   assert.match(md, /^- budget\.js \(enforcement, spending states only\): 1 warning\(s\), 1 escalation\(s\)$/m);
 });
 
+// spec #382 ruling 7: the control-plane and project-lead verdicts come back on the IC cost row.
+const withBudgets = (controlPlaneFresh, projectLeadFresh) => {
+  const report = collectorReport();
+  report.unitMetrics.budgets = {
+    controlPlaneFreshPerCompletedUnit: { baseline: 468687, actual: controlPlaneFresh, change: Math.round((controlPlaneFresh / 468687 - 1) * 1000) / 1000, pass: controlPlaneFresh <= 468687 },
+    projectLeadFreshPerMergedPr: { baseline: 238504, actual: projectLeadFresh, change: Math.round((projectLeadFresh / 238504 - 1) * 1000) / 1000, pass: projectLeadFresh <= 238504 },
+    icJobTokensMedian: { reference: 59256, actual: 50000, pass: null, judged: false },
+  };
+  return report;
+};
+
+test('#382: under both baselines the IC cost row passes and each line shows its change', () => {
+  const root = fixtureWeek();
+  const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => withBudgets(400000, 200000) });
+  const row = card.rows.find((r) => r.key === 'icCost');
+  assert.equal(row.status, 'good');
+  assert.match(row.result, /^control-plane fresh per completed unit 400000 vs baseline 468687 \(-14\.7%\) PASS; project-lead fresh per merged PR 200000 vs baseline 238504 \(-16\.1%\) PASS; whole-life: /);
+  const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
+  assert.match(md, /^- Control-plane fresh per completed unit 400000 vs baseline 468687 \(-14\.7%\) PASS$/m);
+  assert.match(md, /^- Project-lead fresh per merged PR 200000 vs baseline 238504 \(-16\.1%\) PASS$/m);
+  assert.doesNotMatch(md, /void/i, 'no void text in the scorecard');
+});
+
+test('#382: a week above its control-plane baseline fails the IC cost row and says so', () => {
+  const root = fixtureWeek();
+  const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => withBudgets(500000, 200000) });
+  const row = card.rows.find((r) => r.key === 'icCost');
+  assert.equal(row.status, 'weak');
+  assert.match(row.result, /^control-plane fresh per completed unit 500000 vs baseline 468687 \(\+6\.7%\) FAIL; /);
+  const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
+  assert.match(md, /^- Control-plane fresh per completed unit 500000 vs baseline 468687 \(\+6\.7%\) FAIL$/m);
+  assert.match(md, /^- Project-lead fresh per merged PR 200000 vs baseline 238504 \(-16\.1%\) PASS$/m);
+});
+
 test('#131: the week verification history is printed under the table', () => {
   const root = fixtureWeek();
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
@@ -346,7 +380,7 @@ test('#201: the scorecard says token figures before the meter change date read a
   const md = renderScorecard(card);
   assert.match(md, /Token figures before 2026-09-30 read about 2x/);
   assert.equal(md.split('\n').filter((l) => /read about 2x/.test(l)).length, 1, 'one line');
-  assert.match(md, /## IC cost \(two measures\)\n\n[^\n]*read about 2x/, 'the note sits with the token figures');
+  assert.match(md, /## IC cost and budgets\n\n[^\n]*read about 2x/, 'the note sits with the token figures');
 });
 
 test('#201: the scorecard reads the meter change date from config/cycle.json', () => {

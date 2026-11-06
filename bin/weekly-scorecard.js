@@ -31,7 +31,8 @@
 //     review landed in; reported, not judged);
 //   - the cycle collector (bin/measure-cycle.js run for exactly this week): whole-life IC
 //     job tokens per model family and the risk reviewer, printed beside bin/budget.js's
-//     warnings and escalations for the week as a separate measure (#127).
+//     warnings and escalations for the week as a separate measure (#127), and the
+//     control-plane and project-lead verdicts against their recorded baselines (#382).
 // The week's ledger verification history (state/verify/history.jsonl, #129) is printed
 // under the table. Each row carries a status (good, watch, weak, unknown, n/a) from the
 // thresholds in config/cycle.json `scorecard`; the headline is the week and its weakest
@@ -686,14 +687,23 @@ function icCostRow(base, events, week, collect, dryRun) {
   }
   const u = report?.unitMetrics || {};
   const byModel = u.icByModel || {};
-  const collector = { units: u.completedUnits ?? null, medianJobTokens: u.icJobTokensMedian ?? null, p90JobTokens: u.icJobTokensP90 ?? null, byModel, riskReviewer: report?.riskReviewer || null };
-  const judged = Object.values(byModel).filter((entry) => entry.pass !== null && entry.pass !== undefined);
+  // Spec #382 ruling 7: the week's control-plane and project-lead verdicts against their baselines.
+  const verdicts = { controlPlane: u.budgets?.controlPlaneFreshPerCompletedUnit || null, projectLead: u.budgets?.projectLeadFreshPerMergedPr || null };
+  const collector = { units: u.completedUnits ?? null, medianJobTokens: u.icJobTokensMedian ?? null, p90JobTokens: u.icJobTokensP90 ?? null, byModel, riskReviewer: report?.riskReviewer || null, ...verdicts };
+  const judged = [...Object.values(byModel), verdicts.controlPlane, verdicts.projectLead].filter((entry) => entry && entry.pass !== null && entry.pass !== undefined);
   const status = judged.some((entry) => entry.pass === false) ? 'weak' : (judged.length ? 'good' : 'n/a');
+  const verdictPrefix = [verdicts.controlPlane && verdictText('control-plane fresh per completed unit', verdicts.controlPlane), verdicts.projectLead && verdictText('project-lead fresh per merged PR', verdicts.projectLead)].filter(Boolean).map((part) => `${part}; `).join('');
   return {
     figures: { collector, budget },
-    result: `whole-life: ${Object.keys(byModel).length ? Object.entries(byModel).map(([key, entry]) => `${key} median ${entry.jobTokensMedian ?? 'n/a'} (${plural(entry.units, 'unit')})`).join(', ') : 'no completed unit'}, reported not judged; budget.js ${budget.warnings} warning(s), ${budget.escalations} escalation(s)`,
+    result: `${verdictPrefix}whole-life: ${Object.keys(byModel).length ? Object.entries(byModel).map(([key, entry]) => `${key} median ${entry.jobTokensMedian ?? 'n/a'} (${plural(entry.units, 'unit')})`).join(', ') : 'no completed unit'}, reported not judged; budget.js ${budget.warnings} warning(s), ${budget.escalations} escalation(s)`,
     status,
   };
+}
+
+// Spec #382: a week's figure against its baseline, with the signed change and the verdict.
+function verdictText(label, entry) {
+  const change = entry.change === null || entry.change === undefined ? 'n/a' : `${entry.change > 0 ? '+' : ''}${Math.round(entry.change * 1000) / 10}%`;
+  return `${label} ${entry.actual ?? 'n/a'} vs baseline ${entry.baseline ?? 'n/a'} (${change})${entry.pass === true ? ' PASS' : entry.pass === false ? ' FAIL' : ''}`;
 }
 
 // Spec fleet #193 (#211): how Bounded authority was used, from the triage ledger's own
@@ -829,8 +839,13 @@ function icCostLines(row) {
   const whole = collector.error
     ? `unavailable: ${collector.error}`
     : `${families.length ? families.join('; ') : 'no completed unit'}${risk ? `; risk reviewer ${risk.runs} run(s), ${risk.jobTokens} job tokens` : ''}`;
+  const verdictLines = [
+    collector.controlPlane && `- ${verdictText('Control-plane fresh per completed unit', collector.controlPlane)}`,
+    collector.projectLead && `- ${verdictText('Project-lead fresh per merged PR', collector.projectLead)}`,
+  ].filter(Boolean);
   return [
     `- Whole-life (cycle collector): ${whole}`,
+    ...verdictLines,
     `- budget.js (enforcement, spending states only): ${budget.warnings ?? 0} warning(s), ${budget.escalations ?? 0} escalation(s)`,
   ];
 }
@@ -849,7 +864,7 @@ function renderScorecard(card) {
     `Ledger verification this week: ${card.verifyHistory.runs} run(s), ${card.verifyHistory.pass} pass, ${card.verifyHistory.fail} fail.`,
     '',
     ...(card.mergesBy ? [mergesByLine(card.mergesBy), ''] : []),
-    '## IC cost (two measures)',
+    '## IC cost and budgets',
     '',
     ...(card.meterChange ? [card.meterChange.note, ''] : []),
     ...icCostLines(card.rows.find((row) => row.key === 'icCost')),
