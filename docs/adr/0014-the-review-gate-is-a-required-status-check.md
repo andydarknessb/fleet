@@ -47,3 +47,17 @@ not by itself stop an unreviewed merge.
   a hard stop at the third send-back.
 - The tenant file names the check, so `ciGates` and the ruleset stay the one
   list they are today.
+
+## Amendment 2026-11-06 - Reconcile PRs pass through a standing exception (fleet #382, owner ruling)
+
+Cory ruled, 2026-11-06: a Reconcile PR (CONTEXT.md) passes the review gate
+through a standing exception instead of a formal review, because its content
+already landed on main under Cory's own merge. The PR watcher, a script,
+merges one as a merge commit when it has no conflicts and its checks are
+green; one with conflicts follows the branch-diverged escalation to Cory as
+before. Only tenants with a separate integration branch have Reconcile PRs
+(endzone and statelite).
+
+The audit behind it: Reconcile PRs were the slowest pull requests of the two
+weeks to 2026-11-06 (191, 91 and 22 hours on endzone, 34 on statelite), and
+endzone's pipeline stopped for a week behind one. Implemented by fleet #390.

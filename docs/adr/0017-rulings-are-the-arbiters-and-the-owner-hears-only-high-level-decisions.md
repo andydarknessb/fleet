@@ -248,3 +248,15 @@ and six ICs. The Principal and Arbiter stay outside the cap. `scorecard.icCap`
 stays 6, and `icCapOf` now derives the same number from the roster. The
 fallbacks of 3 for a tenant with no `maxIcs` are unchanged, since every tenant
 sets it.
+
+## Amendment 2026-11-06 - the Principal on Sonnet 5.5, the risk reviewer at xhigh (fleet #382, owner ruling)
+
+Cory ruled, 2026-11-06: the Principal moves from Opus 5.5 to Sonnet 5.5 at high
+(ADR 0011, amendment of the same date), and the qa-reviewer, the risk reviewer,
+moves from high to xhigh on Sonnet 5.5. Every other role keeps its model and
+effort: ICs Haiku 5.5 at xhigh or max, project leads Sonnet 5.5 at high, the
+Arbiter Opus 5.5 at xhigh, the Researcher Haiku 5.5 at low.
+
+The audit priced the week to 2026-11-06 at about 60% of a weekly Usage limit,
+88% of it control plane; the Principal was a quarter of the total. Implemented
+by fleet #385.

@@ -69,6 +69,13 @@ try {
   $out3 = Run-Stop
   Assert-True ($lastExit -eq 2 -and $out3 -match 'assignment frontier #101') "recovery: the hook must continue on the assignment frontier again: exit $lastExit :: $out3"
 
+  # fleet #391: a body "Blocked by" line that no GitHub link backs is named on the frontier continuation. It warns; it does not block.
+  Write-Utf8 "$testRoot\issues-body-blocker.json" '[{"number":101,"title":"Fixture","url":"https://github.com/owner/repo/issues/101","body":"Blocked by: #110, #111\n\nChange `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-body-blocker.json"
+  $out3w = Run-Stop
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = "$testRoot\issues-fixture.json"
+  Assert-True ($lastExit -eq 2 -and $out3w -match 'assignment frontier #101' -and $out3w -match 'blocker warning: #101 body names #110, #111') "a body-only Blocker must be named on the frontier continuation, which must still continue: exit $lastExit :: $out3w"
+
   # Case 4 (fleet #265 QA): a CLI that exits 0 with EMPTY stdout is an unreadable fleet, not an empty one (capFree would
   # read as the whole cap and the lead would be told to launch). The hook stops now and says so.
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'exit /b 0' + "`r`n")

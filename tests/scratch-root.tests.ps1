@@ -63,6 +63,8 @@ try {
   $stateFiles = @(Get-ChildItem "$scratch\state" -Recurse -File -Force | Where-Object { $_.Name -ne '.gitkeep' -and $_.FullName -ne "$scratch\state\roster.json" })
   Assert-True ($stateFiles.Count -eq 0) "the scratch state holds no files beyond an empty live roster (got $(@($stateFiles | ForEach-Object { $_.FullName }) -join ', '))"
   foreach ($dir in 'sessions', 'work', 'events', 'manifests', 'flags', 'watch') { Assert-True (Test-Path -LiteralPath "$scratch\state\$dir" -PathType Container) "the scratch state has state\$dir" }
+  # fleet #384: the Stop hook writes state/heartbeats/<name>.json and fails silently without the folder.
+  Assert-True (Test-Path -LiteralPath "$scratch\state\heartbeats" -PathType Container) 'the scratch state has state\heartbeats, where the Stop hook writes each session heartbeat'
   Assert-True (-not (Test-Path -LiteralPath "$scratch\.scratch")) 'the source .scratch notes are not copied'
   # Spec #94 (#165): a scratch root is where a CLI re-test runs, so its profile carries no
   # recorded version and the launch door does not refuse the installed CLI there.
@@ -83,6 +85,9 @@ try {
   Assert-True ("$($built.next.launch)" -match 'assignment\.js launch') 'the builder prints the launch command'
   Assert-True ("$($built.next.watch)" -match 'state\.json') 'the builder prints the state.json path to watch'
   Assert-True ("$($built.remove)" -match [regex]::Escape($scratch)) 'the builder prints the one command that removes the root'
+  # fleet #384 (owner ruling 11): the printed notes send the operator to the live root's skip file and exclusions before a ticket is chosen.
+  $liveFull = [IO.Path]::GetFullPath($liveRoot)
+  Assert-True ($script:lastOut.Contains('note: Before choosing a ticket') -and $script:lastOut.Contains("$liveFull\state\skip\endzone.json") -and $script:lastOut.Contains("$liveFull\state\exclusions\endzone.jsonl")) "the builder must print a note to check the live root's skip file and exclusions before choosing a ticket (got: $script:lastOut)"
   $again = Run-Script $builder @('-Path', $scratch, '-LiveRoot', $liveRoot)
   Assert-True ($script:lastExit -ne 0 -and "$($again.reason)" -match 'not empty') 'building over a non-empty path is refused'
 
@@ -101,6 +106,11 @@ try {
   Assert-True ([int]$launched.liveFleet -eq 0) "a live fleet session must not count toward the scratch cap (liveFleet $($launched.liveFleet))"
   $launchedSettings = Get-Content "$($launched.settings)" -Raw | ConvertFrom-Json
   Assert-True ($launchedSettings.env.FLEET_HOME -eq $scratch) 'the launched session names the scratch root as FLEET_HOME'
+  # fleet #384: the scratch root's own IC launch runs with the fleet's plugin map, plugin sync and Remote Control off, no claude.ai connectors, and --no-chrome.
+  Assert-True ("$($launched.command)" -match '--no-chrome') "a scratch-root IC launch must pass --no-chrome (got: $($launched.command))"
+  $scratchPlugins = @{}; foreach ($plugin in $launchedSettings.enabledPlugins.PSObject.Properties) { $scratchPlugins[$plugin.Name] = $plugin.Value }
+  Assert-True ($scratchPlugins.Count -eq 5 -and $scratchPlugins['ponytail@ponytail'] -eq $true -and $scratchPlugins['mattpocock-skills@claude-plugins-official'] -eq $true -and $scratchPlugins['i-have-adhd@i-have-adhd'] -eq $false -and $scratchPlugins['humanizer@humanizer'] -eq $false -and $scratchPlugins['impeccable@impeccable'] -eq $false) "a scratch-root IC must carry the fleet's plugin map (got $($launchedSettings.enabledPlugins | ConvertTo-Json -Compress))"
+  Assert-True ($launchedSettings.syncClaudeAiPlugins -eq $false -and $launchedSettings.remoteControlAtStartup -eq $false -and $launchedSettings.disableClaudeAiConnectors -eq $true) 'a scratch-root IC must run with plugin sync and Remote Control off and without the claude.ai connectors'
   foreach ($command in @($launchedSettings.hooks.PSObject.Properties | ForEach-Object { $_.Value } | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })) {
     Assert-True ("$command" -like "*$scratchFwd/hooks/*") "a launched session's hook must be the scratch root's own: $command"
   }
