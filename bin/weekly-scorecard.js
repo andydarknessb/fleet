@@ -31,7 +31,10 @@
 //     review landed in; reported, not judged);
 //   - the cycle collector (bin/measure-cycle.js run for exactly this week): whole-life IC
 //     job tokens per model family and the risk reviewer, printed beside bin/budget.js's
-//     warnings and escalations for the week as a separate measure (#127).
+//     warnings and escalations for the week as a separate measure (#127);
+//   - #388 (spec #382): the Usage limit readings (state/usage/readings.jsonl, written hourly by
+//     bin/usage-probe.ps1) for "Weekly-limit points per unit": the weekly rise over the week's
+//     merged units, reported, not judged.
 // The week's ledger verification history (state/verify/history.jsonl, #129) is printed
 // under the table. Each row carries a status (good, watch, weak, unknown, n/a) from the
 // thresholds in config/cycle.json `scorecard`; the headline is the week and its weakest
@@ -82,6 +85,7 @@ const ROWS = [
   ['reviewPickup', 'Review pickup latency'],
   ['icCost', 'IC cost'],
   ['boundedAuthority', 'Bounded authority'],
+  ['usageLimit', 'Weekly-limit points per unit'],
 ];
 const SEVERITY = { weak: 4, unknown: 3, watch: 2, good: 1, 'n/a': 0 };
 
@@ -733,6 +737,34 @@ function boundedAuthorityRow(base, week) {
   };
 }
 
+// fleet #388 (spec #382, ruling 6): weekly-limit points per Unit of work, from the hourly Usage
+// limit readings (bin/usage-limit.js). The rise is the steps up between consecutive readings of one
+// weekly window, in percentage points; a step never crosses a weekly reset, so each side of a reset
+// counts its own readings. Per Unit of work divides it by the week's merged units, the Throughput
+// row's count. n/a until one weekly window has two readings in the week. Reported, not judged.
+function usageLimitRow(base, week, merged) {
+  const readings = (readJsonl(path.join(base, 'state', 'usage', 'readings.jsonl')) || [])
+    .filter((reading) => reading && reading.weekly && inWeek(week, reading.at))
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  let steps = 0;
+  let rise = 0;
+  for (let i = 1; i < readings.length; i += 1) {
+    const before = readings[i - 1].weekly;
+    const after = readings[i].weekly;
+    if (after.resetsAt !== before.resetsAt) continue;
+    steps += 1;
+    rise += Math.max(0, after.utilization - before.utilization);
+  }
+  const risePoints = Math.round(rise * 100 * 10) / 10;
+  const pointsPerUnit = steps && merged ? Math.round((rise * 100 / merged) * 10) / 10 : null;
+  const figures = { readings: readings.length, steps, risePoints: steps ? risePoints : null, units: merged, pointsPerUnit };
+  let result;
+  if (!steps) result = `n/a: no weekly window has two readings in the week (${plural(readings.length, 'reading')})`;
+  else if (!merged) result = `${risePoints.toFixed(1)} points, no unit merged in the week`;
+  else result = `${risePoints.toFixed(1)} points over ${plural(merged, 'unit')}: ${pointsPerUnit.toFixed(1)} points per unit`;
+  return { figures, result, status: 'n/a' };
+}
+
 function verifyWeek(base, week) {
   const runs = readHistory(base).filter((line) => inWeek(week, line.at));
   return { runs: runs.length, pass: runs.filter((line) => line.pass === true).length, fail: runs.filter((line) => line.pass === false).length };
@@ -799,6 +831,7 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
         return { figures: { error: String(error.message || error).split('\n')[0] }, result: `unavailable: ${String(error.message || error).split('\n')[0]}`, status: 'unknown' };
       }
     })(),
+    usageLimit: usageLimitRow(base, week, merged),
   };
   const rows = ROWS.map(([key, area]) => ({ key, area, ...computed[key] }));
   const weakest = rows.reduce((worst, row) => (SEVERITY[row.status] > SEVERITY[worst.status] ? row : worst), rows[0]);

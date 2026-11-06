@@ -1923,6 +1923,23 @@ try {
     } catch {}
   }
 
+  # --- usage limit (#388, spec #382 ruling 6): bin/usage-probe.ps1 takes the hourly reading of the account-wide windows (it probes
+  # only when the latest reading is 55 minutes old or more) and pages Cory once per weekly window at 80%. The CLI step's guard applies:
+  # no config/cli.json (a fixture) and -Verify spawn nothing. Its answer is the tick's `usage` field; a probe that cannot run or fails
+  # is recorded there and never thrown. Under 60 s of the tick budget left it defers to the next tick, as the CLI step does.
+  $usageStep = $null
+  if (-not $Verify -and (Test-Path -LiteralPath "$FleetHome\config\cli.json")) {
+    $usageBudgetSec = [Math]::Min(120, [int][Math]::Floor($tickBudgetSec - ((Get-Date).ToUniversalTime() - $now).TotalSeconds))
+    if ($usageBudgetSec -lt 60) { $usageStep = [pscustomobject]@{ ran = $false; reason = 'deferred: under 60 s of the tick budget left' } }
+    else {
+      try {
+        $usageRaw = & "$PSScriptRoot\usage-probe.ps1" -NoToast:$NoToast -TimeoutSec $usageBudgetSec 2>&1 | Out-String
+        $usageStep = ConvertFrom-LastJsonLine $usageRaw
+        if (-not $usageStep) { $usageStep = [pscustomobject]@{ ran = $false; ok = $false; error = "usage-probe.ps1 printed no JSON: $(Get-OneLine $usageRaw 200)" } }
+      } catch { $usageStep = [pscustomobject]@{ ran = $false; ok = $false; error = "usage-probe.ps1 could not run: $(Get-OneLine $_.Exception.Message 200)" } }
+    }
+  }
+
   # --- shadow log for the 08b parity comparison ---
   $proposed = $null
   if ($check) {
@@ -1945,6 +1962,7 @@ try {
     timeouts = @(@($script:BoundedTimeouts) + @(if ($check -and $check.PSObject.Properties['timeouts']) { $check.timeouts }) | Where-Object { $_ })
     invalidPagePriority = @($invalidPagePriority)
     cli = $(if ($cliStep) { [pscustomobject]@{ version = $cliStep.version; ok = $cliStep.ok; deferred = [bool]$cliStep.PSObject.Properties['deferred'] } } else { $null })
+    usage = $usageStep
     deploy = $(if ($deploy) { [pscustomobject]@{ from = $deploy.from; to = $deploy.to; outcome = $deploy.outcome } } else { $null })
   }
   $line = ($entry | ConvertTo-Json -Compress -Depth 8)

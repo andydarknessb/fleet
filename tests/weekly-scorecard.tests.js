@@ -103,10 +103,10 @@ test('#131: a fixture week produces every row in markdown and JSON', () => {
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
   assert.equal(card.week.label, '2026-09-21..2026-09-27');
   const json = JSON.parse(fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.json'), 'utf8'));
-  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'reviewPickup', 'icCost', 'boundedAuthority']);
-  assert.equal(json.rows[json.rows.length - 1].key, 'boundedAuthority', 'spec #193 adds the last row');
+  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'reviewPickup', 'icCost', 'boundedAuthority', 'usageLimit']);
+  assert.equal(json.rows[json.rows.length - 1].key, 'usageLimit', 'fleet #388 adds the last row');
   const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
-  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'Review pickup latency', 'IC cost', 'Bounded authority']) {
+  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'Review pickup latency', 'IC cost', 'Bounded authority', 'Weekly-limit points per unit']) {
     assert.match(md, new RegExp(`^\\| ${area.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|`, 'm'), area);
   }
 });
@@ -793,4 +793,44 @@ test('#139: escaped defects judge the rate only from 10 merged units; below that
   assert.equal(escaped(10, [900]).status, 'weak', '10% is over 5%');
   assert.equal(escaped(20, [900]).status, 'watch', '5% is not over 5%');
   assert.equal(escaped(10, []).status, 'good');
+});
+
+// fleet #388 (spec #382, ruling 6): weekly-limit points per Unit of work, from the hourly Usage
+// limit readings in state/usage/readings.jsonl. The rise is the steps up between consecutive
+// readings of one weekly window; no step crosses a weekly reset.
+const WEEK_A = 1794290400;
+const WEEK_B = 1794895200;
+const usageReading = (at, utilization, resetsAt) => ({ fiveHour: { utilization: 0.05, resetsAt: 1793995200 }, weekly: { utilization, resetsAt }, status: 'allowed', at });
+function withReadings(root, readings) {
+  fs.mkdirSync(path.join(root, 'state', 'usage'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'usage', 'readings.jsonl'), `${readings.map((r) => JSON.stringify(r)).join('\n')}\n`);
+  return root;
+}
+
+test('#388: weekly-limit points per Unit of work is the rise in the week over the units merged, and no step crosses a reset', () => {
+  // The fixture week merges four units (#11 to #14); the reading the week before is not read.
+  const root = withReadings(fixtureWeek(), [
+    usageReading('2026-09-14T12:00:00Z', 0.01, WEEK_A),
+    usageReading('2026-09-21T06:00:00Z', 0.10, WEEK_A),
+    usageReading('2026-09-22T06:00:00Z', 0.45, WEEK_A), // +35
+    usageReading('2026-09-23T06:00:00Z', 0.46, WEEK_B), // the reset: this step is not a rise
+    usageReading('2026-09-24T06:00:00Z', 0.60, WEEK_B), // +14
+    usageReading('2026-09-25T06:00:00Z', 0.61, WEEK_B), // +1
+  ]);
+  const row = build(root).rows.find((r) => r.key === 'usageLimit');
+  assert.deepEqual(row.figures, { readings: 5, steps: 3, risePoints: 50, units: 4, pointsPerUnit: 12.5 });
+  assert.equal(row.result, '50.0 points over 4 units: 12.5 points per unit');
+  assert.equal(row.status, 'n/a', 'reported, not judged');
+});
+
+test('#388: points per unit reads n/a with too few readings, and with no unit merged it gives the rise alone', () => {
+  const none = build(fixtureWeek()).rows.find((r) => r.key === 'usageLimit');
+  assert.deepEqual([none.status, none.figures.pointsPerUnit], ['n/a', null]);
+  assert.match(none.result, /^n\/a: no weekly window has two readings in the week/);
+  const one = build(withReadings(fixtureWeek(), [usageReading('2026-09-22T06:00:00Z', 0.45, WEEK_A)])).rows.find((r) => r.key === 'usageLimit');
+  assert.equal(one.figures.pointsPerUnit, null);
+  assert.match(one.result, /^n\/a: /);
+  const noUnits = build(withReadings(rootDir(), [usageReading('2026-09-21T06:00:00Z', 0.10, WEEK_A), usageReading('2026-09-22T06:00:00Z', 0.25, WEEK_A)])).rows.find((r) => r.key === 'usageLimit');
+  assert.deepEqual([noUnits.figures.risePoints, noUnits.figures.pointsPerUnit], [15, null]);
+  assert.equal(noUnits.result, '15.0 points, no unit merged in the week');
 });
