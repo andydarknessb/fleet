@@ -16,7 +16,7 @@ function Set-LiveRoster { param([string]$LaunchedAt, [string]$Status = 'active')
 }
 function Set-AgentsRows { param([string]$Json) Write-Utf8 "$testRoot\mock-agents.json" $Json }
 function Reset-Markers {
-  Remove-Item "$testRoot\retire-calls.log", "$testRoot\launch-calls.log", "$testRoot\reconcile-calls.log" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\retire-calls.log", "$testRoot\launch-calls.log", "$testRoot\launch-reasons.log", "$testRoot\reconcile-calls.log" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\rotation\*.json" -ErrorAction SilentlyContinue
 }
 function Run-Rotate {
@@ -70,10 +70,11 @@ if ($rows.Count -eq 1) { $json = "[$json]" }
 Write-Output ('{"retired":"' + $Name + '","jobRemoval":"removed"}')
 '@
   Write-Utf8 "$testRoot\bin\launch.ps1" @'
-param([string]$FromRoster, [switch]$Force)
+param([string]$FromRoster, [switch]$Force, [string]$Reason)
 $root = Split-Path -Parent $PSScriptRoot
 $forceMark = if ($Force) { '|force' } else { '' }
 Add-Content "$root\launch-calls.log" "$FromRoster$forceMark"
+Add-Content "$root\launch-reasons.log" "$FromRoster|$Reason"
 # fleet #230: snapshot the intent exactly as the replacement's SessionStart hook would
 # read it while `claude --bg` is starting the session (before launch.ps1 returns).
 Copy-Item "$root\state\rotation\$FromRoster.json" "$root\intent-at-launch.json" -ErrorAction SilentlyContinue
@@ -118,6 +119,9 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'pe-test') 'the replacement must launch through launch.ps1 -FromRoster'
   Assert-True (Test-Path "$testRoot\reconcile-calls.log") 'active Work records must be reconciled before the replacement acts'
   Assert-True ($intent.newSessionId -eq 'sess-new') 'the intent must record the replacement session'
+  # fleet #392: the replacement launches with the boundary that fired as its reason, and the rotated outcome (the rotation.log row) names it too.
+  Assert-True ((Get-Content "$testRoot\launch-reasons.log" -Raw).Trim() -eq 'pe-test|rotation:age') "an age rotation must launch with the reason rotation:age (got '$((Get-Content "$testRoot\launch-reasons.log" -Raw).Trim())')"
+  Assert-True (@($r2.outcomes | Where-Object { $_.name -eq 'pe-test' -and $_.status -eq 'rotated' -and "$($_.reason)" -match '^age ' }).Count -eq 1) "the rotated outcome must name the boundary that fired (outcomes: $($r2.outcomes | ConvertTo-Json -Compress -Depth 4))"
 
   # Case 2e (fleet #230): the race window. While launch.ps1 is still running (the moment
   # the new session's SessionStart hook fires), the intent on disk must already say this
@@ -172,6 +176,11 @@ console.log(JSON.stringify({ ok: true }));
     Remove-Item "$testRoot\profile\.claude\jobs\job-old" -Recurse -Force
   }
 
+  # fleet #392: a named rotation without -Force takes the policy path and records the same boundary.
+  Set-LiveRoster $old; Set-AgentsRows $idleRow; Reset-Markers
+  $r2f = Run-Rotate @('-Name', 'pe-test')
+  Assert-True ((@($r2f.rotated) -contains 'pe-test') -and (Get-Content "$testRoot\launch-reasons.log" -Raw).Trim() -eq 'pe-test|rotation:age') "a named policy rotation must record the boundary it fired on (got: $($r2f | ConvertTo-Json -Compress -Depth 4))"
+
   # Case 3: mid-turn session -> deferred, no intent, no stop.
   Set-LiveRoster $old; Set-AgentsRows $busyRow; Reset-Markers
   $r3 = Run-Rotate @('-Auto')
@@ -205,6 +214,7 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True (@($r5c.rotated) -contains 'pe-test') '-Force -Name must rotate despite the flag'
   Assert-True ((Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json).reasons -join ' ' -match 'forced') 'a forced rotation must record its reason'
   Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw) -match 'pe-test\|force') 'a forced rotation must pass -Force through to launch.ps1'
+  Assert-True ((Get-Content "$testRoot\launch-reasons.log" -Raw) -match 'pe-test\|rotation:forced') 'a forced rotation must launch with the reason rotation:forced'
   Remove-Item "$testRoot\state\flags\rotation-off"
 
   # Case 5d: -Force under PAUSE must not strand the role: the replacement launch
@@ -233,6 +243,8 @@ console.log(JSON.stringify({ ok: true }));
   $intent6 = Get-Content "$testRoot\state\rotation\pe-test.json" -Raw | ConvertFrom-Json
   Assert-True ($intent6.phase -eq 'launched') 'resume must complete the intent'
   Assert-True ($intent6.offset.totalEvents -eq 2) 'resume must keep the saved offset'
+  # fleet #392: an intent written before launch reasons existed has none recorded; its replacement still launches with a non-empty one.
+  Assert-True ((Get-Content "$testRoot\launch-reasons.log" -Raw).Trim() -eq 'pe-test|rotation:unrecorded') 'a resumed intent with no recorded launch reason must still launch with a non-empty one'
 
   # Case 6b: crash mid-stop (predecessor still alive) -> resume retires it first.
   Set-LiveRoster $old 'active'; Set-AgentsRows $idleRow; Reset-Markers
@@ -346,6 +358,7 @@ console.log(JSON.stringify({ ok: true }));
   Assert-True ((Get-Content "$testRoot\launch-calls.log" -Raw).Trim() -eq 'pe-test') 'a wake must relaunch through launch.ps1 without -Force'
   $intentW = (Get-Content "$testRoot\state\rotation\pe-test.json" -Raw) | ConvertFrom-Json
   Assert-True ((@($intentW.reasons) -join ' ') -match 'frontier-wake: frontier #501') 'the intent must carry the wake reason'
+  Assert-True ((Get-Content "$testRoot\launch-reasons.log" -Raw) -match 'pe-test\|wake:frontier #501') 'a wake must launch with the reason wake:<what changed>'
   Set-LiveRoster $young; Set-AgentsRows $busyRow; Reset-Markers
   $rwb = Run-Rotate @('-Name', 'pe-test', '-Wake', 'frontier #501', '-NoReconcile')
   Assert-True ((@($rwb.deferred) -join ' ') -match 'busy') 'a wake must defer at a busy boundary like any rotation'

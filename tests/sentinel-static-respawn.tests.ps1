@@ -24,8 +24,9 @@ function Set-Job { param([string]$Id, [string[]]$Flags)
 }
 function Set-LiveRoster { param([string]$Json) Write-Utf8 "$testRoot\state\roster.json" $Json }
 function Get-Calls { if (Test-Path "$testRoot\calls.txt") { @(Get-Content "$testRoot\calls.txt" | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) } else { @() } }
-function Reset-CallsOnly { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt" -ErrorAction SilentlyContinue }
-function Reset-Calls { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt", "$testRoot\state\sentinel\respawn-streak.json" -ErrorAction SilentlyContinue }   # fleet #257: the respawn streak is per case, not per suite
+function Get-LaunchReasons { if (Test-Path "$testRoot\launch-reasons.txt") { @(Get-Content "$testRoot\launch-reasons.txt" | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) } else { @() } }   # fleet #392: `name|reason` per launch.ps1 call
+function Reset-CallsOnly { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt", "$testRoot\launch-reasons.txt" -ErrorAction SilentlyContinue }
+function Reset-Calls { Remove-Item "$testRoot\calls.txt", "$testRoot\pid-counter.txt", "$testRoot\launch-reasons.txt", "$testRoot\state\sentinel\respawn-streak.json" -ErrorAction SilentlyContinue }   # fleet #257: the respawn streak is per case, not per suite
 function Run-Check { param([switch]$Apply) $out = if ($Apply) { & "$testRoot\bin\sentinel-check.ps1" -Apply | Out-String } else { & "$testRoot\bin\sentinel-check.ps1" | Out-String }; $out | ConvertFrom-Json }
 
 try {
@@ -64,9 +65,10 @@ exit 0
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'echo []' + "`r`n" + 'exit /b 0' + "`r`n")
   # launch.ps1 is the door the relaunch must go through; the mock logs the call.
   $mockLaunch = @'
-param([string]$FromRoster, [string]$Model, [switch]$Force)
+param([string]$FromRoster, [string]$Model, [switch]$Force, [string]$Reason)
 $modelMark = if ($Model) { "|$Model" } else { '' }
 [IO.File]::AppendAllText('TESTROOT\calls.txt', "launch $FromRoster$modelMark`r`n")
+[IO.File]::AppendAllText('TESTROOT\launch-reasons.txt', "$FromRoster|$Reason`r`n")
 if ($env:MOCK_LAUNCH_FAIL -eq '1') { Write-Output '{"launched":false,"reason":"workspace not trusted"}'; exit 7 }
 $launchedId = if ($env:MOCK_LAUNCH_JOBID) { $env:MOCK_LAUNCH_JOBID } else { 'job-new' }
 Write-Output ('{"launched":true,"name":"' + $FromRoster + '","jobId":"' + $launchedId + '","sessionId":"sess-new"}')
@@ -90,6 +92,7 @@ exit 0
   $s1 = Run-Check -Apply
   Assert-True (@($s1.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) "S1: a stale lead on current flags is respawned (got $($s1 | ConvertTo-Json -Compress -Depth 4))"
   Assert-True ((Get-Calls) -contains 'claude respawn job-p' -and -not (@(Get-Calls) -match '^launch')) "S1: through claude respawn, not the launch door (calls: $(@(Get-Calls) -join '; '))"
+  Assert-True (@($s1.respawned | Where-Object { $_.name -eq 'pl-test' -and "$($_.reason)" -ne '' }).Count -eq 1) 'S1: the respawn record names its reason (fleet #392)'
 
   # S2: the roster's job, but its frozen flags predate a model/effort ruling: stop it and relaunch through the door.
   Set-Job 'job-p' $frozenFlags
@@ -101,6 +104,8 @@ exit 0
   Assert-True ([array]::IndexOf($calls2, 'claude stop job-p') -lt [array]::IndexOf($calls2, 'launch pl-test')) 'S2: stop comes before the launch'
   $r2 = @($s2.respawned | Where-Object { $_.name -eq 'pl-test' })[0]
   Assert-True ($r2 -and "$($r2.via)" -eq 'launch' -and "$($r2.jobId)" -eq 'job-new' -and "$($r2.reason)" -match 'claude-opus-5\b' -and "$($r2.reason)" -match 'claude-sonnet-5-5') "S2: the report says it relaunched, names the new job and both flag sets: $($r2 | ConvertTo-Json -Compress)"
+  # fleet #392: a relaunch that stands in for a respawn passes respawn-fallback to the door, which records it on the roster row.
+  Assert-True ((@(Get-LaunchReasons)) -contains 'pl-test|respawn-fallback') "S2: the relaunch must pass the reason respawn-fallback to launch.ps1 (got: $(@(Get-LaunchReasons) -join '; '))"
 
   # S3 (the incident): no active live-roster row at all. The newest daemon row is a stale job; relaunch, never respawn.
   $env:MOCK_ROW_ID = 'job-old'
@@ -111,6 +116,7 @@ exit 0
   $calls3 = @(Get-Calls)
   Assert-True (-not ($calls3 -contains 'claude respawn job-old') -and $calls3 -contains 'launch pl-test') "S3: with no active roster row the launch door relaunches (calls: $($calls3 -join '; '))"
   Assert-True ("$(@($s3.respawned | Where-Object { $_.name -eq 'pl-test' })[0].reason)" -match 'no active live-roster row') 'S3: the reason names the missing roster row'
+  Assert-True ((@(Get-LaunchReasons)) -contains 'pl-test|respawn-fallback') "S3: the fallback relaunch names respawn-fallback (got: $(@(Get-LaunchReasons) -join '; '))"
 
   # S4: the roster's active row names another job than the daemon's newest row.
   Set-LiveRoster $activeRow
@@ -139,6 +145,7 @@ exit 0
   Reset-Calls
   $s7 = Run-Check -Apply
   Assert-True ((@(Get-Calls) -contains 'launch pl-test') -and -not (@(Get-Calls) -contains 'claude respawn job-p')) "S7: a stopped static on frozen flags relaunches (calls: $(@(Get-Calls) -join '; '))"
+  Assert-True ((@(Get-LaunchReasons)) -contains 'pl-test|respawn-fallback') "S7: the relaunch names respawn-fallback (got: $(@(Get-LaunchReasons) -join '; '))"
   Remove-Item Env:MOCK_ROW_STATE
 
   # S8: a role launch.ps1 pins no model for (the dispatcher runs its role file's `model:
@@ -169,6 +176,7 @@ exit 0
   Reset-Calls
   $s9b = Run-Check -Apply
   Assert-True (@(Get-Calls) -contains 'launch dispatcher|haiku') "S9: the relaunch keeps the roster's -Model (calls: $(@(Get-Calls) -join '; '))"
+  Assert-True ((@(Get-LaunchReasons)) -contains 'dispatcher|respawn-fallback') "S9: the relaunch names respawn-fallback (got: $(@(Get-LaunchReasons) -join '; '))"
 
   # S10 (review): a roster row with no jobId cannot prove the job is its own: relaunch.
   Set-LiveRoster '{"sessions":[{"name":"dispatcher","role":"dispatcher","status":"active","model":""}]}'
@@ -210,6 +218,8 @@ exit 0
   }
   $streak9 = Get-Content $streakFile -Raw | ConvertFrom-Json
   Assert-True ("$($streak9.'pl-test'.jobId)" -eq 'job-a3' -and @($streak9.'pl-test'.attempts).Count -eq 3) "B9: the entry follows the newest launched job id with three attempts (got $(Get-Content $streakFile -Raw))"
+  $b9reasons = @(Get-LaunchReasons)
+  Assert-True ($b9reasons.Count -eq 3 -and @($b9reasons | Where-Object { $_ -eq 'pl-test|respawn-fallback' }).Count -eq 3) "B9: each of the three relaunches names respawn-fallback (got $($b9reasons -join '; '))"
   Reset-CallsOnly
   $env:MOCK_LAUNCH_JOBID = 'job-a4'
   $b9held = Run-Check -Apply

@@ -130,6 +130,15 @@ try {
   Assert-True ($null -eq $r3.projected -or $r3.projected -eq $false) 'a control-plane launch must not report a projection'
   $after3 = Get-EventCount
   Assert-True ($after3 -eq $before3) 'a control-plane launch must append no Work event'
+  # fleet #392: the roster row carries the reason; a launch given none records manual.
+  $rosterPl3 = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'pl-test' -and $_.status -eq 'active' })[0]
+  Assert-True ($r3.launchReason -eq 'manual' -and "$($rosterPl3.launchReason)" -eq 'manual') "a control-plane launch with no -Reason must record manual on its roster row and output (output: $($r3.launchReason), row: $($rosterPl3.launchReason))"
+  # Case 4 (fleet #392): a launch given a reason records that reason on its roster row. The daemon list is reset so the duplicate-name guard passes.
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $r4 = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Reason', 'rotation:merges,age')
+  Assert-True ($lastExit -eq 0 -and $r4.launched -eq $true -and $r4.launchReason -eq 'rotation:merges,age') "a rotation launch must succeed and name its reason: $lastOut"
+  $rosterPl4 = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'pl-test' -and $_.status -eq 'active' })[0]
+  Assert-True ("$($rosterPl4.launchReason)" -eq 'rotation:merges,age') "the roster row must carry the reason the launch was given (row: $($rosterPl4.launchReason))"
 
   Write-Output 'launch projection tests passed'
 } finally {

@@ -125,7 +125,9 @@ function Complete-Rotation {
   }
   # Hashtable splat, not array: PS 5.1 array splatting delivered '-FromRoster' as a
   # positional VALUE to the script, silently launching nothing that was asked for.
-  $launchArgs = @{ FromRoster = $Intent.name }
+  # fleet #392: the reason the replacement launches under. An intent written before launch reasons were recorded has none.
+  $launchReason = if ($Intent.launchReason) { "$($Intent.launchReason)" } else { 'rotation:unrecorded' }
+  $launchArgs = @{ FromRoster = $Intent.name; Reason = $launchReason }
   if ($Force) { $launchArgs.Force = $true }   # a forced rotation must not strand the role behind launch gates it was told to pass
   # fleet #230: the replacement's SessionStart hook can run before launch.ps1 returns its
   # session id, so `launched` + newSessionId (written after) is too late for it. Mark the
@@ -180,7 +182,8 @@ function Complete-Rotation {
     $Intent | Add-Member -NotePropertyName newJobId -NotePropertyValue $launch.jobId -Force
     $Intent | Add-Member -NotePropertyName completedAt -NotePropertyValue (Now-Iso) -Force
     Write-Json $intentPath $Intent
-    return New-Outcome $Intent.name 'rotated'
+    $why = (@($Intent.reasons) -join '; ')
+    return New-Outcome $Intent.name 'rotated' $(if ($why) { $why } else { $launchReason })
   }
   if ($launch -and "$($launch.reason)" -match 'already running') {
     # Someone relaunched by hand between stop and resume; the goal state holds.
@@ -198,7 +201,7 @@ function Complete-Rotation {
 }
 
 function Start-Rotation {
-  param([string]$SessionName, [string[]]$Reasons)
+  param([string]$SessionName, [string[]]$Reasons, [string]$LaunchReason)
   $live = Get-LiveRoster
   $entry = $live.sessions | Where-Object { $_.name -eq $SessionName -and $_.status -eq 'active' } | Select-Object -First 1
   if (-not $entry) { return New-Outcome $SessionName 'failed' 'no active live-roster entry' }
@@ -212,7 +215,7 @@ function Start-Rotation {
   }
   $intent = [pscustomobject]@{
     schemaVersion = 1; name = $SessionName; phase = 'stopping'
-    reasons = @($Reasons); savedAt = (Now-Iso)
+    reasons = @($Reasons); launchReason = $LaunchReason; savedAt = (Now-Iso)
     oldSessionId = $entry.sessionId; oldJobId = $entry.jobId
     offset = (Invoke-Policy offset)
   }
@@ -272,16 +275,16 @@ try {
     $static = Get-StaticRoster
     if (-not ($static.sessions | Where-Object { $_.name -eq $Name })) { Write-Error "'$Name' is not a static roster session; rotation only replaces standing sessions"; exit 4 }
     if ($Force) {
-      $outcomes += Start-Rotation $Name @('forced by operator')
+      $outcomes += Start-Rotation $Name @('forced by operator') 'rotation:forced'
     } elseif ($Wake) {
       # A wake is a rotation whose reason is "there is work and the lead is idle": the
       # same stop-at-a-boundary, reconcile, relaunch-through-the-door path, so the
       # replacement reconstructs from state exactly as a rotated lead does.
-      $outcomes += Start-Rotation $Name @("frontier-wake: $Wake")
+      $outcomes += Start-Rotation $Name @("frontier-wake: $Wake") "wake:$Wake"
     } else {
       $evaluation = Invoke-Policy evaluate
       $due = $evaluation.sessions | Where-Object { $_.name -eq $Name } | Select-Object -First 1
-      if ($due -and $due.due) { $outcomes += Start-Rotation $Name @($due.reasons) }
+      if ($due -and $due.due) { $outcomes += Start-Rotation $Name @($due.reasons) "rotation:$(@($due.boundaries) -join ',')" }
       else { $outcomes += New-Outcome $Name 'skipped' 'no rotation threshold reached (use -Force to override)' }
     }
   }
@@ -290,7 +293,7 @@ try {
     $evaluation = Invoke-Policy evaluate
     foreach ($session in @($evaluation.sessions | Where-Object { $_.due })) {
       if ($handledNames -contains $session.name) { continue }
-      $outcomes += Start-Rotation $session.name @($session.reasons)
+      $outcomes += Start-Rotation $session.name @($session.reasons) "rotation:$(@($session.boundaries) -join ',')"
     }
   }
 

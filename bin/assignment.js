@@ -807,7 +807,7 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
     const base = resolveRemoteBase({ repoPath, remote: manifest.base.remote, ref: manifest.base.ref, runner });
     if (base.sha !== manifest.base.sha) { invalidate([{ field: 'base.sha', expected: manifest.base.sha, actual: base.sha }]); throw new WorkStateError('BASE_PRECONDITION_CHANGED', `manifest base ${manifest.base.sha} is not current at ${base.sha}`); }
   }
-  const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', launchScript || path.join(__dirname, 'launch.ps1'), '-Manifest', manifestPath, '-WorkRecordId', workRecordId];
+  const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', launchScript || path.join(__dirname, 'launch.ps1'), '-Manifest', manifestPath, '-WorkRecordId', workRecordId, '-Reason', 'assignment'];
   if (dryRun) return { launched: false, dryRun: true, command: [powershell, ...args] };
   try {
     const output = runner(powershell, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: LAUNCH_TIMEOUT_MS });

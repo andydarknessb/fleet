@@ -159,7 +159,7 @@ async function evaluate({ root, claudeHome, now } = {}) {
       name: String(row.name), role, tenant: row.tenant || null, sessionId: row.sessionId || null,
       launchedAt: row.launchedAt || null, thresholds,
       metrics: { ageHours: null, merges: null, jobTokens: null },
-      due: false, reasons: [], metricsError: null,
+      due: false, reasons: [], boundaries: [], metricsError: null,
     };
     const launchedMs = new Date(row.launchedAt || NaN).getTime();
     if (!Number.isFinite(launchedMs)) {
@@ -171,11 +171,13 @@ async function evaluate({ root, claudeHome, now } = {}) {
     entry.metrics.ageHours = (new Date(evaluatedAt).getTime() - launchedMs) / 3600000;
     if (Number.isFinite(thresholds.maxAgeHours) && entry.metrics.ageHours >= thresholds.maxAgeHours) {
       entry.reasons.push(`age ${entry.metrics.ageHours.toFixed(1)}h >= ${thresholds.maxAgeHours}h`);
+      entry.boundaries.push('age');
     }
     if (Number.isFinite(thresholds.maxMerges)) {
       entry.metrics.merges = countMerges(events, { tenant: entry.tenant, since: row.launchedAt });
       if (entry.metrics.merges >= thresholds.maxMerges) {
         entry.reasons.push(`merges ${entry.metrics.merges} >= ${thresholds.maxMerges}`);
+        entry.boundaries.push('merges');
       }
     }
     if (Number.isFinite(thresholds.maxJobTokens)) {
@@ -191,6 +193,7 @@ async function evaluate({ root, claudeHome, now } = {}) {
           entry.metrics.usageRowsWithoutId = totals.usageRowsWithoutId;
           if (totals.jobTokens >= thresholds.maxJobTokens) {
             entry.reasons.push(`job tokens ${totals.jobTokens} >= ${thresholds.maxJobTokens}`);
+            entry.boundaries.push('job-tokens');
           }
         } catch (error) {
           entry.metricsError = `transcript unreadable: ${String(error.message || error)}`;

@@ -5,6 +5,6 @@ param([switch]$DryRun)
 if (Test-SentinelOff) { Write-Output 'sentinel: cut over (state/flags/sentinel-off); the watchdog task supervises, not launching' }
 foreach ($n in @((Get-ExpectedStaticSessions) | ForEach-Object { $_.name })) {
   Write-Output "launching $n ..."
-  if ($DryRun) { & "$PSScriptRoot\launch.ps1" -FromRoster $n -DryRun } else { & "$PSScriptRoot\launch.ps1" -FromRoster $n }
+  if ($DryRun) { & "$PSScriptRoot\launch.ps1" -FromRoster $n -Reason manual -DryRun } else { & "$PSScriptRoot\launch.ps1" -FromRoster $n -Reason manual }
 }
 if (-not $DryRun) { & "$PSScriptRoot\status.ps1" }

@@ -292,7 +292,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
 
   # ===== Ticket 08b: live supervision under state/flags/sentinel-off =====
   # A mock launch door records every call and answers like launch.ps1.
-  Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
+  Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster, [string]$Reason)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
   function Get-LaunchCalls { if (Test-Path "$testRoot\launch-calls.txt") { @(Get-Content "$testRoot\launch-calls.txt") } else { @() } }
   function Get-EscalationFiles { param([string]$Pattern) @(Get-ChildItem "$testRoot\state\escalations" -Filter $Pattern -ErrorAction SilentlyContinue) }
   function Get-AppliedLines { $f = Get-ChildItem "$testRoot\state\sentinel\applied" -Filter *.jsonl -ErrorAction SilentlyContinue; if ($f) { @(Get-Content $f.FullName) } else { @() } }

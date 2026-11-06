@@ -124,6 +124,7 @@ exit /b 0
   $env:MOCK_PR = '0'
   $applied1 = (& "$testRoot\bin\sentinel-check.ps1" -Apply | Out-String) | ConvertFrom-Json
   Assert-True (@($applied1.respawned).Count -eq 1) 'the -Apply run must still respawn the stale IC'
+  Assert-True ("$($applied1.respawned[0].reason)" -ne '') 'the respawn record must carry its reason (fleet #392)'
   $applied2 = (& "$testRoot\bin\sentinel-check.ps1" -Apply -Actor watchdog | Out-String) | ConvertFrom-Json
   $ledgerFiles = @(Get-ChildItem "$testRoot\state\sentinel\applied" -Filter *.jsonl)
   Assert-True ($ledgerFiles.Count -eq 1) 'one applied ledger file per day'
@@ -131,6 +132,7 @@ exit /b 0
   Assert-True ($ledger.Count -eq 2) 'each -Apply tick must append exactly one ledger line'
   Assert-True ($ledger[0].actor -eq 'sentinel' -and $ledger[0].applied -eq $true) 'the default actor is the rostered Sentinel'
   Assert-True (@($ledger[0].respawned)[0].name -eq 'ic-900') 'the ledger line must carry the applied action set'
+  Assert-True ("$(@($ledger[0].respawned)[0].reason)" -ne '') 'the applied ledger line must carry the respawn reason (fleet #392)'
   Assert-True ($ledger[0].okCount -ge 0 -and $null -ne $ledger[0].PSObject.Properties['okCount']) 'the ledger line must carry okCount'
   Assert-True ($ledger[1].actor -eq 'watchdog') '-Actor must stamp the line'
   $env:MOCK_CLAUDE_FAIL = '1'

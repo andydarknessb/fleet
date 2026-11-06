@@ -71,6 +71,7 @@ test('evaluate marks a session due on age', async () => {
   const lead = result.sessions.find((s) => s.name === 'pl-endzone');
   assert.equal(lead.due, true);
   assert.match(lead.reasons.join(' '), /age/);
+  assert.deepEqual(lead.boundaries, ['age']);
 });
 
 test('evaluate leaves a young session alone', async () => {
@@ -80,6 +81,7 @@ test('evaluate leaves a young session alone', async () => {
   const lead = result.sessions.find((s) => s.name === 'pl-endzone');
   assert.equal(lead.due, false);
   assert.deepEqual(lead.reasons, []);
+  assert.deepEqual(lead.boundaries, []);
 });
 
 test('evaluate counts only own-tenant merges after launch', async () => {
@@ -106,6 +108,7 @@ test('evaluate counts only own-tenant merges after launch', async () => {
   const lead = five.sessions.find((s) => s.name === 'pl-endzone');
   assert.equal(lead.due, true);
   assert.match(lead.reasons.join(' '), /merges/);
+  assert.deepEqual(lead.boundaries, ['merges']);
 });
 
 test('evaluate sums transcript job tokens and trips the token threshold', async () => {
@@ -123,6 +126,7 @@ test('evaluate sums transcript job tokens and trips the token threshold', async 
   assert.equal(lead.metrics.jobTokens, 255000);
   assert.equal(lead.due, true);
   assert.match(lead.reasons.join(' '), /tokens/);
+  assert.deepEqual(lead.boundaries, ['job-tokens']);
 });
 
 test('evaluate treats a missing transcript as unknown tokens, not due', async () => {
@@ -192,6 +196,18 @@ test('evaluate falls back to spec thresholds when config/cycle.json is absent', 
   const lead = result.sessions.find((s) => s.name === 'pl-endzone');
   assert.equal(lead.due, true);
   assert.equal(lead.thresholds.maxAgeHours, 24);
+});
+
+// --- fleet #392: a session past two boundaries names both, so its launch and log can say which fired ---
+test('fleet#392: a session past the age and merge boundaries names both, age first', async () => {
+  const root = rootDir();
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z' });
+  write(root, 'state/events/2026-09-02.jsonl', [1, 2, 3, 4, 5].map((n) => eventLine({ recordId: `endzone:issue-${n}`, at: '2026-09-02T08:00:00.000Z' })).join(''));
+  const result = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
+  const lead = result.sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal(lead.due, true);
+  assert.deepEqual(lead.boundaries, ['age', 'merges']);
+  assert.equal(lead.reasons.length, 2);
 });
 
 // --- #311: the shipped config drops the project-lead age rotation ---------------------------

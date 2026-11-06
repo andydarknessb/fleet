@@ -7,6 +7,8 @@
 param(
   [string]$Role, [string]$Name, [string]$Tenant, [string]$Parent, [string]$Prompt, [int]$Issue,
   [string]$FromRoster, [string]$Manifest, [string]$WorkRecordId,
+  [ValidateNotNullOrEmpty()]
+  [string]$Reason = 'manual',  # fleet #392: why this launch happened, recorded as launchReason on the roster row and in the output: rotation:<merges|age|job-tokens|forced>, wake:<what changed>, recover, respawn-fallback, launch-needed, assignment, or manual (a human's launch, the default)
   [ValidateSet('', 'auto', 'allowlist')]
   [string]$Permissions, # the permission profile (ADR 0016); an assignment manifest's own `permissions` wins. Empty = auto.
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5', 'sonnet-5.5')]
@@ -540,7 +542,7 @@ if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-o
 }
 
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
+  Write-Output (@{ launched = $false; dryRun = $true; launchReason = $Reason; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
   exit 0
 }
 
@@ -710,7 +712,7 @@ $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
   model = $Model; permissions = $Permissions; effort = $effort
   jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $rosterManifest; workRecordId = $WorkRecordId
-  status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
+  status = 'active'; launchedAt = (Now-Iso); retiredAt = $null; launchReason = $Reason
 }
 # fleet #359: the splice runs on the fresh roster under the lock; the $live read above only feeds the checks.
 Update-LiveRoster { param($r) $r.sessions = @($r.sessions | Where-Object { $_.name -ne $Name }) + @($entry) }
@@ -731,5 +733,5 @@ if ($Role -eq 'ic') {
     $projected = ($LASTEXITCODE -eq 0)
   } catch { $projected = $false }
 }
-Write-Output (@{ launched = $true; name = $Name; jobId = $row.id; sessionId = $row.sessionId; cwd = $cwd; projected = $projected } | ConvertTo-Json -Compress)
+Write-Output (@{ launched = $true; name = $Name; jobId = $row.id; sessionId = $row.sessionId; cwd = $cwd; projected = $projected; launchReason = $Reason } | ConvertTo-Json -Compress)
 exit 0

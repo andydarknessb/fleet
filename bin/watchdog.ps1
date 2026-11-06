@@ -780,7 +780,7 @@ try {
       if ($paused) { $result.reason = 'PAUSE set; not launched' }
       else {
         try {
-          $raw = & "$PSScriptRoot\launch.ps1" -FromRoster $name 2>&1 | Out-String
+          $raw = & "$PSScriptRoot\launch.ps1" -FromRoster $name -Reason 'launch-needed' 2>&1 | Out-String
           $parsed = ConvertFrom-LastJsonLine $raw
           if ($parsed -and $parsed.PSObject.Properties['launched']) {
             $result.launched = [bool]$parsed.launched

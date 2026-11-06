@@ -452,7 +452,7 @@ function Do-Relaunch {
     }
   }
   # Hashtable splat (rotate.ps1's lesson: PS 5.1 array splatting passes '-FromRoster' as a value).
-  $launchArgs = @{ FromRoster = "$($entry.name)" }
+  $launchArgs = @{ FromRoster = "$($entry.name)"; Reason = 'respawn-fallback' }
   # A hand-set -Model on the roster row survives the relaunch (launch.ps1's ValidateSet tokens only).
   $rosterModel = "$(@((Get-LiveRoster).sessions | Where-Object { $_.name -eq $entry.name -and "$($_.status)" -eq 'active' } | Select-Object -Last 1).model)"
   if ($rosterModel -in @('sonnet', 'opus', 'haiku', 'fable', 'opus-5.5', 'sonnet-5.5') -and $rosterModel -ne (Resolve-LaunchModel -Role "$($entry.role)" -Model '').token) { $launchArgs.Model = $rosterModel }
