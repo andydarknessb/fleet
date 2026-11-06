@@ -10,6 +10,7 @@
   watchdog.respawnLoopWindowHours, with no heartbeat in between, is held (respawnHeld) and escalated as respawn-loop when the row has a live pid; a row
   with no pid is always respawned (and counted), with respawn-loop-down raised beside it once the cap is reached.
   Only reported: launchNeeded, escalate (blocked / stray / cap exceeded / vanished IC / orphan-late-session / ic-dead-before-ack / reservation-stranded / respawn-loop). The Sentinel session acts on those.
+  Ticket 386: a dormant Tenant's pl-, pe- and ar- sessions are neither launchNeeded nor respawned (state/watchdog/dormancy.json, fresh verdicts only).
 #>
 param([switch]$Apply, [string]$ReportPath = '', [string]$Actor = 'sentinel', [string]$HealRespawn = '')
 . "$PSScriptRoot\_common.ps1"
@@ -65,6 +66,20 @@ try { $daemon = Get-DaemonSessions -All -Strict } catch {
 }
 $report = [ordered]@{ at = (Now-Iso); applied = [bool]$Apply; respawned = @(); respawnFailed = @(); respawnDeferred = @(); respawnHeld = @(); launchNeeded = @(); escalate = @(); retired = @(); stopped = @(); stopFailed = @(); deadRetired = @(); strandedReleased = @(); strandedReleaseFailed = @(); worktrees = @(); sync = @(); pause = $null; ok = @() }
 
+# ticket 386: the Tenants the watchdog's fresh dormancy verdict calls dormant (bin/dormancy.js). A missing, stale or
+# flagged verdict names none, so nothing is held back. Read here, not through node: this check must not add a node call.
+$script:DormantTenants = @()
+try {
+  $dormSnap = Read-Json "$FleetHome\state\watchdog\dormancy.json"
+  if ($dormSnap -and -not (Test-Path "$FleetHome\state\flags\dormancy-off") -and ((ConvertTo-UtcDateTime $dormSnap.validUntil) -gt (Get-Date).ToUniversalTime())) {
+    $script:DormantTenants = @($dormSnap.tenants.PSObject.Properties | Where-Object { $_.Value.dormant -eq $true } | ForEach-Object { $_.Name })
+  }
+} catch {}
+# ticket 386: a dormant Tenant's pl-, pe- and ar- sessions are neither relaunched (launchNeeded) nor respawned until new work wakes them.
+function Test-DormantControlPlane {
+  param($Entry)
+  return ([bool]$Entry.static -and (@('project-lead', 'principal', 'arbiter') -contains "$($Entry.role)") -and (@($script:DormantTenants) -contains "$($Entry.tenant)"))
+}
 # fleet #252: one strict read of state/roster.json for the orphan pass. Get-LiveRoster above folds an
 # unparseable file into an empty roster, and "no row claims this job" off an empty roster would let
 # a healthy session read as an orphan; an unreadable roster classifies nothing this tick.
@@ -469,6 +484,8 @@ function Do-Relaunch {
 function Get-OneLineText { param([string]$Text) $t = ("$Text" -replace '\s+', ' ').Trim(); if ($t.Length -gt 200) { $t = $t.Substring(0, 200) }; return $t }
 function Do-Respawn {
   param($row, $entry, $reason, [switch]$Reaped)
+  # ticket 386: a dormant Tenant's control-plane session is not respawned, nor relaunched through Do-Relaunch, until new work wakes it.
+  if (Test-DormantControlPlane $entry) { $script:report.ok += [pscustomobject]@{ name = $row.name; detail = "dormant tenant $($entry.tenant): not respawned ($reason)" }; return }
   if (-not $entry.static) {
     $current = Get-LiveRoster
     $currentEntry = $current.sessions | Where-Object { $_.name -eq $entry.name } | Select-Object -First 1
@@ -742,7 +759,8 @@ foreach ($x in $expected) {
     }
   }
   if (-not $row) {
-    if ($x.static) { $report.launchNeeded += [pscustomobject]@{ name = $x.name; reason = 'no job known to the daemon' } }
+    if ($x.static -and (Test-DormantControlPlane $x)) { $report.ok += [pscustomobject]@{ name = $x.name; detail = "dormant tenant $($x.tenant): control-plane session not relaunched until new work wakes it (ticket 386)" } }
+    elseif ($x.static) { $report.launchNeeded += [pscustomobject]@{ name = $x.name; reason = 'no job known to the daemon' } }
     else { $report.escalate += [pscustomobject]@{ name = $x.name; kind = 'ic-vanished'; detail = "active IC for issue #$($x.issue) has no job; parent $($x.parent) must relaunch or retire"; parent = $x.parent } }
     continue
   }

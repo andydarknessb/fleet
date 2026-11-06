@@ -14,7 +14,7 @@
   and no Sentinel session is running, the same run IS the supervisor: the check runs
   with -Apply (respawns, retirements, sweeps, rate-limit PAUSE; ledger actor
   'watchdog'), missing static sessions are launched through launch.ps1 -FromRoster
-  (never under a PAUSE), a respawn files an escalation
+  (never under a PAUSE, and not a dormant Tenant's pl-/pe-/ar- sessions: ticket 386, bin/dormancy.js), a respawn files an escalation
   naming the parent, and check escalations of the configured kinds
   (config/cycle.json supervisor.pageKinds) page once per new name:kind as a banner
   condition plus one escalation file. `blocked` is recorded, never paged: the daemon's
@@ -535,6 +535,14 @@ try {
   $reportPath = if ($Verify) { Join-Path $env:TEMP "fleet-watchdog-verify-check-$PID-$([guid]::NewGuid().ToString('N')).json" } elseif ($mode -eq 'live') { "$FleetHome\state\sentinel\last-check.json" } else { "$FleetHome\state\watchdog\last-shadow-check.json" }
   if (-not $Verify) { [IO.Directory]::CreateDirectory("$FleetHome\state\watchdog") | Out-Null; [IO.Directory]::CreateDirectory("$FleetHome\state\sentinel") | Out-Null }
   Remove-Item $reportPath -ErrorAction SilentlyContinue
+  # --- ticket 386: this tick's dormancy verdict (bin/dormancy.js), written before the check reads it. Removed first, so a failed
+  # --- or timed-out evaluation leaves no dormant verdict behind: a missing verdict reads as awake. -Verify writes nothing.
+  if (-not $Verify) { Remove-Item "$FleetHome\state\watchdog\dormancy.json" -ErrorAction SilentlyContinue }
+  # under Pause every tenant reads awake anyway, and a wedged node must not stall a paused tick (same precedent as the Arbiter skip around line 1424)
+  if (-not $Verify -and -not (Test-Paused) -and -not (Test-Path "$FleetHome\state\flags\dormancy-off")) {
+    $dormancyNode = $null; try { $dormancyNode = Get-NodeExe } catch {}
+    if ($dormancyNode) { $null = Invoke-BoundedExe -FilePath $dormancyNode -ArgumentList @("$PSScriptRoot\dormancy.js", 'snapshot', '--root', $FleetHome) -TimeoutSec 60 -Name 'node dormancy.js snapshot' -KillTree }
+  }
   $check = $null; $checkError = ''; $checkExit = $null
   $childOut = [IO.Path]::GetTempFileName(); $childErr = [IO.Path]::GetTempFileName()
   try {
