@@ -184,6 +184,7 @@ powershell -File C:\Users\Cory\fleet\bin\deploy-live.ps1
 | Cory's own terminal, including `!` commands in an interactive Claude Code session | `andydarknessb` (keyring) | nothing in Cory's environment changes |
 | Every session `launch.ps1` or `rotate.ps1` starts | the Fleet identity | `GH_CONFIG_DIR` and `GIT_CONFIG_SYSTEM` in the session's settings `env` |
 | The Watchdog task, and everything it runs (`deploy-live.ps1`, `sync-integration.ps1`) | the Fleet identity | `watchdog.ps1` sets the same variables in its own process each tick |
+| The PR Watch task (`run-pr-watch.ps1`) | `andydarknessb` (keyring) for its reads and record writes; the Fleet identity for the Reconcile PR calls (list, status, merge; fleet #390) | `pr-watch.js`'s `fleetGhRunner` sets `GH_CONFIG_DIR` for those calls only |
 
 The token lives in `%USERPROFILE%\.fleet-identity\gh\hosts.yml`, never in `state/` or the repo. Commits keep Cory as author; the Fleet identity is only the pusher, PR opener, status poster and merger.
 

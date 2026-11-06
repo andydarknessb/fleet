@@ -632,6 +632,64 @@ function attestPullRequest(options = {}) {
   return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
 }
 
+// --- fleet #390: standing exceptions pass the Review gate with no review ----
+// config/review-exceptions.json `standing` holds a ruling per class of PR that needs no formal review.
+// `reconcile` is the one kind: a PR from the tenant's releaseBranch (main) into its defaultBranch
+// (integration), the Reconcile PR sync-integration opens on divergence. Its content already landed on
+// main under Cory's own merge, so nothing is left to review. bin/pr-watch.js merges one only when it has
+// no conflicts and its gates are green. A tenant with one branch has no Reconcile PR.
+
+function standingException(root, tenant, pr) {
+  if (!tenant || !tenant.releaseBranch || !tenant.defaultBranch || tenant.releaseBranch === tenant.defaultBranch) return null;
+  // A fork's own `main` is not the tenant's main; a PR without the cross-repository flag is not known to be this repo's, so it is refused too.
+  if (pr.headRefName !== tenant.releaseBranch || pr.baseRefName !== tenant.defaultBranch || pr.isCrossRepository !== false) return null;
+  const file = path.join(path.resolve(root || DEFAULT_ROOT), 'config', 'review-exceptions.json');
+  let config;
+  try {
+    let text = fs.readFileSync(file, 'utf8');
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    config = JSON.parse(text);
+  } catch (error) {
+    throw new ReviewPolicyError('EXCEPTIONS_UNREADABLE', `${file} is unreadable (${error.message}); no standing exception is recognized`);
+  }
+  const standing = config && Array.isArray(config.standing) ? config.standing : [];
+  return standing.find((entry) => entry && entry.kind === 'reconcile' && typeof entry.ruling === 'string' && entry.ruling.trim()) || null;
+}
+
+// Nothing is reviewed here, so no artifact is written: the status posts the ruling's verdict on the head.
+// A refused post comes back on the result, and the caller does not merge.
+function postStandingStatus({ tenant, exception, headSha, headRefName, baseRefName, gh }) {
+  const run = gh || defaultGh;
+  const refused = (statusError) => ({ statusPosted: false, status: null, statusError });
+  if (!exception) return refused('no standing exception recognizes this PR');
+  if (!tenant || typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) return refused(`tenant ${tenant?.name || ''} names no reviewStatus`);
+  // #154 (ADR 0015): the same config refusal loadTenant makes for every status post, since the watcher reads tenants itself.
+  try { require('./identity').assertDistinctIdentity(tenant, tenant.name); } catch (error) { throw new ReviewPolicyError(error.code, error.message); }
+  // The login the gh runner acts as is read, not assumed: a status that would be the owner's is refused.
+  let login;
+  try { login = String(run(['api', 'user', '--jq', '.login']) || '').trim(); } catch (error) {
+    return refused(`could not read the acting login: ${String(error.stderr || error.message || error).trim().slice(0, 300)}`);
+  }
+  if (!login) return refused('could not read the acting login');
+  const owner = String(tenant.ownerLogin || '').trim().toLowerCase();
+  if (!owner || login.toLowerCase() === owner) {
+    return refused(owner
+      ? `gh acts as ${login}, the tenant owner; the fleet's status is posted under the fleet identity only (ADR 0015)`
+      : `tenant ${tenant.name || ''} names no ownerLogin, so the acting login cannot be checked against the tenant owner`);
+  }
+  const context = tenant.reviewStatus.trim();
+  const description = `standing exception ${exception.kind}: ${headRefName} into ${baseRefName}; ruling in config/review-exceptions.json`.slice(0, STATUS_DESCRIPTION_LIMIT);
+  const status = { context, state: 'success', sha: String(headSha), description };
+  try {
+    const output = run(['api', '--method', 'POST', `repos/${tenant.github}/statuses/${headSha}`,
+      '-f', 'state=success', '-f', `context=${context}`, '-f', `description=${description}`]);
+    status.postedBy = creatorOf(output);
+    return { statusPosted: true, status };
+  } catch (error) {
+    return { statusPosted: false, status, statusError: String(error.stderr || error.message || error).trim().slice(0, 500) || 'gh exited nonzero' };
+  }
+}
+
 // --- #118: re-review discipline at the door (ADR 0014 Consequences) ---------
 // On endzone #1240 one finding was re-raised five times at a cost of 569k
 // tokens. A finding may carry `repeats: <prior finding id>`, naming a finding
@@ -1227,8 +1285,10 @@ module.exports = {
   holdRecord,
   matchGlob,
   planRereview,
+  postStandingStatus,
   recordReviewArtifact,
   repostReviewStatus,
   reviewStatusFor,
+  standingException,
   verifyRecordedCommits,
 };

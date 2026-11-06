@@ -5,7 +5,7 @@ const path = require('node:path');
 const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
-const { evaluateChecks, planRecord, runWatch, closingLinked, closingLinkage, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS } = require('../bin/pr-watch');
+const { evaluateChecks, planRecord, runWatch, closingLinked, closingLinkage, hopsTo, escalatedHopsTo, WATCHER_MARK, cli, FLAGS, fleetGhRunner } = require('../bin/pr-watch');
 const workState = require('../bin/work-state');
 const exclusions = require('../bin/exclusions');
 const { selectFrontier } = require('../bin/assignment');
@@ -1166,4 +1166,215 @@ test('#203: an issue that no longer resolves (deleted or transferred) releases i
   assert.match(lift.evidence, /^issue #42 no longer resolves \(gh issue view: .*Could not resolve to an issue/);
   assert.ok(lift.evidence.length < 250);
   assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 0);
+});
+
+// --- fleet #390: the watcher merges a Reconcile PR (the tenant's main into its integration branch) as a
+// merge commit when GitHub reports no conflicts and every ciGates check is green. Its Review gate passes
+// through the standing exception in config/review-exceptions.json. Every GitHub call goes through a stubbed
+// runner (`fetchers.gh`) that records each gh argv and answers the calls the pass makes.
+
+const RECONCILE_HEAD = 'e'.repeat(40);
+const RECONCILE_TENANT = { ...TENANT, name: 'endzone', github: 'owner/repo', defaultBranch: 'integration', releaseBranch: 'main', reviewStatus: 'fleet-review', ownerLogin: 'andydarknessb', fleetIdentity: 'andydarknessb-fleet' };
+function reconcilePr(overrides = {}) {
+  return {
+    number: 2680, title: 'Reconcile main into integration', isDraft: false, headRefName: 'main', baseRefName: 'integration',
+    headRefOid: RECONCILE_HEAD, isCrossRepository: false, mergeable: 'MERGEABLE',
+    statusCheckRollup: [check('g1', 'COMPLETED', 'SUCCESS'), check('g2', 'COMPLETED', 'SUCCESS')],
+    ...overrides,
+  };
+}
+function reconcileRoot({ standing = true } = {}) {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  const config = { schemaVersion: 1, exceptions: [], standing: standing ? [{ kind: 'reconcile', ruling: 'Cory 2026-11-06 (fleet #382 ruling 1)' }] : [] };
+  fs.writeFileSync(path.join(root, 'config', 'review-exceptions.json'), JSON.stringify(config));
+  return root;
+}
+function ghStub({ prs = [reconcilePr()], failList = false, failStatus = false, failMerge = false, actingLogin = 'andydarknessb-fleet' } = {}) {
+  const calls = [];
+  const gh = (args) => {
+    calls.push(args);
+    if (args[0] === 'pr' && args[1] === 'list') { if (failList) throw new Error('gh: connection reset by peer'); return JSON.stringify(prs); }
+    if (args[0] === 'api' && args[1] === 'user') return actingLogin;
+    if (args[0] === 'api') {
+      if (failStatus) throw Object.assign(new Error('Command failed: gh api'), { stderr: 'gh: HTTP 502 Bad Gateway' });
+      return JSON.stringify({ state: 'success', creator: { login: actingLogin } });
+    }
+    if (args[0] === 'pr' && args[1] === 'merge') { if (failMerge) throw new Error('Command failed: gh pr merge\nPull request is not mergeable'); return ''; }
+    return '{}';
+  };
+  return { calls, gh };
+}
+function reconcileWatch(root, gh, opts = {}) {
+  return runWatch({ root, tenantName: 'endzone', tenantConfig: RECONCILE_TENANT, fetchers: { ...fetchers(), fleetGh: gh }, shadow: false, ...opts });
+}
+const mergesOf = (calls) => calls.filter((args) => args[0] === 'pr' && args[1] === 'merge');
+const statusPostsOf = (calls) => calls.filter((args) => args[0] === 'api' && args.includes('--method'));
+
+test('#390: a conflict-free Reconcile PR with every gate green gets the standing status on its head, then merges as a merge commit', () => {
+  const root = reconcileRoot();
+  const { calls, gh } = ghStub();
+  const health = reconcileWatch(root, gh);
+  assert.deepEqual(calls[0].slice(0, 4), ['pr', 'list', '-R', 'owner/repo']);
+  assert.deepEqual(calls[0].slice(4, 10), ['--base', 'integration', '--head', 'main', '--state', 'open']);
+  const posts = statusPostsOf(calls);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0][3], `repos/owner/repo/statuses/${RECONCILE_HEAD}`, 'the status lands on the PR head');
+  assert.ok(posts[0].includes('state=success') && posts[0].includes('context=fleet-review'));
+  assert.deepEqual(mergesOf(calls), [['pr', 'merge', '2680', '-R', 'owner/repo', '--merge', '--match-head-commit', RECONCILE_HEAD]]);
+  assert.ok(calls.indexOf(posts[0]) < calls.indexOf(mergesOf(calls)[0]), 'the gate passes before the merge');
+  assert.equal(calls.some((args) => args.includes('--delete-branch')), false, 'the head branch is main: it is never deleted');
+  assert.equal(health.ok, true);
+  assert.equal(health.failures, 0);
+  assert.match(health.actions.join(' '), /endzone:reconcile-pr-2680: merged main into integration as a merge commit/);
+});
+
+test('#390: every run of a gate must be green: a red run on the head blocks the merge in either order, even when a rerun of that gate passed', () => {
+  const root = reconcileRoot();
+  for (const runs of [
+    [check('g1', 'COMPLETED', 'FAILURE'), check('g1', 'COMPLETED', 'SUCCESS'), check('g2', 'COMPLETED', 'SUCCESS')],
+    [check('g1', 'COMPLETED', 'SUCCESS'), check('g1', 'COMPLETED', 'FAILURE'), check('g2', 'COMPLETED', 'SUCCESS')],
+  ]) {
+    const { calls, gh } = ghStub({ prs: [reconcilePr({ statusCheckRollup: runs })] });
+    const health = reconcileWatch(root, gh);
+    assert.deepEqual(mergesOf(calls), [], 'a red run of a gate is not excused by a green one');
+    assert.equal(health.ok, true);
+  }
+  const green = ghStub({ prs: [reconcilePr({ statusCheckRollup: [check('g1', 'COMPLETED', 'SUCCESS'), check('g1', 'COMPLETED', 'SUCCESS'), check('g2', 'COMPLETED', 'SUCCESS')] })] });
+  reconcileWatch(root, green.gh);
+  assert.equal(mergesOf(green.calls).length, 1, 'every run green: the merge goes ahead');
+});
+
+test('#390: a Reconcile PR with conflicts, or whose mergeability is not known yet, is not merged and not gated', () => {
+  for (const mergeable of ['CONFLICTING', 'UNKNOWN']) {
+    const root = reconcileRoot();
+    const { calls, gh } = ghStub({ prs: [reconcilePr({ mergeable })] });
+    const health = reconcileWatch(root, gh);
+    assert.deepEqual(mergesOf(calls), [], `${mergeable}: no merge`);
+    assert.deepEqual(statusPostsOf(calls), [], `${mergeable}: no status posted`);
+    assert.equal(health.ok, true, `${mergeable}: a conflict is the escalation path, not a failed tick`);
+  }
+});
+
+test('#390: a Reconcile PR whose required checks are pending, red or missing is not merged yet', () => {
+  const rollups = {
+    pending: [check('g1', 'COMPLETED', 'SUCCESS'), check('g2', 'IN_PROGRESS', '')],
+    red: [check('g1', 'COMPLETED', 'FAILURE'), check('g2', 'COMPLETED', 'SUCCESS')],
+    missing: [check('g1', 'COMPLETED', 'SUCCESS')],
+  };
+  for (const [name, statusCheckRollup] of Object.entries(rollups)) {
+    const root = reconcileRoot();
+    const { calls, gh } = ghStub({ prs: [reconcilePr({ statusCheckRollup })] });
+    const health = reconcileWatch(root, gh);
+    assert.deepEqual(mergesOf(calls), [], `${name}: no merge`);
+    assert.deepEqual(statusPostsOf(calls), [], `${name}: no status posted`);
+    assert.equal(health.ok, true, `${name}: waiting is not a failed tick`);
+  }
+});
+
+test('#390: a PR titled Reconcile main into integration is not a Reconcile PR unless its head and base are main and integration from this repo', () => {
+  const lookalikes = [
+    reconcilePr({ headRefName: 'fleet/12-thing' }),
+    reconcilePr({ headRefName: 'integration', baseRefName: 'main' }),
+    reconcilePr({ baseRefName: 'master' }),
+    reconcilePr({ isCrossRepository: true }),
+    reconcilePr({ isDraft: true }),
+  ];
+  const root = reconcileRoot();
+  const { calls, gh } = ghStub({ prs: lookalikes });
+  const health = reconcileWatch(root, gh);
+  assert.deepEqual(mergesOf(calls), []);
+  assert.deepEqual(statusPostsOf(calls), []);
+  assert.equal(health.ok, true);
+});
+
+test('#390: without a standing reconcile exception in config, a clean Reconcile PR is left to the escalation', () => {
+  const root = reconcileRoot({ standing: false });
+  const { calls, gh } = ghStub();
+  const health = reconcileWatch(root, gh);
+  assert.deepEqual(mergesOf(calls), []);
+  assert.deepEqual(statusPostsOf(calls), []);
+  assert.equal(health.ok, true);
+});
+
+test('#390: a status post GitHub refuses stops the merge and fails the tick; the next tick retries', () => {
+  const root = reconcileRoot();
+  const refused = ghStub({ failStatus: true });
+  const failed = reconcileWatch(root, refused.gh);
+  assert.deepEqual(mergesOf(refused.calls), []);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.failures, 1);
+  assert.match(failed.actions.join(' '), /endzone:reconcile-pr-2680: not merged/);
+  const retry = ghStub();
+  assert.equal(reconcileWatch(root, retry.gh).ok, true);
+  assert.equal(mergesOf(retry.calls).length, 1);
+});
+
+test('#390: a merge GitHub refuses is a failed watcher action, and the next clean tick merges it', () => {
+  const root = reconcileRoot();
+  const refused = ghStub({ failMerge: true });
+  const failed = reconcileWatch(root, refused.gh);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.failures, 1);
+  assert.match(failed.actions.join(' '), /endzone:reconcile-pr-2680: not merged/);
+  const retry = ghStub();
+  const healthy = reconcileWatch(root, retry.gh);
+  assert.equal(healthy.ok, true);
+  assert.equal(mergesOf(retry.calls).length, 1);
+});
+
+test('#390: a watcher whose gh acts as the tenant owner merges nothing and says why, the failure standing until the fleet identity is in use (ADR 0015)', () => {
+  const root = reconcileRoot();
+  const { calls, gh } = ghStub({ actingLogin: 'andydarknessb' });
+  const health = reconcileWatch(root, gh);
+  assert.deepEqual(statusPostsOf(calls), []);
+  assert.deepEqual(mergesOf(calls), []);
+  assert.equal(health.ok, false);
+  assert.match(health.actions.join(' '), /endzone:reconcile-pr-2680: not merged \(.*tenant owner/);
+});
+
+test('#390: a dry run names the merge it would make and makes no write', () => {
+  const root = reconcileRoot();
+  const { calls, gh } = ghStub();
+  const health = reconcileWatch(root, gh, { dryRun: true });
+  assert.deepEqual(statusPostsOf(calls), []);
+  assert.deepEqual(mergesOf(calls), []);
+  assert.match(health.actions.join(' '), /DRY endzone:reconcile-pr-2680: merge main into integration/);
+});
+
+test('#390: an unreadable PR list fails the tick and merges nothing', () => {
+  const root = reconcileRoot();
+  const { calls, gh } = ghStub({ failList: true });
+  const health = reconcileWatch(root, gh);
+  assert.equal(health.ok, false);
+  assert.match(health.actions.join(' '), /reconcile PR list failed/);
+  assert.deepEqual(statusPostsOf(calls), []);
+  assert.deepEqual(mergesOf(calls), []);
+});
+
+test('#390: a tenant whose main is its integration branch (nidus) never lists a Reconcile PR, and a tenant with no required gates never merges one', () => {
+  const root = reconcileRoot();
+  const one = ghStub();
+  const health = runWatch({ root, tenantName: 'nidus', tenantConfig: { ...RECONCILE_TENANT, defaultBranch: 'master', releaseBranch: 'master' }, fetchers: { ...fetchers(), fleetGh: one.gh }, shadow: false });
+  assert.deepEqual(one.calls, []);
+  assert.equal(health.ok, true);
+  const ungated = ghStub();
+  runWatch({ root, tenantName: 'endzone', tenantConfig: { ...RECONCILE_TENANT, ciGates: [] }, fetchers: { ...fetchers(), fleetGh: ungated.gh }, shadow: false });
+  assert.deepEqual(mergesOf(ungated.calls), [], 'with nothing required there is nothing that proves the merge safe');
+});
+
+test('#390: the Reconcile calls run under the fleet identity config dir, never an inherited token (ADR 0015)', () => {
+  const dir = makeTempDir('fleet-identity-');
+  const saved = { dir: process.env.FLEET_IDENTITY_DIR, token: process.env.GH_TOKEN, github: process.env.GITHUB_TOKEN };
+  process.env.FLEET_IDENTITY_DIR = dir;
+  process.env.GH_TOKEN = 'inherited-owner-token';
+  process.env.GITHUB_TOKEN = 'inherited-owner-token';
+  try {
+    const seen = fleetGhRunner(process.execPath)(['-e', 'process.stdout.write([process.env.GH_CONFIG_DIR, process.env.GH_TOKEN || "", process.env.GITHUB_TOKEN || "", process.env.GH_PROMPT_DISABLED].join("|"))']);
+    assert.equal(seen, `${dir}|||1`);
+  } finally {
+    for (const [key, value] of [['FLEET_IDENTITY_DIR', saved.dir], ['GH_TOKEN', saved.token], ['GITHUB_TOKEN', saved.github]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });

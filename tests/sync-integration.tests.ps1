@@ -51,6 +51,9 @@ try {
   )
   $env:PATH = "$testRoot\mock-bin;$oldPath"
 
+  # No standing reconcile exception is configured until the fleet #390 cases further down, and without one the PR
+  # watcher cannot merge a Reconcile PR: so every divergence in the scenarios up to there escalates as it always did,
+  # including a PR this run opens.
   # --- Scenario A: default and release structurally diverge with real content on both sides. ---
   $remoteA = "$testRoot\remoteA.git"; $repoA = "$testRoot\repoA"
   Invoke-Git @('init', '--bare', '-q', $remoteA) | Out-Null
@@ -489,6 +492,209 @@ try {
   Assert-True ($warnOut -match 'could not write sync memo' -and $warnOut -match '"kind":"sync-waiting"') "a failed memo write must warn on stderr and not change the outcome (got $warnOut)"
   $env:PATH = "$testRoot\mock-bin;$oldPath"
   Remove-Item Env:MOCK_GH_DIR -ErrorAction SilentlyContinue
+
+  # ===== fleet #390 (owner ruling 2026-11-06): only a conflict or a red gate comes to Cory. While the open
+  # ===== Reconcile PR (main into integration, the endzone orientation) is one the PR watcher will merge, this
+  # ===== script holds it instead of escalating: clean, pending, or mergeability unknown on one run. It escalates
+  # ===== a conflict, a red gate, a PR that is not a Reconcile PR, no PR at all (as today), and a hold that
+  # ===== outlives its limit. Each case reads its own fixture `gh pr list` (MOCK_REC_DIR) over one diverged repo. =====
+  [IO.Directory]::CreateDirectory("$testRoot\mock-bin-rec") | Out-Null
+  Write-Utf8 "$testRoot\mock-bin-rec\gh.cmd" (
+    '@echo off' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="list" goto :list' + "`r`n" +
+    'if "%1"=="pr" if "%2"=="create" goto :create' + "`r`n" +
+    'exit /b 0' + "`r`n" +
+    ':list' + "`r`n" +
+    'if exist "%MOCK_REC_DIR%\pr-list.json" (type "%MOCK_REC_DIR%\pr-list.json") else (echo [])' + "`r`n" +
+    'exit /b 0' + "`r`n" +
+    ':create' + "`r`n" +
+    'echo %*>> "%MOCK_REC_DIR%\pr-create-calls.log"' + "`r`n" +
+    'if defined MOCK_REC_FAIL_CREATE (echo gh: pull request create failed 1>&2 & exit /b 1)' + "`r`n" +
+    'echo https://github.com/owner/repo6/pull/777' + "`r`n" +
+    'exit /b 0' + "`r`n"
+  )
+  function New-EndzoneRepo {
+    # main and integration each carry a commit the other lacks; -Merged then merges main into integration
+    # the way the Reconcile PR does (a merge commit) and pushes it.
+    param([string]$Name, [switch]$Merged)
+    $remote = "$testRoot\remote-$Name.git"; $repo = "$testRoot\repo-$Name"
+    Invoke-Git @('init', '--bare', '-q', $remote) | Out-Null
+    Invoke-Git @('clone', '-q', $remote, $repo) | Out-Null
+    Invoke-Git @('-C', $repo, 'config', 'user.email', 'a@b.com') | Out-Null
+    Invoke-Git @('-C', $repo, 'config', 'user.name', 'a') | Out-Null
+    Invoke-Git @('-C', $repo, 'checkout', '-q', '-b', 'main') | Out-Null
+    Invoke-Git @('-C', $repo, 'commit', '-q', '--allow-empty', '-m', 'init') | Out-Null
+    Invoke-Git @('-C', $repo, 'push', '-q', '-u', 'origin', 'main') | Out-Null
+    Invoke-Git @('-C', $repo, 'checkout', '-q', '-b', 'integration') | Out-Null
+    Write-Utf8 "$repo\integration-only.txt" 'integration content'
+    Invoke-Git @('-C', $repo, 'add', '-A') | Out-Null
+    Invoke-Git @('-C', $repo, 'commit', '-q', '-m', 'integration-only change') | Out-Null
+    Invoke-Git @('-C', $repo, 'push', '-q', '-u', 'origin', 'integration') | Out-Null
+    Invoke-Git @('-C', $repo, 'checkout', '-q', 'main') | Out-Null
+    Write-Utf8 "$repo\main-only.txt" 'main content'
+    Invoke-Git @('-C', $repo, 'add', '-A') | Out-Null
+    Invoke-Git @('-C', $repo, 'commit', '-q', '-m', 'main-only change') | Out-Null
+    Invoke-Git @('-C', $repo, 'push', '-q', 'origin', 'main') | Out-Null
+    if ($Merged) {
+      Invoke-Git @('-C', $repo, 'checkout', '-q', 'integration') | Out-Null
+      Invoke-Git @('-C', $repo, 'merge', '-q', '--no-ff', '-m', 'Reconcile main into integration', 'main') | Out-Null
+      Invoke-Git @('-C', $repo, 'push', '-q', 'origin', 'integration') | Out-Null
+    }
+    $repo
+  }
+  function Set-EndzoneTenant {
+    param([string]$Name, [string]$Repo, [string[]]$CiGates = @('test-build', 'guards'))
+    Write-Utf8 "$testRoot\tenants\$Name.json" (@{ name = $Name; repo = $Repo; github = 'owner/repo6'; defaultBranch = 'integration'; releaseBranch = 'main'; ciGates = $CiGates } | ConvertTo-Json -Compress)
+  }
+  $recSha = 'a' * 40
+  function Set-RecPrList {
+    # One open PR as `gh pr list --json` answers it: $Gates maps each ciGate to its CheckRun status and conclusion.
+    param([string]$Dir, [string]$Mergeable = 'MERGEABLE', [string]$Head = 'main', [string]$Base = 'integration', [bool]$Draft = $false,
+      [hashtable]$Gates = @{ 'test-build' = @('COMPLETED', 'SUCCESS'); 'guards' = @('COMPLETED', 'SUCCESS') }, [int]$Number = 2680, [string]$Sha = $recSha)
+    [IO.Directory]::CreateDirectory($Dir) | Out-Null
+    $runs = @(foreach ($name in $Gates.Keys) { [ordered]@{ __typename = 'CheckRun'; name = $name; status = $Gates[$name][0]; conclusion = $Gates[$name][1] } })
+    $pr = [ordered]@{ number = $Number; url = "https://github.com/owner/repo6/pull/$Number"; isDraft = $Draft; isCrossRepository = $false; headRefName = $Head; baseRefName = $Base; headRefOid = $Sha; mergeable = $Mergeable; statusCheckRollup = $runs }
+    Write-Utf8 "$Dir\pr-list.json" (ConvertTo-Json -InputObject @($pr) -Depth 6 -Compress)
+  }
+  function Invoke-Rec {
+    # One applying tick of sync-integration for the tenant $Case over the diverged repo, reading that case's PR list.
+    param([string]$Case)
+    Set-EndzoneTenant -Name $Case -Repo $recRepo
+    $env:MOCK_REC_DIR = "$testRoot\rec-$Case"
+    [IO.Directory]::CreateDirectory($env:MOCK_REC_DIR) | Out-Null
+    Run-Sync @('-Tenant', $Case, '-Apply')
+  }
+  [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\state\sentinel") | Out-Null
+  $standingConfig = '{"schemaVersion":1,"exceptions":[],"standing":[{"kind":"reconcile","ruling":"test ruling"}]}'
+  Write-Utf8 "$testRoot\config\review-exceptions.json" $standingConfig
+  $recRepo = New-EndzoneRepo 'rec'
+  $env:PATH = "$testRoot\mock-bin-rec;$oldPath"
+
+  Set-RecPrList "$testRoot\rec-rp" -Gates @{ 'test-build' = @('COMPLETED', 'SUCCESS'); 'guards' = @('IN_PROGRESS', $null) }
+  $rp = Invoke-Rec 'rp'
+  Assert-True ($script:lastExit -eq 0 -and -not $rp.escalate -and $rp.kind -eq 'reconcile-held') "a clean Reconcile PR with a gate still running is held, not escalated (exit $($script:lastExit), got $($rp | ConvertTo-Json -Compress))"
+  Assert-True (-not (Test-Path "$testRoot\rec-rp\pr-create-calls.log")) 'a held Reconcile PR is reused, never a second one created'
+
+  Set-RecPrList "$testRoot\rec-rg"
+  $rg = Invoke-Rec 'rg'
+  Assert-True ($script:lastExit -eq 0 -and -not $rg.escalate -and $rg.kind -eq 'reconcile-held') "a clean, green Reconcile PR is held for the watcher's merge, not escalated (exit $($script:lastExit), got $($rg | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-rx" -Mergeable 'CONFLICTING'
+  $rx = Invoke-Rec 'rx'
+  Assert-True ($script:lastExit -eq 2 -and $rx.kind -eq 'branch-diverged' -and $rx.escalate -eq $true) "a conflicting Reconcile PR escalates branch-diverged (exit $($script:lastExit), got $($rx | ConvertTo-Json -Compress))"
+  Assert-True ("$($rx.prUrl)" -eq 'https://github.com/owner/repo6/pull/2680') 'the conflict escalation names that Reconcile PR'
+
+  Set-RecPrList "$testRoot\rec-rr" -Gates @{ 'test-build' = @('COMPLETED', 'SUCCESS'); 'guards' = @('COMPLETED', 'FAILURE') }
+  $rr = Invoke-Rec 'rr'
+  Assert-True ($script:lastExit -eq 2 -and $rr.kind -eq 'branch-diverged' -and $rr.escalate -eq $true) "a Reconcile PR with a red gate escalates branch-diverged (exit $($script:lastExit), got $($rr | ConvertTo-Json -Compress))"
+
+  # No Reconcile PR: this run opens one, so the run is pending (held, no page) and starts the hold clock. The next runs
+  # see the PR GitHub now lists and apply the normal verdict: a clean PR holds, a conflict escalates.
+  [IO.Directory]::CreateDirectory("$testRoot\rec-rn") | Out-Null
+  $rn = Invoke-Rec 'rn'
+  Assert-True ($script:lastExit -eq 0 -and $rn.escalate -eq $false -and $rn.kind -eq 'reconcile-held' -and $rn.reconcilePr -eq 777) "a Reconcile PR this run opens is pending, not escalated (exit $($script:lastExit), got $($rn | ConvertTo-Json -Compress))"
+  Assert-True (@(Get-Content "$testRoot\rec-rn\pr-create-calls.log").Count -eq 1) 'exactly one pr create for the missing Reconcile PR'
+  $rnMemo = Get-Content "$testRoot\state\sentinel\reconcile-hold-rn.json" -Raw | ConvertFrom-Json
+  Assert-True ($rnMemo.kind -eq 'pending' -and $rnMemo.pr -eq 777 -and "$($rnMemo.since)") "the run that opened the PR starts the hold clock (got $($rnMemo | ConvertTo-Json -Compress))"
+  $mainSha = (Invoke-Git @('-C', $recRepo, 'rev-parse', 'origin/main')).Trim()
+  Set-RecPrList "$testRoot\rec-rn" -Number 777 -Sha $mainSha
+  $rn2 = Invoke-Rec 'rn'
+  Assert-True ($script:lastExit -eq 0 -and -not $rn2.escalate) "the next run holds the clean PR it opened (exit $($script:lastExit), got $($rn2 | ConvertTo-Json -Compress))"
+  Set-RecPrList "$testRoot\rec-rn" -Number 777 -Sha $mainSha -Mergeable 'CONFLICTING'
+  $rn3 = Invoke-Rec 'rn'
+  Assert-True ($script:lastExit -eq 2 -and $rn3.kind -eq 'branch-diverged' -and "$($rn3.prUrl)" -eq 'https://github.com/owner/repo6/pull/777') "a conflict on the PR it opened escalates on the next run (exit $($script:lastExit), got $($rn3 | ConvertTo-Json -Compress))"
+  Assert-True (@(Get-Content "$testRoot\rec-rn\pr-create-calls.log").Count -eq 1) 'the listed PR is reused: still one pr create'
+
+  # pr create fails: nothing was opened, so the run escalates as before and names the failure.
+  [IO.Directory]::CreateDirectory("$testRoot\rec-rf") | Out-Null
+  $env:MOCK_REC_FAIL_CREATE = '1'
+  $rf = Invoke-Rec 'rf'
+  Remove-Item Env:MOCK_REC_FAIL_CREATE -ErrorAction SilentlyContinue
+  Assert-True ($script:lastExit -eq 2 -and $rf.kind -eq 'branch-diverged' -and $rf.escalate -eq $true -and "$($rf.reason)" -match 'opening the reconciliation PR failed') "when pr create fails the run escalates, naming the failure (exit $($script:lastExit), got $($rf | ConvertTo-Json -Compress))"
+  Assert-True (Test-Path "$testRoot\rec-rf\pr-create-calls.log") 'the create was attempted'
+
+  # The watcher cannot merge a PR this run opens (flag set): the run escalates as before.
+  [IO.Directory]::CreateDirectory("$testRoot\rec-rwc") | Out-Null
+  [IO.Directory]::CreateDirectory("$testRoot\state\flags") | Out-Null
+  Write-Utf8 "$testRoot\state\flags\pr-watch-off" 'test'
+  $rwc = Invoke-Rec 'rwc'
+  Remove-Item "$testRoot\state\flags\pr-watch-off" -ErrorAction SilentlyContinue
+  Assert-True ($script:lastExit -eq 2 -and $rwc.kind -eq 'branch-diverged' -and "$($rwc.prUrl)" -eq 'https://github.com/owner/repo6/pull/777') "with the PR watcher off, a PR this run opens escalates as before (exit $($script:lastExit), got $($rwc | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-ru" -Mergeable 'UNKNOWN'
+  $ru1 = Invoke-Rec 'ru'
+  Assert-True ($script:lastExit -eq 0 -and -not $ru1.escalate) "mergeability unknown on the first run is held (exit $($script:lastExit), got $($ru1 | ConvertTo-Json -Compress))"
+  $ru2 = Invoke-Rec 'ru'
+  Assert-True ($script:lastExit -eq 2 -and $ru2.kind -eq 'branch-diverged') "mergeability still unknown on the second run in a row escalates (exit $($script:lastExit), got $($ru2 | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-ra"
+  $memoSince = { param([int]$SinceMinutes, [int]$AtMinutes) @{ tenant = 'ra'; pr = 2680; sha = $recSha; kind = 'clean'; since = (Get-Date).ToUniversalTime().AddMinutes(-$SinceMinutes).ToString('o'); unknownRuns = 0; at = (Get-Date).ToUniversalTime().AddMinutes(-$AtMinutes).ToString('o') } | ConvertTo-Json -Compress }
+  Write-Utf8 "$testRoot\state\sentinel\reconcile-hold-ra.json" (& $memoSince 130 15)
+  $ra = Invoke-Rec 'ra'
+  Assert-True ($script:lastExit -eq 2 -and $ra.kind -eq 'branch-diverged' -and "$($ra.reason)" -match 'has been clean for 1[3-9]\d min') "a Reconcile PR the watcher has not merged within the stall limit escalates (exit $($script:lastExit), got $($ra | ConvertTo-Json -Compress))"
+  Write-Utf8 "$testRoot\state\sentinel\reconcile-hold-ra.json" (& $memoSince 130 60)
+  $ra2 = Invoke-Rec 'ra'
+  Assert-True ($script:lastExit -eq 0 -and -not $ra2.escalate) "a wait not touched within the last two ticks starts its clock again (exit $($script:lastExit), got $($ra2 | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-rw"
+  [IO.Directory]::CreateDirectory("$testRoot\state\flags") | Out-Null
+  Write-Utf8 "$testRoot\state\flags\pr-watch-off" 'test'
+  $rw = Invoke-Rec 'rw'
+  Remove-Item "$testRoot\state\flags\pr-watch-off" -ErrorAction SilentlyContinue
+  Assert-True ($script:lastExit -eq 2 -and $rw.kind -eq 'branch-diverged') "with the PR watcher switched off nothing would merge a clean Reconcile PR, so it escalates (exit $($script:lastExit), got $($rw | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-rs"
+  Write-Utf8 "$testRoot\config\review-exceptions.json" '{"schemaVersion":1,"exceptions":[]}'
+  $rs = Invoke-Rec 'rs'
+  Write-Utf8 "$testRoot\config\review-exceptions.json" $standingConfig
+  Assert-True ($script:lastExit -eq 2 -and $rs.kind -eq 'branch-diverged') "without the standing reconcile exception the watcher will not merge, so it escalates (exit $($script:lastExit), got $($rs | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-rh" -Head 'fleet/12-thing'
+  $rh = Invoke-Rec 'rh'
+  Assert-True ($script:lastExit -eq 2 -and $rh.kind -eq 'branch-diverged') "a PR from another branch is not a Reconcile PR, so it escalates (exit $($script:lastExit), got $($rh | ConvertTo-Json -Compress))"
+
+  Set-RecPrList "$testRoot\rec-rd" -Draft $true
+  $rd = Invoke-Rec 'rd'
+  Assert-True ($script:lastExit -eq 2 -and $rd.kind -eq 'branch-diverged') "a draft Reconcile PR is not held, so it escalates (exit $($script:lastExit), got $($rd | ConvertTo-Json -Compress))"
+
+  # --- once integration carries main nothing diverged remains: no escalation at all (the watcher's merge landed).
+  $r2Repo = New-EndzoneRepo 'r2' -Merged
+  Set-EndzoneTenant -Name 'r2' -Repo $r2Repo
+  New-Item -ItemType Directory -Force "$testRoot\state\sentinel" | Out-Null
+  Set-Content "$testRoot\state\sentinel\reconcile-hold-r2.json" '{"pr":1,"since":"2026-01-01T00:00:00Z","at":"2026-01-01T00:00:00Z"}'
+  $r2 = Run-Sync @('-Tenant', 'r2', '-Apply')
+  Assert-True ($script:lastExit -eq 0 -and -not $r2.escalate) "once integration carries main nothing escalates (got $($r2 | ConvertTo-Json -Compress))"
+  Assert-True (-not (Test-Path "$testRoot\state\sentinel\reconcile-hold-r2.json")) 'once integration carries main the reconcile hold memo is cleared'
+
+  # --- sync-unattested: a pure fast-forward the ruleset refuses for want of fleet-review on main's tip opens the
+  # same Reconcile PR. Held the same way when the PR is clean; escalated as today when it conflicts.
+  $env:PATH = "$testRoot\mock-bin-ff;$oldPath"
+  foreach ($case in @(@{ name = 'uh'; mergeable = 'MERGEABLE' }, @{ name = 'uc'; mergeable = 'CONFLICTING' })) {
+    $fx = New-FfFixture $case.name 'Required status check "fleet-review" is expected.' 'fleet-review'
+    Write-Utf8 "$testRoot\tenants\$($case.name).json" (@{ name = $case.name; repo = $fx.repo; github = 'owner/repo'; defaultBranch = 'main'; releaseBranch = 'integration'; reviewStatus = 'fleet-review'; ciGates = @('test-build', 'guards') } | ConvertTo-Json -Compress)
+    Set-MockApi $fx $rulesTwo '{"state":"success","total_count":1,"statuses":[{"context":"test-build","state":"success"}]}' $noRuns
+    $env:MOCK_GH_DIR = $fx.dir
+    Write-Utf8 "$($fx.dir)\pr-open.json" ('[{"number":2680,"url":"https://github.com/owner/repo/pull/2680","isDraft":false,"isCrossRepository":false,"headRefName":"integration","baseRefName":"main","headRefOid":"' + $fx.sha + '","mergeable":"' + $case.mergeable + '","statusCheckRollup":[{"__typename":"CheckRun","name":"test-build","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"guards","status":"COMPLETED","conclusion":"SUCCESS"}]}]')
+    $out = Run-Sync @('-Tenant', $case.name, '-Apply')
+    Assert-True (Test-Path "$($fx.dir)\hook-attempts.log") "$($case.name): the push was attempted and refused, so the unattested path ran"
+    if ($case.mergeable -eq 'MERGEABLE') {
+      Assert-True ($script:lastExit -eq 0 -and -not $out.escalate -and $out.kind -eq 'reconcile-held') "a clean Reconcile PR holds the sync-unattested escalation too (exit $($script:lastExit), got $($out | ConvertTo-Json -Compress))"
+    } else {
+      Assert-True ($script:lastExit -eq 2 -and $out.kind -eq 'sync-unattested' -and $out.escalate -eq $true) "a conflicting Reconcile PR keeps the sync-unattested escalation (exit $($script:lastExit), got $($out | ConvertTo-Json -Compress))"
+    }
+  }
+  # The fast-forward path opens its Reconcile PR this run too: that run is pending, so a routine promotion does not page.
+  $env:PATH = "$testRoot\mock-bin-ff;$oldPath"
+  $unFx = New-FfFixture 'un' 'Required status check "fleet-review" is expected.' 'fleet-review'
+  Write-Utf8 "$testRoot\tenants\un.json" (@{ name = 'un'; repo = $unFx.repo; github = 'owner/repo'; defaultBranch = 'main'; releaseBranch = 'integration'; reviewStatus = 'fleet-review'; ciGates = @('test-build', 'guards') } | ConvertTo-Json -Compress)
+  Set-MockApi $unFx $rulesTwo '{"state":"success","total_count":1,"statuses":[{"context":"test-build","state":"success"}]}' $noRuns
+  $env:MOCK_GH_DIR = $unFx.dir
+  $un = Run-Sync @('-Tenant', 'un', '-Apply')
+  Assert-True ($script:lastExit -eq 0 -and $un.escalate -eq $false -and $un.kind -eq 'reconcile-held' -and $un.reconcilePr -eq 501) "a Reconcile PR the fast-forward path opens this run is pending, not escalated (exit $($script:lastExit), got $($un | ConvertTo-Json -Compress))"
+  Assert-True (@(Get-Content "$($unFx.dir)\pr-create-calls.log").Count -eq 1) 'exactly one pr create on the fast-forward path'
+  $env:PATH = "$testRoot\mock-bin;$oldPath"
+  Remove-Item Env:MOCK_REC_DIR, Env:MOCK_GH_DIR -ErrorAction SilentlyContinue
 
   Write-Output 'sync-integration tests passed'
 } finally {

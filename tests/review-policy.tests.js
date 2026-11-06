@@ -14,6 +14,8 @@ const {
   holdRecord,
   repostReviewStatus,
   attestPullRequest,
+  standingException,
+  postStandingStatus,
 } = require('../bin/review-policy');
 const workState = require('../bin/work-state');
 const { spawnSync: runGit } = require('node:child_process');
@@ -2349,4 +2351,90 @@ test('#324: a risk finding can be ruled; the formal review posts success and pla
   assert.equal(statusField(calls[0], 'state'), 'success');
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, formal.artifact), 'utf8')).ruling, RULING);
   assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: '28ab0000' }).unresolved, []);
+});
+
+// --- fleet #390: a standing exception passes the Review gate for a Reconcile PR (the tenant's main merged into
+// its integration branch) with no formal review. The ruling lives in config/review-exceptions.json under
+// `standing`; review-policy recognizes the PR by its head and base and posts fleet-review success on its head.
+
+const RECONCILE_TENANT = { name: 'endzone', github: 'owner/Endzone', defaultBranch: 'integration', releaseBranch: 'main', reviewStatus: 'fleet-review', ownerLogin: 'andydarknessb' };
+const RECONCILE_PR = { headRefName: 'main', baseRefName: 'integration', isCrossRepository: false };
+// gh answers `api user` with the login it acts as (the fleet's, unless a test says otherwise) and the status POST with the status it created.
+const actingAs = (login) => (args) => (args[1] === 'user' ? login : JSON.stringify({ state: 'success', creator: { login } }));
+const postsOf = (calls) => calls.filter((args) => args.includes('--method'));
+
+function standingRoot({ standing = [{ kind: 'reconcile', ruling: 'Cory 2026-11-06 (fleet #382 ruling 1)' }] } = {}) {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'review-exceptions.json'), JSON.stringify({ schemaVersion: 1, exceptions: [], standing }));
+  return root;
+}
+
+test('#390: the standing reconcile exception recognizes main into integration and posts success on the head, naming its ruling', () => {
+  const root = standingRoot();
+  const exception = standingException(root, RECONCILE_TENANT, RECONCILE_PR);
+  assert.equal(exception.kind, 'reconcile');
+  const calls = [];
+  const gh = (args) => { calls.push(args); return actingAs('andydarknessb-fleet')(args); };
+  const posted = postStandingStatus({ tenant: RECONCILE_TENANT, exception, headSha: FULL_HEAD, headRefName: 'main', baseRefName: 'integration', gh });
+  const posts = postsOf(calls);
+  assert.equal(posts.length, 1, 'one status post, no artifact and no receipt');
+  assert.deepEqual(posts[0].slice(0, 4), ['api', '--method', 'POST', `repos/owner/Endzone/statuses/${FULL_HEAD}`]);
+  assert.equal(statusField(posts[0], 'state'), 'success');
+  assert.equal(statusField(posts[0], 'context'), 'fleet-review');
+  assert.match(statusField(posts[0], 'description'), /^standing exception reconcile: main into integration/);
+  assert.equal(posted.statusPosted, true);
+  assert.equal(posted.status.postedBy, 'andydarknessb-fleet');
+});
+
+test('#390: a watcher that acts as the tenant owner posts no standing status, the owner never gates the fleet (ADR 0015)', () => {
+  const root = standingRoot();
+  const exception = standingException(root, RECONCILE_TENANT, RECONCILE_PR);
+  const calls = [];
+  const gh = (args) => { calls.push(args); return actingAs('andydarknessb')(args); };
+  const posted = postStandingStatus({ tenant: RECONCILE_TENANT, exception, headSha: FULL_HEAD, headRefName: 'main', baseRefName: 'integration', gh });
+  assert.equal(posted.statusPosted, false);
+  assert.match(posted.statusError, /tenant owner/);
+  assert.equal(postsOf(calls).length, 0);
+});
+
+test('#390: a PR that is not main into integration from this repo is not recognized, and nothing is posted for it', () => {
+  const root = standingRoot();
+  assert.equal(standingException(root, RECONCILE_TENANT, { ...RECONCILE_PR, headRefName: 'fleet/12-thing' }), null);
+  assert.equal(standingException(root, RECONCILE_TENANT, { ...RECONCILE_PR, baseRefName: 'master' }), null);
+  assert.equal(standingException(root, RECONCILE_TENANT, { ...RECONCILE_PR, isCrossRepository: true }), null);
+  assert.equal(standingException(root, { ...RECONCILE_TENANT, defaultBranch: 'master', releaseBranch: 'master' }, { headRefName: 'master', baseRefName: 'master' }), null, 'a tenant with one branch has no Reconcile PR');
+  assert.equal(standingException(standingRoot({ standing: [] }), RECONCILE_TENANT, RECONCILE_PR), null, 'no standing entry, no exception');
+  assert.equal(standingException(standingRoot({ standing: [{ kind: 'reconcile', ruling: '  ' }] }), RECONCILE_TENANT, RECONCILE_PR), null, 'an entry with no ruling acknowledges nothing');
+  const calls = [];
+  const gh = (args) => { calls.push(args); return '{}'; };
+  assert.equal(postStandingStatus({ tenant: RECONCILE_TENANT, exception: null, headSha: FULL_HEAD, headRefName: 'fleet/12-thing', baseRefName: 'integration', gh }).statusPosted, false);
+  assert.equal(calls.length, 0, 'an unrecognized PR gets no status');
+});
+
+test('#390: an unreadable or missing review-exceptions config fails closed with its own code', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'review-exceptions.json'), '{ not json');
+  assert.throws(() => standingException(root, RECONCILE_TENANT, RECONCILE_PR), (error) => error.code === 'EXCEPTIONS_UNREADABLE');
+  assert.throws(() => standingException(rootDir(), RECONCILE_TENANT, RECONCILE_PR), (error) => error.code === 'EXCEPTIONS_UNREADABLE', 'a missing file is unreadable too');
+});
+
+test('#390: a status GitHub refuses is reported on the result, not thrown; a tenant with no reviewStatus posts nothing', () => {
+  const root = standingRoot();
+  const exception = standingException(root, RECONCILE_TENANT, RECONCILE_PR);
+  const refusing = () => { const error = new Error('HTTP 502'); error.stderr = 'gh: HTTP 502 Bad Gateway'; throw error; };
+  const posted = postStandingStatus({ tenant: RECONCILE_TENANT, exception, headSha: FULL_HEAD, headRefName: 'main', baseRefName: 'integration', gh: refusing });
+  assert.equal(posted.statusPosted, false);
+  assert.match(posted.statusError, /HTTP 502/);
+  const calls = [];
+  const noStatus = postStandingStatus({ tenant: { ...RECONCILE_TENANT, reviewStatus: undefined }, exception, headSha: FULL_HEAD, headRefName: 'main', baseRefName: 'integration', gh: (args) => { calls.push(args); return '{}'; } });
+  assert.equal(noStatus.statusPosted, false);
+  assert.equal(calls.length, 0);
+});
+
+test('#390: the shipped review-exceptions config recognizes the Reconcile PR of a release-branch tenant, with its ruling', () => {
+  const exception = standingException(path.join(__dirname, '..'), RECONCILE_TENANT, RECONCILE_PR);
+  assert.equal(exception.kind, 'reconcile');
+  assert.match(exception.ruling, /2026-11-06/);
 });

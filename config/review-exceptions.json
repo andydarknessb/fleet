@@ -1,6 +1,12 @@
 {
   "schemaVersion": 1,
-  "_comment": "Acknowledged unreviewed merges (#114, ADR 0013). verify-events reports each as merged-without-review-acknowledged instead of failing. An entry needs the ruling that accepted it; nothing is added without one.",
+  "_comment": "Acknowledged unreviewed merges (#114, ADR 0013). verify-events reports each as merged-without-review-acknowledged instead of failing. An entry needs the ruling that accepted it; nothing is added without one. `standing` (#390) passes the Review gate for a class of PR with no formal review: review-policy recognizes it by the PR's head and base, and an entry needs its ruling too.",
+  "standing": [
+    {
+      "kind": "reconcile",
+      "ruling": "Cory's ruling 2026-11-06 (fleet #382, ruling 1): a Reconcile PR, the tenant's main merged into its integration branch (endzone, statelite), needs no formal review, because its content already landed on main under Cory's own merge. The PR watcher merges it as a merge commit only when GitHub reports no conflicts and every ciGates check is green (fleet #390)."
+    }
+  ],
   "exceptions": [
     {
       "recordId": "endzone:issue-1241",
