@@ -187,6 +187,19 @@ function normalizeReservations(issue) {
   return { reservations: Object.fromEntries(RESERVATION_FIELDS.map((field) => [field, [...new Set((source[field] || []).map(String))].sort()])), unrecognizedPaths: [] };
 }
 
+// fleet #391: a "Blocked by" line in a body is commentary; GitHub's blocked-by link is what blocks. The numbers the
+// line lists are read so the planner can warn on one no link backs. "None" lists none.
+function bodyBlockerNumbers(body) {
+  const numbers = new Set();
+  for (const { line, fenced } of fencedLines(String(body || ''))) {
+    if (fenced) continue;
+    const blocked = line.match(/^\s*(?:[-*]\s+)?\**blocked by\b:?\**(.*)$/i);
+    const list = blocked && blocked[1].match(/^\s*#\d+(?:\s*(?:,|and|&)?\s*#\d+)*/i);
+    if (list) for (const [number] of list[0].matchAll(/\d+/g)) numbers.add(Number(number));
+  }
+  return [...numbers].sort((a, b) => a - b);
+}
+
 function normalizeIssue(issue) {
   const labels = normalizeLabels(issue.labels);
   const dependencies = issue.dependencies || issue.blockedBy || [];
@@ -205,6 +218,7 @@ function normalizeIssue(issue) {
     labels,
     assignees: (issue.assignees || []).map((assignee) => typeof assignee === 'string' ? assignee : assignee.login || assignee.name).filter(Boolean),
     unresolvedDependencies,
+    bodyOnlyBlockers: bodyBlockerNumbers(issue.body).filter((number) => !dependencies.some((dependency) => Number(dependency.number ?? dependency.id ?? dependency) === number)),
     isSpecParent,
     subIssueTotal,
     bodyHash: issue.bodyHash || sha256(issue.body || ''),
@@ -468,8 +482,11 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
   const activeByIssue = new Map(scoped.filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
   const eligible = [];
   const excluded = [];
+  const warnings = [];
   for (const issue of normalized) {
     const reasons = [];
+    // fleet #391: a body-only Blocker warns and is never a reason, so only the GitHub link blocks.
+    if (issue.bodyOnlyBlockers.length) warnings.push({ issue: issue.number, code: 'body-blocker-unlinked', numbers: issue.bodyOnlyBlockers });
     if (issue.state !== 'OPEN') reasons.push({ code: 'not-open', detail: `GitHub state is ${issue.state}` });
     if (readyLabel && !issue.labels.includes(readyLabel)) reasons.push({ code: 'not-ready', detail: `missing ${readyLabel}` });
     const foreignAssignees = issue.assignees.filter(foreign);
@@ -496,7 +513,8 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     else eligible.push(issue);
   }
   eligible.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)) || a.number - b.number);
-  return { eligible, excluded, observedAt: now || new Date().toISOString() };
+  warnings.sort((a, b) => a.issue - b.issue);
+  return { eligible, excluded, warnings, observedAt: now || new Date().toISOString() };
 }
 
 function queryGithubIssues({ repo, readyLabel, executable = 'gh', runner = execFileSync, fetchDetails = false } = {}) {
