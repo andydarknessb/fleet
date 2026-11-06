@@ -130,6 +130,13 @@ try {
   Assert-True ($null -eq $r3.projected -or $r3.projected -eq $false) 'a control-plane launch must not report a projection'
   $after3 = Get-EventCount
   Assert-True ($after3 -eq $before3) 'a control-plane launch must append no Work event'
+  # fleet #385: the roster records the model a launch was asked for. A lead launched with no -Model records none, so its
+  # pin stays the door's and a pin change reaches sentinel-check; an IC still records haiku.
+  $liveRows = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions)
+  $leadRow = @($liveRows | Where-Object { $_.name -eq 'pl-test' })[0]
+  $icRow = @($liveRows | Where-Object { $_.name -eq 'ic-101' })[0]
+  Assert-True ($null -ne $leadRow -and "$($leadRow.model)" -eq '') "fleet #385: a lead launched with no -Model records no model on its roster row (got: '$($leadRow.model)')"
+  Assert-True ($null -ne $icRow -and "$($icRow.model)" -eq 'haiku') "fleet #385: an IC's roster row still records haiku (got: '$($icRow.model)')"
   # fleet #392: the roster row carries the reason; a launch given none records manual.
   $rosterPl3 = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'pl-test' -and $_.status -eq 'active' })[0]
   Assert-True ($r3.launchReason -eq 'manual' -and "$($rosterPl3.launchReason)" -eq 'manual') "a control-plane launch with no -Reason must record manual on its roster row and output (output: $($r3.launchReason), row: $($rosterPl3.launchReason))"
