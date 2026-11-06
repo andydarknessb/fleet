@@ -305,6 +305,8 @@ try {
   Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
   [void](Run-Launch @('-Manifest', $m30, '-WorkRecordId', 'test:issue-30'))
   Assert-True ((Get-BgCalls) -eq 1) "control: an untouched reservation still reaches claude --bg: $lastOut"
+  # fleet #384: the real background launch carries --no-chrome (the mock claude logs its argv).
+  Assert-True (@(Get-Content "$testRoot\claude-calls.log" | Where-Object { $_ -match '^--bg ' -and $_ -match ' --no-chrome(\s|$)' }).Count -eq 1) 'the claude --bg call must carry --no-chrome'
 
   # Fleet #350 (ruling 12): a manifest naming the retired deepseek tier is refused at the door and its
   # reservation released. The -Model ValidateSet has no deepseek, so the manifest's model must not go through it.

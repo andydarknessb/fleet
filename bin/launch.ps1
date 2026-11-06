@@ -365,6 +365,8 @@ if ($Manifest) {
   $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
 }
 $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
+# fleet #384: only the project lead keeps the claude.ai connectors (its Supabase connector); every other role runs without them.
+$settings | Add-Member -NotePropertyName disableClaudeAiConnectors -NotePropertyValue ($Role -ne 'project-lead') -Force
 
 # --- role tool contract (ticket 06). work-state.js stays the one validated door to
 # --- durable coordination state, so every role loses direct file-editing tools on
@@ -546,7 +548,7 @@ if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-o
 }
 
 if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
+  Write-Output (@{ launched = $false; dryRun = $true; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath --no-chrome <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
   exit 0
 }
 
@@ -652,7 +654,7 @@ try {
   # command-line parse.
   # fleet #265: resolved once (waiting out an npm reinstall); the prompt still goes over stdin.
   $claudeCli = Resolve-ClaudeCli -Tries 3 -PollMs 3000   # a short ladder: the strict read above already resolved once, and the launch must stay inside assignment.js's 90 s
-  $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath 2>&1 | Out-String
+  $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath --no-chrome 2>&1 | Out-String
 } catch {
   if ($locationPushed) { Pop-Location; $locationPushed = $false }
   # fleet#256: claude itself failing to run (not on PATH, spawn error) is a refusal too. Release first, then remove the worktree (fleet#251 order); the helper never throws, so the original error is what surfaces.

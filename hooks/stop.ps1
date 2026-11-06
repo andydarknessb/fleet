@@ -219,6 +219,7 @@ if ($env:FLEET_NODE_PATH) { if (Test-Path -LiteralPath $env:FLEET_NODE_PATH -Pat
 else { $nodeCmd = Get-Command node -ErrorAction SilentlyContinue; if ($nodeCmd) { $nodeExe = $nodeCmd.Source } }
 $plannerFailure = $null
 $plannerFrontier = @()
+$plannerWarnings = @()
 if (-not $nodeExe) {
   $plannerFailure = 'node not found; the assignment planner cannot be computed'
 } else {
@@ -231,7 +232,11 @@ if (-not $nodeExe) {
       $planner = $null
       try { $planner = ("$frontierRaw".Trim() -split "`n")[-1] | ConvertFrom-Json } catch { $planner = $null }
       if (-not $planner -or $null -eq $planner.PSObject.Properties['eligible']) { $plannerFailure = 'bin/assignment.js frontier produced no report' }
-      else { $plannerFrontier = @($planner.eligible | ForEach-Object { [int]$_.number }) }
+      else {
+        $plannerFrontier = @($planner.eligible | ForEach-Object { [int]$_.number })
+        # fleet #391: a body "Blocked by" line that no GitHub link backs is named on a frontier ticket; it warns, it never blocks.
+        if ($planner.PSObject.Properties['warnings']) { $plannerWarnings = @($planner.warnings | Where-Object { $plannerFrontier -contains [int]$_.issue } | ForEach-Object { "#$($_.issue) body names #$(@($_.numbers) -join ', #') with no GitHub blocked-by link" }) }
+      }
     }
   } catch { $plannerFailure = "$($_.Exception.Message)" }
 }
@@ -249,7 +254,8 @@ if ($plannerFailure) {
   }
   Stop-Now "assignment planner failed ($plannerFailure); launching nothing, escalation filed"
 }
-if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, not a spec (no open sub-issues, no spec label: uncut or done), not ready-for-human, not haiku-rehearsal, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch'$lagNote" }
+$warnNote = if ($plannerWarnings.Count -gt 0) { "; blocker warning: $($plannerWarnings -join '; ') (only a GitHub blocked-by link blocks: add it on GitHub or drop the line)" } else { '' }
+if ($plannerFrontier.Count -gt 0) { Continue-With "assignment frontier #$($plannerFrontier -join ', #') (planner: ready, open, unassigned, unblocked, not a spec (no open sub-issues, no spec label: uncut or done), not ready-for-human, not haiku-rehearsal, not excluded, not reserved) with $capFree cap slot(s) and $icFree IC slot(s) free; reserve the head with 'node $home_\bin\assignment.js assign' and launch it with 'assignment.js launch'$lagNote$warnNote" }
 $why = "assignment frontier empty"
 if ($waitingOnCi.Count -gt 0) { $why += "; PR(s) waiting on CI gates, nothing to do yet: #$($waitingOnCi -join ', #') (the watcher records checks-settled and the watchdog wakes you; never poll)" }
 $why += $lagNote
