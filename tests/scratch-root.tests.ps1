@@ -50,7 +50,7 @@ try {
   $scratch = "$testRoot\scratch"
   $built = Run-Script $builder @('-Path', $scratch, '-LiveRoot', $liveRoot, '-Tenant', 'endzone')
   Assert-True ($script:lastExit -eq 0 -and $built.root -eq $scratch) "the builder must succeed and name the root: $script:lastOut"
-  foreach ($f in 'bin\launch.ps1', 'bin\_common.ps1', 'bin\assignment.js', 'hooks\session-start.ps1', 'config\cycle.json', 'config\permissions-allowlist.json', 'fleet-settings.json', 'CONTEXT.md') {
+  foreach ($f in 'bin\launch.ps1', 'bin\_common.ps1', 'bin\assignment.js', 'bin\usage-limit.js', 'hooks\session-start.ps1', 'config\cycle.json', 'config\permissions-allowlist.json', 'fleet-settings.json', 'CONTEXT.md') {
     Assert-True (Test-Path -LiteralPath "$scratch\$f") "the scratch root must carry $f"
   }
   $tenantFiles = @(Get-ChildItem "$scratch\tenants" -Filter *.json | ForEach-Object { $_.Name })

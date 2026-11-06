@@ -318,6 +318,24 @@ if ($Role -eq 'ic') {
     $r = Release-ReservationOnRefusal "launch refused: $maxIcsReason"
     Write-Output (@{ launched = $false; reason = $maxIcsReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
   }
+  # ADR 0018 (#389): past the weekly Usage limit a NEW IC launch (a manifest the planner reserved) is held before
+  # claude --bg, by Tenant order, as the planner holds it; bin\usage-limit.js owns the rule. A -Recover relaunch has
+  # no manifest and continues in-flight work, so it is not held. No reading, a stale one, or an answer that cannot
+  # be read holds nothing (fail open).
+  if ($Manifest) {
+    $usageHold = $null
+    try {
+      $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+      if ($nodeCmd) {
+        $usageOut = & $nodeCmd.Source "$FleetHome\bin\usage-limit.js" throttle $FleetHome $Tenant 2>&1 | ForEach-Object { "$_" } | Out-String
+        $usageHold = (ConvertFrom-Json (("$usageOut".Trim() -split "`n")[-1])).throttle
+      }
+    } catch { $usageHold = $null }
+    if ($usageHold) {
+      $r = Release-ReservationOnRefusal "launch refused: $($usageHold.reason)"
+      Write-Output (@{ launched = $false; reason = $usageHold.reason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
+    }
+  }
 }
 
 # --- fleet identity (#153, ADR 0015): every session acts on GitHub as the fleet's

@@ -126,5 +126,10 @@
     "parityEvaluations": 20,
     "parityDistinctFrontiers": 5,
     "parityHours": 48
+  },
+  "usageLimit": {
+    "tenantOrder": ["statelite", "endzone", "nidus"],
+    "lowerTenantsAt": 0.85,
+    "allTenantsAt": 0.9
   }
 }

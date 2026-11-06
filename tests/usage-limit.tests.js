@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 const { makeTempDir } = require('./temp-dir');
-const { parseUsageReading, probeDue, pageDue, pageRecordAfter, loadLatestReading, cli, PAGE_AT } = require('../bin/usage-limit');
+const { parseUsageReading, probeDue, pageDue, pageRecordAfter, loadLatestReading, loadUsageLimit, usageThrottle, cli, PAGE_AT } = require('../bin/usage-limit');
 
 // The rate_limit_event captured 2026-11-06.
 const SAMPLE = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1793995200,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.05,"resetsAt":1793995200,"status":"allowed"},"seven_day":{"utilization":0.32,"resetsAt":1794290400,"status":"allowed"}}}}';
@@ -143,4 +143,66 @@ test('#388: a failed probe counts as an attempt, so the next probe waits the hou
   cli(['attempt', root, AT]); // the probe that failed, at 12:00
   assert.deepEqual(cli(['due', root, '2026-11-06T12:54:00.000Z']), { due: false });
   assert.deepEqual(cli(['due', root, '2026-11-06T12:55:00.000Z']), { due: true });
+});
+
+// #389 (spec #382, ruling 6, ADR 0018): the weekly hold on new IC launches, by Tenant order. The limit is
+// the ruling's; the readings are the recorded sample at a set utilization and reset.
+const LIMIT = { tenantOrder: ['statelite', 'endzone', 'nidus'], lowerTenantsAt: 0.85, allTenantsAt: 0.9 };
+
+test('#389: below 85% weekly no Tenant is held', () => {
+  for (const tenant of ['statelite', 'endzone', 'nidus']) {
+    assert.equal(usageThrottle({ reading: reading(0.84), tenant, limit: LIMIT, now: AT }), null, tenant);
+  }
+});
+
+test('#389: at 85% weekly every Tenant but the first in the order is held, and the reason names the threshold and the reading', () => {
+  assert.equal(usageThrottle({ reading: reading(0.85), tenant: 'statelite', limit: LIMIT, now: AT }), null);
+  for (const tenant of ['endzone', 'nidus', 'test']) {
+    const hold = usageThrottle({ reading: reading(0.85), tenant, limit: LIMIT, now: AT });
+    assert.equal(hold.code, 'usage-throttle', tenant);
+    assert.equal(hold.threshold, 0.85, tenant);
+    assert.match(hold.reason, /weekly utilization 0\.85 is at or above the 85% threshold for every Tenant but statelite; new IC launches are held until the weekly reset at 2026-11-10T06:00:00\.000Z/, tenant);
+  }
+});
+
+test('#389: at 90% weekly every Tenant is held, the first included', () => {
+  for (const tenant of ['statelite', 'endzone', 'nidus']) {
+    const hold = usageThrottle({ reading: reading(0.9), tenant, limit: LIMIT, now: AT });
+    assert.equal(hold.threshold, 0.9, tenant);
+    assert.match(hold.reason, /90% threshold for every Tenant;/, tenant);
+  }
+});
+
+test('#389: a reading whose weekly window has reset is stale and holds nothing, and the reset instant lifts a hold', () => {
+  assert.equal(usageThrottle({ reading: reading(0.95, 1793000000), tenant: 'nidus', limit: LIMIT, now: AT }), null);
+  assert.equal(usageThrottle({ reading: reading(0.95, WEEK_A), tenant: 'nidus', limit: LIMIT, now: '2026-11-10T06:00:00.000Z' }), null);
+  assert.ok(usageThrottle({ reading: reading(0.95, WEEK_A), tenant: 'nidus', limit: LIMIT, now: '2026-11-10T05:59:59.000Z' }));
+});
+
+test('#389: no reading, a reading that cannot be read, no limit, no first Tenant or no clock holds nothing (fail open)', () => {
+  assert.equal(usageThrottle({ reading: null, tenant: 'nidus', limit: LIMIT, now: AT }), null);
+  assert.equal(usageThrottle({ reading: { weekly: { utilization: 'high', resetsAt: WEEK_A } }, tenant: 'nidus', limit: LIMIT, now: AT }), null);
+  assert.equal(usageThrottle({ reading: { weekly: { utilization: 0.95 } }, tenant: 'nidus', limit: LIMIT, now: AT }), null, 'no reset time: the reading cannot be shown live');
+  assert.equal(usageThrottle({ reading: reading(0.95), tenant: 'nidus', limit: null, now: AT }), null);
+  assert.equal(usageThrottle({ reading: reading(0.95), tenant: 'nidus', limit: { ...LIMIT, tenantOrder: [] }, now: AT }), null, 'no first Tenant to exempt: nothing is held');
+  assert.equal(usageThrottle({ reading: reading(0.95), tenant: 'nidus', limit: LIMIT, now: 'not a time' }), null);
+});
+
+test('#389: the throttle command answers the door with the hold or null, and loadUsageLimit reads config/cycle.json', () => {
+  const root = makeTempDir('fleet-usage-');
+  assert.equal(loadUsageLimit(root), null);
+  assert.deepEqual(cli(['throttle', root, 'nidus', AT]), { throttle: null }, 'no reading, no hold');
+  fs.mkdirSync(path.join(root, 'config'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ usageLimit: LIMIT }));
+  cli(['record', root, AT], () => withWeekly(0.9));
+  assert.deepEqual(loadUsageLimit(root), LIMIT);
+  const answer = cli(['throttle', root, 'nidus', AT]);
+  assert.equal(answer.throttle.threshold, 0.9);
+  assert.match(answer.throttle.reason, /weekly utilization 0\.9 is at or above the 90% threshold/);
+  assert.equal(cli(['throttle', root, 'statelite', AT]).throttle.threshold, 0.9, 'at 90% the first Tenant is held too');
+});
+
+test('#389: the shipped config carries the ruling: statelite, then endzone, then nidus; 85% for all but the first, 90% for all', () => {
+  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
+  assert.deepEqual(shipped.usageLimit, LIMIT);
 });

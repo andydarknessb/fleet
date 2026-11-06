@@ -70,7 +70,7 @@ try {
   foreach ($dir in 'bin','hooks','agents','tenants','config','state','state/sessions','state/notices','state/work','state/events','state/flags','state/manifests','mock-bin','profile','profile/.claude/jobs','repo') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','launch.ps1','identity.js','work-state.js','assignment.js','premises.js','assignment-parity.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','launch.ps1','identity.js','work-state.js','assignment.js','premises.js','assignment-parity.js','exclusions.js','notify.js','usage-limit.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
@@ -318,6 +318,37 @@ try {
   Assert-True ($lastExit -eq 3 -and $r35 -and $r35.launched -eq $false -and "$($r35.reason)" -match "'deepseek' is refused" -and $r35.reservationReleased -eq $true) "a deepseek manifest is refused at the door with its reservation released: exit $lastExit $lastOut"
   Assert-True ((Get-RecordState 35) -ne 'assigned' -and (Get-Marker $m35) -and "$((Get-Marker $m35).reason)" -match "'deepseek' is refused") 'the deepseek refusal leaves no assigned record and writes the invalidation marker with its reason'
   Assert-True ((Get-BgCalls) -eq 0) 'a deepseek manifest never reaches claude --bg'
+
+  # Fleet ruling 6 (ADR 0018, #389): past the weekly Usage limit a new IC launch is held at the door, before
+  # claude --bg, and its reservation is released like the other refusals. The manifests are reserved before any
+  # reading exists (the planner would hold them once one does); the readings are written afterwards.
+  function Write-UsageReading {
+    param([double]$Weekly, [long]$ResetsAt)
+    [IO.Directory]::CreateDirectory("$testRoot\state\usage") | Out-Null
+    Write-Utf8 "$testRoot\state\usage\latest.json" (@{ fiveHour = @{ utilization = 0.05; resetsAt = 1793995200 }; weekly = @{ utilization = $Weekly; resetsAt = $ResetsAt }; status = 'allowed'; at = '2026-11-06T12:00:00.000Z' } | ConvertTo-Json -Depth 4)
+  }
+  Clear-ActiveRecords
+  $m36 = Reserve-Manifest 36 $baseSha
+  $m37 = Reserve-Manifest 37 $baseSha
+  Write-UsageReading -Weekly 0.91 -ResetsAt 4102444800
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $r36 = Run-Launch @('-Manifest', $m36, '-WorkRecordId', 'test:issue-36')
+  Assert-True ($lastExit -eq 3 -and $r36 -and $r36.launched -eq $false -and "$($r36.reason)" -match '90% threshold' -and $r36.reservationReleased -eq $true) "a weekly reading at 91% holds the IC at the door and releases its reservation: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 36) -ne 'assigned' -and (Get-Marker $m36) -and "$((Get-Marker $m36).reason)" -match '90% threshold') 'the usage hold leaves no assigned record and writes the invalidation marker with its reason'
+  Assert-True ((Get-BgCalls) -eq 0) 'a held IC never reaches claude --bg'
+  # A dry run is held the same way and releases nothing. At 87% the hold is the 85% line, which this Tenant (not first in the order) is past.
+  Write-UsageReading -Weekly 0.87 -ResetsAt 4102444800
+  $r37 = Run-Launch @('-Manifest', $m37, '-WorkRecordId', 'test:issue-37', '-DryRun')
+  Assert-True ($lastExit -eq 3 -and $r37 -and $r37.launched -eq $false -and "$($r37.reason)" -match '85% threshold') "a dry run is held at 87% by the 85% line: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 37) -eq 'assigned' -and -not (Get-Marker $m37)) 'a held dry run releases nothing'
+  # A stale reading (its weekly window has reset) holds nothing: the launch reaches claude --bg, as Case 11 does without a reading.
+  Clear-ActiveRecords
+  Write-UsageReading -Weekly 0.95 -ResetsAt 946684800
+  $m38 = Reserve-Manifest 38 $baseSha
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $m38, '-WorkRecordId', 'test:issue-38'))
+  Assert-True ((Get-BgCalls) -eq 1) "a stale reading never holds a launch: $lastOut"
+  Remove-Item -Recurse -Force "$testRoot\state\usage" -ErrorAction SilentlyContinue
 
   Write-Output 'launch refusal release tests passed'
 } finally {
