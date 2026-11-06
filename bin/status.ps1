@@ -23,7 +23,10 @@ if ($budgetLast) {
   $rows = @($budgetLast.records)
   $counts = "measured $(@($rows | Where-Object { $null -ne $_.jobTokens }).Count), warn $(@($rows | Where-Object { $_.decision -eq 'warn' }).Count), escalate $(@($rows | Where-Object { $_.decision -eq 'escalate' }).Count), unmeasured $(@($rows | Where-Object { $_.decision -eq 'unmeasured' }).Count)"
   $escalateText = if ($null -eq $budgetLast.config.escalateTokens) { 'OFF (warning-only soak)' } else { "$($budgetLast.config.escalateTokens)" }
-  Write-Output "budget: $($budgetLast.mode) (warn $($budgetLast.config.warnTokens) / escalate $escalateText job tokens; flag state/flags/budget-live; summary state/budget/summary.md); $counts; last $($budgetLast.at)"
+  # Spec #382 ruling 7: each model family's own line (Haiku: 120K warn, 350K escalate) follows the default one.
+  $familyLines = ''
+  if ($budgetLast.config.byModel) { $familyLines = (@($budgetLast.config.byModel.PSObject.Properties | ForEach-Object { "; $($_.Name) warn $($_.Value.warnTokens) / escalate $(if ($null -eq $_.Value.escalateTokens) { 'OFF' } else { $_.Value.escalateTokens })" }) -join '') }
+  Write-Output "budget: $($budgetLast.mode) (warn $($budgetLast.config.warnTokens) / escalate $escalateText job tokens$familyLines; flag state/flags/budget-live; summary state/budget/summary.md); $counts; last $($budgetLast.at)"
 } else { Write-Output 'budget: no run recorded (state/budget/last.json)' }
 $verifyLast = $null; try { $verifyLast = Read-Json "$FleetHome\state\verify\last.json" } catch {}
 if ($verifyLast) { Write-Output "ledger: $(if ($verifyLast.pass) { 'verified' } else { 'FINDINGS' }) ($($verifyLast.totals.events) events, $($verifyLast.totals.records) records; archival $(if ($verifyLast.pass) { 'permitted' } else { 'held' })); last $($verifyLast.at)" }
