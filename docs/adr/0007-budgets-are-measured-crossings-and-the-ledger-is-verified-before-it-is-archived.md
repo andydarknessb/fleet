@@ -165,3 +165,28 @@ no longer wakes that lead or counts as fleet-dead work waiting. Outbox lines
 now carry the writer's `actor`, which the work-state CLI takes from
 `FLEET_NAME` when `--actor` is omitted. A line with no actor, written before
 this change, still wakes.
+
+## Amendment 2026-11-06 - per-model lines, the recorded baseline, verdicts resume (fleet #382, owner ruling)
+
+Cory ruled, 2026-11-06:
+
+- Budget lines are per model. A Haiku Unit of work warns at 120,000 job tokens
+  and escalates at 350,000; other models keep 25,000 and 175,000. At 25,000 the
+  warning sat below the Haiku median (59,256 in the week to 2026-11-06) and
+  fired on almost every Unit; 175,000 needed 9 manual extensions in two weeks.
+- The control-plane baseline is the week 2026-10-30T12:45Z to
+  2026-11-06T12:45Z: control-plane fresh tokens per completed unit 468,687,
+  project-lead fresh tokens per merged PR 238,504, IC job-token median 59,256.
+  The voids that waited on the #139 re-baseline end, and scorecard verdicts
+  resume.
+
+The owner session ruled the consequence: a week passes when it is at or below
+its baseline, and the report shows the change in percent. The 70% reduction
+target was set on double-counted units, so it is retired rather than applied
+to the new baseline.
+
+This also explains the stale figures above. The escalation line was armed at
+350,000 on 2026-09-17 and cut to 175,000 on 2026-09-29, when the warning went
+from 50,000 to 25,000; the 50,000 and 75,000 in Consequences predate both.
+
+Implemented by fleet #387.

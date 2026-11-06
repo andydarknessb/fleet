@@ -324,6 +324,98 @@ test('frontier fails closed when the issue comment thread is truncated', () => {
   assert.deepEqual(result.excluded[0].reasons.map((reason) => reason.code), ['issue-comments-truncated']);
 });
 
+// fleet #391: a "Blocked by" line in a body is commentary. Only GitHub's blocked-by link blocks; a Blocker the body
+// names with no link is a warning on the frontier answer, and a link the body does not name is never a warning.
+test('a body-only Blocker is warned on the frontier answer and does not block (fleet #391)', () => {
+  const result = selectFrontier({ issues: [issue(60, { body: 'Blocked by #110\n\nChange `src/60.js`.' })], readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.eligible.map((entry) => entry.number), [60]);
+  assert.deepEqual(result.warnings, [{ issue: 60, code: 'body-blocker-unlinked', numbers: [110] }]);
+});
+
+test('a link-only Blocker blocks and raises no warning (fleet #391)', () => {
+  const result = selectFrontier({ issues: [issue(61, { dependencies: [{ number: 111, state: 'OPEN' }] })], readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.eligible, []);
+  assert.deepEqual(result.excluded[0].reasons.map((reason) => reason.code), ['dependency-blocked']);
+  assert.deepEqual(result.warnings, []);
+});
+
+test('a body line its GitHub link agrees with raises no warning, and only the open link blocks (fleet #391)', () => {
+  const result = selectFrontier({
+    issues: [
+      issue(62, { body: 'Blocked by: #110\n\nChange `src/62.js`.', dependencies: [{ number: 110, state: 'OPEN' }] }),
+      issue(63, { body: 'Blocked by #112\n\nChange `src/63.js`.', dependencies: [{ number: 112, state: 'CLOSED' }] }),
+    ],
+    readyLabel: 'ready-for-agent',
+    now: '2026-09-01T12:00:00.000Z',
+  });
+  assert.deepEqual(result.eligible.map((entry) => entry.number), [63]);
+  assert.deepEqual(result.excluded[0].reasons.map((reason) => reason.code), ['dependency-blocked']);
+  assert.deepEqual(result.warnings, []);
+});
+
+test('"Blocked by None" names no Blocker (fleet #391)', () => {
+  const result = selectFrontier({ issues: [issue(64, { body: 'Blocked by None' }), issue(65, { body: 'Blocked by: none' })], readyLabel: 'ready-for-agent', now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.eligible.map((entry) => entry.number), [64, 65]);
+  assert.deepEqual(result.warnings, []);
+});
+
+test('Blocked by lines take an optional colon, a comma list and any case, and warn only on the numbers no link backs (fleet #391)', () => {
+  const result = selectFrontier({
+    issues: [
+      issue(66, { body: 'blocked by: #198, #207' }),
+      issue(67, { body: 'BLOCKED BY #301' }),
+      issue(68, { body: 'Blocked by: #410, #411', dependencies: [{ number: 410, state: 'CLOSED' }] }),
+    ],
+    readyLabel: 'ready-for-agent',
+    now: '2026-09-01T12:00:00.000Z',
+  });
+  assert.deepEqual(result.warnings, [
+    { issue: 66, code: 'body-blocker-unlinked', numbers: [198, 207] },
+    { issue: 67, code: 'body-blocker-unlinked', numbers: [301] },
+    { issue: 68, code: 'body-blocker-unlinked', numbers: [411] },
+  ]);
+});
+
+test('a Blocked by line keeps its leading list through CRLF ends, a bullet or bold, and ignores trailing commentary and prose (fleet #391)', () => {
+  const result = selectFrontier({
+    issues: [
+      issue(71, { body: 'Blocked by #130\r\n\r\nChange `src/71.js`.' }),
+      issue(72, { body: '- **Blocked by:** #140' }),
+      issue(73, { body: 'Blocked by #160 (see #162)\n\nChange `src/73.js`.' }),
+      issue(74, { body: 'Blocked by the CLI, not fleet config. See #5.' }),
+      issue(75, { body: 'This is not blocked by #180 any more.' }),
+      issue(76, { body: 'Example:\n```\nBlocked by #190\n```\nChange `src/76.js`.' }),
+    ],
+    readyLabel: 'ready-for-agent',
+    now: '2026-09-01T12:00:00.000Z',
+  });
+  assert.deepEqual(result.warnings, [
+    { issue: 71, code: 'body-blocker-unlinked', numbers: [130] },
+    { issue: 72, code: 'body-blocker-unlinked', numbers: [140] },
+    { issue: 73, code: 'body-blocker-unlinked', numbers: [160] },
+  ]);
+});
+
+test('the GitHub detail query is the link source: its blocked-by nodes are not warned on (fleet #391)', () => {
+  const runner = () => JSON.stringify({ data: { repository: { issues: { nodes: [{
+    number: 70, title: 'Issue 70', url: 'https://github.com/example/repo/issues/70', body: 'Blocked by: #12, #13\n\nChange `src/70.js`.', createdAt: '2026-09-01T00:00:00Z', state: 'OPEN',
+    labels: { nodes: [{ name: 'ready-for-agent' }] }, assignees: { nodes: [] }, blockedBy: { nodes: [{ number: 12, state: 'OPEN' }] }, subIssues: { nodes: [] },
+    comments: { nodes: [], pageInfo: { hasNextPage: false } },
+  }] } } } });
+  const result = selectFrontier({ issues: queryGithubIssues({ repo: 'example/repo', readyLabel: 'ready-for-agent', runner, fetchDetails: true }), readyLabel: 'ready-for-agent' });
+  assert.deepEqual(result.excluded[0].reasons.map((reason) => reason.code), ['dependency-blocked']);
+  assert.deepEqual(result.warnings, [{ issue: 70, code: 'body-blocker-unlinked', numbers: [13] }]);
+});
+
+test('the frontier command carries the body-blocker warning in its JSON answer (fleet #391)', () => {
+  const root = rootDir();
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(69, { body: 'Blocked by: #120\n\nChange `src/69.js`.' })]));
+  const frontier = cli(['frontier', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--ready-label', 'ready-for-agent', '--now', '2026-09-01T12:00:00.000Z']);
+  assert.deepEqual(frontier.eligible.map((entry) => entry.number), [69]);
+  assert.deepEqual(frontier.warnings, [{ issue: 69, code: 'body-blocker-unlinked', numbers: [120] }]);
+});
+
 test('a third assignment requires and records an independence proof', () => {
   const frontier = { eligible: [issue(50, { components: ['src/50.js'] }), issue(51, { components: ['src/51.js'] }), issue(52, { components: ['src/52.js'] })] };
   const active = [
