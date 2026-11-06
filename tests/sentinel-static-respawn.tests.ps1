@@ -192,6 +192,31 @@ exit 0
   Assert-True (@(Get-Calls).Count -eq 0 -and @($s11b.respawnDeferred | Where-Object { "$($_.reason)" -match 'trust' }).Count -eq 1) "S11: an untrusted workspace defers the relaunch before any stop (calls: $(@(Get-Calls) -join '; '))"
 
 
+  # S12 (fleet #385): a principal whose roster row records no model (launch.ps1 records only the -Model it was asked for) is held
+  # to the pin the door gives today. A frozen Opus 5.5 job is stopped and relaunched on the Sonnet 5.5 pin, not respawned; the
+  # same row frozen on Sonnet 5.5 respawns as a current job does.
+  [IO.File]::WriteAllText("$testRoot\profile\.claude.json", ('{"projects":{' + ($testRoot | ConvertTo-Json) + ':{"hasTrustDialogAccepted":true}}}'), (New-Object Text.UTF8Encoding $false))   # S11b left the workspace untrusted
+  Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: claude-sonnet-5-5`neffort: high`n---`nPrincipal."
+  [IO.Directory]::CreateDirectory("$testRoot\state\flags") | Out-Null
+  [IO.File]::WriteAllText("$testRoot\state\flags\principal-live", '')   # the sentinel expects a Principal only while this stands (ADR 0011)
+  Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"pe-test","role":"principal","tenant":"test","parent":"dispatcher","cwd":' + ("$testRoot\repo" | ConvertTo-Json) + ',"prompt":"p"}]}')
+  Write-Utf8 "$testRoot\state\heartbeats\pe-test.json" (ConvertTo-Json @{ at = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o') } -Compress)
+  Set-LiveRoster '{"sessions":[{"name":"pe-test","role":"principal","tenant":"test","status":"active","jobId":"job-pe","model":""}]}'
+  $env:MOCK_ROW_NAME = 'pe-test'
+  $env:MOCK_ROW_ID = 'job-pe'
+  Set-Job 'job-pe' @('--name', 'pe-test', '--agent', 'principal', '--settings', 'x', '--model', 'claude-opus-5-5', '--effort', 'high')
+  Reset-Calls
+  $s12 = Run-Check -Apply
+  $calls12 = @(Get-Calls)
+  Assert-True (($calls12 -contains 'claude stop job-pe') -and ($calls12 -contains 'launch pe-test') -and -not ($calls12 -contains 'claude respawn job-pe')) "S12: a principal row with no recorded model holds its frozen Opus 5.5 to the pin: stopped and relaunched, not respawned (calls: $($calls12 -join '; '))"
+  Set-Job 'job-pe' @('--name', 'pe-test', '--agent', 'principal', '--settings', 'x', '--model', 'claude-sonnet-5-5', '--effort', 'high')
+  Reset-Calls
+  $s12b = Run-Check -Apply
+  $calls12b = @(Get-Calls)
+  Assert-True (($calls12b -contains 'claude respawn job-pe') -and -not ($calls12b -contains 'launch pe-test')) "S12b: a principal frozen on the pinned Sonnet 5.5 respawns (calls: $($calls12b -join '; '))"
+  Remove-Item Env:MOCK_ROW_NAME -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\state\flags\principal-live" -ErrorAction SilentlyContinue
+
   # B9 (fleet #257 Gap B): every relaunch starts a NEW job, so the streak follows the id the launch returned. Three relaunches
   # through the door, each seen next tick under the id the last one created, are counted; the fourth is held, nothing stopped.
   Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":' + ("$testRoot\repo" | ConvertTo-Json) + ',"prompt":"lead"}]}')
