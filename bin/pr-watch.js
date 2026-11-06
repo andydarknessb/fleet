@@ -27,9 +27,12 @@ const { execFileSync } = require('node:child_process');
 const workState = require('./work-state');
 const closingLink = require('./closing-link');
 const exclusions = require('./exclusions');
+const reviewPolicy = require('./review-policy');
+const identity = require('./identity');
 
 const WATCH_STATES = Object.freeze(['implementing', 'revision', 'pr-open', 'ci-wait', 'review', 'hold', 'escalated']);
 const WATCHER_MARK = '[pr-watch]';
+const RECONCILE_FIELDS = 'number,isDraft,headRefName,baseRefName,headRefOid,isCrossRepository,mergeable,statusCheckRollup';
 
 function checkName(check) {
   return String(check?.name || check?.context || '');
@@ -433,11 +436,26 @@ function linkagePhrase(linkage, issue, prNumber) {
   return `closing linkage absent on PR #${prNumber} for #${issue}, ruled deliberate by the lead (fleet#44); issue closure is the lead's at the merge`;
 }
 
-function ghJson(executable, args) {
-  const raw = execFileSync(executable, args, {
+function ghRun(executable, args) {
+  return execFileSync(executable, args, {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 30000,
   });
-  return JSON.parse(raw);
+}
+
+function ghJson(executable, args) {
+  return JSON.parse(ghRun(executable, args));
+}
+
+// fleet #390: the Reconcile calls act as the fleet identity (ADR 0015), as the Watchdog's own children do. The PR
+// Watch task runs under the default gh login, so the identity's config dir is named here. An inherited GH_TOKEN
+// is dropped: gh prefers it over the config dir, and it would act as whoever minted it.
+function fleetGhRunner(executable = 'gh') {
+  const env = { ...process.env, GH_CONFIG_DIR: identity.identityDir(), GH_PROMPT_DISABLED: '1' };
+  delete env.GH_TOKEN;
+  delete env.GITHUB_TOKEN;
+  return (args) => execFileSync(executable, args, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 30000, env,
+  });
 }
 
 function makeFetchers(repo, executable = 'gh') {
@@ -445,6 +463,7 @@ function makeFetchers(repo, executable = 'gh') {
     listOpenPrs: () => ghJson(executable, ['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', 'number,isDraft,headRefName,headRefOid,statusCheckRollup']),
     issueState: (n) => String(ghJson(executable, ['issue', 'view', String(n), '-R', repo, '--json', 'state']).state || ''),
     viewPr: (n) => ghJson(executable, ['pr', 'view', String(n), '-R', repo, '--json', 'number,state,isDraft,mergedAt,mergedBy,headRefOid,statusCheckRollup,closingIssuesReferences,headRefName,body']),
+    fleetGh: fleetGhRunner(executable),
   };
 }
 
@@ -503,6 +522,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
     .sort((a, b) => a.issue - b.issue);
   health.records = records.length;
   const repo = tenantConfig.github || null;
+  reconcileReleasePrs({ root: base, tenantName, tenantConfig, policy, fetchers, dryRun, health });
   if (records.length === 0) { releaseClosedIssueExclusions({ root: base, tenantName, fetchers, actor, dryRun, health }); return finish(); }
 
   let openPrs;
@@ -679,6 +699,57 @@ function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRu
   }
 }
 
+// Reruns leave the superseded run under the same name, and a rollup does not promise the order of duplicates
+// (evaluateChecks keeps the last one), so every run of a gate has to be green for the gate to be.
+function everyGateRunGreen(policy, rollup) {
+  return policy.ciGates.every((name) => {
+    const runs = (rollup || []).filter((check) => checkName(check) === name);
+    return runs.length > 0 && runs.every((check) => evaluateChecks({ ciGates: [name], watchedChecks: [], ignoredChecks: [] }, [check]).settled);
+  });
+}
+
+// fleet #390: a Reconcile PR is the tenant's releaseBranch (main) merged into its defaultBranch (integration),
+// the PR sync-integration opens when they diverge. The watcher merges one as a MERGE COMMIT once GitHub reports
+// no conflicts and every ciGates check is green. Its Review gate passes through the standing exception
+// (review-policy.standingException). Anything else stays on sync-integration's branch-diverged escalation.
+// No Work record and no model turn. The head branch is main, so the merge never deletes it. A tenant with one
+// branch has no Reconcile PR, and one with no required gates merges nothing: nothing would prove it safe.
+function reconcileReleasePrs({ root, tenantName, tenantConfig, policy, fetchers, dryRun, health }) {
+  const def = tenantConfig.defaultBranch;
+  const rel = tenantConfig.releaseBranch;
+  if (!def || !rel || def === rel || !policy.ciGates.length) return;
+  let listed;
+  try {
+    listed = JSON.parse(fetchers.fleetGh(['pr', 'list', '-R', tenantConfig.github, '--base', def, '--head', rel, '--state', 'open', '--json', RECONCILE_FIELDS]));
+    health.ghCalls += 1;
+  } catch (error) {
+    health.failures += 1;
+    health.actions.push(`${tenantName}: reconcile PR list failed (${String(error.message || error).slice(0, 120)})`);
+    return;
+  }
+  for (const pr of Array.isArray(listed) ? listed : []) {
+    if (pr.isDraft !== false) continue;
+    const label = `${tenantName}:reconcile-pr-${pr.number}`;
+    try {
+      const exception = reviewPolicy.standingException(root, tenantConfig, pr);
+      if (!exception) continue;
+      // CONFLICTING is sync-integration's escalation to Cory; UNKNOWN is read again on the next tick.
+      if (String(pr.mergeable).toUpperCase() !== 'MERGEABLE') continue;
+      if (!everyGateRunGreen(policy, pr.statusCheckRollup)) continue;
+      if (dryRun) { health.actions.push(`DRY ${label}: merge ${rel} into ${def} as a merge commit`); continue; }
+      const posted = reviewPolicy.postStandingStatus({ tenant: tenantConfig, exception, headSha: pr.headRefOid, headRefName: rel, baseRefName: def, gh: fetchers.fleetGh });
+      health.ghCalls += 1;
+      if (!posted.statusPosted) throw new Error(`fleet-review not posted: ${posted.statusError}`);
+      fetchers.fleetGh(['pr', 'merge', String(pr.number), '-R', tenantConfig.github, '--merge', '--match-head-commit', String(pr.headRefOid)]);
+      health.ghCalls += 1;
+      health.actions.push(`${label}: merged ${rel} into ${def} as a merge commit (head ${String(pr.headRefOid).slice(0, 12)})`);
+    } catch (error) {
+      health.failures += 1;
+      health.actions.push(`${label}: not merged (${String(error.stderr || error.message || error).replace(/\s+/g, ' ').trim().slice(0, 200)})`);
+    }
+  }
+}
+
 // Ticket 09: CI watching has its own rollback flag. With state/flags/pr-watch-off the tick
 // touches nothing and says so; the lead falls back to its own gh reads.
 function isWatchOff(root) {
@@ -795,7 +866,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers,
+  evaluateChecks, buildObservation, planRecord, runWatch, makeFetchers, fleetGhRunner,
   stableStringify, closingLinked, closingLinkage, closingLinkageTag, CLOSING_LINKAGE_TAG_PREFIX, isClosingLinkageEscalation, closingLinkageRuled, hopsTo, escalatedHopsTo, WATCH_STATES, WATCHER_MARK, isWatchOff, mergedChain, mergerLogin,
   cli, FLAGS, PrWatchError,
 };

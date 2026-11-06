@@ -12,6 +12,11 @@
 # classified by its text. An unattested tip (sync-unattested) carries the reconciliation PR and the attest
 # command, and is memoized in state/sentinel/sync-last-<tenant>.json so the same sha and status counts are not
 # pushed on every tick.
+# fleet #390 (owner ruling 2026-11-06): only a conflict or a red gate comes to Cory. An open Reconcile PR (the release
+# branch into the default branch) that the PR watcher will merge is held, not escalated: clean or pending, or unknown on
+# its first run. So is one this run opened. A conflict, a red gate, a PR that is not a Reconcile PR, a hold past the
+# stall limit, or unknown on a second run escalates, and so does a run that could not open one or whose watcher cannot
+# merge it (Get-ReconcileWait, Get-OpenedReconcileWait).
 param([string]$Tenant = 'endzone', [switch]$Apply)
 . "$PSScriptRoot\_common.ps1"
 # Entry point: never inherit a caller's Stop preference (PS 5.1 wraps native stderr).
@@ -25,7 +30,7 @@ function Get-OpenReconciliationPr {
   # on every tick of a gh outage (review finding 4, measured: 3 creates in 3 ticks).
   param([string]$Repo, [string]$Base, [string]$Head)
   $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $raw = & gh pr list -R $Repo --base $Base --head $Head --state open --json number,url 2>&1 }
+  try { $raw = & gh pr list -R $Repo --base $Base --head $Head --state open --json number,url,isDraft,isCrossRepository,headRefName,baseRefName,headRefOid,mergeable,statusCheckRollup 2>&1 }
   finally { $ErrorActionPreference = $previous }
   $text = ($raw | Out-String).Trim()
   if ($LASTEXITCODE -ne 0) { return [pscustomobject]@{ status = 'unknown'; pr = $null; error = (("$text" -replace '\s+', ' ').Trim()) } }
@@ -220,6 +225,89 @@ function New-WaitingOutcome {
   return [pscustomobject]@{ result = $result; exit = 0 }
 }
 
+function Get-ReconcileVerdict {
+  # fleet #390 (owner ruling 2026-11-06): only a conflict or a red gate comes to Cory. The verdict on the open PR from
+  # the tenant's releaseBranch into its defaultBranch: 'clean' (MERGEABLE, every ciGates gate green), 'pending'
+  # (MERGEABLE, a gate still running or not reported yet), 'unknown' (GitHub has not computed mergeability), or
+  # 'escalate' (a conflict, a red gate, no ciGates to judge by, a PR that is not this tenant's Reconcile PR, or
+  # anything unreadable: fail closed, so today's escalation stands). A gate counts as the PR watcher counts it
+  # (bin/pr-watch.js evaluateChecks): pending until completed, and any conclusion but SUCCESS fails.
+  param($Pr, $TenantJson, [string]$Def, [string]$Rel)
+  if (-not $Pr -or $Pr.isDraft -ne $false -or $Pr.isCrossRepository -ne $false) { return 'escalate' }
+  if ("$($Pr.headRefName)" -ne $Rel -or "$($Pr.baseRefName)" -ne $Def) { return 'escalate' }
+  $gates = @($TenantJson.ciGates | Where-Object { $_ })
+  if ($gates.Count -eq 0) { return 'escalate' }
+  $pending = $false
+  foreach ($gate in $gates) {
+    $runs = @($Pr.statusCheckRollup | Where-Object { $null -ne $_ -and ("$($_.name)" -eq "$gate" -or "$($_.context)" -eq "$gate") })
+    if ($runs.Count -eq 0) { $pending = $true; continue }
+    foreach ($run in $runs) {
+      $status = "$($run.status)"; $conclusion = "$($run.conclusion)"
+      if (($status -and $status -ne 'COMPLETED') -or (-not $conclusion -and $status -ne 'COMPLETED')) { $pending = $true; continue }
+      if ($conclusion -ne 'SUCCESS') { return 'escalate' }
+    }
+  }
+  switch ("$($Pr.mergeable)".ToUpperInvariant()) {
+    'MERGEABLE' { if ($pending) { return 'pending' }; return 'clean' }
+    'UNKNOWN' { return 'unknown' }
+    default { return 'escalate' }
+  }
+}
+
+function Test-WatcherWillMerge {
+  # fleet #390: the PR watcher merges a Reconcile PR only while state/flags/pr-watch-off is absent and the config names
+  # the standing reconcile exception (review-policy.standingException). A PR is held for the watcher only if it will act.
+  if (Test-Path "$FleetHome\state\flags\pr-watch-off") { return $false }
+  try {
+    $cfg = Read-Json "$FleetHome\config\review-exceptions.json"
+    return [bool](@($cfg.standing) | Where-Object { $_ -and "$($_.kind)" -eq 'reconcile' -and "$($_.ruling)".Trim() } | Select-Object -First 1)
+  } catch { return $false }
+}
+
+function Get-ReconcileWait {
+  # fleet #390: $null when the open PR is not one the PR watcher will merge (escalate as today). Otherwise
+  # { number; hold; reason }. A clean, pending or unknown Reconcile PR is held while the watcher can merge it, and
+  # released to today's escalation once it has outlived the stall limit (the sync-waiting clock: a wait counts only
+  # while it is touched within two ticks), or, for unknown mergeability, once it is still unknown on the second run in
+  # a row. $Verdict overrides the reading (a Reconcile PR this run opened is pending: see Get-OpenedReconcileWait).
+  # Only an applying run writes the clock, as the other sync memos do: a shadow run must not arm an escalation.
+  param([string]$TenantName, $TenantJson, $Pr, [string]$Def, [string]$Rel, [bool]$Apply, [string]$Verdict = '')
+  $memoPath = "$FleetHome\state\sentinel\reconcile-hold-$TenantName.json"
+  $verdict = if ($Verdict) { $Verdict } else { Get-ReconcileVerdict -Pr $Pr -TenantJson $TenantJson -Def $Def -Rel $Rel }
+  if ($verdict -eq 'escalate' -or -not (Test-WatcherWillMerge)) {
+    if ($Apply) { Remove-Item $memoPath -ErrorAction SilentlyContinue }
+    return $null
+  }
+  $sha = "$($Pr.headRefOid)"
+  $memo = $null; try { $memo = Read-Json $memoPath } catch {}
+  $nowUtc = (Get-Date).ToUniversalTime()
+  $sameWait = [bool]$memo -and "$($memo.pr)" -eq "$($Pr.number)"
+  $touched = if ($sameWait) { ConvertTo-UtcDateTime "$($memo.at)" } else { $null }
+  $continues = [bool]($touched -and $touched -le $nowUtc -and ($nowUtc - $touched).TotalMinutes -le 35)
+  $since = $nowUtc
+  if ($continues) { $parsed = ConvertTo-UtcDateTime "$($memo.since)"; if ($parsed -and $parsed -le $nowUtc) { $since = $parsed } }
+  $unknownRuns = 0
+  if ($verdict -eq 'unknown') { $unknownRuns = 1; if ($continues -and "$($memo.kind)" -eq 'unknown') { $unknownRuns = [int]$memo.unknownRuns + 1 } }
+  if ($Apply) { Write-SyncMemo $memoPath ([ordered]@{ tenant = $TenantName; pr = $Pr.number; sha = $sha; kind = $verdict; since = $since.ToString('o'); unknownRuns = $unknownRuns; at = (Now-Iso) }) }
+  $ageMinutes = [int][Math]::Floor(($nowUtc - $since).TotalMinutes)
+  $stall = Get-SyncStallMinutes
+  if ($verdict -eq 'unknown' -and $unknownRuns -ge 2) { return [pscustomobject]@{ number = $Pr.number; hold = $false; reason = "GitHub still reports no mergeability for reconciliation PR #$($Pr.number) on the second run in a row" } }
+  if ($ageMinutes -ge $stall) { return [pscustomobject]@{ number = $Pr.number; hold = $false; reason = "reconciliation PR #$($Pr.number) has been $verdict for $ageMinutes min (limit $stall) and the PR watcher has not merged it" } }
+  return [pscustomobject]@{ number = $Pr.number; hold = $true; reason = "reconciliation PR #$($Pr.number) is $verdict; the PR watcher merges it" }
+}
+
+function Get-OpenedReconcileWait {
+  # fleet #390 (owner ruling 2026-11-06): a Reconcile PR this run opened is pending, not an escalation, so a routine
+  # divergence does not page. The number is read from the URL gh printed, and the head is the release branch's tip,
+  # which is what the PR was opened from. An applying run starts the clock. What cannot be read escalates as before,
+  # and so does a run whose watcher cannot merge the PR (Get-ReconcileWait returns $null then).
+  param([string]$TenantName, $TenantJson, [string]$Url, [string]$Def, [string]$Rel, [bool]$Apply)
+  if ("$Url" -match '/pull/(\d+)$') { $number = [int]$Matches[1] } else { return $null }
+  $sha = "$(& git -C "$($TenantJson.repo)" rev-parse "origin/$Rel" 2>$null)".Trim()
+  if ($sha -notmatch '^[0-9a-f]{40}$') { return $null }
+  return Get-ReconcileWait -TenantName $TenantName -TenantJson $TenantJson -Pr ([pscustomobject]@{ number = $number; headRefOid = $sha }) -Def $Def -Rel $Rel -Apply $Apply -Verdict 'pending'
+}
+
 function New-UnattestedResult {
   # The escalation for a tip that only lacks the fleet-review status: reuses the open reconciliation PR
   # (or opens one, once) so the page carries its URL and the command that clears it.
@@ -227,11 +315,20 @@ function New-UnattestedResult {
   $result = [ordered]@{ synced = $false; escalate = $true; kind = 'sync-unattested'; to = $ShortSha }
   $lookup = Get-OpenReconciliationPr -Repo $TenantJson.github -Base $Def -Head $Rel
   $pr = $null
+  $wait = $null
   if ($lookup.status -eq 'found') {
     $pr = $lookup.pr
+    # fleet #390: the same Reconcile PR as the diverged case; its merge is what lands the fleet-review status on the tip.
+    $wait = Get-ReconcileWait -TenantName $TenantName -TenantJson $TenantJson -Pr $pr -Def $Def -Rel $Rel -Apply ([bool]$Apply)
+    if ($wait -and $wait.hold) { return [ordered]@{ synced = $false; escalate = $false; kind = 'reconcile-held'; to = $ShortSha; reconcilePr = $pr.number; reason = "$Rel tip $ShortSha lacks ${ReviewContext}; $($wait.reason)" } }
   } elseif ($lookup.status -eq 'none') {
     $created = New-ReconciliationPr -Repo $TenantJson.github -Base $Def -Head $Rel -DefAheadCount 0 -FastForward
-    if ($created.ok) { $pr = [pscustomobject]@{ url = $created.url } } else { $result.prError = $created.error }
+    if ($created.ok) {
+      $pr = [pscustomobject]@{ url = $created.url }
+      # fleet #390 (owner ruling): opened this run, so pending, as in the diverged case.
+      $wait = Get-OpenedReconcileWait -TenantName $TenantName -TenantJson $TenantJson -Url $created.url -Def $Def -Rel $Rel -Apply ([bool]$Apply)
+      if ($wait -and $wait.hold) { return [ordered]@{ synced = $false; escalate = $false; kind = 'reconcile-held'; to = $ShortSha; reconcilePr = $wait.number; reason = "$Rel tip $ShortSha lacks ${ReviewContext}; $($wait.reason)" } }
+    } else { $result.prError = $created.error }
   } else {
     $result.prError = "could not confirm whether a reconciliation PR already exists ($($lookup.error))"
   }
@@ -241,6 +338,7 @@ function New-UnattestedResult {
     if ($pr.PSObject.Properties['number'] -and $pr.number) { $prNumber = "$($pr.number)" } elseif ("$($pr.url)" -match '/pull/(\d+)') { $prNumber = $Matches[1] }
     $result.prUrl = "$($pr.url)"
     $result.reason = "$Rel tip $ShortSha lacks ${ReviewContext}: merge $($pr.url) with a MERGE COMMIT, or attest it: node bin/review-policy.js attest --tenant $TenantName --pr $prNumber --head $Sha --artifact <review.json>"
+    if ($wait) { $result.reason += "; $($wait.reason)" }
   } else {
     $result.reason = "$Rel tip $ShortSha lacks ${ReviewContext}: open a PR $Rel into $Def and merge it with a MERGE COMMIT or attest its head (pr create failed: $($result.prError))"
   }
@@ -253,6 +351,7 @@ $repo = $t.repo; $def = $t.defaultBranch; $rel = $t.releaseBranch
 & git -C $repo fetch -q origin $def $rel 2>$null
 $ahead = [int](& git -C $repo rev-list --count "origin/$def..origin/$rel" 2>$null)
 $behind = [int](& git -C $repo rev-list --count "origin/$rel..origin/$def" 2>$null)
+if ($Apply -and $ahead -eq 0) { Remove-Item "$FleetHome\state\sentinel\reconcile-hold-$Tenant.json" -ErrorAction SilentlyContinue }
 if ($ahead -eq 0) { Write-Output (@{ synced = $false; reason = "$def already has everything on $rel"; defAheadOfRel = $behind } | ConvertTo-Json -Compress); exit 0 }
 & git -C $repo merge-base --is-ancestor "origin/$def" "origin/$rel" 2>$null
 if ($LASTEXITCODE -ne 0) {
@@ -267,11 +366,20 @@ if ($LASTEXITCODE -ne 0) {
   $result = [ordered]@{ synced = $false; escalate = $true; kind = 'branch-diverged' }
   $lookup = Get-OpenReconciliationPr -Repo $t.github -Base $def -Head $rel
   $pr = $null
+  $wait = $null
   if ($lookup.status -eq 'found') {
     $pr = $lookup.pr
+    # fleet #390: a Reconcile PR the PR watcher will merge is held, not escalated (see Get-ReconcileWait).
+    $wait = Get-ReconcileWait -TenantName $Tenant -TenantJson $t -Pr $pr -Def $def -Rel $rel -Apply ([bool]$Apply)
+    if ($wait -and $wait.hold) { Write-Output ([ordered]@{ synced = $false; escalate = $false; kind = 'reconcile-held'; reconcilePr = $pr.number; reason = "$def and $rel have diverged; $($wait.reason)" } | ConvertTo-Json -Compress); exit 0 }
   } elseif ($lookup.status -eq 'none') {
     $created = New-ReconciliationPr -Repo $t.github -Base $def -Head $rel -DefAheadCount $behind
-    if ($created.ok) { $pr = [pscustomobject]@{ url = $created.url } } else { $result.prError = $created.error }
+    if ($created.ok) {
+      $pr = [pscustomobject]@{ url = $created.url }
+      # fleet #390 (owner ruling): the run that opens the Reconcile PR is pending, not an escalation.
+      $wait = Get-OpenedReconcileWait -TenantName $Tenant -TenantJson $t -Url $created.url -Def $def -Rel $rel -Apply ([bool]$Apply)
+      if ($wait -and $wait.hold) { Write-Output ([ordered]@{ synced = $false; escalate = $false; kind = 'reconcile-held'; reconcilePr = $wait.number; reason = "$def and $rel have diverged; $($wait.reason)" } | ConvertTo-Json -Compress); exit 0 }
+    } else { $result.prError = $created.error }
   } else {
     # 'unknown': gh could not confirm whether a PR already exists. Creating one anyway
     # would risk a duplicate on every tick of an outage; escalate instead and let the
@@ -281,6 +389,7 @@ if ($LASTEXITCODE -ne 0) {
   if ($pr -and $pr.url) {
     $result.prUrl = $pr.url
     $result.reason = "$def and $rel have diverged and $rel carries content changes absent from $def; needs a human MERGE COMMIT ($behind commit(s) on the $def side) - reconciliation PR: $($pr.url)"
+    if ($wait) { $result.reason += "; $($wait.reason)" }
   } else {
     $result.reason = "$def and $rel have diverged and $rel carries content changes absent from $def; needs a human merge ($behind commit(s) on the $def side); opening the reconciliation PR failed: $($result.prError)"
   }
@@ -326,8 +435,10 @@ if ($memo -and "$($memo.tenant)" -eq $Tenant -and "$($memo.sha)" -eq $tipSha -an
   $memoAt = ConvertTo-UtcDateTime "$($memo.at)"
   $memoFresh = ($memoAt -and ((Get-Date).ToUniversalTime() - $memoAt).TotalMinutes -lt $memoRecheckMinutes -and ((Get-Date).ToUniversalTime() - $memoAt).TotalMinutes -ge 0)
   if ($memoFresh -and [int]$memo.statusCount -eq $tipState.statusCount -and [int]$memo.checkRunCount -eq $tipState.checkRunCount) {
-    Write-Output ((New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -ReviewContext $reviewContext) | ConvertTo-Json -Compress)
-    exit 2
+    $unattested = New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -ReviewContext $reviewContext
+    Write-Output ($unattested | ConvertTo-Json -Compress)
+    if ($unattested.escalate) { exit 2 }
+    exit 0
   }
 }
 # Start-Process + -RedirectStandardError, not `2>&1`: PS 5.1 wraps a native command's
@@ -357,7 +468,8 @@ if ($ok) {
     $unattested = New-UnattestedResult -TenantName $Tenant -TenantJson $t -Def $def -Rel $rel -Sha $tipSha -ShortSha $tipShort -ReviewContext $reviewContext
     Write-SyncMemo $memoPath ([ordered]@{ tenant = $Tenant; sha = $tipSha; kind = 'sync-unattested'; contexts = $contextsKey; statusCount = $tipState.statusCount; checkRunCount = $tipState.checkRunCount; at = (Now-Iso) })
     Write-Output ($unattested | ConvertTo-Json -Compress)
-    exit 2
+    if ($unattested.escalate) { exit 2 }
+    exit 0
   }
   Write-Output (@{ synced = $false; pushError = $pushError; escalate = $true; kind = 'sync-refused' } | ConvertTo-Json -Compress)
   exit 2
