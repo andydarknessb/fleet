@@ -325,3 +325,38 @@ test('#201: the Rotation policy trips on de-duplicated tokens, not on the repeat
   assert.equal(lead.metrics.jobTokens, 100000, 'three repeated rows are one response: 100000, not the 220000 the rows sum to');
   assert.equal(lead.due, false);
 });
+
+// --- ticket 386: a dormant tenant's control plane retires at its boundary without a replacement ---
+function writeDormancy(root, tenants, validUntil = '2026-09-02T13:00:00.000Z') {
+  writeJson(root, 'state/watchdog/dormancy.json', { schemaVersion: 1, at: NOW, validUntil, tenants });
+}
+
+test('386: a due session of a dormant tenant is marked dormant, so Rotation retires it without a replacement', async () => {
+  const root = rootDir();
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z' });
+  writeDormancy(root, { endzone: { dormant: true, reasons: [] } });
+  const result = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
+  const lead = result.sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal(lead.due, true, 'the boundary is still reached');
+  assert.equal(lead.dormant, true, 'and the session is not replaced');
+});
+
+test('386: an awake tenant, a stale verdict, or no verdict leaves a due session replaceable', async () => {
+  const root = rootDir();
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z' });
+  const lead = async () => (await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW })).sessions.find((s) => s.name === 'pl-endzone');
+  assert.equal((await lead()).dormant, false, 'no verdict at all');
+  writeDormancy(root, { endzone: { dormant: false, reasons: ['1 open fleet pull request'] } });
+  assert.equal((await lead()).dormant, false, 'an awake tenant');
+  writeDormancy(root, { endzone: { dormant: true, reasons: [] } }, '2026-09-02T11:59:00.000Z');
+  assert.equal((await lead()).dormant, false, 'a verdict past its validity window');
+});
+
+test('386: the dormancy-off flag makes a fresh dormant verdict inert', async () => {
+  const root = rootDir();
+  seedFleet(root, { launchedAt: '2026-09-01T10:00:00.000Z' });
+  writeDormancy(root, { endzone: { dormant: true, reasons: [] } });
+  write(root, 'state/flags/dormancy-off', 'rolled back\n');
+  const result = await policy.evaluate({ root, claudeHome: path.join(root, 'no-claude'), now: NOW });
+  assert.equal(result.sessions.find((s) => s.name === 'pl-endzone').dormant, false);
+});

@@ -11,8 +11,8 @@ $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-rotation-test-" + [guid
 $oldPath = $env:PATH
 $oldProfile = $env:USERPROFILE
 
-function Set-LiveRoster { param([string]$LaunchedAt, [string]$Status = 'active')
-  Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @(@{ name = 'pe-test'; role = 'principal'; tenant = $null; sessionId = 'sess-old'; jobId = 'job-old'; status = $Status; launchedAt = $LaunchedAt }) } | ConvertTo-Json -Depth 8)
+function Set-LiveRoster { param([string]$LaunchedAt, [string]$Status = 'active', [string]$Tenant = $null)
+  Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @(@{ name = 'pe-test'; role = 'principal'; tenant = $Tenant; sessionId = 'sess-old'; jobId = 'job-old'; status = $Status; launchedAt = $LaunchedAt }) } | ConvertTo-Json -Depth 8)
 }
 function Set-AgentsRows { param([string]$Json) Write-Utf8 "$testRoot\mock-agents.json" $Json }
 function Reset-Markers {
@@ -32,11 +32,13 @@ $idleRow = '[{"id":"job-old","name":"pe-test","state":"working","status":"idle",
 $busyRow = $idleRow.Replace('"status":"idle"', '"status":"busy"')
 
 try {
-  foreach ($dir in 'bin','tenants','config','state','state/work','state/work/pending','state/events','state/rotation','state/flags','state/heartbeats','mock-bin','profile') {
+  foreach ($dir in 'bin','tenants','config','state','state/work','state/work/pending','state/events','state/rotation','state/flags','state/heartbeats','state/watchdog','mock-bin','profile') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
   foreach ($f in '_common.ps1','rotate.ps1') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\bin\rotation-policy.js", "$testRoot\bin\rotation-policy.js")
+  # ticket 386: rotation-policy.js reads the watchdog's dormancy verdict through this module.
+  [IO.File]::Copy("$sourceRoot\bin\dormancy.js", "$testRoot\bin\dormancy.js")
   # rotation-policy.js has required ./work-state since 359dc20 (fleet #4's shared
   # parseArgs); without this copy the whole suite died at module load with "Cannot
   # find module './work-state'" before a single case ran (review finding 6).
@@ -338,6 +340,24 @@ console.log(JSON.stringify({ ok: true }));
   $null = Run-Rotate @('-Name', 'nobody', '-Force')
   Assert-True ($script:lastExit -eq 4) 'a name off the static roster must be refused'
 
+
+  # Case 9 (ticket 386): a dormant tenant's due control-plane session retires at its boundary WITHOUT a
+  # replacement. A wake and -Force still relaunch it; the verdict is the watchdog's fresh snapshot.
+  $now386 = (Get-Date).ToUniversalTime()
+  Write-Utf8 "$testRoot\state\watchdog\dormancy.json" (ConvertTo-Json @{ schemaVersion = 1; at = $now386.ToString('o'); validUntil = $now386.AddMinutes(40).ToString('o'); tenants = @{ test = @{ dormant = $true; reasons = @() } } } -Depth 5)
+  Set-LiveRoster $old 'active' 'test'; Set-AgentsRows $idleRow; Reset-Markers
+  $r9 = Run-Rotate @('-Auto')
+  Assert-True (@($r9.outcomes | Where-Object { $_.name -eq 'pe-test' -and $_.status -eq 'retired' }).Count -eq 1) "a dormant tenant's due session must retire without a replacement (outcomes: $($r9.outcomes | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True ((Get-Content "$testRoot\retire-calls.log" -Raw) -match 'pe-test\|rotation \(dormant tenant') 'the retirement must name the dormant tenant as its reason'
+  Assert-True (-not (Test-Path "$testRoot\launch-calls.log")) 'a dormant retirement must launch nothing'
+  Assert-True (-not (Test-Path "$testRoot\state\rotation\pe-test.json")) 'a dormant retirement writes no rotation intent'
+  Set-LiveRoster $old 'active' 'test'; Set-AgentsRows $idleRow; Reset-Markers
+  $r9b = Run-Rotate @('-Name', 'pe-test', '-Wake', 'frontier #386', '-NoReconcile')
+  Assert-True (@($r9b.rotated) -contains 'pe-test') 'a wake must relaunch a dormant tenant''s session'
+  Set-LiveRoster $old 'active' 'test'; Set-AgentsRows $idleRow; Reset-Markers
+  $r9c = Run-Rotate @('-Name', 'pe-test', '-Force')
+  Assert-True (@($r9c.rotated) -contains 'pe-test') '-Force must relaunch a dormant tenant''s session'
+  Remove-Item "$testRoot\state\watchdog\dormancy.json"
 
   # Ticket 09 ruling 2: -Wake rotates now for the given reason, at the boundary only, without -Force.
   Set-LiveRoster $young; Set-AgentsRows $idleRow; Reset-Markers

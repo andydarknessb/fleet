@@ -9,7 +9,7 @@ $oldPath = $env:PATH
 $oldProfile = $env:USERPROFILE
 
 try {
-  foreach ($dir in 'bin','tenants','state','state/heartbeats','state/sentinel','state/skip','profile/.claude/jobs/job-900','repo','mock-bin') {
+  foreach ($dir in 'bin','tenants','state','state/heartbeats','state/sentinel','state/skip','state/watchdog','state/flags','profile/.claude/jobs/job-900','repo','mock-bin') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
   [IO.File]::Copy("$sourceRoot\bin\_common.ps1", "$testRoot\bin\_common.ps1")
@@ -40,11 +40,10 @@ if ($Mode -eq 'bump') {
   exit 0
 }
 $icPid = 900 + $n
-if ($SentinelRow -eq '1') {
-  Write-Output ('[{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":' + $icPid + ',"startedAt":"2026-08-28T00:00:00Z"},{"id":"job-s","name":"sentinel","state":"working","status":"idle","pid":12,"startedAt":"2026-08-28T00:00:00Z"}]')
-} else {
-  Write-Output ('[{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":' + $icPid + ',"startedAt":"2026-08-28T00:00:00Z"}]')
-}
+$rows = @('{"id":"job-900","name":"ic-900","state":"working","status":"idle","pid":' + $icPid + ',"startedAt":"2026-08-28T00:00:00Z"}')
+if ($SentinelRow -eq '1') { $rows += '{"id":"job-s","name":"sentinel","state":"working","status":"idle","pid":12,"startedAt":"2026-08-28T00:00:00Z"}' }
+if ($env:MOCK_PL_STOPPED -eq '1') { $rows += '{"id":"job-pl","name":"pl-test","state":"stopped","status":"idle","startedAt":"2026-08-28T00:00:00Z"}' }
+Write-Output ('[' + ($rows -join ',') + ']')
 '@
   Write-Utf8 "$testRoot\mock-bin\mock-respawn.ps1" ($mockRespawnPs1.Replace('TESTROOT', $testRoot))
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_CLAUDE_FAIL%"=="1" exit /b 9' + "`r`n" + 'if "%1"=="respawn" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" bump' + "`r`n" + 'if "%1"=="agents" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" agents %MOCK_SENTINEL_ROW%' + "`r`n" + 'exit /b 0' + "`r`n")
@@ -174,6 +173,50 @@ exit /b 0
   Assert-True (@($dOff.launchNeeded | Where-Object { $_.name -eq 'dispatcher' }).Count -eq 0) 'with dispatcher-off the retired dispatcher is never launchNeeded'
   Remove-Item "$testRoot\state\flags\dispatcher-off"
   Write-Utf8 "$testRoot\roster.json" $rosterBeforeD
+
+  # Ticket 386: a dormant tenant's control-plane sessions (pl-, pe-, ar-) are neither relaunched (launchNeeded)
+  # nor respawned while the tenant is dormant. The verdict is the watchdog's snapshot (state/watchdog/dormancy.json):
+  # a verdict past its validity window, the dormancy-off flag, or no verdict at all leaves the sessions as they were.
+  $rosterBeforeCp = Get-Content "$testRoot\roster.json" -Raw
+  Write-Utf8 "$testRoot\roster.json" ('{"cap":6,"sessions":[{"name":"pl-test","role":"project-lead","parent":"cory","tenant":"test","cwd":"REPO","prompt":"p"},{"name":"pe-test","role":"principal","parent":"cory","tenant":"test","cwd":"REPO","prompt":"p"},{"name":"ar-test","role":"arbiter","parent":"cory","tenant":"test","cwd":"REPO","prompt":"p"}]}'.Replace('REPO', ($testRoot + '\repo').Replace('\', '\\')))
+  Write-Utf8 "$testRoot\state\flags\principal-live" 'ticket 386 case'
+  Write-Utf8 "$testRoot\state\flags\arbiter-live" 'ticket 386 case'
+  $dormSnap = "$testRoot\state\watchdog\dormancy.json"
+  function Set-Dormancy { param([bool]$Dormant, [datetime]$ValidUntil = (Get-Date).ToUniversalTime().AddHours(1))
+    Write-Utf8 $dormSnap (ConvertTo-Json @{ schemaVersion = 1; at = (Get-Date).ToUniversalTime().ToString('o'); validUntil = $ValidUntil.ToString('o'); tenants = @{ test = @{ dormant = $Dormant; reasons = @() } } } -Depth 5)
+  }
+  $cpNames = @('pl-test', 'pe-test', 'ar-test')
+  $cpDown = { param($Report) @($Report.launchNeeded | Where-Object { $cpNames -contains "$($_.name)" }).Count }
+  # Down (no daemon row): launchNeeded, unless the tenant is dormant.
+  Set-Dormancy -Dormant $false
+  $cpAwake = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ((& $cpDown $cpAwake) -eq 3) "an awake tenant's down lead, Principal and Arbiter are all launchNeeded (got: $(@($cpAwake.launchNeeded | ForEach-Object { $_.name }) -join ', '))"
+  Set-Dormancy -Dormant $true
+  $cpDormant = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ((& $cpDown $cpDormant) -eq 0) "a dormant tenant's down control-plane sessions are not launchNeeded (got: $(@($cpDormant.launchNeeded | ForEach-Object { $_.name }) -join ', '))"
+  Assert-True (@($cpDormant.ok | Where-Object { $_.name -eq 'pe-test' -and "$($_.detail)" -match 'dormant tenant test' }).Count -eq 1) 'the dormant skip is named under ok'
+  Set-Dormancy -Dormant $true -ValidUntil ((Get-Date).ToUniversalTime().AddMinutes(-1))
+  $cpStale = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ((& $cpDown $cpStale) -eq 3) 'a verdict past its validity window is no verdict: the sessions are launchNeeded'
+  Set-Dormancy -Dormant $true
+  Write-Utf8 "$testRoot\state\flags\dormancy-off" 'ticket 386 case'
+  $cpOff = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ((& $cpDown $cpOff) -eq 3) 'the dormancy-off flag makes a fresh dormant verdict inert'
+  Remove-Item "$testRoot\state\flags\dormancy-off"
+  Remove-Item $dormSnap
+  $cpNone = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True ((& $cpDown $cpNone) -eq 3) 'no verdict at all is awake'
+  # Stopped on the daemon (a reaped control-plane row): respawned, unless the tenant is dormant.
+  $env:MOCK_PL_STOPPED = '1'
+  Set-Dormancy -Dormant $false
+  $rsAwake = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True (@($rsAwake.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 1) 'an awake tenant''s stopped lead is respawned'
+  Set-Dormancy -Dormant $true
+  $rsDormant = (& "$testRoot\bin\sentinel-check.ps1" | Out-String) | ConvertFrom-Json
+  Assert-True (@($rsDormant.respawned | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0) 'a dormant tenant''s stopped lead is not respawned'
+  Remove-Item Env:MOCK_PL_STOPPED
+  Remove-Item $dormSnap, "$testRoot\state\flags\principal-live", "$testRoot\state\flags\arbiter-live" -ErrorAction SilentlyContinue
+  Write-Utf8 "$testRoot\roster.json" $rosterBeforeCp
 
   # Rate-limit PAUSE, 2026-09-10 (three re-arms in 14h). The detail line is a level, not an
   # event: the same wording stood for 12 hours and re-armed a PAUSE one tick after each manual
