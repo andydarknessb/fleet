@@ -30,7 +30,7 @@ try {
   Write-Utf8 "$testRoot\agents\project-lead.md" "---`nname: project-lead`nmodel: sonnet`neffort: low`n---`nRole body for project-lead."
   # Fleet #350: the IC role file names Haiku 5.5 at xhigh, the effort the planner defaults to.
   Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
-  Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: opus-5.5`neffort: high`n---`nRole body for principal."
+  Write-Utf8 "$testRoot\agents\principal.md" "---`nname: principal`nmodel: sonnet-5.5`neffort: high`n---`nRole body for principal."
   Write-Utf8 "$testRoot\agents\arbiter.md" "---`nname: arbiter`nmodel: claude-opus-5-5`neffort: xhigh`n---`nRole body for arbiter."
   Write-Utf8 "$testRoot\fleet-settings.json" '{"crossSessionInbound":"accept","permissions":{"defaultMode":"auto"}}'
   Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
@@ -310,12 +310,12 @@ exit $LASTEXITCODE
   Write-Utf8 "$testRoot\state\work\active.json" '{"records":{}}'
 
   # ADR 0011 (fleet #37): the Principal comes through the door as pe-<tenant>, on the
-  # pinned Opus 5.5 id (ADR 0017; Fable until then) at effort high, with the control-plane tenant-repo denial and its
-  # own ceiling; it is named by scheme and needs a tenant; it neither counts toward
+  # pinned Sonnet 5.5 id (owner ruling 2026-11-06, fleet #385; Opus 5.5 under ADR 0017 until then) at effort high, with the
+  # control-plane tenant-repo denial and its own ceiling; it is named by scheme and needs a tenant; it neither counts toward
   # nor is refused by the cap.
   $rp = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun')
   Assert-True ($rp.dryRun -eq $true) "a principal dry run must pass the gates (got: $rp)"
-  Assert-True ("$($rp.command)" -match '--model claude-opus-5-5') 'a principal with no -Model must run the pinned Opus 5.5 id (ADR 0017)'
+  Assert-True ("$($rp.command)" -match '--model claude-sonnet-5-5 ') 'a principal with no -Model must run the pinned Sonnet 5.5 id (owner ruling 2026-11-06, fleet #385)'
   Assert-True ("$($rp.command)" -match '--effort high') 'a principal must run at the role file effort'
   Assert-True ($rp.budget.ceiling -eq 30000) 'the principal ceiling must come from config/cycle.json'
   $denyP = @((Get-Content "$testRoot\state\sessions\pe-test.settings.json" -Raw | ConvertFrom-Json).permissions.deny)

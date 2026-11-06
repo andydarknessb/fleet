@@ -68,6 +68,7 @@ const DEFAULTS = Object.freeze({
   escapedRate: { weak: 0.05 },
   fleetDeadRate: { watch: 0.02, weak: 0.1 },
   maxPrLookups: 50,
+  principalRevertPoints: 10,
 });
 const ROWS = [
   ['throughput', 'Throughput'],
@@ -82,6 +83,7 @@ const ROWS = [
   ['reviewPickup', 'Review pickup latency'],
   ['icCost', 'IC cost'],
   ['boundedAuthority', 'Bounded authority'],
+  ['arbiterReturnRate', 'Arbiter return-or-edit rate'],
 ];
 const SEVERITY = { weak: 4, unknown: 3, watch: 2, good: 1, 'n/a': 0 };
 
@@ -733,6 +735,47 @@ function boundedAuthorityRow(base, week) {
   };
 }
 
+// Spec fleet #382 ruling 2 (fleet #385): the Arbiter's return-or-edit rate on the Principal's Triage proposals is the revert
+// trigger for the Principal's Sonnet tier. Its Verdicts are the Arbiter's four kinds in the triage ledger (ARBITER_KINDS, the
+// kinds bin/triage.js's verdict door writes); the rate is the Verdicts returned or endorsed with edits over all of them. The
+// scorecard week is read against the two weeks before it, pooled into one baseline, and a rise of more than
+// principalRevertPoints over that baseline is the trigger (watch). The scorecard only reports it: the revert is Cory's call.
+function arbiterReturnRow(base, week, settings) {
+  const { ARBITER_KINDS, readLedger } = require('./triage');
+  const dir = path.join(base, 'state', 'triage');
+  const verdicts = [];
+  if (fs.existsSync(dir)) {
+    for (const name of fs.readdirSync(dir).filter((entry) => entry.endsWith('.jsonl')).sort()) {
+      verdicts.push(...readLedger(base, name.slice(0, -'.jsonl'.length)).filter((entry) => ARBITER_KINDS.includes(entry.kind)));
+    }
+  }
+  const tally = (window) => {
+    const inside = verdicts.filter((entry) => inWeek(window, entry.at));
+    const edited = inside.filter((entry) => entry.kind === 'returned' || entry.kind === 'endorsed-with-edits').length;
+    return { label: window.label, verdicts: inside.length, returnedOrEdited: edited, rate: inside.length ? Math.round((edited / inside.length) * 1000) / 1000 : null };
+  };
+  const before = previousWeek(week.start);
+  const weeks = [tally(week), tally(before), tally(previousWeek(before.start))];
+  const [current, ...earlier] = weeks;
+  const baseline = { verdicts: earlier[0].verdicts + earlier[1].verdicts, returnedOrEdited: earlier[0].returnedOrEdited + earlier[1].returnedOrEdited };
+  // The change is taken from the exact ratios and rounded to 0.1 point before the trigger test, so float noise at exactly 10 reads 10.
+  const ratio = (counts) => (counts.verdicts ? counts.returnedOrEdited / counts.verdicts : null);
+  const currentRatio = ratio(current);
+  const baselineRatio = ratio(baseline);
+  baseline.rate = baselineRatio === null ? null : Math.round(baselineRatio * 1000) / 1000;
+  const changePoints = currentRatio === null || baselineRatio === null ? null : Math.round((currentRatio - baselineRatio) * 1000) / 10;
+  const trigger = changePoints !== null && changePoints > settings.principalRevertPoints;
+  const words = (counts) => (counts.verdicts ? `${counts.returnedOrEdited} of ${counts.verdicts} (${pct(counts.rate)})` : 'no Verdict');
+  const change = changePoints === null
+    ? 'no change to read, since one side has no Verdict'
+    : `${changePoints >= 0 ? '+' : ''}${changePoints} points against ${baseline.returnedOrEdited} of ${baseline.verdicts} (${pct(baseline.rate)}) over the two weeks before${trigger ? `, past the ${settings.principalRevertPoints}-point revert trigger` : ''}`;
+  return {
+    figures: { weeks, baseline, changePoints, revertPoints: settings.principalRevertPoints, trigger },
+    result: `returned or endorsed with edits ${words(current)} this week, ${words(earlier[0])} the week before, ${words(earlier[1])} the week before that; change ${change}`,
+    status: changePoints === null ? 'n/a' : (trigger ? 'watch' : 'good'),
+  };
+}
+
 function verifyWeek(base, week) {
   const runs = readHistory(base).filter((line) => inWeek(week, line.at));
   return { runs: runs.length, pass: runs.filter((line) => line.pass === true).length, fail: runs.filter((line) => line.pass === false).length };
@@ -796,6 +839,12 @@ function buildScorecard({ root, now, gh = defaultGh, collect = defaultCollect, d
     boundedAuthority: (() => {
       // A corrupt triage ledger makes this row unknown, never the whole scorecard.
       try { return boundedAuthorityRow(base, week); } catch (error) {
+        return { figures: { error: String(error.message || error).split('\n')[0] }, result: `unavailable: ${String(error.message || error).split('\n')[0]}`, status: 'unknown' };
+      }
+    })(),
+    arbiterReturnRate: (() => {
+      // A corrupt triage ledger makes this row unknown, never the whole scorecard.
+      try { return arbiterReturnRow(base, week, settings); } catch (error) {
         return { figures: { error: String(error.message || error).split('\n')[0] }, result: `unavailable: ${String(error.message || error).split('\n')[0]}`, status: 'unknown' };
       }
     })(),

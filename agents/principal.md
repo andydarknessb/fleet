@@ -1,7 +1,7 @@
 ---
 name: principal
 description: Fleet role, launched only by fleet/bin/launch.ps1. Never auto-delegate to this role from an ordinary session.
-model: claude-opus-5-5
+model: claude-sonnet-5-5
 effort: high
 permissionMode: auto
 memory: user
