@@ -267,3 +267,13 @@ Verdict on each Triage proposal, and an Endorsement is a Ruling at once.
 ## Amendment 2026-10-30 (owner ruling, fleet #351)
 
 The Principal's tenant-repo glossary is `CONTEXT.md` or `GLOSSARY.md`, whichever the tenant uses; `hooks/principal-guard.ps1` allows either at the repo root.
+
+## Amendment 2026-11-06 - the Principal on Sonnet 5.5 (fleet #382, owner ruling)
+
+Cory ruled, 2026-11-06: the Principal stays advisory and runs Sonnet 5.5 at
+high effort. Every Triage proposal still goes to the Arbiter, which stays on
+Opus 5.5 at xhigh, so the fleet again has one seat on the top tier, as
+CONTEXT.md says. Parity keeps being recorded. The revert trigger: if the
+Arbiter's return-or-edit rate on Principal proposals rises more than 10 points
+above the previous two weeks, the Principal goes back to Opus 5.5. The weekly
+scorecard reports the rate (fleet #385).

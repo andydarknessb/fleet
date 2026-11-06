@@ -85,7 +85,7 @@ $scratchTenant = Get-Content -LiteralPath "$root\tenants\$Tenant.json" -Raw | Co
 $scratchTenant | Add-Member -NotePropertyName readyLabel -NotePropertyValue 'haiku-rehearsal' -Force
 Write-Utf8 "$root\tenants\$Tenant.json" (($scratchTenant | ConvertTo-Json -Depth 20) + "`n")
 Write-Utf8 "$root\roster.json" "{`n  `"cap`": 1,`n  `"sessions`": []`n}`n"
-foreach ($dir in 'sessions', 'work', 'events', 'archive', 'exclusions', 'status', 'notices', 'flags', 'manifests', 'rotation', 'watch', 'triage', 'skip', 'reviews', 'pages') {
+foreach ($dir in 'sessions', 'work', 'events', 'archive', 'exclusions', 'status', 'notices', 'flags', 'manifests', 'rotation', 'watch', 'triage', 'skip', 'reviews', 'pages', 'heartbeats') {
   [IO.Directory]::CreateDirectory("$root\state\$dir") | Out-Null
 }
 Write-Utf8 "$root\state\roster.json" "{`"sessions`":[]}`n"
@@ -138,7 +138,8 @@ $remove = "Remove-Item -LiteralPath '$root' -Recurse -Force"
 $notes = @(
   "The live fleet does not see this reservation: pick a ticket the live lead is not about to assign, and label it haiku-rehearsal only (this root's readyLabel; the live planner skips it).",
   "A launch leaves a worktree and branch in the tenant repo: git -C $repoFwd worktree remove --force $repoFwd/.claude/worktrees/ic-$issueText-assignment",
-  "The scratch root's own watchers run by hand: powershell -File $root\bin\run-pr-watch.ps1"
+  "The scratch root's own watchers run by hand: powershell -File $root\bin\run-pr-watch.ps1",
+  "Before choosing a ticket, check the live root's skip file and exclusions for the tenant: $liveFull\state\skip\$Tenant.json and $liveFull\state\exclusions\$Tenant.jsonl. This scratch root starts with empty skip and exclusion lists, so a ticket held there looks assignable here."
 )
 Write-Output "scratch fleet root built at $root ($copied files, tenant $Tenant, cap 1)"
 Write-Output "  1. assign:  $($next.assign)"
