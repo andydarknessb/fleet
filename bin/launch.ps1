@@ -325,11 +325,8 @@ if ($Role -eq 'ic') {
   if ($Manifest) {
     $usageHold = $null
     try {
-      $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
-      if ($nodeCmd) {
-        $usageOut = & $nodeCmd.Source "$FleetHome\bin\usage-limit.js" throttle $FleetHome $Tenant 2>&1 | ForEach-Object { "$_" } | Out-String
-        $usageHold = (ConvertFrom-Json (("$usageOut".Trim() -split "`n")[-1])).throttle
-      }
+      $usageOut = & (Get-NodeExe) "$FleetHome\bin\usage-limit.js" throttle $FleetHome $Tenant 2>&1 | ForEach-Object { "$_" } | Out-String
+      $usageHold = (ConvertFrom-Json (("$usageOut".Trim() -split "`n")[-1])).throttle
     } catch { $usageHold = $null }
     if ($usageHold) {
       $r = Release-ReservationOnRefusal "launch refused: $($usageHold.reason)"

@@ -179,6 +179,12 @@ test('#389: a reading whose weekly window has reset is stale and holds nothing, 
   assert.ok(usageThrottle({ reading: reading(0.95, WEEK_A), tenant: 'nidus', limit: LIMIT, now: '2026-11-10T05:59:59.000Z' }));
 });
 
+test('#389: a weekly reset more than 8 days out holds nothing: a millisecond-scale resetsAt, or a reset 30 days out', () => {
+  assert.equal(usageThrottle({ reading: reading(0.95, 1794290400000), tenant: 'nidus', limit: LIMIT, now: AT }), null, 'a millisecond-scale resetsAt');
+  assert.equal(usageThrottle({ reading: reading(0.95, Date.parse(AT) / 1000 + 30 * 86400), tenant: 'nidus', limit: LIMIT, now: AT }), null, 'a reset 30 days out');
+  assert.ok(usageThrottle({ reading: reading(0.95, Date.parse(AT) / 1000 + 8 * 86400), tenant: 'nidus', limit: LIMIT, now: AT }), 'a reset exactly 8 days out still holds');
+});
+
 test('#389: no reading, a reading that cannot be read, no limit, no first Tenant or no clock holds nothing (fail open)', () => {
   assert.equal(usageThrottle({ reading: null, tenant: 'nidus', limit: LIMIT, now: AT }), null);
   assert.equal(usageThrottle({ reading: { weekly: { utilization: 'high', resetsAt: WEEK_A } }, tenant: 'nidus', limit: LIMIT, now: AT }), null);

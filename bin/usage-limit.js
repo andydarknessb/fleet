@@ -73,14 +73,17 @@ function pageRecordAfter(record, reading, delivered, at) {
 
 // #389 (ADR 0018): the weekly hold on a Tenant's new IC launches. At or above `lowerTenantsAt` every
 // Tenant but the first in `tenantOrder` is held; at or above `allTenantsAt`, every Tenant. A reading whose
-// weekly window has reset is stale and holds nothing, and so does a reading, limit or clock that cannot be
-// read: a missing probe must not stop the fleet (fail open).
+// weekly reset is not within the next 8 days holds nothing (a passed reset is stale; a millisecond-scale or
+// far-future one is not a weekly window), and so does a reading, limit or clock that cannot be read: a missing
+// probe must not stop the fleet (fail open).
 function usageThrottle({ reading, tenant, limit, now } = {}) {
   const weekly = reading?.weekly;
   const first = Array.isArray(limit?.tenantOrder) ? limit.tenantOrder[0] : undefined;
   if (!weekly || !Number.isFinite(weekly.utilization) || !first) return null;
-  const reset = new Date(weekly.resetsAt * 1000);
-  if (!(reset.getTime() > new Date(now || Date.now()).getTime())) return null;
+  const resetMs = weekly.resetsAt * 1000;
+  const nowMs = new Date(now || Date.now()).getTime();
+  if (!(resetMs > nowMs && resetMs - nowMs <= 8 * 86400000)) return null;
+  const reset = new Date(resetMs);
   const hold = (threshold, scope) => ({
     code: 'usage-throttle',
     threshold,

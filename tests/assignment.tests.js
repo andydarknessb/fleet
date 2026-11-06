@@ -1175,7 +1175,7 @@ test('#209 m7: plannerInputs throws on a missing tenant instead of answering "no
 // thresholds are the ruling's, in the test root's config/cycle.json.
 const USAGE_LIMIT = { tenantOrder: ['statelite', 'endzone', 'nidus'], lowerTenantsAt: 0.85, allTenantsAt: 0.9 };
 const USAGE_NOW = '2026-11-06T12:00:00.000Z';
-const WEEK_OPEN = 4102444800; // 2100-01-01: a weekly window still open at USAGE_NOW
+const WEEK_OPEN = Date.parse(USAGE_NOW) / 1000 + 3 * 86400; // three days after USAGE_NOW: still open, inside the 8-day horizon
 function usageLatest(weeklyUtilization, weeklyResetsAt = WEEK_OPEN) {
   return JSON.stringify({ fiveHour: { utilization: 0.05, resetsAt: 1793995200 }, weekly: { utilization: weeklyUtilization, resetsAt: weeklyResetsAt }, status: 'allowed', at: USAGE_NOW });
 }
