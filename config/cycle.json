@@ -54,7 +54,8 @@
     "rateMinUnits": 10,
     "escapedRate": { "weak": 0.05 },
     "fleetDeadRate": { "watch": 0.02, "weak": 0.1 },
-    "maxPrLookups": 50
+    "maxPrLookups": 50,
+    "principalRevertPoints": 10
   },
   "review": {
     "trivialMaxChangedLines": 25,

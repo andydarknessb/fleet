@@ -10,7 +10,7 @@ param(
   [ValidateSet('', 'auto', 'allowlist')]
   [string]$Permissions, # the permission profile (ADR 0016); an assignment manifest's own `permissions` wins. Empty = auto.
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5', 'sonnet-5.5')]
-  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5, 'sonnet-5.5' to Sonnet 5.5 (the project-lead default); an IC runs 'haiku' only (fleet #350), see $modelArgs below
+  [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5, 'sonnet-5.5' to Sonnet 5.5 (the project-lead and Principal default); an IC runs 'haiku' only (fleet #350), see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
   [switch]$Recover, # bin\recover.ps1's reboot-recovery relaunch of an IC ONLY: honoured only when
                     # the live roster already holds a row of that exact -Name, role ic, status
@@ -482,19 +482,25 @@ $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
 Write-Json $settingsPath $settings
 
 # The friendly -Model token is passed to `claude --model`, but the bare 'opus'
-# alias tracks the latest Opus (currently Opus 5). ICs must run Opus 4.8, so pin
-# 'opus' to the concrete id. 'fable' stays pinned (ADR 0011) so an explicit -Model fable
+# alias tracks the latest Opus (currently Opus 5), so pin 'opus' to the concrete id: an
+# explicit -Model opus runs Opus 4.8 (ICs run Haiku 5.5 alone, fleet #350). 'fable' stays
+# pinned (ADR 0011) so an explicit -Model fable
 # resolves to claude-fable-5-1 and a default-Fable bump cannot move it silently; the installed
 # CLI 2.1.269 admits claude-fable-5-1 to auto mode, verified in its model predicate
 # 2026-09-11, so no fleet #28-style refusal. Other tokens keep their CLI aliases.
-# An arbiter launched with no -Model runs pinned Opus 5.5 like the principal and project
-# lead (owner ruling 2026-10-20, ADR 0017 amendment); the role file's `model:` agrees.
+# An arbiter launched with no -Model runs its own pin, Opus 5.5 (owner ruling 2026-10-20,
+# ADR 0017 amendment); the role file's `model:` agrees.
 # A project lead launched with no -Model runs Sonnet 5.5 (owner ruling 2026-10-26; Opus
 # 5.5 from 2026-09-23 until then), pinned for the same reason.
+# A principal launched with no -Model runs its own pin, Sonnet 5.5 (owner ruling 2026-11-06,
+# fleet #385; Opus 5.5 under ADR 0017 until then), at the role file's high effort.
 # Every IC runs pinned Haiku 5.5 (owner ruling 2026-10-30, fleet #350), whatever the manifest
 # names: the door refuses any other IC model above.
 # The pins and role defaults live in _common.ps1 (Resolve-LaunchModel) since fleet
 # #121: sentinel-check compares a daemon job's frozen respawnFlags against them.
+# fleet #385: the roster records the model the caller asked for, not the pin a default launch resolved to. A row that named
+# the resolved pin reads as a hand-set -Model to sentinel-check, which would hold the session to that pin after a pin change.
+$requestedModel = $Model
 $launchModel = Resolve-LaunchModel -Role $Role -Model $Model
 $Model = $launchModel.token
 $modelArgs = @()
@@ -725,7 +731,7 @@ if (-not $row) {
 $rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } else { $Manifest }
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
-  model = $Model; permissions = $Permissions; effort = $effort
+  model = $requestedModel; permissions = $Permissions; effort = $effort
   jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $rosterManifest; workRecordId = $WorkRecordId
   status = 'active'; launchedAt = (Now-Iso); retiredAt = $null
 }

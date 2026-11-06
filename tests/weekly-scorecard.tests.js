@@ -103,10 +103,10 @@ test('#131: a fixture week produces every row in markdown and JSON', () => {
   const card = writeScorecard({ root, now: NOW, gh: ghStub().gh, collect: () => collectorReport() });
   assert.equal(card.week.label, '2026-09-21..2026-09-27');
   const json = JSON.parse(fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.json'), 'utf8'));
-  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'reviewPickup', 'icCost', 'boundedAuthority', 'usageLimit']);
+  assert.deepEqual(json.rows.map((r) => r.key), ['throughput', 'cycleTime', 'issueToMergeTail', 'sentBack', 'reviewGate', 'escapedDefects', 'availability', 'waitingOnCory', 'icIdleShare', 'reviewPickup', 'icCost', 'boundedAuthority', 'arbiterReturnRate', 'usageLimit']);
   assert.equal(json.rows[json.rows.length - 1].key, 'usageLimit', 'fleet #388 adds the last row');
   const md = fs.readFileSync(path.join(root, 'state', 'metrics', 'scorecard-2026-09-21.md'), 'utf8');
-  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'Review pickup latency', 'IC cost', 'Bounded authority', 'Weekly-limit points per unit']) {
+  for (const area of ['Throughput', 'Cycle time', 'Issue-to-merge tail', 'Sent back at least once', 'Review gate', 'Escaped defects', 'Availability', 'Waiting on Cory', 'IC idle share', 'Review pickup latency', 'IC cost', 'Bounded authority', 'Arbiter return-or-edit rate', 'Weekly-limit points per unit']) {
     assert.match(md, new RegExp(`^\\| ${area.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\|`, 'm'), area);
   }
 });
@@ -735,7 +735,89 @@ test('#211: a corrupt triage ledger makes the Bounded authority row unknown and 
   fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), 'not json\n{"kind":"x"}\n');
   const card = build(root);
   assert.equal(card.rows.find((r) => r.key === 'boundedAuthority').status, 'unknown');
+  assert.equal(card.rows.find((r) => r.key === 'arbiterReturnRate').status, 'unknown');
   assert.equal(card.rows.find((r) => r.key === 'throughput').status, 'good');
+});
+
+// Spec fleet #382 ruling 2 (fleet #385): the Arbiter's return-or-edit rate on the Principal's proposals is the revert
+// trigger for the Principal's Sonnet tier. Its Verdicts are the Arbiter's four kinds in state/triage/<tenant>.jsonl; the
+// rate is the Verdicts returned or endorsed with edits over all of them. The scorecard week is read against the two
+// weeks before it, pooled, and a rise of more than 10 points is the trigger (watch). The revert itself stays Cory's call.
+const verdictRow = (kind, issue, at, extra = {}) => ({ kind, issue, at, actor: 'arbiter', bodyHash: `hash-${issue}`, commentUrl: `https://x/${issue}`, ...extra });
+const arbiterRow = (card) => card.rows.find((r) => r.key === 'arbiterReturnRate');
+test('#385: the Arbiter return-or-edit row reads three weeks of Verdicts, pools the two before for the baseline, and watches a rise over 10 points', () => {
+  const root = fixtureWeek();
+  triageRows(root, 'endzone', [
+    // 2026-09-21..27, the scorecard week: 4 Verdicts, 2 returned or endorsed with edits
+    verdictRow('returned', 22, '2026-09-22T10:00:00.000Z'),
+    verdictRow('endorsed-with-edits', 23, '2026-09-23T10:00:00.000Z', { edits: 'name the file' }),
+    verdictRow('endorsed', 24, '2026-09-24T10:00:00.000Z'),
+    verdictRow('escalated', 25, '2026-09-25T10:00:00.000Z', { reason: 'product-intent', question: 'Which tier?' }),
+    // 2026-09-14..20: 5 Verdicts, 2 returned or edited
+    verdictRow('endorsed', 21, '2026-09-15T10:00:00.000Z'),
+    verdictRow('endorsed', 26, '2026-09-16T10:00:00.000Z'),
+    verdictRow('endorsed', 27, '2026-09-17T10:00:00.000Z'),
+    verdictRow('endorsed-with-edits', 28, '2026-09-18T10:00:00.000Z', { edits: 'name the file' }),
+    verdictRow('returned', 29, '2026-09-19T10:00:00.000Z'),
+    // 2026-09-07..13: 6 Verdicts, 1 returned or edited
+    verdictRow('endorsed', 11, '2026-09-08T10:00:00.000Z'),
+    verdictRow('endorsed', 12, '2026-09-09T10:00:00.000Z'),
+    verdictRow('endorsed', 13, '2026-09-10T10:00:00.000Z'),
+    verdictRow('endorsed', 14, '2026-09-11T10:00:00.000Z'),
+    verdictRow('endorsed', 15, '2026-09-12T10:00:00.000Z'),
+    verdictRow('endorsed-with-edits', 16, '2026-09-13T10:00:00.000Z', { edits: 'name the file' }),
+    // Not Verdicts, or outside the three weeks: none of these counts.
+    { kind: 'proposed', issue: 30, at: '2026-09-23T10:00:00.000Z', bodyHash: 'hash-30', commentUrl: 'https://x/30', model: 'sonnet-5.5' },
+    { kind: 'approved', issue: 31, at: '2026-09-23T11:00:00.000Z', by: 'owner', bodyHash: 'hash-31', commentUrl: 'https://x/31' },
+    { kind: 'finalized', issue: 22, at: '2026-09-22T11:00:00.000Z', labels: ['ready-for-agent'] },
+    { kind: 'bounded-ready', issue: 32, at: '2026-09-24T10:00:00.000Z', bodyHash: 'hash-32' },
+    { kind: 'veto', issue: 32, at: '2026-09-25T10:00:00.000Z', by: 'owner' },
+    { kind: 'superseded', issue: 33, at: '2026-09-26T10:00:00.000Z', bodyHash: 'hash-33' },
+    { kind: 'consumed', through: '2026-09-26T10:00:00.000Z' },
+    verdictRow('endorsed', 34, '2026-09-28T00:00:00.000Z'),
+    verdictRow('returned', 35, '2026-09-06T23:59:00.000Z'),
+  ]);
+  // nidus's Verdicts count with endzone's: one returned in the scorecard week.
+  triageRows(root, 'nidus', [verdictRow('returned', 9, '2026-09-22T12:00:00.000Z')]);
+  const card = build(root);
+  const row = arbiterRow(card);
+  assert.equal(row.area, 'Arbiter return-or-edit rate');
+  assert.deepEqual(row.figures.weeks.map((w) => [w.label, w.verdicts, w.returnedOrEdited]), [['2026-09-21..2026-09-27', 5, 3], ['2026-09-14..2026-09-20', 5, 2], ['2026-09-07..2026-09-13', 6, 1]]);
+  assert.deepEqual(row.figures.baseline, { verdicts: 11, returnedOrEdited: 3, rate: 0.273 }, 'the two weeks before, pooled: 3 of 11');
+  assert.equal(row.figures.changePoints, 32.7, 'this week 60% against a pooled 27.3%');
+  assert.equal(row.figures.trigger, true);
+  assert.equal(row.status, 'watch');
+  assert.match(row.result, /3 of 5 \(60%\)/);
+  assert.match(row.result, /\+32\.7 points/);
+  assert.match(row.result, /revert trigger/);
+  assert.match(renderScorecard(card), /^\| Arbiter return-or-edit rate \|/m);
+});
+test('#385: the Arbiter return-or-edit row is n/a without a Verdict on both sides of the change, and good at exactly 10 points', () => {
+  const rowFor = (rows) => { const root = fixtureWeek(); triageRows(root, 'endzone', rows); return arbiterRow(build(root)); };
+  assert.equal(rowFor([]).status, 'n/a');
+  const thisWeekOnly = rowFor([verdictRow('endorsed', 22, '2026-09-22T10:00:00.000Z')]);
+  assert.equal(thisWeekOnly.status, 'n/a', 'no Verdict in the two weeks before to compare with');
+  assert.equal(thisWeekOnly.figures.changePoints, null);
+  // 2 of 4 this week (50%) against 4 of 10 pooled over the two weeks before (40%): a rise of exactly 10 points is not over the line.
+  const exact = rowFor([
+    verdictRow('returned', 22, '2026-09-22T10:00:00.000Z'),
+    verdictRow('endorsed-with-edits', 23, '2026-09-23T10:00:00.000Z', { edits: 'name the file' }),
+    verdictRow('endorsed', 24, '2026-09-24T10:00:00.000Z'),
+    verdictRow('escalated', 25, '2026-09-25T10:00:00.000Z', { reason: 'product-intent', question: 'Which tier?' }),
+    verdictRow('endorsed', 21, '2026-09-15T10:00:00.000Z'),
+    verdictRow('endorsed', 26, '2026-09-16T10:00:00.000Z'),
+    verdictRow('endorsed', 27, '2026-09-17T10:00:00.000Z'),
+    verdictRow('endorsed-with-edits', 28, '2026-09-18T10:00:00.000Z', { edits: 'name the file' }),
+    verdictRow('returned', 29, '2026-09-19T10:00:00.000Z'),
+    verdictRow('endorsed', 11, '2026-09-08T10:00:00.000Z'),
+    verdictRow('endorsed', 12, '2026-09-09T10:00:00.000Z'),
+    verdictRow('endorsed', 13, '2026-09-10T10:00:00.000Z'),
+    verdictRow('endorsed-with-edits', 14, '2026-09-11T10:00:00.000Z', { edits: 'name the file' }),
+    verdictRow('returned', 15, '2026-09-12T10:00:00.000Z'),
+  ]);
+  assert.equal(exact.figures.changePoints, 10);
+  assert.equal(exact.figures.trigger, false);
+  assert.equal(exact.status, 'good');
 });
 
 // #139 (ruled 2026-10-27): thresholds re-set from four weeks of scorecards.
