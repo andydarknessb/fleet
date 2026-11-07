@@ -314,7 +314,7 @@ function Test-JobRemoved {
 # job with no roster row behind it and ran it on --model claude-opus-5 --effort xhigh
 # for 16h. A static session is respawned only when the daemon row is the live
 # roster's own active job AND its frozen --model/--effort equal what launch.ps1 passes
-# today (_common.ps1 Resolve-LaunchModel / Get-RoleEffort). Otherwise this returns why,
+# today (_common.ps1 Resolve-LaunchModel and Get-LaunchRoleEffort: the tenant file's roleEffort, else Get-RoleEffort). Otherwise this returns why,
 # and Do-Respawn stops the job and relaunches through launch.ps1 -FromRoster instead.
 # ICs keep the daemon respawn: their flags are per-assignment and short-lived.
 function Get-StaticRespawnRefusal {
@@ -332,7 +332,10 @@ function Get-StaticRespawnRefusal {
     $frozen[$flag] = if ($at -ge 0 -and $at + 1 -lt $flags.Count) { $flags[$at + 1] } else { '' }
   }
   $expectedModel = (Resolve-LaunchModel -Role "$($entry.role)" -Model "$($rosterRow.model)").id
-  $roleEffort = Get-RoleEffort "$($entry.role)"
+  # Fleet #394: the effort launch.ps1 passes is the tenant file's roleEffort for the role, else the role file's; an unreadable tenant file is the role file's.
+  $tenantConfig = $null
+  if ("$($entry.tenant)") { try { $tenantConfig = Read-Json "$FleetHome\tenants\$($entry.tenant).json" } catch {} }
+  $roleEffort = Get-LaunchRoleEffort "$($entry.role)" $tenantConfig
   $expectedEffort = if (Test-LaunchEffort $roleEffort) { $roleEffort } else { '' }
   # A pinned model (a claude-* id) must match exactly. An alias (a roster -Model such as
   # sonnet or haiku, or, with no model at all, the role file's `model:`) is resolved by

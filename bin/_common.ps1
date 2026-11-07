@@ -318,6 +318,15 @@ function Get-RoleEffort {
   return ''
 }
 function Test-LaunchEffort { param([string]$Effort) return $Effort -in @('low', 'medium', 'high', 'xhigh', 'max') }
+# Fleet #394: a non-IC session's effort is its tenant file's roleEffort for the role when valid, else the role file's.
+function Get-LaunchRoleEffort {
+  param([string]$Role, $TenantConfig)
+  if ($Role -ne 'ic' -and $TenantConfig -and $TenantConfig.roleEffort -and $TenantConfig.roleEffort.PSObject.Properties[$Role]) {
+    $override = "$($TenantConfig.roleEffort.$Role)"
+    if (Test-LaunchEffort $override) { return $override }
+  }
+  return Get-RoleEffort $Role
+}
 function Get-RoleModel {
   # The role file's `model:` alias (e.g. sonnet), or '' when it declares none.
   param([string]$Role)

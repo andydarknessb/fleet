@@ -275,6 +275,28 @@ exit 0
   Assert-True ("$($streak10.'pl-test'.jobId)" -eq 'job-d4' -and @($streak10.'pl-test'.attempts).Count -eq 7 -and @($streak10.'pl-test'.downAttempts).Count -eq 4) "B10: the relaunches are counted under the newest job id, four of them deaths (got $(Get-Content $streakFile -Raw))"
   Remove-Item Env:MOCK_LAUNCH_JOBID
 
+  # S13 (fleet #394, the effort trial): the effort launch.ps1 passes a lead is its tenant file's roleEffort, so the sentinel
+  # must expect that. The tenant file is restored after these two cases.
+  $tenantFileS = "$testRoot\tenants\test.json"
+  $tenantOriginalS = Get-Content $tenantFileS -Raw
+  Write-Utf8 $tenantFileS ($tenantOriginalS.Replace('"branchPrefix":"fleet/",', '"branchPrefix":"fleet/","roleEffort":{"project-lead":"medium"},'))
+  $env:MOCK_ROW_ID = 'job-p'
+  Set-LiveRoster $activeRow
+  # S13: frozen at the tenant's medium, the lead is what launch.ps1 passes, so the daemon respawns it.
+  Set-Job 'job-p' @('--name', 'pl-test', '--agent', 'project-lead', '--settings', 'x', '--model', 'claude-sonnet-5-5', '--effort', 'medium')
+  Reset-Calls
+  $s13 = Run-Check -Apply
+  $calls13 = @(Get-Calls)
+  Assert-True (($calls13 -contains 'claude respawn job-p') -and -not ($calls13 -contains 'launch pl-test') -and @($s13.respawned | Where-Object { $_.name -eq 'pl-test' -and "$($_.via)" -ne 'launch' }).Count -eq 1) "S13 (fleet #394): a lead frozen on its tenant's roleEffort medium respawns through the daemon, not the launch door (calls: $($calls13 -join '; '))"
+  # S13b: frozen at the role file's high, the lead differs from what launch.ps1 passes (the tenant's medium): refused, named, relaunched.
+  Set-Job 'job-p' @('--name', 'pl-test', '--agent', 'project-lead', '--settings', 'x', '--model', 'claude-sonnet-5-5', '--effort', 'high')
+  Reset-Calls
+  $s13b = Run-Check -Apply
+  $calls13b = @(Get-Calls)
+  $r13b = @($s13b.respawned | Where-Object { $_.name -eq 'pl-test' })[0]
+  Assert-True (($calls13b -contains 'launch pl-test') -and -not ($calls13b -contains 'claude respawn job-p') -and "$($r13b.reason)" -match "launch\.ps1 passes --model 'claude-sonnet-5-5' --effort 'medium' today") "S13b (fleet #394): a lead frozen on the role file's high is refused, naming the tenant's medium as what launch.ps1 passes (calls: $($calls13b -join '; '); reason: $($r13b.reason))"
+  Write-Utf8 $tenantFileS $tenantOriginalS
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) static-respawn assertion(s) failed" }
   Write-Output 'sentinel static respawn tests passed'
 } finally {
