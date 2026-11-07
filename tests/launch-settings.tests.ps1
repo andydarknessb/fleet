@@ -14,7 +14,7 @@ $oldProfile = $env:USERPROFILE
 function Run-Launch {
   param([string[]]$Arguments)
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $out = & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\bin\launch.ps1" @Arguments 2>&1 | Out-String }
+  try { $out = & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\bin\launch.ps1" @Arguments 2>&1 | Out-String; $script:lastOut = $out }
   finally { $script:lastExit = $LASTEXITCODE; $ErrorActionPreference = $eap }
   try { return ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch { return $out }
 }
@@ -378,6 +378,41 @@ exit $LASTEXITCODE
   Write-Utf8 "$testRoot\roster.json" '{"cap":1,"sessions":[{"name":"ar-test","role":"arbiter","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"p"},{"name":"pl-test","role":"project-lead","tenant":"test","parent":"dispatcher","cwd":"x","prompt":"p"}]}'
   $rcap3 = Run-Launch @('-Role', 'arbiter', '-Name', 'ar-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'p', '-DryRun')
   Assert-True ($rcap3.dryRun -eq $true) "a full cap must not refuse the arbiter (got: $rcap3)"
+
+  # Fleet #394 (the effort trial): a tenant file's roleEffort sets a non-IC role's effort for that tenant alone. The role
+  # files stay project-lead low, principal high, arbiter xhigh and ic xhigh; the tenant file is restored after these cases.
+  $tenantFile = "$testRoot\tenants\test.json"
+  $tenantOriginal = Get-Content $tenantFile -Raw
+  function Set-TenantRoleEffort { param([string]$RoleEffortJson) Write-Utf8 $tenantFile ($tenantOriginal.Replace('"maxIcs":2,', '"maxIcs":2,"roleEffort":' + $RoleEffortJson + ',')) }
+  # The lead's real claude --bg: the mock daemon is empty until --bg, then lists the lead, and logs the --bg arguments.
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[]}'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\mock-agents-after-launch.json" '[{"id":"job-pl","name":"pl-test","state":"working","status":"idle","pid":22,"sessionId":"sess-pl","startedAt":1756000000000}]'
+  Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'if "%1"=="--bg" (echo %* >> "' + $testRoot + '\claude-bg.log" & copy /y "' + $testRoot + '\mock-agents-after-launch.json" "' + $testRoot + '\mock-agents.json" >nul)' + "`r`n" + 'exit /b 0' + "`r`n")
+  Set-TenantRoleEffort '{"project-lead":"medium"}'
+  # Case 1: the lead runs claude --bg at medium, and its roster row records medium.
+  $rl = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead')
+  Assert-True ($script:lastExit -eq 0 -and $rl.launched -eq $true) "a lead launch under roleEffort medium must launch (got: $rl)"
+  Assert-True ((Get-Content "$testRoot\claude-bg.log" -Raw -ErrorAction SilentlyContinue) -match '--effort medium ') 'a project lead named in roleEffort must run claude --bg at medium'
+  $leadRow = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'pl-test' -and $_.status -eq 'active' })[0]
+  Assert-True ("$($leadRow.effort)" -eq 'medium') "the roster row must record effort medium from roleEffort (got: '$($leadRow.effort)')"
+  # The dry runs below start from an empty daemon and live roster, so the lead just launched is not a duplicate.
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  # Case 2: only the named role changes; the principal keeps its role file effort.
+  $rpe = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-DryRun')
+  Assert-True ("$($rpe.command)" -match '--effort high') "a principal under a roleEffort that names only the lead must keep its role file effort high (got: $($rpe.command))"
+  # Case 3: an invalid value falls back to the role file's effort, silently: the launch result is the only output.
+  Set-TenantRoleEffort '{"project-lead":"ultra"}'
+  $rli = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
+  Assert-True ($script:lastExit -eq 0 -and $rli.effort -eq 'low' -and "$($rli.command)" -match '--effort low ') "an invalid roleEffort must fall back to the role file's low (got: $rli)"
+  Assert-True (@($script:lastOut.Trim() -split "`n").Count -eq 1) "an invalid roleEffort must print nothing beyond the launch result (got: $($script:lastOut))"
+  # Case 4: an IC never reads roleEffort; it runs its role file effort, xhigh.
+  Set-TenantRoleEffort '{"ic":"medium"}'
+  $rhr = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-DryRun')
+  Assert-True ($rhr.effort -eq 'xhigh' -and "$($rhr.command)" -match '--effort xhigh ') "an IC must ignore roleEffort and run the role file effort xhigh (got: $($rhr.command))"
+  Write-Utf8 $tenantFile $tenantOriginal
 
   Write-Output 'launch settings tests passed'
 } finally {

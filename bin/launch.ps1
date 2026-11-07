@@ -514,7 +514,8 @@ if ($launchModel.id) { $modelArgs = @('--model', $launchModel.id) }
 # pass the declared effort with --effort, the only lever that sticks for --bg.
 $roleFile = "$FleetHome\agents\$Role.md"
 # Fleet #350: an IC's effort is the one the door checked above (its manifest's, else the role file's).
-$effort = if ($Role -eq 'ic') { $icEffort } else { Get-RoleEffort $Role }
+# Fleet #394: a non-IC's effort is its tenant file's roleEffort, else the role file's.
+$effort = if ($Role -eq 'ic') { $icEffort } else { Get-LaunchRoleEffort $Role $t }
 $effortArgs = @()
 if (Test-LaunchEffort $effort) { $effortArgs = @('--effort', $effort) }
 

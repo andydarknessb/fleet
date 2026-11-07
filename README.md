@@ -28,7 +28,7 @@ cory
 | Path | What |
 |---|---|
 | `roster.json` | Static roster: the sessions that must always exist, the cap, their launch prompts. Cory edits. |
-| `tenants/<name>.json` | One per tenant: repo, GitHub slug, labels, branch prefix, `maxIcs`, carve-outs, checks, notes ICs must obey. |
+| `tenants/<name>.json` | One per tenant: repo, GitHub slug, labels, branch prefix, `maxIcs`, `roleEffort` (optional: a non-IC role's effort for this tenant, #394), carve-outs, checks, notes ICs must obey. |
 | `agents/*.md` | Role files. `~/.claude/agents` is a junction to this directory (`setup.ps1`), so `claude --agent <role>` finds them. Remove with `rmdir`, never `rm -r`. |
 | `fleet-settings.json` | Applied to every fleet session via `--settings`: inbound messaging accepted, auto mode, fleet soft-denies, the hooks (session-start, research-gate, allowlist-gate, principal-guard, stop). |
 | `hooks/session-start.ps1` | Prints the session's identity, tenant, PAUSE state, scoped notices, any rotation handoff (to the session the rotation launched: its id, or a same-name `startup` hook inside 120 s of the intent's `launching` phase, fleet #230), and roster into its context. Notices come from `state/notices/{all,<role>,tenant-<tenant>}.md` only; each paragraph may carry `[until YYYY-MM-DD]` or `[cleared-by <work-record-id> <state>]` and drops out when its end arrives. #311: a project lead rotated by a frontier wake (not a heal) gets a wake brief instead of the reconstruct-from-state handoff: act on the named frontier issues and records first, read only what each needs, then end the turn. |
