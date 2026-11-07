@@ -3,7 +3,7 @@
   "permissions": { "defaultMode": "auto" },
   "enabledPlugins": { "ponytail@ponytail": true, "mattpocock-skills@claude-plugins-official": true, "i-have-adhd@i-have-adhd": false, "humanizer@humanizer": false, "impeccable@impeccable": false },
   "syncClaudeAiPlugins": false,
-  "remoteControlAtStartup": false,
+  "remoteControlAtStartup": true,
   "autoMode": {
     "environment": [
       "$defaults",

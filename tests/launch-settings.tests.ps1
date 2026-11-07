@@ -102,14 +102,14 @@ try {
     # Ponytail is enabled by the fleet's own settings, not only by Cory's user settings.
     $gotPlugins = (Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).enabledPlugins
     Assert-True ($gotPlugins.'ponytail@ponytail' -eq $true) "$($case.Name) per-session settings must enable ponytail@ponytail"
-    # fleet #384 (owner ruling 5): Cory's personal plugins are off by id, the fleet's two stay on, plugin sync and
-    # Remote Control are off, and only the project lead keeps the claude.ai connectors (its Supabase connector).
+    # fleet #384 (owner ruling 5): Cory's personal plugins are off by id, the fleet's two stay on, plugin sync is off and
+    # Remote Control is on, and only the project lead keeps the claude.ai connectors (its Supabase connector).
     $gotSettings = Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json
     $wantPlugins = @{ 'ponytail@ponytail' = $true; 'mattpocock-skills@claude-plugins-official' = $true; 'i-have-adhd@i-have-adhd' = $false; 'humanizer@humanizer' = $false; 'impeccable@impeccable' = $false }
     Assert-True (@($gotSettings.enabledPlugins.PSObject.Properties).Count -eq $wantPlugins.Count) "$($case.Name) per-session settings must name exactly the fleet's plugins (got $($gotSettings.enabledPlugins | ConvertTo-Json -Compress))"
     foreach ($plugin in $wantPlugins.Keys) { Assert-True ($gotSettings.enabledPlugins.PSObject.Properties[$plugin].Value -eq $wantPlugins[$plugin]) "$($case.Name) per-session settings must set $plugin to $($wantPlugins[$plugin])" }
     Assert-True ($gotSettings.syncClaudeAiPlugins -eq $false) "$($case.Name) per-session settings must turn claude.ai plugin sync off"
-    Assert-True ($gotSettings.remoteControlAtStartup -eq $false) "$($case.Name) per-session settings must turn Remote Control off"
+    Assert-True ($gotSettings.remoteControlAtStartup -eq $true) "$($case.Name) per-session settings must turn Remote Control on (#407)"
     if ($case.Role -eq 'project-lead') { Assert-True ($gotSettings.disableClaudeAiConnectors -eq $false) "$($case.Name) must keep the claude.ai connectors" } else { Assert-True ($gotSettings.disableClaudeAiConnectors -eq $true) "$($case.Name) must run without the claude.ai connectors" }
     Assert-True ("$($re.command)" -match '--no-chrome') "$($case.Name) must launch with --no-chrome (got: $($re.command))"
     # Its hooks stay off: only the IC loads it, by invoking the skill (fleet #282).

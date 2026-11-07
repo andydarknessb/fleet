@@ -106,11 +106,11 @@ try {
   Assert-True ([int]$launched.liveFleet -eq 0) "a live fleet session must not count toward the scratch cap (liveFleet $($launched.liveFleet))"
   $launchedSettings = Get-Content "$($launched.settings)" -Raw | ConvertFrom-Json
   Assert-True ($launchedSettings.env.FLEET_HOME -eq $scratch) 'the launched session names the scratch root as FLEET_HOME'
-  # fleet #384: the scratch root's own IC launch runs with the fleet's plugin map, plugin sync and Remote Control off, no claude.ai connectors, and --no-chrome.
+  # fleet #384: the scratch root's own IC launch runs with the fleet's plugin map, plugin sync off, Remote Control on, no claude.ai connectors, and --no-chrome.
   Assert-True ("$($launched.command)" -match '--no-chrome') "a scratch-root IC launch must pass --no-chrome (got: $($launched.command))"
   $scratchPlugins = @{}; foreach ($plugin in $launchedSettings.enabledPlugins.PSObject.Properties) { $scratchPlugins[$plugin.Name] = $plugin.Value }
   Assert-True ($scratchPlugins.Count -eq 5 -and $scratchPlugins['ponytail@ponytail'] -eq $true -and $scratchPlugins['mattpocock-skills@claude-plugins-official'] -eq $true -and $scratchPlugins['i-have-adhd@i-have-adhd'] -eq $false -and $scratchPlugins['humanizer@humanizer'] -eq $false -and $scratchPlugins['impeccable@impeccable'] -eq $false) "a scratch-root IC must carry the fleet's plugin map (got $($launchedSettings.enabledPlugins | ConvertTo-Json -Compress))"
-  Assert-True ($launchedSettings.syncClaudeAiPlugins -eq $false -and $launchedSettings.remoteControlAtStartup -eq $false -and $launchedSettings.disableClaudeAiConnectors -eq $true) 'a scratch-root IC must run with plugin sync and Remote Control off and without the claude.ai connectors'
+  Assert-True ($launchedSettings.syncClaudeAiPlugins -eq $false -and $launchedSettings.remoteControlAtStartup -eq $true -and $launchedSettings.disableClaudeAiConnectors -eq $true) 'a scratch-root IC must run with plugin sync off, Remote Control on, and without the claude.ai connectors'
   foreach ($command in @($launchedSettings.hooks.PSObject.Properties | ForEach-Object { $_.Value } | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })) {
     Assert-True ("$command" -like "*$scratchFwd/hooks/*") "a launched session's hook must be the scratch root's own: $command"
   }
