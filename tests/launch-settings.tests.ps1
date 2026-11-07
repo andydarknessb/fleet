@@ -347,6 +347,14 @@ exit $LASTEXITCODE
   Assert-True ($script:lastExit -eq 4) 'an arbiter without -Tenant must be refused as a usage error'
   $rpl = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
   Assert-True ("$($rpl.command)" -match '--model claude-sonnet-5-5 ') 'a project lead with no -Model must run the pinned Sonnet 5.5 id (owner ruling 2026-10-26)'
+  # fleet #392: every launch records a reason. The dry run names the one it was given; a launch given none is a human's, so manual.
+  $rrd = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-DryRun')
+  Assert-True ($rrd.launchReason -eq 'manual') "a launch with no -Reason must record manual in its output (got: $rrd)"
+  $rrw = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Reason', 'wake:frontier #392', '-DryRun')
+  Assert-True ($rrw.dryRun -eq $true -and $rrw.launchReason -eq 'wake:frontier #392') "the dry run must name the reason it was given (got: $rrw)"
+  # Windows PowerShell drops a bare '' argument to a native exe, so pass a quoted empty to reach the validator itself.
+  $rre = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Reason', '""', '-DryRun')
+  Assert-True ($script:lastExit -ne 0 -and "$rre" -match 'null or empty') "an empty -Reason must be refused by its validator, never recorded as an empty reason (got: $rre)"
   $rplo = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'lead', '-Model', 'sonnet', '-DryRun')
   Assert-True ("$($rplo.command)" -match '--model sonnet\b') 'an explicit -Model must still override the project lead default (ICs take no sonnet: fleet #350)'
   # Fleet #350 (ruling 13): haiku is the IC's model alone. A control-plane role runs its role file's model,

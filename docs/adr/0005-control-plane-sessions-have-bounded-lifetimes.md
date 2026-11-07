@@ -48,6 +48,13 @@ a replacement, and no respawn relaunches them. When work appears, the Watchdog
 Wakes all three through the one door within one tick; a delay of up to fifteen
 minutes on the first new piece of work is accepted.
 
+The owner session ruled two more conditions that keep a tenant awake, so that
+no work strands: a Unit of work in flight, because an IC can stall before it
+opens a pull request and only a running project lead hears that stall; and an
+undelivered wake for its project lead, because a Resolution is new work for the
+lead. Any fact the evaluation cannot read counts as awake, and nothing is
+evaluated while a Pause stands.
+
 The audit behind it: in the week to 2026-11-06, endzone and nidus spent about a
 tenth of the fleet's control-plane usage on 3 Units of work, and their
 Principals and Arbiters rotated on age 43 times in two weeks whether or not

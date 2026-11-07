@@ -161,6 +161,7 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.equal(launch.dryRun, true);
   assert.ok(launch.command.includes('-Manifest'));
   assert.ok(launch.command.includes('-WorkRecordId'));
+  assert.ok(launch.command.join(' ').includes('-Reason assignment'));
   acknowledgeAssignment({ root, workRecordId: manifest.workRecordId, expectedRevision: 1, now: '2026-09-01T00:01:00.000Z' });
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
 });

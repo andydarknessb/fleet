@@ -292,7 +292,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
 
   # ===== Ticket 08b: live supervision under state/flags/sentinel-off =====
   # A mock launch door records every call and answers like launch.ps1.
-  Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
+  Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster, [string]$Reason)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
   function Get-LaunchCalls { if (Test-Path "$testRoot\launch-calls.txt") { @(Get-Content "$testRoot\launch-calls.txt") } else { @() } }
   function Get-EscalationFiles { param([string]$Pattern) @(Get-ChildItem "$testRoot\state\escalations" -Filter $Pattern -ErrorAction SilentlyContinue) }
   function Get-AppliedLines { $f = Get-ChildItem "$testRoot\state\sentinel\applied" -Filter *.jsonl -ErrorAction SilentlyContinue; if ($f) { @(Get-Content $f.FullName) } else { @() } }
@@ -696,6 +696,34 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item Env:FLEET_ALERT_WEBHOOK
   Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
 
+  # Case W9 (ticket 386): a dormant tenant keeps its down lead down, and new work (an in-flight Work record)
+  # brings it back through the one launch door in the same tick. The tenant is quiet here: an empty planner
+  # fixture, the gh mock answers [] for triage and PRs, and no Work record. dormancy.js is copied for this case only.
+  $quietFixture = "$testRoot\quiet-fixture.json"
+  Write-Utf8 $quietFixture '[]'
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = $quietFixture
+  $env:FLEET_TRIAGE_ISSUES_FIXTURE = $quietFixture
+  $env:FLEET_GITHUB_PRS_FIXTURE = $quietFixture
+  [IO.File]::Copy("$sourceRoot\bin\dormancy.js", "$testRoot\bin\dormancy.js", $true)
+  $activeBeforeW9 = if (Test-Path "$testRoot\state\work\active.json") { Get-Content "$testRoot\state\work\active.json" -Raw } else { $null }
+  # The wake outbox has only consumed lines for this tenant: the consumed watermark stands at now (a missing one reads awake).
+  Write-Utf8 "$testRoot\state\watchdog\frontier-wake.json" ('{"tenants":{"test":{"outboxConsumedThrough":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}}}')
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{}}'
+  Remove-Item "$testRoot\launch-calls.txt" -ErrorAction SilentlyContinue
+  Set-AgentsRows "[$dispRow]"
+  $w9 = Run-Watchdog
+  Assert-True (@($w9.launches | Where-Object { $_.name -eq 'pl-test' }).Count -eq 0) "a dormant tenant's down lead is not launched (launches: $($w9.launches | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True (@(Get-LaunchCalls).Count -eq 0) 'a dormant tenant launches nothing through the door'
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test-901":{"tenant":"test","issue":901,"state":"implementing"}}}'
+  $w9b = Run-Watchdog
+  Assert-True (@($w9b.launches | Where-Object { $_.name -eq 'pl-test' -and $_.launched -eq $true }).Count -eq 1) "new work wakes the down lead within the same tick (launches: $($w9b.launches | ConvertTo-Json -Compress -Depth 4))"
+  Assert-True (@(Get-LaunchCalls) -contains 'FromRoster=pl-test') 'the wake goes through launch.ps1 -FromRoster'
+  Remove-Item "$testRoot\bin\dormancy.js", "$testRoot\state\watchdog\dormancy.json", $quietFixture -ErrorAction SilentlyContinue
+  if ($null -ne $activeBeforeW9) { Write-Utf8 "$testRoot\state\work\active.json" $activeBeforeW9 } else { Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue }
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE, Env:FLEET_GITHUB_PRS_FIXTURE -ErrorAction SilentlyContinue
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = $wakeFixture
+
   # ===== Ticket 75 (ADR 0012): fleet-dead requires stale heartbeats AND work waiting =====
   # A session with nothing to do takes no turns and its heartbeat goes stale too;
   # that is not an outage. Reuses the frontier/wake fixtures already wired above
@@ -882,6 +910,8 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   # triage.js call (a different script, a different ticket) does not also hit this
   # same shim and confound the "at most once" count this case exists to prove.
   Write-Utf8 "$testRoot\state\flags\triage-wake-off" 'x'
+  # ticket 386: the dormancy snapshot is one more node call per tick; this shim must count the planner call alone.
+  Write-Utf8 "$testRoot\state\flags\dormancy-off" 'x'
   Write-Utf8 "$testRoot\mock-bin\slow-node.cmd" ('@echo off' + "`r`n" + 'echo called >> "%~dp0slow-node-calls.log"' + "`r`n" + 'ping -n 21 127.0.0.1 >nul' + "`r`n" + 'echo {}' + "`r`n")
   Remove-Item "$testRoot\mock-bin\slow-node-calls.log" -ErrorAction SilentlyContinue
   $oldNodePath = $env:FLEET_NODE_PATH
@@ -918,6 +948,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   }
   Remove-Item "$testRoot\state\work\active.json"
   Remove-Item "$testRoot\state\flags\triage-wake-off"
+  Remove-Item "$testRoot\state\flags\dormancy-off"
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
 

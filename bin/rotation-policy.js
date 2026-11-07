@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { readTranscriptUsage } = require('./transcript-usage');
 const workState = require('./work-state');
+const { dormantTenants } = require('./dormancy');
 
 // fleet#4: refuse an unknown command or flag rather than silently ignore it.
 class RotationPolicyError extends Error {
@@ -149,6 +150,8 @@ async function evaluate({ root, claudeHome, now } = {}) {
   const staticNames = new Set((staticRoster.sessions || []).map((row) => String(row.name)));
   const live = readJson(path.join(base, 'state', 'roster.json'), { sessions: [] });
   const { events } = readEvents(base);
+  // ticket 386: a dormant Tenant's control-plane session that reaches its boundary is marked dormant; rotate.ps1 retires it without a replacement.
+  const dormant = new Set(dormantTenants({ root: base, now: evaluatedAt }));
 
   const sessions = [];
   for (const row of live.sessions || []) {
@@ -159,7 +162,7 @@ async function evaluate({ root, claudeHome, now } = {}) {
       name: String(row.name), role, tenant: row.tenant || null, sessionId: row.sessionId || null,
       launchedAt: row.launchedAt || null, thresholds,
       metrics: { ageHours: null, merges: null, jobTokens: null },
-      due: false, reasons: [], metricsError: null,
+      due: false, dormant: Boolean(row.tenant) && dormant.has(String(row.tenant)), reasons: [], boundaries: [], metricsError: null,
     };
     const launchedMs = new Date(row.launchedAt || NaN).getTime();
     if (!Number.isFinite(launchedMs)) {
@@ -171,11 +174,13 @@ async function evaluate({ root, claudeHome, now } = {}) {
     entry.metrics.ageHours = (new Date(evaluatedAt).getTime() - launchedMs) / 3600000;
     if (Number.isFinite(thresholds.maxAgeHours) && entry.metrics.ageHours >= thresholds.maxAgeHours) {
       entry.reasons.push(`age ${entry.metrics.ageHours.toFixed(1)}h >= ${thresholds.maxAgeHours}h`);
+      entry.boundaries.push('age');
     }
     if (Number.isFinite(thresholds.maxMerges)) {
       entry.metrics.merges = countMerges(events, { tenant: entry.tenant, since: row.launchedAt });
       if (entry.metrics.merges >= thresholds.maxMerges) {
         entry.reasons.push(`merges ${entry.metrics.merges} >= ${thresholds.maxMerges}`);
+        entry.boundaries.push('merges');
       }
     }
     if (Number.isFinite(thresholds.maxJobTokens)) {
@@ -191,6 +196,7 @@ async function evaluate({ root, claudeHome, now } = {}) {
           entry.metrics.usageRowsWithoutId = totals.usageRowsWithoutId;
           if (totals.jobTokens >= thresholds.maxJobTokens) {
             entry.reasons.push(`job tokens ${totals.jobTokens} >= ${thresholds.maxJobTokens}`);
+            entry.boundaries.push('job-tokens');
           }
         } catch (error) {
           entry.metricsError = `transcript unreadable: ${String(error.message || error)}`;

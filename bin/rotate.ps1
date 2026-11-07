@@ -3,7 +3,8 @@
   A rotation retires the old session, reconciles active Work records against GitHub
   (the pr-watch tick), and relaunches the same roster name through launch.ps1 - the
   replacement reconstructs from canonical state, never from the old transcript.
-  Thresholds live in config/cycle.json and are evaluated by bin/rotation-policy.js.
+  Thresholds live in config/cycle.json and are evaluated by bin/rotation-policy.js. A session of a dormant
+  Tenant (bin/dormancy.js, ticket 386) retires at its boundary with no replacement; a wake or -Force still relaunches.
   The intent file state/rotation/<name>.json makes a crash between stop and launch
   recoverable: the next run (-Auto or -Resume) completes the launch from roster
   intent and the saved event offset. Registered by install-rotation-task.ps1.
@@ -125,7 +126,9 @@ function Complete-Rotation {
   }
   # Hashtable splat, not array: PS 5.1 array splatting delivered '-FromRoster' as a
   # positional VALUE to the script, silently launching nothing that was asked for.
-  $launchArgs = @{ FromRoster = $Intent.name }
+  # fleet #392: the reason the replacement launches under. An intent written before launch reasons were recorded has none.
+  $launchReason = if ($Intent.launchReason) { "$($Intent.launchReason)" } else { 'rotation:unrecorded' }
+  $launchArgs = @{ FromRoster = $Intent.name; Reason = $launchReason }
   if ($Force) { $launchArgs.Force = $true }   # a forced rotation must not strand the role behind launch gates it was told to pass
   # fleet #230: the replacement's SessionStart hook can run before launch.ps1 returns its
   # session id, so `launched` + newSessionId (written after) is too late for it. Mark the
@@ -180,7 +183,8 @@ function Complete-Rotation {
     $Intent | Add-Member -NotePropertyName newJobId -NotePropertyValue $launch.jobId -Force
     $Intent | Add-Member -NotePropertyName completedAt -NotePropertyValue (Now-Iso) -Force
     Write-Json $intentPath $Intent
-    return New-Outcome $Intent.name 'rotated'
+    $why = (@($Intent.reasons) -join '; ')
+    return New-Outcome $Intent.name 'rotated' $(if ($why) { $why } else { $launchReason })
   }
   if ($launch -and "$($launch.reason)" -match 'already running') {
     # Someone relaunched by hand between stop and resume; the goal state holds.
@@ -198,7 +202,7 @@ function Complete-Rotation {
 }
 
 function Start-Rotation {
-  param([string]$SessionName, [string[]]$Reasons)
+  param([string]$SessionName, [string[]]$Reasons, [string]$LaunchReason, [switch]$Dormant)
   $live = Get-LiveRoster
   $entry = $live.sessions | Where-Object { $_.name -eq $SessionName -and $_.status -eq 'active' } | Select-Object -First 1
   if (-not $entry) { return New-Outcome $SessionName 'failed' 'no active live-roster entry' }
@@ -206,13 +210,20 @@ function Start-Rotation {
   if (-not $boundary.safe) { return New-Outcome $SessionName 'deferred' $boundary.reason }
   if ($DryRun) {
     $dry = New-Outcome $SessionName 'dry-run'
-    $dry | Add-Member -NotePropertyName wouldRotate -NotePropertyValue $true
+    if ($Dormant) { $dry | Add-Member -NotePropertyName wouldRetire -NotePropertyValue $true } else { $dry | Add-Member -NotePropertyName wouldRotate -NotePropertyValue $true }
     $dry | Add-Member -NotePropertyName reasons -NotePropertyValue @($Reasons)
     return $dry
   }
+  if ($Dormant) {
+    # ticket 386: a dormant Tenant's control-plane session retires at its boundary and is not replaced. No intent is written,
+    # so no resume can relaunch it; the Watchdog Wakes it when new work makes the Tenant not dormant (bin/dormancy.js).
+    $retire = Invoke-RetireSession $SessionName "rotation (dormant tenant, no replacement): $($Reasons -join '; ')"
+    if (-not $retire.ok) { return New-Outcome $SessionName 'deferred' 'retire did not confirm; the session stays up until the next run' }
+    return New-Outcome $SessionName 'retired' 'dormant tenant: retired without a replacement'
+  }
   $intent = [pscustomobject]@{
     schemaVersion = 1; name = $SessionName; phase = 'stopping'
-    reasons = @($Reasons); savedAt = (Now-Iso)
+    reasons = @($Reasons); launchReason = $LaunchReason; savedAt = (Now-Iso)
     oldSessionId = $entry.sessionId; oldJobId = $entry.jobId
     offset = (Invoke-Policy offset)
   }
@@ -272,16 +283,16 @@ try {
     $static = Get-StaticRoster
     if (-not ($static.sessions | Where-Object { $_.name -eq $Name })) { Write-Error "'$Name' is not a static roster session; rotation only replaces standing sessions"; exit 4 }
     if ($Force) {
-      $outcomes += Start-Rotation $Name @('forced by operator')
+      $outcomes += Start-Rotation $Name @('forced by operator') 'rotation:forced'
     } elseif ($Wake) {
       # A wake is a rotation whose reason is "there is work and the lead is idle": the
       # same stop-at-a-boundary, reconcile, relaunch-through-the-door path, so the
       # replacement reconstructs from state exactly as a rotated lead does.
-      $outcomes += Start-Rotation $Name @("frontier-wake: $Wake")
+      $outcomes += Start-Rotation $Name @("frontier-wake: $Wake") "wake:$Wake"
     } else {
       $evaluation = Invoke-Policy evaluate
       $due = $evaluation.sessions | Where-Object { $_.name -eq $Name } | Select-Object -First 1
-      if ($due -and $due.due) { $outcomes += Start-Rotation $Name @($due.reasons) }
+      if ($due -and $due.due) { $isDormant = [bool]$due.dormant; $outcomes += Start-Rotation $Name @($due.reasons) "rotation:$(@($due.boundaries) -join ',')" -Dormant:$isDormant }
       else { $outcomes += New-Outcome $Name 'skipped' 'no rotation threshold reached (use -Force to override)' }
     }
   }
@@ -290,13 +301,15 @@ try {
     $evaluation = Invoke-Policy evaluate
     foreach ($session in @($evaluation.sessions | Where-Object { $_.due })) {
       if ($handledNames -contains $session.name) { continue }
-      $outcomes += Start-Rotation $session.name @($session.reasons)
+      $isDormant = [bool]$session.dormant
+      $outcomes += Start-Rotation $session.name @($session.reasons) "rotation:$(@($session.boundaries) -join ',')" -Dormant:$isDormant
     }
   }
 
   Write-Output (@{
     at = (Now-Iso)
     rotated = @($outcomes | Where-Object { $_.status -eq 'rotated' } | ForEach-Object { $_.name })
+    retired = @($outcomes | Where-Object { $_.status -eq 'retired' } | ForEach-Object { $_.name })
     deferred = @($outcomes | Where-Object { $_.status -eq 'deferred' } | ForEach-Object { "$($_.name): $($_.reason)" })
     outcomes = $outcomes
   } | ConvertTo-Json -Compress -Depth 8)
