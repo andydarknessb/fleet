@@ -379,7 +379,7 @@ test('buildReport computes per-unit ratios, the IC median, and budget verdicts',
   ];
   const report = buildReport(units, [{ reason: 'abandoned' }, { reason: 'abandoned' }, { reason: 'no-pr' }], {
     sessionMetrics: sessions,
-    budgets: { baselineControlPlaneFreshPerCompletedUnit: 200000, controlPlaneFreshReduction: 0.7, projectLeadFreshPerMergedPr: 25000, icJobTokensMedian: 60000 },
+    budgets: { baselineControlPlaneFreshPerCompletedUnit: 200000, baselineProjectLeadFreshPerMergedPr: 25000, icJobTokensMedianReference: 60000 },
   });
   const u = report.unitMetrics;
   assert.equal(u.completedUnits, 3);
@@ -388,9 +388,8 @@ test('buildReport computes per-unit ratios, the IC median, and budget verdicts',
   assert.equal(u.icJobTokensMedian, 55000);
   assert.equal(u.icJobTokensP90, 70000);
   assert.equal(u.icFreshTokensMedian, 120000);
-  assert.equal(u.controlPlaneFreshReductionVsBaseline, 0.85);
-  assert.equal(u.budgets.controlPlaneFreshReduction.pass, true);
-  assert.equal(u.budgets.projectLeadFreshPerMergedPr.pass, true);
+  assert.deepEqual(u.budgets.controlPlaneFreshPerCompletedUnit, { baseline: 200000, actual: 30000, change: -0.85, pass: true });
+  assert.deepEqual(u.budgets.projectLeadFreshPerMergedPr, { baseline: 25000, actual: 20000, change: -0.2, pass: true });
   assert.equal(u.budgets.icJobTokensMedian.pass, null, '#128: the IC median is reported, not judged');
   assert.equal(u.budgets.icJobTokensMedian.reference, 60000);
   assert.deepEqual(report.sample.excludedByReason, { abandoned: 2, 'no-pr': 1 });
@@ -398,9 +397,9 @@ test('buildReport computes per-unit ratios, the IC median, and budget verdicts',
   assert.equal(empty.unitMetrics.controlPlaneFreshPerCompletedUnit, null, 'no units: no ratio, no verdict');
   assert.equal(empty.unitMetrics.budgets.icJobTokensMedian.pass, null);
   const text = renderSummary(report);
-  assert.match(text, /^IC job tokens median: 55000 \(p90 70000; reference 60000 \(doubled units, re-baseline #139\), not a verdict\)$/m);
-  assert.match(text, /project-lead fresh per merged PR: 20000 over 3 merged PR\(s\) \(limit 25000; per completed unit 20000\) PASS/);
-  assert.match(text, /reduction vs baseline 85%, target 70%/);
+  assert.match(text, /^IC job tokens median: 55000 \(p90 70000; reference 60000, not a verdict\)$/m);
+  assert.match(text, /^project-lead fresh per merged PR: 20000 over 3 merged PR\(s\) \(baseline 25000, change -20%; per completed unit 20000\) PASS$/m);
+  assert.match(text, /^control-plane fresh per completed unit: 30000 \(baseline 200000, change -85%\) PASS$/m);
   // Merged PRs are counted from merge events, and the median is a true median on an even count.
   const withPrs = [
     { ...unitOf(4, 10, 10), mergeEvents: [{ number: 900, mergedAt: 'x' }, { number: 901, mergedAt: 'x' }] },
@@ -770,7 +769,7 @@ test('#128: with every per-model target null, the median and p90 print per famil
   assert.deepEqual(byModel.haiku, { units: 2, jobTokensMedian: 30000, jobTokensP90: 40000, target: null, pass: null });
   assert.equal(report.unitMetrics.budgets.icJobTokensMedian.pass, null);
   const text = renderSummary(report);
-  assert.match(text, /^IC job tokens median: 100000 \(p90 300000; reference 60000 \(doubled units, re-baseline #139\), not a verdict\)$/m);
+  assert.match(text, /^IC job tokens median: 100000 \(p90 300000; reference 60000, not a verdict\)$/m);
   assert.match(text, /^- sonnet: median 140000, p90 300000 over 3 unit\(s\) \(no target\)$/m);
   assert.match(text, /^- haiku: median 30000, p90 40000 over 2 unit\(s\) \(no target\)$/m);
   const icLines = text.split('\n').filter((l) => /^IC job tokens median|^- (sonnet|haiku):/.test(l));
@@ -800,7 +799,7 @@ test('#128: the legacy icJobTokensMedian key is read as the reference, never a v
 test('#128: the seven-day JSON carries the per-family figures, and the shipped config has null targets', () => {
   const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
   assert.deepEqual(shipped.budgets.icJobTokensTargets, nullTargets);
-  assert.equal(shipped.budgets.icJobTokensMedianReference, 60000);
+  assert.equal(shipped.budgets.icJobTokensMedianReference, 59256);
   assert.equal(shipped.budgets.icJobTokensMedian, undefined, 'the judged key is gone');
   const root = makeTempDir('fleet-cycle-');
   const transcripts = path.join(root, 'transcripts');
@@ -810,6 +809,10 @@ test('#128: the seven-day JSON carries the per-family figures, and the shipped c
   const result = collectFromFiles({ transcriptsDir: transcripts, rosterPath: path.join(root, 'roster.json'), outputDir: path.join(root, 'out'), since: '2026-09-01T00:00:00.000Z', until: '2026-09-02T00:00:00.000Z', generatedAt: '2026-09-01T12:00:00.000Z', verifyGithub: false, configPath: path.join(__dirname, '..', 'config', 'cycle.json') });
   const json = JSON.parse(fs.readFileSync(result.summaryJsonArtifact, 'utf8'));
   assert.deepEqual(json.unitMetrics.icByModel.sonnet, { units: 1, jobTokensMedian: 68, jobTokensP90: 68, target: null, pass: null });
+  // spec #382 ruling 7: the shipped baselines give a verdict, not a void.
+  assert.equal(json.unitMetrics.budgets.controlPlaneFreshPerCompletedUnit.baseline, 468687);
+  assert.equal(json.unitMetrics.budgets.controlPlaneFreshPerCompletedUnit.pass, true);
+  assert.doesNotMatch(fs.readFileSync(result.summaryArtifact, 'utf8'), /void/);
 });
 
 test('#125 review: a unit whose earlier session retired before the window still sums every session', () => {
@@ -899,26 +902,32 @@ test('#201: rows with no response id are counted as before and flagged in the ou
   assert.match(renderSummary(report), /usage rows with no response id \(counted as rows\): 2/);
 });
 
-test('#201: a void control-plane baseline reports no verdict, PASS or FAIL, against it', () => {
-  const unitOf = (issue) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: 100000, jobTokens: 40000, cacheReadInputTokens: 0 } });
-  const sessions = [{ sessionId: 'd', name: 'sentinel', role: 'sentinel', metrics: { freshTokens: 900000, cacheReadInputTokens: 5 } }];
-  const budgets = { baselineControlPlaneFreshPerCompletedUnit: 200000, controlPlaneFreshReduction: 0.7 };
-  const live = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets });
-  assert.equal(live.unitMetrics.budgets.controlPlaneFreshReduction.pass, false, 'control: without the void flag the same data fails');
-  const report = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets: { ...budgets, baselineControlPlaneVoid: true } });
-  const verdict = report.unitMetrics.budgets.controlPlaneFreshReduction;
-  assert.equal(verdict.void, true);
-  assert.equal(verdict.pass, null);
-  assert.equal(report.unitMetrics.controlPlaneFreshReductionVsBaseline, null);
-  const line = renderSummary(report).split('\n').find((l) => l.startsWith('control-plane fresh per completed unit'));
-  assert.match(line, /baseline void/);
-  assert.doesNotMatch(line, /PASS|FAIL/);
+// --- spec #382 ruling 7: a week passes at or below its recorded baseline, and shows its change
+const verdictUnit = (issue) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: 100000, jobTokens: 40000, cacheReadInputTokens: 0 } });
+const controlPlaneAt = (fresh) => [{ sessionId: 'd', name: 'sentinel', role: 'sentinel', metrics: { freshTokens: fresh, cacheReadInputTokens: 5 } }];
+
+test('#382: the control-plane verdict passes at or below its baseline and fails above it, with the change shown and no void', () => {
+  const budgets = { baselineControlPlaneFreshPerCompletedUnit: 468687 };
+  const at = buildReport([verdictUnit(1)], [], { sessionMetrics: controlPlaneAt(468687), budgets });
+  assert.deepEqual(at.unitMetrics.budgets.controlPlaneFreshPerCompletedUnit, { baseline: 468687, actual: 468687, change: 0, pass: true }, 'exactly at the baseline passes');
+  const below = buildReport([verdictUnit(1)], [], { sessionMetrics: controlPlaneAt(400000), budgets });
+  assert.deepEqual(below.unitMetrics.budgets.controlPlaneFreshPerCompletedUnit, { baseline: 468687, actual: 400000, change: -0.147, pass: true });
+  const above = buildReport([verdictUnit(1)], [], { sessionMetrics: controlPlaneAt(500000), budgets });
+  assert.equal(above.unitMetrics.budgets.controlPlaneFreshPerCompletedUnit.pass, false);
+  assert.equal(above.unitMetrics.budgets.controlPlaneFreshPerCompletedUnit.change, 0.067);
+  const text = renderSummary(above);
+  assert.equal(text.split('\n').find((l) => l.startsWith('control-plane fresh per completed unit')), 'control-plane fresh per completed unit: 500000 (baseline 468687, change +6.7%) FAIL');
+  assert.doesNotMatch(text, /void/i, 'no void text anywhere in the report');
 });
 
-test('#201: the shipped config voids the control-plane baseline and dates the meter change', () => {
+test('#382 ruling 7: the shipped config records the 2026-10-30 to 2026-11-06 baselines with no void, and keeps the meter-change date', () => {
   const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
-  assert.equal(shipped.budgets.baselineControlPlaneVoid, true);
   assert.equal(shipped.meterChange.date, '2026-09-30');
+  assert.deepEqual(shipped.budgets.baselineWindow, { since: '2026-10-30T12:45:00Z', until: '2026-11-06T12:45:00Z' });
+  assert.equal(shipped.budgets.baselineControlPlaneFreshPerCompletedUnit, 468687);
+  assert.equal(shipped.budgets.baselineProjectLeadFreshPerMergedPr, 238504);
+  assert.equal(shipped.budgets.icJobTokensMedianReference, 59256);
+  for (const key of ['baselineControlPlaneVoid', 'projectLeadFreshPerMergedPrVoid', 'controlPlaneFreshReduction', 'projectLeadFreshPerMergedPr']) assert.equal(shipped.budgets[key], undefined, `${key} is retired`);
 });
 
 // --- #201 QA follow-up ------------------------------------------------------------------
@@ -942,29 +951,27 @@ test('#201: a response id repeated across a session file and its subagent files 
   assert.equal(metrics.usageResponses, 2);
 });
 
-test('#201: a void projectLeadFreshPerMergedPr limit reports no verdict, PASS or FAIL, against it', () => {
-  const unitOf = (issue) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: 100000, jobTokens: 40000, cacheReadInputTokens: 0 } });
-  const sessions = [{ sessionId: 'pl', name: 'pl-endzone', role: 'project-lead', metrics: { freshTokens: 90000, cacheReadInputTokens: 5 } }];
-  const budgets = { projectLeadFreshPerMergedPr: 25000 };
-  const control = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets });
-  assert.equal(control.unitMetrics.budgets.projectLeadFreshPerMergedPr.pass, false, 'control: without the void flag the same data fails');
-  const report = buildReport([unitOf(1)], [], { sessionMetrics: sessions, budgets: { ...budgets, projectLeadFreshPerMergedPrVoid: true } });
-  const verdict = report.unitMetrics.budgets.projectLeadFreshPerMergedPr;
-  assert.equal(verdict.void, true);
-  assert.equal(verdict.pass, null);
-  assert.equal(verdict.actual, 90000, 'the figure is still reported');
-  const line = renderSummary(report).split('\n').find((l) => l.startsWith('project-lead fresh per merged PR'));
-  assert.match(line, /limit void/);
-  assert.doesNotMatch(line, /PASS|FAIL/);
+test('#382: the project-lead verdict passes at its baseline and fails above it, with the change shown', () => {
+  const budgets = { baselineProjectLeadFreshPerMergedPr: 238504 };
+  const sessionsAt = (fresh) => [{ sessionId: 'pl', name: 'pl-endzone', role: 'project-lead', metrics: { freshTokens: fresh, cacheReadInputTokens: 5 } }];
+  const at = buildReport([verdictUnit(1)], [], { sessionMetrics: sessionsAt(238504), budgets });
+  assert.equal(at.unitMetrics.budgets.projectLeadFreshPerMergedPr.pass, true, 'exactly at the baseline passes');
+  assert.equal(at.unitMetrics.budgets.projectLeadFreshPerMergedPr.change, 0);
+  const above = buildReport([verdictUnit(1)], [], { sessionMetrics: sessionsAt(300000), budgets });
+  assert.equal(above.unitMetrics.budgets.projectLeadFreshPerMergedPr.pass, false);
+  assert.equal(above.unitMetrics.budgets.projectLeadFreshPerMergedPr.actual, 300000);
+  const line = renderSummary(above).split('\n').find((l) => l.startsWith('project-lead fresh per merged PR'));
+  assert.equal(line, 'project-lead fresh per merged PR: 300000 over 1 merged PR(s) (baseline 238504, change +25.8%; per completed unit 300000) FAIL');
 });
 
-test('#201: the printed IC job-token reference is labelled as doubled units', () => {
+test('#382: the seven-day report names the baseline week it compares against', () => {
+  const budgets = { baselineWindow: { since: '2026-10-30T12:45:00Z', until: '2026-11-06T12:45:00Z' } };
+  const text = renderSummary(buildReport([verdictUnit(1)], [], { budgets }));
+  assert.match(text, /^baseline week: 2026-10-30T12:45:00Z to 2026-11-06T12:45:00Z$/m);
+});
+
+test('#382: the printed IC job-token reference is a reference line, not a verdict', () => {
   const unitOf = (issue) => ({ tenant: 'endzone', issue, session: `ic-${issue}`, role: 'ic', merged: true, completedAt: '2026-09-09T00:00:00.000Z', metrics: { freshTokens: 100, jobTokens: 40000, cacheReadInputTokens: 0 } });
   const text = renderSummary(buildReport([unitOf(1)], [], { budgets: { icJobTokensMedianReference: 60000 } }));
-  assert.match(text, /^IC job tokens median: 40000 \(p90 40000; reference 60000 \(doubled units, re-baseline #139\), not a verdict\)$/m);
-});
-
-test('#201: the shipped config voids the project-lead per-PR limit until the re-baseline', () => {
-  const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'cycle.json'), 'utf8'));
-  assert.equal(shipped.budgets.projectLeadFreshPerMergedPrVoid, true);
+  assert.match(text, /^IC job tokens median: 40000 \(p90 40000; reference 60000, not a verdict\)$/m);
 });

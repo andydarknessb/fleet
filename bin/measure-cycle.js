@@ -649,20 +649,19 @@ function unitMetrics(units, roles, budgets) {
     const median = percentile(values, 0.5);
     return [key, { units: values.length, jobTokensMedian: median, jobTokensP90: percentile(values, 0.9), target, pass: target === null || median === null ? null : median < target }];
   }));
-  const perPrVoid = b.projectLeadFreshPerMergedPrVoid === true;
-  const verdict = (value, limit, kind) => (value === null || limit === undefined || limit === null ? null : (kind === 'max' ? value <= limit : value < limit));
-  const baseline = Number(b.baselineControlPlaneFreshPerCompletedUnit);
-  const reductionTarget = Number(b.controlPlaneFreshReduction);
-  // #201: the baseline was measured on the double-counted meter (and, before WS5 of the 09-17
-  // audit, undercounted control-plane sessions), so it is void: no reduction, no verdict.
-  const baselineVoid = b.baselineControlPlaneVoid === true;
-  const reduction = !baselineVoid && Number.isFinite(baseline) && baseline > 0 && metrics.controlPlaneFreshPerCompletedUnit !== null ? 1 - metrics.controlPlaneFreshPerCompletedUnit / baseline : null;
-  metrics.controlPlaneFreshReductionVsBaseline = reduction === null ? null : Math.round(reduction * 1000) / 1000;
+  // Spec #382 ruling 7: a week passes at or below its recorded baseline (the week 2026-10-30 to
+  // 2026-11-06, on the corrected meter) and shows its change against it. The old 70% reduction
+  // target was set on double-counted units, so it is retired rather than applied to the baseline.
+  const judge = (actual, baseline) => {
+    const value = Number(baseline) > 0 ? Number(baseline) : null;
+    const change = actual === null || value === null ? null : Math.round((actual / value - 1) * 1000) / 1000;
+    return { baseline: value, actual, change, pass: change === null ? null : actual <= value };
+  };
   metrics.budgets = {
-    controlPlaneFreshReduction: { target: Number.isFinite(reductionTarget) ? reductionTarget : null, actual: metrics.controlPlaneFreshReductionVsBaseline, void: baselineVoid, pass: reduction === null || !Number.isFinite(reductionTarget) ? null : reduction >= reductionTarget },
-    // #201: the limit was set on the doubled meter, so it is void until the #139 re-baseline.
-    projectLeadFreshPerMergedPr: { limit: b.projectLeadFreshPerMergedPr ?? null, actual: metrics.projectLeadFreshPerMergedPr, void: perPrVoid, pass: perPrVoid ? null : verdict(metrics.projectLeadFreshPerMergedPr, b.projectLeadFreshPerMergedPr, 'lt') },
+    controlPlaneFreshPerCompletedUnit: judge(metrics.controlPlaneFreshPerCompletedUnit, b.baselineControlPlaneFreshPerCompletedUnit),
+    projectLeadFreshPerMergedPr: judge(metrics.projectLeadFreshPerMergedPr, b.baselineProjectLeadFreshPerMergedPr),
     icJobTokensMedian: { reference, actual: metrics.icJobTokensMedian, pass: null, judged: false },
+    baselineWindow: b.baselineWindow ?? null,
   };
   return metrics;
 }
@@ -829,13 +828,14 @@ function renderSummary(report) {
   const u = report.unitMetrics || {};
   const b = u.budgets || {};
   const show = (v) => (v === null || v === undefined ? 'n/a' : v);
-  const pct = (v) => (v === null || v === undefined ? 'n/a' : `${Math.floor(v * 1000) / 10}%`);
+  const change = (v) => (v === null || v === undefined ? 'n/a' : `${v > 0 ? '+' : ''}${Math.round(v * 1000) / 10}%`);
   const mark = (p) => (p === null || p === undefined ? '' : (p ? ' PASS' : ' FAIL'));
-  lines.push(b.controlPlaneFreshReduction?.void
-    ? `control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (baseline void: it was measured on double-counted tokens, so no reduction is judged until the 10-19 re-baseline, fleet #139)`
-    : `control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (reduction vs baseline ${pct(u.controlPlaneFreshReductionVsBaseline)}, target ${pct(b.controlPlaneFreshReduction?.target)})${mark(b.controlPlaneFreshReduction?.pass)}`);
-  lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (${b.projectLeadFreshPerMergedPr?.void ? 'limit void: set on doubled units, no verdict until the 10-19 re-baseline, fleet #139' : `limit ${show(b.projectLeadFreshPerMergedPr?.limit)}`}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(b.projectLeadFreshPerMergedPr?.pass)}`);
-  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; reference ${show(u.budgets?.icJobTokensMedian?.reference)} (doubled units, re-baseline #139), not a verdict)`);
+  if (b.baselineWindow) lines.push(`baseline week: ${b.baselineWindow.since} to ${b.baselineWindow.until}`);
+  const cp = b.controlPlaneFreshPerCompletedUnit || {};
+  lines.push(`control-plane fresh per completed unit: ${show(u.controlPlaneFreshPerCompletedUnit)} (baseline ${show(cp.baseline)}, change ${change(cp.change)})${mark(cp.pass)}`);
+  const pl = b.projectLeadFreshPerMergedPr || {};
+  lines.push(`project-lead fresh per merged PR: ${show(u.projectLeadFreshPerMergedPr)} over ${show(u.mergedPullRequests)} merged PR(s) (baseline ${show(pl.baseline)}, change ${change(pl.change)}; per completed unit ${show(u.projectLeadFreshPerCompletedUnit)})${mark(pl.pass)}`);
+  lines.push(`IC job tokens median: ${show(u.icJobTokensMedian)} (p90 ${show(u.icJobTokensP90)}; reference ${show(b.icJobTokensMedian?.reference)}, not a verdict)`);
   const icFamilies = Object.entries(u.icByModel || {});
   if (icFamilies.length) {
     lines.push('IC job tokens by model (judged only where a target is set):');

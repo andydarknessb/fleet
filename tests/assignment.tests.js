@@ -1262,6 +1262,82 @@ test('#209 m7: plannerInputs throws on a missing tenant instead of answering "no
   assert.deepEqual(plannerInputs({ root: plannerRoot([]), tenant: 'endzone', tenantConfig: {} }).boundedReadies, []);
 });
 
+// #389 (spec #382, ruling 6, ADR 0018): the weekly Usage limit holds a Tenant's new launches. The reading is a
+// fixture in the test root's state/usage, shaped as bin/usage-limit.js stores it (latest.json); the order and
+// thresholds are the ruling's, in the test root's config/cycle.json.
+const USAGE_LIMIT = { tenantOrder: ['statelite', 'endzone', 'nidus'], lowerTenantsAt: 0.85, allTenantsAt: 0.9 };
+const USAGE_NOW = '2026-11-06T12:00:00.000Z';
+const WEEK_OPEN = Date.parse(USAGE_NOW) / 1000 + 3 * 86400; // three days after USAGE_NOW: still open, inside the 8-day horizon
+function usageLatest(weeklyUtilization, weeklyResetsAt = WEEK_OPEN) {
+  return JSON.stringify({ fiveHour: { utilization: 0.05, resetsAt: 1793995200 }, weekly: { utilization: weeklyUtilization, resetsAt: weeklyResetsAt }, status: 'allowed', at: USAGE_NOW });
+}
+// `latest` is the file's text, or undefined for no reading at all.
+function usageRoot(latest) {
+  const root = makeTempDir('fleet-389-');
+  for (const dir of ['config', 'tenants', path.join('state', 'usage')]) fs.mkdirSync(path.join(root, dir), { recursive: true });
+  fs.writeFileSync(path.join(root, 'config', 'cycle.json'), JSON.stringify({ usageLimit: USAGE_LIMIT }));
+  for (const name of ['statelite', 'endzone', 'nidus']) {
+    fs.writeFileSync(path.join(root, 'tenants', `${name}.json`), JSON.stringify({ name, github: 'example/repo', readyLabel: 'ready-for-agent', fleetIdentity: 'fleet-bot', ownerLogin: OWNER, defaultBranch: 'integration' }));
+  }
+  if (latest !== undefined) fs.writeFileSync(path.join(root, 'state', 'usage', 'latest.json'), latest);
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(60), issue(61)]));
+  return { root, fixture };
+}
+function usageFrontier({ root, fixture }, tenant) {
+  return cli(['frontier', '--root', root, '--tenant', tenant, '--fixture', fixture, '--now', USAGE_NOW]);
+}
+const eligibleNumbers = (frontier) => frontier.eligible.map((entry) => entry.number);
+
+test('#389: below 85% weekly no Tenant is held: every ready ticket stays on its frontier', () => {
+  const root = usageRoot(usageLatest(0.84));
+  for (const tenant of ['statelite', 'endzone', 'nidus']) assert.deepEqual(eligibleNumbers(usageFrontier(root, tenant)), [60, 61], tenant);
+});
+
+test('#389: at 85% weekly only the first Tenant keeps its frontier; the others are empty, each ticket with the reason', () => {
+  const root = usageRoot(usageLatest(0.85));
+  assert.deepEqual(eligibleNumbers(usageFrontier(root, 'statelite')), [60, 61]);
+  for (const tenant of ['endzone', 'nidus']) {
+    const frontier = usageFrontier(root, tenant);
+    assert.deepEqual(frontier.eligible, [], tenant);
+    assert.deepEqual(frontier.excluded.map((entry) => entry.issue), [60, 61], tenant);
+    for (const entry of frontier.excluded) {
+      const reason = entry.reasons.find((item) => item.code === 'usage-throttle');
+      assert.match(reason.detail, /weekly utilization 0\.85 is at or above the 85% threshold for every Tenant but statelite/, tenant);
+    }
+  }
+});
+
+test('#389: at 90% weekly every Tenant is held, the first included', () => {
+  const root = usageRoot(usageLatest(0.9));
+  for (const tenant of ['statelite', 'endzone', 'nidus']) {
+    const frontier = usageFrontier(root, tenant);
+    assert.deepEqual(frontier.eligible, [], tenant);
+    assert.match(frontier.excluded[0].reasons.find((item) => item.code === 'usage-throttle').detail, /90% threshold for every Tenant;/, tenant);
+  }
+});
+
+test('#389: a reading whose weekly window has reset is stale and holds nothing', () => {
+  const root = usageRoot(usageLatest(0.95, 1793000000));
+  assert.deepEqual(eligibleNumbers(usageFrontier(root, 'nidus')), [60, 61]);
+});
+
+test('#389: no reading, and an unreadable one, hold nothing', () => {
+  const missing = usageRoot(undefined);
+  assert.deepEqual(eligibleNumbers(usageFrontier(missing, 'nidus')), [60, 61], 'no reading');
+  const torn = usageRoot('{"weekly":');
+  assert.deepEqual(eligibleNumbers(usageFrontier(torn, 'nidus')), [60, 61], 'a torn reading');
+});
+
+test('#389: the assign door refuses a held Tenant with the same reason and writes no record', () => {
+  const root = usageRoot(usageLatest(0.9));
+  assert.throws(
+    () => cli(['assign', '--root', root.root, '--tenant', 'endzone', '--fixture', root.fixture, '--issue', '60', '--base-sha', 'a'.repeat(40), '--now', USAGE_NOW]),
+    (error) => error.code === 'NO_FRONTIER' && error.excluded[0].reasons[0].code === 'usage-throttle',
+  );
+  assert.equal(fs.existsSync(path.join(root.root, 'state', 'work')), false, 'nothing was reserved');
+});
+
 // fleet#251: a late session acknowledging a manifest launch.ps1 already invalidated used to
 // get NOT_FOUND (the record left active state with the release) and read it as a glitch.
 test('#251: acknowledging an invalidated manifest says so instead of NOT_FOUND', () => {

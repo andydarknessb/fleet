@@ -53,6 +53,19 @@ try {
   Assert-True ($out3 -notmatch 'dispatcher') "status.ps1 must not list the retired dispatcher as a missing session: $out3"
   Assert-True ($out3 -match 'live fleet sessions: 0 / cap 6') "status.ps1 must still report the fleet: $out3"
 
+  # Case 4 (spec #382 ruling 7): the budget line names Haiku's own warn and escalate lines beside
+  # the default ones, so the status never shows only a line no IC runs on.
+  Write-Utf8 "$testRoot\state\budget\last.json" '{"at":"2026-11-06T12:00:00.000Z","mode":"shadow","config":{"warnTokens":25000,"escalateTokens":175000,"byModel":{"haiku":{"warnTokens":120000,"escalateTokens":350000}}},"records":[]}'
+  $out4 = Run-Status
+  Assert-True ($lastExit -eq 0) "status.ps1 must run clean with a budget run recorded: $out4"
+  Assert-True ($out4 -match 'budget: shadow \(warn 25000 / escalate 175000 job tokens; haiku warn 120000 / escalate 350000;') "status.ps1 must name the Haiku budget line: $out4"
+
+  # Case 5: a budget run written before the per-model lines (no config.byModel) prints the default line alone.
+  Write-Utf8 "$testRoot\state\budget\last.json" '{"at":"2026-11-06T12:00:00.000Z","mode":"live","config":{"warnTokens":50000,"escalateTokens":null},"records":[]}'
+  $out5 = Run-Status
+  Assert-True ($lastExit -eq 0) "status.ps1 must run clean with a budget run that has no per-model lines: $out5"
+  Assert-True ($out5 -match 'budget: live \(warn 50000 / escalate OFF \(warning-only soak\) job tokens; flag ') "status.ps1 must print the default line alone when no model has its own: $out5"
+
   Write-Output 'status tests passed'
 } finally {
   $env:PATH = $oldPath

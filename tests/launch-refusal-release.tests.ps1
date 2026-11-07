@@ -19,12 +19,11 @@ function Run-Launch {
   # A wrapper runs launch.ps1 and prints each error record's bare message, so neither PS 5.1's
   # ErrorRecord decoration ("At <path>:..." lines, CategoryInfo) nor its console-width wrapping of
   # those lines can split or hide the text under test. Stdout lines (the JSON refusals) pass through.
+  # The arguments go to launch.ps1 unchanged, so a case can pass -Force or -Recover as well.
   $wrapper = Join-Path $testRoot 'run-launch.ps1'
   $wrapperLines = @(
-    'param([string]$Manifest, [string]$WorkRecordId, [switch]$DryRun)',
     '$ErrorActionPreference = "Continue"',
-    '$splat = @{ Manifest = $Manifest; WorkRecordId = $WorkRecordId }; if ($DryRun) { $splat.DryRun = $true }',
-    ('& "' + $testRoot + '\bin\launch.ps1" @splat 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { "ERR: " + $_.Exception.Message } else { "$_" } }'),
+    ('& "' + $testRoot + '\bin\launch.ps1" @args 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { "ERR: " + $_.Exception.Message } else { "$_" } }'),
     'exit $LASTEXITCODE'
   )
   Write-Utf8 $wrapper ($wrapperLines -join "`r`n")
@@ -46,11 +45,11 @@ function Invoke-Git {
   return $o.Trim()
 }
 function Reserve-Manifest {
-  param([int]$Issue, [string]$Sha)
+  param([int]$Issue, [string]$Sha, [string]$Tenant = 'test')
   $fixture = "$testRoot\issues-$Issue.json"
   Write-Utf8 $fixture ('[{"number":' + $Issue + ',"title":"Refusal fixture","url":"https://github.com/owner/repo/issues/' + $Issue + '","body":' + ("Change ``src/fixture-$Issue.js``." | ConvertTo-Json) + ',"createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]')
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $out = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant test --tenant-config "$testRoot\tenants\test.json" --fixture $fixture --base-sha $Sha --parent pl-test --model haiku 2>&1 | Out-String; $code = $LASTEXITCODE }
+  try { $out = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant $Tenant --tenant-config "$testRoot\tenants\$Tenant.json" --fixture $fixture --base-sha $Sha --parent pl-test --model haiku 2>&1 | Out-String; $code = $LASTEXITCODE }
   finally { $ErrorActionPreference = $eap }
   $r = $null; try { $r = ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch {}
   if ($code -ne 0 -or -not $r -or -not $r.manifestPath) { throw "assign for issue $Issue failed: $out" }
@@ -70,7 +69,7 @@ try {
   foreach ($dir in 'bin','hooks','agents','tenants','config','state','state/sessions','state/notices','state/work','state/events','state/flags','state/manifests','mock-bin','profile','profile/.claude/jobs','repo') {
     [IO.Directory]::CreateDirectory((Join-Path $testRoot $dir)) | Out-Null
   }
-  foreach ($f in '_common.ps1','launch.ps1','identity.js','work-state.js','assignment.js','premises.js','assignment-parity.js','exclusions.js','notify.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
+  foreach ($f in '_common.ps1','launch.ps1','identity.js','work-state.js','assignment.js','premises.js','assignment-parity.js','exclusions.js','notify.js','usage-limit.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f") }
   [IO.File]::Copy("$sourceRoot\hooks\session-start.ps1", "$testRoot\hooks\session-start.ps1")
   [IO.File]::Copy("$sourceRoot\config\cycle.json", "$testRoot\config\cycle.json")
   Write-Utf8 "$testRoot\agents\ic.md" "---`nname: ic`nmodel: claude-haiku-5-5`neffort: xhigh`n---`nRole body for ic."
@@ -320,6 +319,80 @@ try {
   Assert-True ($lastExit -eq 3 -and $r35 -and $r35.launched -eq $false -and "$($r35.reason)" -match "'deepseek' is refused" -and $r35.reservationReleased -eq $true) "a deepseek manifest is refused at the door with its reservation released: exit $lastExit $lastOut"
   Assert-True ((Get-RecordState 35) -ne 'assigned' -and (Get-Marker $m35) -and "$((Get-Marker $m35).reason)" -match "'deepseek' is refused") 'the deepseek refusal leaves no assigned record and writes the invalidation marker with its reason'
   Assert-True ((Get-BgCalls) -eq 0) 'a deepseek manifest never reaches claude --bg'
+
+  # Fleet ruling 6 (ADR 0018, #389): past the weekly Usage limit a new IC launch is held at the door, before
+  # claude --bg, and its reservation is released like the other refusals. The manifests are reserved before any
+  # reading exists (the planner would hold them once one does); the readings are written afterwards.
+  # The default weekly reset is three days out on the real clock: the launch door reads the clock itself, and the throttle
+  # holds only inside its 8-day horizon.
+  function Write-UsageReading {
+    param([double]$Weekly, [long]$ResetsAt = ([DateTimeOffset]::UtcNow.AddDays(3).ToUnixTimeSeconds()))
+    [IO.Directory]::CreateDirectory("$testRoot\state\usage") | Out-Null
+    Write-Utf8 "$testRoot\state\usage\latest.json" (@{ fiveHour = @{ utilization = 0.05; resetsAt = 1793995200 }; weekly = @{ utilization = $Weekly; resetsAt = $ResetsAt }; status = 'allowed'; at = '2026-11-06T12:00:00.000Z' } | ConvertTo-Json -Depth 4)
+  }
+  Clear-ActiveRecords
+  $m36 = Reserve-Manifest 36 $baseSha
+  $m37 = Reserve-Manifest 37 $baseSha
+  Write-UsageReading -Weekly 0.91
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $r36 = Run-Launch @('-Manifest', $m36, '-WorkRecordId', 'test:issue-36')
+  Assert-True ($lastExit -eq 3 -and $r36 -and $r36.launched -eq $false -and "$($r36.reason)" -match '90% threshold' -and $r36.reservationReleased -eq $true) "a weekly reading at 91% holds the IC at the door and releases its reservation: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 36) -ne 'assigned' -and (Get-Marker $m36) -and "$((Get-Marker $m36).reason)" -match '90% threshold') 'the usage hold leaves no assigned record and writes the invalidation marker with its reason'
+  Assert-True ((Get-BgCalls) -eq 0) 'a held IC never reaches claude --bg'
+  # A dry run is held the same way and releases nothing. At 87% the hold is the 85% line, which this Tenant (not first in the order) is past.
+  Write-UsageReading -Weekly 0.87
+  $r37 = Run-Launch @('-Manifest', $m37, '-WorkRecordId', 'test:issue-37', '-DryRun')
+  Assert-True ($lastExit -eq 3 -and $r37 -and $r37.launched -eq $false -and "$($r37.reason)" -match '85% threshold') "a dry run is held at 87% by the 85% line: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 37) -eq 'assigned' -and -not (Get-Marker $m37)) 'a held dry run releases nothing'
+  # A stale reading (its weekly window has reset) holds nothing: the launch reaches claude --bg, as Case 11 does without a reading.
+  Clear-ActiveRecords
+  Write-UsageReading -Weekly 0.95 -ResetsAt 946684800
+  $m38 = Reserve-Manifest 38 $baseSha
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $m38, '-WorkRecordId', 'test:issue-38'))
+  Assert-True ((Get-BgCalls) -eq 1) "a stale reading never holds a launch: $lastOut"
+  # -Force bypasses the cap, maxIcs, PAUSE and the ceiling, never the usage hold: a held manifest still exits 3.
+  # Each case below reserves before it writes its reading, so the reservation never meets a reading that holds it.
+  Clear-ActiveRecords
+  Remove-Item -Recurse -Force "$testRoot\state\usage" -ErrorAction SilentlyContinue
+  $m39 = Reserve-Manifest 39 $baseSha
+  Write-UsageReading -Weekly 0.95
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  # PAUSE stops a launch without -Force, so the usage reason below shows that -Force reached the usage check.
+  Write-Utf8 "$testRoot\state\PAUSE" 'test pause'
+  $r39 = Run-Launch @('-Manifest', $m39, '-WorkRecordId', 'test:issue-39', '-Force')
+  Remove-Item "$testRoot\state\PAUSE" -ErrorAction SilentlyContinue
+  Assert-True ($lastExit -eq 3 -and $r39 -and $r39.launched -eq $false -and "$($r39.reason)" -match '90% threshold' -and $r39.reservationReleased -eq $true) "a held manifest launch with -Force still exits 3 and releases its reservation: exit $lastExit $lastOut"
+  Assert-True ((Get-BgCalls) -eq 0) 'a held manifest launch with -Force never reaches claude --bg'
+  # statelite is first in the order, so the 85% line does not hold it: at 87% its launch reaches claude --bg.
+  Write-Utf8 "$testRoot\tenants\statelite.json" ('{"name":"statelite","github":"owner/repo","readyLabel":"ready-for-agent","defaultBranch":"integration","branchPrefix":"fleet/","maxIcs":2,"repo":' + ($repoPath | ConvertTo-Json) + '}')
+  Clear-ActiveRecords
+  Remove-Item -Recurse -Force "$testRoot\state\usage" -ErrorAction SilentlyContinue
+  $m40 = Reserve-Manifest 40 $baseSha 'statelite'
+  Write-UsageReading -Weekly 0.87
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $m40, '-WorkRecordId', 'statelite:issue-40'))
+  Assert-True ((Get-BgCalls) -eq 1) "the first Tenant in the order (statelite) is not held at 87%: exit $lastExit $lastOut"
+  # Fail open: with usage-limit.js missing the helper cannot answer, so a 95% reading holds nothing. The planner loads
+  # that file too, so the manifest is reserved before the file is removed, and the file is restored after the launch.
+  Clear-ActiveRecords
+  Remove-Item -Recurse -Force "$testRoot\state\usage" -ErrorAction SilentlyContinue
+  $m41 = Reserve-Manifest 41 $baseSha
+  Write-UsageReading -Weekly 0.95
+  $usageJs = "$testRoot\bin\usage-limit.js"
+  Remove-Item $usageJs
+  try {
+    Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+    [void](Run-Launch @('-Manifest', $m41, '-WorkRecordId', 'test:issue-41'))
+  } finally { [IO.File]::Copy("$sourceRoot\bin\usage-limit.js", $usageJs, $true) }
+  Assert-True ((Get-BgCalls) -eq 1) "with usage-limit.js missing, a 95% reading holds nothing (fail open): exit $lastExit $lastOut"
+  # A -Recover relaunch has no manifest, so the hold never reaches it: the live roster row for ic-42 is its credential.
+  Write-Utf8 "$testRoot\state\roster.json" (@{ sessions = @(@{ name = 'ic-42'; role = 'ic'; status = 'active'; tenant = 'test'; parent = 'pl-test'; manifest = "$testRoot\state\manifests\ic-42.json" }) } | ConvertTo-Json -Depth 5)
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Recover', '-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'recover-ic-42'))
+  Assert-True ((Get-BgCalls) -eq 1 -and $lastOut -notmatch 'threshold') "a -Recover relaunch at 95% is not held and reaches claude --bg: exit $lastExit $lastOut"
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item -Recurse -Force "$testRoot\state\usage" -ErrorAction SilentlyContinue
 
   Write-Output 'launch refusal release tests passed'
 } finally {

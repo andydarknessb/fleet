@@ -524,7 +524,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   # ===== Ticket 09 ruling 2: the frontier wake =====
   # A mock rotate.ps1 records every -Wake call and answers like the real one; the planner
   # runs for real against a fixture issue file (FLEET_GITHUB_ISSUES_FIXTURE).
-  foreach ($f in 'assignment.js','premises.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
+  foreach ($f in 'assignment.js','usage-limit.js','premises.js','work-state.js','exclusions.js','notify.js','assignment-parity.js','triage.js') { [IO.File]::Copy("$sourceRoot\bin\$f", "$testRoot\bin\$f", $true) }
   [IO.Directory]::CreateDirectory("$testRoot\state\work") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\state\watch") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
@@ -2409,6 +2409,32 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $callsBefore = @(Get-Content "$testRoot\cli-calls.log").Count
   $clVerify = Run-Watchdog -Verify
   Assert-True ($null -eq $clVerify.cli -and @(Get-Content "$testRoot\cli-calls.log").Count -eq $callsBefore) '-Verify spawns nothing'
+  # fleet #388 (spec #382 ruling 6): the usage step runs on this same config/cli.json fixture. bin/usage-probe.ps1 is not copied
+  # into this fixture, so a stub stands in for it: it logs its TimeoutSec and -NoToast, and prints what each case needs.
+  Write-Utf8 "$testRoot\bin\usage-probe.ps1" ('param([switch]$NoToast,[int]$TimeoutSec=120)' + "`r`n" + 'Add-Content "' + $testRoot + '\usage-calls.log" "$TimeoutSec $NoToast"; Write-Output ''{"ran":true,"ok":true}''' + "`r`n")
+  Remove-Item "$testRoot\usage-calls.log" -ErrorAction SilentlyContinue
+  $u1 = Run-Watchdog
+  Assert-True ($u1.usage.ok -eq $true) "the usage step runs the probe and records its answer: $($u1.usage | ConvertTo-Json -Compress)"
+  $uTimeout = [int](@(Get-Content "$testRoot\usage-calls.log")[-1] -split ' ')[0]
+  Assert-True ($uTimeout -ge 60 -and $uTimeout -le 120) "the probe's TimeoutSec is the tick's budget left, 60 to 120 s (got $uTimeout)"
+  Write-Utf8 "$testRoot\bin\usage-probe.ps1" ('param([switch]$NoToast,[int]$TimeoutSec=120)' + "`r`n" + 'Write-Output garbage' + "`r`n")
+  $u2 = Run-Watchdog
+  Assert-True ($u2.usage.ok -eq $false -and $u2.usage.error -match 'printed no JSON') "a probe that prints no JSON is recorded, not thrown: $($u2.usage | ConvertTo-Json -Compress)"
+  Write-Utf8 "$testRoot\bin\usage-probe.ps1" ('param([switch]$NoToast,[int]$TimeoutSec=120)' + "`r`n" + "throw 'x'" + "`r`n")
+  $u3 = Run-Watchdog
+  Assert-True ($u3.usage.ok -eq $false -and $u3.usage.error -match 'could not run') "a probe that throws is recorded as could not run: $($u3.usage | ConvertTo-Json -Compress)"
+  Write-Utf8 "$testRoot\bin\usage-probe.ps1" ('param([switch]$NoToast,[int]$TimeoutSec=120)' + "`r`n" + 'Add-Content "' + $testRoot + '\usage-calls.log" "$TimeoutSec $NoToast"; Write-Output ''{"ran":true,"ok":true}''' + "`r`n")
+  $uCallsBefore = @(Get-Content "$testRoot\usage-calls.log").Count
+  Write-Utf8 "$testRoot\config\cycle.json" '{"watchdog":{"tickBudgetSec":30}}'
+  $u4 = Run-Watchdog
+  Remove-Item "$testRoot\config\cycle.json"
+  Assert-True ($u4.usage.reason -match '^deferred' -and @(Get-Content "$testRoot\usage-calls.log").Count -eq $uCallsBefore) "a 30 s tick budget defers the probe, with no call: $($u4.usage | ConvertTo-Json -Compress)"
+  $u5 = Run-Watchdog -Verify
+  Assert-True ($null -eq $u5.usage -and @(Get-Content "$testRoot\usage-calls.log").Count -eq $uCallsBefore) '-Verify runs no usage step and calls no probe'
+  Remove-Item "$testRoot\config\cli.json"
+  $u6 = Run-Watchdog
+  Assert-True ($null -eq $u6.usage) 'no config/cli.json, no usage step'
+  Remove-Item "$testRoot\bin\usage-probe.ps1", "$testRoot\usage-calls.log" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\config\cli.json", "$testRoot\bin\install-cli.ps1", "$testRoot\state\watchdog\cli.json", "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
 
   # ===== Ticket 85: Do-Respawn verifies the pid actually changed =====

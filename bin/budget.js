@@ -7,8 +7,10 @@
 // At config/cycle.json `ic.warnTokens` (25,000) the record gets ONE budget-warning event
 // carrying the measured count. At `ic.escalateTokens` (175,000) the record is escalated
 // with decision evidence, unless an approved extension (work-state.js budget --phase
-// extend) covers the spend; then the extension amount is the line. Escalation is a
-// human decision: the transition is a decision event and pages through the notifier.
+// extend) covers the spend; then the extension amount is the line. A model with its own
+// `ic.byModel` entry (Haiku: 120,000 and 350,000) is measured against that entry, picked
+// by the IC session's roster model. Escalation is a human decision: the transition is a
+// decision event and pages through the notifier.
 //
 // Shadow unless state/flags/budget-live exists: the same decisions are computed and
 // written to state/budget/shadow.jsonl, no record moves, so the fleet can see what the
@@ -21,10 +23,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 const { findTranscript, sumTranscriptTokens } = require('./rotation-policy');
+const { modelFamily } = require('./measure-cycle');
 const { parseArgs } = workState;
 
 // #201: halved with the meter fix, which counts each model response once (it read about 2x).
-const DEFAULTS = Object.freeze({ warnTokens: 25000, escalateTokens: 175000 });
+// #382 ruling 7: Haiku has its own line; every other model keeps the default one.
+const DEFAULTS = Object.freeze({ warnTokens: 25000, escalateTokens: 175000, byModel: Object.freeze({ haiku: Object.freeze({ warnTokens: 120000, escalateTokens: 350000 }) }) });
 // hold is Cory's state and escalated is already a decision; merged and later are done.
 const BUDGET_STATES = Object.freeze(['implementing', 'revision', 'pr-open', 'ci-wait', 'review']);
 
@@ -57,11 +61,21 @@ function readJson(file, fallback) {
 }
 
 // `escalateTokens: null` is the warning-only mode (the soak Cory ruled 2026-09-09):
-// warnings are recorded, nothing is ever escalated, and the summary says so.
-function budgetConfig(root) {
+// warnings are recorded, nothing is ever escalated, and the summary says so. A model
+// family's own `ic.byModel` entry overrides the default line field by field; a model with
+// no entry, or no recorded model, takes the default line.
+function budgetConfig(root, model) {
   const ic = readJson(path.join(baseOf(root), 'config', 'cycle.json'), {}).ic || {};
-  const escalate = ic.escalateTokens === null ? null : Number(ic.escalateTokens ?? DEFAULTS.escalateTokens);
-  return { warnTokens: Number(ic.warnTokens ?? DEFAULTS.warnTokens), escalateTokens: escalate };
+  const own = (ic.byModel ?? DEFAULTS.byModel)[modelFamily(model).key] || {};
+  const pick = (key) => (own[key] !== undefined ? own[key] : ic[key]);
+  const escalate = pick('escalateTokens') === null ? null : Number(pick('escalateTokens') ?? DEFAULTS.escalateTokens);
+  return { warnTokens: Number(pick('warnTokens') ?? DEFAULTS.warnTokens), escalateTokens: escalate };
+}
+
+// Every line the config sets, for status and the summary: the default line and each family's.
+function budgetLines(root) {
+  const byModel = readJson(path.join(baseOf(root), 'config', 'cycle.json'), {}).ic?.byModel ?? DEFAULTS.byModel;
+  return { ...budgetConfig(root), byModel: Object.fromEntries(Object.keys(byModel).map((family) => [family, budgetConfig(root, family)])) };
 }
 
 function isLive({ root, live } = {}) {
@@ -71,14 +85,15 @@ function isLive({ root, live } = {}) {
 
 // The session that owns a unit: the roster row named ic-<issue> for the tenant. Manifest
 // reservations carry no owner until the roster has the session, and a respawn keeps the
-// session id, so the roster is the one source for both launch paths.
+// session id, so the roster is the one source for both launch paths. The row's model is
+// the unit's budget line (#382); budget-report.js reads the same row.
 function rosterSession(root, tenant, issue) {
   const roster = readJson(path.join(baseOf(root), 'state', 'roster.json'), { sessions: [] });
   const rows = (Array.isArray(roster) ? roster : roster.sessions || [])
     .filter((row) => row.role === 'ic' && String(row.tenant) === String(tenant) && Number(row.issue) === Number(issue) && row.sessionId);
   const active = rows.filter((row) => row.status === 'active');
   const chosen = (active.length ? active : rows).sort((a, b) => String(b.launchedAt || '').localeCompare(String(a.launchedAt || '')))[0];
-  return chosen ? { name: chosen.name, sessionId: chosen.sessionId } : null;
+  return chosen ? { name: chosen.name, sessionId: chosen.sessionId, model: chosen.model || null } : null;
 }
 
 // An extension is the new ABSOLUTE escalation line, not an increment: a grant of 100,000
@@ -97,7 +112,6 @@ function decide({ jobTokens, record, config }) {
 
 async function applyBudgets({ root, claudeHome, tenant, now, live, actor = 'budget', notifier = null } = {}) {
   const base = baseOf(root);
-  const config = budgetConfig(base);
   const mode = isLive({ root: base, live }) ? 'live' : 'shadow';
   const at = now || new Date().toISOString();
   const active = readJson(path.join(base, 'state', 'work', 'active.json'), { records: {} });
@@ -110,6 +124,7 @@ async function applyBudgets({ root, claudeHome, tenant, now, live, actor = 'budg
     const session = rosterSession(base, record.tenant, record.issue);
     if (!session) { entry.reason = 'no roster session for this unit'; results.push(entry); continue; }
     entry.session = session.name;
+    const config = budgetConfig(base, session.model);
     const transcript = findTranscript(claudeHome, session.sessionId);
     if (!transcript) { entry.reason = `transcript not found for session ${session.sessionId}`; results.push(entry); continue; }
     let totals;
@@ -153,7 +168,7 @@ async function applyBudgets({ root, claudeHome, tenant, now, live, actor = 'budg
   }
   const dir = path.join(base, 'state', 'budget');
   fs.mkdirSync(dir, { recursive: true });
-  const summary = { at, mode, tenant: tenant || null, config, records: results };
+  const summary = { at, mode, tenant: tenant || null, config: budgetLines(base), records: results };
   fs.writeFileSync(path.join(dir, 'last.json'), `${JSON.stringify(summary, null, 2)}\n`, 'utf8');
   // The shadow log is day-partitioned like every other shadow surface, and a tick with
   // nothing to measure writes nothing: 288 empty lines a day are not evidence.
