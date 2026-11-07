@@ -116,7 +116,7 @@ powershell -File C:\Users\Cory\fleet\bin\status.ps1
 claude agents                      # TUI: attach, peek, reply, pin (Ctrl+T pins a session so it is never idle-reaped)
 
 # talk to the fleet: attach to a tenant's project lead (pl-<tenant>)
-claude attach <job id>             # or reply from the claude agents TUI; fleet sessions start with Remote Control off (remoteControlAtStartup false in fleet-settings.json), so they do not appear in claude.ai/code or the mobile app
+claude attach <job id>             # or reply from the claude agents TUI; fleet sessions start with Remote Control on (remoteControlAtStartup true in fleet-settings.json, #407), so they also appear in claude.ai/code and the mobile app
 
 # stop everything launching (sessions finish their turn and idle)
 powershell -File C:\Users\Cory\fleet\bin\pause.ps1 -Reason "going on holiday"
