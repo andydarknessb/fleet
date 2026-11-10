@@ -11,8 +11,8 @@ const dormancy = require('../bin/dormancy');
 
 const NOW = '2026-11-06T12:00:00.000Z';
 const WATERMARK = '2026-11-06T11:00:00.000Z';
-const QUIET = Object.freeze({ frontier: 0, triage: 0, verdicts: 0, openPrs: 0, escalations: 0, inFlight: 0, wakes: 0 });
-const KEYS = ['frontier', 'triage', 'verdicts', 'openPrs', 'escalations', 'inFlight', 'wakes'];
+const QUIET = Object.freeze({ frontier: 0, triage: 0, verdicts: 0, openPrs: 0, escalations: 0, inFlight: 0, wakes: 0, legacyHolds: 0 });
+const KEYS = ['frontier', 'triage', 'verdicts', 'openPrs', 'escalations', 'inFlight', 'wakes', 'legacyHolds'];
 
 function write(root, relative, content) {
   const file = path.join(root, relative);
@@ -86,6 +86,10 @@ test('a fact that is missing reads as unreadable, never as quiet', () => {
   assert.equal(dormancy.evaluateDormancy({}).dormant, false);
 });
 
+test('a ready ticket held only by a skip-file string keeps the tenant awake, with its reason (fleet #406)', () => {
+  assert.deepEqual(dormancy.evaluateDormancy({ ...QUIET, legacyHolds: 1 }), { dormant: false, reasons: ['1 ready Unit(s) held by a skip-file entry with no exclusion'] });
+});
+
 // --- the gather (existing frontiers, open PRs, Work records, wake outbox) -------------------
 
 test('the gather counts escalations and in-flight Work records of its own tenant only', () => {
@@ -111,7 +115,7 @@ test('the gather counts escalations and in-flight Work records of its own tenant
   };
   const gathered = gatherFor(root, runner);
   assert.deepEqual(gathered.errors, {});
-  assert.deepEqual(gathered.facts, { frontier: 0, triage: 0, verdicts: 0, openPrs: 1, escalations: 1, inFlight: 1, wakes: 0 });
+  assert.deepEqual(gathered.facts, { frontier: 0, triage: 0, verdicts: 0, openPrs: 1, escalations: 1, inFlight: 1, wakes: 0, legacyHolds: 0 });
   assert.equal(dormancy.evaluateDormancy(gathered.facts).dormant, false);
 });
 
@@ -121,6 +125,28 @@ test('the gather of a quiet tenant is all zeros, so the tenant is dormant', () =
   const gathered = gatherFor(root);
   assert.deepEqual(gathered.facts, QUIET);
   assert.equal(dormancy.evaluateDormancy(gathered.facts).dormant, true);
+});
+
+// fleet #406: a ready ticket that only a skip-file string holds has no release, so it keeps the tenant awake until an exclusion stands for it.
+test('a ready ticket held by a skip-file string keeps the tenant awake until an exclusion stands for it (fleet #406)', () => {
+  const root = tenantRoot();
+  setWatermark(root, WATERMARK);
+  writeJson(root, 'state/skip/endzone.json', { issues: { '7': 'human-only evidence' } });
+  writeJson(root, 'fixtures/ready.json', [{ number: 7, title: 'Issue 7', url: 'https://github.com/owner/endzone/issues/7', body: 'Change `src/7.js`.', createdAt: '2026-09-01T00:00:07.000Z', state: 'OPEN', labels: ['ready-for-agent'], assignees: [] }]);
+  const gatherReady = () => withFixtures(root, () => {
+    process.env.FLEET_GITHUB_ISSUES_FIXTURE = path.join(root, 'fixtures', 'ready.json');
+    return dormancy.gatherTenantFacts({ root, tenant: 'endzone', now: NOW, runner: () => '[]' });
+  });
+  const held = gatherReady();
+  assert.deepEqual(held.errors, {});
+  assert.equal(held.facts.frontier, 0);
+  assert.equal(held.facts.legacyHolds, 1);
+  assert.equal(dormancy.evaluateDormancy(held.facts).dormant, false);
+
+  require('../bin/exclusions').addExclusion({ root, tenant: 'endzone', issue: 7, reason: 'lead holds it by hand', evidence: 'e', owner: 'cory', actor: 'cory', recheck: { event: { type: 'exclusion-lifted' } }, now: NOW });
+  const excluded = gatherReady();
+  assert.equal(excluded.facts.legacyHolds, 0);
+  assert.equal(excluded.facts.frontier, 0);
 });
 
 test('a tenant it cannot read gathers as unreadable facts, and stays awake', () => {

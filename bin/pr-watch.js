@@ -660,19 +660,21 @@ function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRu
     return;
   }
   for (const entry of standing) {
+    // fleet #406: the exclusion waits on the issue its recheck names, which is the held issue only when the fleet wrote it.
+    const watched = entry.recheck.event.issue ?? entry.issue;
     let state;
     try {
-      state = String(fetchers.issueState(entry.issue) || '').toUpperCase();
+      state = String(fetchers.issueState(watched) || '').toUpperCase();
       health.ghCalls += 1;
     } catch (error) {
       const message = String(error.message || error);
       if (/could not resolve to an issue/i.test(message)) {
         // Deleted or transferred: the issue can never close here, so nothing else would
         // ever release the exclusion. Lift it, say why, and count no failure.
-        if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${entry.issue} no longer resolves)`); continue; }
+        if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${watched} no longer resolves)`); continue; }
         try {
-          exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${entry.issue} no longer resolves (gh issue view: ${message.slice(0, 120)})` });
-          health.actions.push(`${entry.id}: lifted, issue #${entry.issue} no longer resolves`);
+          exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${watched} no longer resolves (gh issue view: ${message.slice(0, 120)})` });
+          health.actions.push(`${entry.id}: lifted, issue #${watched} no longer resolves`);
         } catch (liftError) {
           if (liftError.code === 'EXCLUSION_NOT_ACTIVE') continue;
           health.failures += 1;
@@ -687,10 +689,10 @@ function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRu
       continue;
     }
     if (state !== 'CLOSED') continue;
-    if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${entry.issue} is CLOSED)`); continue; }
+    if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${watched} is CLOSED)`); continue; }
     try {
-      exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${entry.issue} is CLOSED (gh issue view)` });
-      health.actions.push(`${entry.id}: lifted, issue #${entry.issue} closed`);
+      exclusions.liftExclusion({ root, tenant: tenantName, id: entry.id, actor, evidence: `issue #${watched} is CLOSED (gh issue view)` });
+      health.actions.push(`${entry.id}: lifted, issue #${watched} closed`);
     } catch (error) {
       if (error.code === 'EXCLUSION_NOT_ACTIVE') continue;   // released meanwhile
       health.failures += 1;

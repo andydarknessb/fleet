@@ -1168,6 +1168,35 @@ test('#203: an issue that no longer resolves (deleted or transferred) releases i
   assert.equal(exclusions.activeExclusions({ root, tenant: 'endzone' }).length, 0);
 });
 
+// fleet #406: an issue-closed hold names the issue it waits on (recheck.event.issue), which may not be the held one.
+const HELD_10 = { number: 10, state: 'OPEN', labels: ['ready-for-agent'], createdAt: '2026-08-01T00:00:10.000Z', body: 'Change `src/10.js`.' };
+function holdOn20(root) {
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 10, reason: 'waits on #20 closing', evidence: 'e', owner: 'cory', actor: 'cory', recheck: { event: { type: 'issue-closed', issue: 20 } } });
+}
+
+test('#406: an issue-closed hold on issue 10 that names issue 20 is released when 20 closes, and the planner then offers 10 again', () => {
+  const root = rootDir();
+  holdOn20(root);
+  const asked = [];
+  const f = { ...fetchers({ open: [] }), issueState: (n) => { asked.push(n); return n === 20 ? 'CLOSED' : 'OPEN'; } };
+  const health = watch(root, f);
+  assert.deepEqual(asked, [20], 'the watched issue is the one read, never the held one');
+  assert.match(health.actions.join(' '), /endzone:excl-10-1: lifted, issue #20 closed/);
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }), []);
+  assert.deepEqual(selectFrontier({ issues: [HELD_10], readyLabel: 'ready-for-agent', exclusions: exclusions.activeExclusions({ root, tenant: 'endzone' }), tenant: 'endzone' }).eligible.map((i) => i.number), [10]);
+});
+
+test('#406: the same hold stays while issue 20 is open, and issue 10 is not read as closed', () => {
+  const root = rootDir();
+  holdOn20(root);
+  const asked = [];
+  const f = { ...fetchers({ open: [] }), issueState: (n) => { asked.push(n); return n === 20 ? 'OPEN' : 'CLOSED'; } };
+  watch(root, f);
+  assert.deepEqual(asked, [20]);
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [10]);
+  assert.deepEqual(selectFrontier({ issues: [HELD_10], readyLabel: 'ready-for-agent', exclusions: exclusions.activeExclusions({ root, tenant: 'endzone' }), tenant: 'endzone' }).excluded[0].reasons.map((r) => r.code), ['frontier-exclusion']);
+});
+
 // --- fleet #390: the watcher merges a Reconcile PR (the tenant's main into its integration branch) as a
 // merge commit when GitHub reports no conflicts and every ciGates check is green. Its Review gate passes
 // through the standing exception in config/review-exceptions.json. Every GitHub call goes through a stubbed

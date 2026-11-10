@@ -59,3 +59,18 @@ The audit behind it: in the week to 2026-11-06, endzone and nidus spent about a
 tenth of the fleet's control-plane usage on 3 Units of work, and their
 Principals and Arbiters rotated on age 43 times in two weeks whether or not
 there was work. Implemented by fleet #386.
+
+## Amendment 2026-11-10 - a ready ticket behind a skip-file hold keeps a tenant awake (fleet #406)
+
+On 2026-11-07 endzone went dormant with two ready tickets held by skip-file
+entries marked "REMOVE WHEN: #2683 merges". #2683 had merged, nothing releases
+a skip-file entry, and dormancy is not an Escalation, so the tickets sat for
+five and a half hours until a Cory session lifted the holds by hand.
+
+One more condition keeps a tenant awake: a ready Unit of work held only by a
+skip-file entry with no active Frontier exclusion beside it. The planner's
+frontier answer warns about every such entry, and the Watchdog wakes the
+project lead naming the hold, at most once per hold per 24 hours. An exclusion
+can release itself (an expiry, a ledger event, or the issue it waits on
+closing); a skip-file entry cannot, so the lead is told. Implemented by fleet
+#406.
