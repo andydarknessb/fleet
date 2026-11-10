@@ -3,7 +3,7 @@
 // a rate_limit_event for the account-wide five-hour and weekly windows. bin/usage-probe.ps1 runs one
 // cheap call an hour and hands its stream here: parseUsageReading reads the event, probeDue says when
 // the next probe is due, and pageDue says whether a weekly window pages Cory (once per window). The
-// state lives in state/usage/: latest.json (loadLatestReading, for #389) and readings.jsonl (the
+// state lives in state/usage/: latest.json (loadLatestReading) and readings.jsonl (the
 // history the weekly scorecard reads). Everything above the file section is pure.
 
 const fs = require('node:fs');
@@ -71,31 +71,6 @@ function pageRecordAfter(record, reading, delivered, at) {
   return { weeklyResetsAt: reading.weekly.resetsAt, delivered: delivered === true, attempts: (sameWindow ? record.attempts || 0 : 0) + 1, at };
 }
 
-// #389 (ADR 0018): the weekly hold on a Tenant's new IC launches. At or above `lowerTenantsAt` every
-// Tenant but the first in `tenantOrder` is held; at or above `allTenantsAt`, every Tenant. A reading whose
-// weekly reset is not within the next 8 days holds nothing (a passed reset is stale; a millisecond-scale or
-// far-future one is not a weekly window), and so does a reading, limit or clock that cannot be read: a missing
-// probe must not stop the fleet (fail open).
-function usageThrottle({ reading, tenant, limit, now } = {}) {
-  const weekly = reading?.weekly;
-  const first = Array.isArray(limit?.tenantOrder) ? limit.tenantOrder[0] : undefined;
-  if (!weekly || !Number.isFinite(weekly.utilization) || !first) return null;
-  const resetMs = weekly.resetsAt * 1000;
-  const nowMs = new Date(now || Date.now()).getTime();
-  if (!(resetMs > nowMs && resetMs - nowMs <= 8 * 86400000)) return null;
-  const reset = new Date(resetMs);
-  const hold = (threshold, scope) => ({
-    code: 'usage-throttle',
-    threshold,
-    utilization: weekly.utilization,
-    resetsAt: weekly.resetsAt,
-    reason: `weekly utilization ${weekly.utilization} is at or above the ${Math.round(threshold * 100)}% threshold for ${scope}; new IC launches are held until the weekly reset at ${reset.toISOString()}`,
-  });
-  if (weekly.utilization >= limit.allTenantsAt) return hold(limit.allTenantsAt, 'every Tenant');
-  if (weekly.utilization >= limit.lowerTenantsAt && tenant !== first) return hold(limit.lowerTenantsAt, `every Tenant but ${first}`);
-  return null;
-}
-
 // File section. A missing or torn file reads as absent, never as a throw.
 function usageFile(root, name) { return path.join(root, 'state', 'usage', name); }
 function readJsonFile(file) {
@@ -109,11 +84,6 @@ function writeFileAtomic(file, text) {
 function loadLatestReading(root) {
   const reading = readJsonFile(usageFile(root, 'latest.json'));
   return reading && reading.weekly && Number.isFinite(reading.weekly.utilization) ? reading : null;
-}
-// config/cycle.json `usageLimit` (the Tenant order and the two thresholds), or null: nothing is held without it.
-function loadUsageLimit(root) {
-  const cycle = readJsonFile(path.join(root, 'config', 'cycle.json'));
-  return (cycle && cycle.usageLimit) || null;
 }
 function loadPageRecord(root) { return readJsonFile(usageFile(root, 'paged.json')); }
 // The last probe attempt, successful or not (attempt.json, or the latest reading's time). A failing
@@ -142,7 +112,6 @@ function storeAttempt(root, at) {
 //   attempt <root> [at]                    -> { at }                  a probe ran and failed
 //   record <root> [at]  (stream on stdin)  -> { reading, pageDue }    stores the reading
 //   page-attempt <root> <true|false> [at]  -> the page record         after an attempt that reached Pushover
-//   throttle <root> <tenant> [now]         -> { throttle }            the weekly hold on a new IC launch, or null (the launch door asks)
 function cli(argv, readStdin = () => fs.readFileSync(0, 'utf8')) {
   const [command, root, ...rest] = argv;
   const now = new Date().toISOString();
@@ -160,8 +129,7 @@ function cli(argv, readStdin = () => fs.readFileSync(0, 'utf8')) {
     if (!latest) throw new UsageLimitError('NO_READING', 'there is no reading to record a page attempt against');
     return storePageRecord(root, pageRecordAfter(loadPageRecord(root), latest, rest[0] === 'true', rest[1] || now));
   }
-  if (command === 'throttle') return { throttle: usageThrottle({ reading: loadLatestReading(root), tenant: rest[0], limit: loadUsageLimit(root), now: rest[1] || now }) };
-  throw new UsageLimitError('USAGE', `usage-limit.js: expected due, record, page-attempt or throttle, got ${command || 'nothing'}`);
+  throw new UsageLimitError('USAGE', `usage-limit.js: expected due, attempt, record or page-attempt, got ${command || 'nothing'}`);
 }
 
 if (require.main === module) {
@@ -173,4 +141,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { PAGE_AT, UsageLimitError, cli, loadLatestReading, loadUsageLimit, pageDue, pageRecordAfter, parseUsageReading, probeDue, usageThrottle };
+module.exports = { PAGE_AT, UsageLimitError, cli, loadLatestReading, pageDue, pageRecordAfter, parseUsageReading, probeDue };

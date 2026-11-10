@@ -49,3 +49,14 @@ nothing either; the reset brings it back by Wake.
   the rate-limit signal that sets a Pause.
 - Implemented by fleet #388 (reading, Page, scorecard) and fleet #389
   (throttle).
+
+## Amendment 1 (2026-11-09): the throttle is removed
+
+Cory asked for the usage throttle removed. The planner no longer holds a
+Frontier at 85% or 90% weekly utilization, and the launch door no longer
+refuses IC launches past those lines. `usageThrottle`, `loadUsageLimit`, the
+`usage-limit.js throttle` command and `config/cycle.json` `usageLimit` are gone.
+
+Kept: the hourly reading, the Page at 80% of the weekly window, and the
+scorecard row. The Tenant order is no longer configured anywhere. The decisions
+above that name the 85% and 90% lines and the weekly-reset lift no longer apply.

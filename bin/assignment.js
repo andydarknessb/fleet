@@ -20,7 +20,6 @@ const {
   transitionRecord,
 } = require('./work-state');
 const { PREMISES_HEADING, PremisesError, checkPremises, fencedLines, readPremises } = require('./premises');
-const { loadLatestReading, loadUsageLimit, usageThrottle } = require('./usage-limit');
 
 function sha256(value) {
   return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
@@ -425,9 +424,6 @@ function plannerInputs({ root, tenant, tenantConfig } = {}) {
   return {
     boundedReadies: [...liveBoundedReadies(readTriageRows(base, tenant)).values()].map((entry) => ({ issue: Number(entry.issue), at: entry.at })),
     ownerLogin,
-    // #389: the weekly Usage limit's reading and its Tenant order (state/usage, config/cycle.json).
-    usageReading: loadLatestReading(base),
-    usageLimit: loadUsageLimit(base),
   };
 }
 
@@ -478,15 +474,12 @@ const SPEC_LABEL = 'spec';
 // under Bounded authority and when (plannerInputs reads them
 // from the triage ledger); `ownerLogin` is whose comment beginning `Veto` counts. A
 // ticket readied through the owner's Approval is in neither, so nothing here touches it.
-// #389 (ADR 0018): `usageReading` and `usageLimit` (plannerInputs reads both) hold every ticket for
-// this Tenant, with the reason, while the weekly Usage limit is past its threshold.
-function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, tenant, now, windowNow, boundedReadies = [], ownerLogin, usageReading = null, usageLimit = null } = {}) {
+function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], active = [], fleetIdentity, tenant, now, windowNow, boundedReadies = [], ownerLogin } = {}) {
   const foreign = (assignee) => !fleetIdentity || String(assignee).toLowerCase() !== String(fleetIdentity).toLowerCase();
   if (!Array.isArray(issues)) throw new WorkStateError('INVALID_GITHUB_FIXTURE', 'issues must be an array');
   const normalized = issues.map(normalizeIssue);
   const scoped = activeRecords(active, tenant);
   const boundedAt = new Map((boundedReadies || []).map((entry) => [Number(entry.issue), entry.at]));
-  const usageHold = usageThrottle({ reading: usageReading, tenant, limit: usageLimit, now: windowNow || now });
   const activeByIssue = new Map(scoped.filter((record) => record.state !== 'retired').map((record) => [Number(record.issue), record]));
   const eligible = [];
   const excluded = [];
@@ -517,7 +510,6 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (boundedAt.has(issue.number) && (!readyLabel || issue.labels.includes(readyLabel))) {
       reasons.push(...windowReasons({ issue, readyAt: boundedAt.get(issue.number), ownerLogin, now: windowNow || now }));
     }
-    if (usageHold) reasons.push({ code: 'usage-throttle', detail: usageHold.reason });
     if (reasons.length) excluded.push({ issue: issue.number, reasons });
     else eligible.push(issue);
   }
