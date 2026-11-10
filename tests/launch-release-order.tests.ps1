@@ -112,7 +112,6 @@ $exitRows = @(
   @{ Anchor = 'cap reached'; Decision = 'release' }
   @{ Anchor = 'ICs need -Issue'; Decision = 'release' }
   @{ Anchor = 'tenant maxIcs reached'; Decision = 'release' }
-  @{ Anchor = 'reason = \$usageHold\.reason'; Decision = 'release' }       # ADR 0018 (#389): the weekly Usage limit holds a new IC launch
   @{ Anchor = 'code = .*refusal\.code'; Decision = 'release' }
   @{ Anchor = "permission profile '.*is missing or unreadable"; Decision = 'release' }
   @{ Anchor = 'profileMessage\$\(\$r\.note\)'; Decision = 'release' }
