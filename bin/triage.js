@@ -336,19 +336,19 @@ function runStalePremiseNotice({ root, now, send, dryRun = false } = {}) {
   return { armed: true, due: true, sent: true, attempted: true, firedAt: at, tally: counts };
 }
 
-// fleet #367: a lead's lift-only exclusion still standing a day after a finalize newer than it. Only the lead lifts it
-// (#362: its reason may be unrelated), so this flags and pages; it never lifts. An unreadable ledger throws.
+// fleet #367: a lead's lift-only exclusion still standing a day after a finalize newer than it (fleet #406: an issue-closed hold is the
+// watcher's to lift when the issue closes, so it is not flagged). Only the lead lifts it (#362: its reason may be unrelated), so this flags and pages; it never lifts. An unreadable ledger throws.
 function leadHoldNoticePath(root) {
   return path.join(baseOf(root), 'state', 'triage', 'lead-hold-notice.json');
 }
 
 function unliftedLeadHolds({ root, tenant, now } = {}) {
-  const { activeExclusions, LIFT_ONLY_RECHECK_EVENTS } = require('./exclusions');
+  const { activeExclusions } = require('./exclusions');
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
   const byIssue = projectTriage({ entries: readLedger(root, tenant), now: at }).byIssue;
   const holds = [];
   for (const entry of activeExclusions({ root, tenant, now: at })) {
-    if (entry.owner !== `pl-${tenant}` || !entry.recheck.event || !LIFT_ONLY_RECHECK_EVENTS.includes(entry.recheck.event.type)) continue;
+    if (entry.owner !== `pl-${tenant}` || !entry.recheck.event || entry.recheck.event.type !== 'exclusion-lifted') continue;
     const row = byIssue[Number(entry.issue)];
     if (!row || !row.finalized || !(row.finalized.at > entry.at)) continue;
     if (Date.parse(at) - Date.parse(row.finalized.at) < LEAD_HOLD_NOTICE_HOURS * 3600000) continue;

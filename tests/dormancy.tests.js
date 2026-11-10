@@ -149,6 +149,24 @@ test('a ready ticket held by a skip-file string keeps the tenant awake until an 
   assert.equal(excluded.facts.frontier, 0);
 });
 
+// fleet #406 (QA): a skip-file string on a ticket that is not otherwise ready holds nothing a lead alone could release, so it is not a legacy hold.
+test('a skip-file string on a ticket not otherwise ready is not a legacy hold (fleet #406)', () => {
+  const root = tenantRoot();
+  setWatermark(root, WATERMARK);
+  writeJson(root, 'state/skip/endzone.json', { issues: { '7': 'human-only evidence', '8': 'human-only evidence' } });
+  writeJson(root, 'fixtures/unready.json', [
+    { number: 7, title: 'Issue 7', url: 'https://github.com/owner/endzone/issues/7', body: 'Change `src/7.js`.', createdAt: '2026-09-01T00:00:07.000Z', state: 'OPEN', labels: [], assignees: [] },
+    { number: 8, title: 'Issue 8', url: 'https://github.com/owner/endzone/issues/8', body: 'Change `src/8.js`.', createdAt: '2026-09-01T00:00:08.000Z', state: 'OPEN', labels: ['ready-for-agent'], assignees: [], dependencies: [{ number: 9, state: 'OPEN' }] },
+  ]);
+  const gathered = withFixtures(root, () => {
+    process.env.FLEET_GITHUB_ISSUES_FIXTURE = path.join(root, 'fixtures', 'unready.json');
+    return dormancy.gatherTenantFacts({ root, tenant: 'endzone', now: NOW, runner: () => '[]' });
+  });
+  assert.deepEqual(gathered.errors, {});
+  assert.equal(gathered.facts.frontier, 0);
+  assert.equal(gathered.facts.legacyHolds, 0);
+});
+
 test('a tenant it cannot read gathers as unreadable facts, and stays awake', () => {
   const root = tenantRoot();
   const gathered = withFixtures(root, () => dormancy.gatherTenantFacts({ root, tenant: 'ghost', now: NOW, runner: () => '[]' }));

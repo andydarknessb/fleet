@@ -134,7 +134,7 @@ function gatherTenantFacts({ root, tenant, now, runner = execFileSync } = {}) {
   const needFrontier = () => { if (frontierError) throw new Error(frontierError); return frontier; };
   read('frontier', () => needFrontier().eligible.length);
   // fleet #406: a ready ticket behind a skip-file hold that nothing can release keeps the Tenant awake, so its lead is woken to deal with it.
-  read('legacyHolds', () => (needFrontier().warnings || []).filter((warning) => warning.code === 'legacy-hold-unstructured' && warning.ready).length);
+  read('legacyHolds', () => needFrontier().warnings.filter((warning) => warning.code === 'legacy-hold-unstructured' && warning.ready).length);
   read('triage', () => require('./triage').computeFrontier({ root: base, tenant, now, fixture: fixture('FLEET_TRIAGE_ISSUES_FIXTURE') }).eligible.length);
   read('verdicts', () => {
     const arbiter = require('./triage').computeArbiterFrontier({ root: base, tenant, now, fixture: fixture('FLEET_TRIAGE_ISSUES_FIXTURE') });
