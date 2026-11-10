@@ -11,7 +11,7 @@ function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllTex
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-identity-env-test-" + [guid]::NewGuid().ToString('N'))
 $saved = @{}
-foreach ($k in 'FLEET_IDENTITY_DIR','FLEET_NO_TOAST','GH_CONFIG_DIR','GIT_CONFIG_SYSTEM','GH_TOKEN','GCM_INTERACTIVE','GIT_ASKPASS','GH_PROMPT_DISABLED','GIT_TERMINAL_PROMPT') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
+foreach ($k in 'FLEET_IDENTITY_DIR','FLEET_NO_TOAST','GH_CONFIG_DIR','GIT_CONFIG_SYSTEM','GH_TOKEN','GCM_INTERACTIVE','GIT_ASKPASS','GH_PROMPT_DISABLED','GIT_TERMINAL_PROMPT','PATH') { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process') }
 
 # One child process per case: the env it ends with, and the credential git would send.
 function Run-Case {
@@ -44,6 +44,16 @@ try {
   $env:FLEET_NO_TOAST = '1'
   # GIT_TERMINAL_PROMPT=0 so a case that falls through to no helper fails fast instead of prompting.
   $env:GIT_TERMINAL_PROMPT = '0'
+
+  # The runner takes the real gh off PATH (fleet #416), so a stand-in gh answers git from this hosts.yml.
+  [IO.Directory]::CreateDirectory("$testRoot\mock-bin") | Out-Null
+  Write-Utf8 "$testRoot\mock-bin\gh" (@(
+    '#!/bin/sh',
+    '[ "$3" = get ] || exit 0',
+    'sed -n ''s/^    user: /username=/p; s/^    oauth_token: /password=/p'' "$GH_CONFIG_DIR/hosts.yml"',
+    ''
+  ) -join "`n")
+  $env:PATH = "$testRoot\mock-bin;$env:PATH"
 
   # Present: the process env routes git through gh, which answers with the fleet token.
   $r1 = Run-Case '{"name":"t","fleetIdentity":"fleet-bot","ownerLogin":"cory-owner"}'
