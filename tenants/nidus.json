@@ -9,7 +9,7 @@
   "ownerLogin": "andydarknessb",
   "escalationLabel": "fleet-escalation",
   "branchPrefix": "fleet/",
-  "maxIcs": 6,
+  "maxIcs": 999,
   "carveOuts": [
     ".github/workflows/**",
     ".env*",

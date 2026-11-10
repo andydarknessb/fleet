@@ -260,3 +260,13 @@ Arbiter Opus 5.5 at xhigh, the Researcher Haiku 5.5 at low.
 The audit priced the week to 2026-11-06 at about 60% of a weekly Usage limit,
 88% of it control plane; the Principal was a quarter of the total. Implemented
 by fleet #385.
+
+## Amendment 2026-11-10 - the IC cap and roster cap removed (owner ruling)
+
+Cory ruled, 2026-11-10: no cap on concurrent ICs. Each tenant's `maxIcs`, the
+static roster `cap`, and `scorecard.icCap` are set to 999, which no fleet reaches,
+so the existing checks (`MAX_ICS_REACHED`, launch's cap refusal, the Stop hook's
+`capFree`/`icFree`) never fire. Independence proof past the second assignment
+still applies. The fallbacks of 3 for a tenant with no `maxIcs` are unchanged.
+Supersedes the six-IC and cap-9 rulings above; usage is now bounded only by the
+weekly limit.

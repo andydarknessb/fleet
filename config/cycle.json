@@ -48,7 +48,7 @@
     "tailWeakUnits": 3,
     "waitTickMinutes": 15,
     "waitGapMinutes": 35,
-    "icCap": 6,
+    "icCap": 999,
     "sentBackRate": { "watch": 0.4, "weak": 0.5 },
     "rateMinUnits": 10,
     "escapedRate": { "weak": 0.05 },
