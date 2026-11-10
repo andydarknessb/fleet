@@ -11,6 +11,7 @@ function Get-PagedKeys { param($NewlyPaged) @($NewlyPaged | ForEach-Object { $_.
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-watchdog-test-" + [guid]::NewGuid().ToString('N'))
 $oldPath = $env:PATH
+$oldFleetGh = $env:FLEET_GH
 $oldProfile = $env:USERPROFILE
 $oldRetryDelayMs = $env:FLEET_PAGE_RETRY_DELAY_MS
 # Cory's ruling 2026-09-18 (fleet #76): Send-FleetPage now waits 5s before its
@@ -85,7 +86,12 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Write-Utf8 "$testRoot\mock-bin\claude.cmd" ('@echo off' + "`r`n" + 'if "%1"=="agents" type "' + $testRoot + '\mock-agents.json"' + "`r`n" + 'if "%1"=="respawn" powershell -NoProfile -ExecutionPolicy Bypass -File "' + $testRoot + '\mock-bin\mock-respawn.ps1" %2' + "`r`n" + 'exit /b 0' + "`r`n")
   Write-Utf8 "$testRoot\mock-bin\gh.cmd" ('@echo off' + "`r`n" + 'if "%MOCK_GH_FAIL%"=="1" (echo gh down 1>&2 & exit /b 9)' + "`r`n" + 'if "%3"=="902" (echo {"state":"CLOSED"}) else if "%2"=="view" (echo {"state":"OPEN"}) else echo []' + "`r`n" + 'exit /b 0' + "`r`n")
 
-  $env:PATH = "$testRoot\mock-bin;$oldPath"
+  # Fleet #399: a node child runs gh without a shell, which skips the gh.cmd mock and reaches the real gh.exe. With its directory off PATH that call fails here.
+  $pathWithoutGh = (@($oldPath -split ';') | Where-Object { $_ -and -not [IO.File]::Exists("$_\gh.exe") }) -join ';'
+  $env:PATH = "$testRoot\mock-bin;$pathWithoutGh"
+  $env:FLEET_GH = "$testRoot\mock-bin\no-gh.exe"
+  & node -e "try{require('child_process').execFileSync('gh',['--version'],{stdio:'ignore'});process.exit(1)}catch(e){process.exit(e.code==='ENOENT'?0:1)}"
+  if ($LASTEXITCODE -ne 0) { throw 'a real gh is reachable from node children; the suite would make real GitHub calls (fleet #399)' }
   $env:USERPROFILE = "$testRoot\profile"
   # Claude Code 2.1.281 trust pre-flight (launch.ps1 Test-WorkspaceTrusted): trust the test root so every path under it launches.
   [IO.Directory]::CreateDirectory("$testRoot\profile") | Out-Null
@@ -2812,6 +2818,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Write-Output 'watchdog tests passed'
 } finally {
   $env:PATH = $oldPath
+  $env:FLEET_GH = $oldFleetGh
   $env:USERPROFILE = $oldProfile
   if ($oldRetryDelayMs) { $env:FLEET_PAGE_RETRY_DELAY_MS = $oldRetryDelayMs } else { Remove-Item Env:FLEET_PAGE_RETRY_DELAY_MS -ErrorAction SilentlyContinue }
   Remove-Item Env:MOCK_GH_FAIL -ErrorAction SilentlyContinue
