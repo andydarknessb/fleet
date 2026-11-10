@@ -510,6 +510,9 @@ function selectFrontier({ issues, readyLabel, skipIssues = {}, exclusions = [], 
     if (boundedAt.has(issue.number) && (!readyLabel || issue.labels.includes(readyLabel))) {
       reasons.push(...windowReasons({ issue, readyAt: boundedAt.get(issue.number), ownerLogin, now: windowNow || now }));
     }
+    // fleet #406: a skip-file entry has no release the fleet can check, so one with no active exclusion beside it is warned; `ready` says it alone holds the ticket.
+    const legacyHold = reasons.find((reason) => reason.source === 'legacy-skip');
+    if (legacyHold && !reasons.some((reason) => reason.source === 'exclusion-ledger')) warnings.push({ issue: issue.number, code: 'legacy-hold-unstructured', detail: legacyHold.detail, ready: reasons.length === 1 });
     if (reasons.length) excluded.push({ issue: issue.number, reasons });
     else eligible.push(issue);
   }

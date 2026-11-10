@@ -653,6 +653,84 @@ try {
   Remove-Item "$testRoot\state\escalations\*" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\profile\.claude\jobs\job-i" -Recurse -ErrorAction SilentlyContinue
 
+  # ===== fleet #406: a ready issue held only by a skip-file string (no structured exclusion) is wake evidence for the lead,
+  # once per hold per 24 hours. The planner reports it as a `legacy-hold-unstructured` warning; the wake names the hold and stamps it.
+  # The planner is asked with or without a free IC slot: H1 to H4 run with one (so the frontier path runs too), H5 with none.
+  function Get-HoldState { Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw | ConvertFrom-Json }
+  function Set-HoldWakeState { param([double]$LastAtMinutesAgo, [double]$HoldMinutesAgo)
+    Write-Utf8 "$testRoot\state\watchdog\frontier-wake.json" ('{"tenants":{"test":{"lastAt":"' + (Get-Iso $LastAtMinutesAgo) + '","digest":"skip-file hold on #501","outboxConsumedThrough":"' + (Get-Iso $LastAtMinutesAgo) + '","delivered":["legacy-hold:test#501"],"frontierIssues":[]}},"legacyHolds":{"legacy-hold:test#501":"' + (Get-Iso $HoldMinutesAgo) + '"}}')
+  }
+  $holdFixture = '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]'
+
+  # Case H1 (fleet #406): issue 501 is ready but a skip-file string holds it with no exclusion -> the lead is woken once,
+  # the wake names #501 and the reason, and frontier-wake.json stamps the hold under legacyHolds for the 24-hour limit.
+  Start-WakeCase -Ics 1
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE $holdFixture
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"501":"waits for #400 to merge"},"prs":{}}'
+  Set-Outbox @()
+  $h1 = Run-Watchdog; $wh1 = Get-TestWake $h1
+  $evH1 = (@($wh1.evidence) -join '; ')
+  Assert-True ($wh1.decision -eq 'woken' -and $evH1 -match '#501' -and $evH1 -match 'waits for #400 to merge') "H1: a ready issue held by a skip-file string must wake the lead, naming the hold (got $($wh1.decision): '$($wh1.reason)'; evidence '$evH1')"
+  Assert-True (@(Get-RotateCalls).Count -eq 1) "H1: exactly one rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count))"
+  $holdStamp = (Get-HoldState).legacyHolds.'legacy-hold:test#501'
+  Assert-True ([bool]$holdStamp) "H1: frontier-wake.json must stamp the hold under legacyHolds (got '$((Get-HoldState).legacyHolds | ConvertTo-Json -Compress)')"
+
+  # Case H2 (fleet #406): the next tick, with the ordinary 60-minute cooldown long elapsed (lastAt 90 min ago) but the hold
+  # stamped 2 hours ago, does not wake for it: the 24-hour limit governs a hold, not the cooldown. The state is written
+  # explicitly (H1's shape) so that a red H1 cannot abort the suite here.
+  Set-HoldWakeState -LastAtMinutesAgo 90 -HoldMinutesAgo 120
+  $callsBeforeH2 = @(Get-RotateCalls).Count
+  $h2 = Run-Watchdog; $wh2 = Get-TestWake $h2
+  Assert-True ($wh2.decision -eq 'none' -and (@($wh2.evidence) -join '; ') -notmatch 'skip-file hold') "H2: a hold stamped inside 24 hours must not wake again (got $($wh2.decision): '$($wh2.reason)'; evidence '$(@($wh2.evidence) -join '; ')')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeH2) 'H2: no rotate.ps1 call for a hold stamped inside 24 hours'
+
+  # Case H3 (fleet #406): the same hold, its stamp aged to 25 hours ago -> the lead is woken again and the evidence names the hold.
+  Set-HoldWakeState -LastAtMinutesAgo 90 -HoldMinutesAgo 1500
+  $callsBeforeH3 = @(Get-RotateCalls).Count
+  $h3 = Run-Watchdog; $wh3 = Get-TestWake $h3
+  $evH3 = (@($wh3.evidence) -join '; ')
+  Assert-True ($wh3.decision -eq 'woken' -and $evH3 -match '#501' -and $evH3 -match 'waits for #400 to merge') "H3: a hold stamped more than 24 hours ago must wake the lead again (got $($wh3.decision): '$($wh3.reason)'; evidence '$evH3')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeH3 + 1) "H3: exactly one more rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count - $callsBeforeH3))"
+
+  # Case H4 (fleet #406, control): the same skip-file string, but an active structured exclusion for #501 stands -> no hold evidence, no wake for it.
+  Start-WakeCase -Ics 1
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"501":"waits for #400 to merge"},"prs":{}}'
+  $exclOut = & node "$testRoot\bin\exclusions.js" add --root "$testRoot" --tenant test --issue 501 --reason held --evidence fixture --owner cory --actor cory --expires 2099-01-01T00:00:00.000Z
+  Assert-True ($LASTEXITCODE -eq 0 -and "$exclOut" -match '"issue":501') "H4: the fixture exclusion for #501 must be written (exit $($LASTEXITCODE): '$exclOut')"
+  $h4 = Run-Watchdog; $wh4 = Get-TestWake $h4
+  Assert-True ($wh4.decision -eq 'none' -and (@($wh4.evidence) -join '; ') -notmatch 'skip-file hold' -and @(Get-RotateCalls).Count -eq 0) "H4: a hold with an active structured exclusion must not wake (got $($wh4.decision): '$($wh4.reason)'; evidence '$(@($wh4.evidence) -join '; ')')"
+  # H5 and H6 start with no exclusion for #501: the H4 fixture is lifted from the ledger here.
+  Remove-Item "$testRoot\state\exclusions\test.jsonl" -ErrorAction SilentlyContinue
+
+  # Case H5 (fleet #406): as H1 with no IC slot (both ICs active at maxIcs 2, so the frontier has no slot). The hold is still
+  # reported: the lead is woken for it, the evidence names #501 and the reason, and no frontier evidence is named.
+  Start-WakeCase
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE $holdFixture
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"501":"waits for #400 to merge"},"prs":{}}'
+  Set-Outbox @()
+  $callsBeforeH5 = @(Get-RotateCalls).Count
+  $h5 = Run-Watchdog; $wh5 = Get-TestWake $h5
+  $evH5 = (@($wh5.evidence) -join '; ')
+  Assert-True ($wh5.decision -eq 'woken' -and $evH5 -match '#501' -and $evH5 -match 'waits for #400 to merge' -and $evH5 -notmatch 'frontier #') "H5: a held ticket with no IC slot must still wake the lead, naming the hold and no frontier (got $($wh5.decision): '$($wh5.reason)'; evidence '$evH5')"
+  Assert-True (@(Get-RotateCalls).Count -eq $callsBeforeH5 + 1) "H5: exactly one more rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count - $callsBeforeH5))"
+
+  # Case H6 (fleet #406, control): a free IC slot and the skip entry on #501, where #501 is not otherwise ready (no
+  # ready-for-agent label): the planner's warning is not ready, so no hold evidence, no wake and no rotate call.
+  $unreadyFixture = '[{"number":501,"title":"Ready","url":"https://github.com/owner/repo/issues/501","body":"Change `src/fixture.js`.","createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":[],"assignees":[]}]'
+  Start-WakeCase -Ics 1
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE $unreadyFixture
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{"501":"waits for #400 to merge"},"prs":{}}'
+  Set-Outbox @()
+  $callsBeforeH6 = @(Get-RotateCalls).Count
+  $h6 = Run-Watchdog; $wh6 = Get-TestWake $h6
+  Assert-True ($wh6.decision -eq 'none' -and (@($wh6.evidence) -join '; ') -notmatch 'skip-file hold' -and @(Get-RotateCalls).Count -eq $callsBeforeH6) "H6: a held ticket that is not ready must not wake the lead (got $($wh6.decision): '$($wh6.reason)'; evidence '$(@($wh6.evidence) -join '; ')')"
+
+  # The H cases leave the skip entry, fixture, exclusion ledger and wake state as the suite found them (nothing after them reads them).
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{},"prs":{}}'
+  Write-Utf8 $env:FLEET_GITHUB_ISSUES_FIXTURE '[]'
+  Remove-Item "$testRoot\state\exclusions\test.jsonl" -ErrorAction SilentlyContinue
+  Reset-Wake
+
   if ($script:failures.Count -gt 0) { throw "$($script:failures.Count) frontier-wake-respawn assertion(s) failed" }
   Write-Output 'frontier-wake-respawn tests passed'
 } finally {

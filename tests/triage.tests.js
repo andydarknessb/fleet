@@ -2858,6 +2858,20 @@ test('fleet #367 9: a lifted hold is not paged', () => {
   assert.equal(sent.length, 0);
 });
 
+// fleet #406: an issue-closed hold is the PR watcher's to lift when the issue closes, so a lead's wait on one is not a lift-only hold.
+test('fleet #406: a lead issue-closed hold older than a finalize more than 24 hours old is not paged; the lift-only hold still is', () => {
+  const later = '2026-09-15T12:00:00.000Z';
+  const { sent, send } = holdSends();
+  const waiting = finalizeWorld({ afterPropose: (root) => holdWith(root, { event: { type: 'issue-closed', issue: 20 } }) });
+  waiting.finalize();
+  assert.deepEqual(triage.runLeadHoldNotice({ root: waiting.root, now: later, send }), NOTHING);
+  assert.equal(sent.length, 0);
+  const lifted = finalizeWorld({ afterPropose: (root) => leadHold(root) });
+  lifted.finalize();
+  assert.equal(triage.runLeadHoldNotice({ root: lifted.root, now: later, send }).flagged, 1);
+  assert.equal(sent.length, 1);
+});
+
 test('fleet #367 10: a dry run returns the page and sends and writes nothing', () => {
   const world = finalizeWorld({ afterPropose: (root) => leadHold(root) });
   world.finalize();

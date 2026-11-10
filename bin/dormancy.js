@@ -1,5 +1,5 @@
 'use strict';
-// Ticket 386: is a Tenant dormant (CONTEXT.md)? One pure evaluation over seven facts, a gather that reads the existing
+// Ticket 386: is a Tenant dormant (CONTEXT.md)? One pure evaluation over eight facts, a gather that reads the existing
 // frontiers, open fleet PRs, Work records and wake outbox, and a snapshot the watchdog writes once per tick. Rotation
 // (rotation-policy.js) and the Sentinel's respawn (sentinel-check.ps1) read the snapshot and never evaluate it.
 // Scripts only, no model turns (ADR 0004).
@@ -21,6 +21,7 @@ const NOT_IN_FLIGHT = ['merged', 'retiring', 'retired', 'released', 'abandoned',
 const WAKE_KINDS = ['checks-settled', 'checks-failed', 'decision-needed', 'resolution'];
 const CONDITIONS = [
   ['frontier', 'ready Unit(s) on the Frontier'],
+  ['legacyHolds', 'ready Unit(s) held by a skip-file entry with no exclusion'],
   ['triage', 'item(s) awaiting Triage'],
   ['verdicts', 'Triage proposal(s) awaiting a Verdict'],
   ['openPrs', 'open fleet pull request(s)'],
@@ -122,11 +123,18 @@ function gatherTenantFacts({ root, tenant, now, runner = execFileSync } = {}) {
     return { facts, errors };
   }
   const fixture = (name) => process.env[name] || undefined;
-  read('frontier', () => {
+  // The planner is asked once; its failure is the failure of both facts read from its answer.
+  let frontier = null;
+  let frontierError = null;
+  try {
     const argv = ['frontier', '--root', base, '--tenant', tenant];
     if (fixture('FLEET_GITHUB_ISSUES_FIXTURE')) argv.push('--fixture', fixture('FLEET_GITHUB_ISSUES_FIXTURE'));
-    return require('./assignment').cli(argv).eligible.length;
-  });
+    frontier = require('./assignment').cli(argv);
+  } catch (error) { frontierError = errorText(error); }
+  const needFrontier = () => { if (frontierError) throw new Error(frontierError); return frontier; };
+  read('frontier', () => needFrontier().eligible.length);
+  // fleet #406: a ready ticket behind a skip-file hold that nothing can release keeps the Tenant awake, so its lead is woken to deal with it.
+  read('legacyHolds', () => needFrontier().warnings.filter((warning) => warning.code === 'legacy-hold-unstructured' && warning.ready).length);
   read('triage', () => require('./triage').computeFrontier({ root: base, tenant, now, fixture: fixture('FLEET_TRIAGE_ISSUES_FIXTURE') }).eligible.length);
   read('verdicts', () => {
     const arbiter = require('./triage').computeArbiterFrontier({ root: base, tenant, now, fixture: fixture('FLEET_TRIAGE_ISSUES_FIXTURE') });

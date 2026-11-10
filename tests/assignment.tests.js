@@ -416,6 +416,37 @@ test('the frontier command carries the body-blocker warning in its JSON answer (
   assert.deepEqual(frontier.warnings, [{ issue: 69, code: 'body-blocker-unlinked', numbers: [120] }]);
 });
 
+// fleet #406: a skip-file entry has no release the fleet can check, so one with no active exclusion beside it is warned.
+test('a string skip entry with no exclusion is warned as an unstructured hold, and the ticket is excluded (fleet #406)', () => {
+  const result = selectFrontier({ issues: [issue(80)], readyLabel: 'ready-for-agent', skipIssues: { issues: { '80': 'human-only evidence' } }, now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.eligible, []);
+  assert.deepEqual(result.warnings, [{ issue: 80, code: 'legacy-hold-unstructured', detail: 'human-only evidence', ready: true }]);
+});
+
+test('a string skip entry under an active exclusion raises no unstructured-hold warning (fleet #406)', () => {
+  const exclusion = { id: 'endzone:excl-81-1', tenant: 'endzone', issue: 81, reason: 'lead hold', evidence: 'e', owner: 'cory', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } };
+  const result = selectFrontier({ issues: [issue(81)], readyLabel: 'ready-for-agent', skipIssues: { issues: { '81': 'human-only evidence' } }, exclusions: [exclusion], now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.excluded[0].reasons.map((reason) => reason.code), ['frontier-exclusion', 'frontier-exclusion']);
+  assert.deepEqual(result.warnings, []);
+});
+
+test('a string skip entry on a ticket with another reason too is warned with ready false (fleet #406)', () => {
+  const result = selectFrontier({ issues: [issue(82, { dependencies: [{ number: 83, state: 'OPEN' }] })], readyLabel: 'ready-for-agent', skipIssues: { issues: { '82': 'human-only evidence' } }, now: '2026-09-01T12:00:00.000Z' });
+  assert.deepEqual(result.eligible, []);
+  assert.deepEqual(result.warnings, [{ issue: 82, code: 'legacy-hold-unstructured', detail: 'human-only evidence', ready: false }]);
+});
+
+test('the frontier command carries the unstructured-hold warning in its JSON answer (fleet #406)', () => {
+  const root = rootDir();
+  const fixture = path.join(root, 'issues.json');
+  fs.writeFileSync(fixture, JSON.stringify([issue(84)]));
+  fs.mkdirSync(path.join(root, 'state', 'skip'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'skip', 'endzone.json'), JSON.stringify({ issues: { '84': 'human-only evidence' } }));
+  const frontier = cli(['frontier', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--ready-label', 'ready-for-agent', '--now', '2026-09-01T12:00:00.000Z']);
+  assert.deepEqual(frontier.eligible, []);
+  assert.deepEqual(frontier.warnings, [{ issue: 84, code: 'legacy-hold-unstructured', detail: 'human-only evidence', ready: true }]);
+});
+
 test('a third assignment requires and records an independence proof', () => {
   const frontier = { eligible: [issue(50, { components: ['src/50.js'] }), issue(51, { components: ['src/51.js'] }), issue(52, { components: ['src/52.js'] })] };
   const active = [

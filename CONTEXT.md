@@ -277,8 +277,9 @@ _Avoid_: project (when the distinction from the fleet itself matters), workspace
 **Dormant tenant**:
 A Tenant none of whose roles has anything to do: nothing on its Frontier, no
 ticket awaiting Triage, no Triage proposal awaiting a Verdict, no open fleet
-pull request, no Escalation pending, no Unit of work in flight, and no
-undelivered wake for its project lead. While it is dormant, neither Rotation
+pull request, no Escalation pending, no Unit of work in flight, no
+undelivered wake for its project lead, and no ready Unit of work held only by
+a skip-file entry with no Frontier exclusion beside it. While it is dormant, neither Rotation
 nor respawn relaunches its control-plane sessions; the first new piece of work
 brings them back by Wake.
 _Avoid_: idle (a session with nothing waiting), paused (the fleet-wide Pause),
@@ -402,7 +403,7 @@ The fleet records one itself when it observes a merged PR whose linkage is an
 explained `Refs` (prose after it on the line, or on the next non-empty line): owned by the fleet, its recheck event is the issue closing,
 which the watcher observes and lifts.
 A lead's lift-only exclusion older than an open proposal, or any lead's exclusion older than a stale-premise restatement, is a launch hold only: the Principal and the Arbiter still see the proposal (fleet #362, #366).
-A lead's lift-only exclusion still standing 24 hours after a finalize newer than it pages once from the daily run; nothing lifts it but the lead (fleet #367).
+A lead's exclusion that only a lift releases (`exclusion-lifted`) and that still stands 24 hours after a finalize newer than it pages once from the daily run; nothing lifts it but the lead (fleet #367). One rechecked on an issue closing is the watcher's to lift and never pages (fleet #406).
 GitHub labels, assignees, dependencies, and sub-issue structure take
 precedence whenever they can express the condition.
 _Avoid_: hold (a reviewed PR waiting for Cory), skip, blocked

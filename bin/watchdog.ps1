@@ -320,11 +320,13 @@ try {
   function Test-FrontierWaiting {
     param($TenantName, $Tenant, $NodeExe, $LiveRoster, $LiveCount, $Cap)
     if ($script:frontierWaitingCache.ContainsKey($TenantName)) { return $script:frontierWaitingCache[$TenantName] }
-    $result = [pscustomobject]@{ evidence = @(); issues = @(); reason = ''; error = $null }
+    $result = [pscustomobject]@{ evidence = @(); issues = @(); reason = ''; error = $null; legacyHolds = @() }
     if (-not $NodeExe) { $result.error = 'node not found'; $script:frontierWaitingCache[$TenantName] = $result; return $result }
     $activeIcs = 0; if ($LiveRoster) { $activeIcs = @($LiveRoster.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $TenantName }).Count }
     $maxIcs = 0; try { $maxIcs = [int]$Tenant.maxIcs } catch {}
-    if ($activeIcs -ge $maxIcs -or $LiveCount -ge $Cap) { $result.reason = "no slot (ICs $activeIcs/$maxIcs, cap $LiveCount/$Cap)"; $script:frontierWaitingCache[$TenantName] = $result; return $result }
+    # fleet #406: with no slot the planner is still asked, for the skip-file holds alone: telling the lead about one needs no slot. Its frontier and its failure count only with a slot, as before.
+    $noSlot = ($activeIcs -ge $maxIcs -or $LiveCount -ge $Cap)
+    if ($noSlot) { $result.reason = "no slot (ICs $activeIcs/$maxIcs, cap $LiveCount/$Cap)" }
     # Bounded (Invoke-BoundedExe: Start-Process + WaitForExit + Kill): a wedged
     # assignment.js (a hung gh call inside it) must not wedge the whole tick. A
     # timeout is recorded as a planner failure - Test-WorkWaiting already fails
@@ -333,16 +335,20 @@ try {
     $frontierArgs = @('frontier', '--root', $FleetHome, '--tenant', $TenantName)
     if ($env:FLEET_GITHUB_ISSUES_FIXTURE) { $frontierArgs += @('--fixture', $env:FLEET_GITHUB_ISSUES_FIXTURE) }
     $bounded = Invoke-BoundedExe -FilePath $NodeExe -ArgumentList (@("$PSScriptRoot\assignment.js") + $frontierArgs) -TimeoutSec $frontierTimeoutSec -Name "node assignment.js frontier $TenantName"
-    if ($bounded.startError) { $result.error = "assignment.js could not start: $(Get-OneLine $bounded.startError 200)" }
-    elseif ($bounded.timedOut) { $result.error = "assignment.js timed out after ${frontierTimeoutSec}s and was killed" }
+    $plannerError = $null
+    if ($bounded.startError) { $plannerError = "assignment.js could not start: $(Get-OneLine $bounded.startError 200)" }
+    elseif ($bounded.timedOut) { $plannerError = "assignment.js timed out after ${frontierTimeoutSec}s and was killed" }
     else {
       $frontier = ConvertFrom-LastJsonLine $bounded.stdout
-      if (-not $frontier) { $result.error = "assignment.js returned no JSON: $(Get-OneLine $bounded.stdout 200)" }
+      if (-not $frontier) { $plannerError = "assignment.js returned no JSON: $(Get-OneLine $bounded.stdout 200)" }
       else {
         $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
-        if ($eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')"; $result.issues = $eligible }
+        if (-not $noSlot -and $eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')"; $result.issues = $eligible }
+        # fleet #406: a ready ticket held by a skip-file entry with no exclusion is wake evidence for the lead; the wake block applies the 24-hour limit.
+        if ($frontier.PSObject.Properties['warnings']) { $result.legacyHolds = @($frontier.warnings | Where-Object { "$($_.code)" -eq 'legacy-hold-unstructured' -and $_.ready }) }
       }
     }
+    if ($plannerError -and -not $noSlot) { $result.error = $plannerError }
     $script:frontierWaitingCache[$TenantName] = $result
     return $result
   }
@@ -1057,6 +1063,7 @@ try {
   if (-not $wakeState) { $wakeState = [pscustomobject]@{ tenants = [pscustomobject]@{} } }
   if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
   if ($null -eq $wakeState.PSObject.Properties['stalls']) { $wakeState | Add-Member -NotePropertyName stalls -NotePropertyValue ([pscustomobject]@{}) -Force }
+  if ($null -eq $wakeState.PSObject.Properties['legacyHolds']) { $wakeState | Add-Member -NotePropertyName legacyHolds -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
   # fleet #346: an empty or lead-less roster is a read glitch (Save-LiveRoster is not atomic), never "every IC left": no stall evaluation or pruning on it.
   $rosterOk = [bool]($liveRoster -and @($liveRoster.sessions | Where-Object { $_.role -eq 'project-lead' -and $_.status -eq 'active' }).Count -gt 0)
@@ -1126,6 +1133,19 @@ try {
         $fw = Test-FrontierWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap
         if ($fw.evidence.Count -gt 0) { $wake.evidence += $fw.evidence } elseif ($fw.reason) { $wake.reason = $fw.reason }
       }
+      # fleet #406: such a hold is evidence at most once per 24 hours; frontier-wake.json keeps the last delivered wake per hold.
+      $dueHolds = @()
+      if ($fw) {
+        foreach ($lh in @($fw.legacyHolds)) {
+          $holdId = "legacy-hold:${tenantName}#$([int]$lh.issue)"
+          $holdLast = $null; if ($wakeState.legacyHolds.PSObject.Properties[$holdId]) { $holdLast = ConvertTo-UtcDateTime $wakeState.legacyHolds.$holdId }
+          if ($holdLast -and ($now - $holdLast).TotalHours -lt 24) { continue }
+          $dueHolds += $holdId
+          # fleet #406: the no-slot reason the frontier left behind is not the reason for a hold wake.
+          $wake.reason = ''
+          $wake.evidence += "skip-file hold on #$([int]$lh.issue) has no exclusion and nothing else holds the ticket ($(Get-OneLine "$($lh.detail)" 160)): remove the entry or add the exclusion"
+        }
+      }
       $leadLines = New-Object System.Collections.ArrayList
       # Source 2: PR-watcher wakes recorded since this lead was launched and not yet delivered.
       if ($wakeSources -contains 'outbox') {
@@ -1148,7 +1168,7 @@ try {
       # digest-equality rule and is upgraded by its next wake.
       $digest = ($wake.evidence -join '; ')
       $frontierIssues = @(); if ($fw -and $fw.PSObject.Properties['issues']) { $frontierIssues = @($fw.issues) }
-      $lineIds = @($leadLines | ForEach-Object { $_.id }) + @($newStalls | ForEach-Object { $_.id })
+      $lineIds = @($leadLines | ForEach-Object { $_.id }) + @($newStalls | ForEach-Object { $_.id }) + @($dueHolds)
       $tenantState = $null; if ($wakeState.tenants.PSObject.Properties[$tenantName]) { $tenantState = $wakeState.tenants.$tenantName }
       $alreadyCarried = $false
       if ($tenantState -and $tenantState.lastAt) {
@@ -1189,6 +1209,7 @@ try {
         if ($tenantState -and $tenantState.outboxConsumedThrough) { $priorWm = ConvertTo-UtcDateTime $tenantState.outboxConsumedThrough; if ($priorWm) { $wmCandidates += $priorWm } }
         $newWatermark = if ($wmCandidates.Count -gt 0) { (@($wmCandidates | Sort-Object -Descending)[0]).ToString('o') } else { Now-Iso }
         $wakeState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $digest; outboxConsumedThrough = $newWatermark; delivered = @($lineIds); frontierIssues = @($frontierIssues) }) -Force
+        foreach ($holdId in $dueHolds) { $wakeState.legacyHolds | Add-Member -NotePropertyName $holdId -NotePropertyValue (Now-Iso) -Force }
         foreach ($ns in $newStalls) {
           $prior = $null; if ($wakeState.stalls.PSObject.Properties[$ns.id]) { $prior = $wakeState.stalls.($ns.id) }
           $wakeState.stalls | Add-Member -NotePropertyName $ns.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = (Now-Iso); escalatedAt = $(if ($prior) { $prior.escalatedAt }) }) -Force
