@@ -23,7 +23,9 @@ param(
                     # -Prompt (read from that same roster row): recovery restarts the crashed
                     # process with its own history, it does not re-run manifest preconditions or
                     # create a new worktree, so a validated -Recover does not set -Manifest here
-                    # either - it lifts the no-manifest IC refusal below and takes the IC's effort from its roster row. A -Recover for any
+                    # either - it lifts the no-manifest IC refusal below and takes the IC's effort,
+                    # permissions, cwd, manifest and Work record id from its roster row, and its branch
+                    # and base from that manifest file (fleet #434). A -Recover for any
                     # other name (or one with no manifest on its row) gets no exemption at all
                     # (QA fix, fleet #89: it used to accept any name unconditionally). Cap, PAUSE
                     # and maxIcs still apply regardless.
@@ -59,9 +61,19 @@ $cwd = $null
 $t = $null
 $worktreePath = $null
 $recoverValidated = $false
+$recoverManifest = $null
+$recoverAssignment = $null
 if ($Recover -and -not $Manifest -and ($Role -eq 'ic' -or ($Name -and $Name -match '^ic-'))) {
   $recoverableRow = $live.sessions | Where-Object { $_.name -eq $Name -and $_.role -eq 'ic' -and $_.status -eq 'active' -and $_.manifest } | Select-Object -Last 1
   $recoverValidated = [bool]$recoverableRow
+  # fleet #434: a validated recovery restarts the unit its manifest launch built, so it takes what that launch recorded. A missing or unreadable manifest file refuses nothing.
+  if ($recoverValidated) {
+    $recoverManifest = "$($recoverableRow.manifest)"
+    try { if (Test-Path -LiteralPath $recoverManifest -PathType Leaf) { $recoverAssignment = Read-Json $recoverManifest } } catch {}
+    if (-not $WorkRecordId) { $WorkRecordId = "$($recoverableRow.workRecordId)" }
+    if (-not $WorkRecordId -and $recoverAssignment) { $WorkRecordId = "$($recoverAssignment.workRecordId)" }
+    if (-not $Permissions -and "$($recoverableRow.permissions)" -in @('auto', 'allowlist')) { $Permissions = "$($recoverableRow.permissions)" }
+  }
 }
 if ($Manifest) {
   # no release: a manifest that cannot be read names no Work record, so there is nothing this script can release.
@@ -365,6 +377,11 @@ if ($Manifest) {
   $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId
   $envBlock.FLEET_BASE_SHA = [string]$assignment.base.sha
   $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
+} elseif ($recoverValidated) {
+  $envBlock.FLEET_ASSIGNMENT_MANIFEST = $recoverManifest
+  if ($WorkRecordId) { $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId }
+  if ($recoverAssignment -and "$($recoverAssignment.base.sha)") { $envBlock.FLEET_BASE_SHA = [string]$recoverAssignment.base.sha }
+  if ($recoverAssignment -and "$($recoverAssignment.branch)") { $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$recoverAssignment.branch }
 }
 $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
 # fleet #384: only the project lead keeps the claude.ai connectors (its Supabase connector); every other role runs without them.
@@ -630,6 +647,9 @@ if ($Manifest) {
     } catch { Write-Warning "could not add the PR body file to $excludePath ($_)" }
   }
   $cwd = $worktreePath
+} elseif ($recoverValidated -and "$($recoverableRow.cwd)" -and (Test-Path -LiteralPath "$($recoverableRow.cwd)" -PathType Container)) {
+  # fleet #434: a recovered IC restarts in the assignment worktree its manifest launch created, not the tenant repo root.
+  $cwd = "$($recoverableRow.cwd)"
 }
 
 # --- launch ---
@@ -716,7 +736,7 @@ if (-not $row) {
 # --- record ---
 # The row carries the resolved manifest path (as FLEET_ASSIGNMENT_MANIFEST does), which
 # work-state release matches against the record's manifest to tell a live claim from a stale row.
-$rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } else { $Manifest }
+$rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } elseif ($recoverValidated) { $recoverManifest } else { $Manifest }
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
   model = $requestedModel; permissions = $Permissions; effort = $effort
