@@ -469,6 +469,52 @@ try {
   Assert-True ($wf8.decision -eq 'woken' -and (@($wf8.evidence) -join '; ') -eq 'outbox checks-failed x1') "F8: a checks-failed line newer than the lead's launch must still wake (got $($wf8.decision): $(@($wf8.evidence) -join '; '))"
   Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
 
+  # ===== fleet #419: an owner-answer line is the PR watcher's record that the owner commented on an escalated record. It
+  # counts only while that record is still escalated, and like #344's resolution it is not bound by the lead's launch.
+  # O1: an owner-answer for an escalated record, idle lead launched before the comment -> woken, the evidence names it.
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-2606' 2606 'escalated')
+  Set-Outbox @((New-OutboxLine 5 'issue-2606' 'owner-answer' 'watch:test:issue-2606:owner-answer:9001' 'pr-watch'))
+  $o1 = Run-Watchdog; $wo1 = Get-TestWake $o1
+  Assert-True ($wo1.decision -eq 'woken' -and (@($wo1.evidence) -join '; ') -eq 'outbox owner-answer x1') "O1: an owner-answer for an escalated record must wake the idle lead (got $($wo1.decision): '$($wo1.reason)'; $(@($wo1.evidence) -join '; '))"
+  $callsO1 = @(Get-RotateCalls)
+  Assert-True ($callsO1.Count -eq 1 -and $callsO1[0] -match '\[records: owner-answer test:issue-2606\]$') "O1: the rotate call must name owner-answer test:issue-2606 (got '$($callsO1 -join ' / ')')"
+
+  # O2: the same line once the record is no longer escalated (moved to review, or absent from active.json) -> no wake.
+  foreach ($case in @(@{ id = 'O2 record moved to review'; json = (Get-ActiveJson 'issue-2606' 2606 'review') }, @{ id = 'O2 record absent'; json = (Get-ActiveJson 'issue-9' 9 'escalated') })) {
+    Start-WakeCase
+    Set-Active $case.json
+    Set-Outbox @((New-OutboxLine 5 'issue-2606' 'owner-answer' 'watch:test:issue-2606:owner-answer:9001' 'pr-watch'))
+    $ro = Run-Watchdog; $wro = Get-TestWake $ro
+    Assert-True ($wro.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 0) "$($case.id): an owner-answer must not wake (got $($wro.decision): '$($wro.reason)')"
+  }
+
+  # O3: a line older than the lead's launch still wakes while its record is escalated, once; the watermark keeps it out after.
+  Start-WakeCase -LeadMinutes 23
+  Set-Active (Get-ActiveJson 'issue-2606' 2606 'escalated')
+  Set-Outbox @((New-OutboxLine 30 'issue-2606' 'owner-answer' 'watch:test:issue-2606:owner-answer:9001' 'pr-watch'))
+  $o3 = Run-Watchdog; $wo3 = Get-TestWake $o3
+  Assert-True ($wo3.decision -eq 'woken' -and (@($wo3.evidence) -join '; ') -match 'owner-answer') "O3: an owner-answer older than the lead's launch must wake while its record is still escalated (got $($wo3.decision): '$($wo3.reason)'; $(@($wo3.evidence) -join '; '))"
+  Assert-True (@(Get-RotateCalls).Count -eq 1) "O3: exactly one rotate.ps1 -Wake call (got $(@(Get-RotateCalls).Count))"
+  $o3b = Run-Watchdog; $wo3b = Get-TestWake $o3b
+  Assert-True ($wo3b.decision -eq 'none' -and @(Get-RotateCalls).Count -eq 1) "O3b: the delivered owner-answer must not be counted again (got $($wo3b.decision): $(@($wo3b.evidence) -join '; '))"
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+
+  # O4: the lead was just woken for the escalation's own decision-needed line (its eventSequence is in `delivered`). A later
+  # owner-answer for the same record, written with no eventSequence, is a new line by identity: woken again, not cooldown.
+  # (A line that carried the escalation's eventSequence would share its id and read as already carried.)
+  Start-WakeCase
+  Set-Active (Get-ActiveJson 'issue-2606' 2606 'escalated')
+  $escalation4 = New-OutboxLine 10 'issue-2606' 'decision-needed' 'watch:test:issue-2606:r2:escalated' 'pr-watch'
+  Set-Outbox @($escalation4)
+  $o4a = Run-Watchdog; $wo4a = Get-TestWake $o4a
+  Assert-True ($wo4a.decision -eq 'woken') "O4a: the escalation's decision-needed line must wake the idle lead (got $($wo4a.decision): '$($wo4a.reason)')"
+  $answer4 = ([ordered]@{ at = (Get-Iso 2); recordId = 'test:issue-2606'; revision = 3; wake = 'owner-answer'; idempotencyKey = 'watch:test:issue-2606:owner-answer:9007'; actor = 'pr-watch'; evidence = 'owner comment after the escalation' } | ConvertTo-Json -Compress)
+  Set-Outbox @($escalation4, $answer4)
+  $o4b = Run-Watchdog; $wo4b = Get-TestWake $o4b
+  Assert-True ($wo4b.decision -eq 'woken' -and (@($wo4b.evidence) -join '; ') -eq 'outbox owner-answer x1') "O4: an owner-answer with no eventSequence must wake the lead again on the next tick, not cooldown (got $($wo4b.decision): '$($wo4b.reason)'; $(@($wo4b.evidence) -join '; '))"
+  Remove-Item "$testRoot\state\work\active.json" -ErrorAction SilentlyContinue
+
   # ===== fleet #346: a Stall (an IC owed work, at a turn boundary, no turn for 2 h) wakes the lead; one that
   # outlasts the wake by 2 h more files one `stall` escalation (and page). Config defaults: 120 / 120.
   function Get-StallEscalations { @(Get-ChildItem "$testRoot\state\escalations" -Filter *-stall.json -ErrorAction SilentlyContinue) }

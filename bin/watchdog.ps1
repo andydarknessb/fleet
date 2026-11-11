@@ -419,19 +419,23 @@ try {
         if ($sinceRecord) {
           if ("$($o.wake)" -eq 'resolution') { $stands = "$($sinceRecord.state)" -eq "$($o.to)" }
           elseif ("$($o.wake)" -eq 'checks-failed') { $stands = "$($sinceRecord.state)" -eq 'ci-wait' -and @($sinceRecord.github.observation.gates.failures | Where-Object { $_ }).Count -gt 0 }
+          # fleet #419: an owner-answer stands while the owner's comment still answers an escalation.
+          elseif ("$($o.wake)" -eq 'owner-answer') { $stands = "$($sinceRecord.state)" -eq 'escalated' }
         }
         if (-not $stands) { continue }
       }
       if ($ConsumedThrough -and $atUtc -le $ConsumedThrough) { continue }
-      if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution') -notcontains "$($o.wake)") { continue }
+      if (@('checks-settled', 'checks-failed', 'decision-needed', 'resolution', 'owner-answer') -notcontains "$($o.wake)") { continue }
       $raisedBy = ''; if ($o.PSObject.Properties['raisedBy']) { $raisedBy = "$($o.raisedBy)" }
       if ($Recipient -eq 'principal') { if ("$($o.wake)" -ne 'resolution' -or $raisedBy -notlike 'pe-*') { continue } }
       elseif ("$($o.wake)" -eq 'resolution' -and ($raisedBy -like 'pe-*' -or ($o.PSObject.Properties['to'] -and "$($o.to)" -eq 'ci-wait'))) { continue }
       if ($SelfActor -and @('decision-needed', 'resolution') -contains "$($o.wake)" -and $o.PSObject.Properties['actor'] -and "$($o.actor)" -eq $SelfActor) { continue }
-      if ($wakeRecords -and "$($o.wake)" -like 'checks-*') {
+      # fleet #419: an owner-answer counts only while its record is still escalated, like the checks-* lines are filtered here.
+      if ($wakeRecords -and (("$($o.wake)" -like 'checks-*') -or ("$($o.wake)" -eq 'owner-answer'))) {
         $wakeRecord = $null; if ($wakeRecords.PSObject.Properties["$($o.recordId)"]) { $wakeRecord = $wakeRecords."$($o.recordId)" }
         if (-not $wakeRecord) { continue }
         if ("$($o.wake)" -eq 'checks-settled' -and "$($wakeRecord.state)" -ne 'review') { continue }
+        if ("$($o.wake)" -eq 'owner-answer' -and "$($wakeRecord.state)" -ne 'escalated') { continue }
       }
       $kinds["$($o.wake)"] = [int]$kinds["$($o.wake)"] + 1
       if ($null -ne $Lines) { [void]$Lines.Add([pscustomobject]@{ id = (Get-WakeLineId $o); at = $atUtc; wake = "$($o.wake)" }) }
