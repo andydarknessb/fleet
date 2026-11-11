@@ -188,6 +188,25 @@ test('an unconsumed resolution keeps the tenant awake', () => {
   assert.equal(dormancy.evaluateDormancy(gathered.facts, gathered.errors).dormant, false);
 });
 
+// fleet #419: an owner-answer is the lead's work only while its record is still escalated (the watchdog's filter, mirrored).
+test('an owner-answer keeps the tenant awake only while its record is still escalated (fleet #419)', () => {
+  const root = tenantRoot();
+  setWatermark(root, WATERMARK);
+  setOutbox(root, [{ at: '2026-11-06T11:30:00.000Z', recordId: 'endzone:issue-7', wake: 'owner-answer', actor: 'pr-watch' }]);
+  writeJson(root, 'state/work/active.json', { schemaVersion: 1, records: { 'endzone:issue-7': { tenant: 'endzone', state: 'escalated' } } });
+  assert.equal(gatherFor(root).facts.wakes, 1);
+  writeJson(root, 'state/work/active.json', { schemaVersion: 1, records: { 'endzone:issue-7': { tenant: 'endzone', state: 'review' } } });
+  assert.equal(gatherFor(root).facts.wakes, 0);
+});
+
+test('an owner-answer whose record is absent from active.json is not counted (fleet #419)', () => {
+  const root = tenantRoot();
+  setWatermark(root, WATERMARK);
+  setOutbox(root, [{ at: '2026-11-06T11:30:00.000Z', recordId: 'endzone:issue-7', wake: 'owner-answer', actor: 'pr-watch' }]);
+  writeJson(root, 'state/work/active.json', { schemaVersion: 1, records: { 'endzone:issue-8': { tenant: 'endzone', state: 'escalated' } } });
+  assert.equal(gatherFor(root).facts.wakes, 0);
+});
+
 test('a resolution the lead has consumed does not keep the tenant awake', () => {
   const root = tenantRoot();
   setWatermark(root, '2026-11-06T11:45:00.000Z');

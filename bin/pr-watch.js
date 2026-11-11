@@ -2,7 +2,9 @@
 // Ticket 04: deterministic PR watcher. Reconciles active Work records against GitHub,
 // writes a Fleet event ONLY when an observed value changes, and records an eligible
 // project-lead wake (checks-settled | checks-failed | decision-needed; the state door adds
-// `resolution` when a record leaves escalated or hold, #204). The EVENT
+// `resolution` when a record leaves escalated or hold, #204; `owner-answer` when the owner
+// comments on an escalated record, #419: re-derived from GitHub each tick and keyed by comment
+// id, so it has no ledger event and a lost outbox line is rewritten). The EVENT
 // LEDGER is the authoritative wake record (changes.wake on observations, a
 // `wake:<kind>; ` evidence prefix on transitions); state/watch/wake-outbox.jsonl is a
 // best-effort convenience cache written after commit. A decision-needed wake also
@@ -462,6 +464,8 @@ function makeFetchers(repo, executable = 'gh') {
   return {
     listOpenPrs: () => ghJson(executable, ['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', 'number,isDraft,headRefName,headRefOid,statusCheckRollup']),
     issueState: (n) => String(ghJson(executable, ['issue', 'view', String(n), '-R', repo, '--json', 'state']).state || ''),
+    // shortcut: first 100 comments since the escalation, paginate if an escalated thread outgrows it
+    issueComments: (n, since) => ghJson(executable, ['api', `repos/${repo}/issues/${n}/comments?per_page=100&since=${encodeURIComponent(since)}`]),
     viewPr: (n) => ghJson(executable, ['pr', 'view', String(n), '-R', repo, '--json', 'number,state,isDraft,mergedAt,mergedBy,headRefOid,statusCheckRollup,closingIssuesReferences,headRefName,body']),
     fleetGh: fleetGhRunner(executable),
   };
@@ -487,6 +491,44 @@ function previousTenantHealth(previous, name) {
 }
 function failureStreak(ok, previousEntry) {
   return ok === false ? priorFailureStreak(previousEntry) + 1 : 0;
+}
+
+// #419: the owner's comment on an escalated record is the answer to the ask. The watcher writes an `owner-answer` wake
+// and never changes the record: the lead reads the comment and resolves the record itself. The wake is keyed by comment
+// id, so a lost outbox line is rewritten on the next tick. `since` is the escalation's own event in the ledger (the
+// outbox is only a cache, so a lost line must not move it); `ledger` holds the events, read at most once per tick.
+function ownerAnswerWake({ root, record, tenantConfig, fetchers, actor, dryRun, health, ledger }) {
+  if (!tenantConfig.ownerLogin) return;   // fail closed: without the owner there is no answer to read
+  try {
+    ledger.events = ledger.events || workState.readEvents(root);
+    const entering = workState.enteringEvent(ledger.events, record.id, 'escalated');
+    const since = entering ? entering.at : record.updatedAt;
+    const comments = [];
+    for (const number of [record.issue, record.github?.prNumber].filter(Boolean)) {
+      // One read per number: a failed PR read loses only its comments, not the answer on the issue.
+      try {
+        comments.push(...fetchers.issueComments(number, since));
+        health.ghCalls += 1;
+      } catch (error) {
+        health.failures += 1;
+        health.actions.push(`${record.id}: owner-answer check failed on #${number} (${String(error.message || error).slice(0, 120)})`);
+      }
+    }
+    const owned = comments.filter((c) => identity.sameLogin(c.user?.login, tenantConfig.ownerLogin) && Date.parse(c.created_at) > Date.parse(since));
+    if (!owned.length) return;
+    const answer = owned.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+    const summary = `${record.id}: owner-answer wake (${answer.html_url})`;
+    if (dryRun) { health.actions.push(`DRY ${summary}`); return; }
+    // No eventSequence on the line: the watchdog keys a line on it, and the escalation's own line already holds that id.
+    const written = workState.appendWakeOutbox({
+      root, recordId: record.id, revision: record.revision, wake: 'owner-answer',
+      idempotencyKey: `watch:${record.id}:owner-answer:${answer.id}`, evidence: `owner comment ${answer.html_url} after the escalation`, actor,
+    });
+    if (written) health.actions.push(summary);
+  } catch (error) {
+    health.failures += 1;
+    health.actions.push(`${record.id}: owner-answer check failed (${String(error.message || error).slice(0, 120)})`);
+  }
 }
 
 function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true, notifier = null, healthFile = 'health.json' } = {}) {
@@ -538,7 +580,9 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
   const byNumber = new Map(openPrs.filter((pr) => !pr.isDraft).map((pr) => [Number(pr.number), pr]));
   const prefix = tenantConfig.branchPrefix || '';
 
+  const ledger = { events: null };
   for (const record of records) {
+    if (record.state === 'escalated') ownerAnswerWake({ root: base, record, tenantConfig, fetchers, actor, dryRun, health, ledger });
     const prNumber = record.github?.prNumber || null;
     let openPr = prNumber ? byNumber.get(Number(prNumber)) || null : null;
     if (!openPr && (record.state === 'implementing' || record.state === 'revision')) {

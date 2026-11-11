@@ -18,7 +18,7 @@ const PR_LIST_LIMIT = 100;
 // A Work record in one of these states is finished or waits on Cory's own decision, so it is not work for a role.
 const NOT_IN_FLIGHT = ['merged', 'retiring', 'retired', 'released', 'abandoned', 'hold', 'escalated'];
 // The wake kinds the lead's wake reads from the outbox (bin/watchdog.ps1, Get-UnconsumedWakes).
-const WAKE_KINDS = ['checks-settled', 'checks-failed', 'decision-needed', 'resolution'];
+const WAKE_KINDS = ['checks-settled', 'checks-failed', 'decision-needed', 'resolution', 'owner-answer'];
 const CONDITIONS = [
   ['frontier', 'ready Unit(s) on the Frontier'],
   ['legacyHolds', 'ready Unit(s) held by a skip-file entry with no exclusion'],
@@ -97,9 +97,10 @@ function unconsumedWakes(root, tenant, records, watermark) {
     // The lead's own decision-needed and resolution lines are Cory's to act on, not a wake for the lead.
     if ((entry.wake === 'decision-needed' || entry.wake === 'resolution') && entry.actor === `pl-${tenant}`) continue;
     // checks-* lines count only while their record is still in active.json, and checks-settled only while it is in review.
-    if (records && String(entry.wake).startsWith('checks-')) {
+    // owner-answer (fleet #419) counts only while its record is still escalated, as Get-UnconsumedWakes filters it.
+    if (records && (String(entry.wake).startsWith('checks-') || entry.wake === 'owner-answer')) {
       const record = Object.prototype.hasOwnProperty.call(records, entry.recordId) ? records[entry.recordId] : null;
-      if (!record || (entry.wake === 'checks-settled' && record.state !== 'review')) continue;
+      if (!record || (entry.wake === 'checks-settled' && record.state !== 'review') || (entry.wake === 'owner-answer' && record.state !== 'escalated')) continue;
     }
     count += 1;
   }

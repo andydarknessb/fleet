@@ -16,7 +16,7 @@ function rootDir() {
 }
 
 const TENANT = {
-  github: 'owner/repo', branchPrefix: 'fleet/',
+  github: 'owner/repo', branchPrefix: 'fleet/', ownerLogin: 'cory',
   ciGates: ['g1', 'g2'], watchedChecks: ['w1'], ignoredChecks: ['ig1'],
 };
 
@@ -55,8 +55,9 @@ function pr(overrides = {}) {
 function view(overrides = {}) {
   return { number: 77, state: 'OPEN', isDraft: false, mergedAt: null, headRefOid: 'abc123', statusCheckRollup: [], closingIssuesReferences: [], body: '', ...overrides };
 }
-function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false, issueState = 'OPEN', failIssue = false } = {}) {
+function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false, issueState = 'OPEN', failIssue = false, comments = () => [] } = {}) {
   return {
+    issueComments: (n, since) => comments(n, since),
     issueState: () => { if (failIssue) throw new Error('boom: issue view down'); return issueState; },
     listOpenPrs: () => { if (failList) throw new Error('boom: api down'); return JSON.parse(JSON.stringify(open)); },
     viewPr: () => { if (failView) throw new Error('boom: view down'); return JSON.parse(JSON.stringify(viewResult)); },
@@ -310,6 +311,146 @@ test('a human escalation is never resolved or touched by the watcher', () => {
   assert.equal(rec.state, 'escalated');
   assert.equal(rec.decisionEvidence, 'scope question, do not proceed until Cory rules');
   assert.equal(health.actions.length, 0);
+});
+
+// fleet #419: the owner's comment on an escalated record answers the ask. The watcher writes an owner-answer wake and
+// never changes the record; the lead reads the comment and resolves the record itself.
+const OWNER_COMMENT = { id: 9001, user: { login: 'cory' }, created_at: '2099-01-01T00:00:00Z', html_url: 'https://github.com/owner/repo/issues/42#issuecomment-9001' };
+function escalateByLead(root) {
+  const revision = seed(root);
+  workState.transitionRecord({
+    root, id: 'endzone:issue-42', to: 'escalated', expectedRevision: revision,
+    idempotencyKey: 'lead-esc', actor: 'pl-endzone', evidence: 'scope question: keep the old API?', now: now(),
+  });
+}
+function ownerAnswers(root) { return outbox(root).filter((w) => w.wake === 'owner-answer'); }
+
+test('#419: an owner comment after the escalation writes one owner-answer line naming it; a second tick adds none and the record stands', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const before = record(root);
+  const eventCount = events(root).length;
+  const calls = [];
+  const f = fetchers({ comments: (n, since) => { calls.push({ n, since }); return n === 42 ? [OWNER_COMMENT] : []; } });
+  watch(root, f);
+  watch(root, f);
+  const escalatedAt = workState.enteringEvent(events(root), 'endzone:issue-42', 'escalated').at;
+  assert.ok(calls.some((c) => c.n === 42 && c.since === escalatedAt), `the issue is read since the escalation event: ${JSON.stringify(calls)}`);
+  assert.equal(ownerAnswers(root).length, 1);
+  assert.equal(ownerAnswers(root)[0].idempotencyKey, 'watch:endzone:issue-42:owner-answer:9001');
+  assert.equal(ownerAnswers(root)[0].evidence, `owner comment ${OWNER_COMMENT.html_url} after the escalation`);
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(record(root).revision, before.revision);
+  assert.equal(events(root).length, eventCount, 'no ledger event for the wake');
+});
+
+test('#419: a comment by another login, or an owner comment from before the escalation, writes no owner-answer line', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const other = { ...OWNER_COMMENT, id: 9002, user: { login: 'someone-else' } };
+  const early = { ...OWNER_COMMENT, id: 9003, created_at: '2000-01-01T00:00:00Z' };
+  watch(root, fetchers({ comments: () => [other, early] }));
+  assert.deepEqual(ownerAnswers(root), []);
+});
+
+test('#419: an owner comment on the PR of an escalated record counts as the answer', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const onPr = { ...OWNER_COMMENT, id: 9004, html_url: 'https://github.com/owner/repo/pull/77#issuecomment-9004' };
+  watch(root, fetchers({ comments: (n) => (n === 77 ? [onPr] : []) }));
+  assert.equal(ownerAnswers(root).length, 1);
+  assert.match(ownerAnswers(root)[0].evidence, /pull\/77#issuecomment-9004/);
+});
+
+test('#419: a newer owner comment writes a second owner-answer line, and neither line carries an eventSequence (the watchdog keys a line on it)', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  watch(root, fetchers({ comments: () => [OWNER_COMMENT] }));
+  const newer = { ...OWNER_COMMENT, id: 9005, created_at: '2099-02-01T00:00:00Z', html_url: 'https://github.com/owner/repo/issues/42#issuecomment-9005' };
+  watch(root, fetchers({ comments: () => [OWNER_COMMENT, newer] }));
+  const lines = ownerAnswers(root);
+  assert.equal(lines.length, 2);
+  assert.ok(lines.every((l) => !('eventSequence' in l)), JSON.stringify(lines));
+  assert.ok(lines[1].evidence.includes(newer.html_url), lines[1].evidence);
+});
+
+test('#419: when one read returns two owner comments, the line names the newest', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const newer = { ...OWNER_COMMENT, id: 9006, created_at: '2099-03-01T00:00:00Z', html_url: 'https://github.com/owner/repo/issues/42#issuecomment-9006' };
+  watch(root, fetchers({ comments: (n) => (n === 42 ? [OWNER_COMMENT, newer] : []) }));
+  assert.equal(ownerAnswers(root).length, 1);
+  assert.ok(ownerAnswers(root)[0].evidence.includes(newer.html_url), ownerAnswers(root)[0].evidence);
+});
+
+test('#419: a failed PR-number read loses only that read; the owner comment on the issue is still written', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const health = watch(root, fetchers({ comments: (n) => { if (n === 77) throw new Error('boom: pr comments down'); return [OWNER_COMMENT]; } }));
+  assert.equal(ownerAnswers(root).length, 1);
+  assert.equal(health.failures, 1);
+  assert.ok(health.actions.some((a) => a.includes('owner-answer check failed on #77')), JSON.stringify(health.actions));
+});
+
+test('#419: the since is the escalation event in the ledger, not the outbox cache: a lost outbox line does not move it', () => {
+  const root = rootDir();
+  const revision = seed(root);
+  workState.transitionRecord({
+    root, id: 'endzone:issue-42', to: 'escalated', expectedRevision: revision,
+    idempotencyKey: 'lead-esc', actor: 'pl-endzone', evidence: 'scope question: keep the old API?', now: '2030-01-01T00:00:00.000Z',
+  });
+  fs.rmSync(path.join(root, 'state', 'watch', 'wake-outbox.jsonl'), { force: true });
+  workState.observeRecord({ root, id: 'endzone:issue-42', expectedRevision: revision + 1, idempotencyKey: 'obs-after-escalation', observation: { digest: 'after' }, now: '2030-01-01T00:02:00.000Z' });
+  watch(root, fetchers({ comments: () => [{ ...OWNER_COMMENT, created_at: '2030-01-01T00:01:00Z' }] }));
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(ownerAnswers(root).length, 1);
+});
+
+test('#419: a dry run names the owner-answer it would write and writes no outbox line', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const health = watch(root, fetchers({ comments: (n) => (n === 42 ? [OWNER_COMMENT] : []) }), { dryRun: true });
+  assert.deepEqual(ownerAnswers(root), []);
+  assert.ok(health.actions.some((a) => a.startsWith('DRY endzone:issue-42: owner-answer wake')), JSON.stringify(health.actions));
+});
+
+test('#419: a record in hold is never read for an owner comment', () => {
+  const root = rootDir();
+  seed(root, { state: 'hold' });
+  const asked = [];
+  watch(root, fetchers({ open: [pr()], comments: (n) => { asked.push(n); return [OWNER_COMMENT]; } }));
+  assert.deepEqual(asked, []);
+  assert.deepEqual(ownerAnswers(root), []);
+});
+
+test('#419: a record that is not escalated never has its comments read', () => {
+  const root = rootDir();
+  seed(root);
+  const asked = [];
+  watch(root, fetchers({ comments: (n) => { asked.push(n); return [OWNER_COMMENT]; } }));
+  assert.deepEqual(asked, []);
+  assert.deepEqual(ownerAnswers(root), []);
+});
+
+test('#419: a tenant with no ownerLogin reads no comments and writes no owner-answer (fail closed)', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  const asked = [];
+  runWatch({ root, tenantName: 'endzone', tenantConfig: { ...TENANT, ownerLogin: undefined }, fetchers: fetchers({ comments: (n) => { asked.push(n); return [OWNER_COMMENT]; } }), shadow: false });
+  assert.deepEqual(asked, []);
+  assert.deepEqual(ownerAnswers(root), []);
+});
+
+test('#419: a failed comment read is noted in the health actions, and the other records still tick', () => {
+  const root = rootDir();
+  escalateByLead(root);
+  seed(root, { id: 'endzone:issue-43', issue: 43, prNumber: 78, state: 'pr-open' });
+  const open = [pr(), pr({ number: 78, headRefName: 'fleet/43-thing' })];
+  const health = watch(root, fetchers({ open, comments: () => { throw new Error('boom: comments down'); } }));
+  assert.equal(record(root, 'endzone:issue-43').state, 'ci-wait');
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(health.failures, 2, 'one per failed read: the issue and the PR');
+  assert.ok(health.actions.some((a) => a.startsWith('endzone:issue-42: owner-answer check failed') && a.includes('boom: comments down')), JSON.stringify(health.actions));
 });
 
 test('a watcher escalation self-resolves when linkage appears, then settles normally', () => {
