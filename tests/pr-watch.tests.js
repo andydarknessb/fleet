@@ -55,9 +55,10 @@ function pr(overrides = {}) {
 function view(overrides = {}) {
   return { number: 77, state: 'OPEN', isDraft: false, mergedAt: null, headRefOid: 'abc123', statusCheckRollup: [], closingIssuesReferences: [], body: '', ...overrides };
 }
-function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false, issueState = 'OPEN', failIssue = false, comments = () => [] } = {}) {
+function fetchers({ open = [pr()], viewResult = null, failList = false, failView = false, issueState = 'OPEN', failIssue = false, comments = () => [], closedAt = () => null } = {}) {
   return {
     issueComments: (n, since) => comments(n, since),
+    issueClosedAt: (n) => closedAt(n),
     issueState: () => { if (failIssue) throw new Error('boom: issue view down'); return issueState; },
     listOpenPrs: () => { if (failList) throw new Error('boom: api down'); return JSON.parse(JSON.stringify(open)); },
     viewPr: () => { if (failView) throw new Error('boom: view down'); return JSON.parse(JSON.stringify(viewResult)); },
@@ -451,6 +452,114 @@ test('#419: a failed comment read is noted in the health actions, and the other 
   assert.equal(record(root).state, 'escalated');
   assert.equal(health.failures, 2, 'one per failed read: the issue and the PR');
   assert.ok(health.actions.some((a) => a.startsWith('endzone:issue-42: owner-answer check failed') && a.includes('boom: comments down')), JSON.stringify(health.actions));
+});
+
+// fleet #432: an escalation with no PR and no manifest has nothing else to end it, so its issue closing after the
+// escalation abandons it. The abandoning tick writes no owner-answer: the record is gone.
+function escalateWithoutPr(root, manifestPath = null) {
+  workState.createRecord({
+    root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, state: 'implementing',
+    github: { issueNumber: 42 }, manifestPath, actor: 'test', idempotencyKey: 'create-42', now: now(),
+  });
+  workState.transitionRecord({
+    root, id: 'endzone:issue-42', to: 'escalated', expectedRevision: 1,
+    idempotencyKey: 'lead-esc', actor: 'pl-endzone', evidence: 'scope question: keep the old API?', now: now(),
+  });
+}
+
+test('#432: an escalation with no PR and no manifest is abandoned once its issue closes after the escalation: one resolution wake, no owner-answer, the abandon named', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const health = watch(root, fetchers({ closedAt: () => '2099-01-01T00:00:00Z', comments: () => [OWNER_COMMENT] }));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records['endzone:issue-42'], undefined);
+  assert.equal(record(root).state, 'abandoned');
+  assert.match(record(root).abandonment.reason, /issue #42 closed at 2099-01-01T00:00:00Z, after the escalation/);
+  const resolutions = outbox(root).filter((w) => w.wake === 'resolution');
+  assert.equal(resolutions.length, 1);
+  assert.equal(resolutions[0].recordId, 'endzone:issue-42');
+  assert.equal(resolutions[0].to, 'abandoned');
+  assert.equal(ownerAnswers(root).length, 0, 'the abandoning tick does not answer');
+  assert.ok(health.actions.includes('endzone:issue-42: abandoned, issue #42 closed at 2099-01-01T00:00:00Z after the escalation'), JSON.stringify(health.actions));
+});
+
+test('#432: an escalation with no PR and no manifest stays escalated while its issue is open, and the owner answer still lands', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  watch(root, fetchers({ closedAt: () => null, comments: () => [OWNER_COMMENT] }));
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(ownerAnswers(root).length, 1);
+});
+
+test('#432: an issue closed at or before the escalation leaves the record escalated', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const at = workState.enteringEvent(events(root), 'endzone:issue-42', 'escalated').at;
+  for (const closedAt of ['2000-01-01T00:00:00Z', at]) watch(root, fetchers({ closedAt: () => closedAt }));
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(record(root).revision, 2);
+});
+
+test('#432: a record with a PR or a manifest is never read for its issue, and both stay escalated', () => {
+  const asked = [];
+  const closedAt = (n) => { asked.push(n); throw new Error('boom: a record with a PR or a manifest must not read its issue'); };
+  const withPr = rootDir();
+  escalateByLead(withPr);
+  const withManifest = rootDir();
+  escalateWithoutPr(withManifest, path.join(withManifest, 'manifests', 'issue-42.json'));
+  for (const root of [withPr, withManifest]) {
+    watch(root, fetchers({ closedAt }));
+    assert.equal(record(root).state, 'escalated');
+  }
+  assert.deepEqual(asked, []);
+});
+
+test('#432: an unreadable issue retains the escalated record and counts a release failure, not a failed tick; the owner answer still runs', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const health = watch(root, fetchers({ closedAt: () => { throw new Error('boom: issue view down'); }, comments: () => [OWNER_COMMENT] }));
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(health.releaseFailures, 1);
+  assert.equal(health.failures, 0);
+  assert.equal(health.ok, true);
+  assert.ok(health.actions.some((a) => a.startsWith('endzone:issue-42: issue view failed, retained') && a.includes('boom: issue view down')), JSON.stringify(health.actions));
+  assert.equal(ownerAnswers(root).length, 1);
+});
+
+test('#432: an unreadable ledger retains the escalated record and counts the failure; the tick does not throw', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const eventsDir = path.join(root, 'state', 'events');
+  const file = fs.readdirSync(eventsDir).filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)).sort()[0];
+  fs.appendFileSync(path.join(eventsDir, file), 'not json\n');
+  // No owner login: ownerAnswerWake reads the same ledger and would count its own failure, so the count here is the abandon's alone.
+  const health = runWatch({ root, tenantName: 'endzone', tenantConfig: { ...TENANT, ownerLogin: undefined }, fetchers: fetchers({ closedAt: () => '2099-01-01T00:00:00Z' }), shadow: false });
+  assert.equal(record(root).state, 'escalated');
+  // Two counts from the one unreadable ledger: this abandon check, and releaseClosedIssueExclusions' exclusion ledger read (existing).
+  assert.equal(health.failures, 2, JSON.stringify(health.actions));
+  assert.ok(health.actions.some((a) => a.startsWith('endzone:issue-42: issue-closed check failed')), JSON.stringify(health.actions));
+});
+
+test('#432: a dry run names the abandon it would make, changes nothing, and writes no outbox line', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const before = record(root);
+  const lines = outbox(root).length;
+  const health = watch(root, fetchers({ closedAt: () => '2099-01-01T00:00:00Z', comments: () => [OWNER_COMMENT] }), { dryRun: true });
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(record(root).revision, before.revision);
+  assert.equal(outbox(root).length, lines);
+  assert.ok(health.actions.includes('DRY endzone:issue-42: abandon (issue #42 closed at 2099-01-01T00:00:00Z)'), JSON.stringify(health.actions));
+  assert.ok(!health.actions.some((a) => a.includes('owner-answer')), JSON.stringify(health.actions));
+});
+
+test('#432: a second tick after the abandon is a no-op: no second resolution wake', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const f = fetchers({ closedAt: () => '2099-01-01T00:00:00Z' });
+  watch(root, f);
+  const second = watch(root, f);
+  assert.equal(outbox(root).filter((w) => w.wake === 'resolution').length, 1);
+  assert.deepEqual(second.actions, []);
 });
 
 test('a watcher escalation self-resolves when linkage appears, then settles normally', () => {
