@@ -134,6 +134,16 @@ test('a bug that escaped from the PR that delivered an endorsed ticket writes th
   assert.equal(proposal.scan({ issues: [bug(32, 'No form here.', { comments: [comment] })] }).wrote, true);
 });
 
+test('#427: a blank form field with digits in a body Ruling section falls through to the newest Ruling line', () => {
+  const older = { id: 'c0', url: 'https://github.com/owner/repo/issues/34#issuecomment-0', author: 'andydarknessb-fleet', createdAt: '2026-10-08T11:31:00.000Z', body: '## Triage proposal (advisory)\nEscaped from: #999' };
+  const newest = { id: 'c1', url: 'https://github.com/owner/repo/issues/34#issuecomment-1', author: 'andydarknessb-fleet', createdAt: '2026-10-08T11:40:00.000Z', body: '## Ruling\nClassification: bug\nEscaped from: #1007' };
+  const w = world();
+  const result = w.scan({ issues: [bug(34, '### What happened\n\nboom\n\n### Escaped from PR #\n\n_No response_\n\n## Ruling\n\nThe live screen is `height: 128px` too tall.\n', { comments: [older, newest] })] });
+  assert.equal(result.wrote, true);
+  assert.equal(result.issue, 7);
+  assert.match(result.reason, /bug #34 escaped from PR #1007, which delivered endorsed ticket #7/);
+});
+
 test('a bug filed from the formal review of its own escaped-from PR is a review follow-up, not an escape (ruled 2026-10-09)', () => {
   const followUp = world();
   const result = followUp.scan({ issues: [bug(50, 'Follow-up from the formal review of PR #1007: the guard misses an empty list.\n\n### Escaped from PR #\n\n1007')] });
