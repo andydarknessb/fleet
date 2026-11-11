@@ -234,6 +234,42 @@ test('#426: a fixture assign with --adr-paths and no repository is not refused, 
   assert.deepEqual(result.manifest.adrPaths, ['docs/adr/0033-with-transaction.md']);
 });
 
+test('#426: a non-ASCII file name is matched as git lists it: the real name is accepted, a near miss is refused with the real name as its suggestion', () => {
+  const real = 'docs/adr/0033-caf\u00e9.md';
+  const { repo, head } = adrRepo([real]);
+  assert.deepEqual(adrAssignAt(rootDir(), repo, head, [real]).manifest.adrPaths, [real]);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr/0033-cafe.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [{ path: 'docs/adr/0033-cafe.md', suggestions: [real] }]);
+    return true;
+  });
+});
+
+test('#426: a git failure listing the directory refuses ADR_PATH_CHECK_FAILED, never ADR_PATH_NOT_FOUND, and writes no manifest and no Work record', () => {
+  const root = rootDir();
+  const { repo } = adrRepo(['docs/adr/0002-one-launch-door.md']);
+  const unknown = '0'.repeat(40);
+  assert.throws(() => adrAssignAt(root, repo, unknown, ['docs/adr/0002-one-launch-door.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_CHECK_FAILED');
+    assert.match(error.message, new RegExp(`the listing of docs/adr at ${unknown} could not be read: .*fatal`));
+    assert.equal(error.base, unknown);
+    return true;
+  });
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+  const manifests = path.join(root, 'state', 'manifests');
+  assert.equal(fs.existsSync(manifests) ? fs.readdirSync(manifests).length : 0, 0);
+});
+
+test('#426: a repeated --adr-paths entry is checked and listed once', () => {
+  const { repo, head } = adrRepo(['docs/adr/0002-one-launch-door.md']);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr/0033-with-transaction.md', 'docs/adr/0033-with-transaction.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.equal(error.missing.length, 1);
+    assert.match(error.message, /names 1 path\(s\)/);
+    return true;
+  });
+});
+
 test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 90 s (fleet#256)', () => {
   const root = rootDir();
   const result = reserveAssignment({

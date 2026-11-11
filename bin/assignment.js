@@ -726,11 +726,15 @@ function assignAdrPathCheck({ adrPaths = [], repoPath, base, runner = execFileSy
   if (!adrPaths.length || !repoPath) return;
   const listings = new Map();
   const missing = [];
-  for (const entry of adrPaths) {
-    const file = String(entry).replace(/\\/g, '/');
+  for (const file of new Set(adrPaths.map((entry) => String(entry).replace(/\\/g, '/')))) {
     const dir = path.posix.dirname(file);
     if (!listings.has(dir)) {
-      const raw = String(runner('git', ['-C', repoPath, 'ls-tree', base.sha, `${dir}/`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 10000 }));
+      let raw;
+      try {
+        raw = String(runner('git', ['-c', 'core.quotePath=false', '-C', repoPath, 'ls-tree', base.sha, `${dir}/`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 10000 }));
+      } catch (error) {
+        throw new WorkStateError('ADR_PATH_CHECK_FAILED', `the listing of ${dir} at ${base.sha} could not be read: ${String(error.stderr || error.message || error).trim()}`, { base: base.sha });
+      }
       listings.set(dir, [...raw.matchAll(/^\d+ blob [0-9a-f]+\t(.+)$/gm)].map((match) => match[1]));
     }
     const files = listings.get(dir);
