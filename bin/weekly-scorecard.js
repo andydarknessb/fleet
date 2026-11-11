@@ -276,10 +276,10 @@ function ledgerRows(base, events, week, settings) {
   return { rows, merged };
 }
 
-// The bug form's "Escaped from PR #" field: the first number under that heading, up to
-// the next heading. `_No response_` (the form's blank) or no heading at all is null.
+// The bug form's "Escaped from PR #" field: the first number under that heading, up to the next
+// heading of any level (# to ######). `_No response_` (the form's blank) or no heading at all is null.
 function parseEscapedFrom(body) {
-  const match = String(body || '').match(/^###\s*Escaped from PR #[ \t]*\r?\n([\s\S]*?)(?=^###\s|(?![\s\S]))/m);
+  const match = String(body || '').match(/^###\s*Escaped from PR #[ \t]*\r?\n([\s\S]*?)(?=^#{1,6}\s|(?![\s\S]))/m);
   if (!match) return null;
   const number = match[1].match(/#?(\d+)/);
   return number ? Number(number[1]) : null;

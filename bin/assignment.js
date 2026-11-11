@@ -718,6 +718,40 @@ function assignPremiseCheck({ issue, repoPath, base, premisesRechecked, runner }
   return check;
 }
 
+// fleet #426: an --adr-paths entry must be a file at the base the manifest records, or the IC
+// launches on a pointer to nothing. One `ls-tree` per directory answers both questions: is the
+// entry a file there, and which files share its number. A git failure throws rather than reading
+// as missing, and no repository (a fixture run) skips the check.
+function assignAdrPathCheck({ adrPaths = [], repoPath, base, runner = execFileSync }) {
+  if (!adrPaths.length || !repoPath) return;
+  const listings = new Map();
+  const missing = [];
+  for (const file of new Set(adrPaths.map((entry) => String(entry).replace(/\\/g, '/')))) {
+    const dir = path.posix.dirname(file);
+    if (!listings.has(dir)) {
+      let raw;
+      try {
+        raw = String(runner('git', ['-c', 'core.quotePath=false', '-C', repoPath, 'ls-tree', base.sha, `${dir}/`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 10000 }));
+      } catch (error) {
+        throw new WorkStateError('ADR_PATH_CHECK_FAILED', `the listing of ${dir} at ${base.sha} could not be read: ${String(error.stderr || error.message || error).trim()}`, { base: base.sha });
+      }
+      listings.set(dir, [...raw.matchAll(/^\d+ blob [0-9a-f]+\t(.+)$/gm)].map((match) => match[1]));
+    }
+    const files = listings.get(dir);
+    if (files.includes(file)) continue;
+    const number = /^(\d+)/.exec(path.posix.basename(file));
+    const suggestions = number ? files.filter((name) => path.posix.basename(name).startsWith(`${number[1]}-`)) : [];
+    missing.push({ path: file, suggestions });
+  }
+  if (!missing.length) return;
+  const list = missing.map(({ path: file, suggestions }) => {
+    const number = /^(\d+)/.exec(path.posix.basename(file));
+    const reason = suggestions.length ? `same number at the base: ${suggestions.join(', ')}` : number ? `no file numbered ${number[1]} at the base` : 'not a file at the base';
+    return `"${file}" (${reason})`;
+  }).join('; ');
+  throw new WorkStateError('ADR_PATH_NOT_FOUND', `--adr-paths names ${missing.length} path(s) that are not files at base ${base.sha}: ${list}. Re-run assign with the real path for each`, { missing, base: base.sha });
+}
+
 function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig = {}, active = [], skipIssues = {}, exclusions = [], readyLabel, repoPath, base, remote = 'origin', ref, parent, model, effort, permissions, risk, tokenBudget, contextHeadings, adrPaths, testPlan, ciGates, independenceProof: proof, reservations, premisesRechecked, now, actor = 'assignment-planner', runner, boundedReadies, windowNow } = {}) {
   const proofRecords = hydrateActiveReservations(active, issues, tenant);
   const explicit = explicitReservations(reservations);
@@ -748,6 +782,7 @@ function reserveAssignment({ root, issue, issues = [issue], tenant, tenantConfig
   }
   const resolvedBase = base || resolveRemoteBase({ repoPath, remote, ref: ref || tenantConfig.defaultBranch || 'integration', runner });
   const premiseCheck = assignPremiseCheck({ issue: normalized, repoPath, base: resolvedBase, premisesRechecked, runner });
+  assignAdrPathCheck({ adrPaths, repoPath, base: resolvedBase, runner });
   const workRecordId = `${tenant}:issue-${normalized.number}`;
   const baseline = reservationBaseline({ root, id: workRecordId });
   const activeAssignments = proofRecords.filter((record) => record.manifestPath && record.state !== 'retired');

@@ -4,7 +4,7 @@ const path = require('node:path');
 const { makeTempDir } = require('./temp-dir');
 const test = require('node:test');
 
-const { spawnSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 const {
   FLAGS,
@@ -164,6 +164,141 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.ok(launch.command.join(' ').includes('-Reason assignment'));
   acknowledgeAssignment({ root, workRecordId: manifest.workRecordId, expectedRevision: 1, now: '2026-09-01T00:01:00.000Z' });
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
+});
+
+// fleet #426: an --adr-paths entry must be a file at the base the manifest records. The
+// tenant checkout is a real repo with one commit, and `head` is the base assign reads.
+function adrRepo(files) {
+  const repo = makeTempDir('fleet-adr-repo-');
+  const git = (...args) => execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true }).trim();
+  git('init', '-q');
+  git('config', 'user.email', 'test@example.com');
+  git('config', 'user.name', 'test');
+  git('config', 'commit.gpgsign', 'false');
+  for (const file of files) {
+    fs.mkdirSync(path.join(repo, path.dirname(file)), { recursive: true });
+    fs.writeFileSync(path.join(repo, file), '# ADR\n');
+  }
+  git('add', '-A');
+  git('commit', '-q', '-m', 'adrs');
+  return { repo, head: git('rev-parse', 'HEAD') };
+}
+
+function adrAssignAt(root, repo, head, adrPaths) {
+  return reserveAssignment({
+    root, issue: issue(90), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    repoPath: repo, base: { remote: 'origin', ref: 'integration', sha: head }, adrPaths, now: '2026-09-24T00:00:00.000Z',
+  });
+}
+
+test('#426: an --adr-paths entry the base does not hold refuses ADR_PATH_NOT_FOUND, names it, and writes no manifest and no Work record', () => {
+  const root = rootDir();
+  const { repo, head } = adrRepo(['docs/adr/0002-one-launch-door.md']);
+  assert.throws(() => adrAssignAt(root, repo, head, ['docs/adr/0033-with-transaction.md', 'docs/adr/0002-one-launch-door.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.match(error.message, /docs\/adr\/0033-with-transaction\.md/);
+    assert.match(error.message, new RegExp(head));
+    return true;
+  });
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+  const manifests = path.join(root, 'state', 'manifests');
+  assert.equal(fs.existsSync(manifests) ? fs.readdirSync(manifests).length : 0, 0);
+});
+
+test('#426: the refusal suggests the files at the base with the same leading number, and no others', () => {
+  const root = rootDir();
+  const { repo, head } = adrRepo(['docs/adr/0033-transaction-boundary.md', 'docs/adr/0034-kickoff-waivers.md', 'docs/adr/0330-other.md']);
+  assert.throws(() => adrAssignAt(root, repo, head, ['docs/adr/0033-with-transaction.md', 'docs/adr/notes.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [
+      { path: 'docs/adr/0033-with-transaction.md', suggestions: ['docs/adr/0033-transaction-boundary.md'] },
+      { path: 'docs/adr/notes.md', suggestions: [] },
+    ]);
+    assert.equal(error.base, head);
+    assert.match(error.message, /docs\/adr\/0033-transaction-boundary\.md/);
+    assert.doesNotMatch(error.message, /docs\/adr\/0034|docs\/adr\/0330/);
+    return true;
+  });
+});
+
+test('#426: every --adr-paths entry a file at the base: assign succeeds, and the manifest keeps the paths as given', () => {
+  const root = rootDir();
+  const { repo, head } = adrRepo(['docs/adr/0002-one-launch-door.md']);
+  const reserved = adrAssignAt(root, repo, head, ['docs\\adr\\0002-one-launch-door.md']);
+  assert.deepEqual(reserved.manifest.adrPaths, ['docs\\adr\\0002-one-launch-door.md']);
+  assert.equal(getRecord({ root, id: 'endzone:issue-90' }).state, 'assigned');
+});
+
+test('#426: a fixture assign with --adr-paths and no repository is not refused, even for a path the base would not hold', () => {
+  const result = assignCli(['--adr-paths', 'docs/adr/0033-with-transaction.md']);
+  assert.deepEqual(result.manifest.adrPaths, ['docs/adr/0033-with-transaction.md']);
+});
+
+test('#426: a non-ASCII file name is matched as git lists it: the real name is accepted, a near miss is refused with the real name as its suggestion', () => {
+  const real = 'docs/adr/0033-caf\u00e9.md';
+  const { repo, head } = adrRepo([real]);
+  assert.deepEqual(adrAssignAt(rootDir(), repo, head, [real]).manifest.adrPaths, [real]);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr/0033-cafe.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [{ path: 'docs/adr/0033-cafe.md', suggestions: [real] }]);
+    return true;
+  });
+});
+
+test('#426: a git failure listing the directory refuses ADR_PATH_CHECK_FAILED, never ADR_PATH_NOT_FOUND, and writes no manifest and no Work record', () => {
+  const root = rootDir();
+  const { repo } = adrRepo(['docs/adr/0002-one-launch-door.md']);
+  const unknown = '0'.repeat(40);
+  assert.throws(() => adrAssignAt(root, repo, unknown, ['docs/adr/0002-one-launch-door.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_CHECK_FAILED');
+    assert.match(error.message, new RegExp(`the listing of docs/adr at ${unknown} could not be read: .*fatal`));
+    assert.equal(error.base, unknown);
+    return true;
+  });
+  assert.throws(() => getRecord({ root, id: 'endzone:issue-90' }), (error) => error.code === 'NOT_FOUND');
+  const manifests = path.join(root, 'state', 'manifests');
+  assert.equal(fs.existsSync(manifests) ? fs.readdirSync(manifests).length : 0, 0);
+});
+
+test('#426: a repeated --adr-paths entry is checked and listed once', () => {
+  const { repo, head } = adrRepo(['docs/adr/0002-one-launch-door.md']);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr/0033-with-transaction.md', 'docs/adr/0033-with-transaction.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.equal(error.missing.length, 1);
+    assert.match(error.message, /names 1 path\(s\)/);
+    return true;
+  });
+});
+
+test('#426: a glob or a bare number naming an ADR suggests the file at the base with that number, and no other', () => {
+  const { repo, head } = adrRepo(['docs/adr/0033-a-real-name.md', 'docs/adr/0330-other.md']);
+  for (const entry of ['docs/adr/0033*', 'docs/adr/0033*.md', 'docs/adr/0033']) {
+    assert.throws(() => adrAssignAt(rootDir(), repo, head, [entry]), (error) => {
+      assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+      assert.deepEqual(error.missing, [{ path: entry, suggestions: ['docs/adr/0033-a-real-name.md'] }]);
+      return true;
+    });
+  }
+});
+
+test('#426: a directory named as an --adr-paths entry is refused as not a file at the base, with no suggestion', () => {
+  const { repo, head } = adrRepo(['docs/adr/0033-a-real-name.md']);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [{ path: 'docs/adr', suggestions: [] }]);
+    assert.match(error.message, /not a file at the base/);
+    return true;
+  });
+});
+
+test('#426: an --adr-paths entry whose number no file at the base shares is refused as no file numbered that number', () => {
+  const { repo, head } = adrRepo(['docs/adr/0033-a-real-name.md', 'docs/adr/0330-other.md']);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr/0099-nothing.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [{ path: 'docs/adr/0099-nothing.md', suggestions: [] }]);
+    assert.match(error.message, /no file numbered 0099 at the base/);
+    return true;
+  });
 });
 
 test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 90 s (fleet#256)', () => {

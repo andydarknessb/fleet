@@ -287,6 +287,12 @@ test('#131: parseEscapedFrom reads the form heading and nothing else', () => {
   assert.equal(parseEscapedFrom(null), null);
 });
 
+test('#427: the form field ends at the next heading of any level, so a body Ruling or Premises section is not read', () => {
+  assert.equal(parseEscapedFrom('### Escaped from PR #\n\n_No response_\n\n## Premises\n\n- server/services/leagueSettings.service.js:537: the ROLLBACK is swallowed @abc1234\n'), null);
+  assert.equal(parseEscapedFrom('### Escaped from PR #\n_No response_\n\n\n\n## Ruling\n\nThe live screen is `height: 128px` too tall.\n'), null);
+  assert.equal(parseEscapedFrom('### Escaped from PR #\n\n#1545\n\n## Ruling\n\nSee PR #99.\n'), 1545);
+});
+
 test('#131: latestScorecard returns the newest file, or null when none exists', () => {
   const root = rootDir();
   assert.equal(latestScorecard(root), null);

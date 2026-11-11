@@ -85,7 +85,9 @@ function addCount(target, key, amount = 1) {
 function isFormalReviewTurn(text, toolCalls) {
   const toolReview = toolCalls.some((tool) => {
     const input = JSON.stringify(tool.input || {});
-    return tool.name === 'Skill' && /code-review|standards?.*spec/i.test(input);
+    // fleet #425: the lead's formal review is one code-reviewer spawn; the Skill branch reads older transcripts
+    return (tool.name === 'Skill' && /code-review|standards?.*spec/i.test(input))
+      || (['Agent', 'Task'].includes(tool.name) && tool.input?.subagent_type === 'code-reviewer');
   });
   const completedReview = /(?:standards?\s+and\s+spec(?:ification)?|formal|risk)\s+review\s+(?:passed|complete|finished)/i.test(text);
   return toolReview || completedReview;
