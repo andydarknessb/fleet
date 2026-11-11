@@ -138,7 +138,7 @@ test('#427: a blank form field with digits in a body Ruling section falls throug
   const older = { id: 'c0', url: 'https://github.com/owner/repo/issues/34#issuecomment-0', author: 'andydarknessb-fleet', createdAt: '2026-10-08T11:31:00.000Z', body: '## Triage proposal (advisory)\nEscaped from: #999' };
   const newest = { id: 'c1', url: 'https://github.com/owner/repo/issues/34#issuecomment-1', author: 'andydarknessb-fleet', createdAt: '2026-10-08T11:40:00.000Z', body: '## Ruling\nClassification: bug\nEscaped from: #1007' };
   const w = world();
-  const result = w.scan({ issues: [bug(34, '### What happened\n\nboom\n\n### Escaped from PR #\n\n_No response_\n\n## Ruling\n\nThe live screen is `height: 128px` too tall.\n', { comments: [older, newest] })] });
+  const result = w.scan({ issues: [bug(34, '### What happened\n\nboom\n\n### Escaped from PR #\n\n_No response_\n\n## Ruling\n\nThe live screen is `height: 128px` too tall.\n', { comments: [newest, older] })] });   // newest first: only the createdAt sort finds it
   assert.equal(result.wrote, true);
   assert.equal(result.issue, 7);
   assert.match(result.reason, /bug #34 escaped from PR #1007, which delivered endorsed ticket #7/);
