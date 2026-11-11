@@ -2230,6 +2230,66 @@ test('fleet #433: reserve falls back to 3 when the tenant maxIcs is missing or n
   }
 });
 
+// fleet#433: three active assignments (a manifest each), the third carrying its independence proof.
+function threeActiveAssignments(root) {
+  const subjects = [40, 41, 42].map((issue) => ({ issue, reservations: { components: [`bin/${issue}.js`] } }));
+  for (const [index, subject] of subjects.entries()) {
+    reserveRecord({ root, id: `endzone:issue-${subject.issue}`, tenant: 'endzone', issue: subject.issue, manifestPath: `m${subject.issue}`, reservations: subject.reservations, independenceProof: index === 2 ? proofFor(subjects) : undefined, idempotencyKey: `reserve-${subject.issue}`, now: '2026-09-01T00:00:00.000Z' });
+  }
+  return subjects;
+}
+
+// fleet #433: a reserve with no manifest (an escalation-only record) is not an assignment, so the CLI accepts it past three.
+test('fleet #433: CLI manifest-less reserve past three is accepted and can be escalated when maxIcs is unset', () => {
+  const root = rootDir();
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  const run = (...args) => JSON.parse(execFileSync(process.execPath, [script, ...args], { encoding: 'utf8' }));
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone' }));
+  threeActiveAssignments(root);
+  const reserved = run('reserve', '--root', root, '--id', 'endzone:issue-2837', '--tenant', 'endzone', '--issue', '2837', '--actor', 'pl-endzone', '--idempotency-key', 'reserve-2837');
+  assert.equal(reserved.record.state, 'assigned');
+  assert.equal(reserved.record.manifestPath, null);
+  const escalated = run('transition', '--root', root, '--id', 'endzone:issue-2837', '--to', 'escalated', '--expected-revision', String(reserved.revision), '--idempotency-key', 'esc-2837', '--actor', 'pl-endzone', '--evidence', 'needs a Ruling', '--no-notifier');
+  assert.equal(escalated.record.state, 'escalated');
+});
+
+test('fleet #433: CLI manifest-less reserve past three is accepted when the tenant maxIcs is 999', () => {
+  const root = rootDir();
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  const run = (...args) => JSON.parse(execFileSync(process.execPath, [script, ...args], { encoding: 'utf8' }));
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', maxIcs: 999 }));
+  threeActiveAssignments(root);
+  const reserved = run('reserve', '--root', root, '--id', 'endzone:issue-2837', '--tenant', 'endzone', '--issue', '2837', '--actor', 'pl-endzone', '--idempotency-key', 'reserve-2837');
+  assert.equal(reserved.record.state, 'assigned');
+  assert.equal(reserved.record.manifestPath, null);
+});
+
+test('fleet #433: a manifest-less reserve still refuses a reservation conflict past three', () => {
+  const root = rootDir();
+  threeActiveAssignments(root);
+  assert.throws(
+    () => reserveRecord({ root, id: 'endzone:issue-2837', tenant: 'endzone', issue: 2837, reservations: { components: ['bin/41.js'] }, idempotencyKey: 'reserve-2837', now: '2026-09-01T00:00:01.000Z' }),
+    (error) => error.code === 'RESERVATION_CONFLICT',
+  );
+});
+
+test('fleet #433: a manifest-less reserve is not counted by the third-assignment proof or the cap', () => {
+  const root = rootDir();
+  const pair = [40, 41].map((issue) => ({ issue, reservations: { components: [`bin/${issue}.js`] } }));
+  for (const subject of pair) reserveRecord({ root, id: `endzone:issue-${subject.issue}`, tenant: 'endzone', issue: subject.issue, manifestPath: `m${subject.issue}`, reservations: subject.reservations, idempotencyKey: `reserve-${subject.issue}`, now: '2026-09-01T00:00:00.000Z' });
+  reserveRecord({ root, id: 'endzone:issue-2837', tenant: 'endzone', issue: 2837, reservations: {}, idempotencyKey: 'reserve-2837', now: '2026-09-01T00:00:01.000Z' });
+  const third = { issue: 42, reservations: { components: ['bin/42.js'] } };
+  const reserved = reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: third.reservations, independenceProof: proofFor([...pair, third]), idempotencyKey: 'reserve-42', now: '2026-09-01T00:00:02.000Z' });
+  assert.equal(reserved.record.issue, 42);
+  const fourth = { issue: 43, reservations: { components: ['bin/43.js'] } };
+  assert.throws(
+    () => reserveRecord({ root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43, manifestPath: 'm43', reservations: fourth.reservations, independenceProof: proofFor([...pair, third, fourth]), idempotencyKey: 'reserve-43', now: '2026-09-01T00:00:03.000Z' }),
+    (error) => error.code === 'MAX_ICS_REACHED' && /3\/3/.test(error.message),
+  );
+});
+
 // fleet #362: a create refused on a released or abandoned record names the door that reuses it (the id, tenant and issue).
 test('fleet #362: RECORD_RELEASED and RECORD_ABANDONED name the reserve door', () => {
   const root = rootDir();
