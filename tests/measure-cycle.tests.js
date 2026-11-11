@@ -118,6 +118,20 @@ test('parseTranscript records usage, model, messages, review, PR, and stop-hook 
   assert.equal(parsed.wallTimeMs, 4000);
 });
 
+test('#425: a lead turn that spawns a code-reviewer is one formal review pass; a researcher spawn is not', () => {
+  const spawn = (id, subagentType) => [
+    { type: 'custom-title', customTitle: 'pl-9', sessionId: 'session-9' },
+    assistant({
+      uuid: id, timestamp: '2026-11-11T00:00:00.000Z',
+      content: [{ type: 'tool_use', id, name: 'Agent', input: { subagent_type: subagentType, prompt: 'Review PR 77.' } }],
+      usage: { input: 1, output: 1 },
+    }),
+  ].map(line).join('\n');
+
+  assert.equal(parseTranscript(spawn('review', 'code-reviewer'), 'fixture/review.jsonl').formalReviewPasses, 1);
+  assert.equal(parseTranscript(spawn('research', 'researcher'), 'fixture/research.jsonl').formalReviewPasses, 0);
+});
+
 test('first useful turn skips an empty startup acknowledgement', () => {
   const parsed = parseTranscript([
     { type: 'custom-title', customTitle: 'ic-9', sessionId: 'session-9' },

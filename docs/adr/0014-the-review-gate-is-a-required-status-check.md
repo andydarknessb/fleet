@@ -61,3 +61,30 @@ before. Only tenants with a separate integration branch have Reconcile PRs
 The audit behind it: Reconcile PRs were the slowest pull requests of the two
 weeks to 2026-11-06 (191, 91 and 22 hours on endzone, 34 on statelite), and
 endzone's pipeline stopped for a week behind one. Implemented by fleet #390.
+
+## Amendment 2026-11-11 - a code reviewer worker reads the diff for the formal review (fleet #425, owner ruling)
+
+Cory asked for a code reviewer role, 2026-11-11. The owner session ruled its
+shape:
+
+1. The role is a worker, not a session: `agents/code-reviewer.md`,
+   `claude-sonnet-5-5` at xhigh, read-only. It has no roster row and the launch
+   door does not change.
+2. The project lead spawns exactly one per PR in `review`, and one per
+   re-review round. It replaces the two `/code-review` finders.
+3. The reviewer's read is the exhaustive one, at the lead's two angles,
+   Standards and Spec. The lead reads what each finding cites, enough to verify
+   it, and does not read the whole diff a second time.
+4. The formal artifact, its actor (`pl-<tenant>`), the review status and every
+   gate in `bin/review-policy.js` stay as they are.
+5. The `qa-reviewer` keeps its model, effort and trigger (ADR 0017, amendment
+   of 2026-11-06).
+6. The scorecard's escaped-defects line and the weekly second read are the
+   watch. If escaped defects rise after this lands, the lead goes back to
+   reading the diff.
+
+In the two weeks to 2026-11-11 the lead's formal reviews recorded no blocker
+and 25 majors over 288 artifacts, while the risk reviewer, a focused worker at
+xhigh, recorded 7 blockers and 26 majors over 135. In the week to 2026-11-10
+a statelite project lead session spent a median of 198K fresh tokens, and most
+sessions held one review.

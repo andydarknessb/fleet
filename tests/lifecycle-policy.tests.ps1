@@ -11,6 +11,15 @@ $retire = Get-Content "$root\bin\retire.ps1" -Raw -Encoding UTF8
 Assert-Match $ic 'Closes #n.*only when.*every issue criterion' 'IC closing keywords must be conditional on complete issue satisfaction'
 Assert-Match $ic 'otherwise use `Refs #n`' 'IC instructions must provide the non-closing reference path'
 
+# Fleet #425: the code reviewer worker's pins, and the lead's review step that names it.
+$codeReviewer = Get-Content "$root\agents\code-reviewer.md" -Raw -Encoding UTF8
+$lead = Get-Content "$root\agents\project-lead.md" -Raw -Encoding UTF8
+Assert-Match $codeReviewer '(?m)^model: claude-sonnet-5-5\r?$' 'The code reviewer must pin claude-sonnet-5-5'
+Assert-Match $codeReviewer '(?m)^effort: xhigh\r?$' 'The code reviewer must run at xhigh effort'
+Assert-Match $codeReviewer '(?m)^tools: Read, Grep, Glob, Bash\r?$' 'The code reviewer must be read-only: Read, Grep, Glob, Bash'
+Assert-Match $lead 'subagent_type: "code-reviewer"' 'The project lead must spawn the code reviewer by subagent_type'
+Assert-True (-not $lead.Contains('`/code-review`')) 'The project lead must not run the /code-review finders any more'
+
 # The Sentinel role file (agents/sentinel.md) that once stated the open-PR stale-heartbeat
 # exemption in prose was retired by ticket 89 (after one release); no assertion was added
 # in its place, because none was needed - the surviving assertions already cover the
