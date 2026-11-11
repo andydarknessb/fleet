@@ -1067,6 +1067,8 @@ try {
   if (-not $wakeState) { $wakeState = [pscustomobject]@{ tenants = [pscustomobject]@{} } }
   if ($null -eq $wakeState.PSObject.Properties['tenants']) { $wakeState | Add-Member -NotePropertyName tenants -NotePropertyValue ([pscustomobject]@{}) -Force }
   if ($null -eq $wakeState.PSObject.Properties['stalls']) { $wakeState | Add-Member -NotePropertyName stalls -NotePropertyValue ([pscustomobject]@{}) -Force }
+  # fleet #418: an entry written before the fix holds {} where a stamp was missing; read it as $null.
+  foreach ($sp in @($wakeState.stalls.PSObject.Properties)) { foreach ($stamp in @('deliveredAt', 'escalatedAt')) { if ($sp.Value -and $sp.Value.PSObject.Properties[$stamp] -and $sp.Value.$stamp -is [pscustomobject]) { $sp.Value.$stamp = $null } } }
   if ($null -eq $wakeState.PSObject.Properties['legacyHolds']) { $wakeState | Add-Member -NotePropertyName legacyHolds -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
   # fleet #346: an empty or lead-less roster is a read glitch (Save-LiveRoster is not atomic), never "every IC left": no stall evaluation or pruning on it.
@@ -1106,7 +1108,9 @@ try {
           $due = if ($deliveredAt) { ($now - $deliveredAt).TotalMinutes -ge $stallEscalateAfter } else { ($now - $since).TotalMinutes -ge ($stallThreshold + $stallEscalateAfter) }
           if ($due -and -not $escalated) {
             $stall.outcome = 'escalated'
-            $wakeState.stalls | Add-Member -NotePropertyName $stall.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = $(if ($deliveredAt) { $deliveredAt.ToString('o') }); escalatedAt = (Now-Iso) }) -Force
+            # fleet #418: $(if ...) with no output is AutomationNull, which ConvertTo-Json writes as {} (truthy when read back): store a real $null.
+            $deliveredIso = $null; if ($deliveredAt) { $deliveredIso = $deliveredAt.ToString('o') }
+            $wakeState.stalls | Add-Member -NotePropertyName $stall.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = $deliveredIso; escalatedAt = (Now-Iso) }) -Force
             $escalated = $true
           }
           $tenantStalls += $stall
@@ -1216,7 +1220,8 @@ try {
         foreach ($holdId in $dueHolds) { $wakeState.legacyHolds | Add-Member -NotePropertyName $holdId -NotePropertyValue (Now-Iso) -Force }
         foreach ($ns in $newStalls) {
           $prior = $null; if ($wakeState.stalls.PSObject.Properties[$ns.id]) { $prior = $wakeState.stalls.($ns.id) }
-          $wakeState.stalls | Add-Member -NotePropertyName $ns.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = (Now-Iso); escalatedAt = $(if ($prior) { $prior.escalatedAt }) }) -Force
+          $escalatedIso = $null; if ($prior) { $escalatedIso = $prior.escalatedAt }
+          $wakeState.stalls | Add-Member -NotePropertyName $ns.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = (Now-Iso); escalatedAt = $escalatedIso }) -Force
         }
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
         try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
