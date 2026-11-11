@@ -270,6 +270,37 @@ test('#426: a repeated --adr-paths entry is checked and listed once', () => {
   });
 });
 
+test('#426: a glob or a bare number naming an ADR suggests the file at the base with that number, and no other', () => {
+  const { repo, head } = adrRepo(['docs/adr/0033-a-real-name.md', 'docs/adr/0330-other.md']);
+  for (const entry of ['docs/adr/0033*', 'docs/adr/0033*.md', 'docs/adr/0033']) {
+    assert.throws(() => adrAssignAt(rootDir(), repo, head, [entry]), (error) => {
+      assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+      assert.deepEqual(error.missing, [{ path: entry, suggestions: ['docs/adr/0033-a-real-name.md'] }]);
+      return true;
+    });
+  }
+});
+
+test('#426: a directory named as an --adr-paths entry is refused as not a file at the base, with no suggestion', () => {
+  const { repo, head } = adrRepo(['docs/adr/0033-a-real-name.md']);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [{ path: 'docs/adr', suggestions: [] }]);
+    assert.match(error.message, /not a file at the base/);
+    return true;
+  });
+});
+
+test('#426: an --adr-paths entry whose number no file at the base shares is refused as no file numbered that number', () => {
+  const { repo, head } = adrRepo(['docs/adr/0033-a-real-name.md', 'docs/adr/0330-other.md']);
+  assert.throws(() => adrAssignAt(rootDir(), repo, head, ['docs/adr/0099-nothing.md']), (error) => {
+    assert.equal(error.code, 'ADR_PATH_NOT_FOUND');
+    assert.deepEqual(error.missing, [{ path: 'docs/adr/0099-nothing.md', suggestions: [] }]);
+    assert.match(error.message, /no file numbered 0099 at the base/);
+    return true;
+  });
+});
+
 test('a nonzero launch.ps1 exit carries its refusal JSON into LAUNCH_FAILED, and the launch budget is 90 s (fleet#256)', () => {
   const root = rootDir();
   const result = reserveAssignment({

@@ -739,12 +739,16 @@ function assignAdrPathCheck({ adrPaths = [], repoPath, base, runner = execFileSy
     }
     const files = listings.get(dir);
     if (files.includes(file)) continue;
-    const number = /^(\d+)-/.exec(path.posix.basename(file));
+    const number = /^(\d+)/.exec(path.posix.basename(file));
     const suggestions = number ? files.filter((name) => path.posix.basename(name).startsWith(`${number[1]}-`)) : [];
     missing.push({ path: file, suggestions });
   }
   if (!missing.length) return;
-  const list = missing.map(({ path: file, suggestions }) => `"${file}" (${suggestions.length ? `same number at the base: ${suggestions.join(', ')}` : 'no file with its number at the base'})`).join('; ');
+  const list = missing.map(({ path: file, suggestions }) => {
+    const number = /^(\d+)/.exec(path.posix.basename(file));
+    const reason = suggestions.length ? `same number at the base: ${suggestions.join(', ')}` : number ? `no file numbered ${number[1]} at the base` : 'not a file at the base';
+    return `"${file}" (${reason})`;
+  }).join('; ');
   throw new WorkStateError('ADR_PATH_NOT_FOUND', `--adr-paths names ${missing.length} path(s) that are not files at base ${base.sha}: ${list}. Re-run assign with the real path for each`, { missing, base: base.sha });
 }
 
