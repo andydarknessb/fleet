@@ -2,7 +2,7 @@
   "name": "nidus",
   "repo": "E:\\Nidus",
   "github": "andydarknessb/Nidus",
-  "defaultBranch": "master",
+  "defaultBranch": "owner/v19",
   "releaseBranch": "master",
   "readyLabel": "ready-for-agent",
   "fleetIdentity": "andydarknessb-fleet",
