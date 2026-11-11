@@ -499,6 +499,7 @@ try {
   Assert-True ((Get-StallEscalations).Count -eq 0) 'T1: no escalation yet'
   $t1b = Run-Watchdog
   Assert-True (@(Get-RotateCalls).Count -eq 1 -and @($t1b.stalls)[0].outcome -ne 'woken') 'T1: the same identity is not woken twice'
+  Assert-True ((Get-StallEscalations).Count -eq 0) 'T1: a delivered stall files no escalation on the next tick'
 
   # T2: not stalled.
   foreach ($case in @(
@@ -554,6 +555,33 @@ try {
   $null = Run-Watchdog
   Assert-True ((Get-StallEscalations).Count -eq 0) 'T4: a never-woken stall 200 min old files none'
   Remove-Item "$testRoot\profile\.claude\jobs\job-p" -Recurse -ErrorAction SilentlyContinue
+
+  # T4b: a stall escalated while the lead was busy (never woken) still wakes the lead once the lead is idle.
+  Set-StallCase -HbMin 241 -UpdatedMin 300
+  Set-BusyLead
+  $null = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq 0 -and (Get-StallEscalations).Count -eq 1) "T4b: busy lead, stall 241 min old: no rotate and one escalation (got $(@(Get-RotateCalls).Count) rotates, $((Get-StallEscalations).Count) escalations)"
+  Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-240)) + '},{"id":"job-i","name":"ic-1","state":"working","status":"idle","pid":14,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-300)) + '}]')
+  Remove-Item "$testRoot\profile\.claude\jobs\job-p" -Recurse -ErrorAction SilentlyContinue
+  $t4b2 = Run-Watchdog; $wt4b2 = Get-TestWake $t4b2
+  Assert-True ($wt4b2.decision -eq 'woken' -and ((@($wt4b2.evidence) -join '; ') -match 'stall ic-1')) "T4b: an idle lead is woken for the escalated, never-woken stall (got $($wt4b2.decision): '$($wt4b2.reason)' '$(@($wt4b2.evidence) -join '; ')')"
+  $sid4b = Get-StallId; $se4b = (Get-Content "$testRoot\state\watchdog\frontier-wake.json" -Raw | ConvertFrom-Json).stalls.($sid4b)
+  Assert-True ($se4b.deliveredAt -is [string] -and $se4b.escalatedAt -is [string]) "T4b: the woken stall entry stores both stamps as strings (got $($se4b | ConvertTo-Json -Compress))"
+  Assert-True (@(Get-RotateCalls).Count -eq 1 -and (Get-StallEscalations).Count -eq 1) "T4b: exactly one rotate and still one escalation (got $(@(Get-RotateCalls).Count) rotates, $((Get-StallEscalations).Count) escalations)"
+  $null = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq 1 -and (Get-StallEscalations).Count -eq 1) "T4b: the next tick neither wakes again nor files another escalation (got $(@(Get-RotateCalls).Count) rotates, $((Get-StallEscalations).Count) escalations)"
+
+  # T4c (fleet #418): an entry written before the fix holds {} where a stamp was missing; read it as no stamp.
+  # (a) escalated, never delivered: the idle lead is woken for it once.
+  Set-StallCase -HbMin 241 -UpdatedMin 300
+  Write-Utf8 "$testRoot\state\watchdog\frontier-wake.json" ('{"tenants":{},"stalls":{"' + (Get-StallId) + '":{"deliveredAt":{},"escalatedAt":"' + (Get-Iso 5) + '"}}}')
+  $t4c1 = Run-Watchdog; $wt4c1 = Get-TestWake $t4c1
+  Assert-True ($wt4c1.decision -eq 'woken' -and ((@($wt4c1.evidence) -join '; ') -match 'stall ic-1') -and @(Get-RotateCalls).Count -eq 1 -and @($t4c1.stalls)[0].outcome -eq 'woken') "T4c: an escalated, never-delivered entry with {} for deliveredAt wakes the idle lead once with stall evidence, outcome woken (got $($wt4c1.decision): '$(@($wt4c1.evidence) -join '; ')', $(@(Get-RotateCalls).Count) rotates, outcome $(@($t4c1.stalls)[0].outcome))"
+  # (b) delivered 10 min ago with {} for escalatedAt: not yet due, so no second wake and no escalation.
+  Set-StallCase
+  Write-Utf8 "$testRoot\state\watchdog\frontier-wake.json" ('{"tenants":{},"stalls":{"' + (Get-StallId) + '":{"deliveredAt":"' + (Get-Iso 10) + '","escalatedAt":{}}}}')
+  $null = Run-Watchdog
+  Assert-True (@(Get-RotateCalls).Count -eq 0 -and (Get-StallEscalations).Count -eq 0) "T4c: delivered 10 min ago with {} for escalatedAt: no second wake and no escalation (got $(@(Get-RotateCalls).Count) rotates, $((Get-StallEscalations).Count) escalations)"
 
   # T5: a newer heartbeat clears the stall: no evidence, no escalation (even with an old delivery recorded).
   Set-StallCase
