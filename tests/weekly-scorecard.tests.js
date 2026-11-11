@@ -293,6 +293,15 @@ test('#427: the form field ends at the next heading of any level, so a body Ruli
   assert.equal(parseEscapedFrom('### Escaped from PR #\n\n#1545\n\n## Ruling\n\nSee PR #99.\n'), 1545);
 });
 
+test('#429: parseEscapedFrom reads the heading with or without its #, and only the form field', () => {
+  assert.equal(parseEscapedFrom('### What happened\n\nboom\n\n### Escaped from PR\n#2264 (found in QA of #2266, nit 1).\n'), 2264);
+  assert.equal(parseEscapedFrom('### Escaped from PR\n\n_No response_\n\n## Ruling\n\nline 128\n'), null);
+  assert.equal(parseEscapedFrom('### Escaped from PR\n#1238 added the advice read; #1856 added reload(); #2171 rebuilt the write.\n\n### Other\n\n9'), 1238);
+  assert.equal(parseEscapedFrom('Ruled: Endorsed with edits. Escaped from: #2.\n\n**What happens.** The scheduler runs only in the worker.\n'), null);
+  assert.equal(parseEscapedFrom('### Escaped from PR #\n\n1545\n'), 1545);
+  assert.equal(parseEscapedFrom('### Escaped from PRs we reverted\n\n77\n'), null);
+});
+
 test('#131: latestScorecard returns the newest file, or null when none exists', () => {
   const root = rootDir();
   assert.equal(latestScorecard(root), null);
