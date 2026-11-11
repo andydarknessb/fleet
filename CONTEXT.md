@@ -310,7 +310,7 @@ fleet PR in `review`, and once per re-review round. It reads the whole diff at
 the Standards and Spec angles and returns findings; the lead verifies every
 claim, decides, and records the one formal review. It never merges, sends a PR
 back, posts or edits.
-_Avoid_: second reviewer, QA, risk reviewer
+_Avoid_: finder, QA, risk reviewer
 
 **Risk reviewer**:
 An ephemeral, read-only `qa-reviewer` worker added to a Unit of work only when
