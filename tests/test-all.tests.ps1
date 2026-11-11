@@ -5,6 +5,8 @@
 # #278 red-tell: a suite that exits 0 but leaves a fleet-* directory in TEMP is FAIL and
 # the directory is gone afterwards; a green run leaves no fleet-test-all-* log dir behind.
 # Before #278 the leaky suites passed and every run left its LogDir in TEMP.
+# #416 red-tell: a suite cannot see a gh.exe that is on the runner's PATH, and a gh that node
+# can still reach makes the runner exit 2. Before #416 the suite saw it and the runner ran.
 $ErrorActionPreference = 'Stop'
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
@@ -121,6 +123,30 @@ try {
   $tooLong = Join-Path $fixture ('x' * 200)
   $long = Run-Runner @('-Filter', '[ag]*', '-LogDir', $tooLong)
   Assert-True ($script:lastExit -eq 2 -and $long -match 'too long') "a -LogDir too long for the suites' TEMP is refused, got $($script:lastExit): $long"
+
+  # Fleet #416: the runner strips every PATH directory holding a gh.exe, so a suite cannot see it; a gh.com
+  # survives the strip, node resolves gh to it, and the runner refuses to start any suite.
+  $ghSuites = Join-Path $fixture 'gh-suites'
+  $ghExeDir = Join-Path $fixture 'gh-exe'
+  $ghComDir = Join-Path $fixture 'gh-com'
+  foreach ($dir in @($ghSuites, $ghExeDir, $ghComDir)) { [IO.Directory]::CreateDirectory($dir) | Out-Null }
+  Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\whoami.exe') -Destination "$ghExeDir\gh.exe"
+  Copy-Item -LiteralPath (Join-Path $env:SystemRoot 'System32\whoami.exe') -Destination "$ghComDir\gh.com"
+  Write-Utf8 "$ghSuites\sees-gh.tests.ps1" "`$ErrorActionPreference = 'Stop'`nif (Get-Command gh.exe -ErrorAction SilentlyContinue) { exit 1 }`nexit 0`n"
+  $oldPath = $env:PATH
+  try {
+    $env:PATH = "$ghExeDir;$oldPath"
+    $ghOut = Run-Runner @() $ghSuites
+    $ghOutExit = $script:lastExit
+    $env:PATH = "$ghComDir;$oldPath"
+    $ghRefused = Run-Runner @() $ghSuites
+    $ghRefusedExit = $script:lastExit
+  } finally { $env:PATH = $oldPath }
+  Assert-True ($ghOutExit -eq 0) "a suite cannot see a gh.exe on PATH, the runner strips it; got $($ghOutExit): $ghOut"
+  Assert-True ($ghOut -match '(?m)^PASS  sees-gh\.tests\.ps1  exit=0') "the fixture suite is PASS with the gh.exe directory off PATH: $ghOut"
+  Assert-True ($ghRefusedExit -eq 2) "a node-reachable gh.com makes the runner exit 2, got $($ghRefusedExit): $ghRefused"
+  Assert-True ($ghRefused -match '(?m)^test-all: .*#416') "the refusal names fleet #416: $ghRefused"
+  Assert-True ($ghRefused -notmatch '(?m)^(PASS|FAIL)  ') "the refusal runs no suite: $ghRefused"
 
   Write-Output 'test-all.tests.ps1: all assertions passed'
 } finally {

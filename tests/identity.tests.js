@@ -87,10 +87,20 @@ test('gitConfigText: includes the real system config first, then resets the help
 
 test('the session env routes a real `git credential fill` to the fleet token, bypassing the credential manager', () => {
   const dir = identityDir({ login: 'endzone-fleet', token: 'ghp_route_probe' });
-  identity.ensureGitConfig(dir);
+  // The runner takes the real gh off PATH (fleet #416), so a stand-in gh answers git from this hosts.yml; the empty global config hides a host's own helper.
+  const stub = tmp('fleet-identity-gh-');
+  fs.writeFileSync(path.join(stub, 'gh'), [
+    '#!/bin/sh',
+    '[ "$3" = get ] || exit 0',
+    `sed -n 's/^    user: /username=/p; s/^    oauth_token: /password=/p' "$GH_CONFIG_DIR/hosts.yml"`,
+    '',
+  ].join('\n'), 'utf8');
+  identity.ensureGitConfig(dir, { env: { ...process.env, PATH: [stub, process.env.PATH].join(path.delimiter) } });
+  const globalFile = path.join(tmp('fleet-identity-global-'), '.gitconfig');
+  fs.writeFileSync(globalFile, '', 'utf8');
   const out = execFileSync('git', ['credential', 'fill'], {
     input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8', windowsHide: true,
-    env: { ...process.env, ...identity.sessionEnv(dir) },
+    env: { ...process.env, GIT_CONFIG_GLOBAL: globalFile, ...identity.sessionEnv(dir) },
   });
   assert.match(out, /username=endzone-fleet/);
   assert.match(out, /password=ghp_route_probe/);

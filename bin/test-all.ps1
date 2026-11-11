@@ -18,6 +18,8 @@
 # removes the default -LogDir too (exit 1 naming it if that fails); a failed run keeps it and
 # prints the path. An explicit -LogDir is never removed; only the per-run t<N>-<hex> directories
 # the runner created inside it are.
+# Each suite runs with the real gh off PATH (fleet #416): a node child runs gh without a shell,
+# skips a gh.cmd mock and reaches the real gh.exe. Exit 2 when node can still reach a gh.
 param(
   [string]$Filter = '*',
   [string]$TestsDir = '',
@@ -59,6 +61,16 @@ if (($LogDir.Length + 14) -gt $maxTempPath) {
   Write-Output "test-all: -LogDir '$LogDir' is too long; each suite's TEMP under it must stay within $maxTempPath characters"
   exit 2
 }
+$pathWithoutGh = (@($env:PATH -split ';') | Where-Object { $_ -and -not [IO.File]::Exists("$_\gh.exe") }) -join ';'
+if ($node) {
+  $runnerPath = $env:PATH
+  $env:PATH = $pathWithoutGh
+  try { & $node.Source -e "try{require('child_process').execFileSync('gh',['--version'],{stdio:'ignore'});process.exit(1)}catch(e){process.exit(e.code==='ENOENT'?0:1)}" } finally { $env:PATH = $runnerPath }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Output 'test-all: a real gh is still reachable from node children with gh.exe off PATH (fleet #416); no suite was run'
+    exit 2
+  }
+}
 [IO.Directory]::CreateDirectory($LogDir) | Out-Null
 
 $failed = New-Object System.Collections.Generic.List[string]
@@ -79,13 +91,13 @@ foreach ($suite in $suites) {
   # The hex makes it unique per run: an explicit -LogDir may already hold a t<N> the runner must not touch.
   $suiteTemp = Join-Path $LogDir ('t' + $suiteIndex + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
   [IO.Directory]::CreateDirectory($suiteTemp) | Out-Null
-  $savedTemp = $env:TEMP; $savedTmp = $env:TMP
-  $env:TEMP = $suiteTemp; $env:TMP = $suiteTemp
+  $savedTemp = $env:TEMP; $savedTmp = $env:TMP; $savedPath = $env:PATH
+  $env:TEMP = $suiteTemp; $env:TMP = $suiteTemp; $env:PATH = $pathWithoutGh
   $clock = [Diagnostics.Stopwatch]::StartNew()
   try {
     $process = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $fleetRoot `
       -RedirectStandardOutput $log -RedirectStandardError $errLog -NoNewWindow -PassThru
-  } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
+  } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp; $env:PATH = $savedPath }
   # Windows PowerShell 5.1: ExitCode reads back null unless the handle was taken
   # while the process was alive.
   $null = $process.Handle
