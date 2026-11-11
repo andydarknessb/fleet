@@ -2211,20 +2211,23 @@ test('fleet #433: CLI reserve honors the tenant file maxIcs when no option is pa
   assert.equal(reserved.record.issue, 43);
 });
 
-test('fleet #433: reserve falls back to 3 when the tenant file names no maxIcs', () => {
-  const root = rootDir();
-  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone' }));
+test('fleet #433: reserve falls back to 3 when the tenant maxIcs is missing or not positive', () => {
   const subjects = [40, 41, 42].map((issue) => ({ issue, reservations: { components: [`bin/${issue}.js`] } }));
-  for (const [index, subject] of subjects.entries()) {
-    reserveRecord({ root, id: `endzone:issue-${subject.issue}`, tenant: 'endzone', issue: subject.issue, manifestPath: `m${subject.issue}`, reservations: subject.reservations, independenceProof: index === 2 ? proofFor(subjects) : undefined, idempotencyKey: `reserve-${subject.issue}`, now: '2026-09-01T00:00:00.000Z' });
-  }
   const fourth = { issue: 43, reservations: { components: ['bin/43.js'] } };
   const proof = proofFor([...subjects, fourth]);
-  assert.throws(
-    () => reserveRecord({ root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43, manifestPath: 'm43', reservations: fourth.reservations, independenceProof: proof, idempotencyKey: 'reserve-43', now: '2026-09-01T00:00:01.000Z' }),
-    (error) => error.code === 'MAX_ICS_REACHED' && /3\/3/.test(error.message),
-  );
+  for (const tenant of [{ name: 'endzone' }, { name: 'endzone', maxIcs: 0 }, { name: 'endzone', maxIcs: -1 }]) {
+    const root = rootDir();
+    fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify(tenant));
+    for (const [index, subject] of subjects.entries()) {
+      reserveRecord({ root, id: `endzone:issue-${subject.issue}`, tenant: 'endzone', issue: subject.issue, manifestPath: `m${subject.issue}`, reservations: subject.reservations, independenceProof: index === 2 ? proofFor(subjects) : undefined, idempotencyKey: `reserve-${subject.issue}`, now: '2026-09-01T00:00:00.000Z' });
+    }
+    assert.throws(
+      () => reserveRecord({ root, id: 'endzone:issue-43', tenant: 'endzone', issue: 43, manifestPath: 'm43', reservations: fourth.reservations, independenceProof: proof, idempotencyKey: 'reserve-43', now: '2026-09-01T00:00:01.000Z' }),
+      (error) => error.code === 'MAX_ICS_REACHED' && /3\/3/.test(error.message),
+      JSON.stringify(tenant),
+    );
+  }
 });
 
 // fleet #362: a create refused on a released or abandoned record names the door that reuses it (the id, tenant and issue).

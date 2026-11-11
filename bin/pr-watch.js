@@ -4,7 +4,9 @@
 // project-lead wake (checks-settled | checks-failed | decision-needed; the state door adds
 // `resolution` when a record leaves escalated or hold, #204; `owner-answer` when the owner
 // comments on an escalated record, #419: re-derived from GitHub each tick and keyed by comment
-// id, so it has no ledger event and a lost outbox line is rewritten), and #432 abandons an escalated record with no PR and no manifest once GitHub reads its issue as CLOSED after the escalation. The EVENT
+// id, so it has no ledger event and a lost outbox line is rewritten). #432 abandons an escalated record with no PR
+// and no manifest once GitHub reads its issue as CLOSED after the escalation; the abandon writes its own `resolution`
+// wake. The EVENT
 // LEDGER is the authoritative wake record (changes.wake on observations, a
 // `wake:<kind>; ` evidence prefix on transitions); state/watch/wake-outbox.jsonl is a
 // best-effort convenience cache written after commit. A decision-needed wake also
@@ -20,7 +22,8 @@
 // so every key is scoped to the record revision it acts on (novelty detection is
 // digest-vs-stored-observation); multi-hop paths are computed from the store's own
 // TRANSITIONS, never hand-coded; the watcher resolves only escalations it raised
-// (its decisionEvidence starts with the [pr-watch] mark), except #432: it abandons a no-PR, no-manifest escalation, whoever raised it, once its issue reads CLOSED.
+// (its decisionEvidence starts with the [pr-watch] mark). #432 is the one exception: it abandons a no-PR, no-manifest
+// escalation whoever raised it, once GitHub reads its issue as CLOSED.
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -232,7 +235,8 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   const livePr = openPr || (viewIsOpen && !viewPr.isDraft ? viewPr : null);
 
   if (state === 'escalated') {
-    // Only the watcher's own escalations are its to resolve; a human's hold stands.
+    // Only the watcher's own escalations are its to resolve; a human's hold stands. The one exception is #432's abandon
+    // of a no-PR, no-manifest escalation, which runs before this plan in the record loop.
     // (Containment, not prefix: transition evidence carries a `wake:<kind>; ` prefix.)
     if (!String(record.decisionEvidence || '').includes(WATCHER_MARK)) return { actions: [] };
     if (!prNumber) return { actions: [] };

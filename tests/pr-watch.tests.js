@@ -478,6 +478,9 @@ test('#432: an escalation with no PR and no manifest is abandoned once its issue
   assert.equal(resolutions.length, 1);
   assert.equal(resolutions[0].recordId, 'endzone:issue-42');
   assert.equal(resolutions[0].to, 'abandoned');
+  // The lead must not be the actor of its own resolution wake: bin/dormancy.js and bin/watchdog.ps1 drop those.
+  assert.equal(resolutions[0].actor, 'pr-watch');
+  assert.equal(record(root).abandonment.actor, 'pr-watch');
   assert.equal(ownerAnswers(root).length, 0, 'the abandoning tick does not answer');
   assert.ok(health.actions.includes('endzone:issue-42: abandoned, issue #42 closed at 2099-01-01T00:00:00Z after the escalation'), JSON.stringify(health.actions));
 });
@@ -560,6 +563,36 @@ test('#432: a second tick after the abandon is a no-op: no second resolution wak
   const second = watch(root, f);
   assert.equal(outbox(root).filter((w) => w.wake === 'resolution').length, 1);
   assert.deepEqual(second.actions, []);
+});
+
+// fleet #432: a record escalated, answered back to implementing, and escalated again. The ask that is still open is the second one.
+function escalateTwiceWithAnswer(root, observedAt) {
+  const id = 'endzone:issue-42';
+  workState.createRecord({ root, id, tenant: 'endzone', issue: 42, state: 'implementing', github: { issueNumber: 42 }, actor: 'test', idempotencyKey: 'create-42', now: '2026-11-11T10:00:00.000Z' });
+  workState.transitionRecord({ root, id, to: 'escalated', expectedRevision: 1, idempotencyKey: 'lead-esc-1', actor: 'pl-endzone', evidence: 'first ask', now: '2026-11-11T10:05:00.000Z' });
+  workState.transitionRecord({ root, id, to: 'implementing', expectedRevision: 2, idempotencyKey: 'answer-1', actor: 'cory', evidence: 'answered', now: '2026-11-11T10:20:00.000Z' });
+  workState.transitionRecord({ root, id, to: 'escalated', expectedRevision: 3, idempotencyKey: 'lead-esc-2', actor: 'pl-endzone', evidence: 'second ask', now: '2026-11-11T11:00:00.000Z' });
+  workState.observeRecord({ root, id, expectedRevision: 4, idempotencyKey: 'obs-after-second-escalation', observation: { digest: 'after' }, now: observedAt });
+}
+
+test('#432: the issue is judged against the latest escalation, not the first one or the last update', () => {
+  const between = rootDir();
+  escalateTwiceWithAnswer(between, '2026-11-11T11:30:00.000Z');
+  watch(between, fetchers({ closedAt: () => '2026-11-11T10:50:00.000Z' }));   // after the first ask, before the second: answered then
+  assert.equal(record(between).state, 'escalated');
+  const after = rootDir();
+  escalateTwiceWithAnswer(after, '2026-11-11T11:30:00.000Z');
+  watch(after, fetchers({ closedAt: () => '2026-11-11T11:10:00.000Z' }));   // after the second ask, before the record's last update
+  assert.equal(record(after).state, 'abandoned');
+});
+
+test('#432: a closedAt that is not a date leaves the record escalated and counts no failure', () => {
+  const root = rootDir();
+  escalateWithoutPr(root);
+  const health = watch(root, fetchers({ closedAt: () => 'garbage' }));
+  assert.equal(record(root).state, 'escalated');
+  assert.equal(health.failures, 0);
+  assert.equal(health.releaseFailures, 0);
 });
 
 test('a watcher escalation self-resolves when linkage appears, then settles normally', () => {

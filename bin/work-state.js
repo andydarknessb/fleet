@@ -828,8 +828,9 @@ function reserveRecord(options = {}) {
     });
     const proofSubjects = reservationSubjects.filter((record) => record.manifestPath && record.state !== 'retired');
     const expectedProof = proofFor([...proofSubjects, { issue: Number(options.issue), reservations: options.reservations }]);
-    // fleet#433: the bare CLI passes no maxIcs, so the tenant file is the second source, then 3.
-    const maxIcs = [Number(options.maxIcs), Number(readTenantConfigs(root)[options.tenant]?.maxIcs)].find((cap) => cap > 0) || 3;
+    // fleet#433: the bare CLI passes no maxIcs, so the tenant file is read only when the option is not a positive number; then 3.
+    const cap = Number(options.maxIcs) > 0 ? Number(options.maxIcs) : Number(readTenantConfigs(root)[options.tenant]?.maxIcs);
+    const maxIcs = cap > 0 ? cap : 3;
     if (activeAssignments.length >= maxIcs) throw new WorkStateError('MAX_ICS_REACHED', `${activeAssignments.length}/${maxIcs} assignments are active; wait for one to finish`);
     if (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof)) {
       throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'an assignment past the second requires an independent machine-readable proof');
