@@ -190,9 +190,41 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $r5b = Run-Watchdog
   Assert-True (@($r5b.newlyPaged).Count -eq 0) 'a standing trip must not page again'
   Assert-True (@($r5b.skipWrites).Count -eq 0) 'an existing hold must not be rewritten'
-  Assert-True (-not (@($r5b.conditions) -contains 'launch-retry:ic-901')) 'a written hold means handled: the condition clears'
-  Assert-True (-not (Test-Path "$testRoot\state\watchdog\banner.txt")) 'a fully handled trip must clear the banner'
+  # fleet #452: this fixture has no pushover.json, so the Page is undelivered and the held trip keeps its condition.
+  Assert-True (@($r5b.conditions) -contains 'launch-retry:ic-901') 'a held trip keeps its condition while its page is undelivered'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'launch-retry:ic-901') 'the banner must carry the undelivered Hold page'
   Assert-True (@($r5b.retryTrips | Where-Object { $_.name -eq 'ic-901' -and $_.disposition -eq 'already-held' }).Count -eq 1) 'the shadow log must record the already-held disposition'
+
+  # Case 5L (fleet #452): a lifted Hold stays lifted. Cory removes the launch-failed entry while the same failures are still in the
+  # window: nothing newer than the Hold has failed, so it is not written again, and its undelivered Page is sent once more.
+  Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{},"prs":{}}'   # Cory lifts the hold
+  $pageLines5L = @(Get-Content "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue | Where-Object { $_ -match '"key":"launch-retry:ic-901"' }).Count
+  $r5L = Run-Watchdog
+  Assert-True (@($r5L.skipWrites).Count -eq 0) 'a lifted hold must not be rewritten from the failures that caused it'
+  $skipL = (Get-Content "$testRoot\state\skip\test.json" -Raw) | ConvertFrom-Json
+  Assert-True (@($skipL.issues.PSObject.Properties).Count -eq 0) 'a lifted hold must stay lifted'
+  Assert-True (@($r5L.retryTrips | Where-Object { $_.name -eq 'ic-901' -and $_.disposition -eq 'lifted' }).Count -eq 1) 'the shadow log must record the lifted disposition'
+  Assert-True (@($r5L.conditions) -contains 'launch-retry:ic-901') 'an undelivered Page keeps its condition after the lift'
+  Assert-True (@(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ -match '"key":"launch-retry:ic-901"' }).Count -eq $pageLines5L + 1) 'the undelivered Page must be sent again'
+
+  # Case 5L2 (fleet #452): a launch that fails after the lift is newer than the Hold, so the Hold is written again and its Page is sent.
+  Set-AgentsRows ((New-StormRows 'ic-901' (Get-Date).AddHours(-2)).TrimEnd(']') + ',{"id":"job-ic-901-4","name":"ic-901","state":"failed","pid":null,"startedAt":' + (Get-EpochMs (Get-Date).AddMinutes(-1)) + '}]')
+  $pageLines5L2 = @(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ -match '"key":"launch-retry:ic-901"' }).Count
+  $r5L2 = Run-Watchdog
+  Assert-True (@($r5L2.skipWrites).Count -eq 1) 'a launch that fails after the lift must write the hold again'
+  $skipL2 = (Get-Content "$testRoot\state\skip\test.json" -Raw) | ConvertFrom-Json
+  Assert-True ("$($skipL2.issues.'901')" -match 'launch-failed: 3 consecutive') 'the hold written again must cover the newest failure'
+  Assert-True (@(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ -match '"key":"launch-retry:ic-901"' }).Count -eq $pageLines5L2 + 1) 'the trip after the lift must send its page'
+
+  # Case 5L3 (fleet #452): once the Hold's Page is delivered, the still-standing Hold does not raise it again.
+  $pagedL3 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+  $pagedL3.'launch-retry:ic-901'.deliveredAt = (Get-Date).ToUniversalTime().ToString('o')   # stands in for a delivered send (no pushover.json here)
+  Write-Utf8 "$testRoot\state\watchdog\paged.json" ($pagedL3 | ConvertTo-Json -Depth 8)
+  $pageLines5L3 = @(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ -match '"key":"launch-retry:ic-901"' }).Count
+  $r5L3 = Run-Watchdog
+  Assert-True (-not (@($r5L3.conditions) -contains 'launch-retry:ic-901')) 'a delivered Hold page must not be raised again while the hold stands'
+  Assert-True (@(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ -match '"key":"launch-retry:ic-901"' }).Count -eq $pageLines5L3) 'a delivered Hold page must not be sent again'
+  Assert-True (@($r5L3.skipWrites).Count -eq 0) 'the standing hold must not be rewritten'
 
   # Case 5w: outside the 24h window, old failures are history - a lifted hold stays lifted.
   Write-Utf8 "$testRoot\state\skip\test.json" '{"issues":{},"prs":{}}'   # Cory lifts the hold

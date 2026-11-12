@@ -662,7 +662,7 @@ try {
       $latest = $rows[0].row
       $js = $null; try { $js = Get-JobState $latest.id } catch {}
       $detail = 'no detail recorded'; if ($js -and $js.detail) { $detail = Get-OneLine $js.detail }
-      $retryTrips += [pscustomobject]@{ name = $g.Name; failures = $streak; latestJob = $latest.id; detail = $detail }
+      $retryTrips += [pscustomobject]@{ name = $g.Name; failures = $streak; latestJob = $latest.id; latestAt = $rows[0].ts; detail = $detail }
     }
   }
 
@@ -712,10 +712,28 @@ try {
   }
 
   # --- retry cap -> skip-hold for ICs (the third identical attempt never finds the cause).
-  # --- Dispositions keep the page honest: our own launch-failed hold means handled (the
-  # --- condition clears; a lifted hold whose failures recur inside the window re-pages);
-  # --- a human's unrelated hold is never treated as ours and never overwritten; a CLOSED
-  # --- issue's failures are history.
+  # --- Dispositions keep the page honest: our own launch-failed hold means handled (its Page
+  # --- stays a condition only while that Page is undelivered); a human's unrelated hold is
+  # --- never treated as ours and never overwritten; a CLOSED issue's failures are history.
+  # --- fleet #452: state/watchdog/launch-held.json keeps, per tenant/issue, the newest failed
+  # --- launch the Watchdog's Hold covers. A lifted Hold stays lifted: a trip only holds an
+  # --- issue for a failed launch newer than that one. An unreadable record is never reset to
+  # --- empty (that would re-write every lifted Hold): the trip pages and writes nothing.
+  $heldPath = "$FleetHome\state\watchdog\launch-held.json"
+  $held = $null; $heldUnreadable = $false
+  try { $held = Read-Json $heldPath } catch { $heldUnreadable = $true }
+  if (-not $held) { $held = [pscustomobject]@{} }
+  $heldChanged = $false
+  # fleet #452: paged.json as this tick found it. A Hold's Page is carried the way every other condition's is:
+  # raised while its entry is undelivered and not given up. An unreadable paged.json fails toward paging.
+  $pagedNow = $null; $pagedNowUnreadable = $false
+  try { $pagedNow = Read-Json "$FleetHome\state\watchdog\paged.json" } catch { $pagedNowUnreadable = $true }
+  function Test-LaunchRetryPagePending {
+    param([string]$Key)
+    if ($pagedNowUnreadable) { return $true }
+    $e = $null; if ($pagedNow -and $pagedNow.PSObject.Properties[$Key]) { $e = $pagedNow.PSObject.Properties[$Key].Value }
+    return [bool]($e -and $e.PSObject.Properties['attempts'] -and -not $e.deliveredAt -and -not $e.gaveUpAt)
+  }
   $tenantFiles = @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)
   $soleTenant = $null; if ($tenantFiles.Count -eq 1) { $soleTenant = [IO.Path]::GetFileNameWithoutExtension($tenantFiles[0].Name) }
   $skipWrites = @()
@@ -738,15 +756,25 @@ try {
         try { $skip = Read-Json $skipPath } catch { $skipReadable = $false }
         if (-not $skipReadable) {
           $ev.disposition = 'skip-unreadable-paged'
+        } elseif ($heldUnreadable) {
+          $ev.disposition = 'held-state-unreadable-paged'   # no Hold written: a lifted one would come back
         } else {
           if (-not $skip) { $skip = [pscustomobject]@{ issues = [pscustomobject]@{}; prs = [pscustomobject]@{} } }
           if ($null -eq $skip.issues) { $skip | Add-Member -NotePropertyName issues -NotePropertyValue ([pscustomobject]@{}) -Force }
           $existingHold = $null
           if (@($skip.issues.PSObject.Properties.Name) -contains $issue) { $existingHold = "$($skip.issues.$issue)" }
+          $heldKey = "$tenant/$issue"
+          $heldEntry = $null; if ($held.PSObject.Properties[$heldKey]) { $heldEntry = $held.PSObject.Properties[$heldKey].Value }
+          $heldAt = $null; if ($heldEntry) { $heldAt = ConvertTo-UtcDateTime $heldEntry.startedAt }
+          # a failed launch newer than the one the Hold covers; a record with no readable time counts as newer (fails toward holding and paging)
+          $newer = (-not $heldEntry) -or (-not $heldAt) -or ($trip.latestAt -gt $heldAt)
           if ($existingHold -and $existingHold -match '^launch-failed:') {
-            $ev.disposition = 'already-held'; $ev.page = $false
+            $ev.disposition = 'already-held'; $ev.page = (Test-LaunchRetryPagePending "launch-retry:$($trip.name)")
           } elseif ($existingHold) {
             $ev.disposition = 'held-other-paged'   # a human's hold for another reason: page, never overwrite
+          } elseif (-not $newer) {
+            # fleet #452: Cory lifted the Hold and nothing newer has failed: not written again, the undelivered Page is still sent
+            $ev.disposition = 'lifted'; $ev.page = (Test-LaunchRetryPagePending "launch-retry:$($trip.name)")
           } else {
             $t = $null
             try { $t = Read-Json "$FleetHome\tenants\$tenant.json" } catch {}
@@ -769,10 +797,24 @@ try {
               $ev.disposition = 'gh-failed-paged'   # fail safe: visible, but no hold on unverified state
             }
           }
+          # fleet #452: the newest failure a Hold now covers (already held, or held just now) is the one a later lift is judged against
+          if ($newer -and @('already-held', 'held-paged') -contains $ev.disposition) {
+            $held | Add-Member -NotePropertyName $heldKey -NotePropertyValue ([pscustomobject]@{ job = "$($trip.latestJob)"; startedAt = $trip.latestAt.ToString('o') }) -Force
+            $heldChanged = $true
+          }
         }
       }
     }
     $tripEvals += $ev
+  }
+  # fleet #452: a record whose failure has left the window covers nothing any more (every failure still in it is newer), so it goes and the map cannot grow.
+  if (-not $heldUnreadable) {
+    foreach ($hp in @($held.PSObject.Properties)) {
+      $hpAt = ConvertTo-UtcDateTime $hp.Value.startedAt
+      if (-not $hpAt -or $hpAt -lt $windowStart) { $held.PSObject.Properties.Remove($hp.Name); $heldChanged = $true }
+    }
+    # Written after the skip writes above: a Hold with no record is re-recorded next tick (already-held), but a record with no Hold would read as lifted.
+    if ($heldChanged -and -not $Verify) { Write-Json $heldPath $held }
   }
 
   # --- live supervision (ticket 08b): what the Sentinel session used to do with the
