@@ -8,6 +8,12 @@ $dry = (& powershell -NoProfile -ExecutionPolicy Bypass -File "$fleetHome\bin\in
 if ($dry.taskName -ne 'Fleet daily summary') { throw 'summary dry-run task metadata mismatch' }
 if ($dry.logonTrigger -notmatch 'at logon of') { throw 'summary installer must add a logon trigger' }
 if ($dry.arguments -notmatch '-IfMissing') { throw 'summary action must pass -IfMissing so the logon trigger skips when a page went out today' }
+# Review item 5: the logon trigger waits PT12M, behind the four logon tasks and the collector's PT10M.
+if ($dry.logonDelay -ne 'PT12M') { throw 'summary logon trigger must wait PT12M behind the four logon tasks and the collector (PT10M)' }
+# Review item 6: the printed hints say a plain start does nothing once a page went out today, and give the forced run.
+$installer = Get-Content "$fleetHome\bin\install-daily-summary-task.ps1" -Raw
+if ($installer -notmatch 'does nothing when a page already went out today') { throw 'summary installer hint must say a plain start does nothing once a page went out today' }
+if ($installer -notmatch 'Force a run now') { throw 'summary installer must print the forced-run command' }
 
 $capRoot = Join-Path ([IO.Path]::GetTempPath()) ('summary-ifmissing-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
 $calls = "$capRoot\bin\node-calls.log"

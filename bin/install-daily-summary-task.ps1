@@ -23,6 +23,7 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfil
 $trigger = New-ScheduledTaskTrigger -Daily -At '08:00'
 # Ticket 443: one action for both triggers, so -IfMissing also guards the 08:00 run: a day gets one page.
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$logon.Delay = 'PT12M'   # after the four logon tasks (PT2M to PT8M) and the collector's PT10M: the network may not be up at a cold boot
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
 # fleet#79 QA round 1, item 11: the zone refusal used to throw BEFORE this
@@ -35,6 +36,7 @@ if ($DryRun) {
     script = $scriptPath
     schedule = '08:00 Central daily'
     logonTrigger = "at logon of $($logon.UserId)"
+    logonDelay = "$($logon.Delay)"
     timeZone = $zoneId
     wouldRegister = $zoneOk
     refusalReason = if ($zoneOk) { $null } else { "host time zone is '$zoneId', not 'Central Standard Time'" }
@@ -50,5 +52,6 @@ if (-not $zoneOk) {
 
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger, $logon) -Settings $settings -Description 'Fleet ticket 80: one 08:00 Central page of what is waiting on Cory, with ages' -Force | Out-Null
 Write-Output "Registered '$taskName' (daily at 08:00 Central, and at logon)."
-Write-Output "Run now: Start-ScheduledTask -TaskName '$taskName'"
+Write-Output "Run now: Start-ScheduledTask -TaskName '$taskName' does nothing when a page already went out today (the action passes -IfMissing)."
+Write-Output "Force a run now: powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
 Write-Output "Remove with: Unregister-ScheduledTask -TaskName '$taskName' -Confirm:0"
