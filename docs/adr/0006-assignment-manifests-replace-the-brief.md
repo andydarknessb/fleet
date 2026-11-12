@@ -101,7 +101,7 @@ Mechanism landed; the flag flip is Cory's hand after the gate, as for 08b.
   record is not `assigned`, a live session may own it, the manifest is already invalidated), and a release
   that fails never replaces the refusal reason. The session-start hook prints the
   manifest, Work record, and the acknowledgment command with the record's
-  current revision. Manifest launches prompt with
+  current revision (2026-11-11, fleet #434: the acknowledgment command only while the record is `assigned`; otherwise the record's state, and `ack` leaves a record past `assigned` where it is). Manifest launches prompt with
   `/mattpocock-skills:implement` so the IC runs the real `/implement`.
 - Rollback (`bin/rollback-assignment.ps1`): removes the flag, releases every
   manifest still pending acknowledgment through `work-state.js release` (one
@@ -215,8 +215,13 @@ no-manifest refusal only when the live roster already holds an active `ic`
 row of that exact name carrying a manifest path (the credential proving a
 genuine prior reservation); `recover.ps1` never passes `-Manifest` itself,
 only the row's own original `-Prompt`, so a validated recovery restarts
-exactly as it always did (no worktree, no manifest reconciliation) and an
-unvalidated `-Recover` gets no exemption at all.
+without re-running the manifest (no worktree, no manifest reconciliation) and an
+unvalidated `-Recover` gets no exemption at all. (2026-11-11, fleet #434: a
+validated recovery now takes its effort, cwd, manifest, Work record id and
+permissions from its roster row, the row winning over a caller's
+`-WorkRecordId` or `-Permissions`, and the branch and base from the manifest
+file when it is readable; a recovery whose worktree is gone is refused rather
+than run in the tenant repo.)
 `bin/assignment-parity.js` was left in place (out of this ticket's named
 scope) since `bin/cutover-assignment.ps1` still runs its `report` gate; its
 `observe` command has no caller left. `_common.ps1`'s `Test-AssignmentLive`

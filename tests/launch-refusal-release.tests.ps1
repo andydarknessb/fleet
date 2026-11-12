@@ -45,11 +45,12 @@ function Invoke-Git {
   return $o.Trim()
 }
 function Reserve-Manifest {
-  param([int]$Issue, [string]$Sha, [string]$Tenant = 'test')
+  param([int]$Issue, [string]$Sha, [string]$Tenant = 'test', [string]$Permissions = '')
   $fixture = "$testRoot\issues-$Issue.json"
   Write-Utf8 $fixture ('[{"number":' + $Issue + ',"title":"Refusal fixture","url":"https://github.com/owner/repo/issues/' + $Issue + '","body":' + ("Change ``src/fixture-$Issue.js``." | ConvertTo-Json) + ',"createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]')
+  $permArgs = if ($Permissions) { @('--permissions', $Permissions) } else { @() }
   $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $out = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant $Tenant --tenant-config "$testRoot\tenants\$Tenant.json" --fixture $fixture --base-sha $Sha --parent pl-test --model haiku 2>&1 | Out-String; $code = $LASTEXITCODE }
+  try { $out = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant $Tenant --tenant-config "$testRoot\tenants\$Tenant.json" --fixture $fixture --base-sha $Sha --parent pl-test --model haiku @permArgs 2>&1 | Out-String; $code = $LASTEXITCODE }
   finally { $ErrorActionPreference = $eap }
   $r = $null; try { $r = ($out.Trim() -split "`n")[-1] | ConvertFrom-Json } catch {}
   if ($code -ne 0 -or -not $r -or -not $r.manifestPath) { throw "assign for issue $Issue failed: $out" }
@@ -131,17 +132,26 @@ try {
   # claude logs every call to claude-calls.log (the #264 cases ask whether `--bg` was ever called). `agents` lists no
   # sessions. With MOCK_MUTATE_AT=agents the `agents --json --all` call applies the mutation and records whether the
   # assignment worktree (MOCK_WORKTREE_PATH) existed at that moment in mutate-saw-worktree.log.
+  # fleet #434: `agents` prints mock-agents.json (always '[]' unless a case writes rows), and MOCK_BG_ROW=1 gives a
+  # --bg launch its daemon row, so a launch can complete (launched = true). Without it a --bg starts no session.
   $claudeLines = @(
     "'use strict';",
     "const fs = require('fs'); const path = require('path');",
     "const args = process.argv.slice(2);",
+    "const daemonFile = path.join(__dirname, '..', 'mock-agents.json');",
     "fs.appendFileSync(path.join(__dirname, '..', 'claude-calls.log'), args.join(' ') + '\n');",
     "if (args[0] === 'agents') {",
     "  if (process.env.MOCK_MUTATE_AT === 'agents' && args.includes('--all')) {",
     "    fs.appendFileSync(path.join(__dirname, '..', 'mutate-saw-worktree.log'), String(fs.existsSync(process.env.MOCK_WORKTREE_PATH)) + '\n');",
     "    require('./mock-mutate.js')();",
     "  }",
-    "  process.stdout.write('[]');",
+    "  process.stdout.write(fs.readFileSync(daemonFile, 'utf8'));",
+    "}",
+    "if (args[0] === '--bg' && process.env.MOCK_BG_ROW === '1') {",
+    "  const name = args[args.indexOf('--name') + 1];",
+    "  const rows = JSON.parse(fs.readFileSync(daemonFile, 'utf8'));",
+    "  rows.push({ id: 'job-' + name + '-' + Date.now(), name, state: 'working', status: 'idle', pid: 21, sessionId: 'sess-' + name + '-' + Date.now(), startedAt: Date.now() });",
+    "  fs.writeFileSync(daemonFile, JSON.stringify(rows));",
     "}"
   )
   Write-Utf8 "$testRoot\mock-bin\mock-claude.js" (($claudeLines -join "`n") + "`n")
@@ -320,11 +330,126 @@ try {
   Assert-True ((Get-RecordState 35) -ne 'assigned' -and (Get-Marker $m35) -and "$((Get-Marker $m35).reason)" -match "'deepseek' is refused") 'the deepseek refusal leaves no assigned record and writes the invalidation marker with its reason'
   Assert-True ((Get-BgCalls) -eq 0) 'a deepseek manifest never reaches claude --bg'
 
+  # fleet #434: bin\recover.ps1 relaunches a dead IC with -Recover and no -Manifest. A validated recovery is the same
+  # unit as the manifest launch it restarts, so it carries that launch's roster row over (manifest, Work record id,
+  # cwd, permissions) and reads the branch and base from the manifest file. The allowlist profile is pinned here
+  # because it is the one non-default permissions value; its rehearsalRoot marker is the scratch-root bypass of the CLI gate.
+  Clear-ActiveRecords
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" '{"rehearsalRoot":true,"defaultMode":"acceptEdits","allow":[{"rule":"Bash(git status)"}]}'
+  $m40 = Reserve-Manifest 40 $baseSha 'test' 'allowlist'
+  $manifest40 = (Get-Content $m40 -Raw) | ConvertFrom-Json
+  $env:MOCK_BG_ROW = '1'
+  try {
+    Write-Utf8 "$testRoot\mock-agents.json" '[]'
+    $r40 = Run-Launch @('-Manifest', $m40, '-WorkRecordId', 'test:issue-40')
+  } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 0 -and $r40.launched -eq $true) "fixture: a real manifest launch completes against the mock daemon: exit $lastExit $lastOut"
+  $oldRow = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0]
+  Assert-True ($oldRow -and "$($oldRow.manifest)" -and "$($oldRow.workRecordId)" -eq 'test:issue-40' -and "$($oldRow.permissions)" -eq 'allowlist') "fixture: the manifest launch's roster row records its manifest, Work record and permissions: $(($oldRow | ConvertTo-Json -Compress))"
+  Assert-True ("$($oldRow.cwd)" -eq "$repoPath\.claude\worktrees\ic-40-assignment") "fixture: the manifest launch's row names its assignment worktree: $($oldRow.cwd)"
+  $recordBefore = Get-Record 40
+  $worktreesBefore = Invoke-Git @('worktree', 'list', '--porcelain')
+  $recoverArgs = @('-Role', 'ic', '-Name', 'ic-40', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '40', '-Prompt', "$($oldRow.prompt)", '-Recover', '-Reason', 'recover')
+
+  # fleet #434: no manifest precondition runs on a recovery (no gh read, no fetch). The controls come first: the mock gh
+  # log records the manifest launch's reconciliation, and a fetch recreates origin/integration, so both probes see a call.
+  function Get-GhCount { if (Test-Path "$testRoot\gh-calls.log") { return @(Get-Content "$testRoot\gh-calls.log").Count } return 0 }
+  function Test-OriginRef { $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'; try { & git.exe -C "$testRoot\repo" rev-parse --verify --quiet refs/remotes/origin/integration 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) } finally { $ErrorActionPreference = $eap } }
+  Assert-True ((Get-GhCount) -gt 0) 'control: the mock gh log records the manifest launch, so a gh call during a recovery would show'
+  Invoke-Git @('fetch', '-q', 'origin', 'integration')
+  Assert-True (Test-OriginRef) 'control: a fetch creates origin/integration, so its absence after a recovery shows that no fetch ran'
+  Invoke-Git @('update-ref', '-d', 'refs/remotes/origin/integration')
+  $ghBeforeRecover = Get-GhCount
+
+  # The daemon lost the job: no session row for ic-40 when the recovery runs.
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $rec1 = Run-Launch $recoverArgs } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 0 -and $rec1 -and $rec1.launched -eq $true) "a validated -Recover of a dead IC launches: exit $lastExit $lastOut"
+  Assert-True ((Get-GhCount) -eq $ghBeforeRecover -and -not (Test-OriginRef)) 'fleet #434: a recovery runs no manifest precondition: no gh call and no fetch (origin/integration stays absent)'
+  Assert-True ("$($rec1.cwd)" -eq "$($oldRow.cwd)") "fleet #434: the recovered IC starts in its assignment worktree ($($oldRow.cwd)), not the repo root: $($rec1.cwd)"
+  $rows1 = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })
+  Assert-True ($rows1.Count -eq 1) "the recovery replaces the roster row (active ic-40 rows: $($rows1.Count))"
+  $newRow = $rows1[0]
+  Assert-True ("$($newRow.manifest)" -eq "$($oldRow.manifest)" -and "$($newRow.workRecordId)" -eq "$($oldRow.workRecordId)" -and "$($newRow.cwd)" -eq "$($oldRow.cwd)" -and "$($newRow.permissions)" -eq "$($oldRow.permissions)" -and "$($newRow.launchReason)" -eq 'recover') "fleet #434: the recovered roster row keeps the manifest, Work record, cwd and permissions of the row it replaces: $(($newRow | ConvertTo-Json -Compress))"
+  $sessionEnv = (Get-Content "$testRoot\state\sessions\ic-40.settings.json" -Raw | ConvertFrom-Json).env
+  Assert-True ("$($sessionEnv.FLEET_ASSIGNMENT_MANIFEST)" -eq "$($oldRow.manifest)" -and "$($sessionEnv.FLEET_WORK_RECORD_ID)" -eq 'test:issue-40' -and "$($sessionEnv.FLEET_BASE_SHA)" -eq "$($manifest40.base.sha)" -and "$($sessionEnv.FLEET_ASSIGNMENT_BRANCH)" -eq "$($manifest40.branch)" -and "$($sessionEnv.FLEET_PERMISSIONS)" -eq 'allowlist') "fleet #434: the recovered session's settings carry its assignment env (manifest, Work record, base, branch, permissions): $(($sessionEnv | ConvertTo-Json -Compress))"
+  Assert-True ((Invoke-Git @('worktree', 'list', '--porcelain')) -eq $worktreesBefore) 'fleet #434: a recovery creates no worktree (git worktree list is unchanged)'
+  $recordAfter = Get-Record 40
+  Assert-True ("$($recordAfter.state)" -eq "$($recordBefore.state)" -and [string]$recordAfter.revision -eq [string]$recordBefore.revision) "fleet #434: a recovery leaves the Work record's state and revision unchanged: $($recordBefore.state) r$($recordBefore.revision) -> $($recordAfter.state) r$($recordAfter.revision)"
+
+  # A second recovery of the same IC is not refused: the first one wrote the row that a later recovery checks.
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $rec2 = Run-Launch $recoverArgs } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 0 -and $rec2 -and $rec2.launched -eq $true -and $lastFlat -notmatch 'Recoverfoundnoactive') "fleet #434: a second recovery of the same IC is not refused: exit $lastExit $lastOut"
+
+  # fleet #434: the roster row is the credential, so a caller's -WorkRecordId and -Permissions do not override it.
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $rec3 = Run-Launch ($recoverArgs + @('-WorkRecordId', 'test:issue-99', '-Permissions', 'auto')) } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 0 -and $rec3 -and $rec3.launched -eq $true) "fleet #434: a recovery with a caller's -WorkRecordId and -Permissions still launches: exit $lastExit $lastOut"
+  $sessionEnv3 = (Get-Content "$testRoot\state\sessions\ic-40.settings.json" -Raw | ConvertFrom-Json).env
+  Assert-True ("$($sessionEnv3.FLEET_WORK_RECORD_ID)" -eq 'test:issue-40' -and "$($sessionEnv3.FLEET_PERMISSIONS)" -eq 'allowlist') "fleet #434: the settings keep the roster row's Work record and permissions over the caller's: $(($sessionEnv3 | ConvertTo-Json -Compress))"
+  $row3 = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0]
+  Assert-True ("$($row3.workRecordId)" -eq 'test:issue-40' -and "$($row3.permissions)" -eq 'allowlist') "fleet #434: the new roster row keeps the row's Work record and permissions: $(($row3 | ConvertTo-Json -Compress))"
+
+  # fleet #434: a recovery whose manifest file is gone still launches. It has the row's manifest path and Work record id,
+  # and no branch or base to read from the file, so the base and branch keys are absent.
+  $m40Aside = "$($m40).aside"
+  Move-Item -LiteralPath $m40 -Destination $m40Aside
+  try {
+    Write-Utf8 "$testRoot\mock-agents.json" '[]'
+    $env:MOCK_BG_ROW = '1'
+    $rec4 = Run-Launch $recoverArgs
+  } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue; Move-Item -LiteralPath $m40Aside -Destination $m40 }
+  Assert-True ($lastExit -eq 0 -and $rec4 -and $rec4.launched -eq $true) "fleet #434: a recovery whose manifest file is missing still launches: exit $lastExit $lastOut"
+  $sessionEnv4 = (Get-Content "$testRoot\state\sessions\ic-40.settings.json" -Raw | ConvertFrom-Json).env
+  Assert-True ("$($sessionEnv4.FLEET_ASSIGNMENT_MANIFEST)" -eq "$($oldRow.manifest)" -and "$($sessionEnv4.FLEET_WORK_RECORD_ID)" -eq 'test:issue-40' -and -not $sessionEnv4.PSObject.Properties['FLEET_BASE_SHA'] -and -not $sessionEnv4.PSObject.Properties['FLEET_ASSIGNMENT_BRANCH']) "fleet #434: with no manifest file the recovery keeps the row's manifest and Work record id and sets no base or branch: $(($sessionEnv4 | ConvertTo-Json -Compress))"
+
+  # fleet #434 (ruling 3): a recovered allowlist IC goes through the CLI rehearsal gate, and a refusal there releases nothing.
+  # The fixture's rehearsalRoot skips the gate, so this step drops it and names a verified CLI version the mock does not report.
+  $gateRowBefore = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)
+  $gateRecordBefore = Get-Record 40
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" '{"verifiedCliVersion":"2.1.312","defaultMode":"acceptEdits","allow":[{"rule":"Bash(git status)"}]}'
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $gate1 = Run-Launch $recoverArgs } finally {
+    Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue
+    Write-Utf8 "$testRoot\config\permissions-allowlist.json" '{"rehearsalRoot":true,"defaultMode":"acceptEdits","allow":[{"rule":"Bash(git status)"}]}'
+  }
+  Assert-True ($lastExit -eq 3 -and $gate1 -and $gate1.launched -eq $false -and "$($gate1.reason)" -match 'allowlist profile was verified on Claude Code 2.1.312' -and $gate1.reservationReleased -eq $false) "fleet #434: a recovery of an allowlist IC is refused by the CLI rehearsal gate with nothing released: exit $lastExit $lastOut"
+  Assert-True (-not (Test-Path "$($oldRow.manifest).invalidated.json")) 'fleet #434: the gate refusal writes no invalidation marker beside the manifest'
+  $gateRowAfter = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)
+  Assert-True ($gateRowAfter -eq $gateRowBefore) "fleet #434: the gate refusal leaves the roster row unchanged: $gateRowAfter"
+  $gateRecordAfter = Get-Record 40
+  Assert-True ("$($gateRecordAfter.state)" -eq "$($gateRecordBefore.state)" -and [string]$gateRecordAfter.revision -eq [string]$gateRecordBefore.revision) 'fleet #434: the gate refusal leaves the Work record state and revision unchanged'
+
+  # fleet #434: a recovery whose assignment worktree is gone is refused before anything is written: no release, no marker,
+  # and the roster row and the Work record keep their state. An empty leftover directory at the path is no worktree either.
+  $goneRowBefore = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)
+  $goneRecordBefore = Get-Record 40
+  Invoke-Git @('worktree', 'remove', '--force', "$($oldRow.cwd)")
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $gone1 = Run-Launch $recoverArgs } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 3 -and $gone1 -and $gone1.launched -eq $false -and "$($gone1.reason)" -match "assignment worktree of 'ic-40' gone") "fleet #434: a recovery whose worktree is gone is refused with exit 3 naming it: exit $lastExit $lastOut"
+  [IO.Directory]::CreateDirectory("$($oldRow.cwd)") | Out-Null
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $gone2 = Run-Launch $recoverArgs } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 3 -and $gone2 -and $gone2.launched -eq $false -and "$($gone2.reason)" -match "assignment worktree of 'ic-40' gone") "fleet #434: an empty leftover directory at the worktree path is refused the same way: exit $lastExit $lastOut"
+  Assert-True (-not (Test-Path "$($oldRow.manifest).invalidated.json")) 'fleet #434: the refused recovery writes no invalidation marker beside its manifest'
+  $goneRowAfter = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)
+  Assert-True ($goneRowAfter -eq $goneRowBefore) "fleet #434: the refused recovery leaves the roster row unchanged: $goneRowAfter"
+  $goneRecordAfter = Get-Record 40
+  Assert-True ("$($goneRecordAfter.state)" -eq "$($goneRecordBefore.state)" -and [string]$goneRecordAfter.revision -eq [string]$goneRecordBefore.revision) 'fleet #434: the refused recovery leaves the Work record state and revision unchanged'
+
   Write-Output 'launch refusal release tests passed'
 } finally {
   $env:PATH = $oldPath
   $env:USERPROFILE = $oldProfile
-  Remove-Item Env:MOCK_GH_FAIL, Env:MOCK_GH_ACTIVE_PATH, Env:MOCK_GH_MUTATE, Env:MOCK_GH_MARKER_PATH, Env:MOCK_GH_RECORD_ID, Env:MOCK_MUTATE_AT, Env:MOCK_WORKTREE_PATH -ErrorAction SilentlyContinue
+  Remove-Item Env:MOCK_GH_FAIL, Env:MOCK_GH_ACTIVE_PATH, Env:MOCK_GH_MUTATE, Env:MOCK_GH_MARKER_PATH, Env:MOCK_GH_RECORD_ID, Env:MOCK_MUTATE_AT, Env:MOCK_WORKTREE_PATH, Env:MOCK_BG_ROW -ErrorAction SilentlyContinue
   $resolved = [IO.Path]::GetFullPath($testRoot)
   $expectedPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()) + 'fleet-launch-refusal-test-'
   if ($resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -and [IO.Directory]::Exists($resolved)) {

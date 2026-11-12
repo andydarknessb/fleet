@@ -828,9 +828,11 @@ function reserveRecord(options = {}) {
     });
     const proofSubjects = reservationSubjects.filter((record) => record.manifestPath && record.state !== 'retired');
     const expectedProof = proofFor([...proofSubjects, { issue: Number(options.issue), reservations: options.reservations }]);
-    const maxIcs = Number(options.maxIcs) || 3;
-    if (activeAssignments.length >= maxIcs) throw new WorkStateError('MAX_ICS_REACHED', `${activeAssignments.length}/${maxIcs} assignments are active; wait for one to finish`);
-    if (activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof)) {
+    // fleet#433: only a reserve with a manifest is an assignment, so only it is capped; the cap is the option when positive, else the tenant file, else 3.
+    const cap = Number(options.maxIcs) > 0 ? Number(options.maxIcs) : Number(readTenantConfigs(root)[options.tenant]?.maxIcs);
+    const maxIcs = cap > 0 ? cap : 3;
+    if (options.manifestPath && activeAssignments.length >= maxIcs) throw new WorkStateError('MAX_ICS_REACHED', `${activeAssignments.length}/${maxIcs} assignments are active; wait for one to finish`);
+    if (options.manifestPath && activeAssignments.length >= 2 && !proofMatches(expectedProof, options.independenceProof)) {
       throw new WorkStateError('THIRD_ASSIGNMENT_REQUIRES_PROOF', 'an assignment past the second requires an independent machine-readable proof');
     }
     const conflicts = reservationConflicts(Object.fromEntries(reservationSubjects.map((record) => [record.id, record])), options.reservations);

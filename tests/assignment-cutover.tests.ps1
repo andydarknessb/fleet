@@ -152,6 +152,10 @@ try {
   Assert-True ($r7e.effort -eq 'max') "a -Recover relaunch keeps the effort its live roster row records: $lastOut"
   Assert-True ($r7e.prompt -eq 'legacy') "-Recover must relaunch with the roster's own original -Prompt, unchanged, not a manifest-derived one: $lastOut"
   Assert-True ((Get-Content "$testRoot\bin\recover.ps1" -Raw) -match '-Prompt \$e\.prompt -Recover') 'recover.ps1 must pass -Recover when it relaunches an IC'
+  # fleet #434: the recovered session's settings carry the manifest and Work record its roster row recorded (a dry run
+  # writes the settings file, never the row). The fixture's manifest file does not exist, so nothing else is read from it.
+  $env7e = (Get-Content "$testRoot\state\sessions\ic-101.settings.json" -Raw | ConvertFrom-Json).env
+  Assert-True ("$($env7e.FLEET_ASSIGNMENT_MANIFEST)" -eq 'state/manifests/assignment-101.json' -and "$($env7e.FLEET_WORK_RECORD_ID)" -eq 'test:issue-101') "fleet #434: a -Recover dry run's settings carry the roster row's manifest and Work record id: $(($env7e | ConvertTo-Json -Compress))"
   # -Recover exempts ONLY this guard: PAUSE still stops it, even for a genuine recovery.
   Write-Utf8 "$testRoot\state\PAUSE" 'testing'
   $r7f = Run-Script 'launch.ps1' @('-Role', 'ic', '-Name', 'ic-101', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '101', '-Prompt', 'legacy', '-Recover')

@@ -4,7 +4,9 @@
 // project-lead wake (checks-settled | checks-failed | decision-needed; the state door adds
 // `resolution` when a record leaves escalated or hold, #204; `owner-answer` when the owner
 // comments on an escalated record, #419: re-derived from GitHub each tick and keyed by comment
-// id, so it has no ledger event and a lost outbox line is rewritten). The EVENT
+// id, so it has no ledger event and a lost outbox line is rewritten). #432 abandons an escalated record with no PR
+// and no manifest once GitHub reads its issue as CLOSED after the escalation; the abandon writes its own `resolution`
+// wake. The EVENT
 // LEDGER is the authoritative wake record (changes.wake on observations, a
 // `wake:<kind>; ` evidence prefix on transitions); state/watch/wake-outbox.jsonl is a
 // best-effort convenience cache written after commit. A decision-needed wake also
@@ -20,7 +22,8 @@
 // so every key is scoped to the record revision it acts on (novelty detection is
 // digest-vs-stored-observation); multi-hop paths are computed from the store's own
 // TRANSITIONS, never hand-coded; the watcher resolves only escalations it raised
-// (its decisionEvidence starts with the [pr-watch] mark).
+// (its decisionEvidence starts with the [pr-watch] mark). #432 is the one exception: it abandons a no-PR, no-manifest
+// escalation whoever raised it, once GitHub reads its issue as CLOSED.
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -232,7 +235,8 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
   const livePr = openPr || (viewIsOpen && !viewPr.isDraft ? viewPr : null);
 
   if (state === 'escalated') {
-    // Only the watcher's own escalations are its to resolve; a human's hold stands.
+    // Only the watcher's own escalations are its to resolve; a human's hold stands. The one exception is #432's abandon
+    // of a no-PR, no-manifest escalation, which runs before this plan in the record loop.
     // (Containment, not prefix: transition evidence carries a `wake:<kind>; ` prefix.)
     if (!String(record.decisionEvidence || '').includes(WATCHER_MARK)) return { actions: [] };
     if (!prNumber) return { actions: [] };
@@ -464,6 +468,7 @@ function makeFetchers(repo, executable = 'gh') {
   return {
     listOpenPrs: () => ghJson(executable, ['pr', 'list', '-R', repo, '--state', 'open', '--limit', '100', '--json', 'number,isDraft,headRefName,headRefOid,statusCheckRollup']),
     issueState: (n) => String(ghJson(executable, ['issue', 'view', String(n), '-R', repo, '--json', 'state']).state || ''),
+    issueClosedAt: (n) => { const issue = ghJson(executable, ['issue', 'view', String(n), '-R', repo, '--json', 'state,closedAt']); return String(issue.state || '').toUpperCase() === 'CLOSED' ? issue.closedAt || null : null; },
     // shortcut: first 100 comments since the escalation, paginate if an escalated thread outgrows it
     issueComments: (n, since) => ghJson(executable, ['api', `repos/${repo}/issues/${n}/comments?per_page=100&since=${encodeURIComponent(since)}`]),
     viewPr: (n) => ghJson(executable, ['pr', 'view', String(n), '-R', repo, '--json', 'number,state,isDraft,mergedAt,mergedBy,headRefOid,statusCheckRollup,closingIssuesReferences,headRefName,body']),
@@ -531,6 +536,47 @@ function ownerAnswerWake({ root, record, tenantConfig, fetchers, actor, dryRun, 
   }
 }
 
+// #432: an escalation raised with no PR and no manifest has no PR to resolve it, so the one end it can get is GitHub
+// reading its issue as CLOSED after the escalation. abandonRecord writes the `resolution` wake to `abandoned`. Returns
+// true when the record is settled for this tick (abandoned, named by a dry run, or refused), so the caller skips the rest.
+function abandonClosedEscalation({ root, record, fetchers, actor, dryRun, health, ledger }) {
+  if (record.state !== 'escalated' || record.github?.prNumber || record.manifestPath) return false;
+  let closedAt;
+  try {
+    closedAt = fetchers.issueClosedAt(record.issue);
+    health.ghCalls += 1;
+  } catch (error) {
+    health.releaseFailures += 1;
+    health.actions.push(`${record.id}: issue view failed, retained (${String(error.message || error).slice(0, 120)})`);
+    return false;
+  }
+  if (!closedAt) return false;
+  try {
+    ledger.events = ledger.events || workState.readEvents(root);
+  } catch (error) {
+    health.failures += 1;
+    health.actions.push(`${record.id}: issue-closed check failed (${String(error.message || error).slice(0, 120)})`);
+    return false;
+  }
+  const entering = workState.enteringEvent(ledger.events, record.id, 'escalated');
+  const since = entering ? entering.at : record.updatedAt;
+  if (!(Date.parse(closedAt) > Date.parse(since))) return false;
+  if (dryRun) { health.actions.push(`DRY ${record.id}: abandon (issue #${record.issue} closed at ${closedAt})`); return true; }
+  try {
+    workState.abandonRecord({
+      root, id: record.id, expectedRevision: record.revision, actor,
+      idempotencyKey: `watch:${record.id}:r${record.revision}:issue-closed:abandoned`,
+      reason: `issue #${record.issue} closed at ${closedAt}, after the escalation; no PR and no manifest stand behind the record`,
+      evidence: `gh issue view ${record.issue} (CLOSED at ${closedAt})`,
+    });
+    health.actions.push(`${record.id}: abandoned, issue #${record.issue} closed at ${closedAt} after the escalation`);
+  } catch (error) {
+    health.failures += 1;
+    health.actions.push(`${record.id}: abandon failed (${error.code || ''} ${String(error.message).slice(0, 120)})`);
+  }
+  return true;
+}
+
 function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch', dryRun = false, shadow = true, notifier = null, healthFile = 'health.json' } = {}) {
   const started = Date.now();
   const base = path.resolve(root || path.resolve(__dirname, '..'));
@@ -582,6 +628,7 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
 
   const ledger = { events: null };
   for (const record of records) {
+    if (abandonClosedEscalation({ root: base, record, fetchers, actor, dryRun, health, ledger })) continue;
     if (record.state === 'escalated') ownerAnswerWake({ root: base, record, tenantConfig, fetchers, actor, dryRun, health, ledger });
     const prNumber = record.github?.prNumber || null;
     let openPr = prNumber ? byNumber.get(Number(prNumber)) || null : null;

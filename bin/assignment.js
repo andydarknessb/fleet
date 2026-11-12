@@ -909,7 +909,11 @@ function assertManifestNotInvalidated(manifestPath) {
 function acknowledgeAssignment({ root, workRecordId, expectedRevision, now, actor = 'ic', evidence = 'assignment-started', manifestPath } = {}) {
   assertManifestNotInvalidated(manifestPath);
   const record = getRecord({ root, id: workRecordId });
-  const result = transitionRecord({ root, id: workRecordId, expectedRevision, to: 'implementing', idempotencyKey: `assignment-started:${workRecordId}:${expectedRevision}`, evidence, actor, now });
+  const key = `assignment-started:${workRecordId}:${expectedRevision}`;
+  // fleet #434: an ack on a record already past `assigned` changes nothing (a recovery replays a launch prompt that still says to acknowledge, and a resumed IC may run it again); only a replay of this key reaches the transition.
+  const live = readStateFixture(undefined, { records: {} }, root, path.join('state', 'work', 'active.json')).records?.[workRecordId];
+  if (live && live.state !== 'assigned' && !live.idempotency?.[key]) return { replayed: false, pastAssigned: true, revision: live.revision, eventSequence: live.eventSequence, record: live };
+  const result = transitionRecord({ root, id: workRecordId, expectedRevision, to: 'implementing', idempotencyKey: key, evidence, actor, now });
   if (record.manifestPath) writeSidecar(`${record.manifestPath}.acknowledged.json`, { schemaVersion: 1, workRecordId, acknowledgedAt: now || new Date().toISOString(), actor, evidence });
   return result;
 }

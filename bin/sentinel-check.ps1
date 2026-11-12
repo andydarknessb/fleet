@@ -540,7 +540,7 @@ function Property-Names { param($obj) if ($null -eq $obj) { return @() }; return
 # (manifest, workRecordId, launchedAt) only after it saw the session, and the session's first turn writes
 # the ack sidecar and, at the end of the turn, a heartbeat; a row with neither, past the grace, whose job
 # is gone will never do either. Returns the one-line why, or $null when any leg of the proof is missing
-# (a legacy row without a manifest, any heartbeat - the recover/respawn path owns that row -, an ack, the
+# (a row without a manifest or Work record id: a legacy prompt launch, or a recovery before fleet #434; any heartbeat - the recover/respawn path owns that row -, an ack, the
 # grace not yet over, an unparseable or future launchedAt, a job that could still be running, a roster
 # that did not read cleanly). Branch (a): no daemon row for the name AND the job state is terminal, or
 # not fresh (updatedAt older than watchdog.staleMinutes); a working state with no updatedAt is not proof.

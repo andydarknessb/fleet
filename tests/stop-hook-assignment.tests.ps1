@@ -198,6 +198,16 @@ try {
     Assert-True ($viaBash -match 'ACK-STUB ack --root') "the ack command must run unchanged through bash: $viaBash"
   }
 
+  # fleet #434: a session started on a record already past `assigned` (a recovered or resumed IC) gets its facts and the
+  # state, never the ack command: the ack would run its transition from whatever state the record is in.
+  foreach ($pastState in 'implementing', 'escalated') {
+    Write-Utf8 "$testRoot\state\work\active.json" ('{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"' + $pastState + '","revision":4}}}')
+    $past = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\session-start.ps1" 2>&1 | Out-String)
+    Assert-True ($past -match 'Assignment manifest:' -and $past -match "now $pastState" -and $past -notmatch 'assignment\.js ack --root' -and $past -match 'The record is no longer assigned: do not run assignment\.js ack\.') "fleet #434: a session starting on a record in $pastState must get its state, not the ack command: $past"
+  }
+  Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"assigned","revision":3}}}'
+  $assignedAgain = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\session-start.ps1" 2>&1 | Out-String)
+  Assert-True ($assignedAgain -match 'assignment\.js ack --root' -and $assignedAgain -match '--expected-revision 3') "fleet #434: an assigned record still gets the ack command with its revision: $assignedAgain"
   Write-Output 'stop hook assignment tests passed'
 } finally {
   $env:PATH = $oldPath

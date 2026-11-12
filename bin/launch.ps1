@@ -10,7 +10,7 @@ param(
   [ValidateNotNullOrEmpty()]
   [string]$Reason = 'manual',  # fleet #392: why this launch happened, recorded as launchReason on the roster row and in the output: rotation:<merges|age|job-tokens|forced>, wake:<what changed>, recover, respawn-fallback, launch-needed, assignment, or manual (a human's launch, the default)
   [ValidateSet('', 'auto', 'allowlist')]
-  [string]$Permissions, # the permission profile (ADR 0016); an assignment manifest's own `permissions` wins. Empty = auto.
+  [string]$Permissions, # the permission profile (ADR 0016); an assignment manifest's own `permissions` wins, and a validated -Recover's roster row does too. Empty = auto.
   [ValidateSet('', 'sonnet', 'opus', 'haiku', 'fable', 'opus-5.5', 'sonnet-5.5')]
   [string]$Model,   # per-launch override of the role file's model (project leads use it per ticket); 'opus' pins to Opus 4.8, 'opus-5.5' to Opus 5.5, 'sonnet-5.5' to Sonnet 5.5 (the project-lead and Principal default); an IC runs 'haiku' only (fleet #350), see $modelArgs below
   [switch]$Force,   # bypass the cap (Cory only); does not restore the legacy IC prompt path (fleet #89: retired for good)
@@ -23,7 +23,11 @@ param(
                     # -Prompt (read from that same roster row): recovery restarts the crashed
                     # process with its own history, it does not re-run manifest preconditions or
                     # create a new worktree, so a validated -Recover does not set -Manifest here
-                    # either - it lifts the no-manifest IC refusal below and takes the IC's effort from its roster row. A -Recover for any
+                    # either - it lifts the no-manifest IC refusal below and takes the IC's effort,
+                    # cwd, manifest, Work record id and permissions from its roster row (the row's Work
+                    # record id and permissions win over a caller's -WorkRecordId or -Permissions), and
+                    # its branch and base from that manifest file when it is readable; a recovery whose
+                    # worktree is gone is refused (fleet #434). A -Recover for any
                     # other name (or one with no manifest on its row) gets no exemption at all
                     # (QA fix, fleet #89: it used to accept any name unconditionally). Cap, PAUSE
                     # and maxIcs still apply regardless.
@@ -59,9 +63,21 @@ $cwd = $null
 $t = $null
 $worktreePath = $null
 $recoverValidated = $false
+$recoverManifest = $null
+$recoverAssignment = $null
+$recoverCwd = $null
 if ($Recover -and -not $Manifest -and ($Role -eq 'ic' -or ($Name -and $Name -match '^ic-'))) {
   $recoverableRow = $live.sessions | Where-Object { $_.name -eq $Name -and $_.role -eq 'ic' -and $_.status -eq 'active' -and $_.manifest } | Select-Object -Last 1
   $recoverValidated = [bool]$recoverableRow
+  # fleet #434: a validated recovery restarts the unit its manifest launch built, so the roster row is the credential: its Work record id and permissions win over the caller's. A missing or unreadable manifest file refuses nothing.
+  if ($recoverValidated) {
+    $recoverManifest = "$($recoverableRow.manifest)"
+    try { if (Test-Path -LiteralPath $recoverManifest -PathType Leaf) { $recoverAssignment = Read-Json $recoverManifest } } catch {}
+    if ("$($recoverableRow.workRecordId)") { $WorkRecordId = "$($recoverableRow.workRecordId)" } elseif ($recoverAssignment -and "$($recoverAssignment.workRecordId)") { $WorkRecordId = "$($recoverAssignment.workRecordId)" }
+    if ("$($recoverableRow.permissions)" -in @('auto', 'allowlist')) { $Permissions = "$($recoverableRow.permissions)" }
+    # fleet #434: the row's worktree is the cwd the recovery restarts in; one with no .git entry is gone (or an empty leftover), and the refusal below names it.
+    if ("$($recoverableRow.cwd)" -and (Test-Path -LiteralPath (Join-Path "$($recoverableRow.cwd)" '.git'))) { $recoverCwd = "$($recoverableRow.cwd)" }
+  }
 }
 if ($Manifest) {
   # no release: a manifest that cannot be read names no Work record, so there is nothing this script can release.
@@ -132,6 +148,11 @@ if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $reco
   if ($Recover) { $legacyRefusal = "-Recover found no active IC named '$Name' with a recorded manifest on the live roster; there is nothing to recover, and -Recover carries no exemption of its own (fleet #89)" }
   Write-Output (@{ launched = $false; reason = $legacyRefusal } | ConvertTo-Json -Compress); exit 3
 }
+# no release: a recovery has no -Manifest, so no reservation stands behind this refusal.
+if ($recoverValidated -and "$($recoverableRow.cwd)" -and -not $recoverCwd -and -not $DryRun) {
+  $worktreeReason = "-Recover found the assignment worktree of '$Name' gone ($($recoverableRow.cwd)); there is nothing to restart it in. Retire the IC with bin\retire.ps1 and abandon its Work record (work-state.js abandon) before the issue is assigned again"
+  Write-Output (@{ launched = $false; reason = $worktreeReason } | ConvertTo-Json -Compress); exit 3
+}
 if ($Tenant) {
   $t = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $t) { $r = Release-ReservationOnRefusal "launch refused: no tenant file for '$Tenant'"; Write-Error "no tenant file for '$Tenant'$($r.note)"; exit 4 }
@@ -169,7 +190,7 @@ if ($Manifest) {
 # the lead picks its effort per ticket: the manifest's effort, xhigh by default or max, else the
 # role file's. Anything else is refused here, dry runs included, before any gate or write.
 # The permission profile is a launch-door choice (ADR 0016): an IC runs the auto profile unless
-# the manifest pins allowlist, the rollback. A release goes through Invalidate-Manifest.
+# the manifest (or a validated -Recover's roster row) pins allowlist, the rollback. A release goes through Invalidate-Manifest.
 if (-not $Permissions) { $Permissions = 'auto' }
 $icReason = $null
 if ($Role -eq 'ic') {
@@ -365,6 +386,11 @@ if ($Manifest) {
   $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId
   $envBlock.FLEET_BASE_SHA = [string]$assignment.base.sha
   $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
+} elseif ($recoverValidated) {
+  $envBlock.FLEET_ASSIGNMENT_MANIFEST = $recoverManifest
+  if ($WorkRecordId) { $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId }
+  if ($recoverAssignment -and "$($recoverAssignment.base.sha)") { $envBlock.FLEET_BASE_SHA = [string]$recoverAssignment.base.sha }
+  if ($recoverAssignment -and "$($recoverAssignment.branch)") { $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$recoverAssignment.branch }
 }
 $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
 # fleet #384: only the project lead keeps the claude.ai connectors (its Supabase connector); every other role runs without them.
@@ -630,6 +656,9 @@ if ($Manifest) {
     } catch { Write-Warning "could not add the PR body file to $excludePath ($_)" }
   }
   $cwd = $worktreePath
+} elseif ($recoverCwd) {
+  # fleet #434: a recovered IC restarts in the assignment worktree its manifest launch created, not the tenant repo root.
+  $cwd = $recoverCwd
 }
 
 # --- launch ---
@@ -716,7 +745,7 @@ if (-not $row) {
 # --- record ---
 # The row carries the resolved manifest path (as FLEET_ASSIGNMENT_MANIFEST does), which
 # work-state release matches against the record's manifest to tell a live claim from a stale row.
-$rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } else { $Manifest }
+$rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } elseif ($recoverValidated) { $recoverManifest } else { $Manifest }
 $entry = [pscustomobject]@{
   name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
   model = $requestedModel; permissions = $Permissions; effort = $effort
