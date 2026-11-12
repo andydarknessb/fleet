@@ -29,7 +29,7 @@ $pad = 'x' * 89
 try {
   New-Item -ItemType Directory -Force "$capRoot\bin", "$capRoot\state\watch" | Out-Null
   Copy-Item "$sourceRoot\bin\_common.ps1", "$sourceRoot\bin\run-pr-watch.ps1" -Destination "$capRoot\bin"
-  [IO.File]::WriteAllText("$capRoot\bin\node-stub.cmd", "@echo off`r`necho stub-node`r`nexit /b 0`r`n", (New-Object Text.UTF8Encoding $false))
+  [IO.File]::WriteAllText("$capRoot\bin\node-stub.cmd", "@echo off`r`necho %*>>""%~dp0node-calls.log""`r`nexit /b 0`r`n", (New-Object Text.UTF8Encoding $false))
   $env:FLEET_NODE_PATH = "$capRoot\bin\node-stub.cmd"
 
   # 105000 lines of 100 bytes: 10,500,000 bytes, a little over the 10 MB cap.
@@ -46,6 +46,20 @@ try {
   [IO.File]::WriteAllText($capLog, ((1..10 | ForEach-Object { ('L{0:D7} ' -f $_) + $pad + "`r`n" }) -join ''), (New-Object Text.UTF8Encoding $false))
   & powershell -NoProfile -ExecutionPolicy Bypass -File "$capRoot\bin\run-pr-watch.ps1" | Out-Null
   Assert-True ((Get-Content -LiteralPath $capLog -TotalCount 1) -match '^L0000001 ') 'a log under the cap must not be trimmed'
+
+  # Review item 8: a reader holding the log open (no Delete sharing) makes the trim's Replace fail. The tick
+  # goes on, prints nothing and leaves no watch.log.trim behind; the next tick tries again.
+  $writer = New-Object IO.StreamWriter($capLog, $false, (New-Object Text.UTF8Encoding $false))
+  try { for ($line = 1; $line -le 105000; $line++) { $writer.Write(('L{0:D7} ' -f $line) + $pad + "`r`n") } } finally { $writer.Dispose() }
+  $originalLength = (Get-Item -LiteralPath $capLog).Length
+  Remove-Item -LiteralPath "$capRoot\bin\node-calls.log" -ErrorAction SilentlyContinue
+  $held = [IO.File]::Open($capLog, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+  try { $heldOut = (& powershell -NoProfile -ExecutionPolicy Bypass -File "$capRoot\bin\run-pr-watch.ps1" 2>&1 | Out-String) } finally { $held.Dispose() }
+  Assert-True ($LASTEXITCODE -eq 0) "a log held open must not turn the tick red, got $LASTEXITCODE. Output: $heldOut"
+  Assert-True ($heldOut.Trim() -eq '') "a trim that fails prints nothing: $heldOut"
+  Assert-True (-not (Test-Path -LiteralPath "$capLog.trim") -and -not (Test-Path -LiteralPath "$capLog.bak")) 'a trim that fails leaves no watch.log.trim or .bak behind'
+  Assert-True ((Get-Item -LiteralPath $capLog).Length -ge $originalLength -and (Get-Content -LiteralPath $capLog -TotalCount 1) -match '^L0000001 ') 'a trim that fails leaves the log whole'
+  Assert-True (Test-Path -LiteralPath "$capRoot\bin\node-calls.log") 'the tick still runs its node steps after a trim that fails'
 } finally {
   Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $capRoot -Recurse -Force -ErrorAction SilentlyContinue

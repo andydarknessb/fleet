@@ -53,12 +53,18 @@ try {
   Assert-True ($script:lastExit -eq 0) "the same fixture without the red suites exits 0, got $($script:lastExit): $green"
   Assert-True ($green -match 'test-all: all 2 suites passed') "the green summary counts the suites: $green"
 
+  Assert-True ((Get-LogDirs).Count -eq 0) "a green run removes its own log dir from TEMP: $((Get-LogDirs) -join ', ')"
   # #444: -Filter takes a list and -Exclude leaves suites out after it. From the command line a list is one
   # comma-separated token (powershell -File binds one token per parameter).
   $listed = Run-Runner @('-Filter', 'alpha*,gamma*')
   Assert-True ($script:lastExit -eq 0 -and $listed -match '(?m)^PASS  alpha\.tests\.js' -and $listed -match '(?m)^PASS  gamma\.tests\.ps1' -and $listed -notmatch '(?m)^(PASS|FAIL)  beta') "-Filter takes a comma-separated list of wildcards: $listed"
+  # Item 2 (review): the comma split trims, so a list written with a space after the comma names every suite.
+  $spaced = Run-Runner @('-Filter', 'alpha*, gamma*')
+  Assert-True ($script:lastExit -eq 0 -and $spaced -match '(?m)^PASS  alpha\.tests\.js' -and $spaced -match '(?m)^PASS  gamma\.tests\.ps1' -and $spaced -notmatch '(?m)^(PASS|FAIL)  beta') "-Filter with a space after the comma runs every name in it: $spaced"
   $excluded = Run-Runner @('-Exclude', 'beta*,delta*')
   Assert-True ($script:lastExit -eq 0 -and $excluded -match 'test-all: all 2 suites passed' -and $excluded -notmatch '(?m)^(PASS|FAIL)  (beta|delta)') "-Exclude leaves out every suite it names: $excluded"
+  $spacedExcluded = Run-Runner @('-Exclude', 'beta*, delta*')
+  Assert-True ($script:lastExit -eq 0 -and $spacedExcluded -match 'test-all: all 2 suites passed' -and $spacedExcluded -notmatch '(?m)^(PASS|FAIL)  (beta|delta)') "-Exclude with a space after the comma leaves out every name in it: $spacedExcluded"
   $afterFilter = Run-Runner @('-Filter', 'alpha*,beta*', '-Exclude', 'beta*')
   Assert-True ($script:lastExit -eq 0 -and $afterFilter -match 'test-all: all 1 suites passed' -and $afterFilter -notmatch '(?m)^(PASS|FAIL)  beta') "-Exclude is applied after -Filter: $afterFilter"
   $emptied = Run-Runner @('-Filter', 'alpha*', '-Exclude', 'alpha*')
@@ -74,8 +80,6 @@ try {
   Assert-True ($notSuites.Count -eq 0) "config/ci-shards.json names no suite file in tests/: $($notSuites -join ', ')"
   $listedTwice = @($shardNames | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
   Assert-True ($listedTwice.Count -eq 0) "config/ci-shards.json lists a suite twice: $($listedTwice -join ', ')"
-
-  Assert-True ((Get-LogDirs).Count -eq 0) "a green run removes its own log dir from TEMP: $((Get-LogDirs) -join ', ')"
 
   $explicitLogs = Join-Path $fixture 'explicit-logs'
   $null = Run-Runner @('-Filter', '[ag]*', '-LogDir', $explicitLogs)
