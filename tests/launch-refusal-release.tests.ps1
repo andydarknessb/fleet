@@ -407,6 +407,24 @@ try {
   $sessionEnv4 = (Get-Content "$testRoot\state\sessions\ic-40.settings.json" -Raw | ConvertFrom-Json).env
   Assert-True ("$($sessionEnv4.FLEET_ASSIGNMENT_MANIFEST)" -eq "$($oldRow.manifest)" -and "$($sessionEnv4.FLEET_WORK_RECORD_ID)" -eq 'test:issue-40' -and -not $sessionEnv4.PSObject.Properties['FLEET_BASE_SHA'] -and -not $sessionEnv4.PSObject.Properties['FLEET_ASSIGNMENT_BRANCH']) "fleet #434: with no manifest file the recovery keeps the row's manifest and Work record id and sets no base or branch: $(($sessionEnv4 | ConvertTo-Json -Compress))"
 
+  # fleet #434 (ruling 3): a recovered allowlist IC goes through the CLI rehearsal gate, and a refusal there releases nothing.
+  # The fixture's rehearsalRoot skips the gate, so this step drops it and names a verified CLI version the mock does not report.
+  $gateRowBefore = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)
+  $gateRecordBefore = Get-Record 40
+  Write-Utf8 "$testRoot\config\permissions-allowlist.json" '{"verifiedCliVersion":"2.1.312","defaultMode":"acceptEdits","allow":[{"rule":"Bash(git status)"}]}'
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $env:MOCK_BG_ROW = '1'
+  try { $gate1 = Run-Launch $recoverArgs } finally {
+    Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue
+    Write-Utf8 "$testRoot\config\permissions-allowlist.json" '{"rehearsalRoot":true,"defaultMode":"acceptEdits","allow":[{"rule":"Bash(git status)"}]}'
+  }
+  Assert-True ($lastExit -eq 3 -and $gate1 -and $gate1.launched -eq $false -and "$($gate1.reason)" -match 'allowlist profile was verified on Claude Code 2.1.312' -and $gate1.reservationReleased -eq $false) "fleet #434: a recovery of an allowlist IC is refused by the CLI rehearsal gate with nothing released: exit $lastExit $lastOut"
+  Assert-True (-not (Test-Path "$($oldRow.manifest).invalidated.json")) 'fleet #434: the gate refusal writes no invalidation marker beside the manifest'
+  $gateRowAfter = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)
+  Assert-True ($gateRowAfter -eq $gateRowBefore) "fleet #434: the gate refusal leaves the roster row unchanged: $gateRowAfter"
+  $gateRecordAfter = Get-Record 40
+  Assert-True ("$($gateRecordAfter.state)" -eq "$($gateRecordBefore.state)" -and [string]$gateRecordAfter.revision -eq [string]$gateRecordBefore.revision) 'fleet #434: the gate refusal leaves the Work record state and revision unchanged'
+
   # fleet #434: a recovery whose assignment worktree is gone is refused before anything is written: no release, no marker,
   # and the roster row and the Work record keep their state. An empty leftover directory at the path is no worktree either.
   $goneRowBefore = (@((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-40' -and $_.status -eq 'active' })[0] | ConvertTo-Json -Compress)

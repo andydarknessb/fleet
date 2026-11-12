@@ -150,7 +150,7 @@ if (($Role -eq 'ic' -or $Name -match '^ic-') -and -not $Manifest -and -not $reco
 }
 # no release: a recovery has no -Manifest, so no reservation stands behind this refusal.
 if ($recoverValidated -and "$($recoverableRow.cwd)" -and -not $recoverCwd -and -not $DryRun) {
-  $worktreeReason = "-Recover found the assignment worktree of '$Name' gone ($($recoverableRow.cwd)); there is nothing to restart it in. Retire it with bin\retire.ps1 and assign the issue again"
+  $worktreeReason = "-Recover found the assignment worktree of '$Name' gone ($($recoverableRow.cwd)); there is nothing to restart it in. Retire the IC with bin\retire.ps1 and abandon its Work record (work-state.js abandon) before the issue is assigned again"
   Write-Output (@{ launched = $false; reason = $worktreeReason } | ConvertTo-Json -Compress); exit 3
 }
 if ($Tenant) {

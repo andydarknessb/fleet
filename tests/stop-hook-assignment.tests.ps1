@@ -203,7 +203,7 @@ try {
   foreach ($pastState in 'implementing', 'escalated') {
     Write-Utf8 "$testRoot\state\work\active.json" ('{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"' + $pastState + '","revision":4}}}')
     $past = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\session-start.ps1" 2>&1 | Out-String)
-    Assert-True ($past -match 'Assignment manifest:' -and $past -match "now $pastState" -and $past -notmatch 'assignment\.js ack --root' -and $past -match 'do not run assignment\.js ack again') "fleet #434: a session starting on a record in $pastState must get its state, not the ack command: $past"
+    Assert-True ($past -match 'Assignment manifest:' -and $past -match "now $pastState" -and $past -notmatch 'assignment\.js ack --root' -and $past -match 'The record is no longer assigned: do not run assignment\.js ack\.') "fleet #434: a session starting on a record in $pastState must get its state, not the ack command: $past"
   }
   Write-Utf8 "$testRoot\state\work\active.json" '{"schemaVersion":1,"records":{"test:issue-101":{"id":"test:issue-101","state":"assigned","revision":3}}}'
   $assignedAgain = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File "$testRoot\hooks\session-start.ps1" 2>&1 | Out-String)

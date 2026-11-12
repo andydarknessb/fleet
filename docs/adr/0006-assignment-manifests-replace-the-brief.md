@@ -101,7 +101,7 @@ Mechanism landed; the flag flip is Cory's hand after the gate, as for 08b.
   record is not `assigned`, a live session may own it, the manifest is already invalidated), and a release
   that fails never replaces the refusal reason. The session-start hook prints the
   manifest, Work record, and the acknowledgment command with the record's
-  current revision. Manifest launches prompt with
+  current revision (2026-11-11, fleet #434: the acknowledgment command only while the record is `assigned`; otherwise the record's state, and `ack` leaves a record past `assigned` where it is). Manifest launches prompt with
   `/mattpocock-skills:implement` so the IC runs the real `/implement`.
 - Rollback (`bin/rollback-assignment.ps1`): removes the flag, releases every
   manifest still pending acknowledgment through `work-state.js release` (one

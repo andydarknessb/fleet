@@ -1477,9 +1477,8 @@ test('#251: acknowledging a live manifest still works when the manifest path is 
   assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
 });
 
-// fleet #434: an ack on a record already past `assigned` changes nothing. A session started on such a record (a recovered
-// or resumed IC, a record sent back for revision or escalated) runs the ack its hook printed; only a replay of the ack's
-// own key goes through the transition.
+// fleet #434: an ack on a record already past `assigned` changes nothing. A recovery replays a launch prompt that still says
+// to acknowledge, and a resumed IC may run it again; only a replay of the ack's own key goes through the transition.
 function ledgerLineCount(root) {
   const dir = path.join(root, 'state', 'events');
   if (!fs.existsSync(dir)) return 0;
@@ -1507,7 +1506,7 @@ test('#434: a repeated ack on an implementing record changes nothing and does no
   const sidecar = fs.readFileSync(`${manifestPath}.acknowledged.json`, 'utf8');
   const ledger = ledgerLineCount(root);
   const again = acknowledgeAssignment({ root, workRecordId: id, expectedRevision: before.revision, manifestPath, now: '2026-09-30T00:02:00.000Z' });
-  assert.equal(again.alreadyStarted, true);
+  assert.equal(again.pastAssigned, true);
   assert.equal(getRecord({ root, id }).state, 'implementing');
   assert.equal(getRecord({ root, id }).revision, before.revision);
   assert.equal(ledgerLineCount(root), ledger);
@@ -1542,7 +1541,7 @@ test('#434: a replay of the original ack still goes through the transition and r
   const replay = acknowledgeAssignment({ root, workRecordId: id, expectedRevision: 1, manifestPath, now: '2026-09-30T00:05:00.000Z' });
   assert.equal(replay.replayed, true);
   assert.equal(replay.revision, 2);
-  assert.equal(replay.alreadyStarted, undefined);
+  assert.equal(replay.pastAssigned, undefined);
   assert.equal(getRecord({ root, id }).state, 'implementing');
 });
 
@@ -1554,7 +1553,7 @@ test('#434: the first ack on an assigned record still transitions and writes the
   });
   const first = acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:01:00.000Z' });
   assert.equal(first.replayed, false);
-  assert.equal(first.alreadyStarted, undefined);
+  assert.equal(first.pastAssigned, undefined);
   assert.equal(first.record.state, 'implementing');
   assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
 });

@@ -97,7 +97,7 @@ cory
 | `bin/install-cycle-collector-task.ps1` | Idempotently registers the daily collector task; run manually. |
 | `bin/pause.ps1` | Fleet-wide kill switch. `-Off` clears. |
 | `bin/status.ps1` | One-screen view. |
-| `bin/recover.ps1` | Bring the roster back after a reboot (a cut-over Sentinel is not recovered). An IC row whose assignment manifest carries an `.invalidated.json` marker (the sentinel's dead-before-ack retire, fleet #253, or launch.ps1's no-session path) is skipped and logged to `state/sentinel/last-recover.txt`, never respawned or relaunched. `install-recovery-task.ps1` registers it at logon. |
+| `bin/recover.ps1` | Bring the roster back after a reboot (a cut-over Sentinel is not recovered). An IC row whose assignment manifest carries an `.invalidated.json` marker (the sentinel's dead-before-ack retire, fleet #253, or launch.ps1's no-session path) is skipped and logged to `state/sentinel/last-recover.txt`, never respawned or relaunched. An IC whose assignment worktree is gone is refused by `launch.ps1` and logged there the same way, not started in the tenant repo. `install-recovery-task.ps1` registers it at logon. |
 | `bin/pilot.ps1` | Launch every expected static session (pl-endzone; the Sentinel's roster entry was retired by ticket 89 and the dispatcher's by #303, so neither is among them). `-DryRun` to check gates without starting anything. |
 | `state/` | Runtime only, gitignored: live roster, heartbeats, escalations, per-session settings, status files, PAUSE. |
 | `state/metrics/` | Generated measurement artifacts; cache-read tokens remain separate from fresh control-plane and IC tokens. |
