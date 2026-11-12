@@ -625,10 +625,10 @@ test('lock probe forgives a delete-pending lock that stats as EPERM or EBUSY', (
   }
 });
 
-function staleLock(root, content) {
+function staleLock(root, content, ageMs = 10 * 60 * 1000) {
   const lock = path.join(root, 'state', 'work', '.lock');
   fs.writeFileSync(lock, content);
-  const old = new Date(Date.now() - 10 * 60 * 1000);
+  const old = new Date(Date.now() - ageMs);
   fs.utimesSync(lock, old, old);
   return lock;
 }
@@ -702,7 +702,8 @@ test('#235: a break removal that keeps reporting EPERM throws after about five s
 test('breaking a stale lock forgives a lock that reads as EPERM', () => {
   const root = rootDir();
   makeRecord(root);
-  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+  // Under 120 s (#447): an older lock is broken on its age, so its owner is never read.
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }), 90 * 1000);
   withFsFault('readFileSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
     assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
     assert.equal(probe.failures, 2);
@@ -1835,7 +1836,8 @@ test('#235: a stale lock and a stale breaker mutex whose removal keeps reporting
 test('#235: a lock whose owner pid reports EPERM to signal 0 is alive and not breakable', () => {
   const root = rootDir();
   makeRecord(root);
-  const lock = staleLock(root, JSON.stringify({ pid: 4, at: '2026-01-01T00:00:00.000Z' }));
+  // Older than LOCK_STALE_MS but younger than the 120 s force-break age (#447): only the owner decides.
+  const lock = staleLock(root, JSON.stringify({ pid: 4, at: '2026-01-01T00:00:00.000Z' }), 90 * 1000);
   const kill = process.kill;
   process.kill = () => { throw Object.assign(new Error('EPERM: simulated'), { code: 'EPERM' }); };
   try {
@@ -1845,6 +1847,54 @@ test('#235: a lock whose owner pid reports EPERM to signal 0 is alive and not br
     });
   } finally { process.kill = kill; }
   assert.equal(fs.existsSync(lock), true);
+});
+
+// #447: past 120 s a lock is broken on its age alone, because a dead owner's pid may belong to a live
+// unrelated process by then. Younger than that, a live owner keeps its lock. The stubs count breaker opens.
+function countBreakerOpens(target, probe) {
+  if (path.basename(target) === '.lock.break') probe.breakerOpens = (probe.breakerOpens || 0) + 1;
+  return null;
+}
+
+test('#447: a lock older than 120 s is broken under the breaker mutex even when its pid is a live process', () => {
+  const root = rootDir();
+  makeRecord(root);
+  staleLock(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 130 * 1000);
+  withFsFault('openSync', countBreakerOpens, (probe) => {
+    probe.onWait = () => { if (probe.waits > 1000) throw new Error('spun: a 130 s lock held by a live pid was never broken'); return 'timed-out'; };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.breakerOpens, 1);
+  });
+});
+
+test('#447: a lock younger than 120 s with a live owner is never broken', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 100 * 1000);
+  withFsFault('openSync', countBreakerOpens, (probe) => {
+    probe.onWait = () => { if (probe.waits === 50) fs.rmSync(lock, { force: true }); return 'timed-out'; };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.ok(probe.waits >= 50, `waits: ${probe.waits}`);
+    assert.equal(probe.breakerOpens, undefined, 'the breaker mutex was never opened for a young live lock');
+  });
+});
+
+test('#447: a caller that has waited 180 s throws LOCK_TIMEOUT naming the lock and the wait', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock } = paths(root);
+  fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  withFsFault('statSync', () => null, (probe) => {
+    // A live holder that keeps its lock young: nothing breaks it, so only the 180 s deadline ends the wait.
+    probe.onWait = () => {
+      const now = new Date(Date.now());
+      fs.utimesSync(lock, now, now);
+      if (probe.waits > 20000) throw new Error('spun past the 180 s deadline');
+      return 'timed-out';
+    };
+    assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'LOCK_TIMEOUT'
+      && error.message.includes(lock) && error.waitedMs >= 180 * 1000 && error.waitedMs < 185 * 1000);
+  });
 });
 
 test('#235: a contender stalled after judging the lock stale re-judges it under the breaker mutex', async () => {

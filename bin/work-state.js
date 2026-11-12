@@ -44,6 +44,11 @@ function isMergeReviewEvent(event) {
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
 const LOCK_STALE_MS = 60 * 1000;
+// #447: a lock older than LOCK_FORCE_BREAK_MS is broken whatever its pid says (a pid can be reused), and a
+// caller that has waited LOCK_WAIT_MAX_MS throws LOCK_TIMEOUT. The longest work done under the lock today is a
+// 15 s GitHub call (reconcilePullRequest), so 120 s and 180 s leave room for it.
+const LOCK_FORCE_BREAK_MS = 120 * 1000;
+const LOCK_WAIT_MAX_MS = 180 * 1000;
 // #234: Windows answers EPERM/EACCES/EBUSY for a lock or rename target that is delete-pending.
 // The lock treats them as contended, but throws once they have persisted for LOCK_TRANSIENT_MAX_MS of
 // wall time (a Windows wait is ~16 ms, so a wait count would stall every door call for over a minute),
@@ -146,11 +151,14 @@ function releaseLock(file, handle) {
   if (mine) fs.rmSync(file, { force: true, maxRetries: 5, retryDelay: 10 });
 }
 
-// A lock (or breaker lock) is breakable when it is older than LOCK_STALE_MS and its owner is gone.
+// A lock (or breaker lock) is breakable when it is older than LOCK_STALE_MS and its owner is gone, or
+// older than LOCK_FORCE_BREAK_MS whatever its owner says (#447).
 function breakable(file) {
   try {
     const stat = fs.statSync(file, { bigint: true });
-    if (Date.now() - Number(stat.mtimeMs) <= LOCK_STALE_MS) return false;
+    const age = Date.now() - Number(stat.mtimeMs);
+    if (age <= LOCK_STALE_MS) return false;
+    if (age > LOCK_FORCE_BREAK_MS) return true;
     // #234: an empty or partial lock file has no owner to find; treat it as ownerless.
     let owner = {};
     // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
@@ -167,6 +175,7 @@ function breakable(file) {
 
 function withLock(root, callback) {
   const p = ensureLayout(root);
+  const waitStartedAt = Date.now();
   let handle;
   let transientSince;
   let breakTransientSince;
@@ -181,6 +190,11 @@ function withLock(root, callback) {
         if (Date.now() - transientSince > LOCK_TRANSIENT_MAX_MS) throw error;
       } else {
         transientSince = undefined;
+      }
+      // #447: every wait passes through here, so one check bounds the whole wait (breaker mutex included).
+      const waitedMs = Date.now() - waitStartedAt;
+      if (waitedMs > LOCK_WAIT_MAX_MS) {
+        throw new WorkStateError('LOCK_TIMEOUT', `timed out after waiting ${Math.round(waitedMs / 1000)} s for the state lock at ${p.lock}`, { lock: p.lock, waitedMs });
       }
       if (!breakable(p.lock)) {
         breakTransientSince = undefined;
