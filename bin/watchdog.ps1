@@ -202,7 +202,8 @@ try {
   # age is reached, and never if it clears first. Exact kind match (a grace is deliberate, not a prefix
   # family); a value that is not a non-negative number is reported by Get-InvalidPagePriorities and
   # falls back to the built-in below.
-  $script:DefaultPageMinAge = @{ 'sync-unattested' = 60 }
+  # ticket 453 review: an unreadable planner or triage frontier pages only once it has stood 20 min, so one GitHub 502 tick never pages.
+  $script:DefaultPageMinAge = @{ 'sync-unattested' = 60; 'planner-failed' = 20; 'triage-frontier-unreadable' = 20 }
   function Test-PageMinAgeValue {
     param($Value)
     return (($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) -and $Value -ge 0)
@@ -901,13 +902,21 @@ try {
         if ($rn -and $respawnFailState.PSObject.Properties[$rn]) { $respawnFailState.PSObject.Properties.Remove($rn); $respawnFailChanged = $true }
       }
       $respawnFailWindowStart = $now.AddHours(-$retryWindowHours)
+      # ticket 453 review: a launch refusal count is consecutive. A tick that did not refuse that name (its launch not asked for, or it started)
+      # drops it; a failed respawn keeps its count.
+      $refusedNow = @($launchRefusals | ForEach-Object { $_.name })
+      foreach ($rp in @($respawnFailState.PSObject.Properties)) {
+        if ($rp.Value.PSObject.Properties['launch'] -and $rp.Value.launch -eq $true -and $refusedNow -notcontains $rp.Name) { $respawnFailState.PSObject.Properties.Remove($rp.Name); $respawnFailChanged = $true }
+      }
       foreach ($rf in @($check.respawnFailed) + $launchRefusals) {
         $rn = "$($rf.name)"; if (-not $rn) { continue }
         $rfPrior = $null; if ($respawnFailState.PSObject.Properties[$rn]) { $rfPrior = $respawnFailState.$rn }
         $rfAttempts = @(); if ($rfPrior -and $rfPrior.PSObject.Properties['attempts']) { $rfAttempts = @($rfPrior.attempts | Where-Object { $_ }) }
         $rfRecent = @($rfAttempts | Where-Object { $ts = ConvertTo-UtcDateTime $_; $ts -and $ts -ge $respawnFailWindowStart })
         $rfRecent += (Now-Iso)
-        $respawnFailState | Add-Member -NotePropertyName $rn -NotePropertyValue ([pscustomobject]@{ attempts = @($rfRecent); lastReason = "$($rf.reason)" }) -Force
+        # launch: true only while every attempt in the entry is a launch refusal (a respawn failure in it makes the entry a respawn count).
+        $rfLaunch = ([bool]$rf.PSObject.Properties['launchRefused']) -and ($null -eq $rfPrior -or ($rfPrior.PSObject.Properties['launch'] -and $rfPrior.launch -eq $true))
+        $respawnFailState | Add-Member -NotePropertyName $rn -NotePropertyValue ([pscustomobject]@{ attempts = @($rfRecent); lastReason = "$($rf.reason)"; launch = $rfLaunch }) -Force
         $respawnFailChanged = $true
         $rfIsLaunch = [bool]$rf.PSObject.Properties['launchRefused']
         if ($rfRecent.Count -ge $retryCap) { $respawnFailTrips += [pscustomobject]@{ name = $rn; failures = $rfRecent.Count; reason = "$($rf.reason)"; launchRefused = $rfIsLaunch } }
@@ -1122,15 +1131,27 @@ try {
   if ($null -eq $wakeState.PSObject.Properties['legacyHolds']) { $wakeState | Add-Member -NotePropertyName legacyHolds -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
   # ticket 453 (ADR 0012): tenants whose planner (assignment.js frontier) failed and has not answered since. The wake block asks
-  # only for an idle lead, so an entry must outlive the ticks that do not ask. An unreadable file fails closed: never reset, never written.
+  # only for an idle lead, so an entry must outlive the ticks that do not ask. An unreadable file is moved aside, as paged.json is, and the tick carries on empty.
   $plannerFailedPath = "$FleetHome\state\watchdog\planner-failed.json"
-  $plannerFailed = $null; $plannerFailedUnreadable = $false
-  try { $plannerFailed = Read-Json $plannerFailedPath } catch { $plannerFailedUnreadable = $true }
+  $plannerFailed = $null
+  try { $plannerFailed = Read-Json $plannerFailedPath } catch {
+    if (-not $Verify) { try { Move-Item -Force $plannerFailedPath "$plannerFailedPath.corrupt-$($now.ToString('yyyyMMddTHHmmssZ'))" } catch {} }
+  }
   if (-not $plannerFailed) { $plannerFailed = [pscustomobject]@{} }
   $plannerFailedChanged = $false
   # fleet #346: an empty or lead-less roster is a read glitch (Save-LiveRoster is not atomic), never "every IC left": no stall evaluation or pruning on it.
   $rosterOk = [bool]($liveRoster -and @($liveRoster.sessions | Where-Object { $_.role -eq 'project-lead' -and $_.status -eq 'active' }).Count -gt 0)
   if ($mode -eq 'live' -and -not $Verify -and -not $paused) {
+    # ticket 453 review: an entry no planner answer can clear is dropped: its Tenant file is gone, the Tenant is dormant in this tick's
+    # snapshot, or the frontier wake is off. PAUSE, blind and shadow ticks keep their entries.
+    $dormantNow = @()
+    $dormSnap = $null; try { $dormSnap = Read-Json "$FleetHome\state\watchdog\dormancy.json" } catch {}
+    if ($dormSnap -and $dormSnap.PSObject.Properties['tenants']) { $dormantNow = @($dormSnap.tenants.PSObject.Properties | Where-Object { $_.Value.dormant -eq $true } | ForEach-Object { $_.Name }) }
+    foreach ($pfName in @($plannerFailed.PSObject.Properties.Name)) {
+      if ((-not (Test-Path "$FleetHome\tenants\$pfName.json")) -or ($dormantNow -contains $pfName) -or $wakeOff -or ($wakeSources -notcontains 'frontier')) {
+        $plannerFailed.PSObject.Properties.Remove($pfName); $plannerFailedChanged = $true
+      }
+    }
     # nodeExe, liveRoster, cap and liveCount are computed once above (ticket 75:
     # fleet-dead's Test-WorkWaiting needs them too, before this block even runs).
     foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
@@ -1302,7 +1323,7 @@ try {
       $frontierWakes += [pscustomobject]$wake
     }
     # ticket 453: persist the planner-failed entries this tick changed (never over an unreadable file).
-    if ($plannerFailedChanged -and -not $plannerFailedUnreadable) { try { $pfTmp = "$plannerFailedPath.tmp"; Write-Json $pfTmp $plannerFailed; Move-Item -Force $pfTmp $plannerFailedPath } catch {} }
+    if ($plannerFailedChanged) { try { $pfTmp = "$plannerFailedPath.tmp"; Write-Json $pfTmp $plannerFailed; Move-Item -Force $pfTmp $plannerFailedPath } catch {} }
     # A stall's outcome is its tenant's wake outcome unless it escalated this tick.
     foreach ($st in $stallLedger) {
       if ($st.outcome -eq 'escalated') { continue }
@@ -1609,10 +1630,8 @@ try {
   $conditions += $wakeConditions  # fleet #359: the failed wakes above, one wake-failed:<session> each
   # ticket 453: one planner-failed condition per tenant whose planner has not answered since. The tenant file must still exist,
   # or the entry is a leftover no planner answer could ever clear.
-  if (-not $plannerFailedUnreadable) {
-    foreach ($pf in @($plannerFailed.PSObject.Properties | Where-Object { Test-Path "$FleetHome\tenants\$($_.Name).json" })) {
-      $conditions += [pscustomobject]@{ key = "planner-failed:$($pf.Name)"; kind = 'planner-failed'; detail = "the frontier planner (assignment.js) failed for $($pf.Name): $(Get-OneLine "$($pf.Value.error)" 200); no wake or launch sees that tenant's frontier until a planner answer clears this"; url = $null }
-    }
+  foreach ($pf in @($plannerFailed.PSObject.Properties | Where-Object { Test-Path "$FleetHome\tenants\$($_.Name).json" })) {
+    $conditions += [pscustomobject]@{ key = "planner-failed:$($pf.Name)"; kind = 'planner-failed'; detail = "the frontier planner (assignment.js) failed for $($pf.Name): $(Get-OneLine "$($pf.Value.error)" 200); no wake or launch sees that tenant's frontier until a planner answer clears this"; url = $null }
   }
   foreach ($pw in $permissionWaits) {
     $pwDetail = "$($pw.name) (job $($pw.job)) has waited $($pw.waitMin) min on a permission prompt no one can answer in a --bg session: $($pw.needs). Stop it (claude stop $($pw.job)) and relaunch on a model the CLI runs in auto mode, or attach and answer (claude attach $($pw.job))"
