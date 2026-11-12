@@ -115,6 +115,18 @@
       "head": "f306bdb2b3b6d015c99b48a0089a1a19d27426f0",
       "pr": 1602,
       "ruling": "Merged 2026-09-24 at the fix-up head f306bdb2 after formal-001 at 8dbdf69c; no formal review recorded at the merged head. Ruling 2026-10-09 (Cory, fleet optimization review): acknowledged."
+    },
+    {
+      "recordId": "statelite:issue-171",
+      "head": "3e038ef412f63cab184bc185a02deb7d321223f4",
+      "pr": 179,
+      "ruling": "Cory's ruling 2026-11-12 (fleet #439, #440): his own merge with CI green, acknowledged with no retro review."
+    },
+    {
+      "recordId": "nidus:issue-316",
+      "head": "0bd2a89312765050f7d43614eb852f516235dd44",
+      "pr": 318,
+      "ruling": "Cory's ruling 2026-11-12 (fleet #439, #440): his own merge with CI green, acknowledged with no retro review."
     }
   ]
 }

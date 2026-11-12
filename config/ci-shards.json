@@ -1,0 +1,4 @@
+{
+  "watchdog": ["watchdog.tests.ps1"],
+  "slow": ["frontier-wake-respawn.tests.ps1", "page.tests.ps1", "principal-guard.tests.ps1"]
+}

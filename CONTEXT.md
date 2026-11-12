@@ -410,7 +410,7 @@ its owner's lift, its expiry, or the named Fleet event, keeping its history.
 The fleet records one itself when it observes a merged PR whose linkage is an
 explained `Refs` (prose after it on the line, or on the next non-empty line): owned by the fleet, its recheck event is the issue closing,
 which the watcher observes and lifts.
-A lead's lift-only exclusion older than an open proposal, or any lead's exclusion older than a stale-premise restatement, is a launch hold only: the Principal and the Arbiter still see the proposal (fleet #362, #366).
+A lead's lift-only exclusion older than an open proposal, or any lead's exclusion older than a stale-premise restatement, blocks the launch and nothing more: the Principal and the Arbiter still see the proposal (fleet #362, #366).
 A lead's exclusion that only a lift releases (`exclusion-lifted`) and that still stands 24 hours after a finalize newer than it pages once from the daily run; nothing lifts it but the lead (fleet #367). One rechecked on an issue closing is the watcher's to lift and never pages (fleet #406).
 GitHub labels, assignees, dependencies, and sub-issue structure take
 precedence whenever they can express the condition.
@@ -439,7 +439,9 @@ A pull request reviewed clean and parked for Cory's merge, recorded under
 `prs` in `state/skip/<tenant>.json` with its reason. A hold pages Cory once,
 through an escalation, and then waits; the IC that opened it waits with it
 and is neither retried nor respawned for being idle; a reaped one is respawned only to stay reachable. Lifting the hold is
-Cory's merge, or Cory's instruction to the project lead.
+Cory's merge, or Cory's instruction to the project lead. The Watchdog also
+holds an issue under `issues` in the same file after repeated failed launches
+of its IC, with a reason of the form `launch-failed: <n> consecutive failed launches (watchdog <time>); latest job <job>: <detail>. Fix the cause, then lift this hold.`, and pages Cory once. A Frontier exclusion is never called a hold.
 _Avoid_: blocked (a GitHub issue dependency), escalation (the page, not the
 state), parked
 
@@ -501,6 +503,12 @@ A Verdict that adopts a Triage proposal, as it stands or with the Arbiter's
 edits, and so turns it into a Ruling at once. It has no waiting period, no
 Veto window and no page of its own; it appears in the daily summary only.
 _Avoid_: approval (the owner's word), sign-off, auto-approval
+
+**Plain endorsement**:
+An Endorsement that adopts a Triage proposal as it stands, with no Arbiter
+edits. Its Verdict is Endorsed, not Endorsed with edits or an answer; it turns
+the proposal into a Ruling at once, as any Endorsement does.
+_Avoid_: clean endorsement, unedited endorsement
 
 **Return**:
 A Verdict that sends a Triage proposal back to the Principal with numbered

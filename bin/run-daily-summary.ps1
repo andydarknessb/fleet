@@ -4,11 +4,23 @@
 # with how long it has waited. Nothing waiting sends nothing, so a quiet day
 # never pages; the script's own exit code still tells Task Scheduler whether
 # the run itself succeeded.
+param([switch]$IfMissing)
 . "$PSScriptRoot\_common.ps1"
 
 $outDir = "$FleetHome\state\notify"
 New-Item -ItemType Directory -Force $outDir | Out-Null
 $logPath = "$outDir\daily-summary.log"
+
+# Ticket 443: the logon trigger passes -IfMissing. It skips when the sent marker (written only when a
+# page goes out) says today; a quiet day writes no marker, so a later logon runs it again and sends nothing.
+if ($IfMissing) {
+  $sentAt = $null
+  try { $sentAt = [DateTimeOffset]::Parse([string](Get-Content -LiteralPath "$outDir\daily-summary.json" -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json).lastSentAt) } catch { }
+  if ($null -ne $sentAt -and $sentAt.ToLocalTime().ToString('yyyy-MM-dd') -eq (Get-Date).ToString('yyyy-MM-dd')) {
+    [IO.File]::AppendAllText($logPath, "$(Now-Iso) INFO skipped -IfMissing: a page was sent today at $($sentAt.ToLocalTime().ToString('HH:mm'))`r`n", $Utf8)
+    exit 0
+  }
+}
 
 $nodePath = $env:FLEET_NODE_PATH
 if ($nodePath -and -not (Test-Path -LiteralPath $nodePath -PathType Leaf)) {
