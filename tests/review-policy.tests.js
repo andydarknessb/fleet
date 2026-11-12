@@ -439,6 +439,14 @@ test('#445 review: a file marked -diff in .gitattributes still has its added lin
   assert.equal(destructive.matches[0].file, 'src/y.dat');
 });
 
+test('#445 review: a head equal to its base changes nothing: classifyFromGit classifies no files and no trigger, and does not refuse it', () => {
+  const { repo, head } = commitIn(rootDir());
+  const { classification } = classifyFromGit({ repoPath: repo, baseRef: head, tenant: TENANT });
+  assert.deepEqual(classification.files, []);
+  assert.deepEqual(classification.triggers, []);
+  assert.equal(classification.tier, 'trivial');
+});
+
 test('#445 review: a --files entry in git\'s quoted form is unquoted before it is matched', () => {
   const classification = classifyChange({ files: ['"server/db/migrations/caf\\303\\251.js"'], tenant: TENANT });
   assert.deepEqual(classification.files, ['server/db/migrations/café.js']);
@@ -2198,6 +2206,19 @@ test('#445 review: a git failure while a formal record classifies its head write
   assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision, 'no event was written');
   assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
   assert.equal(calls.length, 0, 'no status was posted');
+});
+
+test('#445 review: a formal record at a head its base already holds is not refused for that: the change is empty and nothing triggers', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const { repo, head } = commitIn(root);
+  gitIn(repo)('update-ref', 'refs/remotes/origin/integration', head);
+  const recorded = recordAgainstRepo({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'formal', headSha: head, actor: 'project-lead',
+    findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }], idempotencyKey: 'formal-empty-change', now: '2026-09-14T18:00:00.000Z',
+  });
+  assert.equal(recorded.result.record.review.formal.headSha, head);
+  assert.deepEqual(recorded.result.record.review.formal.triggers, []);
 });
 
 test('#445 review: the base is origin/<defaultBranch>: a fixture where another base would classify the head differently decides on the named one', () => {

@@ -310,7 +310,10 @@ function classifyFromGit(options = {}) {
   // whatever diff.noprefix or diff.mnemonicPrefix say.
   const diffText = git(['diff', '--no-renames', '--text', '--no-ext-diff', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', `${baseRef}...${headRef}`]);
   const headSha = git(['rev-parse', headRef]).trim();
-  return { headSha, classification: classifyChange({ files, diffText, tenant, config }) };
+  // An empty listing with an empty diff is a true answer, no file changed, so it classifies with no files and no trigger.
+  // The refusal of an empty diff is for a diff text a caller supplied, which is the one case this is not (#445).
+  const emptyChange = files.length === 0 && diffText === '';
+  return { headSha, classification: classifyChange(emptyChange ? { files, changedLines: 0, tenant, config } : { files, diffText, tenant, config }) };
 }
 
 // --- findings artifacts ---

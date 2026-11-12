@@ -245,7 +245,11 @@ against the tenant's `defaultBranch` (`origin/<defaultBranch>`, the base that
 `CLASSIFICATION_REQUIRED` is gone. A tenant that names no `defaultBranch` is
 refused `TENANT_BASE_UNKNOWN`, exit 2, nothing written. The trigger rule above
 applies to that computed classification. A risk review still takes its
-classification from the caller.
+classification from the caller. A `--prior-artifact` makes a formal record a
+linked re-review only when it names the record's own prior formal artifact; any
+other value is refused (`USAGE` when the record has no prior formal review,
+`REREVIEW_REQUIRES_PRIOR` when it names another). Carve-out and risk-trigger
+paths are matched without regard to case.
 
 ## 8. A recorded head is a commit (fleet#67)
 
