@@ -180,6 +180,10 @@ test('launch refuses a manifest the Work record was not reserved with', () => {
   assert.equal(after.state, 'assigned');
   assert.equal(after.revision, before.revision);
   assert.equal(fs.existsSync(`${handWritten}.invalidated.json`), false);
+  // fleet #437: a file named `null` is the path String(null) names; the guard on a missing manifestPath still refuses it.
+  const nullNamed = path.join(root, 'null');
+  fs.copyFileSync(handWritten, nullNamed);
+  assert.throws(() => launchReservedAssignment({ root, manifestPath: nullNamed, workRecordId: 'endzone:issue-44', dryRun: true }), (error) => error.code === 'INVALID_LAUNCH');
 
   const reservedRoot = rootDir();
   const result = reserveAssignment({
@@ -206,7 +210,29 @@ test('launch refuses a manifest the Work record was not reserved with', () => {
   assert.deepEqual(getRecord({ root: reservedRoot, id: 'endzone:issue-45' }), reserved);
   assert.equal(fs.existsSync(`${copy}.invalidated.json`), false);
   assert.equal(fs.existsSync(`${result.manifestPath}.invalidated.json`), false);
+  // fleet #437: the refusal happens before any GitHub call (the runner must never run) and invalidates nothing.
+  let githubCalls = 0;
+  assert.throws(() => launchReservedAssignment({ root: reservedRoot, manifestPath: copy, workRecordId: 'endzone:issue-45', githubRepo: 'owner/name', runner: () => { githubCalls += 1; throw new Error('no GitHub call allowed'); }, dryRun: true }), (error) => error.code === 'INVALID_LAUNCH');
+  assert.equal(githubCalls, 0);
+  assert.deepEqual(getRecord({ root: reservedRoot, id: 'endzone:issue-45' }), reserved);
+  assert.equal(fs.existsSync(`${copy}.invalidated.json`), false);
+  assert.equal(fs.existsSync(`${result.manifestPath}.invalidated.json`), false);
   assert.equal(launchReservedAssignment({ root: reservedRoot, manifestPath: result.manifestPath, workRecordId: 'endzone:issue-45', dryRun: true }).dryRun, true);
+  // fleet #437: a relative manifest path is read from the caller's cwd, so a file planted at the same relative path
+  // under another cwd is not the manifest the record names; the same relative path from the root is.
+  const relative = path.relative(reservedRoot, result.manifestPath);
+  const otherCwd = rootDir();
+  fs.mkdirSync(path.dirname(path.join(otherCwd, relative)), { recursive: true });
+  fs.copyFileSync(result.manifestPath, path.join(otherCwd, relative));
+  const callerCwd = process.cwd();
+  try {
+    process.chdir(otherCwd);
+    assert.throws(() => launchReservedAssignment({ root: reservedRoot, manifestPath: relative, workRecordId: 'endzone:issue-45', dryRun: true }), (error) => error.code === 'INVALID_LAUNCH');
+    process.chdir(reservedRoot);
+    assert.equal(launchReservedAssignment({ root: reservedRoot, manifestPath: relative, workRecordId: 'endzone:issue-45', dryRun: true }).dryRun, true);
+  } finally {
+    process.chdir(callerCwd);
+  }
 });
 
 // fleet #426: an --adr-paths entry must be a file at the base the manifest records. The

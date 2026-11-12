@@ -59,12 +59,12 @@ function Release-ReservationOnRefusal {
   catch { $result.error = "$($_.Exception.Message)"; $result.note = " (the reservation release also failed: $($result.error))" }
   return $result
 }
-# fleet #437: does this Work record name this manifest? Both paths take the same normalisation (CI temp paths can be 8.3 short names).
+# fleet #437: does this Work record name the manifest this launch reads? The manifest side is the file read ($manifestFullPath); the record side resolves against the fleet home.
 function Test-RecordNamesManifest {
   param($Record)
   $recorded = [string]$Record.manifestPath
   if (-not $recorded) { return $false }
-  return [IO.Path]::GetFullPath([IO.Path]::Combine($FleetHome, $recorded)) -eq [IO.Path]::GetFullPath([IO.Path]::Combine($FleetHome, $Manifest))
+  return [IO.Path]::GetFullPath([IO.Path]::Combine($FleetHome, $recorded)) -eq $manifestFullPath
 }
 $cwd = $null
 $t = $null
@@ -89,6 +89,8 @@ if ($Recover -and -not $Manifest -and ($Role -eq 'ic' -or ($Name -and $Name -mat
 if ($Manifest) {
   # no release: a manifest that cannot be read names no Work record, so there is nothing this script can release.
   if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) { Write-Error "manifest '$Manifest' was not found"; exit 4 }
+  # fleet #437: the file this launch reads, resolved once from PowerShell's location (not .NET's current directory).
+  $manifestFullPath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Manifest).ProviderPath)
   $assignment = Read-Json $Manifest
   # no release: the manifest's status is immutable 'pending-ack' (acknowledgment and invalidation are sidecar files, checked below), so this only catches an unreadable or malformed manifest, which names no record we could release.
   if (-not $assignment -or $assignment.status -ne 'pending-ack') { Write-Error "manifest '$Manifest' is not pending acknowledgment"; exit 4 }
@@ -112,6 +114,10 @@ if ($Manifest) {
   $Prompt = "/mattpocock-skills:implement Read the assignment manifest at $Manifest and the GitHub issue body and comments. Emit assignment-started for Work record $WorkRecordId in your first useful turn (node $fleetHomeFwd/bin/assignment.js ack), then follow the manifest pointers without restating the issue criteria."
   # no release: the invalidation marker is the record of an earlier release; there is nothing left to release. Checked before the tenant file so a replayed release never overwrites the original marker.
   if (Test-Path -LiteralPath "$Manifest.invalidated.json") { Write-Error "manifest '$Manifest' was invalidated"; exit 4 }
+  $activeState = Read-Json "$FleetHome\state\work\active.json"
+  $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
+  # no release: the record exists but names another manifest (or none), so this manifest did not reserve it and a release would take someone else's reservation (fleet #437). Checked before the tenant file, whose refusal releases; an absent record falls through to the 'is not assigned' refusal.
+  if ($recordProperty -and -not (Test-RecordNamesManifest $recordProperty.Value)) { Write-Error "Work record '$WorkRecordId' was not reserved with manifest '$Manifest'"; exit 4 }
   $tenantConfig = Read-Json "$FleetHome\tenants\$Tenant.json"
   if (-not $tenantConfig) { $r = Release-ReservationOnRefusal "launch refused: no tenant file for '$Tenant'"; Write-Error "no tenant file for '$Tenant'$($r.note)"; exit 4 }
   $cwd = $tenantConfig.repo
@@ -168,14 +174,10 @@ if ($Tenant) {
 if (-not $cwd) { $cwd = $FleetHome }
 
 if ($Manifest) {
-  $activeState = Read-Json "$FleetHome\state\work\active.json"
-  $recordProperty = if ($activeState) { $activeState.records.PSObject.Properties[$WorkRecordId] } else { $null }
   # no release: the record is not `assigned` (absent, claimed by a live IC, released, or already past the reservation), so it is no longer this manifest's reservation. A release from this manifest's revision would be refused, or would pull a claim a session holds.
   if (-not $recordProperty -or $recordProperty.Value.state -ne 'assigned') { Write-Error "Work record '$WorkRecordId' is not assigned"; exit 4 }
   # no release: the record is `assigned` but at another revision than this manifest reserved (fleet#264: a lead's escalate -> assigned round trip bumps it on the same manifest). The reservation is no longer this manifest's, and a release from its revision would be refused as stale. Refused here, before the gh check, fetch and worktree work.
   if ([string]$recordProperty.Value.revision -ne [string]$assignment.workRecordRevision) { Write-Error "Work record '$WorkRecordId' is at revision $($recordProperty.Value.revision), but the manifest reserved revision $($assignment.workRecordRevision)"; exit 4 }
-  # no release: the record is `assigned` at this revision but names another manifest (or none), so this manifest did not reserve it and a release would take someone else's reservation (fleet #437).
-  if (-not (Test-RecordNamesManifest $recordProperty.Value)) { Write-Error "Work record '$WorkRecordId' was not reserved with manifest '$Manifest'"; exit 4 }
   # Per tenant, the way work-state.js's isForeignRecord scopes it: another tenant's ICs are
   # not this tenant's assignments (nidus #2 sat blocked behind endzone's two ICs, 2026-09-25).
   # A record with no tenant is legacy and still counts, matching isForeignRecord.

@@ -322,13 +322,32 @@ try {
   $copy36 = "$testRoot\copy-36.json"
   Copy-Item $m36 $copy36
   $revision36 = (Get-Record 36).revision
-  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\claude-calls.log", "$testRoot\gh-calls.log" -ErrorAction SilentlyContinue
   [void](Run-Launch @('-Manifest', $copy36, '-WorkRecordId', 'test:issue-36'))
   Assert-True ($lastExit -eq 4 -and $lastFlat -match 'wasnotreservedwithmanifest') "a copy of a reserved manifest is refused by the early check (exit 4, naming the reservation): exit $lastExit $lastOut"
   Assert-True ((Get-RecordState 36) -eq 'assigned' -and (Get-Record 36).revision -eq $revision36 -and -not (Get-Marker $copy36) -and -not (Get-Marker $m36)) 'the copy refusal leaves the record assigned at its revision, with no marker on either file'
   Assert-True ((Get-BgCalls) -eq 0) 'a copy of a reserved manifest never reaches claude --bg'
+  Assert-True (-not (Test-Path "$testRoot\gh-calls.log")) 'the early check refuses before any gh call'
+  Assert-True (-not (Test-Path "$repoPath\.claude\worktrees\ic-36-assignment") -and -not (Invoke-Git @('branch', '--list', 'fleet/*36*'))) 'the early check creates no worktree and no branch'
   $r36 = Run-Launch @('-Manifest', $m36, '-WorkRecordId', 'test:issue-36', '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r36 -and $r36.dryRun -eq $true) "the real manifest for the same record passes the record checks: exit $lastExit $lastOut"
+
+  # fleet #437: a hand-written manifest for a record reserved with NO manifest, carrying no tenant, parent or issue, is
+  # refused at the door by the record check, not by the tenant check: no release, the record stays assigned, no marker, no claude --bg.
+  Clear-ActiveRecords
+  $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $bareOut = & node "$testRoot\bin\work-state.js" reserve --root $testRoot --id test:issue-37 --tenant test --issue 37 --idempotency-key reserve-37 2>&1 | Out-String; $bareCode = $LASTEXITCODE }
+  finally { $ErrorActionPreference = $eap }
+  Assert-True ($bareCode -eq 0) "fixture: the record for issue 37 is reserved with no manifest: $bareOut"
+  $rev37 = (Get-Record 37).revision
+  Assert-True (-not (Get-Record 37).manifestPath) 'fixture: the record names no manifest'
+  $hand37 = "$testRoot\state\manifests\hand-37.json"
+  Write-Utf8 $hand37 ('{"schemaVersion":1,"id":"hand-37","status":"pending-ack","workRecordId":"test:issue-37","workRecordRevision":' + $rev37 + '}')
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $hand37, '-WorkRecordId', 'test:issue-37'))
+  Assert-True ($lastExit -eq 4 -and $lastFlat -match 'wasnotreservedwithmanifest') "a hand-written manifest for a record reserved with no manifest is refused naming the reservation: exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 37) -eq 'assigned' -and (Get-Record 37).revision -eq $rev37 -and -not (Get-Marker $hand37)) 'the hand-written refusal releases nothing and writes no marker'
+  Assert-True ((Get-BgCalls) -eq 0) 'a hand-written manifest never reaches claude --bg'
 
   # Case 11: the control. With nothing changed in the window the same launch reaches `claude --bg` (the
   # mock claude starts no session, so it then fails as it always did): the re-check does not refuse every launch.
