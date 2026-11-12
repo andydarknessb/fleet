@@ -1385,7 +1385,7 @@ function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idemp
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
   const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), ...(from ? { from, to } : {}), ...(raisedBy ? { raisedBy } : {}), evidence: text };
-  fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
+  appendLedgerRow(file, JSON.stringify(line));
   return true;
 }
 

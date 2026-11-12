@@ -1514,6 +1514,19 @@ test('#450: the first tick after the deploy lifts every standing lift-only exclu
   assert.deepEqual(asked, [11], 'the open one is still read, and nothing else');
 });
 
+test('#450: a lift-only Frontier exclusion whose issue does not resolve or whose view fails is left standing; only a closed issue lifts it', () => {
+  const root = rootDir();
+  liftOnly(root, 10);
+  liftOnly(root, 11);
+  const f = { ...fetchers({ open: [] }), issueState: (n) => { if (n === 10) throw new Error('GraphQL: Could not resolve to an issue or pull request with the number of 10. (repository.issue)'); throw new Error('boom: issue view down'); } };
+  const health = watch(root, f);
+  assert.equal(health.failures, 0, 'a read that does not close the issue is not a failed tick');
+  assert.match(health.actions.join(' '), /endzone:excl-10-1: issue view failed, retained/);
+  assert.match(health.actions.join(' '), /endzone:excl-11-1: issue view failed, retained/);
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [10, 11]);
+  assert.equal(exclusionRows(root).some((r) => r.kind === 'exclusion-lifted'), false);
+});
+
 // --- fleet #390: the watcher merges a Reconcile PR (the tenant's main into its integration branch) as a
 // merge commit when GitHub reports no conflicts and every ciGates check is green. Its Review gate passes
 // through the standing exception in config/review-exceptions.json. Every GitHub call goes through a stubbed

@@ -760,7 +760,8 @@ function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRu
       health.ghCalls += 1;
     } catch (error) {
       const message = String(error.message || error);
-      if (/could not resolve to an issue/i.test(message)) {
+      // fleet #450: only a closed issue lifts a lift-only exclusion, so a missing one is retained below.
+      if (/could not resolve to an issue/i.test(message) && entry.recheck.event.type === 'issue-closed') {
         // Deleted or transferred: the issue can never close here, so nothing else would
         // ever release the exclusion. Lift it, say why, and count no failure.
         if (dryRun) { health.actions.push(`DRY ${entry.id}: lift (issue #${watched} no longer resolves)`); continue; }

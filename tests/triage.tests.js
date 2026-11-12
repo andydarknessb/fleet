@@ -191,6 +191,19 @@ test('#450: a corrupt wake outbox line fails the frontier naming the outbox, and
   assert.doesNotThrow(() => computeFrontier({ root, tenant: 'endzone', fixture, now: NOW }));
 });
 
+// fleet #450: a wake appended after a torn outbox tail is not glued onto it, so the frontier reads the new wake.
+test('#450: a wake appended through the real door after a torn outbox fragment is read by the frontier, which does not throw', () => {
+  const root = rootDir();
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  fs.mkdirSync(path.dirname(outboxFile), { recursive: true });
+  fs.writeFileSync(outboxFile, '{"at":"2026-09-06T00:00:00.000Z","recordId":"endzone:issue-6');
+  require('../bin/work-state').appendWakeOutbox({ root, recordId: 'endzone:issue-602', revision: 1, eventSequence: 1, wake: 'decision-needed', idempotencyKey: 'k-602', evidence: 'stuck', now: '2026-09-06T00:00:00.000Z' });
+  const result = computeFrontier({ root, tenant: 'endzone', fixture: writeFixture(root, [issue(602, { labels: ['ready-for-agent'] })]), now: NOW });
+  assert.equal(result.eligible[0].kind, 'escalation');
+  assert.equal(result.eligible[0].number, 602);
+  assert.equal(result.eligible[0].evidence, 'stuck');
+});
+
 // fleet #450: an append after a torn tail reads back whole, with the new row in it (the same two cases as the exclusion ledger).
 test('#450: an append after a torn triage fragment reads back whole: the fragment is cut and the new row is the last line', () => {
   const root = rootDir();
