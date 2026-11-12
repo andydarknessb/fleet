@@ -844,5 +844,5 @@ try {
   exit 0
 } finally {
   if ($nameHeld) { $nameMutex.ReleaseMutex() }
-  $nameMutex.Dispose()
+  if ($nameMutex) { $nameMutex.Dispose() }   # null when creating it failed
 }
