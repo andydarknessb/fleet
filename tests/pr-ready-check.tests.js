@@ -229,3 +229,52 @@ test('#181: a recorded risk review at the head, an untriggered diff, or no tenan
   assert.deepEqual(riskDefects({ repo: '.', base: 'b', issue: 1730, tenant, classify: quiet, getRecord: () => { throw new Error('must not read'); } }), []);
   assert.deepEqual(riskDefects({ repo: '.', base: 'b', issue: 1730, tenant: null, classify: () => { throw new Error('must not classify'); } }), []);
 });
+
+test('#445: a pull request that moves a carve-out file out of its folder trips the risk-review check, listed by the review policy', () => {
+  const { riskDefects } = require('../bin/pr-ready-check');
+  const root = makeTempDir('fleet-pr-ready-');
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(path.join(repo, 'server', 'db', 'migrations'), { recursive: true });
+  const git = (...args) => {
+    const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  fs.writeFileSync(path.join(repo, 'server', 'db', 'migrations', '20260901_a.js'), 'exports.up = 1;\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base', '--no-gpg-sign');
+  const base = git('rev-parse', 'HEAD');
+  fs.mkdirSync(path.join(repo, 'server', 'services'), { recursive: true });
+  fs.renameSync(path.join(repo, 'server', 'db', 'migrations', '20260901_a.js'), path.join(repo, 'server', 'services', 'a.js'));
+  git('add', '.');
+  git('commit', '-q', '-m', 'move', '--no-gpg-sign');
+  const notFound = () => { const error = new Error('no record'); error.code = 'NOT_FOUND'; throw error; };
+  const defects = riskDefects({ repo, base, head: 'HEAD', issue: 1730, tenant: { name: 'endzone', carveOuts: ['server/db/migrations/**'] }, root, getRecord: notFound });
+  assert.equal(defects.length, 1);
+  assert.equal(defects[0].kind, 'risk-review');
+  assert.match(defects[0].detail, /carve-out/);
+});
+
+test('#445: a pull request with no changes is clean for the risk check: its empty change is classified, not refused', () => {
+  const { riskDefects } = require('../bin/pr-ready-check');
+  const root = makeTempDir('fleet-pr-ready-');
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  const git = (...args) => {
+    const result = spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base', '--no-gpg-sign');
+  const head = git('rev-parse', 'HEAD');
+  const notFound = () => { const error = new Error('no record'); error.code = 'NOT_FOUND'; throw error; };
+  assert.deepEqual(riskDefects({ repo, base: head, head: 'HEAD', issue: 1730, tenant: { name: 'endzone', carveOuts: ['server/db/migrations/**'] }, root, getRecord: notFound }), []);
+});

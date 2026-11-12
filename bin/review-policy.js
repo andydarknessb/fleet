@@ -25,6 +25,8 @@
 //                 FLEET_NAME (fleet#46). Every SHA it is given is resolved
 //                 against the tenant repo before anything is written: an
 //                 object git does not know is refused UNKNOWN_COMMIT (fleet#67).
+//                 A head is a full 40-character sha (#445), and a formal review
+//                 classifies its head itself rather than trusting the caller's.
 //   plan-rereview a revision re-review inspects the changed range and the
 //                 unresolved findings, never the settled material.
 //   hold          a clean carve-out (or any PR requiring Cory) parks in the
@@ -94,28 +96,124 @@ function matchGlob(glob, filePath) {
 
 // --- classification ---
 
-function parseDiff(diffText) {
+// git C-quotes a name that holds a quote, a backslash, a control character or a non-ASCII byte (core.quotePath): an
+// octal escape is one UTF-8 byte, and a raw character inside the quotes is UTF-8 as it stands (#445).
+const GIT_ESCAPES = Object.freeze({ a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 });
+
+function unquoteGitPath(name) {
+  if (name.length < 2 || !name.startsWith('"') || !name.endsWith('"')) return name;
+  const inner = name.slice(1, -1);
+  const parts = [];
+  let raw = '';
+  for (let i = 0; i < inner.length; i += 1) {
+    if (inner[i] !== '\\') { raw += inner[i]; continue; }
+    parts.push(Buffer.from(raw, 'utf8'));
+    raw = '';
+    const octal = inner.slice(i + 1, i + 4);
+    if (/^[0-7]{3}$/.test(octal)) { parts.push(Buffer.from([parseInt(octal, 8)])); i += 3; continue; }
+    const code = GIT_ESCAPES[inner[i + 1]];
+    parts.push(code === undefined ? Buffer.from(inner[i + 1] || '', 'utf8') : Buffer.from([code]));
+    i += 1;
+  }
+  parts.push(Buffer.from(raw, 'utf8'));
+  return Buffer.concat(parts).toString('utf8');
+}
+
+// git's prefixes: a/ and b/ by default, c/ i/ o/ w/ under diff.mnemonicPrefix, none under diff.noprefix. A side loses
+// only a prefix that fits it, so a name with no prefix is kept. shortcut: under --no-prefix a top-level a/ or b/
+// directory reads as a prefix; classifyFromGit forces its own a/ b/ prefixes, so only a hand-made --diff file can hit it.
+const LEFT_PREFIX = /^[acio]\//;
+const RIGHT_PREFIX = /^[bciow]\//;
+const withoutPrefix = (name, prefix) => name.replace(prefix, '');
+
+// A name on a `---` or `+++` line: git's trailing tab (names with a space) and the side's prefix come off, and
+// /dev/null is no file.
+function headerName(raw, prefix) {
+  const named = unquoteGitPath(raw.trim());
+  return named === '/dev/null' ? null : withoutPrefix(named, prefix);
+}
+
+// The two names on a `diff --git <p> <q>` line. A raw name may hold spaces, so the split is the one whose sides carry
+// their prefixes, and within those the one whose names are equal (a change that is not a rename). A rename's names are
+// also in its `rename from` / `rename to` lines, exactly.
+function diffHeaderNames(line) {
+  const rest = line.slice('diff --git '.length);
+  const splits = [];
+  for (let at = rest.indexOf(' '); at !== -1; at = rest.indexOf(' ', at + 1)) {
+    splits.push([unquoteGitPath(rest.slice(0, at)), unquoteGitPath(rest.slice(at + 1))]);
+  }
+  const prefixed = splits.filter(([left, right]) => LEFT_PREFIX.test(left) && RIGHT_PREFIX.test(right));
+  const pool = prefixed.length ? prefixed : splits;
+  const same = pool.find(([left, right]) => withoutPrefix(left, LEFT_PREFIX) === withoutPrefix(right, RIGHT_PREFIX));
+  return (same ? [same] : pool).flatMap(([left, right]) => [withoutPrefix(left, LEFT_PREFIX), withoutPrefix(right, RIGHT_PREFIX)]);
+}
+
+// #445 review: a file's name, with or without its prefix, from every line that carries one. A `diff --cc` names one path.
+// Hunks are counted: inside a hunk's `@@ -a,b +c,d @@` count an added line is content even when it reads `+++ b/x` (the
+// content `++ b/x`), so a file header is only a line outside a hunk. A combined hunk has no such count and runs to the
+// next header.
+function parseDiffText(diffText) {
+  const text = String(diffText || '').replace(/^﻿/, '');
+  const paths = new Set();
   const addedByFile = new Map();
   let currentFile = null;
   let changedLines = 0;
-  for (const line of String(diffText || '').split(/\r?\n/)) {
-    if (line.startsWith('+++ ')) {
-      const named = line.slice(4).trim();
-      currentFile = named === '/dev/null' ? null : named.replace(/^b\//, '');
-      if (currentFile && !addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
+  let hunk = null; // lines still to come in the current hunk: { old, new }, or { combined: true }
+  let previousHeader = ''; // the last line read outside a hunk: a `+++` is a file header only right after `--- ` or `diff `
+  const addLine = (content) => {
+    if (!addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
+    addedByFile.get(currentFile).push(content);
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (hunk?.combined && !/^(?:diff |@@)/.test(line)) {
+      // Two prefix columns; a `+` in either counts as added. That over-matches, and an over-match never hides a trigger.
+      const columns = line.slice(0, 2);
+      if (columns.includes('+')) { changedLines += 1; addLine(line.slice(2)); } else if (columns.includes('-')) changedLines += 1;
       continue;
     }
-    if (line.startsWith('---')) continue;
-    if (line.startsWith('+')) {
-      changedLines += 1;
-      if (currentFile) addedByFile.get(currentFile).push(line.slice(1));
-      else {
-        if (!addedByFile.has(null)) addedByFile.set(null, []);
-        addedByFile.get(null).push(line.slice(1));
+    if (hunk && !hunk.combined && (hunk.old > 0 || hunk.new > 0) && /^(?: |\+|-|\\|$)/.test(line)) {
+      if (line.startsWith('+')) { hunk.new -= 1; changedLines += 1; addLine(line.slice(1)); } else if (line.startsWith('-')) { hunk.old -= 1; changedLines += 1; } else if (!line.startsWith('\\')) { hunk.old -= 1; hunk.new -= 1; }
+      continue;
+    }
+    hunk = null;
+    const afterHeader = /^(?:--- |diff )/.test(previousHeader);
+    previousHeader = line;
+    const hunkHeader = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (hunkHeader) { hunk = { old: Number(hunkHeader[1] ?? 1), new: Number(hunkHeader[2] ?? 1) }; continue; }
+    if (line.startsWith('@@@')) { hunk = { combined: true }; continue; }
+    if (line.startsWith('diff --git ')) { currentFile = null; diffHeaderNames(line).forEach((name) => paths.add(name)); continue; }
+    if (line.startsWith('diff --cc ') || line.startsWith('diff --combined ')) {
+      currentFile = null;
+      paths.add(unquoteGitPath(line.replace(/^diff --(?:cc|combined) /, '')));
+      continue;
+    }
+    if (line.startsWith('+++ ') && afterHeader) {
+      currentFile = headerName(line.slice(4), RIGHT_PREFIX);
+      if (currentFile !== null) {
+        paths.add(currentFile);
+        if (!addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
       }
-    } else if (line.startsWith('-')) changedLines += 1;
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      const name = headerName(line.slice(4), LEFT_PREFIX);
+      if (name !== null) paths.add(name);
+      continue;
+    }
+    if (/^(?:rename|copy) (?:from|to) /.test(line)) { paths.add(unquoteGitPath(line.replace(/^(?:rename|copy) (?:from|to) /, ''))); continue; }
+    const binary = /^Binary files (.+) and (.+) differ$/.exec(line);
+    if (binary) {
+      for (const [raw, prefix] of [[binary[1], LEFT_PREFIX], [binary[2], RIGHT_PREFIX]]) {
+        const name = headerName(raw, prefix);
+        if (name !== null) paths.add(name);
+      }
+      continue;
+    }
+    // #445 round 2: a +/- line no counted hunk claims is content of the current file, so a hunk whose count is short or
+    // missing cannot hide what it adds. Over-matching never hides a trigger.
+    if (line.startsWith('+')) { changedLines += 1; addLine(line.slice(1)); } else if (line.startsWith('-')) changedLines += 1;
   }
-  return { addedByFile, changedLines };
+  return { paths: [...paths], addedByFile, changedLines };
 }
 
 // fleet#58: a pattern matches in the case the tenant wrote it. Compiled with
@@ -134,7 +232,8 @@ function evaluateTrigger(name, { paths: pathGlobs = [], patterns = [] }, files, 
   const matches = [];
   for (const glob of pathGlobs) {
     for (const file of files) {
-      if (matchGlob(glob, file)) matches.push({ file, glob });
+      // Path globs match in any case: every tenant checkout is case-insensitive on this host (#445).
+      if (matchGlob(String(glob).toLowerCase(), String(file).toLowerCase())) matches.push({ file, glob });
     }
   }
   const excluded = (file) => file !== null && excludeGlobs.some((glob) => matchGlob(glob, file));
@@ -157,8 +256,14 @@ function classifyChange(options = {}) {
   const tenant = options.tenant || {};
   const config = { ...DEFAULT_REVIEW_CONFIG, ...(options.config?.review || options.config || {}) };
   const excludeGlobs = config.patternExcludePaths || [];
-  const files = (options.files || []).map((file) => String(file).replace(/\\/g, '/'));
-  const parsed = options.diffText !== undefined ? parseDiff(options.diffText) : null;
+  // A diff names its own paths: from the diff alone the file list is the diff's, and a list given with a diff is
+  // widened by it, so a Carve-out the diff touches is never missed (#445). A diff that names no path is refused:
+  // an empty classification must not come out trivial.
+  const parsed = options.diffText !== undefined ? parseDiffText(options.diffText) : null;
+  const files = [...new Set([...(options.files || []).map((file) => unquoteGitPath(String(file)).replace(/\\/g, '/')), ...(parsed ? parsed.paths : [])])];
+  if (parsed && files.length === 0) {
+    throw new ReviewPolicyError('USAGE', 'the diff names no file path: a classification needs the file headers, the --- and +++ lines or the rename lines of a unified diff, or a file list (#445)');
+  }
   let addedByFile = parsed ? parsed.addedByFile : new Map();
   if (options.addedLines) {
     // Flat added lines with no per-file attribution: usable only when the file
@@ -203,11 +308,21 @@ function classifyFromGit(options = {}) {
   const { repoPath, baseRef, tenant, config } = options;
   const headRef = options.headRef || 'HEAD';
   if (!repoPath || !baseRef) throw new ReviewPolicyError('USAGE', 'repoPath and baseRef are required');
-  const git = (args) => gitInRepo(repoPath, args);
-  // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01).
-  const files = git(['diff', '--name-only', `${baseRef}...${headRef}`]).split(/\r?\n/).filter(Boolean);
-  const diffText = git(['diff', `${baseRef}...${headRef}`]);
+  const git = (args) => (options.git ? options.git(args, repoPath) : gitInRepo(repoPath, args));
+  // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01). --no-renames -z: a moved file lists
+  // both its paths, and a non-ASCII name arrives as written rather than C-quoted (#445).
+  const files = git(['diff', '--name-only', '--no-renames', '-z', `${baseRef}...${headRef}`]).split('\0').filter(Boolean);
+  // The diff text is read as the plain unified diff the parser expects (#445): no renames (a renamed prose file shows its
+  // added lines), --text (a `-diff` attribute hides them), no external diff tool, no colour, and our own a/ b/ prefixes
+  // whatever diff.noprefix or diff.mnemonicPrefix say.
+  const diffText = git(['diff', '--no-renames', '--text', '--no-ext-diff', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', `${baseRef}...${headRef}`]);
   const headSha = git(['rev-parse', headRef]).trim();
+  // An empty listing with an empty diff is a true answer, no file changed, so it classifies with no files and no trigger.
+  // The refusal of an empty diff is for a diff text a caller supplied, which is the one case this is not (#445).
+  const emptyChange = files.length === 0 && diffText === '';
+  if (emptyChange) {
+    return { headSha, classification: { ...classifyChange({ files, changedLines: 0, tenant, config }), emptyChange: true } };
+  }
   return { headSha, classification: classifyChange({ files, diffText, tenant, config }) };
 }
 
@@ -346,6 +461,35 @@ function buildFindings(stamp, suppliedFindings, priors, resolutions) {
   return findings;
 }
 
+// #446: every open finding of an artifact a review accounts for (its linked formal prior, a risk artifact the formal
+// consumes, or the earlier attestation or risk review at the same head) needs a resolution, the formal path's rule
+// (ADR 0009, ruling 5). Still-open findings are carried forward by buildFindings.
+function accountForPriors(priors, resolutions) {
+  for (const { data, path: priorPath } of priors) {
+    if (!data) continue;
+    const open = openFindings(data);
+    for (const finding of open) {
+      const resolution = resolutions?.[finding.id];
+      if (!resolution) {
+        throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} in ${priorPath} has no resolution`, { unresolved: open.map((entry) => entry.id), artifact: priorPath });
+      }
+      if (!RESOLUTION_VALUES.includes(resolution)) {
+        throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
+      }
+    }
+  }
+}
+
+// #324: a `ruled` resolution cites the Ruling that keeps the finding, and the citation belongs to no other resolution.
+// A bare --ruling parses to 'true' and cites nothing. Returns the citation, or null.
+function checkRuling(resolutions, value) {
+  const ruling = typeof value === 'string' && value.trim().length > 0 && value !== 'true' ? value.trim() : null;
+  const anyRuled = Object.values(resolutions || {}).includes('ruled');
+  if (anyRuled && !ruling) throw new ReviewPolicyError('RULING_REQUIRED', 'a ruled resolution cites the Ruling that keeps the finding: pass --ruling "<link or reference>"');
+  if (ruling && !anyRuled) throw new ReviewPolicyError('USAGE', '--ruling belongs to a ruled resolution: it cites the Ruling that keeps the finding');
+  return ruling;
+}
+
 // --- fleet#67: a recorded head is a commit ---------------------------------
 // `record --kind risk` on endzone #1382 accepted headSha
 // 0f2fb0064a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c: the branch head's real 8-character
@@ -373,10 +517,16 @@ function tenantRepoPath({ root, recordId, record, repoPath }) {
   return String(configured);
 }
 
-function gitInRepo(repoPath, args) {
+function gitInRepo(repoPath, args, timeout) {
   return execFileSync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout,
   });
+}
+
+// The fetches wait no longer than the module's gh calls do (defaultGh, 20 s), so a stalled remote cannot hold a record.
+const FETCH_TIMEOUT_MS = 20000;
+function fetchRun(git, repo) {
+  return git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args, FETCH_TIMEOUT_MS);
 }
 
 function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) {
@@ -384,16 +534,51 @@ function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) 
   const run = git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args);
   const branch = record?.assignment?.branch;
   if (branch) {
-    try { run(['fetch', '--quiet', 'origin', String(branch)]); } catch { /* offline or not yet pushed: the object may still be local */ }
+    try { fetchRun(git, repo)(['fetch', '--quiet', 'origin', String(branch)]); } catch { /* offline or not yet pushed: the object may still be local */ }
   }
   for (const { flag, sha } of shas) {
+    let resolved;
     try {
-      run(['cat-file', '-e', `${sha}^{commit}`]);
+      resolved = String(run(['rev-parse', '--verify', `${sha}^{commit}`]) || '').trim();
     } catch {
       throw new ReviewPolicyError('UNKNOWN_COMMIT', `${flag} ${sha} is not a commit in ${repo}${branch ? ` (after fetching origin/${branch})` : ''}; a review is recorded at a head that exists, never at a typed or invented SHA (fleet#67)`, { flag, sha: String(sha), repoPath: repo, branch: branch || null });
     }
+    requireCommitItself(resolved, sha, flag);
   }
   return repo;
+}
+
+// #445: a review is recorded at a full sha. A branch name, a relative ref (HEAD, HEAD~1) or a short sha names no
+// commit that stays put, and is refused rather than resolved for the caller.
+function requireFullSha(sha, flag) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) {
+    throw new ReviewPolicyError('FULL_SHA_REQUIRED', `${flag} ${sha} is not a full sha: a full 40-character sha is needed, so a branch name, a relative ref like HEAD~1 or a short sha is refused; take it from git rev-parse HEAD in the PR's worktree, or from gh pr view <n> --json headRefOid (#445)`, { flag, sha: String(sha) });
+  }
+}
+
+// #445: a recorded head is its commit's own sha. `<sha>^{commit}` must answer the sha itself: an annotated tag is a
+// 40-hex object of its own that peels to the commit beneath it, so one commit would otherwise have two accepted spellings.
+function requireCommitItself(resolved, sha, flag) {
+  if (resolved === String(sha)) return;
+  throw new ReviewPolicyError('FULL_SHA_REQUIRED', `${flag} ${sha} is not the commit's own sha: it peels to ${resolved || 'no commit git reports'}, as an annotated tag does; a full sha of the commit itself is needed, so take git rev-parse HEAD in the PR's worktree, or gh pr view <n> --json headRefOid (#445)`, { flag, sha: String(sha), commit: resolved || null });
+}
+
+// #445: a formal review's classification is the head's own, computed against the tenant's defaultBranch: the base
+// the IC's `classify --base origin/<defaultBranch>` runs against (ic.md step 5). A passed one never decides.
+function classificationAt({ root, tenant, recordId, record, repo, headSha, git }) {
+  const config = tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+  if (!config || !config.defaultBranch) {
+    throw new ReviewPolicyError('TENANT_BASE_UNKNOWN', `cannot classify ${headSha} against the tenant's defaultBranch: ${config ? `tenant ${config.name || ''} names none` : 'no tenant file'}; a formal review records the head's own classification (#445)`, { headSha: String(headSha) });
+  }
+  const base = `origin/${config.defaultBranch}`;
+  const run = git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args);
+  try { fetchRun(git, repo)(['fetch', '--quiet', 'origin', String(config.defaultBranch)]); } catch { /* offline: the base may still be local */ }
+  try {
+    run(['rev-parse', '--verify', '--quiet', `${base}^{commit}`]);
+  } catch {
+    throw new ReviewPolicyError('TENANT_BASE_MISSING', `${base} is not a commit in ${repo}: the tenant's defaultBranch ${config.defaultBranch} has no ref there to classify ${headSha} against, so nothing is recorded (#445)`, { base, repoPath: repo, headSha: String(headSha) });
+  }
+  return classifyFromGit({ repoPath: repo, baseRef: base, headRef: headSha, tenant: config, config: loadConfig(root), git }).classification;
 }
 
 // --- #115: the fleet-review commit status (ADR 0014) ------------------------
@@ -442,6 +627,29 @@ function tenantFor(root, name) {
   const file = path.join(root, 'tenants', `${name}.json`);
   if (!fs.existsSync(file)) return null;
   return loadTenant(root, name);
+}
+
+// #445 round 3: a tenant is keyed by its file name, as work-state keys it (readTenantConfigs takes the base name of
+// tenants/*.json) and as record ids are built (`<name>:issue-N`). The name a caller types is matched to that file name
+// without regard to case, as NTFS matches it, and the name on disk is the canonical one. The directory is listed, not
+// the file read: a tenant file the door never needs stays unread, and its declared `name` is not an alias. Null when no
+// tenant file has that name.
+function canonicalTenantName(root, requested) {
+  const wanted = String(requested || '');
+  let entries;
+  try { entries = fs.readdirSync(path.join(path.resolve(root || DEFAULT_ROOT), 'tenants')); } catch { return null; }
+  const names = entries.filter((entry) => entry.endsWith('.json')).map((entry) => entry.slice(0, -'.json'.length));
+  if (names.includes(wanted)) return wanted;
+  return names.filter((name) => name.toLowerCase() === wanted.toLowerCase()).sort()[0] || null;
+}
+
+// The record id with its tenant part canonical. An id whose tenant has no file is left as it was given.
+function canonicalRecordId(root, recordId) {
+  const id = String(recordId);
+  const colon = id.indexOf(':');
+  if (colon <= 0) return id;
+  const canonical = canonicalTenantName(root, id.slice(0, colon));
+  return canonical ? `${canonical}${id.slice(colon)}` : id;
 }
 
 // The status API wants the full SHA; a head recorded before fleet#67 may be
@@ -509,7 +717,7 @@ function postReviewStatus({ root, tenant, headSha, artifact, artifactPath, gh, n
 
 function repostReviewStatus(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId } = options;
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId) throw new ReviewPolicyError('USAGE', '--repost needs --id <record>');
   const record = workState.getRecord({ root, id: recordId });
   const formal = record.review?.formal;
@@ -532,6 +740,41 @@ function repostReviewStatus(options = {}) {
 // copy under state/reviews/<tenant>_pr-<n>/attest-NNN.json and posts the status
 // exactly as a formal record does. The head must be the PR's current head: an
 // attestation of a head the PR has moved past would stamp a tree nobody read.
+
+// #446 (#445 review): the newest attestation at one head across the tenant's pull requests, the prior a further
+// attestation of that head accounts for. The status is per sha, so the same sha under another PR number is the same
+// review; newest is by the artifact's `at`, ties by its path.
+// #445 round 2: a zero-byte file is an artifact a crash left behind (writeArtifactExclusive takes the name before it
+// writes); it holds no finding and is skipped. A file that does not parse might hold the blocker, so it refuses.
+function readAttestation(root, relative) {
+  const file = path.join(path.resolve(root || DEFAULT_ROOT), relative);
+  if (fs.statSync(file).size === 0) return null;
+  try {
+    // A byte-order mark is no part of the JSON (loadTenant strips it too); a file saved with one is still read (#445 round 3).
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+  } catch (error) {
+    throw new ReviewPolicyError('ATTESTATION_UNREADABLE', `${relative} is not readable JSON (${error.message}); it might hold the open finding that blocks this attestation, so nothing is attested (#445 review)`, { path: relative });
+  }
+}
+
+function latestAttestAt(root, tenantName, headSha) {
+  const reviews = path.join(path.resolve(root || DEFAULT_ROOT), 'state', 'reviews');
+  if (!fs.existsSync(reviews)) return null;
+  const prefix = `${safeRecordName(tenantName)}_pr-`;
+  let newest = null;
+  for (const directory of fs.readdirSync(reviews)) {
+    if (!directory.startsWith(prefix)) continue;
+    for (const name of fs.readdirSync(path.join(reviews, directory))) {
+      if (!/^attest-\d{3}\.json$/.test(name)) continue;
+      const relative = path.posix.join('state', 'reviews', directory, name);
+      const data = readAttestation(root, relative);
+      if (!data || data.tenant !== tenantName || data.headSha !== headSha) continue;
+      const key = `${data.at || ''}\u0000${relative}`;
+      if (!newest || key > newest.key) newest = { key, data, path: relative };
+    }
+  }
+  return newest && { data: newest.data, path: newest.path };
+}
 
 function readAttestArtifact(file) {
   if (!file || file === 'true' || !fs.existsSync(file)) {
@@ -574,14 +817,17 @@ function readAttestArtifact(file) {
 
 function attestPullRequest(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { tenantName, headSha, artifactPath, actor } = options;
+  const { headSha, artifactPath, actor } = options;
+  const requestedTenant = options.tenantName;
   const prNumber = Number(options.prNumber);
-  if (!tenantName || tenantName === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
+  if (!requestedTenant || requestedTenant === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new ReviewPolicyError('USAGE', 'attest needs --pr <number>');
   if (!headSha || headSha === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --head <sha>');
+  requireFullSha(headSha, '--head');
   if (!artifactPath || artifactPath === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --artifact <path>');
-  const tenantFile = path.join(root, 'tenants', `${tenantName}.json`);
-  if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${tenantName}': ${tenantFile} does not exist`);
+  // The tenant's name is its file's, once at the door (#445 round 3): the paths and comparisons below all use it.
+  const tenantName = canonicalTenantName(root, requestedTenant);
+  if (!tenantName) throw new ReviewPolicyError('USAGE', `unknown tenant '${requestedTenant}': ${path.join(root, 'tenants', `${requestedTenant}.json`)} does not exist`);
   const tenant = loadTenant(root, tenantName);
   if (typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) {
     throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenantName} names no reviewStatus; there is no status to attest`);
@@ -591,6 +837,18 @@ function attestPullRequest(options = {}) {
   // The artifact first: every refusal that needs no network keeps precedence.
   const supplied = readAttestArtifact(artifactPath);
   buildFindings('pending', supplied.findings, [], null);
+
+  // #446: the earlier attestation of this head is the prior: each of its open findings needs a resolution, as a linked
+  // formal review's do, and the ones still open ride in this attestation. A statement cannot sit beside them.
+  const recordId = `${tenantName}:pr-${prNumber}`;
+  const earlier = latestAttestAt(root, tenantName, headSha);
+  const priors = earlier ? [{ data: earlier.data, path: earlier.path }] : [];
+  const resolutions = options.resolutions || null;
+  const ruling = checkRuling(resolutions, options.ruling);
+  accountForPriors(priors, resolutions);
+  if (supplied.noFindings && buildFindings('pending', [], priors, resolutions).length) {
+    throw new ReviewPolicyError('USAGE', `${artifactPath} is a no-findings statement, but this attestation would carry open finding(s) from ${earlier.path}; a statement cannot sit beside them, so omit the statement and resolve or carry each finding`);
+  }
 
   const gh = options.gh || defaultGh;
   let currentHead;
@@ -605,18 +863,20 @@ function attestPullRequest(options = {}) {
   const repo = options.repoPath || tenant.repo;
   if (!repo) throw new ReviewPolicyError('TENANT_REPO_UNKNOWN', `cannot resolve --head against a repository: pass --repo-path <tenant repo> or set "repo" in ${tenantFile}`);
   const run = options.git ? (args) => options.git(args, repo) : (args) => gitInRepo(repo, args);
-  try { run(['fetch', '--quiet', 'origin', `+refs/pull/${prNumber}/head`]); } catch { /* offline: the object may still be local */ }
+  try { fetchRun(options.git, repo)(['fetch', '--quiet', 'origin', `+refs/pull/${prNumber}/head`]); } catch { /* offline: the object may still be local */ }
+  let resolved;
   try {
-    run(['cat-file', '-e', `${headSha}^{commit}`]);
+    resolved = String(run(['rev-parse', '--verify', `${headSha}^{commit}`]) || '').trim();
   } catch {
     throw new ReviewPolicyError('UNKNOWN_COMMIT', `--head ${headSha} is not a commit in ${repo} (after fetching PR #${prNumber}); an attestation names a head that exists (fleet#67)`, { flag: '--head', sha: String(headSha), repoPath: repo });
   }
-  const head = fullSha(headSha, repo, options.git);
+  requireCommitItself(resolved, headSha, '--head');
+  const head = resolved;
   if (head.toLowerCase() !== currentHead.toLowerCase()) {
     throw new ReviewPolicyError('STALE_HEAD', `PR #${prNumber} has moved: its head is ${currentHead}, not ${head}; review ${currentHead} and attest that`, { currentHead, headSha: head });
   }
 
-  const written = writeArtifactExclusive(root, `${tenantName}:pr-${prNumber}`, 'attest', (stamp) => ({
+  const written = writeArtifactExclusive(root, recordId, 'attest', (stamp) => ({
     schemaVersion: 1,
     kind: 'attest',
     tenant: tenantName,
@@ -625,8 +885,11 @@ function attestPullRequest(options = {}) {
     reviewer: actor || 'unknown',
     at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
     source: path.resolve(artifactPath),
+    priorArtifact: earlier ? earlier.path : null,
+    resolutions,
+    ruling: ruling || undefined,
     noFindings: supplied.noFindings,
-    findings: buildFindings(stamp, supplied.findings, [], null),
+    findings: buildFindings(stamp, supplied.findings, priors, resolutions),
   }));
   const posted = postReviewStatus({ root, tenant, headSha: head, artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh, now: options.now });
   return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
@@ -780,8 +1043,11 @@ function afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, wr
 
 function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId, kind, headSha, actor } = options;
+  const { kind, headSha, actor } = options;
+  // The tenant part of the id is canonical before anything is read or written: work-state keys records by the exact id.
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
+  requireFullSha(headSha, '--head-sha');
   if (!['formal', 'risk'].includes(kind)) throw new ReviewPolicyError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
   // fleet#43: `headSha` is the head the artifact is recorded against;
   // `reviewedSha` is the tree the reviewer actually read. An IC that fixes
@@ -791,25 +1057,15 @@ function recordReviewArtifact(options = {}) {
   // lead's own read at the head it records, so there the two must agree; a
   // moved head is a re-review, never a record at a tree nobody read.
   const reviewedSha = options.reviewedSha !== undefined && options.reviewedSha !== null ? String(options.reviewedSha) : String(headSha);
+  requireFullSha(reviewedSha, '--reviewed-sha');
   if (kind === 'formal' && reviewedSha !== String(headSha)) {
     throw new ReviewPolicyError('REVIEWED_SHA_MISMATCH', `a formal review is recorded at the head it read: --reviewed-sha ${reviewedSha} differs from --head-sha ${headSha}; re-review at ${headSha} (plan-rereview scopes it) rather than record a review of a tree nobody read`, { reviewedSha, headSha: String(headSha) });
   }
-  const classification = options.classification || {};
-  // fleet#64: a formal record with no classification read `triggers: []` and
-  // walked past every trigger guard, so a triggered head was formally recorded
-  // with no risk review ever having existed (Endzone PR #1380, formal-002 at
-  // c4e31d2c). The lead classifies the head before it reviews (project-lead.md,
-  // Merge); the record now carries that answer, and a triggered head needs its
-  // risk artifact (below) unless the lead rules the trigger on record.
-  if (kind === 'formal' && typeof classification.tier !== 'string') {
-    throw new ReviewPolicyError('CLASSIFICATION_REQUIRED', `a formal review records the head's classification: pass --classification '<json>' from review-policy.js classify at ${headSha}`, { headSha: String(headSha) });
-  }
+  // A risk review takes its classification from the caller (the IC ran classify). A formal review's is computed at
+  // its head once the head is verified, below (#445), so a classification passed in from another head decides nothing.
+  let classification = options.classification || {};
   const riskRuling = typeof options.riskRuling === 'string' && options.riskRuling.trim().length > 0 ? options.riskRuling.trim() : null;
-  // #324: a `ruled` resolution cites the Ruling that keeps the finding; the citation belongs to no other resolution.
-  const ruling = typeof options.ruling === 'string' && options.ruling.trim().length > 0 && options.ruling !== 'true' ? options.ruling.trim() : null; // a bare --ruling parses to 'true'
-  const anyRuled = Object.values(options.resolutions || {}).includes('ruled');
-  if (anyRuled && !ruling) throw new ReviewPolicyError('RULING_REQUIRED', 'a ruled resolution cites the Ruling that keeps the finding: pass --ruling "<link or reference>"');
-  if (ruling && !anyRuled) throw new ReviewPolicyError('USAGE', '--ruling belongs to a ruled resolution: it cites the Ruling that keeps the finding');
+  const ruling = checkRuling(options.resolutions, options.ruling);
   if (riskRuling && kind !== 'formal') throw new ReviewPolicyError('USAGE', '--risk-ruling belongs to a formal review: it is the lead ruling on a trigger');
   // Ticket 09: with state/flags/review-dedup-off every review pass is written down (the
   // legacy behaviour). The default replay key is kind:record:head, which would make a
@@ -828,6 +1084,11 @@ function recordReviewArtifact(options = {}) {
 
   let written = null;
   let verifiedRepo = null;
+  const headShas = () => {
+    const shas = [{ flag: '--head-sha', sha: String(headSha) }];
+    if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
+    return shas;
+  };
   try {
     for (let attempt = 0; ; attempt += 1) {
       const record = workState.getRecord({ root, id: recordId });
@@ -847,11 +1108,22 @@ function recordReviewArtifact(options = {}) {
       }
 
       const prior = record.review?.[kind] || null;
+      // #445 review: a link names a prior formal review. With none on the record the link has nothing to name, and it
+      // must not stand in for the risk review a trigger needs (the chain walk belongs to that prior alone).
+      if (linkedRereview && !prior) {
+        throw new ReviewPolicyError('USAGE', `--prior-artifact ${options.priorArtifact} names no prior formal review of ${recordId}; a first formal review takes no link (#445)`, { priorArtifact: String(options.priorArtifact) });
+      }
       if (prior && prior.headSha === String(headSha) && !dedupOff && !linkedRereview) {
         throw new ReviewPolicyError('ALREADY_REVIEWED', `a ${kind} review is already recorded for ${recordId} at ${headSha}`, { artifact: prior.artifact });
       }
       if (kind === 'risk' && !(classification.triggers || []).length) {
         throw new ReviewPolicyError('RISK_REVIEW_NOT_TRIGGERED', 'a risk review requires a configured trigger; a normal PR never launches the risk reviewer');
+      }
+      // #445: a formal record classifies its head itself, which needs the head in the tenant repo, so the commit guard
+      // (fleet#67) runs here for a formal record; a retry keeps what it found.
+      if (kind === 'formal' && !verifiedRepo) {
+        verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas: headShas(), repoPath: options.repoPath, git: options.git });
+        classification = classificationAt({ root, tenant: options.tenant, recordId, record, repo: verifiedRepo, headSha, git: options.git });
       }
       // fleet#64: a triggered head has its risk artifact before the formal review
       // records. A first formal at a head needs the risk artifact at that head;
@@ -873,7 +1145,9 @@ function recordReviewArtifact(options = {}) {
       let priorArtifactMissing = false;
       let range = kind === 'risk' && reviewedSha !== String(headSha) ? `${reviewedSha}..${headSha}` : null;
       const resolutions = options.resolutions || null;
-      const sameHeadPassUnderFlag = dedupOff && prior && prior.headSha === String(headSha) && !options.priorArtifact;
+      // A same-head pass under the flag: a formal one that does not link its prior, or any risk one (#446 review: a risk
+      // record's --prior-artifact is no formal link, and must not skip the accounting).
+      const sameHeadPassUnderFlag = dedupOff && prior && prior.headSha === String(headSha) && (kind === 'risk' || !options.priorArtifact);
       // Every artifact whose open findings this review must account for: the
       // linked formal prior, and (fleet#43) the risk artifact the formal
       // review consumes. Each open finding needs a resolution; still-open ones
@@ -897,6 +1171,9 @@ function recordReviewArtifact(options = {}) {
         if (priorArtifactData === null) priorArtifactMissing = true;
         priors.push({ data: priorArtifactData, path: prior.artifact });
       }
+      // #446: under review-dedup-off a risk review that replaces one at the same head accounts for that one's open
+      // findings, as a linked formal review accounts for its prior.
+      if (kind === 'risk' && sameHeadPassUnderFlag) priors.push({ data: readArtifact(root, prior.artifact), path: prior.artifact });
       // fleet#43: nothing walked the risk chain. `prior` is scoped per kind, so
       // a formal review never saw risk findings and a risk artifact was
       // write-only: recorded once, resolved by nothing, unable to go stale.
@@ -917,19 +1194,7 @@ function recordReviewArtifact(options = {}) {
           priors.push({ data: riskData, path: risk.artifact });
         }
       }
-      for (const { data, path: priorPath } of priors) {
-        if (!data) continue;
-        const open = openFindings(data);
-        for (const finding of open) {
-          const resolution = resolutions?.[finding.id];
-          if (!resolution) {
-            throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} in ${priorPath} has no resolution`, { unresolved: open.map((entry) => entry.id), artifact: priorPath });
-          }
-          if (!RESOLUTION_VALUES.includes(resolution)) {
-            throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
-          }
-        }
-      }
+      accountForPriors(priors, resolutions);
 
       // fleet#18: the artifact is never silent about its own result. A reviewer
       // who found nothing is a real outcome, so it is recorded as a statement
@@ -962,11 +1227,8 @@ function recordReviewArtifact(options = {}) {
       // fleet#67: the last guard before the write. It runs git (a fetch of the
       // PR branch), so every cheaper refusal above keeps precedence over it;
       // an artifact is never written for a head the tenant repo does not hold.
-      if (!written) {
-        const shas = [{ flag: '--head-sha', sha: String(headSha) }];
-        if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
-        verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
-      }
+      // A formal record ran it already, ahead of its trigger guard (#445).
+      if (!verifiedRepo) verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas: headShas(), repoPath: options.repoPath, git: options.git });
       if (!written) {
         written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
           schemaVersion: 1,
@@ -1036,7 +1298,8 @@ function recordReviewArtifact(options = {}) {
 
 function planRereview(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId, headSha } = options;
+  const { headSha } = options;
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
   const record = workState.getRecord({ root, id: recordId });
   const prior = record.review?.formal;
@@ -1056,7 +1319,8 @@ function planRereview(options = {}) {
 
 function holdRecord(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId, reason, actor } = options;
+  const { reason, actor } = options;
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId || !reason) throw new ReviewPolicyError('USAGE', 'recordId and reason are required');
   const key = options.idempotencyKey || `hold:${recordId}`;
   const result = workState.transitionRecord({
@@ -1115,6 +1379,16 @@ function usage(message) {
   return new ReviewPolicyError('USAGE', `${message}\nusage: ${CLASSIFY_USAGE}`);
 }
 
+// A --diff file: UTF-8 with or without its byte-order mark, or UTF-16 with its own mark, which PowerShell's `>` writes
+// (#445). An odd trailing byte of UTF-16 is no character and is dropped.
+function readDiffFile(file) {
+  const bytes = fs.readFileSync(file);
+  const even = bytes.length - ((bytes.length - 2) % 2);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2, even).toString('utf16le');
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return Buffer.from(bytes.subarray(2, even)).swap16().toString('utf16le');
+  return bytes.toString('utf8').replace(/^﻿/, '');
+}
+
 function classifyCli(rest) {
   let args;
   try {
@@ -1129,11 +1403,13 @@ function classifyCli(rest) {
   // answer it could give is riskReview:false, which is a false negative by
   // construction, not an answer.
   if (!args.tenant || args.tenant === 'true') throw usage('--tenant <name> is required');
-  const tenant = loadTenant(root, args.tenant);
+  // The tenant's name is its file's (#445 round 3). An unknown name is read as typed, so loadTenant refuses it as before.
+  const tenantName = canonicalTenantName(root, args.tenant) || args.tenant;
+  const tenant = loadTenant(root, tenantName);
   const carveOuts = Array.isArray(tenant.carveOuts) ? tenant.carveOuts.length : 0;
   const triggers = tenant.riskTriggers && typeof tenant.riskTriggers === 'object' ? Object.keys(tenant.riskTriggers).length : 0;
   if (carveOuts === 0 && triggers === 0) {
-    throw new ReviewPolicyError('EMPTY_TENANT', `tenant "${args.tenant}" declares no carveOuts and no riskTriggers; a classification against it could only ever answer riskReview:false`);
+    throw new ReviewPolicyError('EMPTY_TENANT', `tenant "${tenantName}" declares no carveOuts and no riskTriggers; a classification against it could only ever answer riskReview:false`);
   }
   const config = loadConfig(root);
   if (args.repo) {
@@ -1150,7 +1426,7 @@ function classifyCli(rest) {
   if (args.diff && !fs.existsSync(args.diff)) throw usage(`--diff file not found: ${args.diff}`);
   return classifyChange({
     files,
-    diffText: args.diff ? fs.readFileSync(args.diff, 'utf8') : undefined,
+    diffText: args.diff ? readDiffFile(args.diff) : undefined,
     changedLines: args['changed-lines'] ? Number(args['changed-lines']) : undefined,
     tenant, config,
   });
@@ -1166,7 +1442,7 @@ const COMMAND_FLAGS = Object.freeze({
   record: RECORD_FLAGS,
   'plan-rereview': ['root', 'id', 'head-sha'],
   hold: ['root', 'id', 'expected-revision', 'reason', 'actor', 'now', 'idempotency-key', 'no-notifier'],
-  attest: ['root', 'tenant', 'pr', 'head', 'artifact', 'repo-path', 'actor', 'now'],
+  attest: ['root', 'tenant', 'pr', 'head', 'artifact', 'repo-path', 'actor', 'now', 'resolutions', 'ruling'],
 });
 
 function cli(argv) {
@@ -1222,6 +1498,8 @@ function cli(argv) {
     return attestPullRequest({
       root, tenantName: args.tenant, prNumber: args.pr, headSha: args.head, artifactPath: args.artifact,
       repoPath: args['repo-path'], actor, now: args.now,
+      // #446: the same resolution format a formal record takes, for the open findings of the earlier attestation.
+      resolutions: args.resolutions ? JSON.parse(args.resolutions) : null, ruling: args.ruling,
     });
   }
   if (command === 'plan-rereview') {
@@ -1264,11 +1542,12 @@ if (require.main === module) {
     // FINDING_CARRIES_OUTCOME and REVIEWED_SHA_MISMATCH (fleet#43) are refused
     // invocations too: nothing was recorded, and the message names the door.
     // UNKNOWN_COMMIT and TENANT_REPO_UNKNOWN (fleet#67) likewise: nothing was
-    // recorded, and the message names the repo and the SHA.
+    // recorded, and the message names the repo and the SHA. FULL_SHA_REQUIRED and
+    // TENANT_BASE_UNKNOWN (#445) likewise.
     // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
     // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
     // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'FULL_SHA_REQUIRED', 'TENANT_BASE_UNKNOWN', 'TENANT_BASE_MISSING', 'ATTESTATION_UNREADABLE', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 
