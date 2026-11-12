@@ -53,6 +53,28 @@ try {
   Assert-True ($script:lastExit -eq 0) "the same fixture without the red suites exits 0, got $($script:lastExit): $green"
   Assert-True ($green -match 'test-all: all 2 suites passed') "the green summary counts the suites: $green"
 
+  # #444: -Filter takes a list and -Exclude leaves suites out after it. From the command line a list is one
+  # comma-separated token (powershell -File binds one token per parameter).
+  $listed = Run-Runner @('-Filter', 'alpha*,gamma*')
+  Assert-True ($script:lastExit -eq 0 -and $listed -match '(?m)^PASS  alpha\.tests\.js' -and $listed -match '(?m)^PASS  gamma\.tests\.ps1' -and $listed -notmatch '(?m)^(PASS|FAIL)  beta') "-Filter takes a comma-separated list of wildcards: $listed"
+  $excluded = Run-Runner @('-Exclude', 'beta*,delta*')
+  Assert-True ($script:lastExit -eq 0 -and $excluded -match 'test-all: all 2 suites passed' -and $excluded -notmatch '(?m)^(PASS|FAIL)  (beta|delta)') "-Exclude leaves out every suite it names: $excluded"
+  $afterFilter = Run-Runner @('-Filter', 'alpha*,beta*', '-Exclude', 'beta*')
+  Assert-True ($script:lastExit -eq 0 -and $afterFilter -match 'test-all: all 1 suites passed' -and $afterFilter -notmatch '(?m)^(PASS|FAIL)  beta') "-Exclude is applied after -Filter: $afterFilter"
+  $emptied = Run-Runner @('-Filter', 'alpha*', '-Exclude', 'alpha*')
+  Assert-True ($script:lastExit -eq 2) "an -Exclude that leaves no suite exits 2, got $($script:lastExit): $emptied"
+
+  # #444: config/ci-shards.json names the watchdog and slow suites and rest is every other suite, so a suite
+  # is in no shard only when it is not a file here, and in two only when a name is listed twice.
+  $repoRoot = Split-Path -Parent $PSScriptRoot
+  $shards = Get-Content -LiteralPath (Join-Path $repoRoot 'config\ci-shards.json') -Raw | ConvertFrom-Json
+  $shardNames = @($shards.watchdog) + @($shards.slow)
+  $suiteFiles = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'tests') -File | Where-Object { $_.Name -like '*.tests.js' -or $_.Name -like '*.tests.ps1' } | ForEach-Object { $_.Name })
+  $notSuites = @($shardNames | Where-Object { $suiteFiles -notcontains $_ })
+  Assert-True ($notSuites.Count -eq 0) "config/ci-shards.json names no suite file in tests/: $($notSuites -join ', ')"
+  $listedTwice = @($shardNames | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+  Assert-True ($listedTwice.Count -eq 0) "config/ci-shards.json lists a suite twice: $($listedTwice -join ', ')"
+
   Assert-True ((Get-LogDirs).Count -eq 0) "a green run removes its own log dir from TEMP: $((Get-LogDirs) -join ', ')"
 
   $explicitLogs = Join-Path $fixture 'explicit-logs'

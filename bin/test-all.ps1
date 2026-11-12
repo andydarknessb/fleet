@@ -2,13 +2,16 @@
 # and every tests/*.tests.ps1 (Windows PowerShell 5.1), SERIALLY, each in its own
 # process. Suites never run in parallel (ADR 0013 Consequences; the mutex flake
 # once blamed on parallel load was a Windows lock race, #234). One line per suite (outcome, exit code,
-# seconds); exit 1 naming every failed suite, 0 when all passed, 2 when -Filter
-# matched nothing. CI (.github/workflows/ci.yml, job `fleet-ci`) runs exactly this.
+# seconds); exit 1 naming every failed suite, 0 when all passed, 2 when -Filter and -Exclude
+# leave no suite. CI (.github/workflows/ci.yml, job `suites`) runs this once per shard in
+# config/ci-shards.json, each shard on its own runner, so one host still runs one suite at a time.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File bin\test-all.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File bin\test-all.ps1 -Filter 'review-*'
+#   powershell -NoProfile -ExecutionPolicy Bypass -File bin\test-all.ps1 -Filter 'budget*,review-*' -Exclude 'review-policy*'
 #
-# -Filter is a wildcard against the suite file name (`budget*`, `*.tests.ps1`).
+# -Filter and -Exclude are wildcards against the suite file name (`budget*`, `*.tests.ps1`), each
+# a list; -Exclude is applied after -Filter.
 # -TestsDir points the runner at another directory (its own test uses a fixture).
 # A suite that outlives -SuiteTimeoutMinutes is killed and counted as failed.
 # Each suite's output goes to -LogDir\<suite>.log; a failed suite's tail is printed.
@@ -21,7 +24,8 @@
 # Each suite runs with the real gh off PATH (fleet #416): a node child runs gh without a shell,
 # skips a gh.cmd mock and reaches the real gh.exe. Exit 2 when node can still reach a gh.
 param(
-  [string]$Filter = '*',
+  [string[]]$Filter = '*',
+  [string[]]$Exclude = @(),
   [string]$TestsDir = '',
   [string]$LogDir = '',
   [int]$SuiteTimeoutMinutes = 60,
@@ -42,11 +46,16 @@ $node = (Get-Command node -ErrorAction SilentlyContinue)
 $powershell = Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path $powershell)) { $powershell = 'powershell' }
 
+# -Filter and -Exclude are lists: an array in process, or one comma-separated token from the
+# command line (powershell -File binds one token per parameter). Suite file names have no commas.
+$Filter = @($Filter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$Exclude = @($Exclude | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+function Test-Named { param([string]$Name, [string[]]$Patterns) @($Patterns | Where-Object { $Name -like $_ }).Count -gt 0 }
 $suites = @(Get-ChildItem -Path $TestsDir -File | Where-Object {
-    ($_.Name -like '*.tests.js' -or $_.Name -like '*.tests.ps1') -and $_.Name -like $Filter
+    ($_.Name -like '*.tests.js' -or $_.Name -like '*.tests.ps1') -and (Test-Named $_.Name $Filter) -and -not (Test-Named $_.Name $Exclude)
   } | Sort-Object Name)
 if ($suites.Count -eq 0) {
-  Write-Output "test-all: no suite in $TestsDir matches -Filter '$Filter'"
+  Write-Output "test-all: no suite in $TestsDir matches -Filter '$($Filter -join ',')' after -Exclude '$($Exclude -join ',')'"
   exit 2
 }
 if (($suites | Where-Object { $_.Name -like '*.tests.js' }) -and -not $node) {

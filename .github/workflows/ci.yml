@@ -1,7 +1,10 @@
-# #112 (ADR 0013): the full-suite authority for fleet master. One aggregate runner,
-# suites serial, on Windows (the .tests.ps1 suites are Windows PowerShell 5.1).
-# The job name `fleet-ci` is stable: the Watchdog's deploy step (#113) reads the
-# check run of that name on origin/master's head before it advances `live`.
+# #112 (ADR 0013): the full-suite authority for fleet master. #444: the suites run as three
+# shards (config/ci-shards.json), each on its own Windows runner: `watchdog` alone, `slow`,
+# and `rest` (every other suite). Within a shard the suites run serially through one aggregate
+# runner, bin/test-all.ps1 (the .tests.ps1 suites are Windows PowerShell 5.1).
+# The job `fleet-ci` runs after the shards and is green only when every one is. Its name is
+# stable: the Watchdog's deploy step (#113) reads the check run of that name on origin/master's
+# head before it advances `live`, so that step needs no change for the shards.
 name: fleet-ci
 
 on:
@@ -18,10 +21,14 @@ permissions:
   contents: read
 
 jobs:
-  fleet-ci:
-    name: fleet-ci
+  suites:
+    name: suites
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [watchdog, slow, rest]
     steps:
       # The host checkout runs with core.autocrlf false; the suites compare bytes.
       - name: Keep line endings as committed
@@ -36,13 +43,33 @@ jobs:
           git config --global user.name "fleet-ci"
           git config --global user.email "fleet-ci@users.noreply.github.com"
           git config --global init.defaultBranch master
-      - name: Run every suite, serially
+      - name: Run this shard's suites, serially
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File bin\test-all.ps1 -LogDir "$env:RUNNER_TEMP\fleet-test-logs"
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          # rest is every suite the other two shards do not name; a list is one comma-separated value.
+          $lists = Get-Content config\ci-shards.json -Raw | ConvertFrom-Json
+          if ($env:SHARD -eq 'rest') {
+            $mode = '-Exclude'; $names = @($lists.watchdog) + @($lists.slow)
+          } else {
+            $mode = '-Filter'; $names = @($lists.($env:SHARD))
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File bin\test-all.ps1 $mode ($names -join ',') -LogDir "$env:RUNNER_TEMP\fleet-test-logs"
       - name: Keep suite logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: fleet-test-logs
+          name: fleet-test-logs-${{ matrix.shard }}
           path: ${{ runner.temp }}\fleet-test-logs
           if-no-files-found: ignore
+
+  # The one check run the deploy step reads: green only when every shard is green on this head.
+  fleet-ci:
+    name: fleet-ci
+    needs: suites
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every shard is green
+        run: test "${{ needs.suites.result }}" = "success"
