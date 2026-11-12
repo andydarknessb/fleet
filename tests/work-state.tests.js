@@ -2106,38 +2106,173 @@ function stateFiles(root) {
   return files;
 }
 
-// #447 follow-up: stands in for a breaker. Once the journal's rename completes, another holder takes the lock,
-// which is where a holder frozen inside commitMutation wakes up.
-function takeLockAfterJournal(lock, content) {
+// #447 follow-up: stands in for a breaker that takes the lock from a holder. 'before-journal' takes it on the
+// holder's first read of active.json, before the call writes anything; 'after-journal' takes it once the journal's
+// rename completes. The other holder's lock is dead-owned and ten minutes old, so the next door call breaks it at once.
+function takeLock(lock, when) {
+  const read = fs.readFileSync;
   const rename = fs.renameSync;
   let taken = false;
-  fs.renameSync = function swapping(from, to) {
-    const result = rename.call(this, from, to);
-    if (!taken && String(to).includes(`${path.sep}pending${path.sep}`)) {
-      taken = true;
-      fs.rmSync(lock, { force: true });
-      fs.writeFileSync(lock, content);
-    }
-    return result;
+  const swap = () => {
+    taken = true;
+    const content = JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' });
+    fs.rmSync(lock, { force: true });
+    fs.writeFileSync(lock, content);
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    fs.utimesSync(lock, old, old);
   };
-  return () => { fs.renameSync = rename; };
+  if (when === 'before-journal') {
+    fs.readFileSync = function reading(file, ...rest) {
+      const out = read.call(this, file, ...rest);
+      if (!taken && path.basename(String(file)) === 'active.json') swap();
+      return out;
+    };
+  } else {
+    fs.renameSync = function renaming(from, to) {
+      const out = rename.call(this, from, to);
+      if (!taken && String(to).includes(`${path.sep}pending${path.sep}`)) swap();
+      return out;
+    };
+  }
+  return () => { fs.readFileSync = read; fs.renameSync = rename; };
 }
 
-test('#447 follow-up: a holder whose lock another holder took refuses its write with LOCK_LOST and writes nothing', () => {
+test('#447 follow-up: a lock lost before the journal is written leaves nothing behind, and the refusal says the outcome is unknown', () => {
   const root = rootDir();
   makeRecord(root);
   const { lock } = paths(root);
   const before = stateFiles(root);
-  const otherHolder = JSON.stringify({ pid: 2147483646, at: '2026-09-01T00:00:00.000Z' });
-  const restore = takeLockAfterJournal(lock, otherHolder);
+  const restore = takeLock(lock, 'before-journal');
+  let failure;
   try {
-    assert.throws(() => move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z'),
-      (error) => error.code === 'LOCK_LOST' && error.message.includes(lock));
+    move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z');
+  } catch (error) { failure = error; } finally { restore(); }
+  assert.equal(failure?.code, 'LOCK_LOST');
+  assert.ok(failure.message.includes(lock), 'the message names the lock path');
+  assert.match(failure.message, /outcome is unknown/);
+  assert.match(failure.message, /same idempotency key/);
+  assert.deepEqual(stateFiles(root), before, 'nothing was written: active.json, the ledger and the journal directory are byte-identical');
+  assert.match(fs.readFileSync(lock, 'utf8'), /"pid":2147483646/, 'the other holder still has its lock');
+});
+
+test('#447 follow-up: a write lost after its journal is recovered once by the next holder, and a same-key retry replays', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock, pending } = paths(root);
+  const restore = takeLock(lock, 'after-journal');
+  let failure;
+  try {
+    move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z');
+  } catch (error) { failure = error; } finally { restore(); }
+  assert.equal(failure?.code, 'LOCK_LOST');
+  assert.equal(fs.readdirSync(pending).length, 1, 'the journal stays for the next holder');
+  // The next door call breaks the dead holder's lock, and its recovery completes the journal.
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 2);
+  assert.equal(fs.readdirSync(pending).length, 0);
+  const sequence2 = () => readEvents(root).filter((event) => event.recordId === 'endzone:issue-42' && event.sequence === 2);
+  assert.equal(sequence2().length, 1, 'the event is in the ledger exactly once');
+  const retry = move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z');
+  assert.equal(retry.replayed, true);
+  assert.equal(retry.revision, 2);
+  assert.equal(sequence2().length, 1, 'the same-key retry wrote nothing');
+});
+
+test('#447 follow-up: a lock taken while active.json is written is refused before the rename, and the temporary file is removed', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock, active, work } = paths(root);
+  const activeBefore = fs.readFileSync(active, 'utf8');
+  const eventsBefore = readEvents(root);
+  const write = fs.writeFileSync;
+  let taken = false;
+  fs.writeFileSync = function writing(file, ...rest) {
+    const out = write.call(this, file, ...rest);
+    // The temporary file for active.json is written; the holder is frozen before its rename.
+    if (!taken && path.basename(String(file)).startsWith('active.json.')) {
+      taken = true;
+      fs.rmSync(lock, { force: true });
+      write.call(fs, lock, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }));
+    }
+    return out;
+  };
+  let failure;
+  try {
+    move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z');
+  } catch (error) { failure = error; } finally { fs.writeFileSync = write; }
+  assert.equal(failure?.code, 'LOCK_LOST');
+  assert.equal(fs.readFileSync(active, 'utf8'), activeBefore, 'active.json is the one the holder read');
+  assert.deepEqual(readEvents(root), eventsBefore, 'the ledger is unchanged');
+  assert.deepEqual(fs.readdirSync(work).filter((name) => name.endsWith('.tmp')), [], 'the temporary file was removed');
+});
+
+test('#447 follow-up: one transient EBUSY on the lock stat does not produce LOCK_LOST', () => {
+  const root = rootDir();
+  makeRecord(root);
+  let result;
+  withFsFault('statSync', (target, probe) => (isLock(target) && probe.failures < 1 ? 'EBUSY' : null), (probe) => {
+    result = move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'ack', '2026-09-01T00:00:01.000Z');
+    assert.equal(probe.failures, 1);
+  });
+  assert.equal(result.record.state, 'implementing');
+});
+
+test('#447 follow-up: a lock that is gone is lost at once, with no transient retry', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock } = paths(root);
+  const rename = fs.renameSync;
+  let removed = false;
+  fs.renameSync = function removing(from, to) {
+    const out = rename.call(this, from, to);
+    if (!removed && String(to).includes(`${path.sep}pending${path.sep}`)) {
+      removed = true;
+      fs.rmSync(lock, { force: true });
+    }
+    return out;
+  };
+  let failure;
+  withFsFault('statSync', () => null, (probe) => {
+    try {
+      move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z');
+    } catch (error) { failure = error; }
+    assert.equal(probe.waits, 0, 'ENOENT is not retried');
+  });
+  fs.renameSync = rename;
+  assert.equal(failure?.code, 'LOCK_LOST');
+});
+
+test('#447 follow-up: a holder frozen between its guard and its append does not append an event recovery appended meanwhile', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock, active, events } = paths(root);
+  const day = path.join(events, '2026-09-01.jsonl');
+  const rename = fs.renameSync;
+  const stat = fs.statSync;
+  let armed = false;
+  let copied = false;
+  fs.renameSync = function renaming(from, to) {
+    const out = rename.call(this, from, to);
+    if (String(to) === active) armed = true;
+    return out;
+  };
+  fs.statSync = function stating(file, ...rest) {
+    // The first lock stat after the record write is appendEvent's guard: the breaker's recovery appends this
+    // holder's event just after that guard, while the holder is frozen.
+    if (armed && !copied && String(file) === lock) {
+      copied = true;
+      fs.appendFileSync(day, `${JSON.stringify({ schemaVersion: 1, recordId: 'endzone:issue-42', sequence: 2, revision: 2, type: 'state-implementing', actor: 'test', at: '2026-09-01T00:00:01.000Z', evidence: 'ack', idempotencyKey: 'ack', changes: {} })}\n`);
+    }
+    return stat.call(this, file, ...rest);
+  };
+  try {
+    const result = move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'ack', '2026-09-01T00:00:01.000Z');
+    assert.equal(result.record.state, 'implementing');
   } finally {
-    restore();
+    fs.renameSync = rename;
+    fs.statSync = stat;
   }
-  assert.deepEqual(stateFiles(root), before, 'active.json, the ledger and every other state file are byte-identical');
-  assert.equal(fs.readFileSync(lock, 'utf8'), otherHolder, 'the other holder still has its lock');
+  assert.equal(copied, true, 'the recovery stand-in ran');
+  assert.equal(readEvents(root).filter((event) => event.recordId === 'endzone:issue-42' && event.sequence === 2).length, 1, 'the event is in the ledger exactly once');
 });
 
 test('#447 follow-up: a commit under its own lock still writes and releases the lock', () => {
@@ -2151,7 +2286,7 @@ test('#447 follow-up: the CLI exits 1 with LOCK_LOST on stderr when another hold
   const root = rootDir();
   makeRecord(root);
   const { lock } = paths(root);
-  // The same take-over as takeLockAfterJournal, preloaded into the CLI child from a scratch directory.
+  // The same take-over as takeLock(lock, 'after-journal'), preloaded into the CLI child from a scratch directory.
   const preload = path.join(rootDir(), 'take-lock.js');
   fs.writeFileSync(preload, `const fs = require('node:fs');
 const path = require('node:path');
@@ -2177,6 +2312,7 @@ fs.renameSync = function swapping(from, to) {
   assert.ok(failure, 'expected the CLI to refuse the write');
   assert.equal(failure.status, 1);
   assert.equal(JSON.parse(failure.stderr).code, 'LOCK_LOST');
+  assert.match(JSON.parse(failure.stderr).message, /outcome is unknown/);
   // Read without the door: getRecord would wait out the other holder's lock, which is still there.
   assert.equal(JSON.parse(fs.readFileSync(paths(root).active, 'utf8')).records['endzone:issue-42'].revision, 1, 'nothing was written');
   assert.match(fs.readFileSync(lock, 'utf8'), /"pid":2147483646/, 'the other holder still has its lock');

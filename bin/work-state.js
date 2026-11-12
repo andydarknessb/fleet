@@ -107,24 +107,29 @@ function readJson(file, fallback = null) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function writeAtomicJson(file, value) {
+// `p` (#447 follow-up) names the lock this write is made under: the lock is checked between writing the temporary
+// file and renaming it over the target, so nothing after the check but the rename itself.
+function writeAtomicJson(file, value, p) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  renameWithRetry(temporary, file);
+  renameWithRetry(temporary, file, p);
 }
 
-function writeAtomicText(file, value) {
+function writeAtomicText(file, value, p) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, value, 'utf8');
-  renameWithRetry(temporary, file);
+  renameWithRetry(temporary, file, p);
 }
 
 // #234: a rename onto a file another process just opened or replaced can report EPERM/EBUSY on Windows.
-function renameWithRetry(from, to) {
+// Each attempt asserts the lock first (#447 follow-up): a retry sleeps, so the lock may be lost meanwhile. A refused
+// attempt removes the temporary file, as a failed rename does.
+function renameWithRetry(from, to, p) {
   for (let attempt = 0; ; attempt += 1) {
     try {
+      if (p) assertLockHeld(p);
       fs.renameSync(from, to);
       return;
     } catch (error) {
@@ -180,9 +185,16 @@ function breakable(file) {
 function assertLockHeld(p) {
   if (p.lockIno === undefined) return; // not taken through withLock: a direct appendEvent call, as tests make
   let ino = null;
-  try { ino = fs.statSync(p.lock, { bigint: true }).ino; } catch {}
+  // A transient stat error is retried for the lock's transient bound (#234); ENOENT or any other error is lost at once.
+  const since = Date.now();
+  for (;;) {
+    try { ino = fs.statSync(p.lock, { bigint: true }).ino; break; } catch (error) {
+      if (!TRANSIENT_FS_CODES.has(error.code) || Date.now() - since > LOCK_TRANSIENT_MAX_MS) break;
+      sleepBriefly();
+    }
+  }
   if (ino !== p.lockIno) {
-    throw new WorkStateError('LOCK_LOST', `the state lock at ${p.lock} was broken and taken by another holder; the write was refused`, { lock: p.lock });
+    throw new WorkStateError('LOCK_LOST', `the state lock at ${p.lock} was broken and taken by another holder; the outcome is unknown: retry the call with the same idempotency key (a same-key retry replays as success if the write landed)`, { lock: p.lock });
   }
 }
 
@@ -277,7 +289,7 @@ function withLock(root, callback) {
   try {
     if (!fs.existsSync(p.active)) {
       assertLockHeld(p);
-      writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
+      writeAtomicJson(p.active, { schemaVersion: 1, records: {} }, p);
     }
     recoverPendingUnlocked(p);
     archiveExpiredEvents(p, new Date().toISOString());
@@ -292,7 +304,7 @@ function activeState(p) {
 }
 
 function saveActive(p, state) {
-  writeAtomicJson(p.active, state);
+  writeAtomicJson(p.active, state, p);
 }
 
 function eventFile(p, timestamp) {
@@ -398,7 +410,7 @@ function checkEventSlot(p, event) {
 }
 
 // fleet #450 review: the cut is made on one descriptor, and only while the file is the size the tail was read at.
-function settleTail(fd) {
+function settleTail(fd, p) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const size = fs.fstatSync(fd).size;
     if (!size) return '';
@@ -411,6 +423,7 @@ function settleTail(fd) {
     // The window left is the gap between this size check and the cut.
     if (fs.fstatSync(fd).size !== size) continue;   // another writer appended: read the tail again
     if (whole) return '\n';   // a whole row missing its newline keeps its line
+    if (p) assertLockHeld(p);   // #447 follow-up: the cut is a write under the lock, checked just before it
     fs.ftruncateSync(fd, start);
     return '';
   }
@@ -419,20 +432,24 @@ function settleTail(fd) {
 }
 
 // fleet #450: a crash mid-append leaves a tail; a whole row keeps its line (newline added), a fragment is cut so the new row does not glue onto it.
-function appendLedgerRow(file, row) {
+// `p` is set for the Work record's own wake outbox (#447 follow-up): the lock is checked before the row is appended.
+function appendLedgerRow(file, row, p) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   let prefix = '';
   if (fs.existsSync(file)) {
     const fd = fs.openSync(file, 'r+');
-    try { prefix = settleTail(fd); } finally { fs.closeSync(fd); }
+    try { prefix = settleTail(fd, p); } finally { fs.closeSync(fd); }
   }
+  if (p) assertLockHeld(p);
   fs.appendFileSync(file, `${prefix}${row}\n`, 'utf8');
 }
 
+// #447 follow-up: the lock is checked first and the slot second, so an event the breaker's recovery appended while
+// this holder was frozen is seen as a replay. Nothing sits between the slot check and the append.
 function appendEvent(p, event) {
-  if (checkEventSlot(p, event)) return;
-  assertLockHeld(p);
   fs.mkdirSync(path.dirname(eventFile(p, event.at)), { recursive: true });
+  assertLockHeld(p);
+  if (checkEventSlot(p, event)) return;
   fs.appendFileSync(eventFile(p, event.at), `${JSON.stringify(event)}\n`, 'utf8');
 }
 
@@ -490,6 +507,8 @@ function recordEventFiles(p, record) {
   }))];
 }
 
+// The early assert stops the work before the full-ledger read in recordEventFiles; the lock is checked again late,
+// inside writeAtomicJson, after that read.
 function archiveRecord(p, record) {
   assertLockHeld(p);
   writeAtomicJson(archiveFile(p, record.id), {
@@ -497,7 +516,7 @@ function archiveRecord(p, record) {
     archivedAt: record.updatedAt,
     record,
     eventFiles: recordEventFiles(p, record),
-  });
+  }, p);
   cleanupEphemeral(p, record);
 }
 
@@ -508,7 +527,7 @@ function storeReleasedRecord(p, record) {
     releasedAt: record.updatedAt,
     record,
     eventFiles: recordEventFiles(p, record),
-  });
+  }, p);
   cleanupEphemeral(p, record);
 }
 
@@ -519,7 +538,7 @@ function storeAbandonedRecord(p, record) {
     abandonedAt: record.updatedAt,
     record,
     eventFiles: recordEventFiles(p, record),
-  });
+  }, p);
   cleanupEphemeral(p, record);
 }
 
@@ -652,16 +671,16 @@ function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archive
   checkEventSlot(p, event);
   assertLockHeld(p);
   const journalPath = pendingFile(p, recordId, event.idempotencyKey);
-  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable });
+  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable }, p);
   if (killPoint === 'after-journal') throw new WorkStateError('KILL_POINT', 'stopped after journal write');
   const active = activeState(p);
   if (afterRecord === null) delete active.records[recordId];
   else active.records[recordId] = afterRecord;
-  // #447 follow-up: lost before the record write, the journal is this call's only write, so it goes with the refusal.
-  try { assertLockHeld(p); } catch (error) { fs.rmSync(journalPath, { force: true }); throw error; }
+  // #447 follow-up: a loss from here on leaves the journal in place. The next holder's recovery completes the
+  // mutation, so the caller's same-key retry replays it rather than writing twice.
+  assertLockHeld(p);
   saveActive(p, active);
   if (killPoint === 'after-record') throw new WorkStateError('KILL_POINT', 'stopped after record replacement');
-  // Lost after the record write, the journal stays: the next holder's recovery completes this event.
   appendEvent(p, event);
   if (killPoint === 'after-event') throw new WorkStateError('KILL_POINT', 'stopped after event append');
   if (supersedeReusable) preserveReusableSnapshot(p, supersedeReusable);
@@ -1464,7 +1483,7 @@ function appendWakeOutbox({ root, p, recordId, revision, eventSequence, wake, id
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
   const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), ...(from ? { from, to } : {}), ...(raisedBy ? { raisedBy } : {}), evidence: text };
-  appendLedgerRow(file, JSON.stringify(line));
+  appendLedgerRow(file, JSON.stringify(line), p);
   return true;
 }
 
@@ -1692,7 +1711,7 @@ function projectStatus(options = {}) {
         throw new WorkStateError('OUTPUT_NOT_GENERATED', `refusing to overwrite ${output}: not a file this projection generated (it does not start with ${JSON.stringify(STATUS_MARKER)})`, { output });
       }
       assertLockHeld(p);
-      writeAtomicText(output, content);
+      writeAtomicText(output, content, p);
     }
     return { output, content };
   });
