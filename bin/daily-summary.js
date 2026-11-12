@@ -17,7 +17,7 @@ const workState = require('./work-state');
 const { foldLedger } = require('./digest');
 const { pageSender } = require('./notify');
 const { headlineOf, latestScorecard } = require('./weekly-scorecard');
-const { runStalePremiseNotice, runLeadHoldNotice, readLedger, projectTriage, ARBITER_KINDS } = require('./triage');
+const { runStalePremiseNotice, runLeadHoldNotice, readLedger, readOpenIssues, projectTriage, ARBITER_KINDS } = require('./triage');
 const { centralClock, scanTenants, standingSuspensions } = require('./bounded-authority');
 const { plannerInputs, vetoWindow } = require('./assignment');
 
@@ -193,7 +193,8 @@ function proposalLines({ root, now }) {
       // ADR 0017: while the Arbiter is live a proposal waits on its verdict, not on Cory; only one the
       // Arbiter escalated is his. Without the Arbiter every pending proposal waits on his Approval.
       const arbiterLive = fs.existsSync(path.join(base, 'state', 'flags', 'arbiter-live'));
-      const pending = projectTriage({ entries: readLedger(base, tenant), now: new Date(nowMs).toISOString() }).pending
+      // #451: a proposal on an issue the Watchdog's last read shows closed is not listed (readOpenIssues: no read, no drop).
+      const pending = projectTriage({ entries: readLedger(base, tenant), now: new Date(nowMs).toISOString(), openIssues: readOpenIssues(base, tenant) }).pending
         .filter((row) => !arbiterLive || row.escalated)
         .sort((a, b) => String(a.since).localeCompare(String(b.since)));
       // Send-FleetPage cuts a body at 1024 characters: the line names at most MAX_ROWS issues.

@@ -244,6 +244,24 @@ test('#143: the Triage section counts open ready tickets without a Premises sect
   assert.equal(line, '- endzone: 2 of 10 open ready-for-agent ticket(s) without `## Premises` (#1440, #1441); malformed: #1609 (census 2026-09-24T07:45:00.000Z).');
 });
 
+// #451: the Triage section leaves out a proposal on a closed issue, against the Watchdog's last open-issue read, and says when that read was.
+test('#451: the Triage section leaves out a proposal on a closed issue, and stamps the read it used', () => {
+  const root = rootDir();
+  const { recordEntry } = require('../bin/triage');
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 12, bodyHash: 'h', commentUrl: 'https://x/12', model: 'fable', now: '2026-09-20T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 13, bodyHash: 'h', commentUrl: 'https://x/13', model: 'fable', now: '2026-09-23T00:00:00.000Z' });
+  const triageSection = () => section(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content, 'Triage (advisory Principal, ADR 0011)');
+  assert.match(triageSection(), /^- endzone: 2 proposal\(s\) awaiting approval, 0 approved awaiting finalizing, 2 proposed in all;/m);
+  fs.mkdirSync(path.join(root, 'state', 'watchdog'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'watchdog', 'triage-frontier.json'), JSON.stringify({
+    at: '2026-09-24T07:45:00.000Z', tenants: [{ tenant: 'endzone', skipped: [{ number: 13, reason: 'awaiting approval' }], eligible: [] }],
+  }));
+  const content = triageSection();
+  assert.match(content, /^- endzone: 1 proposal\(s\) awaiting approval, 0 approved awaiting finalizing, 2 proposed in all;.*; open issues read 2026-09-24T07:45:00\.000Z, closed ones left out\.$/m);
+  assert.match(content, /^  - #13 proposed 2026-09-23T00:00:00\.000Z - https:\/\/x\/13$/m);
+  assert.doesNotMatch(content, /#12 proposed/);
+});
+
 // Spec fleet #92 / #148: 30 days of stale-premise restatements, counted by verdict
 // on the tenant's Triage line and listed in a table; the revisit notice's state.
 test('#148: the Triage section tables stale-premise restatements and counts them by verdict', () => {

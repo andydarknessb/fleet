@@ -430,8 +430,10 @@ function staleRows(entries) {
 
 // ------------------------------------------------------------ projection ----
 
-function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
+function projectTriage({ entries = [], now, windowDays, graduation, openIssues = null } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  // #451: a proposal on an issue absent from the open set is closed when it predates the read; one proposed after the read stays.
+  const stillOpen = (row) => !openIssues || openIssues.numbers.has(row.issue) || !(Date.parse(row.proposed.at) < Date.parse(openIssues.at));
   const window = Number(windowDays) > 0 ? Number(windowDays) : DEFAULT_CONFIG.windowDays;
   const rule = { ...DEFAULT_CONFIG.graduation, ...(graduation || {}) };
   const sorted = [...entries].filter((entry) => entry && entry.kind).sort((left, right) => String(left.at).localeCompare(String(right.at)));
@@ -462,8 +464,8 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     else if (entry.kind === 'finalized') { if (row.outcome) row.finalized = entry; }
   }
   const rows = Object.values(byIssue).sort((left, right) => left.issue - right.issue);
-  const pending = rows.filter((row) => row.proposed && (!row.outcome || row.outcome.kind === 'escalated')).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model, ...(row.outcome ? { escalated: true } : {}), ...(row.returned ? { returned: true } : {}) }));
-  const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits', 'endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
+  const pending = rows.filter((row) => row.proposed && (!row.outcome || row.outcome.kind === 'escalated') && stillOpen(row)).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model, ...(row.outcome ? { escalated: true } : {}), ...(row.returned ? { returned: true } : {}) }));
+  const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits', 'endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized && stillOpen(row)).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
   // Spec fleet #92 (#145): proposed at one hash, finalized at another. The finalize
   // edit is expected (a restated premise), not "body changed since the proposal".
   const restated = rows.filter((row) => row.finalized && row.finalized.bodyHash && row.proposed && row.finalized.bodyHash !== row.proposed.bodyHash).map((row) => ({ issue: row.issue, proposedBodyHash: row.proposed.bodyHash, finalizedBodyHash: row.finalized.bodyHash, finalizedAt: row.finalized.at }));
@@ -498,6 +500,19 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     met: allTime.decided >= rule.minProposals && spanDays >= rule.minDays && allTime.unchangedRatio !== null && allTime.unchangedRatio >= rule.minUnchangedRatio,
   };
   return { at, windowDays: window, byIssue, pending, awaitingFinalize, restated, stalePremise: { days: STALE_NOTICE_DAYS, rows: staleWindow, counts: staleCounts }, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
+}
+
+// #451: a tenant's open issues as its last Watchdog tick read them, from state/watchdog/triage-frontier.json (rewritten every tick).
+// Each tenant entry classifies every open issue the frontier read, as skipped or eligible, so those numbers are the open set. `at` is
+// the tick's start, which precedes every tenant's read: an earlier bound, so an issue opened after the read is never dropped.
+// Null when the file, the tenant's entry or its arrays are missing, unreadable or errored: the caller then counts everything, as before.
+function readOpenIssues(root, tenant) {
+  let shadow = null;
+  try { shadow = readJsonFile(path.join(baseOf(root), 'state', 'watchdog', 'triage-frontier.json'), null); } catch { return null; }
+  const entry = shadow && Array.isArray(shadow.tenants) ? shadow.tenants.find((row) => row && row.tenant === String(tenant)) : null;
+  const at = shadow ? Date.parse(shadow.at) : NaN;
+  if (!entry || entry.error || !Number.isFinite(at) || !Array.isArray(entry.skipped) || !Array.isArray(entry.eligible)) return null;
+  return { at: new Date(at).toISOString(), numbers: new Set([...entry.skipped, ...entry.eligible].map((row) => Number(row && row.number))) };
 }
 
 // --------------------------------------------------------------- GitHub ----
@@ -1603,7 +1618,7 @@ function cli(argv) {
   if (command === 'finalize') return finalizeApprovals({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
   const config = readTriageConfig(args.root);
-  const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation });
+  const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation, openIssues: readOpenIssues(args.root, tenant) });
   const { byIssue, ...summary } = projection;
   return { tenant, ...summary };
 }
@@ -1657,6 +1672,7 @@ module.exports = {
   readFixtureIssues,
   readHeldIssues,
   readLedger,
+  readOpenIssues,
   readOutbox,
   readTenantConfig,
   readTriageConfig,

@@ -250,6 +250,56 @@ test('the projection reports pending, awaiting-finalize, the window ratio and th
   assert.equal(notYet.graduation.met, false);
 });
 
+// #451: a proposal on an issue the Watchdog's last open-issue read does not show is closed, and leaves the pending and
+// awaiting-finalize counts when the proposal predates that read. One opened after the read stays. No open set: as before.
+test('#451: pending and awaiting-finalize leave out a closed issue older than the read, and keep one opened after it', () => {
+  const entries = [
+    { kind: 'proposed', issue: 1, at: '2026-09-10T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u1', model: 'fable' },
+    { kind: 'proposed', issue: 2, at: '2026-09-10T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u2', model: 'fable' },
+    { kind: 'proposed', issue: 3, at: '2026-09-13T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u3', model: 'fable' },
+    { kind: 'proposed', issue: 4, at: '2026-09-10T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u4', model: 'fable' },
+    { kind: 'approved', issue: 4, at: '2026-09-10T01:00:00.000Z', by: OWNER },
+  ];
+  const openIssues = { at: '2026-09-12T00:00:00.000Z', numbers: new Set([2]) };
+  const open = projectTriage({ entries, now: NOW, openIssues });
+  assert.deepEqual(open.pending.map((row) => row.issue), [2, 3]);
+  assert.deepEqual(open.awaitingFinalize, [], 'the approved closed issue is not awaiting finalizing');
+  const counted = projectTriage({ entries, now: NOW });
+  assert.deepEqual(counted.pending.map((row) => row.issue), [1, 2, 3], 'with no open set nothing is left out');
+  assert.deepEqual(counted.awaitingFinalize.map((row) => row.issue), [4]);
+});
+
+// #451: the open set is the Watchdog's last read, from state/watchdog/triage-frontier.json. Every issue the frontier classified is
+// open (skipped or eligible). A missing file, a missing or errored tenant entry or an unreadable file gives no open set at all.
+test('#451: readOpenIssues reads the open issues of a tenant from the Watchdog shadow, and gives none when the shadow cannot say', () => {
+  const root = rootDir();
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'no file');
+  const shadow = path.join(root, 'state', 'watchdog', 'triage-frontier.json');
+  fs.mkdirSync(path.dirname(shadow), { recursive: true });
+  const write = (body) => fs.writeFileSync(shadow, typeof body === 'string' ? body : JSON.stringify(body));
+  write('{ not json');
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'a torn file');
+  write({ at: '2026-09-12T07:45:00.1234567Z', tenants: [{ tenant: 'endzone', error: 'triage.js timed out' }, { tenant: 'nidus', skipped: [], eligible: [] }] });
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'an errored entry');
+  write({ at: '2026-09-12T07:45:00.1234567Z', tenants: [{ tenant: 'endzone', premises: { ready: 1, missing: [], malformed: [] } }] });
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'an entry with no classification');
+  assert.equal(triage.readOpenIssues(root, 'missing'), null, 'no entry for the tenant');
+  write({ at: '2026-09-12T07:45:00.1234567Z', tenants: [{ tenant: 'endzone', skipped: [{ number: 7, reason: 'held' }], eligible: [{ kind: 'ticket', number: 9, reason: 'unrouted' }] }] });
+  const read = triage.readOpenIssues(root, 'endzone');
+  assert.equal(read.at, '2026-09-12T07:45:00.123Z');
+  assert.deepEqual([...read.numbers].sort((a, b) => a - b), [7, 9]);
+});
+
+// #451: readOpenIssues takes the open set from the frontier's skipped and eligible lists, so every open issue must appear in one.
+test('#451: every open issue the frontier read is classified as skipped or eligible, so those numbers are the open set', () => {
+  const issues = [
+    issue(1, { labels: ['needs-triage'] }), issue(2, { labels: ['ready-for-agent'] }), issue(3, { labels: ['spec'] }),
+    issue(4, { assignees: [OWNER] }), issue(5, { openSubIssues: 1 }), issue(6, { labels: ['triage-proposed'] }),
+  ];
+  const result = frontier(issues);
+  assert.deepEqual([...result.eligible, ...result.skipped].map((row) => row.number).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6]);
+});
+
 test('computeFrontier fails closed on an unset owner login and on an unreadable GitHub; a fixture stands in for GitHub', () => {
   const noOwner = rootDir({ ownerLogin: '' });
   assert.throws(() => computeFrontier({ root: noOwner, tenant: 'endzone', fixture: writeFixture(noOwner, [issue(1)]), now: NOW }), { code: 'TENANT_OWNER_UNSET' });
