@@ -131,6 +131,8 @@ try {
   # a refused push to high, not fall through to 'normal'.
   # #113: a deploy refusal is normal priority (ADR 0013), whatever defaultPriority says.
   # fleet #149: busy-stale (a stale busy session no heal path can act on) is normal too.
+  # ticket 453: planner-failed (the frontier planner could not answer for a tenant) is normal: a Page, never a heal.
+  # ticket 453: triage-frontier-unreadable (the Principal's or Arbiter's triage frontier failed where its wake would act) is normal too.
   # fleet #136: watcher-stale is high: a dead PR watcher stalls every unit silently.
   # fleet #359: wake-failed (a wake whose rotate.ps1 outcome is failed: no live-roster entry, a replacement launch that failed) is high: a stopped control-plane session stalls its tenant.
   # fleet #274: sync-unattested (a release tip that only lacks the fleet-review status; normal, and held
@@ -142,7 +144,7 @@ try {
   # #197: fleet-dead is high (ADR 0012 as amended: a dead fleet costs throughput, not users);
   # its one repeat reads pages.fleetDeadRepeatPriority (default high; the shipped config sets emergency, #302) so it can return to
   # high or emergency by config alone. Dead-man silence stays emergency (config/cycle.json).
-  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'wake-failed' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal'; 'stall' = 'normal' }
+  $script:DefaultPagePriority = @{ 'fleet-dead' = 'high'; 'permission-wait' = 'high'; 'launch-retry' = 'high'; 'branch-diverged' = 'high'; 'sync-refused' = 'high'; 'sync-unattested' = 'normal'; 'sync-stalled' = 'normal'; 'sync-blocked' = 'high'; 'watcher-stale' = 'high'; 'wake-failed' = 'high'; 'human-wait' = 'normal'; 'deploy-refused' = 'normal'; 'busy-stale' = 'normal'; 'planner-failed' = 'normal'; 'triage-frontier-unreadable' = 'normal'; 'config-invalid' = 'normal'; 'orphan-late-session' = 'normal'; 'ic-dead-before-ack' = 'normal'; 'reservation-stranded' = 'normal'; 'respawn-loop' = 'normal'; 'respawn-loop-down' = 'high'; 'cleanup-pending' = 'normal'; 'ic-first-turn-stale' = 'normal'; 'stall' = 'normal' }
   function Get-PagePriority {
     param([string]$Kind, $PagesConfig)
     $map = @{}
@@ -340,7 +342,8 @@ try {
     elseif ($bounded.timedOut) { $plannerError = "assignment.js timed out after ${frontierTimeoutSec}s and was killed" }
     else {
       $frontier = ConvertFrom-LastJsonLine $bounded.stdout
-      if (-not $frontier) { $plannerError = "assignment.js returned no JSON: $(Get-OneLine $bounded.stdout 200)" }
+      # ticket 453: a refused or failed planner writes its error JSON to stderr, so the wake reason carries both streams.
+      if (-not $frontier) { $plannerError = "assignment.js returned no JSON: $(Get-OneLine "$($bounded.stdout) $($bounded.stderr)" 200)" }
       else {
         $eligible = @(); if ($frontier.PSObject.Properties['eligible']) { $eligible = @($frontier.eligible | ForEach-Object { [int]$_.number }) }
         if (-not $noSlot -and $eligible.Count -gt 0) { $result.evidence += "frontier #$($eligible -join ', #')"; $result.issues = $eligible }
@@ -648,8 +651,9 @@ try {
   # --- launch retry storms: newest-first consecutive 'failed' rows per fleet name,
   # --- counting only rows started inside the window (daemon history never expires,
   # --- and a week-old storm re-paging after Cory lifts its hold would fight the human).
+  # --- ticket 453: pe- and ar- sessions count here and in the permission waits below; the trip holds only ic- names.
   $windowStart = $now.AddHours(-$retryWindowHours)
-  $fleetPattern = '^(sentinel|pl-[a-z0-9-]+|ic-[0-9]+)$'
+  $fleetPattern = '^(sentinel|pl-[a-z0-9-]+|pe-[a-z0-9-]+|ar-[a-z0-9-]+|ic-[0-9]+)$'
   $retryTrips = @()
   foreach ($g in ($daemon | Where-Object { "$($_.name)" -match $fleetPattern } | Group-Object name)) {
     $rows = @($g.Group | ForEach-Object {
@@ -890,12 +894,14 @@ try {
     if (-not $respawnFailStateUnreadable) {
       if (-not $respawnFailState) { $respawnFailState = [pscustomobject]@{} }
       $respawnFailChanged = $false
-      foreach ($r in @($check.respawned)) {
+      # ticket 453: a launch the door refused with no session counts per name like a failed respawn. A PAUSE is a hold on purpose, not a refusal.
+      $launchRefusals = @($launches | Where-Object { -not $_.launched -and "$($_.reason)" -notlike 'PAUSE*' } | ForEach-Object { [pscustomobject]@{ name = $_.name; reason = $_.reason; launchRefused = $true } })
+      foreach ($r in @($check.respawned) + @($launches | Where-Object { $_.launched })) {
         $rn = "$($r.name)"
         if ($rn -and $respawnFailState.PSObject.Properties[$rn]) { $respawnFailState.PSObject.Properties.Remove($rn); $respawnFailChanged = $true }
       }
       $respawnFailWindowStart = $now.AddHours(-$retryWindowHours)
-      foreach ($rf in @($check.respawnFailed)) {
+      foreach ($rf in @($check.respawnFailed) + $launchRefusals) {
         $rn = "$($rf.name)"; if (-not $rn) { continue }
         $rfPrior = $null; if ($respawnFailState.PSObject.Properties[$rn]) { $rfPrior = $respawnFailState.$rn }
         $rfAttempts = @(); if ($rfPrior -and $rfPrior.PSObject.Properties['attempts']) { $rfAttempts = @($rfPrior.attempts | Where-Object { $_ }) }
@@ -903,7 +909,9 @@ try {
         $rfRecent += (Now-Iso)
         $respawnFailState | Add-Member -NotePropertyName $rn -NotePropertyValue ([pscustomobject]@{ attempts = @($rfRecent); lastReason = "$($rf.reason)" }) -Force
         $respawnFailChanged = $true
-        if ($rfRecent.Count -ge $retryCap) { $respawnFailTrips += [pscustomobject]@{ name = $rn; failures = $rfRecent.Count; reason = "$($rf.reason)" } }
+        $rfIsLaunch = [bool]$rf.PSObject.Properties['launchRefused']
+        if ($rfRecent.Count -ge $retryCap) { $respawnFailTrips += [pscustomobject]@{ name = $rn; failures = $rfRecent.Count; reason = "$($rf.reason)"; launchRefused = $rfIsLaunch } }
+        elseif ($rfIsLaunch) { $waiting += [pscustomobject]@{ name = $rn; kind = 'launch-refused'; detail = "launch refused with no session ($($rf.reason)); attempt $($rfRecent.Count)/$retryCap before this trips launch-retry" } }
         else { $waiting += [pscustomobject]@{ name = $rn; kind = 'respawn-failed'; detail = "no-op respawn ($($rf.reason)); attempt $($rfRecent.Count)/$retryCap before this trips launch-retry" } }
       }
       if ($respawnFailChanged) {
@@ -1113,6 +1121,13 @@ try {
   foreach ($sp in @($wakeState.stalls.PSObject.Properties)) { foreach ($stamp in @('deliveredAt', 'escalatedAt')) { if ($sp.Value -and $sp.Value.PSObject.Properties[$stamp] -and $sp.Value.$stamp -is [pscustomobject]) { $sp.Value.$stamp = $null } } }
   if ($null -eq $wakeState.PSObject.Properties['legacyHolds']) { $wakeState | Add-Member -NotePropertyName legacyHolds -NotePropertyValue ([pscustomobject]@{}) -Force }
   $wakeOff = Test-Path "$FleetHome\state\flags\frontier-wake-off"
+  # ticket 453 (ADR 0012): tenants whose planner (assignment.js frontier) failed and has not answered since. The wake block asks
+  # only for an idle lead, so an entry must outlive the ticks that do not ask. An unreadable file fails closed: never reset, never written.
+  $plannerFailedPath = "$FleetHome\state\watchdog\planner-failed.json"
+  $plannerFailed = $null; $plannerFailedUnreadable = $false
+  try { $plannerFailed = Read-Json $plannerFailedPath } catch { $plannerFailedUnreadable = $true }
+  if (-not $plannerFailed) { $plannerFailed = [pscustomobject]@{} }
+  $plannerFailedChanged = $false
   # fleet #346: an empty or lead-less roster is a read glitch (Save-LiveRoster is not atomic), never "every IC left": no stall evaluation or pruning on it.
   $rosterOk = [bool]($liveRoster -and @($liveRoster.sessions | Where-Object { $_.role -eq 'project-lead' -and $_.status -eq 'active' }).Count -gt 0)
   if ($mode -eq 'live' -and -not $Verify -and -not $paused) {
@@ -1182,6 +1197,14 @@ try {
       if ($wakeSources -contains 'frontier' -and $nodeExe) {
         $fw = Test-FrontierWaiting -TenantName $tenantName -Tenant $tenant -NodeExe $nodeExe -LiveRoster $liveRoster -LiveCount $liveCount -Cap $cap
         if ($fw.evidence.Count -gt 0) { $wake.evidence += $fw.evidence } elseif ($fw.reason) { $wake.reason = $fw.reason }
+        # ticket 453: a planner that could not answer is not "nothing to wake for". The reason names the error, and the tenant's
+        # planner-failed condition stands until a planner answer clears it. A no-slot reason is no answer and clears nothing (fleet #406).
+        if ($fw.error) {
+          $wake.reason = "planner failed: $($fw.error)"
+          $pfSince = (Now-Iso); if ($plannerFailed.PSObject.Properties[$tenantName]) { $pfSince = $plannerFailed.$tenantName.since }
+          $plannerFailed | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ since = $pfSince; error = "$($fw.error)" }) -Force
+          $plannerFailedChanged = $true
+        } elseif (-not $fw.reason -and $plannerFailed.PSObject.Properties[$tenantName]) { $plannerFailed.PSObject.Properties.Remove($tenantName); $plannerFailedChanged = $true }
       }
       # fleet #406: such a hold is evidence at most once per 24 hours; frontier-wake.json keeps the last delivered wake per hold.
       $dueHolds = @()
@@ -1278,6 +1301,8 @@ try {
       }
       $frontierWakes += [pscustomobject]$wake
     }
+    # ticket 453: persist the planner-failed entries this tick changed (never over an unreadable file).
+    if ($plannerFailedChanged -and -not $plannerFailedUnreadable) { try { $pfTmp = "$plannerFailedPath.tmp"; Write-Json $pfTmp $plannerFailed; Move-Item -Force $pfTmp $plannerFailedPath } catch {} }
     # A stall's outcome is its tenant's wake outcome unless it escalated this tick.
     foreach ($st in $stallLedger) {
       if ($st.outcome -eq 'escalated') { continue }
@@ -1434,7 +1459,8 @@ try {
       if (-not $principalLive) { $twake.decision = 'shadow'; $twake.reason = 'state/flags/principal-live absent: frontier recorded, nothing launched'; $triageWakes += [pscustomobject]$twake; continue }
       if ($mode -ne 'live') { $twake.reason = "supervision mode is $mode, not live"; $triageWakes += [pscustomobject]$twake; continue }
       if ($paused) { $twake.reason = 'PAUSE set'; $triageWakes += [pscustomobject]$twake; continue }
-      if ($twake.frontierError) { $twake.reason = 'frontier unreadable; waking nothing (fail closed)'; $triageWakes += [pscustomobject]$twake; continue }
+      # ticket 453 (#450 ruling): this tick's read is the state, since the frontier is read every tick. Raised only where the wake would have acted, so shadow and paused ticks page nothing.
+      if ($twake.frontierError) { $twake.reason = 'frontier unreadable; waking nothing (fail closed)'; $wakeConditions += [pscustomobject]@{ key = "triage-frontier-unreadable:principal:$tenantName"; kind = 'triage-frontier-unreadable'; detail = "the Principal's triage frontier for $tenantName is unreadable ($(Get-OneLine "$($twake.frontierError)" 200)); its triage wakes nothing for that Tenant until the frontier reads again"; url = $null }; $triageWakes += [pscustomobject]$twake; continue }
       if ($twake.evidence.Count -eq 0) { $twake.reason = 'nothing to wake for'; $triageWakes += [pscustomobject]$twake; continue }
       $principalTarget = Get-WakeTarget $daemon $principalName $busyQuietMinutes $now; $principalRow = if ($principalTarget) { $principalTarget.row }
       if (-not $principalRow) { $twake.reason = 'no running principal session (launchNeeded covers a missing one)'; $triageWakes += [pscustomobject]$twake; continue }
@@ -1523,7 +1549,8 @@ try {
       if (-not $arbiterLive) { $awake.decision = 'shadow'; $awake.reason = 'state/flags/arbiter-live absent: frontier recorded, nothing launched'; $arbiterWakes += [pscustomobject]$awake; continue }
       if ($mode -ne 'live') { $awake.reason = "supervision mode is $mode, not live"; $arbiterWakes += [pscustomobject]$awake; continue }
       if ($paused) { $awake.reason = 'PAUSE set'; $arbiterWakes += [pscustomobject]$awake; continue }
-      if ($awake.frontierError) { $awake.reason = 'frontier unreadable; waking nothing (fail closed)'; $arbiterWakes += [pscustomobject]$awake; continue }
+      # ticket 453 (#450 ruling): the same condition as the Principal's, raised only where the Arbiter's wake would have acted.
+      if ($awake.frontierError) { $awake.reason = 'frontier unreadable; waking nothing (fail closed)'; $wakeConditions += [pscustomobject]@{ key = "triage-frontier-unreadable:arbiter:$tenantName"; kind = 'triage-frontier-unreadable'; detail = "the Arbiter's triage frontier for $tenantName is unreadable ($(Get-OneLine "$($awake.frontierError)" 200)); its triage wakes nothing for that Tenant until the frontier reads again"; url = $null }; $arbiterWakes += [pscustomobject]$awake; continue }
       if ($awake.evidence.Count -eq 0) { $awake.reason = if ($aFrontier -and $aFrontier.suspended) { 'arbiter suspended (state/flags/arbiter-suspended); waking nothing' } else { 'nothing to wake for' }; $arbiterWakes += [pscustomobject]$awake; continue }
       $arbiterTarget = Get-WakeTarget $daemon $arbiterName $busyQuietMinutes $now; $arbiterRow = if ($arbiterTarget) { $arbiterTarget.row }
       if (-not $arbiterRow) { $awake.reason = 'no running arbiter session (launchNeeded covers a missing one)'; $arbiterWakes += [pscustomobject]$awake; continue }
@@ -1580,6 +1607,13 @@ try {
   }
   $conditions += $stallConditions
   $conditions += $wakeConditions  # fleet #359: the failed wakes above, one wake-failed:<session> each
+  # ticket 453: one planner-failed condition per tenant whose planner has not answered since. The tenant file must still exist,
+  # or the entry is a leftover no planner answer could ever clear.
+  if (-not $plannerFailedUnreadable) {
+    foreach ($pf in @($plannerFailed.PSObject.Properties | Where-Object { Test-Path "$FleetHome\tenants\$($_.Name).json" })) {
+      $conditions += [pscustomobject]@{ key = "planner-failed:$($pf.Name)"; kind = 'planner-failed'; detail = "the frontier planner (assignment.js) failed for $($pf.Name): $(Get-OneLine "$($pf.Value.error)" 200); no wake or launch sees that tenant's frontier until a planner answer clears this"; url = $null }
+    }
+  }
   foreach ($pw in $permissionWaits) {
     $pwDetail = "$($pw.name) (job $($pw.job)) has waited $($pw.waitMin) min on a permission prompt no one can answer in a --bg session: $($pw.needs). Stop it (claude stop $($pw.job)) and relaunch on a model the CLI runs in auto mode, or attach and answer (claude attach $($pw.job))"
     # Keyed by job, not name: a stale daemon row and its relaunch can share a name, and one
@@ -1643,7 +1677,9 @@ try {
   # respawn-failed.json tracking above, since a wedged 'working' daemon row never
   # shows up in the retryTrips scan this loop reads.
   foreach ($rft in $respawnFailTrips) {
-    $conditions += [pscustomobject]@{ key = "launch-retry:$($rft.name)"; kind = 'launch-retry'; detail = "$($rft.failures) consecutive respawn-failed results for $($rft.name) (latest: $($rft.reason)); a no-op respawn never changed the daemon pid"; url = $null }
+    $rftDetail = "$($rft.failures) consecutive respawn-failed results for $($rft.name) (latest: $($rft.reason)); a no-op respawn never changed the daemon pid"
+    if ($rft.launchRefused) { $rftDetail = "$($rft.failures) consecutive launch refusals of $($rft.name) with no session (latest: $($rft.reason)); the launch door refused before any session started" }
+    $conditions += [pscustomobject]@{ key = "launch-retry:$($rft.name)"; kind = 'launch-retry'; detail = $rftDetail; url = $null }
   }
   # Ticket 81 (ADR 0012): a date that has passed, in config or on a Notice, is
   # a condition of its own - normal priority, one page per key, cleared the
