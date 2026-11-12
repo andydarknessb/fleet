@@ -340,6 +340,27 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Assert-True (@(Get-LaunchCalls) -contains 'FromRoster=pl-test') 'the launch must go through -FromRoster'
   Assert-True (@($r10b.launches | Where-Object { $_.name -eq 'sentinel' }).Count -eq 0) 'the retired Sentinel must never be launched'
 
+  # Case 10b2 (ticket 453): a launch the door refuses before any session exists counts per name, like a
+  # failed respawn: the second refusal trips launch-retry and pages, and a successful launch of another
+  # name resets that name's count. The door is a mock for this case only (restored before the asserts).
+  $launchDoorOrig453 = Get-Content "$testRoot\bin\launch.ps1" -Raw
+  Write-Utf8 "$testRoot\bin\launch.ps1" ('param([string]$FromRoster, [string]$Reason)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\launch-calls.txt", "FromRoster=$FromRoster`n")' + "`r`n" + 'if ($FromRoster -eq "pl-test") { Write-Output (@{ launched = $false; reason = "mock refusal: the door refused pl-test" } | ConvertTo-Json -Compress); exit 3 }' + "`r`n" + 'Write-Output (@{ launched = $true; name = $FromRoster; jobId = "job-new-$FromRoster" } | ConvertTo-Json -Compress)' + "`r`n" + 'exit 0' + "`r`n")
+  $seedAt453 = (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o')
+  Write-Utf8 "$testRoot\state\watchdog\respawn-failed.json" ('{"pl-test":{"attempts":["' + $seedAt453 + '"],"lastReason":"seed"},"dispatcher":{"attempts":["' + $seedAt453 + '"],"lastReason":"seed"}}')
+  # An unrelated daemon row keeps the list non-empty (an empty read is a glitch) without making either static look running.
+  Set-AgentsRows ('[{"id":"job-other","name":"unrelated-tool","state":"working","status":"idle","pid":77,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-1)) + '}]')
+  $r10b2 = Run-Watchdog
+  Write-Utf8 "$testRoot\bin\launch.ps1" $launchDoorOrig453
+  $rf453 = (Get-Content "$testRoot\state\watchdog\respawn-failed.json" -Raw) | ConvertFrom-Json
+  Assert-True (@($r10b2.launches | Where-Object { $_.name -eq 'pl-test' -and $_.launched -eq $false -and $_.reason -match 'mock refusal' }).Count -eq 1) 'the refusal must reach the shadow line with the door reason'
+  Assert-True (@($r10b2.conditions) -contains 'launch-retry:pl-test') 'a refusal with no session must trip the launch-retry cap'
+  Assert-True ((Get-PagedKeys $r10b2.newlyPaged) -contains 'launch-retry:pl-test') 'the refusal trip must page once'
+  Assert-True (@($rf453.'pl-test'.attempts).Count -eq 2) 'the refusal must join the per-name count the seed started'
+  Assert-True (@($r10b2.launches | Where-Object { $_.name -eq 'dispatcher' -and $_.launched -eq $true }).Count -eq 1) 'the successful launch must go through the door'
+  Assert-True (-not $rf453.PSObject.Properties['dispatcher']) 'a successful launch must reset that name count, as a successful respawn does'
+  Set-AgentsRows "[$dispRow]"
+  Remove-Item "$testRoot\state\watchdog\respawn-failed.json", "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
+
   # Case 10c: PAUSE launches nothing, and the run still applies (how a rate-limit PAUSE clears).
   Write-Utf8 "$testRoot\state\PAUSE" 'reason=test; setAt=now; until='
   $callsBefore = @(Get-LaunchCalls).Count
@@ -958,7 +979,69 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
 
+  # ===== Ticket 453: a planner that cannot answer pages its tenant, a triage frontier that cannot be read pages its =====
+  # ===== tenant, and a Principal or an Arbiter on a permission prompt pages as a lead or an IC does =====
+  # Case W9 (453): on a shim that fails every node call, the wake block's planner call fails for tenant test (the wake
+  # reason names the error; planner-failed:test pages at normal priority), and the Principal's and Arbiter's triage
+  # frontiers are unreadable for tenant other, so each pages at normal priority and names the error. One tick, two tenants.
+  Write-Utf8 "$testRoot\mock-bin\broken-node.cmd" ('@echo off' + "`r`n" + 'echo boom-planner' + "`r`n" + 'echo gh-denied 1>&2' + "`r`n" + 'exit /b 1' + "`r`n")
+  Write-Utf8 "$testRoot\tenants\other.json" '{"name":"other","github":"owner/other","readyLabel":"ready-for-agent","maxIcs":2,"ownerLogin":"cory-owner"}'
+  Write-Utf8 "$testRoot\state\flags\dormancy-off" 'x'
+  Write-Utf8 "$testRoot\state\flags\principal-live" 'x'
+  Write-Utf8 "$testRoot\state\flags\arbiter-live" 'x'
+  Remove-Item "$testRoot\state\watchdog\planner-failed.json", "$testRoot\state\watchdog\frontier-wake.json" -ErrorAction SilentlyContinue
+  Set-AgentsRows $idleLeadRows
+  foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
+  $env:FLEET_NODE_PATH = "$testRoot\mock-bin\broken-node.cmd"
+  $w9 = Run-Watchdog
+  Remove-Item Env:FLEET_NODE_PATH
+  $w9Wake = @($w9.frontierWakes | Where-Object { $_.tenant -eq 'test' })[0]
+  Assert-True ("$($w9Wake.reason)" -match 'planner failed: .*boom-planner.*gh-denied') "a planner failure must be the wake reason, not nothing to wake for (got: $($w9Wake.reason))"
+  Assert-True (@($w9.conditions) -contains 'planner-failed:test') 'a planner failure must raise the tenant planner-failed condition'
+  $w9Entry = @($w9.newlyPaged | Where-Object { $_.key -eq 'planner-failed:test' })[0]
+  Assert-True ($null -ne $w9Entry -and $w9Entry.priority -eq 'normal') 'planner-failed must page once at normal priority'
+  $w9Principal = @($w9.triageWakes | Where-Object { $_.tenant -eq 'other' })[0]
+  Assert-True ($w9Principal.reason -match 'frontier unreadable' -and "$($w9Principal.frontierError)" -match 'boom-planner') "an unreadable Principal frontier must fail closed and say why (got: $($w9Principal.reason); error=$($w9Principal.frontierError))"
+  $w9Arbiter = @($w9.arbiterWakes | Where-Object { $_.tenant -eq 'other' })[0]
+  Assert-True ($w9Arbiter.reason -match 'frontier unreadable') "an unreadable Arbiter frontier must fail closed (got: $($w9Arbiter.reason))"
+  Assert-True (@($w9.conditions) -contains 'triage-frontier-unreadable:principal:other' -and @($w9.conditions) -contains 'triage-frontier-unreadable:arbiter:other') 'an unreadable triage frontier must raise its tenant condition, per role'
+  $w9TriageEntry = @($w9.newlyPaged | Where-Object { $_.key -eq 'triage-frontier-unreadable:principal:other' })[0]
+  Assert-True ($null -ne $w9TriageEntry -and $w9TriageEntry.priority -eq 'normal') 'an unreadable triage frontier must page once at normal priority'
+  $w9Banner = Get-Content "$testRoot\state\watchdog\banner.txt" -Raw
+  Assert-True ($w9Banner -match 'triage-frontier-unreadable:principal:other: .*other.*boom-planner') 'the unreadable-frontier page must name its tenant and carry the error'
+  Assert-True ($w9Banner -match 'planner-failed:test: .*gh-denied') 'the planner-failed page must carry the error text'
+
+  # Case W10 (453): a planner answer clears the tenant's planner-failed condition, and triage frontiers that read again clear
+  # theirs (the empty triage fixture leaves nothing to wake for). A Principal and an Arbiter stuck on a permission prompt page at high.
+  $empty453 = "$testRoot\issues-453-empty.json"
+  Write-Utf8 $empty453 '[]'
+  $env:FLEET_GITHUB_ISSUES_FIXTURE = $empty453
+  $env:FLEET_TRIAGE_ISSUES_FIXTURE = $empty453
+  $promptAt453 = (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o')
+  $peRow453 = '{"id":"job-pe453","name":"pe-test","state":"working","status":"idle","pid":21,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-2)) + '}'
+  $arRow453 = '{"id":"job-ar453","name":"ar-test","state":"working","status":"idle","pid":22,"startedAt":' + (Get-EpochMs (Get-Date).AddHours(-2)) + '}'
+  foreach ($jobId453 in 'job-pe453', 'job-ar453') {
+    [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\$jobId453") | Out-Null
+    Write-Utf8 "$testRoot\profile\.claude\jobs\$jobId453\state.json" ('{"needs":"approve Read: a file","updatedAt":"' + $promptAt453 + '"}')
+  }
+  Set-AgentsRows ($idleLeadRows.TrimEnd(']') + ',' + $peRow453 + ',' + $arRow453 + ']')
+  foreach ($n in 'pe-test','ar-test') { Set-Heartbeat $n 5 }
+  $w10 = Run-Watchdog
   Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE
+  Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE
+  Assert-True (-not (@($w10.conditions) -contains 'planner-failed:test')) 'a planner answer must clear the planner-failed condition'
+  $pfAfter453 = (Get-Content "$testRoot\state\watchdog\planner-failed.json" -Raw) | ConvertFrom-Json
+  Assert-True (-not ($pfAfter453.PSObject.Properties.Name -contains 'test')) 'a planner answer must drop the tenant from planner-failed.json'
+  Assert-True (@($w10.conditions | Where-Object { "$_" -like 'triage-frontier-unreadable:*' }).Count -eq 0) 'a triage frontier that reads again must clear its conditions'
+  Assert-True (@($w10.conditions) -contains 'permission-wait:pe-test:job-pe453') 'a Principal stuck on a permission prompt must raise permission-wait'
+  Assert-True (@($w10.conditions) -contains 'permission-wait:ar-test:job-ar453') 'an Arbiter stuck on a permission prompt must raise permission-wait'
+  $pe10Entry = @($w10.newlyPaged | Where-Object { $_.key -eq 'permission-wait:pe-test:job-pe453' })[0]
+  Assert-True ($null -ne $pe10Entry -and $pe10Entry.priority -eq 'high') 'a Principal permission-wait pages at high, as an IC does'
+  Assert-True (@(@($w10.launches) + @($w10.healed) | Where-Object { "$($_.name)" -match '^(pe|ar)-' }).Count -eq 0) 'a Principal or Arbiter on a prompt is never launched, respawned or healed'
+  Remove-Item $empty453, "$testRoot\mock-bin\broken-node.cmd", "$testRoot\tenants\other.json", "$testRoot\state\flags\dormancy-off", "$testRoot\state\flags\principal-live", "$testRoot\state\flags\arbiter-live" -ErrorAction SilentlyContinue
+  Remove-Item "$testRoot\profile\.claude\jobs\job-pe453", "$testRoot\profile\.claude\jobs\job-ar453" -Recurse -Force -ErrorAction SilentlyContinue
+  Set-AgentsRows $idleLeadRows
+  Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   foreach ($n in 'dispatcher','pl-test') { Set-Heartbeat $n 5 }
 
   # ===== Ticket 84: heal a blocked, stale session when work is waiting =====
@@ -1561,6 +1644,11 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $tw6 = @($t6.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ("$($tw6.frontierError)" -ne '' -and $tw6.decision -eq 'none' -and $tw6.reason -match 'fail closed') "an unreadable frontier must fail closed (got $($tw6.decision): $($tw6.reason); error=$($tw6.frontierError))"
   Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6) 'an unreadable frontier must not rotate'
+  # ticket 453: the same tick pages the Principal's unreadable frontier at normal priority, naming the tenant and the error.
+  Assert-True (@($t6.conditions) -contains 'triage-frontier-unreadable:principal:test') 'an unreadable Principal frontier must raise its tenant condition'
+  $t6Entry = @($t6.newlyPaged | Where-Object { $_.key -eq 'triage-frontier-unreadable:principal:test' })[0]
+  Assert-True ($null -ne $t6Entry -and $t6Entry.priority -eq 'normal') 'an unreadable Principal frontier must page at normal priority'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'triage-frontier-unreadable:principal:test: .*test.*triage\.js') 'the Principal page must name the tenant and carry the triage error'
   Assert-True ("$($tw6.finalize.error)" -match 'did not complete') "the failed tick must be recorded as the finalize error (got $(($tw6.finalize | ConvertTo-Json -Compress -Depth 4)))"
   $env:FLEET_TRIAGE_ISSUES_FIXTURE = $triageFixture
 
@@ -1710,6 +1798,9 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\watchdog\paged.json" -ErrorAction SilentlyContinue
   Remove-Item "$testRoot\state\watchdog\banner.txt" -ErrorAction SilentlyContinue
 
+  # ticket 453: the T-series and Arbiter ticks above keep pl-test idle after the GitHub fixture is removed, so their planner
+  # call fails on this host and stands as planner-failed. Clear it before any Pushover post is counted below.
+  Remove-Item "$testRoot\state\watchdog\planner-failed.json" -ErrorAction SilentlyContinue
   $pushLog = Join-Path $testRoot 'pushover-requests.log'
   [IO.File]::WriteAllText($pushLog, '')
   $pushMock = Start-MockPushover -LogPath $pushLog -Count 10
