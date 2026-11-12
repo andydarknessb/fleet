@@ -25,6 +25,8 @@
 //                 FLEET_NAME (fleet#46). Every SHA it is given is resolved
 //                 against the tenant repo before anything is written: an
 //                 object git does not know is refused UNKNOWN_COMMIT (fleet#67).
+//                 A head is a full 40-character sha (#445), and a formal review
+//                 classifies its head itself rather than trusting the caller's.
 //   plan-rereview a revision re-review inspects the changed range and the
 //                 unresolved findings, never the settled material.
 //   hold          a clean carve-out (or any PR requiring Cory) parks in the
@@ -94,6 +96,46 @@ function matchGlob(glob, filePath) {
 
 // --- classification ---
 
+// git C-quotes a name that holds a quote, a backslash, a control character or a non-ASCII byte; an octal
+// escape is one UTF-8 byte (#445).
+const GIT_ESCAPES = Object.freeze({ a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 });
+
+function unquoteGitPath(name) {
+  if (!name.startsWith('"')) return name;
+  const bytes = [];
+  for (let i = 1; i < name.length - 1; i += 1) {
+    if (name[i] !== '\\') { bytes.push(name.charCodeAt(i)); continue; }
+    const octal = name.slice(i + 1, i + 4);
+    if (/^[0-7]{3}$/.test(octal)) { bytes.push(parseInt(octal, 8)); i += 3; } else { bytes.push(GIT_ESCAPES[name[i + 1]]); i += 1; }
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+// The two names on a `diff --git a/<p> b/<q>` line. A raw name may hold spaces, so the split is the one that
+// leaves an a/ side and a b/ side, and equal names (a change that is not a rename) win over the rest.
+function diffHeaderNames(line) {
+  const rest = line.slice('diff --git '.length);
+  const splits = [];
+  for (let at = rest.indexOf(' '); at !== -1; at = rest.indexOf(' ', at + 1)) {
+    const left = unquoteGitPath(rest.slice(0, at));
+    const right = unquoteGitPath(rest.slice(at + 1));
+    if (left.startsWith('a/') && right.startsWith('b/')) splits.push([left.slice(2), right.slice(2)]);
+  }
+  return splits.find(([left, right]) => left === right) || splits[0] || [];
+}
+
+// The paths a diff names, for a classification made from the diff alone: each `diff --git` header, and the
+// `rename from` / `rename to` lines when the diff was made with renames on (#445).
+function pathsFromDiff(diffText) {
+  const paths = new Set();
+  for (const line of String(diffText || '').split(/\r?\n/)) {
+    if (line.startsWith('diff --git ')) diffHeaderNames(line).forEach((name) => paths.add(name));
+    else if (line.startsWith('rename from ')) paths.add(unquoteGitPath(line.slice('rename from '.length)));
+    else if (line.startsWith('rename to ')) paths.add(unquoteGitPath(line.slice('rename to '.length)));
+  }
+  return [...paths];
+}
+
 function parseDiff(diffText) {
   const addedByFile = new Map();
   let currentFile = null;
@@ -101,7 +143,7 @@ function parseDiff(diffText) {
   for (const line of String(diffText || '').split(/\r?\n/)) {
     if (line.startsWith('+++ ')) {
       const named = line.slice(4).trim();
-      currentFile = named === '/dev/null' ? null : named.replace(/^b\//, '');
+      currentFile = named === '/dev/null' ? null : unquoteGitPath(named).replace(/^b\//, '');
       if (currentFile && !addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
       continue;
     }
@@ -157,7 +199,9 @@ function classifyChange(options = {}) {
   const tenant = options.tenant || {};
   const config = { ...DEFAULT_REVIEW_CONFIG, ...(options.config?.review || options.config || {}) };
   const excludeGlobs = config.patternExcludePaths || [];
-  const files = (options.files || []).map((file) => String(file).replace(/\\/g, '/'));
+  // A diff names its own paths: from the diff alone the file list is the diff's, and a list given with a diff is
+  // widened by it, so a Carve-out the diff touches is never missed (#445).
+  const files = [...new Set([...(options.files || []), ...pathsFromDiff(options.diffText)].map((file) => String(file).replace(/\\/g, '/')))];
   const parsed = options.diffText !== undefined ? parseDiff(options.diffText) : null;
   let addedByFile = parsed ? parsed.addedByFile : new Map();
   if (options.addedLines) {
@@ -203,9 +247,10 @@ function classifyFromGit(options = {}) {
   const { repoPath, baseRef, tenant, config } = options;
   const headRef = options.headRef || 'HEAD';
   if (!repoPath || !baseRef) throw new ReviewPolicyError('USAGE', 'repoPath and baseRef are required');
-  const git = (args) => gitInRepo(repoPath, args);
-  // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01).
-  const files = git(['diff', '--name-only', `${baseRef}...${headRef}`]).split(/\r?\n/).filter(Boolean);
+  const git = (args) => (options.git ? options.git(args, repoPath) : gitInRepo(repoPath, args));
+  // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01). --no-renames -z: a moved file lists
+  // both its paths, and a non-ASCII name arrives as written rather than C-quoted (#445).
+  const files = git(['diff', '--name-only', '--no-renames', '-z', `${baseRef}...${headRef}`]).split('\0').filter(Boolean);
   const diffText = git(['diff', `${baseRef}...${headRef}`]);
   const headSha = git(['rev-parse', headRef]).trim();
   return { headSha, classification: classifyChange({ files, diffText, tenant, config }) };
@@ -396,6 +441,26 @@ function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) 
   return repo;
 }
 
+// #445: a review is recorded at a full sha. A branch name, a relative ref (HEAD, HEAD~1) or a short sha names no
+// commit that stays put, and is refused rather than resolved for the caller.
+function requireFullSha(sha, flag) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha))) {
+    throw new ReviewPolicyError('FULL_SHA_REQUIRED', `${flag} ${sha} is not a full sha: a full 40-character sha is needed, so a branch name, a relative ref like HEAD~1 or a short sha is refused (#445)`, { flag, sha: String(sha) });
+  }
+}
+
+// #445: a formal review's classification is the head's own, computed against the tenant's defaultBranch: the base
+// the IC's `classify --base origin/<defaultBranch>` runs against (ic.md step 5). A passed one never decides.
+function classificationAt({ root, tenant, recordId, record, repo, headSha, git }) {
+  const config = tenant || tenantFor(root, record.tenant || String(recordId).split(':')[0]);
+  if (!config || !config.defaultBranch) {
+    throw new ReviewPolicyError('TENANT_BASE_UNKNOWN', `cannot classify ${headSha} against the tenant's defaultBranch: ${config ? `tenant ${config.name || ''} names none` : 'no tenant file'}; a formal review records the head's own classification (#445)`, { headSha: String(headSha) });
+  }
+  const run = git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args);
+  try { run(['fetch', '--quiet', 'origin', String(config.defaultBranch)]); } catch { /* offline: the base may still be local */ }
+  return classifyFromGit({ repoPath: repo, baseRef: `origin/${config.defaultBranch}`, headRef: headSha, tenant: config, config: loadConfig(root), git }).classification;
+}
+
 // --- #115: the fleet-review commit status (ADR 0014) ------------------------
 // "No merge without a recorded formal review" lived in the lead's role file,
 // and pr-watch could only see a merge, never stop one: endzone #1241 and #1263
@@ -579,6 +644,7 @@ function attestPullRequest(options = {}) {
   if (!tenantName || tenantName === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new ReviewPolicyError('USAGE', 'attest needs --pr <number>');
   if (!headSha || headSha === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --head <sha>');
+  requireFullSha(headSha, '--head');
   if (!artifactPath || artifactPath === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --artifact <path>');
   const tenantFile = path.join(root, 'tenants', `${tenantName}.json`);
   if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${tenantName}': ${tenantFile} does not exist`);
@@ -782,6 +848,7 @@ function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
   const { recordId, kind, headSha, actor } = options;
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
+  requireFullSha(headSha, '--head-sha');
   if (!['formal', 'risk'].includes(kind)) throw new ReviewPolicyError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
   // fleet#43: `headSha` is the head the artifact is recorded against;
   // `reviewedSha` is the tree the reviewer actually read. An IC that fixes
@@ -791,19 +858,13 @@ function recordReviewArtifact(options = {}) {
   // lead's own read at the head it records, so there the two must agree; a
   // moved head is a re-review, never a record at a tree nobody read.
   const reviewedSha = options.reviewedSha !== undefined && options.reviewedSha !== null ? String(options.reviewedSha) : String(headSha);
+  requireFullSha(reviewedSha, '--reviewed-sha');
   if (kind === 'formal' && reviewedSha !== String(headSha)) {
     throw new ReviewPolicyError('REVIEWED_SHA_MISMATCH', `a formal review is recorded at the head it read: --reviewed-sha ${reviewedSha} differs from --head-sha ${headSha}; re-review at ${headSha} (plan-rereview scopes it) rather than record a review of a tree nobody read`, { reviewedSha, headSha: String(headSha) });
   }
-  const classification = options.classification || {};
-  // fleet#64: a formal record with no classification read `triggers: []` and
-  // walked past every trigger guard, so a triggered head was formally recorded
-  // with no risk review ever having existed (Endzone PR #1380, formal-002 at
-  // c4e31d2c). The lead classifies the head before it reviews (project-lead.md,
-  // Merge); the record now carries that answer, and a triggered head needs its
-  // risk artifact (below) unless the lead rules the trigger on record.
-  if (kind === 'formal' && typeof classification.tier !== 'string') {
-    throw new ReviewPolicyError('CLASSIFICATION_REQUIRED', `a formal review records the head's classification: pass --classification '<json>' from review-policy.js classify at ${headSha}`, { headSha: String(headSha) });
-  }
+  // A risk review takes its classification from the caller (the IC ran classify). A formal review's is computed at
+  // its head once the head is verified, below (#445), so a classification passed in from another head decides nothing.
+  let classification = options.classification || {};
   const riskRuling = typeof options.riskRuling === 'string' && options.riskRuling.trim().length > 0 ? options.riskRuling.trim() : null;
   // #324: a `ruled` resolution cites the Ruling that keeps the finding; the citation belongs to no other resolution.
   const ruling = typeof options.ruling === 'string' && options.ruling.trim().length > 0 && options.ruling !== 'true' ? options.ruling.trim() : null; // a bare --ruling parses to 'true'
@@ -828,6 +889,11 @@ function recordReviewArtifact(options = {}) {
 
   let written = null;
   let verifiedRepo = null;
+  const headShas = () => {
+    const shas = [{ flag: '--head-sha', sha: String(headSha) }];
+    if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
+    return shas;
+  };
   try {
     for (let attempt = 0; ; attempt += 1) {
       const record = workState.getRecord({ root, id: recordId });
@@ -852,6 +918,12 @@ function recordReviewArtifact(options = {}) {
       }
       if (kind === 'risk' && !(classification.triggers || []).length) {
         throw new ReviewPolicyError('RISK_REVIEW_NOT_TRIGGERED', 'a risk review requires a configured trigger; a normal PR never launches the risk reviewer');
+      }
+      // #445: a formal record classifies its head itself, which needs the head in the tenant repo, so the commit guard
+      // (fleet#67) runs here for a formal record; a retry keeps what it found.
+      if (kind === 'formal' && !verifiedRepo) {
+        verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas: headShas(), repoPath: options.repoPath, git: options.git });
+        classification = classificationAt({ root, tenant: options.tenant, recordId, record, repo: verifiedRepo, headSha, git: options.git });
       }
       // fleet#64: a triggered head has its risk artifact before the formal review
       // records. A first formal at a head needs the risk artifact at that head;
@@ -962,11 +1034,8 @@ function recordReviewArtifact(options = {}) {
       // fleet#67: the last guard before the write. It runs git (a fetch of the
       // PR branch), so every cheaper refusal above keeps precedence over it;
       // an artifact is never written for a head the tenant repo does not hold.
-      if (!written) {
-        const shas = [{ flag: '--head-sha', sha: String(headSha) }];
-        if (reviewedSha !== String(headSha)) shas.push({ flag: '--reviewed-sha', sha: reviewedSha });
-        verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas, repoPath: options.repoPath, git: options.git });
-      }
+      // A formal record ran it already, ahead of its trigger guard (#445).
+      if (!verifiedRepo) verifiedRepo = verifyRecordedCommits({ root, recordId, record, shas: headShas(), repoPath: options.repoPath, git: options.git });
       if (!written) {
         written = writeArtifactExclusive(root, recordId, kind, (stamp) => ({
           schemaVersion: 1,
@@ -1264,11 +1333,12 @@ if (require.main === module) {
     // FINDING_CARRIES_OUTCOME and REVIEWED_SHA_MISMATCH (fleet#43) are refused
     // invocations too: nothing was recorded, and the message names the door.
     // UNKNOWN_COMMIT and TENANT_REPO_UNKNOWN (fleet#67) likewise: nothing was
-    // recorded, and the message names the repo and the SHA.
+    // recorded, and the message names the repo and the SHA. FULL_SHA_REQUIRED and
+    // TENANT_BASE_UNKNOWN (#445) likewise.
     // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
     // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
     // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'CLASSIFICATION_REQUIRED', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'FULL_SHA_REQUIRED', 'TENANT_BASE_UNKNOWN', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 

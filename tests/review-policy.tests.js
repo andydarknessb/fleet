@@ -8,6 +8,7 @@ const test = require('node:test');
 const {
   ReviewPolicyError,
   classifyChange,
+  classifyFromGit,
   matchGlob,
   recordReviewArtifact: recordAgainstRepo,
   planRereview,
@@ -29,6 +30,46 @@ function recordReviewArtifact(options) {
   return recordAgainstRepo({ repoPath: 'E:/stub-repo', git: () => '', ...options });
 }
 
+// The injected git runner for a head that changed these files: the name listing
+// (NUL-separated, as classifyFromGit asks for it) and their diff, each adding one line.
+function changedFiles(files, addedLine = 'x') {
+  return (args) => {
+    if (args[0] !== 'diff') return '';
+    if (args.includes('--name-only')) return files.map((file) => `${file}\0`).join('');
+    return files.map((file) => `diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1 @@\n+${addedLine}\n`).join('');
+  };
+}
+
+// A runner for a real repository, throwing on a non-zero exit like execFileSync.
+function gitIn(repo) {
+  return (...args) => {
+    const result = runGit('git', ['-C', repo, ...args], { encoding: 'utf8', windowsHide: true });
+    if (result.status !== 0) throw new Error(`git ${args.join(' ')}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+}
+
+// A repository with a base commit of `baseFiles` and one more commit made by `change(repo)`.
+function twoCommitRepo(root, baseFiles, change) {
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  const git = gitIn(repo);
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  for (const file of baseFiles) {
+    fs.mkdirSync(path.dirname(path.join(repo, file)), { recursive: true });
+    fs.writeFileSync(path.join(repo, file), 'exports.up = 1;\n');
+  }
+  git('add', '.');
+  git('commit', '-q', '-m', 'base', '--no-gpg-sign');
+  const base = git('rev-parse', 'HEAD');
+  change(repo);
+  git('add', '.');
+  git('commit', '-q', '-m', 'change', '--no-gpg-sign');
+  return { repo, base };
+}
+
 // A real repository with one commit, for the CLI tests (the binary runs git for
 // real) and the fleet#67 tests. Returns the repo path and its head SHA.
 function commitIn(root) {
@@ -46,6 +87,8 @@ function commitIn(root) {
   git('add', 'a.txt');
   git('commit', '-q', '-m', 'one', '--no-gpg-sign');
   const prior = git('rev-parse', 'HEAD');
+  // The formal record classifies its head against origin/<defaultBranch> (#445): the prior commit stands for it.
+  git('update-ref', 'refs/remotes/origin/integration', prior);
   fs.writeFileSync(path.join(repo, 'a.txt'), 'b');
   git('commit', '-q', '-a', '-m', 'two', '--no-gpg-sign');
   return { repo, head: git('rev-parse', 'HEAD'), prior };
@@ -55,17 +98,27 @@ function rootDir() {
   return makeTempDir('fleet-review-policy-');
 }
 
+// A head is recorded as a full 40-character sha (#445): a readable prefix padded out.
+const sha40 = (prefix) => prefix.padEnd(40, '0');
+
 const TENANT = {
   name: 'endzone',
+  defaultBranch: 'integration',
   carveOuts: ['server/db/migrations/**', '**/knexfile*', '.github/workflows/**', '.env*', 'netlify.toml'],
   riskTriggers: {
     auth: { paths: ['server/middleware/**', 'server/services/leagueRole*'], patterns: [] },
     destructive: { paths: [], patterns: ['DROP TABLE', 'TRUNCATE', 'DELETE FROM'] },
     concurrency: { paths: [], patterns: ['FOR UPDATE'] },
+    accessibility: { paths: [], patterns: ['aria-'] },
   },
 };
 
 function seedRecord(root, { state = 'review', prNumber = 77 } = {}) {
+  // The tenant file a formal record classifies its head against (#445: defaultBranch is the base); a test's own tenant file stands.
+  if (!fs.existsSync(path.join(root, 'tenants', 'endzone.json'))) {
+    fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify(TENANT));
+  }
   workState.createRecord({
     root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, state: 'implementing',
     github: { issueNumber: 42, prNumber },
@@ -194,6 +247,71 @@ test('classification parses added lines and changed-line counts from a unified d
   assert.equal(classification.changedLines, 3);
 });
 
+test('#445: a classification from a diff alone takes its paths from the diff, and a diff touching a carve-out is never trivial', () => {
+  const newMigration = [
+    'diff --git a/server/db/migrations/20260901_add_thing.js b/server/db/migrations/20260901_add_thing.js',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/server/db/migrations/20260901_add_thing.js',
+    '@@ -0,0 +1 @@',
+    '+exports.up = () => {};',
+  ].join('\n');
+  const classification = classifyChange({ diffText: newMigration, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/20260901_add_thing.js']);
+  assert.equal(classification.tier, 'high-risk');
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445: a move out of a carve-out folder is a carve-out, and a rename diff lists both paths', () => {
+  const moved = [
+    'diff --git a/server/db/migrations/x.js b/server/services/x.js',
+    'similarity index 90%',
+    'rename from server/db/migrations/x.js',
+    'rename to server/services/x.js',
+    '@@ -1 +1 @@',
+    '-exports.up = 1;',
+    '+exports.up = 2;',
+  ].join('\n');
+  const classification = classifyChange({ diffText: moved, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/x.js', 'server/services/x.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445: a non-ASCII carve-out file in git\'s quoted diff header is a carve-out, and its name is decoded', () => {
+  const quoted = [
+    'diff --git "a/server/db/migrations/caf\\303\\251.js" "b/server/db/migrations/caf\\303\\251.js"',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ "b/server/db/migrations/caf\\303\\251.js"',
+    '@@ -0,0 +1 @@',
+    '+exports.up = () => {};',
+  ].join('\n');
+  const classification = classifyChange({ diffText: quoted, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/café.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445: a pull request that moves a carve-out file out of its folder is a carve-out, and both paths are listed', () => {
+  const { repo, base } = twoCommitRepo(rootDir(), ['server/db/migrations/20260901_a.js'], (dir) => {
+    fs.mkdirSync(path.join(dir, 'server', 'services'), { recursive: true });
+    fs.renameSync(path.join(dir, 'server', 'db', 'migrations', '20260901_a.js'), path.join(dir, 'server', 'services', 'a.js'));
+  });
+  const { classification } = classifyFromGit({ repoPath: repo, baseRef: base, tenant: TENANT });
+  assert.ok(classification.files.includes('server/db/migrations/20260901_a.js'), 'the old path is listed');
+  assert.ok(classification.files.includes('server/services/a.js'), 'the new path is listed');
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445: a pull request that adds a carve-out file with a non-ASCII name is a carve-out', () => {
+  const { repo, base } = twoCommitRepo(rootDir(), ['README.md'], (dir) => {
+    fs.mkdirSync(path.join(dir, 'server', 'db', 'migrations'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'server', 'db', 'migrations', 'café.js'), 'exports.up = () => {};\n');
+  });
+  const { classification } = classifyFromGit({ repoPath: repo, baseRef: base, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/café.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
 // --- exactly one formal review ---
 
 test('a normal PR records exactly one formal review; a second attempt at the same head is refused', () => {
@@ -201,7 +319,7 @@ test('a normal PR records exactly one formal review; a second attempt at the sam
   const revision = seedRecord(root);
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'major', category: 'correctness' }],
     idempotencyKey: 'formal-1', now: '2026-09-01T02:00:00.000Z',
@@ -216,7 +334,7 @@ test('a normal PR records exactly one formal review; a second attempt at the sam
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
-      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       idempotencyKey: 'formal-dup', now: '2026-09-01T02:01:00.000Z',
     }),
@@ -232,7 +350,7 @@ test('a normal PR never gets a risk review recorded; a triggered one gets exactl
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'risk', headSha: 'bbb2222', actor: 'ic-42',
+      kind: 'risk', headSha: sha40('bbb2222'), actor: 'ic-42',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       idempotencyKey: 'risk-none', now: '2026-09-01T02:00:00.000Z',
     }),
@@ -240,7 +358,7 @@ test('a normal PR never gets a risk review recorded; a triggered one gets exactl
   );
   const triggered = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'risk', headSha: 'bbb2222', actor: 'ic-42',
+    kind: 'risk', headSha: sha40('bbb2222'), actor: 'ic-42',
     classification: { tier: 'high-risk', triggers: [{ class: 'carve-out', matches: [{ file: 'server/db/migrations/x.js', glob: 'server/db/migrations/**' }] }] },
     findings: [{ file: 'server/db/migrations/x.js', line: 1, claim: 'missing down()', severity: 'blocker', category: 'correctness' }],
     idempotencyKey: 'risk-1', now: '2026-09-01T02:01:00.000Z',
@@ -249,7 +367,7 @@ test('a normal PR never gets a risk review recorded; a triggered one gets exactl
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: triggered.result.revision,
-      kind: 'risk', headSha: 'bbb2222', actor: 'ic-42',
+      kind: 'risk', headSha: sha40('bbb2222'), actor: 'ic-42',
       classification: { tier: 'high-risk', triggers: [{ class: 'carve-out', matches: [] }] }, findings: [],
       idempotencyKey: 'risk-dup', now: '2026-09-01T02:02:00.000Z',
     }),
@@ -264,7 +382,7 @@ test('a revision re-review links the prior findings and carries only unresolved 
   let revision = seedRecord(root);
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [
       { file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'major', category: 'correctness' },
@@ -282,17 +400,17 @@ test('a revision re-review links the prior findings and carries only unresolved 
     }).revision;
   }
 
-  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: 'ccc3333' });
+  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('ccc3333') });
   assert.equal(plan.priorArtifact, first.artifact);
-  assert.equal(plan.priorHeadSha, 'aaa1111');
-  assert.equal(plan.range, 'aaa1111..ccc3333');
+  assert.equal(plan.priorHeadSha, sha40('aaa1111'));
+  assert.equal(plan.range, `${sha40('aaa1111')}..${sha40('ccc3333')}`);
   assert.deepEqual(plan.unresolved.map((finding) => finding.id), ['formal-001-f1', 'formal-001-f2']);
 
   // A second formal at a new head without linking the prior artifact is refused.
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       idempotencyKey: 'formal-2-bad', now: '2026-09-01T02:20:00.000Z',
     }),
@@ -303,7 +421,7 @@ test('a revision re-review links the prior findings and carries only unresolved 
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
       idempotencyKey: 'formal-2-partial', now: '2026-09-01T02:21:00.000Z',
@@ -313,7 +431,7 @@ test('a revision re-review links the prior findings and carries only unresolved 
 
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/c.js', line: 1, claim: 'new regression', severity: 'blocker', category: 'correctness' }],
     priorArtifact: first.artifact,
@@ -322,7 +440,7 @@ test('a revision re-review links the prior findings and carries only unresolved 
   });
   const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
   assert.equal(stored.priorArtifact, first.artifact);
-  assert.equal(stored.range, 'aaa1111..ccc3333');
+  assert.equal(stored.range, `${sha40('aaa1111')}..${sha40('ccc3333')}`);
   const ids = stored.findings.map((finding) => finding.id).sort();
   // Only the still-open carry-over and the newly introduced finding; the resolved one is settled material.
   assert.deepEqual(ids, ['formal-001-f2', 'formal-002-f1']);
@@ -425,7 +543,7 @@ test('caller-supplied finding fields cannot smuggle a non-open status, and dupli
   const revision = seedRecord(root);
   const recorded = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', claim: 'sneaky', severity: 'nit', category: 'style', status: 'resolved' }],
     idempotencyKey: 'formal-1', now: '2026-09-01T02:00:00.000Z',
@@ -438,7 +556,7 @@ test('caller-supplied finding fields cannot smuggle a non-open status, and dupli
   assert.throws(
     () => recordReviewArtifact({
       root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2,
-      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] },
       findings: [
         { id: 'formal-001-f1', file: 'a', claim: 'x', severity: 'nit', category: 'style' },
@@ -455,7 +573,7 @@ test('a retried record call replays instead of raising ALREADY_REVIEWED, and lea
   const revision = seedRecord(root);
   const args = {
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
     now: '2026-09-01T02:00:00.000Z',
@@ -478,7 +596,7 @@ test('a routine concurrent observation does not destroy a review: record retries
   });
   const recorded = recordReviewArtifact({
     root, recordId: 'endzone:issue-42',
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
     idempotencyKey: 'formal-1', now: '2026-09-01T02:01:00.000Z',
@@ -492,7 +610,7 @@ test('a missing prior artifact degrades to an honest re-review instead of wedgin
   let revision = seedRecord(root);
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
     idempotencyKey: 'formal-1', now: '2026-09-01T02:00:00.000Z',
@@ -505,12 +623,12 @@ test('a missing prior artifact degrades to an honest re-review instead of wedgin
       actor: 'test', evidence: 'revision cycle', now: `2026-09-01T02:1${index}:00.000Z`,
     }).revision;
   }
-  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: 'ccc3333' });
+  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('ccc3333') });
   assert.equal(plan.priorArtifactMissing, true);
   assert.deepEqual(plan.unresolved, []);
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [], noFindings: 'prior artifact gone; nothing new at ccc3333', priorArtifact: first.artifact,
     idempotencyKey: 'formal-2', now: '2026-09-01T02:20:00.000Z',
@@ -549,7 +667,7 @@ test('state/flags/review-dedup-off records a second formal review at the same he
   const revision = seedRecord(root);
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'nothing at bbb2222',
     idempotencyKey: 'formal-a', now: '2026-09-09T02:00:00.000Z',
   });
@@ -558,7 +676,7 @@ test('state/flags/review-dedup-off records a second formal review at the same he
   // No explicit key and no prior link: exactly what a legacy second pass looks like.
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
-    kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'nothing at bbb2222, second pass',
     now: '2026-09-09T02:01:00.000Z',
   });
@@ -568,7 +686,7 @@ test('state/flags/review-dedup-off records a second formal review at the same he
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
-      kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       idempotencyKey: 'formal-c', now: '2026-09-09T02:02:00.000Z',
     }),
@@ -704,7 +822,7 @@ test('record --kind formal in ci-wait is refused with the door named, and leaves
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] },
       findings: [{ file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'major', category: 'correctness' }],
       idempotencyKey: 'formal-early', now: '2026-09-01T02:00:00.000Z',
@@ -753,6 +871,8 @@ test('record: INVALID_REVIEW_STATE exits 2 with the refusal on stderr and nothin
 // REREVIEW_REQUIRES_PRIOR, UNRESOLVED_FINDINGS_UNACCOUNTED) keep their cases.
 
 const RISK = { tier: 'high-risk', triggers: [{ class: 'accessibility', matches: [{ pattern: 'aria-', file: 'src/a.jsx', line: 'aria-label' }] }] };
+// A formal record's head whose diff trips the accessibility trigger (#445: the record classifies its head itself).
+const ACCESSIBILITY_HEAD = changedFiles(['src/a.jsx'], 'aria-label');
 
 test('record --kind risk with an empty findings array is refused, leaves no artifact, and touches no state', () => {
   const root = rootDir();
@@ -760,7 +880,7 @@ test('record --kind risk with an empty findings array is refused, leaves no arti
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK, findings: [],
+      kind: 'risk', headSha: sha40('ce19d6a'), actor: 'ic-42', classification: RISK, findings: [],
       idempotencyKey: 'risk-empty', now: '2026-09-10T18:56:28.000Z',
     }),
     (error) => {
@@ -782,7 +902,7 @@ test('record --kind risk with an explicit no-findings statement writes the state
   const revision = seedRecord(root, { state: 'implementing' });
   const clean = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK, findings: [],
+    kind: 'risk', headSha: sha40('ce19d6a'), actor: 'ic-42', classification: RISK, findings: [],
     noFindings: 'Examined the Badge link for focus ring, hover and cursor; ButtonBase is reached via clickable, nothing to fix.',
     idempotencyKey: 'risk-clean', now: '2026-09-10T18:56:28.000Z',
   });
@@ -798,7 +918,7 @@ test('a formal review with no findings needs the same statement; a re-review tha
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       idempotencyKey: 'formal-empty', now: '2026-09-01T02:00:00.000Z',
     }),
@@ -806,7 +926,7 @@ test('a formal review with no findings needs the same statement; a re-review tha
   );
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'major', category: 'correctness' }],
     idempotencyKey: 'formal-1', now: '2026-09-01T02:01:00.000Z',
@@ -822,7 +942,7 @@ test('a formal review with no findings needs the same statement; a re-review tha
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
       idempotencyKey: 'formal-2-empty', now: '2026-09-01T02:20:00.000Z',
@@ -831,10 +951,10 @@ test('a formal review with no findings needs the same statement; a re-review tha
   );
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [],
     priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
-    noFindings: 'Range aaa1111..ccc3333 fixes the off-by-one; nothing new in the changed lines.',
+    noFindings: `Range ${sha40('aaa1111')}..${sha40('ccc3333')} fixes the off-by-one; nothing new in the changed lines.`,
     idempotencyKey: 'formal-2', now: '2026-09-01T02:21:00.000Z',
   });
   const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
@@ -848,7 +968,7 @@ test('a no-findings statement cannot accompany findings, and cannot be blank or 
   const revision = seedRecord(root, { state: 'implementing' });
   const base = {
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK, now: '2026-09-10T18:56:28.000Z',
+    kind: 'risk', headSha: sha40('ce19d6a'), actor: 'ic-42', classification: RISK, now: '2026-09-10T18:56:28.000Z',
   };
   assert.throws(
     () => recordReviewArtifact({ ...base, findings: [{ file: 'src/a.jsx', claim: 'x', severity: 'nit', category: 'style' }], noFindings: 'nothing', idempotencyKey: 'k1' }),
@@ -895,7 +1015,7 @@ test('record: EMPTY_FINDINGS exits 2 with the refusal on stderr and nothing on s
 test('plan-rereview and hold refuse their confusable flag names too', () => {
   const root = rootDir();
   seedRecord(root);
-  assert.throws(() => cli(['plan-rereview', '--root', root, '--id', 'endzone:issue-42', '--head', 'ccc3333']), (error) => error.code === 'USAGE' && /unknown flag --head/.test(error.message));
+  assert.throws(() => cli(['plan-rereview', '--root', root, '--id', 'endzone:issue-42', '--head', sha40('ccc3333')]), (error) => error.code === 'USAGE' && /unknown flag --head/.test(error.message));
   assert.throws(() => cli(['hold', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', '4', '--why', 'carve-out']), (error) => error.code === 'USAGE' && /unknown flag --why/.test(error.message));
   assert.throws(() => cli(['unhold', '--root', root]), (error) => error.code === 'USAGE' && /unknown command/.test(error.message));
 });
@@ -905,7 +1025,7 @@ test('a no-findings statement is refused beside a carried-forward still-open fin
   let revision = seedRecord(root);
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [
       { file: 'src/a.js', line: 3, claim: 'off-by-one', severity: 'major', category: 'correctness' },
@@ -924,7 +1044,7 @@ test('a no-findings statement is refused beside a carried-forward still-open fin
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       priorArtifact: first.artifact, resolutions, noFindings: 'nothing new in the range',
       idempotencyKey: 'formal-2-lie', now: '2026-09-01T02:20:00.000Z',
@@ -933,7 +1053,7 @@ test('a no-findings statement is refused beside a carried-forward still-open fin
   );
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'ccc3333', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('ccc3333'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [],
     priorArtifact: first.artifact, resolutions,
     idempotencyKey: 'formal-2', now: '2026-09-01T02:21:00.000Z',
@@ -950,7 +1070,7 @@ test('a duplicate finding id is refused before any artifact file exists', () => 
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] },
       findings: [{ id: 'same', file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }, { id: 'same', file: 'src/b.js', claim: 'y', severity: 'nit', category: 'style' }],
       idempotencyKey: 'formal-dupid', now: '2026-09-01T02:00:00.000Z',
@@ -975,7 +1095,7 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   const revision = seedRecord(root);
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'PR body', claim: 'asserts a command result that is false', severity: 'blocker', category: 'correctness' }],
     now: '2026-09-10T19:00:00.000Z',
@@ -984,7 +1104,7 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
-      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       priorArtifact: 'state/reviews/endzone_issue-42/formal-009.json', resolutions: { 'formal-001-f1': 'resolved' },
       noFindings: 'body corrected', now: '2026-09-10T19:30:00.000Z',
@@ -994,19 +1114,19 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
-      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [],
       priorArtifact: first.artifact, noFindings: 'body corrected', now: '2026-09-10T19:30:00.000Z',
     }),
     (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED',
   );
-  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: 'f91ba70' });
-  assert.equal(plan.range, 'f91ba70..f91ba70');
+  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('f91ba70') });
+  assert.equal(plan.range, `${sha40('f91ba70')}..${sha40('f91ba70')}`);
   assert.deepEqual(plan.unresolved.map((finding) => finding.id), ['formal-001-f1']);
 
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
-    kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [],
     priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
     noFindings: 'PR body now states the measured result; nothing else changed at f91ba70.',
@@ -1016,18 +1136,18 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   assert.notEqual(second.artifact, first.artifact);
   const stored = JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8'));
   assert.equal(stored.priorArtifact, first.artifact);
-  assert.equal(stored.range, 'f91ba70..f91ba70');
+  assert.equal(stored.range, `${sha40('f91ba70')}..${sha40('f91ba70')}`);
   assert.equal(stored.sameHead, true);
   assert.deepEqual(stored.resolutions, { 'formal-001-f1': 'resolved' });
   assert.deepEqual(stored.findings, []);
   assert.equal(second.result.record.review.formal.artifact, second.artifact);
-  assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: 'f91ba70' }).unresolved, []);
+  assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('f91ba70') }).unresolved, []);
 
   // A linked third pass at the same head has nothing open to resolve: it is not a re-review.
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
-      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'still clean',
       priorArtifact: second.artifact, idempotencyKey: 'formal-3-linked', now: '2026-09-10T19:32:30.000Z',
     }),
@@ -1038,7 +1158,7 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   // A retry of the same re-review replays it; an unlinked third pass is still refused.
   const retry = recordReviewArtifact({
     root, recordId: 'endzone:issue-42',
-    kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [],
     priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'resolved' },
     noFindings: 'PR body now states the measured result; nothing else changed at f91ba70.',
@@ -1050,7 +1170,7 @@ test('a linked formal re-review at an unchanged head records a new artifact, res
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: second.result.revision,
-      kind: 'formal', headSha: 'f91ba70', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('f91ba70'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] }, findings: [], noFindings: 'again',
       idempotencyKey: 'formal-3-unlinked', now: '2026-09-10T19:33:00.000Z',
     }),
@@ -1064,13 +1184,13 @@ test('a risk review at the same head is still exactly one review: the link is a 
   const classification = { tier: 'high-risk', triggers: [{ class: 'concurrency', matches: [{ pattern: 'FOR UPDATE', file: 'server/x.js', line: 'FOR UPDATE' }] }] };
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'risk', headSha: 'ddd4444', actor: 'ic-42', classification,
+    kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification,
     findings: [{ file: 'server/x.js', claim: 'lock order', severity: 'major', category: 'correctness' }], now: '2026-09-10T19:00:00.000Z',
   });
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
-      kind: 'risk', headSha: 'ddd4444', actor: 'ic-42', classification,
+      kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification,
       findings: [], noFindings: 'fixed', priorArtifact: first.artifact, resolutions: { 'risk-001-f1': 'resolved' },
       idempotencyKey: 'risk-2-linked', now: '2026-09-10T19:01:00.000Z',
     }),
@@ -1083,7 +1203,7 @@ test('a replay says what it did not write: the result names the ignored findings
   const revision = seedRecord(root);
   const args = {
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
     now: '2026-09-01T02:00:00.000Z',
@@ -1196,7 +1316,7 @@ test('fleet#43: a supplied finding carrying outcome (or resolution) is refused b
     assert.throws(
       () => recordReviewArtifact({
         root, recordId: 'endzone:issue-42', expectedRevision: revision,
-        kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK,
+        kind: 'risk', headSha: sha40('ce19d6a'), actor: 'ic-42', classification: RISK,
         findings: [{ ...RISK_FINDINGS[0], [field]: 'fixed' }, RISK_FINDINGS[1]],
         idempotencyKey: `risk-${field}`, now: '2026-09-12T10:00:00.000Z',
       }),
@@ -1227,25 +1347,25 @@ test('fleet#43: a risk artifact records the tree the reviewer read as reviewedSh
   const revision = seedRecord(root, { state: 'implementing' });
   const recorded = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'risk', headSha: '17fa3c48', reviewedSha: '000c07b9', actor: 'ic-42', classification: RISK,
+    kind: 'risk', headSha: sha40('17fa3c48'), reviewedSha: sha40('000c07b9'), actor: 'ic-42', classification: RISK,
     findings: RISK_FINDINGS, idempotencyKey: 'risk-1', now: '2026-09-12T10:00:00.000Z',
   });
   const stored = JSON.parse(fs.readFileSync(path.join(root, recorded.artifact), 'utf8'));
-  assert.equal(stored.headSha, '17fa3c48');
-  assert.equal(stored.reviewedSha, '000c07b9');
-  assert.equal(stored.range, '000c07b9..17fa3c48');
-  assert.equal(recorded.result.record.review.risk.headSha, '17fa3c48');
+  assert.equal(stored.headSha, sha40('17fa3c48'));
+  assert.equal(stored.reviewedSha, sha40('000c07b9'));
+  assert.equal(stored.range, `${sha40('000c07b9')}..${sha40('17fa3c48')}`);
+  assert.equal(recorded.result.record.review.risk.headSha, sha40('17fa3c48'));
 
   // Same tree read and recorded: reviewedSha equals headSha and range stays null.
   const root2 = rootDir();
   const revision2 = seedRecord(root2, { state: 'implementing' });
   const same = recordReviewArtifact({
     root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2,
-    kind: 'risk', headSha: 'ce19d6a', actor: 'ic-42', classification: RISK,
+    kind: 'risk', headSha: sha40('ce19d6a'), actor: 'ic-42', classification: RISK,
     findings: RISK_FINDINGS, idempotencyKey: 'risk-1', now: '2026-09-12T10:00:00.000Z',
   });
   const storedSame = JSON.parse(fs.readFileSync(path.join(root2, same.artifact), 'utf8'));
-  assert.equal(storedSame.reviewedSha, 'ce19d6a');
+  assert.equal(storedSame.reviewedSha, sha40('ce19d6a'));
   assert.equal(storedSame.range, null);
 });
 
@@ -1255,7 +1375,7 @@ test('fleet#43: a formal review is recorded at the head it read; a differing --r
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'aaa1111', reviewedSha: 'aaa0000', actor: 'project-lead',
+      kind: 'formal', headSha: sha40('aaa1111'), reviewedSha: sha40('aaa0000'), actor: 'project-lead',
       classification: { tier: 'normal', triggers: [] },
       findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
       idempotencyKey: 'formal-1', now: '2026-09-12T10:00:00.000Z',
@@ -1265,19 +1385,19 @@ test('fleet#43: a formal review is recorded at the head it read; a differing --r
   assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')));
   const ok = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', reviewedSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), reviewedSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
     idempotencyKey: 'formal-1', now: '2026-09-12T10:00:00.000Z',
   });
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, ok.artifact), 'utf8')).reviewedSha, 'aaa1111');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, ok.artifact), 'utf8')).reviewedSha, sha40('aaa1111'));
 });
 
-function seedRiskThenReview(root, { headSha = '17fa3c48', findings = RISK_FINDINGS } = {}) {
+function seedRiskThenReview(root, { headSha = sha40('17fa3c48'), findings = RISK_FINDINGS } = {}) {
   const revision = seedRecord(root, { state: 'implementing' });
   const risk = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'risk', headSha, reviewedSha: '000c07b9', actor: 'ic-42', classification: RISK,
+    kind: 'risk', headSha, reviewedSha: sha40('000c07b9'), actor: 'ic-42', classification: RISK,
     findings, idempotencyKey: 'risk-1', now: '2026-09-12T10:00:00.000Z',
   });
   let current = risk.result.revision;
@@ -1299,7 +1419,7 @@ test('fleet#43: the first formal review walks the risk chain: every open risk fi
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+      kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
       findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit', category: 'style' }],
       idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
     }),
@@ -1309,7 +1429,7 @@ test('fleet#43: the first formal review walks the risk chain: every open risk fi
 
   const formal = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit', category: 'style' }],
     resolutions: { 'risk-001-f1': 'resolved', 'risk-001-f2': 'resolved', 'risk-001-f3': 'still-open' },
     idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
@@ -1323,7 +1443,7 @@ test('fleet#43: the first formal review walks the risk chain: every open risk fi
   ]);
 
   // The re-review scopes from the formal artifact, which now carries the still-open risk finding.
-  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: '28ab0000' });
+  const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('28ab0000') });
   assert.deepEqual(plan.unresolved.map((finding) => finding.id), ['formal-001-f1', 'risk-001-f3']);
 
   // A later formal re-review does not walk the risk artifact twice: only the formal prior binds.
@@ -1336,7 +1456,7 @@ test('fleet#43: the first formal review walks the risk chain: every open risk fi
   });
   const rereview = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: current,
-    kind: 'formal', headSha: '28ab0000', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('28ab0000'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     priorArtifact: formal.artifact,
     resolutions: { 'formal-001-f1': 'resolved', 'risk-001-f3': 'resolved' },
     noFindings: 'Re-read the changed range; the icon button is now named and nothing new was found.',
@@ -1363,14 +1483,14 @@ test('fleet#103: a third formal link does not re-walk a risk artifact an earlier
   // formal-001 consumes risk-001 and carries risk-001-f3 still-open (deploy ordering: only the Hold resolves it).
   const first = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     resolutions: { 'risk-001-f1': 'resolved', 'risk-001-f2': 'resolved', 'risk-001-f3': 'still-open' },
     findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit', category: 'correctness' }],
     idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
   });
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: cycle(first.result.revision, 'c1', '12'),
-    kind: 'formal', headSha: '28ab0000', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('28ab0000'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     priorArtifact: first.artifact,
     resolutions: { 'formal-001-f1': 'resolved', 'risk-001-f3': 'still-open' },
     idempotencyKey: 'formal-2', now: '2026-09-12T13:00:00.000Z',
@@ -1380,7 +1500,7 @@ test('fleet#103: a third formal link does not re-walk a risk artifact an earlier
   // The third link binds to the formal chain alone: only formal-002's open findings need resolutions.
   const third = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: cycle(second.result.revision, 'c2', '14'),
-    kind: 'formal', headSha: '39bc0000', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('39bc0000'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     priorArtifact: second.artifact,
     resolutions: { 'risk-001-f3': 'still-open' },
     idempotencyKey: 'formal-3', now: '2026-09-12T15:00:00.000Z',
@@ -1396,7 +1516,7 @@ test('fleet#43: a formal no-findings statement beside a still-open risk finding 
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+      kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
       resolutions: { 'risk-001-f1': 'still-open' }, noFindings: 'Looked; nothing.',
       idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
     }),
@@ -1404,7 +1524,7 @@ test('fleet#43: a formal no-findings statement beside a still-open risk finding 
   );
   const clean = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     resolutions: { 'risk-001-f1': 'resolved' }, noFindings: 'Verified the focus fix at 17fa3c48; Standards and Spec angles found nothing.',
     idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
   });
@@ -1420,7 +1540,7 @@ test('fleet#43: a risk artifact whose file is gone degrades honestly instead of 
   fs.rmSync(path.join(root, risk.artifact));
   const formal = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK,
+    kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
     findings: [{ file: 'src/c.js', claim: 'formal-only', severity: 'nit', category: 'style' }],
     idempotencyKey: 'formal-1', now: '2026-09-12T11:00:00.000Z',
   });
@@ -1482,7 +1602,7 @@ test('fleet#64: a formal review at a triggered head with no risk artifact is ref
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification: RISK,
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
       noFindings: 'clean at both angles', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
     }),
     (error) => error instanceof ReviewPolicyError && error.code === 'RISK_REVIEW_MISSING'
@@ -1501,11 +1621,11 @@ test('fleet#64: a first formal review at a new head does not lean on a risk arti
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'formal', headSha: 'bbb2222', actor: 'project-lead', classification: RISK,
+      kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead', git: ACCESSIBILITY_HEAD,
       noFindings: 'clean', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
     }),
     (error) => error instanceof ReviewPolicyError && error.code === 'RISK_REVIEW_MISSING'
-      && error.message.includes(risk.artifact) && error.message.includes('17fa3c48') && error.riskHeadSha === '17fa3c48',
+      && error.message.includes(risk.artifact) && error.message.includes(sha40('17fa3c48')) && error.riskHeadSha === sha40('17fa3c48'),
   );
 });
 
@@ -1515,7 +1635,7 @@ test('fleet#64: --risk-ruling records the lead ruling in the artifact in place o
   const ruling = 'destructive pattern is cleanup on a throwaway CI test database; no live table is touched';
   const formal = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification: RISK, riskRuling: ruling,
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead', git: ACCESSIBILITY_HEAD, riskRuling: ruling,
     noFindings: 'clean at both angles', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
   });
   const stored = JSON.parse(fs.readFileSync(path.join(root, formal.artifact), 'utf8'));
@@ -1527,57 +1647,90 @@ test('fleet#64: --risk-ruling records the lead ruling in the artifact in place o
   const revision2 = seedRecord(root2);
   const plain = recordReviewArtifact({
     root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification: { tier: 'normal', triggers: [] },
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead', classification: { tier: 'normal', triggers: [] },
     noFindings: 'clean', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
   });
   assert.ok(!('riskRuling' in JSON.parse(fs.readFileSync(path.join(root2, plain.artifact), 'utf8'))));
 });
 
-test('fleet#64: a formal review without a classification is refused before any state is read', () => {
+test('fleet#64: a risk review never takes a ruling: the IC hosts it, the lead rules', () => {
   const root = rootDir();
   const revision = seedRecord(root);
-  for (const classification of [undefined, {}, { triggers: [] }]) {
-    assert.throws(
-      () => recordReviewArtifact({
-        root, recordId: 'endzone:issue-42', expectedRevision: revision,
-        kind: 'formal', headSha: 'aaa1111', actor: 'project-lead', classification,
-        noFindings: 'clean', idempotencyKey: 'formal-1', now: '2026-09-14T18:00:00.000Z',
-      }),
-      (error) => error instanceof ReviewPolicyError && error.code === 'CLASSIFICATION_REQUIRED' && error.message.includes('--classification'),
-    );
-  }
-  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision);
-  // A risk review never takes a ruling: the IC hosts it, the lead rules.
   assert.throws(
     () => recordReviewArtifact({
       root, recordId: 'endzone:issue-42', expectedRevision: revision,
-      kind: 'risk', headSha: 'aaa1111', actor: 'ic-42', classification: RISK, riskRuling: 'no',
+      kind: 'risk', headSha: sha40('aaa1111'), actor: 'ic-42', classification: RISK, riskRuling: 'no',
       noFindings: 'clean', idempotencyKey: 'risk-1', now: '2026-09-14T18:00:00.000Z',
     }),
     (error) => error instanceof ReviewPolicyError && error.code === 'USAGE',
   );
 });
 
-test('fleet#64: record --kind formal exits 2 on RISK_REVIEW_MISSING and CLASSIFICATION_REQUIRED, and --risk-ruling opens the door', () => {
+test('fleet#64: record --kind formal exits 2 on RISK_REVIEW_MISSING, and --risk-ruling opens the door', () => {
   const root = rootDir();
   const revision = seedRecord(root);
-  const { repo, head } = commitIn(root);
+  const { repo } = commitIn(root);
+  // The head adds a carve-out file: the formal record classifies the head itself, with no --classification (#445).
+  fs.mkdirSync(path.join(repo, 'server', 'db', 'migrations'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'server', 'db', 'migrations', '20260901_x.js'), 'exports.up = () => {};\n');
+  const git = gitIn(repo);
+  git('add', '.');
+  git('commit', '-q', '-m', 'carve-out', '--no-gpg-sign');
+  const head = git('rev-parse', 'HEAD');
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const base = [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision),
     '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'project-lead', '--no-findings', 'clean'];
-  const unclassified = spawnSync(process.execPath, base, { encoding: 'utf8', windowsHide: true });
-  assert.equal(unclassified.status, 2, unclassified.stderr);
-  assert.equal(unclassified.stdout, '');
-  assert.equal(JSON.parse(unclassified.stderr).code, 'CLASSIFICATION_REQUIRED');
-  const triggered = spawnSync(process.execPath, [...base, '--classification', JSON.stringify(RISK)], { encoding: 'utf8', windowsHide: true });
-  assert.equal(triggered.status, 2, triggered.stderr);
-  assert.equal(triggered.stdout, '');
-  assert.equal(JSON.parse(triggered.stderr).code, 'RISK_REVIEW_MISSING');
-  const ruled = spawnSync(process.execPath, [...base, '--classification', JSON.stringify(RISK), '--risk-ruling', 'cleanup on a throwaway CI database'], { encoding: 'utf8', windowsHide: true });
+  const refused = spawnSync(process.execPath, base, { encoding: 'utf8', windowsHide: true });
+  assert.equal(refused.status, 2, refused.stderr);
+  assert.equal(refused.stdout, '');
+  assert.equal(JSON.parse(refused.stderr).code, 'RISK_REVIEW_MISSING');
+  const ruled = spawnSync(process.execPath, [...base, '--risk-ruling', 'cleanup on a throwaway CI database'], { encoding: 'utf8', windowsHide: true });
   assert.equal(ruled.status, 0, ruled.stderr);
   const record = workState.getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(record.review.formal.headSha, head);
-  assert.equal(JSON.parse(fs.readFileSync(path.join(root, record.review.formal.artifact), 'utf8')).riskRuling, 'cleanup on a throwaway CI database');
+  const stored = JSON.parse(fs.readFileSync(path.join(root, record.review.formal.artifact), 'utf8'));
+  assert.equal(stored.riskRuling, 'cleanup on a throwaway CI database');
+  assert.deepEqual(stored.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445: a formal record computes the classification at its own head: a clean one passed in cannot hide a carve-out', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const findings = [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }];
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'),
+      actor: 'project-lead', git: changedFiles(['server/db/migrations/20260901_x.js']),
+      classification: { tier: 'normal', triggers: [] }, findings, idempotencyKey: 'formal-other-head', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error.code === 'RISK_REVIEW_MISSING' && error.triggers === 'carve-out',
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision);
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
+
+  // A triggered classification passed in is ignored when the head itself is clean.
+  const clean = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'),
+    actor: 'project-lead', git: changedFiles(['src/a.js']),
+    classification: { tier: 'high-risk', triggers: [{ class: 'carve-out', matches: [] }] }, findings,
+    idempotencyKey: 'formal-clean-head', now: '2026-09-14T18:00:00.000Z',
+  });
+  const stored = JSON.parse(fs.readFileSync(path.join(root, clean.artifact), 'utf8'));
+  assert.deepEqual(stored.triggers, []);
+  assert.notEqual(stored.tier, 'high-risk');
+
+  // A tenant that names no defaultBranch has no base to classify the head against: refused, nothing written.
+  const root2 = rootDir();
+  const revision2 = seedRecord(root2);
+  assert.throws(
+    () => recordReviewArtifact({
+      root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2, kind: 'formal', headSha: sha40('aaa1111'),
+      actor: 'project-lead', tenant: { ...TENANT, defaultBranch: undefined }, findings, idempotencyKey: 'formal-no-base',
+      now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error.code === 'TENANT_BASE_UNKNOWN',
+  );
+  assert.ok(!fs.existsSync(path.join(root2, 'state', 'reviews')), 'no artifact was written');
 });
 
 // --- fleet#67: a recorded head is a commit ----------------------------------
@@ -1607,8 +1760,11 @@ test('fleet#67: record refuses a headSha that is not a commit in the tenant repo
 
   const otherRoot = rootDir();
   const otherRevision = seedRecord(otherRoot, { state: 'implementing' });
-  const short = recordAgainstRepo({ root: otherRoot, recordId: 'endzone:issue-42', expectedRevision: otherRevision, repoPath: repo, kind: 'risk', headSha: head.slice(0, 12), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
-  assert.ok(short.artifact, 'an abbreviated SHA that names a commit is accepted, as git accepts it');
+  // #445: an abbreviated sha that names a commit is refused too; a full sha is what the record stores.
+  assert.throws(
+    () => recordAgainstRepo({ root: otherRoot, recordId: 'endzone:issue-42', expectedRevision: otherRevision, repoPath: repo, kind: 'risk', headSha: head.slice(0, 12), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS }),
+    (error) => error.code === 'FULL_SHA_REQUIRED',
+  );
 });
 
 test('fleet#67: reviewedSha is resolved too, so a range cannot start at a tree nobody could read', () => {
@@ -1682,6 +1838,36 @@ test('fleet#67: the binary refuses an invented head with exit 2 and takes --repo
   assert.equal(JSON.parse(real.stdout).result.record.review.risk.headSha, head);
 });
 
+test('#445: a recorded head is a full 40-character sha: a branch name, a relative ref or a short sha is refused, and nothing is written', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const findings = [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }];
+  for (const headSha of ['fleet/445-review-gate', 'HEAD', 'HEAD~1', sha40('aaa1111').slice(0, 7)]) {
+    assert.throws(
+      () => recordReviewArtifact({
+        root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha, actor: 'project-lead',
+        classification: { tier: 'normal', triggers: [] }, findings, idempotencyKey: `head-${headSha}`, now: '2026-09-14T18:00:00.000Z',
+      }),
+      (error) => error.code === 'FULL_SHA_REQUIRED' && /a full 40-character sha is needed/.test(error.message),
+    );
+  }
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'risk', headSha: sha40('aaa1111'), reviewedSha: 'HEAD~1',
+      actor: 'ic-42', classification: RISK, findings, idempotencyKey: 'risk-reviewed-head', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error.code === 'FULL_SHA_REQUIRED',
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision);
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
+
+  const recorded = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings, idempotencyKey: 'head-full', now: '2026-09-14T18:00:00.000Z',
+  });
+  assert.equal(recorded.result.record.review.formal.headSha, sha40('aaa1111'));
+});
+
 // --- #117: every recorded finding carries a severity from the enum and a category ---
 // The audit counted 485 findings with 12+ severity spellings and 41 blank; nothing
 // at the door checked either. Red-tell: with bin/review-policy.js reverted, the
@@ -1690,7 +1876,7 @@ test('fleet#67: the binary refuses an invented head with exit 2 and takes --repo
 function formalAt(root, revision, findings, extra = {}) {
   return recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'aaa1111', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings,
     idempotencyKey: `formal-${JSON.stringify(findings).length}`, now: '2026-09-24T02:00:00.000Z', ...extra,
   });
@@ -1769,7 +1955,7 @@ test('#117: a carried legacy "Major" finding is still carried as written', () =>
   }
   const second = recordReviewArtifact({
     root, recordId: 'endzone:issue-42', expectedRevision: revision,
-    kind: 'formal', headSha: 'bbb2222', actor: 'project-lead',
+    kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead',
     classification: { tier: 'normal', triggers: [] }, findings: [],
     priorArtifact: first.artifact, resolutions: { [prior.findings[0].id]: 'still-open' },
     idempotencyKey: 'formal-117-2', now: '2026-09-24T02:30:00.000Z',
@@ -2011,6 +2197,18 @@ test('#116: a head the tenant repo does not hold is refused UNKNOWN_COMMIT', () 
   );
 });
 
+test('#445: an attestation names a full sha too: a branch name or a short sha is refused FULL_SHA_REQUIRED before the PR is read', () => {
+  const { root, head, calls, gh, artifact } = attestFixture();
+  for (const headSha of ['fleet/445-review-gate', head.slice(0, 8)]) {
+    assert.throws(
+      () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha, artifactPath: artifact({ noFindings: 'clean' }), gh }),
+      (error) => error.code === 'FULL_SHA_REQUIRED',
+    );
+  }
+  assert.equal(calls.length, 0, 'the PR is not read');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'reviews')), false, 'nothing is kept');
+});
+
 test('#116: an artifact whose finding says status resolved is refused, by the record guard', () => {
   const { root, head, calls, gh, artifact } = attestFixture();
   for (const finding of [
@@ -2081,14 +2279,14 @@ function cycleBackToReview(root, revision, round) {
 function settledChain(root) {
   let revision = seedRecord(root);
   const first = recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'aaa1111', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'a.js', claim: 'null deref', severity: 'major', category: 'correctness' }, { file: 'b.js', claim: 'phantom', severity: 'minor', category: 'correctness' }],
     idempotencyKey: 'f118-1', now: '2026-09-24T04:00:00.000Z',
   });
   revision = cycleBackToReview(root, first.result.revision, 1);
   const second = recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'bbb2222', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('bbb2222'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] }, priorArtifact: first.artifact,
     resolutions: { 'formal-001-f1': 'resolved', 'formal-001-f2': 'not-real' },
     noFindings: 'the changed range fixes the null deref; nothing new',
@@ -2102,7 +2300,7 @@ test('#118: a formal review carrying a repeats finding records and moves the rec
   const root = rootDir();
   const { revision, second } = settledChain(root);
   const third = recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'ccc3333', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('ccc3333'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] }, priorArtifact: second.artifact,
     findings: [{ file: 'a.js', claim: 'null deref is back', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
     idempotencyKey: 'f118-3', now: '2026-09-24T04:40:00.000Z',
@@ -2125,7 +2323,7 @@ test('#118: repeats may name a not-real finding too; a repeats naming nothing se
   const root = rootDir();
   const { revision, second } = settledChain(root);
   const base = {
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'ccc3333', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('ccc3333'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] }, priorArtifact: second.artifact, now: '2026-09-24T04:40:00.000Z',
   };
   for (const repeats of ['formal-009-f1', '', 42]) {
@@ -2145,7 +2343,7 @@ test('#118: a finding still open in the chain is not a repeat; repeats belongs t
   const root = rootDir();
   let revision = seedRecord(root);
   const first = recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'aaa1111', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'a.js', claim: 'x', severity: 'major', category: 'correctness' }],
     idempotencyKey: 'o118-1', now: '2026-09-24T05:00:00.000Z',
@@ -2153,7 +2351,7 @@ test('#118: a finding still open in the chain is not a repeat; repeats belongs t
   revision = cycleBackToReview(root, first.result.revision, 5);
   assert.throws(
     () => recordReviewArtifact({
-      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'bbb2222', actor: 'pl-endzone',
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('bbb2222'), actor: 'pl-endzone',
       classification: { tier: 'normal', triggers: [] }, priorArtifact: first.artifact,
       resolutions: { 'formal-001-f1': 'still-open' },
       findings: [{ file: 'a.js', claim: 'x again', severity: 'major', category: 'correctness', repeats: 'formal-001-f1' }],
@@ -2164,7 +2362,7 @@ test('#118: a finding still open in the chain is not a repeat; repeats belongs t
   const root2 = rootDir();
   const revision2 = seedRecord(root2, { state: 'implementing' });
   assert.throws(
-    () => recordReviewArtifact({ root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2, kind: 'risk', headSha: 'ddd4444', actor: 'ic-42', classification: RISK, findings: [{ ...RISK_FINDINGS[0], repeats: 'risk-001-f1' }] }),
+    () => recordReviewArtifact({ root: root2, recordId: 'endzone:issue-42', expectedRevision: revision2, kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification: RISK, findings: [{ ...RISK_FINDINGS[0], repeats: 'risk-001-f1' }] }),
     (error) => error.code === 'INVALID_FINDING' && /formal/.test(error.message),
   );
 });
@@ -2175,7 +2373,7 @@ test('#118 review: a repeats finding blocks the review status whatever its sever
   const { revision, second } = settledChain(root);
   const { calls, gh } = stubGh();
   recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'ccc3333', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('ccc3333'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] }, priorArtifact: second.artifact, gh,
     findings: [{ file: 'b.js', claim: 'phantom again', severity: 'minor', category: 'correctness', repeats: 'formal-001-f2' }],
     idempotencyKey: 'rb118', now: '2026-09-24T04:50:00.000Z',
@@ -2262,7 +2460,7 @@ function blockerChain(root) {
   reviewTenant(root);
   const revision = seedRecord(root);
   const first = recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'aaa1111', actor: 'pl-endzone',
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'), actor: 'pl-endzone',
     classification: { tier: 'normal', triggers: [] },
     findings: [{ file: 'a.js', claim: 'spec sets the hex', severity: 'major', category: 'correctness' }],
     idempotencyKey: 'r324-1', now: '2026-09-24T04:00:00.000Z',
@@ -2275,7 +2473,7 @@ test('#324: a formal re-review whose only blocker is resolved ruled posts succes
   const { revision, first } = blockerChain(root);
   const { calls, gh } = stubGh();
   const second = formalRecord(root, revision, gh, {
-    headSha: 'bbb2222'.padEnd(40, '2'), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'ruled' },
+    headSha: sha40('bbb2222'), priorArtifact: first.artifact, resolutions: { 'formal-001-f1': 'ruled' },
     ruling: `  ${RULING}  `, noFindings: 'the Ruling keeps the finding; nothing new', idempotencyKey: 'r324-2',
   });
   assert.equal(statusField(calls[0], 'state'), 'success');
@@ -2344,13 +2542,13 @@ test('#324: a risk finding can be ruled; the formal review posts success and pla
   const { revision } = seedRiskThenReview(root);
   const { calls, gh } = stubGh();
   const formal = recordReviewArtifact({
-    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: '17fa3c48', actor: 'project-lead', classification: RISK, gh,
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('17fa3c48'), actor: 'project-lead', git: ACCESSIBILITY_HEAD, gh,
     resolutions: { 'risk-001-f1': 'ruled', 'risk-001-f2': 'resolved', 'risk-001-f3': 'resolved' }, ruling: RULING,
     noFindings: 'the Ruling keeps the risk finding; nothing new', idempotencyKey: 'r324-risk', now: '2026-09-12T11:00:00.000Z',
   });
   assert.equal(statusField(calls[0], 'state'), 'success');
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, formal.artifact), 'utf8')).ruling, RULING);
-  assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: '28ab0000' }).unresolved, []);
+  assert.deepEqual(planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('28ab0000') }).unresolved, []);
 });
 
 // --- fleet #390: a standing exception passes the Review gate for a Reconcile PR (the tenant's main merged into
