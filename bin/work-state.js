@@ -353,20 +353,36 @@ function checkEventSlot(p, event) {
   });
 }
 
+// fleet #450 review: the cut is made on one descriptor, and only while the file is the size the tail was read at.
+function settleTail(fd) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const size = fs.fstatSync(fd).size;
+    if (!size) return '';
+    const bytes = Buffer.alloc(size);
+    fs.readSync(fd, bytes, 0, size, 0);
+    if (bytes[size - 1] === 0x0a) return '';
+    const start = bytes.lastIndexOf(0x0a) + 1;
+    let whole = true;
+    try { JSON.parse(bytes.subarray(start).toString('utf8').replace(/^\uFEFF/, '')); } catch { whole = false; }
+    // The window left is the gap between this size check and the cut.
+    if (fs.fstatSync(fd).size !== size) continue;   // another writer appended: read the tail again
+    if (whole) return '\n';   // a whole row missing its newline keeps its line
+    fs.ftruncateSync(fd, start);
+    return '';
+  }
+  // Still moving after three reads: cutting could erase another writer's row, so only start this one on its own line.
+  return '\n';
+}
+
 // fleet #450: a crash mid-append leaves a tail; a whole row keeps its line (newline added), a fragment is cut so the new row does not glue onto it.
 function appendLedgerRow(file, row) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  let prefix = '';
   if (fs.existsSync(file)) {
-    const bytes = fs.readFileSync(file);
-    if (bytes.length && bytes[bytes.length - 1] !== 0x0a) {
-      const start = bytes.lastIndexOf(0x0a) + 1;
-      let whole = true;
-      try { JSON.parse(bytes.subarray(start).toString('utf8').replace(/^﻿/, '')); } catch { whole = false; }
-      if (whole) fs.appendFileSync(file, '\n', 'utf8');
-      else fs.truncateSync(file, start);
-    }
+    const fd = fs.openSync(file, 'r+');
+    try { prefix = settleTail(fd); } finally { fs.closeSync(fd); }
   }
-  fs.appendFileSync(file, `${row}\n`, 'utf8');
+  fs.appendFileSync(file, `${prefix}${row}\n`, 'utf8');
 }
 
 function appendEvent(p, event) {

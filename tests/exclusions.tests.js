@@ -157,6 +157,63 @@ test('#450: an append after a whole row that lost only its newline keeps the row
   assert.deepEqual(activeExclusions({ root, tenant: 'endzone' }).map((entry) => entry.issue), [125, 126]);
 });
 
+// fleet #450 review: the cut is made only while the file is the size it was read at. The stub runs in the
+// size check between our read and our cut: another writer cuts the same tail there and appends its whole row.
+test('#450 review: a second writer that cuts the same torn tail between our read and our check keeps its row, and ours follows it', () => {
+  const root = rootDir();
+  addExclusion({ root, tenant: 'endzone', ...BASE, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  const file = path.join(root, 'state', 'exclusions', 'endzone.jsonl');
+  fs.appendFileSync(file, '{"schemaVersion":1,"kind":"exclusion-added","id":"endz');
+  const otherRow = { schemaVersion: 1, kind: 'exclusion-added', id: 'endzone:excl-126-1', tenant: 'endzone', issue: 126, reason: 'other writer', evidence: 'e', owner: 'cory', actor: 'other', recheck: { expiresAt: '2027-01-01T00:00:00.000Z' }, at: '2026-09-01T00:00:00.000Z' };
+  // The second stat of the write is the size check after our read and before our cut.
+  const realStat = fs.fstatSync;
+  let stats = 0;
+  let interleaved = false;
+  fs.fstatSync = (...args) => {
+    stats += 1;
+    if (stats === 2) {
+      interleaved = true;
+      const text = fs.readFileSync(file, 'utf8');
+      fs.truncateSync(file, Buffer.byteLength(text.slice(0, text.lastIndexOf('\n') + 1)));
+      fs.appendFileSync(file, `${JSON.stringify(otherRow)}\n`);
+    }
+    return realStat(...args);
+  };
+  try {
+    addExclusion({ root, tenant: 'endzone', ...BASE, issue: 127, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  } finally {
+    fs.fstatSync = realStat;
+  }
+  assert.equal(interleaved, true, 'the other writer ran between our read and our check');
+  assert.deepEqual(readExclusions(root, 'endzone').map((entry) => entry.id), ['endzone:excl-125-1', 'endzone:excl-126-1', 'endzone:excl-127-1']);
+});
+
+test('#450 review: a tail that keeps moving through three reads is left uncut; the bytes another writer appended survive and this row starts its own line', () => {
+  const root = rootDir();
+  addExclusion({ root, tenant: 'endzone', ...BASE, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  const file = path.join(root, 'state', 'exclusions', 'endzone.jsonl');
+  fs.appendFileSync(file, '{"schemaVersion":1,"kind":"exclusion-added","id":"endz');
+  const realStat = fs.fstatSync;
+  let writers = 0;
+  fs.fstatSync = (...args) => {
+    writers += 1;
+    fs.appendFileSync(file, `{"id":"other-${writers}"`);   // an unfinished row: every read sees a tail that moved
+    return realStat(...args);
+  };
+  try {
+    addExclusion({ root, tenant: 'endzone', ...BASE, issue: 127, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  } finally {
+    fs.fstatSync = realStat;
+  }
+  const text = fs.readFileSync(file, 'utf8');
+  assert.ok(writers >= 3, `the tail was read again (${writers} stats)`);
+  assert.ok(text.includes('{"schemaVersion":1,"kind":"exclusion-added","id":"endz'), 'the fragment is not cut');
+  for (let n = 1; n <= writers; n += 1) assert.ok(text.includes(`{"id":"other-${n}"`), `other-${n} survives`);
+  const mine = text.split('\n').filter((line) => line.includes('"id":"endzone:excl-127-1"'));
+  assert.equal(mine.length, 1);
+  assert.equal(JSON.parse(mine[0]).id, 'endzone:excl-127-1');
+});
+
 // --- fleet#4: exclusions.js fails closed on a typo'd flag ------------------
 // Before this, `parseArgs` in this binary accepted any `--flag`: a typo
 // (`--reasno`, `--evidnce`, `--tenat`) landed in a bucket nothing read and the
