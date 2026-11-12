@@ -144,7 +144,8 @@ function renderRow(row) {
 function staleHeadline(stale) {
   if (!stale) return '';
   const counts = stale.counts;
-  return `; stale-premise restatements (last ${stale.days} days): ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}`;
+  const endorsed = counts.endorsed + counts['endorsed-with-edits'];
+  return `; stale-premise restatements (last ${stale.days} days): ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}${endorsed ? `, ${endorsed} endorsed` : ''}`;
 }
 
 function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus, staleNotice, offset, configs }) {
