@@ -9,6 +9,20 @@ $outDir = "$FleetHome\state\watch"
 $logPath = "$outDir\watch.log"
 New-Item -ItemType Directory -Force $outDir | Out-Null
 
+# Ticket 443: over 10 MB the log keeps its newest 5 MB, cut just after a line feed, before this tick
+# writes. Replace is atomic, so a crash leaves the old log whole; no line feed in the tail empties it.
+if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 10MB) {
+  $bytes = [IO.File]::ReadAllBytes($logPath)
+  $lineFeed = [Array]::IndexOf($bytes, [byte]10, $bytes.Length - 5MB)
+  $keepFrom = if ($lineFeed -lt 0) { $bytes.Length } else { $lineFeed + 1 }
+  $kept = New-Object byte[] ($bytes.Length - $keepFrom)
+  [Array]::Copy($bytes, $keepFrom, $kept, 0, $kept.Length)
+  [IO.File]::WriteAllBytes("$logPath.trim", $kept)
+  # The backup argument is required: a null one throws on Windows PowerShell 5.1 (.NET Framework).
+  [IO.File]::Replace("$logPath.trim", $logPath, "$logPath.bak")
+  Remove-Item -LiteralPath "$logPath.bak" -Force
+}
+
 $nodePath = $env:FLEET_NODE_PATH
 if ($nodePath -and -not (Test-Path -LiteralPath $nodePath -PathType Leaf)) {
   $message = "FLEET_NODE_PATH does not point to a Node executable: $nodePath"
