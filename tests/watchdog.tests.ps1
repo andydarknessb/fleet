@@ -1663,6 +1663,12 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
     Assert-True ((@($tw6c.finalize.finalized) | ForEach-Object { $_.issue }) -contains 777 -and -not $tw6c.finalize.error) "the finalize result must survive a frontier failure (got $(($tw6c.finalize | ConvertTo-Json -Compress -Depth 4)))"
     Assert-True ("$($tw6c.frontierError)" -match 'after the finalize' -and $tw6c.decision -eq 'none' -and $tw6c.reason -match 'fail closed') "a frontierError must be recorded and wake nothing (got $($tw6c.decision): $($tw6c.reason); $($tw6c.frontierError))"
     Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6c) 'a frontier failure after a finalize must not rotate'
+    # ticket 453: T6c is the first unreadable tick under principal-live, so it pages the Principal's frontier at normal priority,
+    # naming the tenant and the error. Case T6 below sees the same frontier still unreadable and must not page it again.
+    Assert-True (@($t6c.conditions) -contains 'triage-frontier-unreadable:principal:test') 'an unreadable Principal frontier must raise its tenant condition'
+    $t6cEntry = @($t6c.newlyPaged | Where-Object { $_.key -eq 'triage-frontier-unreadable:principal:test' })[0]
+    Assert-True ($null -ne $t6cEntry -and $t6cEntry.priority -eq 'normal') 'an unreadable Principal frontier must page at normal priority'
+    Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'triage-frontier-unreadable:principal:test: .*test.*after the finalize') 'the unreadable-frontier page must name the tenant and carry the error'
     Assert-True ((@(Get-AlertLines | Where-Object { ($_ | ConvertFrom-Json).kind -eq 'triage-finalize' }).Count) -ge 1 -and @(Get-AlertLines).Count -eq $alertsBefore6c + 1) 'the finalize audit line must survive a frontier failure'
   } finally {
     if ($oldNodePathT6a) { $env:FLEET_NODE_PATH = $oldNodePathT6a } else { Remove-Item Env:FLEET_NODE_PATH -ErrorAction SilentlyContinue }
@@ -1676,11 +1682,10 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   $tw6 = @($t6.triageWakes | Where-Object { $_.tenant -eq 'test' })[0]
   Assert-True ("$($tw6.frontierError)" -ne '' -and $tw6.decision -eq 'none' -and $tw6.reason -match 'fail closed') "an unreadable frontier must fail closed (got $($tw6.decision): $($tw6.reason); error=$($tw6.frontierError))"
   Assert-True (@(Get-TriageRotateCalls).Count -eq $callsBefore6) 'an unreadable frontier must not rotate'
-  # ticket 453: the same tick pages the Principal's unreadable frontier at normal priority, naming the tenant and the error.
-  Assert-True (@($t6.conditions) -contains 'triage-frontier-unreadable:principal:test') 'an unreadable Principal frontier must raise its tenant condition'
-  $t6Entry = @($t6.newlyPaged | Where-Object { $_.key -eq 'triage-frontier-unreadable:principal:test' })[0]
-  Assert-True ($null -ne $t6Entry -and $t6Entry.priority -eq 'normal') 'an unreadable Principal frontier must page at normal priority'
-  Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'triage-frontier-unreadable:principal:test: .*test.*triage\.js') 'the Principal page must name the tenant and carry the triage error'
+  # ticket 453: the Principal's frontier is still unreadable here, so its condition stands and T6c's page is not repeated.
+  Assert-True (@($t6.conditions) -contains 'triage-frontier-unreadable:principal:test') 'a still-unreadable Principal frontier must keep its condition standing'
+  Assert-True (@($t6.newlyPaged | Where-Object { $_.key -eq 'triage-frontier-unreadable:principal:test' }).Count -eq 0) 'a standing unreadable Principal frontier must not page again'
+  Assert-True ((Get-Content "$testRoot\state\watchdog\banner.txt" -Raw) -match 'triage-frontier-unreadable:principal:test: .*test.*triage\.js') 'the Principal condition must name the tenant and carry the triage error'
   Assert-True ("$($tw6.finalize.error)" -match 'did not complete') "the failed tick must be recorded as the finalize error (got $(($tw6.finalize | ConvertTo-Json -Compress -Depth 4)))"
   $env:FLEET_TRIAGE_ISSUES_FIXTURE = $triageFixture
 
