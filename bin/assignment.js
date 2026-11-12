@@ -889,6 +889,10 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
     if (refusal && refusal.reason) parts.push(`launch refused: ${refusal.reason}`);
     if (refusal && 'reservationReleased' in refusal) parts.push(`reservationReleased=${refusal.reservationReleased}`);
     if (refusal && refusal.releaseError) parts.push(`releaseError=${refusal.releaseError}`);
+    // ticket 455 review: what launch.ps1 kept, so the lead sees why the next launch of this issue will be refused.
+    if (refusal && refusal.worktreeKept) parts.push('worktreeKept=true');
+    if (refusal && refusal.sessionListUnreadable) parts.push('sessionListUnreadable=true (the session list could not be read after the wait; nothing was released)');
+    if (refusal && refusal.sessionStopFailed) parts.push(`sessionStopFailed=true (job ${refusal.jobId}; claude stop did not succeed)`);
     if (stderr) parts.push(stderr);
     if (!parts.length) parts.push(String(error.message || error));
     throw new WorkStateError('LAUNCH_FAILED', parts.join('; '), { exitCode: error.status ?? null, refusal, stderr, timedOut });

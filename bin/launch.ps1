@@ -295,16 +295,30 @@ if ($Manifest -and -not $DryRun) {
 }
 
 # ticket 455: one launch per name. A named mutex, keyed like the roster lock (the fleet root, then the name), covers this
-# launch from its name check to its roster write. A second launch of the name waits here, at most 120 s, then passes the
-# name check as it always did. The finally at the end of the script releases it on every exit.
-$nameLockKey = [BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($FleetHome.ToLowerInvariant()))).Replace('-', '').ToLowerInvariant()
-$nameMutex = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$nameLockKey-$Name"
+# launch from its name check to its roster write. A second launch of the name waits here, at most 10 s; past that it is
+# refused with exit 8 (launchInFlight), since the launch holding the name is not going to end inside that wait. The finally
+# at the end of the script releases the mutex on every exit, and a mutex that could not be created or taken is refused too.
 $nameHeld = $false
+$nameMutex = $null
 try {
-  # an abandoned mutex (a launch died holding it) is ours now
-  try { $nameHeld = $nameMutex.WaitOne(120000) } catch [System.Threading.AbandonedMutexException] { $nameHeld = $true }
-  # no release: the wait ran out before this launch wrote or released anything; the launch holding the name owns what follows
-  if (-not $nameHeld) { Write-Output (@{ launched = $false; reason = "another launch of '$Name' still holds the launch lock after 120 s; nothing was touched" } | ConvertTo-Json -Compress); exit 8 }
+  try {
+    $nameLockKey = [BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($FleetHome.ToLowerInvariant()))).Replace('-', '').ToLowerInvariant()
+    $nameMutex = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$nameLockKey-$Name"
+    # an abandoned mutex (a launch died holding it) is ours now
+    try { $nameHeld = $nameMutex.WaitOne(10000) } catch [System.Threading.AbandonedMutexException] { $nameHeld = $true }
+  } catch {
+    # no release: the lock could not be created or taken, so nothing was written or released; the reservation (if any) stays
+    Write-Output (@{ launched = $false; launchLockFailed = $true; reason = "the launch lock for '$Name' could not be taken ($($_.Exception.Message)); nothing was touched" } | ConvertTo-Json -Compress); exit 9
+  }
+  # no release: another launch of this name holds the lock; this one has touched nothing, and what it reserved stays for that launch to settle
+  if (-not $nameHeld) { Write-Output (@{ launched = $false; launchInFlight = $true; reason = "another launch of '$Name' is in flight (it holds the launch lock); nothing was touched" } | ConvertTo-Json -Compress); exit 8 }
+  # ticket 455 review: the roster is read again now that the lock is held. The read before the wait predates any row another launch wrote while this one waited.
+  $live = Get-LiveRoster
+  # no release: a -Recover holds no reservation of its own. If the roster row it recovers changed while it waited, it is not restarted on the row it read before the wait.
+  if ($recoverValidated) {
+    $freshRecoverRow = $live.sessions | Where-Object { $_.name -eq $Name -and $_.role -eq 'ic' -and $_.status -eq 'active' -and $_.manifest } | Select-Object -Last 1
+    if ((ConvertTo-Json -Compress -Depth 6 $freshRecoverRow) -ne (ConvertTo-Json -Compress -Depth 6 $recoverableRow)) { Write-Output (@{ launched = $false; reason = "the roster row for '$Name' changed while this recovery waited for the launch lock; nothing was touched" } | ConvertTo-Json -Compress); exit 3 }
+  }
   # --- gates ---
   if ((Test-Paused) -and -not $Force) {
     $p = Get-Content "$FleetHome\state\PAUSE" -Raw
@@ -664,9 +678,11 @@ try {
     # no release: a worktree already at this path is an earlier launch's. The duplicate-name and job-state guards above already said no ic-N session is live, so nothing is about to acknowledge and nothing here removes it: the janitor never removes the worktree of an open issue whose record is assigned or absent, so an operator must remove it. Releasing here would only re-offer the issue into an assign, launch, refuse loop that fails at this line every time (the reservation is what keeps the planner from doing that).
     if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
     New-Item -ItemType Directory -Force $worktreeParent | Out-Null
+    # ticket 455 review: the flag is set before the add, not after its exit code. An add that exits non-zero can still leave the
+    # worktree and its branch behind (a failing post-checkout hook), and the existence check above, made inside the lock, proved the path absent.
+    $createdWorktree = $true
     & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch failed: could not create the assignment worktree from $expectedBase"; Remove-FailedAssignmentWorktree; Write-Error "could not create assignment worktree from $expectedBase$($r.note)"; exit 4 }
-    $createdWorktree = $true
     # ic.md step 6: the PR body file is .fleet-pr-body.md in the worktree root, written with
     # the Write tool, not a heredoc into a temp directory outside the allowed directories
     # (fleet #171, rehearsal wait 4). The repo's info/exclude, shared by every worktree,
@@ -732,13 +748,12 @@ try {
   }
   $adopted = $false
   $lateRead = $true
-  if (-not $row) {
-    # ticket 455: one read of the session list by name before any release. A session that registered after the wait is
-    # adopted, and the success path below runs as if it had appeared in time. A read that fails cannot show that no
-    # session exists, so nothing is released or removed then.
-    try { $row = Get-DaemonSessions -Strict -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1 } catch { $lateRead = $false }
-    $adopted = [bool]$row
-  }
+  # ticket 455: one read of the session list by name before any release. A session that registered after the wait is
+  # adopted, and the success path below runs as if it had appeared in time. A read that fails cannot show that no
+  # session exists, so nothing is released or removed then.
+  $polledRow = $row
+  $row = if ($row) { $row } else { try { Get-DaemonSessions -Strict -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1 } catch { $lateRead = $false } }
+  $adopted = (-not $polledRow) -and [bool]$row
   if (-not $row) {
     $failedRow = Get-DaemonSessions -All -NoRetry |
       Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
@@ -761,8 +776,9 @@ try {
     # stays only if the assignment is demonstrably live: the record left `assigned` (a late
     # session acknowledged) or the session list now shows the job. Otherwise it goes as before:
     # a stranded worktree makes every relaunch exit 4 ("already exists") before it can release.
-    # An unreadable record and daemon list default to removing the worktree (the pre-#251
-    # behaviour): keeping it on no evidence is what strands every relaunch.
+    # An unreadable record or daemon list there removes the worktree as before (the pre-#251 behaviour): keeping it on no
+    # evidence is what strands every relaunch. A session list that cannot be read before the release is a different case,
+    # handled above (ticket 455): nothing is released or removed then, since no session can be ruled out.
     $keepWorktree = -not $lateRead
     if ($Manifest -and -not $released -and $lateRead) {
       try {
@@ -795,11 +811,17 @@ try {
   } catch {
     $rosterError = "$($_.Exception.Message)"
     if (-not $adopted) { throw }
-    # ticket 455: an adopted session that cannot be rostered is stopped, then released like a launch with no session.
-    try { [void](Invoke-ClaudeCli -Arguments @('stop', "$($row.id)")) } catch {}
+    # ticket 455: an adopted session that cannot be rostered is stopped, then released like a launch with no session. A stop
+    # that does not succeed (a non-zero exit, a timeout, no CLI) keeps the reservation and the worktree instead: the session
+    # may still run in that worktree, and only the operator can tell.
+    $stop = $null
+    try { $stop = Invoke-ClaudeCli -Arguments @('stop', "$($row.id)") } catch {}
+    $stopped = [bool]($stop -and -not $stop.startError -and -not $stop.timedOut -and $stop.exitCode -eq 0)
+    # no release: the adopted session may still be running in its worktree, so the reservation and the worktree stay for the operator
+    if (-not $stopped) { Write-Output (@{ launched = $false; reason = "the roster write for the adopted session '$Name' failed, and claude stop $($row.id) did not succeed: its reservation and worktree are kept (sessionStopFailed)"; jobId = "$($row.id)"; sessionStopFailed = $true; reservationReleased = $false; releaseError = $null; worktreeKept = [bool]$Manifest } | ConvertTo-Json -Compress); exit 5 }
     $r = Release-ReservationOnRefusal "launch failed: the roster write for the adopted session '$Name' failed: $rosterError"
     if ($r.released) { Remove-FailedAssignmentWorktree }
-    Write-Output (@{ launched = $false; reason = "the roster write for the adopted session '$Name' failed: $rosterError"; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 5
+    Write-Output (@{ launched = $false; reason = "the roster write for the adopted session '$Name' failed: $rosterError"; reservationReleased = $r.released; releaseError = $r.error; worktreeKept = [bool]($Manifest -and -not $r.released) } | ConvertTo-Json -Compress); exit 5
   }
 
   # 02/03: reserve the unit before returning. The roster entry now exists, so the projection

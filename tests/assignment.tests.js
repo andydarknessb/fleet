@@ -166,6 +166,21 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
 });
 
+// ticket 455 review: a refused launch says which parts it kept. The message names a worktree kept, an unreadable session
+// list and a stop that did not succeed, so the lead sees why the next launch will be refused.
+test('ticket 455: a refused launch names the worktree kept, the unreadable list and the failed stop', () => {
+  const root = rootDir();
+  const manifestPath = path.join(root, 'manifest-70.json');
+  fs.writeFileSync(manifestPath, JSON.stringify({ id: 'm70', workRecordId: 'endzone:issue-70', status: 'pending-ack' }));
+  const runner = () => {
+    const error = new Error('Command failed');
+    error.stdout = `${JSON.stringify({ launched: false, reason: 'claude --bg did not produce a session', reservationReleased: false, worktreeKept: true, sessionListUnreadable: true, sessionStopFailed: true, jobId: 'job-70' })}\n`;
+    error.stderr = '';
+    throw error;
+  };
+  assert.throws(() => launchReservedAssignment({ manifestPath, workRecordId: 'endzone:issue-70', runner }), (error) => error.code === 'LAUNCH_FAILED' && /worktreeKept=true/.test(error.message) && /sessionListUnreadable=true/.test(error.message) && /sessionStopFailed=true \(job job-70;/.test(error.message));
+});
+
 // fleet #437: the launch door starts only the manifest a Work record was reserved with. A hand-written
 // manifest for a record reserved with none, and a byte copy of a reserved manifest at another path, are
 // refused, and the refusal leaves the record and both files untouched (no invalidation sidecar).
