@@ -5,7 +5,8 @@ $ErrorActionPreference = 'Stop'
 # retire.ps1 driven end to end leaves a row that now holds a newer launch's job (or no row) untouched, because the
 # mock CLI's `stop` swaps the roster in between retire's two writes; and launch.ps1 / retire.ps1 never call
 # Save-LiveRoster directly. fleet #449: Write-Json renames a temporary file over roster.json, so a reader sees the old
-# roster or the new one, never part of one, and a failed write leaves no temporary file behind.
+# roster or the new one, never part of one, and a failed write leaves no temporary file behind. A reader holding the
+# roster delays the rename, not the write; a hold past the 2 s bound makes the write throw, the old roster intact.
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
 function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
@@ -46,6 +47,41 @@ for ($i = 1; $i -le $Writes; $i++) {
 New-Item -ItemType Directory -Path "$Dir\blocked" | Out-Null
 try { Write-Json "$Dir\blocked" ([pscustomobject]@{ a = 1 }); Write-Output 'no-throw' } catch { Write-Output 'threw' }
 '@
+
+# fleet #449: calls Write-Json once the parent holds roster.json, and reports its outcome, its duration and its finish time (UTC ticks).
+$holderWriterSource = @'
+param([string]$Path, [string]$GoFile, [string]$ReadyFile)
+. "$PSScriptRoot\_common.ps1"
+[IO.File]::WriteAllText($ReadyFile, '')
+$goBy = (Get-Date).AddSeconds(20)
+while (-not (Test-Path $GoFile) -and (Get-Date) -lt $goBy) { Start-Sleep -Milliseconds 5 }
+$sw = [Diagnostics.Stopwatch]::StartNew()
+try { Write-Json $Path ([pscustomobject]@{ sessions = @([pscustomobject]@{ name = 'fresh' }) }); $outcome = 'wrote' } catch { $outcome = 'threw' }
+Write-Output "$outcome $($sw.ElapsedMilliseconds) $([DateTime]::UtcNow.Ticks)"
+'@
+
+# fleet #449: a child writes roster.json while this process holds it open without Delete sharing for $HoldMs.
+function Invoke-WriteUnderHold {
+  param([string]$Dir, [int]$HoldMs)
+  [IO.Directory]::CreateDirectory($Dir) | Out-Null
+  $file = "$Dir\roster.json"; $go = "$Dir\go"; $ready = "$Dir\ready"
+  Write-Utf8 "$testRoot\bin\holder-writer.ps1" $holderWriterSource
+  Write-Utf8 $file '{"sessions":[{"name":"old"}]}'
+  $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$testRoot\bin\holder-writer.ps1`" -Path `"$file`" -GoFile `"$go`" -ReadyFile `"$ready`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$Dir\child.out" -RedirectStandardError "$Dir\child.err"
+  $null = $child.Handle
+  $script:writers += [pscustomobject]@{ tag = $Dir; process = $child }
+  $readyBy = (Get-Date).AddSeconds(20); while (-not (Test-Path $ready) -and (Get-Date) -lt $readyBy) { Start-Sleep -Milliseconds 20 }
+  Assert-True (Test-Path $ready) "the holder writer did not start within 20 s: $(Get-Content "$Dir\child.err" -Raw)"
+  $hold = [IO.File]::Open($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+  Write-Utf8 $go ''
+  Start-Sleep -Milliseconds $HoldMs
+  $releasedAt = [DateTime]::UtcNow.Ticks
+  $hold.Dispose()
+  Assert-True ($child.WaitForExit(15000)) "the holder writer did not finish within 15 s"
+  Assert-True ($child.ExitCode -eq 0) "the holder writer exited $($child.ExitCode): $(Get-Content "$Dir\child.err" -Raw)"
+  $fields = (Get-Content "$Dir\child.out" -Raw).Trim() -split ' '
+  return [pscustomobject]@{ outcome = $fields[0]; ms = [long]$fields[1]; finishedAt = [long]$fields[2]; releasedAt = $releasedAt; file = $file }
+}
 
 $writers = @()
 try {
@@ -103,6 +139,21 @@ try {
   Assert-True ($finalRows -eq 60) "the last write must be the roster that stands, got $finalRows rows"
   $temporaries = @(Get-ChildItem -LiteralPath $atomicDir -Force -Filter '*.tmp')
   Assert-True ($temporaries.Count -eq 0) "no temporary file may be left behind: $($temporaries.Name -join ', ')"
+
+  # Case 1c (fleet #449): a reader holding roster.json without Delete sharing fails the rename for a moment, not the write.
+  # Write-Json waits out a 300 ms hold, the new roster stands afterwards, and no temporary file is left.
+  $held = Invoke-WriteUnderHold -Dir "$testRoot\held" -HoldMs 300
+  Assert-True ($held.outcome -eq 'wrote') "Write-Json must wait out a reader's hold, not throw: outcome $($held.outcome) after $($held.ms) ms"
+  Assert-True ($held.finishedAt -ge $held.releasedAt) 'the write must finish after the hold is released, so the hold really blocked the rename'
+  Assert-True ((Get-Content $held.file -Raw | ConvertFrom-Json).sessions[0].name -eq 'fresh') 'the new roster must stand after the hold'
+  Assert-True (@(Get-ChildItem -LiteralPath "$testRoot\held" -Force -Filter '*.tmp').Count -eq 0) 'no temporary file may be left behind after a held write'
+
+  # Case 1d (fleet #449): a target held past the 2 s bound makes Write-Json throw; the old roster stands and no temporary file is left.
+  $stuck = Invoke-WriteUnderHold -Dir "$testRoot\stuck" -HoldMs 2600
+  Assert-True ($stuck.outcome -eq 'threw') "a target held past the bound must make Write-Json throw: outcome $($stuck.outcome)"
+  Assert-True ($stuck.ms -ge 2000 -and $stuck.ms -lt 5000) "Write-Json must keep trying for about 2 s before it gives up, took $($stuck.ms) ms"
+  Assert-True ((Get-Content $stuck.file -Raw | ConvertFrom-Json).sessions[0].name -eq 'old') 'the old roster must stand when the write gives up'
+  Assert-True (@(Get-ChildItem -LiteralPath "$testRoot\stuck" -Force -Filter '*.tmp').Count -eq 0) 'no temporary file may be left behind after a write that gives up'
 
   # Case 2-4: retire.ps1 end to end. The mock CLI's `stop` copies $retireRoot\swap.json over the roster, so retire's
   # second write (after stop) meets whatever a newer launch, or nothing, left in its place.
