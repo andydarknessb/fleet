@@ -846,7 +846,8 @@ test('fleet#54: an allowlist item the recognizer cannot place is reported, and a
   assert.deepEqual(normalized.unrecognizedPaths, ['assignment.js', 'weird~name']);
 
   const root = rootDir();
-  const base = 'c'.repeat(40);
+  // ticket 455: the base is the object reserveAssignment takes ({ remote, ref, sha }); a bare sha string is refused by buildManifest.
+  const base = { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) };
   assert.throws(
     () => reserveAssignment({ root, issue: issue(1296, { body }), tenant: 'endzone', readyLabel: 'ready-for-agent', base }),
     (error) => error.code === 'PARTIAL_RESERVATIONS' && error.issue === 1296 && /assignment.js/.test(error.message) && /--reservations/.test(error.message) && error.unrecognizedPaths.length === 2,

@@ -359,11 +359,22 @@ try {
   Clear-ActiveRecords
   $fixture49 = "$testRoot\issues-49.json"
   Write-Utf8 $fixture49 ('[{"number":49,"title":"Refusal fixture","url":"https://github.com/owner/repo/issues/49","body":' + ("Change ``src/fixture-49.js``." | ConvertTo-Json) + ',"createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]')
-  foreach ($bad in @(@('--model', 'deepseek'), @('--effort', 'high'), @('--permissions', 'bogus'))) {
+  # ticket 455 (ruling): every value launch.ps1 refuses from the manifest alone is refused by assign too. The base cases
+  # (launch.ps1's invalid base precondition: a remote, a ref and a 40-hex sha) pass --fixture, which takes the base as given.
+  $noDefault = "$testRoot\tenants\nodefault.json"
+  Write-Utf8 $noDefault ('{"name":"test","github":"owner/repo","readyLabel":"ready-for-agent","branchPrefix":"fleet/","maxIcs":2,"repo":' + ($repoPath | ConvertTo-Json) + '}')
+  $testTenant = "$testRoot\tenants\test.json"
+  foreach ($bad in @(
+      @{ Label = '--model deepseek'; Expect = 'Haiku 5\.5 only'; Args = @('--tenant-config', $testTenant, '--base-sha', $baseSha, '--model', 'deepseek') },
+      @{ Label = '--effort high'; Expect = 'xhigh or max'; Args = @('--tenant-config', $testTenant, '--base-sha', $baseSha, '--effort', 'high') },
+      @{ Label = '--permissions bogus'; Expect = 'unknown permission profile'; Args = @('--tenant-config', $testTenant, '--base-sha', $baseSha, '--permissions', 'bogus') },
+      @{ Label = '--base-sha bbb (not 40 hex)'; Expect = 'invalid base precondition'; Args = @('--tenant-config', $testTenant, '--base-sha', 'bbb') },
+      @{ Label = 'a tenant with no defaultBranch (no ref)'; Expect = 'invalid base precondition'; Args = @('--tenant-config', $noDefault, '--base-sha', $baseSha) }
+    )) {
     $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $badOut = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant test --tenant-config "$testRoot\tenants\test.json" --fixture $fixture49 --base-sha $baseSha --parent pl-test @bad 2>&1 | Out-String; $badCode = $LASTEXITCODE }
+    try { $badOut = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant test --fixture $fixture49 --parent pl-test @($bad.Args) 2>&1 | Out-String; $badCode = $LASTEXITCODE }
     finally { $ErrorActionPreference = $eap }
-    Assert-True ($badCode -ne 0 -and $null -eq (Get-RecordState 49) -and @(Get-ChildItem "$testRoot\state\manifests" -Filter '*issue-49*' -ErrorAction SilentlyContinue).Count -eq 0) "assign refuses '$($bad -join ' ')' before any reservation exists (exit $badCode): $badOut"
+    Assert-True ($badCode -ne 0 -and $badOut -match $bad.Expect -and $null -eq (Get-RecordState 49) -and @(Get-ChildItem "$testRoot\state\manifests" -Filter '*issue-49*' -ErrorAction SilentlyContinue).Count -eq 0) "assign refuses $($bad.Label) before any reservation exists, naming it (exit $badCode): $badOut"
   }
 
   # ticket 455: a worktree that existed before this launch is not this launch's to remove: the launch refuses at its

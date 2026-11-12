@@ -640,6 +640,8 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
   model = icModel(model);
   effort = icEffort(effort);
   permissions = icPermissions(model, permissions);
+  // ticket 455: the base precondition launch.ps1 refuses (a remote, a ref and a 40-hex sha) is refused here, before the manifest is written or reserved.
+  if (!base || !base.remote || !base.ref || !/^[0-9a-f]{40}$/i.test(String(base.sha ?? ''))) throw new WorkStateError('INVALID_BASE', `invalid base precondition: the base needs a remote, a ref and a 40-hex sha, got remote '${base?.remote ?? ''}', ref '${base?.ref ?? ''}', sha '${base?.sha ?? ''}'`);
   const normalized = normalizeIssue(issue);
   if (normalized.commentsTruncated) throw new WorkStateError('INCOMPLETE_ISSUE_CRITERIA', `issue #${normalized.number} has more comments than the assignment query can pin`);
   const createdAt = now || new Date().toISOString();
