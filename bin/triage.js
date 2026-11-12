@@ -754,13 +754,13 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     const isRouted = [...labels].some((label) => routing.has(label));
     if (isRouted) { skipped.push({ number: issue.number, reason: `routed (${[...labels].filter((label) => routing.has(label)).join(', ')})` }); continue; }
 
-    // 1c. (#451) A superseded proposal with no successor: the session that superseded it died before proposing again. Served as a
-    // reproposal, marker or not; its superseded row is already written, so the Principal records `proposed` alone.
-    if (row && row.outcome && row.outcome.kind === 'superseded') { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: `superseded at ${row.outcome.at} with no newer proposal` }); continue; }
+    // (#451) A superseded proposal with no successor: the session that superseded it died before proposing again. It meets the
+    // skips of step 3 like any ticket, and is served there as a reproposal, marker or not (its superseded row is already written).
+    const supersededNoSuccessor = Boolean(row && row.outcome && row.outcome.kind === 'superseded');
 
     // 2. Marker present: re-propose only on a body change or the owner's ask; otherwise it is waiting.
     const ownerAsksAgain = newest && newest.author === owner && REPROPOSE_RE.test(newest.body) && (!proposed || newest.createdAt > proposed.at);
-    if (labels.has(marker)) {
+    if (labels.has(marker) && !supersededNoSuccessor) {
       if (!row || !row.proposed) { skipped.push({ number: issue.number, reason: 'marker present with no ledger record; leave it to a human' }); continue; }
       if (proposed && issue.bodyHash !== proposed.bodyHash) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'body changed since the proposal' }); continue; }
       if (ownerAsksAgain) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
@@ -780,7 +780,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     }
 
     // 3. A fresh candidate: unrouted or carrying a triage label.
-    if (!hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
+    if (!supersededNoSuccessor && !hasTriageLabel && labels.size > 0 && [...labels].every((label) => routing.has(label) || label === marker)) { skipped.push({ number: issue.number, reason: 'routed' }); continue; }
     // Settled at this body: the triage is done, and a label the owner moves it to
     // afterwards (a hold such as haiku-rehearsal, or none) is the owner's routing, not
     // a new ask. Settled is a finalized row (the hash it restated, else the proposal's) or a
@@ -808,6 +808,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     // fleet role may write (the guard hook), a second lock beside the login.
     // A Re-propose on an issue the ledger already decided is a re-proposal, as it is under the marker.
     if (ownerAsksAgain && settled) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: 'owner asked for a new proposal' }); continue; }
+    if (supersededNoSuccessor) { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: `superseded at ${row.outcome.at} with no newer proposal` }); continue; }
     tickets.push({ kind: 'ticket', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: hasTriageLabel ? `labelled ${[...labels].filter((label) => triageLabels.has(label)).join(', ')}` : 'unrouted' });
   }
 
@@ -1427,7 +1428,8 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
   };
 
   // Recovery (section 5): a claim of ours with no finalized row is a run cut short. Finish it, after the checks a first run makes
-  // (#451: the owner-commented check and the proposal gate), unless a Ruling newer than the approval already stands: its poster passed them.
+  // (#451), unless the script's own Ruling (its marker) newer than the approval already stands: the run that posted it passed them.
+  // Any other Ruling newer than the approval is the Principal's, and a first run refuses it (clause 3).
   for (const issue of sorted) {
     const row = projection.byIssue[issue.number] || null;
     if (!row || !row.proposed || !row.outcome || row.finalized) continue;
@@ -1438,8 +1440,9 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
       if (!proposalComment) { leave('stale-proposal', 'recovery: proposal comment not found'); continue; }
       const approvalComment = issue.comments.find((comment) => comment.url && comment.url === row.outcome.commentUrl);
       const approvalAt = approvalComment ? approvalComment.createdAt : row.outcome.at;
-      const ruled = issue.comments.some((comment) => comment.createdAt > approvalAt && RULING_HEADING_RE.test(comment.body));
-      if (!ruled) {
+      const standing = issue.comments.filter((comment) => comment.createdAt > approvalAt && RULING_HEADING_RE.test(comment.body)).pop();
+      if (standing && !standing.body.includes('Finalized by script')) { leave('ruling-already-posted'); continue; }
+      if (!standing) {
         if (approvalComment && !isExactApproval(approvalComment.body)) { leave('not-exact-approval'); continue; }   // clause 2, as the first run
         if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > approvalAt)) { leave('owner-commented-after-approval'); continue; }
         const failures = proposalGate({ issue, row: { ...row, outcome: null }, proposal: proposalComment, approval: approvalComment || null, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });
