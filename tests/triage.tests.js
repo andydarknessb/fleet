@@ -679,6 +679,22 @@ test('#451: a superseded proposal with no successor is served as a reproposal, m
     assert.match(served.eligible[0].reason, /superseded at 2026-09-25T00:00:00.000Z with no newer proposal/);
     assert.equal(served.eligible[0].bodyHash, hash);
   }
+  // A superseded issue meets the skips a ticket meets: owner-assigned, a spec parent, held under a Frontier exclusion, or the owner's
+  // newest comment (not a Re-propose). None of them is served as a reproposal, marker or not.
+  const guarded = [
+    [{ assignees: [OWNER] }, {}, 'assigned to the owner'],
+    [{ openSubIssues: 1 }, {}, 'spec parent'],
+    [{}, { held: new Map([[7, 'frontier exclusion endzone:excl-7-1']]) }, 'held (frontier exclusion'],
+    [{ comments: [comment(OWNER, 'Thanks, looking into it.', '2026-09-25T00:30:00.000Z')] }, { fleetIdentity: FLEET }, 'owner has the newest comment'],
+  ];
+  for (const [options, extra, reason] of guarded) {
+    for (const labels of [[], ['triage-proposed']]) {
+      const skipped = frontier([issue(7, { body: OPEN_BODY, labels, ...options })], { entries, now: '2026-09-25T01:00:00.000Z', ...extra });
+      assert.deepEqual(skipped.eligible, [], `${reason} with labels [${labels}]`);
+      assert.equal(skipped.skipped.length, 1, reason);
+      assert.ok(skipped.skipped[0].reason.startsWith(reason), `${reason}: got "${skipped.skipped[0].reason}"`);
+    }
+  }
   assert.doesNotThrow(() => recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/new', model: 'fable', now: '2026-09-25T02:00:00.000Z' }), 'the successor is recorded without a second superseded row');
 });
 
@@ -1155,7 +1171,8 @@ function ghRunner(seed, write, onQuery) {
 }
 
 test('#207: a run cut short is finished by the next run: one Ruling, the labels, one finalized row', () => {
-  const ruling = { id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: '## Ruling\nApproved without edits.', createdAt: '2026-09-11T00:01:00.000Z' };
+  // The Ruling the script posts carries its marker; a resumed claim with any other Ruling is the Principal's (#451).
+  const ruling = { id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: `## Ruling\nApproved without edits: ${approvalUrl(40)}. Finalized by script (fleet #207).`, createdAt: '2026-09-11T00:01:00.000Z' };
   for (const [name, extra, labels] of [
     ['claim with no Ruling', [], ['needs-triage', 'triage-proposed']],
     ['Ruling but no label', [ruling], ['needs-triage', 'triage-proposed']],
@@ -1198,6 +1215,20 @@ test('#451: a resumed claim is refused after the body was edited, the owner comm
   }
 });
 
+// #451: a Ruling the script did not post is the Principal's, and every fleet session posts under the owner's login, so the script
+// must not finish a resumed claim over it: the first run would refuse it (clause 3), and so does the resume.
+test('#451: a Ruling the script did not post leaves a resumed claim to the Principal: no ready label, nothing finalized', () => {
+  const byHand = { id: 'hand', url: 'https://github.com/owner/repo/issues/40#issuecomment-hand', author: FLEET, body: '## Ruling\nRouted to needs-info: the caption is out of scope.', createdAt: '2026-09-11T00:01:00.000Z' };
+  const world = finalizeWorld({ each: () => ({ labels: ['needs-triage', 'triage-proposed'], comments: thread(40, { extraComments: [byHand] }) }) });
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, commentUrl: approvalUrl(40), actor: 'finalize-script', now: '2026-09-11T00:00:30.000Z' });
+  const result = world.finalize();
+  assert.deepEqual(result.finalized, []);
+  assert.deepEqual(result.left.map((entry) => [entry.issue, entry.reason]), [[40, 'ruling-already-posted']]);
+  assert.deepEqual([...world.fixtureIssue().labels].sort(), ['needs-triage', 'triage-proposed'], 'no ready label');
+  assert.equal(rulingsOn(world.fixtureIssue()).length, 1, 'only the Principal\'s Ruling; the script posts none');
+  assert.deepEqual(world.ledger().slice(1).map((row) => row.kind), ['approved'], 'nothing finalized');
+});
+
 test('#207: a failed GitHub write after the claim is retried by the next run without a second Ruling', () => {
   const world = finalizeWorld();
   const seed = JSON.parse(fs.readFileSync(world.fixture, 'utf8'));
@@ -1213,7 +1244,7 @@ test('#207: a failed GitHub write after the claim is retried by the next run wit
   assert.match(first.errors[0].message, /502/);
   assert.deepEqual(writes, ['issue comment', 'issue edit']);
   assert.deepEqual(world.ledger().slice(1).map((row) => row.kind), ['approved'], 'the claim stands, so the Principal cannot also rule');
-  seed[0].comments.push({ id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: '## Ruling\nApproved without edits.', createdAt: '2026-09-11T00:01:00.000Z' });
+  seed[0].comments.push({ id: 'ruling', url: 'https://github.com/owner/repo/issues/40#issuecomment-ruling', author: FLEET, body: `## Ruling\nApproved without edits: ${approvalUrl(40)}. Finalized by script (fleet #207).`, createdAt: '2026-09-11T00:01:00.000Z' });
   writes.length = 0;
   const second = triage.finalizeApprovals({ root: world.root, tenant: 'endzone', now: NOW, runner: ghRunner(seed, write) });
   assert.deepEqual(second.finalized.map((row) => row.issue), [40]);
