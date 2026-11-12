@@ -906,8 +906,10 @@ try {
       # ticket 453 review: a launch refusal count is consecutive. A tick that did not refuse that name (its launch not asked for, or it started)
       # drops it; a failed respawn keeps its count.
       $refusedNow = @($launchRefusals | ForEach-Object { $_.name })
+      # A tick whose sentinel-check child could not read the sessions asked for no launch: it says nothing about refusals, so counts stay.
+      $childReadFailed = [bool]($check -and $check.PSObject.Properties['daemonReadError'] -and $check.daemonReadError)
       foreach ($rp in @($respawnFailState.PSObject.Properties)) {
-        if ($rp.Value.PSObject.Properties['launch'] -and $rp.Value.launch -eq $true -and $refusedNow -notcontains $rp.Name) { $respawnFailState.PSObject.Properties.Remove($rp.Name); $respawnFailChanged = $true }
+        if (-not $childReadFailed -and $rp.Value -and $rp.Value.PSObject.Properties['launch'] -and $rp.Value.launch -eq $true -and $refusedNow -notcontains $rp.Name) { $respawnFailState.PSObject.Properties.Remove($rp.Name); $respawnFailChanged = $true }
       }
       foreach ($rf in @($check.respawnFailed) + $launchRefusals) {
         $rn = "$($rf.name)"; if (-not $rn) { continue }
