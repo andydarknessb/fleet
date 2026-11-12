@@ -1477,6 +1477,95 @@ test('#251: acknowledging a live manifest still works when the manifest path is 
   assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
 });
 
+// fleet #434: an ack on a record already past `assigned` changes nothing. A session started on such a record (a recovered
+// or resumed IC, a record sent back for revision or escalated) runs the ack its hook printed; only a replay of the ack's
+// own key goes through the transition.
+function ledgerLineCount(root) {
+  const dir = path.join(root, 'state', 'events');
+  if (!fs.existsSync(dir)) return 0;
+  return fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl'))
+    .reduce((sum, name) => sum + fs.readFileSync(path.join(dir, name), 'utf8').split('\n').filter(Boolean).length, 0);
+}
+function resolutionWakeLines(root, recordId) {
+  const file = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)).filter((line) => line.recordId === recordId && line.wake === 'resolution');
+}
+function assignmentStartedAt(issueNumber) {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(issueNumber), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:01:00.000Z' });
+  return { root, id: result.manifest.workRecordId, manifestPath: result.manifestPath };
+}
+
+test('#434: a repeated ack on an implementing record changes nothing and does not throw', () => {
+  const { root, id, manifestPath } = assignmentStartedAt(4340);
+  const before = getRecord({ root, id });
+  const sidecar = fs.readFileSync(`${manifestPath}.acknowledged.json`, 'utf8');
+  const ledger = ledgerLineCount(root);
+  const again = acknowledgeAssignment({ root, workRecordId: id, expectedRevision: before.revision, manifestPath, now: '2026-09-30T00:02:00.000Z' });
+  assert.equal(again.alreadyStarted, true);
+  assert.equal(getRecord({ root, id }).state, 'implementing');
+  assert.equal(getRecord({ root, id }).revision, before.revision);
+  assert.equal(ledgerLineCount(root), ledger);
+  assert.equal(fs.readFileSync(`${manifestPath}.acknowledged.json`, 'utf8'), sidecar);
+});
+
+test('#434: an ack on a record sent back for revision leaves it in revision', () => {
+  const { root, id, manifestPath } = assignmentStartedAt(4341);
+  transitionRecord({ root, id, expectedRevision: 2, to: 'pr-open', idempotencyKey: 'pr-4341', evidence: 'pr opened', actor: 'test', now: '2026-09-30T00:02:00.000Z' });
+  transitionRecord({ root, id, expectedRevision: 3, to: 'review', idempotencyKey: 'review-4341', evidence: 'reviewed', actor: 'test', now: '2026-09-30T00:03:00.000Z' });
+  transitionRecord({ root, id, expectedRevision: 4, to: 'revision', idempotencyKey: 'revise-4341', evidence: 'sent back', actor: 'test', now: '2026-09-30T00:04:00.000Z' });
+  const revised = getRecord({ root, id });
+  assert.equal(revised.state, 'revision');
+  acknowledgeAssignment({ root, workRecordId: id, expectedRevision: revised.revision, manifestPath, now: '2026-09-30T00:05:00.000Z' });
+  assert.equal(getRecord({ root, id }).state, 'revision');
+  assert.equal(getRecord({ root, id }).revision, revised.revision);
+});
+
+test('#434: an ack on an escalated record leaves it escalated, with no resolution wake', () => {
+  const { root, id, manifestPath } = assignmentStartedAt(4342);
+  transitionRecord({ root, id, expectedRevision: 2, to: 'escalated', idempotencyKey: 'escalate-4342', evidence: 'premise is stale', actor: 'test', now: '2026-09-30T00:02:00.000Z' });
+  const escalated = getRecord({ root, id });
+  assert.deepEqual(resolutionWakeLines(root, id), []);
+  acknowledgeAssignment({ root, workRecordId: id, expectedRevision: escalated.revision, manifestPath, now: '2026-09-30T00:03:00.000Z' });
+  assert.equal(getRecord({ root, id }).state, 'escalated');
+  assert.equal(getRecord({ root, id }).revision, escalated.revision);
+  assert.deepEqual(resolutionWakeLines(root, id), []);
+});
+
+test('#434: a replay of the original ack still goes through the transition and returns the committed result', () => {
+  const { root, id, manifestPath } = assignmentStartedAt(4343);
+  const replay = acknowledgeAssignment({ root, workRecordId: id, expectedRevision: 1, manifestPath, now: '2026-09-30T00:05:00.000Z' });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.revision, 2);
+  assert.equal(replay.alreadyStarted, undefined);
+  assert.equal(getRecord({ root, id }).state, 'implementing');
+});
+
+test('#434: the first ack on an assigned record still transitions and writes the sidecar', () => {
+  const root = rootDir();
+  const result = reserveAssignment({
+    root, issue: issue(4344), tenant: 'endzone', tenantConfig: { branchPrefix: 'fleet/' }, readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'c'.repeat(40) }, now: '2026-09-30T00:00:00.000Z',
+  });
+  const first = acknowledgeAssignment({ root, workRecordId: result.manifest.workRecordId, expectedRevision: 1, manifestPath: result.manifestPath, now: '2026-09-30T00:01:00.000Z' });
+  assert.equal(first.replayed, false);
+  assert.equal(first.alreadyStarted, undefined);
+  assert.equal(first.record.state, 'implementing');
+  assert.equal(fs.existsSync(`${result.manifestPath}.acknowledged.json`), true);
+});
+
+test('#434: an ack on a record that is no longer active still fails NOT_FOUND', () => {
+  const { root, id, manifestPath } = assignmentStartedAt(4345);
+  transitionRecord({ root, id, expectedRevision: 2, to: 'escalated', idempotencyKey: 'escalate-4345', evidence: 'ruled', actor: 'test', now: '2026-09-30T00:02:00.000Z' });
+  abandonRecord({ root, id, expectedRevision: 3, idempotencyKey: 'abandon-4345', reason: 'ruled', now: '2026-09-30T00:03:00.000Z' });
+  assert.throws(() => acknowledgeAssignment({ root, workRecordId: id, expectedRevision: 4, manifestPath, now: '2026-09-30T00:04:00.000Z' }), (error) => error.code === 'NOT_FOUND');
+});
+
 // fleet#304: a placeholder (`server/services/<file>:<line>`) cut the path match at
 // `<`, so the bare directory was reserved and overlapped everything under it; and
 // `--reservations` with `--issue` was applied after the frontier, so a wrong

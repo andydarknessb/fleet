@@ -103,13 +103,19 @@ if ($role -eq 'arbiter') {
 # so the first useful turn can acknowledge without a lookup.
 if ($env:FLEET_ASSIGNMENT_MANIFEST -and $env:FLEET_WORK_RECORD_ID) {
   $ackRevision = $null
+  $ackState = $null
   try {
     $activeWork = Get-Content "$home_\state\work\active.json" -Raw -Encoding UTF8 | ConvertFrom-Json
     $ackRecord = $activeWork.records.PSObject.Properties[$env:FLEET_WORK_RECORD_ID]
-    if ($ackRecord) { $ackRevision = [int]$ackRecord.Value.revision }
+    if ($ackRecord) { $ackRevision = [int]$ackRecord.Value.revision; $ackState = "$($ackRecord.Value.state)" }
   } catch {}
   $revisionText = if ($null -ne $ackRevision) { "$ackRevision" } else { '<revision from node ' + $homeFwd + '/bin/work-state.js get --root ' + $homeFwd + ' --id ' + $env:FLEET_WORK_RECORD_ID + '>' }
-  Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $homeFwd/bin/assignment.js ack --root $homeFwd --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
+  # fleet #434: a record already past `assigned` (a recovered or resumed IC) gets its state, not the ack: the ack would transition it from there.
+  if ($ackState -and $ackState -ne 'assigned') {
+    Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID), now $ackState; branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. The record is no longer assigned: do not run assignment.js ack again."
+  } else {
+    Write-Output "Assignment manifest: $($env:FLEET_ASSIGNMENT_MANIFEST) (Work record $($env:FLEET_WORK_RECORD_ID); branch $($env:FLEET_ASSIGNMENT_BRANCH) at base $($env:FLEET_BASE_SHA), already checked out here). The GitHub issue body and comments stay the only copy of the criteria; the manifest carries pointers and pins both. In your first useful turn acknowledge it: node $homeFwd/bin/assignment.js ack --root $homeFwd --work-record-id $($env:FLEET_WORK_RECORD_ID) --expected-revision $revisionText"
+  }
 }
 # The handoff goes only to the session the rotation itself launched. Two rules. Exact: the
 # intent is `launched` and its newSessionId matches this session's id. Window (fleet #230:
