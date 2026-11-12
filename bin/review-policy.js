@@ -391,6 +391,35 @@ function buildFindings(stamp, suppliedFindings, priors, resolutions) {
   return findings;
 }
 
+// #446: every open finding of an artifact a review accounts for (its linked formal prior, a risk artifact the formal
+// consumes, or the earlier attestation or risk review at the same head) needs a resolution, the formal path's rule
+// (ADR 0009, ruling 5). Still-open findings are carried forward by buildFindings.
+function accountForPriors(priors, resolutions) {
+  for (const { data, path: priorPath } of priors) {
+    if (!data) continue;
+    const open = openFindings(data);
+    for (const finding of open) {
+      const resolution = resolutions?.[finding.id];
+      if (!resolution) {
+        throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} in ${priorPath} has no resolution`, { unresolved: open.map((entry) => entry.id), artifact: priorPath });
+      }
+      if (!RESOLUTION_VALUES.includes(resolution)) {
+        throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
+      }
+    }
+  }
+}
+
+// #324: a `ruled` resolution cites the Ruling that keeps the finding, and the citation belongs to no other resolution.
+// A bare --ruling parses to 'true' and cites nothing. Returns the citation, or null.
+function checkRuling(resolutions, value) {
+  const ruling = typeof value === 'string' && value.trim().length > 0 && value !== 'true' ? value.trim() : null;
+  const anyRuled = Object.values(resolutions || {}).includes('ruled');
+  if (anyRuled && !ruling) throw new ReviewPolicyError('RULING_REQUIRED', 'a ruled resolution cites the Ruling that keeps the finding: pass --ruling "<link or reference>"');
+  if (ruling && !anyRuled) throw new ReviewPolicyError('USAGE', '--ruling belongs to a ruled resolution: it cites the Ruling that keeps the finding');
+  return ruling;
+}
+
 // --- fleet#67: a recorded head is a commit ---------------------------------
 // `record --kind risk` on endzone #1382 accepted headSha
 // 0f2fb0064a7d4a0b5c1e2f3a4b5c6d7e8f9a0b1c: the branch head's real 8-character
@@ -598,6 +627,19 @@ function repostReviewStatus(options = {}) {
 // exactly as a formal record does. The head must be the PR's current head: an
 // attestation of a head the PR has moved past would stamp a tree nobody read.
 
+// #446: the newest attestation of one PR at one head, the prior a further attestation of that head accounts for.
+function latestAttestAt(root, recordId, headSha) {
+  const directory = reviewsDir(root, recordId);
+  if (!fs.existsSync(directory)) return null;
+  const names = fs.readdirSync(directory).filter((name) => /^attest-\d{3}\.json$/.test(name)).sort().reverse();
+  for (const name of names) {
+    const relative = path.posix.join('state', 'reviews', safeRecordName(recordId), name);
+    const data = readArtifact(root, relative);
+    if (data && data.headSha === headSha) return { data, path: relative };
+  }
+  return null;
+}
+
 function readAttestArtifact(file) {
   if (!file || file === 'true' || !fs.existsSync(file)) {
     throw new ReviewPolicyError('INVALID_ARTIFACT', `findings artifact not found: ${file}`);
@@ -658,6 +700,18 @@ function attestPullRequest(options = {}) {
   const supplied = readAttestArtifact(artifactPath);
   buildFindings('pending', supplied.findings, [], null);
 
+  // #446: the earlier attestation of this head is the prior: each of its open findings needs a resolution, as a linked
+  // formal review's do, and the ones still open ride in this attestation. A statement cannot sit beside them.
+  const recordId = `${tenantName}:pr-${prNumber}`;
+  const earlier = latestAttestAt(root, recordId, headSha);
+  const priors = earlier ? [{ data: earlier.data, path: earlier.path }] : [];
+  const resolutions = options.resolutions || null;
+  const ruling = checkRuling(resolutions, options.ruling);
+  accountForPriors(priors, resolutions);
+  if (supplied.noFindings && buildFindings('pending', [], priors, resolutions).length) {
+    throw new ReviewPolicyError('USAGE', `${artifactPath} is a no-findings statement, but this attestation would carry open finding(s) from ${earlier.path}; a statement cannot sit beside them, so omit the statement and resolve or carry each finding`);
+  }
+
   const gh = options.gh || defaultGh;
   let currentHead;
   try {
@@ -682,7 +736,7 @@ function attestPullRequest(options = {}) {
     throw new ReviewPolicyError('STALE_HEAD', `PR #${prNumber} has moved: its head is ${currentHead}, not ${head}; review ${currentHead} and attest that`, { currentHead, headSha: head });
   }
 
-  const written = writeArtifactExclusive(root, `${tenantName}:pr-${prNumber}`, 'attest', (stamp) => ({
+  const written = writeArtifactExclusive(root, recordId, 'attest', (stamp) => ({
     schemaVersion: 1,
     kind: 'attest',
     tenant: tenantName,
@@ -691,8 +745,11 @@ function attestPullRequest(options = {}) {
     reviewer: actor || 'unknown',
     at: options.now ? new Date(options.now).toISOString() : new Date().toISOString(),
     source: path.resolve(artifactPath),
+    priorArtifact: earlier ? earlier.path : null,
+    resolutions,
+    ruling: ruling || undefined,
     noFindings: supplied.noFindings,
-    findings: buildFindings(stamp, supplied.findings, [], null),
+    findings: buildFindings(stamp, supplied.findings, priors, resolutions),
   }));
   const posted = postReviewStatus({ root, tenant, headSha: head, artifact: readArtifact(root, written.relative), artifactPath: written.relative, gh, now: options.now });
   return { artifact: written.relative, pr: prNumber, headSha: head, ...posted };
@@ -866,11 +923,7 @@ function recordReviewArtifact(options = {}) {
   // its head once the head is verified, below (#445), so a classification passed in from another head decides nothing.
   let classification = options.classification || {};
   const riskRuling = typeof options.riskRuling === 'string' && options.riskRuling.trim().length > 0 ? options.riskRuling.trim() : null;
-  // #324: a `ruled` resolution cites the Ruling that keeps the finding; the citation belongs to no other resolution.
-  const ruling = typeof options.ruling === 'string' && options.ruling.trim().length > 0 && options.ruling !== 'true' ? options.ruling.trim() : null; // a bare --ruling parses to 'true'
-  const anyRuled = Object.values(options.resolutions || {}).includes('ruled');
-  if (anyRuled && !ruling) throw new ReviewPolicyError('RULING_REQUIRED', 'a ruled resolution cites the Ruling that keeps the finding: pass --ruling "<link or reference>"');
-  if (ruling && !anyRuled) throw new ReviewPolicyError('USAGE', '--ruling belongs to a ruled resolution: it cites the Ruling that keeps the finding');
+  const ruling = checkRuling(options.resolutions, options.ruling);
   if (riskRuling && kind !== 'formal') throw new ReviewPolicyError('USAGE', '--risk-ruling belongs to a formal review: it is the lead ruling on a trigger');
   // Ticket 09: with state/flags/review-dedup-off every review pass is written down (the
   // legacy behaviour). The default replay key is kind:record:head, which would make a
@@ -969,6 +1022,9 @@ function recordReviewArtifact(options = {}) {
         if (priorArtifactData === null) priorArtifactMissing = true;
         priors.push({ data: priorArtifactData, path: prior.artifact });
       }
+      // #446: under review-dedup-off a risk review that replaces one at the same head accounts for that one's open
+      // findings, as a linked formal review accounts for its prior.
+      if (kind === 'risk' && sameHeadPassUnderFlag) priors.push({ data: readArtifact(root, prior.artifact), path: prior.artifact });
       // fleet#43: nothing walked the risk chain. `prior` is scoped per kind, so
       // a formal review never saw risk findings and a risk artifact was
       // write-only: recorded once, resolved by nothing, unable to go stale.
@@ -989,19 +1045,7 @@ function recordReviewArtifact(options = {}) {
           priors.push({ data: riskData, path: risk.artifact });
         }
       }
-      for (const { data, path: priorPath } of priors) {
-        if (!data) continue;
-        const open = openFindings(data);
-        for (const finding of open) {
-          const resolution = resolutions?.[finding.id];
-          if (!resolution) {
-            throw new ReviewPolicyError('UNRESOLVED_FINDINGS_UNACCOUNTED', `prior finding ${finding.id} in ${priorPath} has no resolution`, { unresolved: open.map((entry) => entry.id), artifact: priorPath });
-          }
-          if (!RESOLUTION_VALUES.includes(resolution)) {
-            throw new ReviewPolicyError('INVALID_RESOLUTION', `resolution '${resolution}' for ${finding.id} is not one of ${RESOLUTION_VALUES.join(', ')}`);
-          }
-        }
-      }
+      accountForPriors(priors, resolutions);
 
       // fleet#18: the artifact is never silent about its own result. A reviewer
       // who found nothing is a real outcome, so it is recorded as a statement
@@ -1235,7 +1279,7 @@ const COMMAND_FLAGS = Object.freeze({
   record: RECORD_FLAGS,
   'plan-rereview': ['root', 'id', 'head-sha'],
   hold: ['root', 'id', 'expected-revision', 'reason', 'actor', 'now', 'idempotency-key', 'no-notifier'],
-  attest: ['root', 'tenant', 'pr', 'head', 'artifact', 'repo-path', 'actor', 'now'],
+  attest: ['root', 'tenant', 'pr', 'head', 'artifact', 'repo-path', 'actor', 'now', 'resolutions', 'ruling'],
 });
 
 function cli(argv) {
@@ -1291,6 +1335,8 @@ function cli(argv) {
     return attestPullRequest({
       root, tenantName: args.tenant, prNumber: args.pr, headSha: args.head, artifactPath: args.artifact,
       repoPath: args['repo-path'], actor, now: args.now,
+      // #446: the same resolution format a formal record takes, for the open findings of the earlier attestation.
+      resolutions: args.resolutions ? JSON.parse(args.resolutions) : null, ruling: args.ruling,
     });
   }
   if (command === 'plan-rereview') {

@@ -662,6 +662,43 @@ test('a crash between the hold transition and the page is repaired by the retry'
 });
 
 // Ticket 09: review deduplication has its own rollback flag.
+test('#446: under review-dedup-off a risk review that replaces one at the same head accounts for its open findings', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const classification = { tier: 'high-risk', triggers: [{ class: 'concurrency', matches: [{ pattern: 'FOR UPDATE', file: 'server/x.js', line: 'FOR UPDATE' }] }] };
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification,
+    findings: [{ file: 'server/x.js', claim: 'lock order', severity: 'blocker', category: 'correctness' }], now: '2026-09-10T19:00:00.000Z',
+  });
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'review-dedup-off'), 'x');
+  const replace = (extra) => recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+    kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification, now: '2026-09-10T19:01:00.000Z', ...extra,
+  });
+  assert.throws(
+    () => replace({ findings: [], noFindings: 'fixed', idempotencyKey: 'risk-replace-1' }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('risk-001-f1'),
+  );
+  assert.equal(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')).length, 1, 'the refused replacement keeps no copy');
+
+  // Still open, carried into the replacement with the new minor finding.
+  const carried = replace({
+    findings: [{ file: 'server/x.js', claim: 'still racy', severity: 'minor', category: 'correctness' }],
+    resolutions: { 'risk-001-f1': 'still-open' }, idempotencyKey: 'risk-replace-2',
+  });
+  const carriedStored = JSON.parse(fs.readFileSync(path.join(root, carried.artifact), 'utf8'));
+  assert.equal(carriedStored.priorArtifact, first.artifact);
+  assert.equal(carriedStored.findings.find((finding) => finding.id === 'risk-001-f1').carriedFrom, first.artifact);
+
+  const settled = replace({
+    findings: [], noFindings: 'both fixed', resolutions: { 'risk-001-f1': 'resolved', 'risk-002-f1': 'resolved' },
+    expectedRevision: carried.result.revision, idempotencyKey: 'risk-replace-3',
+  });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).priorArtifact, carried.artifact);
+});
+
 test('state/flags/review-dedup-off records a second formal review at the same head instead of refusing it', () => {
   const root = rootDir();
   const revision = seedRecord(root);
@@ -2238,6 +2275,63 @@ test('#116: the artifact is held to the record door: severity enum, category, an
   refuse([1, 2], 'INVALID_ARTIFACT');
   const missing = path.join(root, 'nope.json');
   assert.throws(() => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: missing, gh }), (error) => error.code === 'INVALID_ARTIFACT');
+});
+
+test('#446: a second attestation at a head is refused while the earlier one has an open blocker, and accounted for once it does', () => {
+  const { root, head, calls, gh, artifact } = attestFixture();
+  const attest = (content, extra = {}) => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact(content), actor: 'cory', gh, ...extra });
+  const attestations = () => fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_pr-1601')).filter((name) => /^attest-\d{3}\.json$/.test(name)).length;
+  const first = attest({ findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'correctness' }] });
+  assert.equal(first.status.state, 'failure');
+  assert.throws(
+    () => attest({ noFindings: 'read it again; nothing new' }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('attest-001-f1'),
+  );
+  assert.equal(attestations(), 1, 'the refused attestation keeps no copy');
+  assert.equal(statusCalls(calls).length, 1, 'and posts no status');
+
+  // Still open, carried into the second attestation with the new minor finding: the blocker keeps the status failed.
+  const carried = attest({ findings: [{ file: 'b.js', claim: 'y', severity: 'minor', category: 'style' }] }, { resolutions: { 'attest-001-f1': 'still-open' } });
+  assert.equal(carried.status.state, 'failure');
+  const carriedStored = JSON.parse(fs.readFileSync(path.join(root, carried.artifact), 'utf8'));
+  assert.equal(carriedStored.priorArtifact, first.artifact);
+  assert.deepEqual(carriedStored.findings.map((finding) => finding.id).sort(), ['attest-001-f1', 'attest-002-f1']);
+  assert.equal(carriedStored.findings.find((finding) => finding.id === 'attest-001-f1').carriedFrom, first.artifact);
+  // A statement cannot sit beside a carried finding.
+  assert.throws(
+    () => attest({ noFindings: 'nothing new' }, { resolutions: { 'attest-001-f1': 'still-open', 'attest-002-f1': 'resolved' } }),
+    (error) => error.code === 'USAGE' && /omit|statement|open finding/.test(error.message),
+  );
+
+  // Every open finding of the second attestation resolved: the third is accounted for and posts success.
+  const settled = attest({ noFindings: 'both fixed at this head' }, { resolutions: { 'attest-001-f1': 'resolved', 'attest-002-f1': 'resolved' } });
+  assert.equal(settled.artifact, 'state/reviews/endzone_pr-1601/attest-003.json');
+  assert.equal(settled.status.state, 'success');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).priorArtifact, carried.artifact);
+});
+
+test('#446: an earlier attestation with nothing open does not hold a second one back, and a bad resolution is refused', () => {
+  const { root, head, gh, artifact } = attestFixture();
+  const attest = (content, extra = {}) => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact(content), actor: 'cory', gh, ...extra });
+  const first = attest({ noFindings: 'read the whole diff; nothing wrong' });
+  const second = attest({ noFindings: 'read it again' });
+  assert.equal(second.artifact, 'state/reviews/endzone_pr-1601/attest-002.json', 'as before: a second attestation with nothing open is its own file');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, second.artifact), 'utf8')).priorArtifact, first.artifact);
+
+  const blocked = attest({ findings: [{ file: 'a.js', claim: 'x', severity: 'major', category: 'correctness' }] });
+  assert.equal(blocked.status.state, 'failure');
+  assert.throws(
+    () => attest({ noFindings: 'again' }, { resolutions: { 'attest-003-f1': 'maybe' } }),
+    (error) => error.code === 'INVALID_RESOLUTION',
+  );
+  assert.throws(
+    () => attest({ noFindings: 'again' }, { resolutions: { 'attest-003-f1': 'ruled' } }),
+    (error) => error.code === 'RULING_REQUIRED',
+  );
+  // The binary takes the same --resolutions and --ruling as record; gh that always fails stops it after the artifact checks.
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const offline = spawnSync(process.execPath, [bin, 'attest', '--root', root, '--tenant', 'endzone', '--pr', '1601', '--head', head, '--artifact', artifact({ noFindings: 'clean' }), '--resolutions', '{"attest-003-f1":"ruled"}', '--ruling', 'https://example.invalid/ruling/1'], { encoding: 'utf8', windowsHide: true, env: { ...process.env, FLEET_GH: process.execPath } });
+  assert.equal(JSON.parse(offline.stderr).code, 'PR_HEAD_UNREADABLE', offline.stderr);
 });
 
 test('#116: the binary attests, refuses unknown flags as USAGE, and exits 3 when the post fails', () => {
