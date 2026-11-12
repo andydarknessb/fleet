@@ -1,5 +1,6 @@
 # Run the read-only cycle collector with a bounded daily window.
 # This script is the Task Scheduler entry point; it never changes fleet decisions.
+param([switch]$IfMissing)
 . "$PSScriptRoot\_common.ps1"
 
 $until = (Get-Date).ToUniversalTime()
@@ -9,6 +10,19 @@ $sinceText = $since.ToString('o')
 $outDir = "$FleetHome\state\metrics"
 $logPath = "$outDir\collector.log"
 New-Item -ItemType Directory -Force $outDir | Out-Null
+
+# Ticket 443: the logon trigger passes -IfMissing. It skips when today's file (named by the UTC
+# date, as measure-cycle.js names it) exists, or when the UTC and local days differ: an evening
+# logon, which the next morning's run covers. A run without the switch is unchanged.
+if ($IfMissing) {
+  $untilDay = $until.ToString('yyyy-MM-dd')
+  $localDay = $until.ToLocalTime().ToString('yyyy-MM-dd')
+  $skip = if ($untilDay -ne $localDay) { "UTC day $untilDay is not local day $localDay" } elseif (Test-Path "$outDir\daily-$untilDay.json") { "daily-$untilDay.json already exists" }
+  if ($skip) {
+    [IO.File]::AppendAllText($logPath, "$(Now-Iso) INFO skipped -IfMissing: $skip`r`n", $Utf8)
+    exit 0
+  }
+}
 
 $nodePath = $env:FLEET_NODE_PATH
 if ($nodePath -and -not (Test-Path -LiteralPath $nodePath -PathType Leaf)) {
