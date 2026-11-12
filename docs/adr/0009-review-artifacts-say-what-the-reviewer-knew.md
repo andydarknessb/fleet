@@ -74,6 +74,13 @@ head whose prior has nothing open (or no readable prior) is refused too: a
 re-review at an unchanged head exists to resolve prior findings, so once the
 chain is clean at a head it is one review at that head, never a pileup.
 
+**Amended 2026-11-12 (fleet #446).** The risk clause above holds without
+`state/flags/review-dedup-off`. Under that flag a risk review that replaces one
+at the same head accounts for each open finding of the one it replaces: each
+needs a resolution, as a linked formal review's prior does, and a still-open
+one is carried into the new artifact. Without the flag a second risk review at
+a head is refused `ALREADY_REVIEWED`, as before.
+
 A replay says what it did not write: the result carries `ignored:
 {findings, resolutions}` when the caller supplied either, and the CLI prints
 that on stderr while still exiting 0, so a formatted summary cannot present a
@@ -221,6 +228,16 @@ The guard sits in the record, not in a doc line, because the doc line already
 said "a triggered diff missing that artifact goes back to the IC" and the
 record accepted it anyway.
 
+**Amended 2026-11-12 (fleet #445).** A formal record no longer takes the
+classification from the caller. It computes the head's classification itself,
+against the tenant's `defaultBranch` (`origin/<defaultBranch>`, the base that
+`ic.md`'s `classify` runs against), once the head is verified to exist. A
+`--classification` passed in is accepted and ignored, so
+`CLASSIFICATION_REQUIRED` is gone. A tenant that names no `defaultBranch` is
+refused `TENANT_BASE_UNKNOWN`, exit 2, nothing written. The trigger rule above
+applies to that computed classification. A risk review still takes its
+classification from the caller.
+
 ## 8. A recorded head is a commit (fleet#67)
 
 **Observed.** `record --kind risk` on endzone #1382 accepted `headSha`
@@ -257,3 +274,14 @@ replay (an idempotency key the record already holds) returns the artifact it
 recorded and writes nothing, so it is not re-resolved; and `plan-rereview`
 resolves nothing itself, because it is a reader of these SHAs and the formal
 record at that head is where the guard sits.
+
+**Amended 2026-11-12 (fleet #445).** A recorded head is the full 40-character
+sha at every door that records one: `record --kind formal`, `record --kind risk`
+(`--head-sha`, and `--reviewed-sha` when given) and `attest --head`. A branch
+name, a relative ref such as `HEAD~1`, or a short sha is refused
+`FULL_SHA_REQUIRED`, exit 2, nothing written, and is not resolved for the
+caller. The bullet above that accepts an abbreviated SHA no longer applies. A
+record written before this amendment may still hold an abbreviated head:
+`bin/verify-events.js` matches a prefix of seven or more characters against the
+full sha, and `record --repost` expands it in the tenant repo before it posts
+the status.
