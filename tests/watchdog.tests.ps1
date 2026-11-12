@@ -567,7 +567,7 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   [IO.Directory]::CreateDirectory("$testRoot\state\watch") | Out-Null
   [IO.Directory]::CreateDirectory("$testRoot\config") | Out-Null
   Write-Utf8 "$testRoot\config\cycle.json" '{"supervisor":{"pageKinds":["stray"]},"frontierWake":{"cooldownMinutes":60,"sources":["frontier","outbox"]}}'
-  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'if ($env:MOCK_ROTATE_DEFER -eq "1") { Write-Output (@{ rotated = @(); deferred = @("$Name`: session is mid-turn (status busy)"); outcomes = @(@{ name = $Name; status = "deferred"; reason = "session is mid-turn (status busy)" }) } | ConvertTo-Json -Compress -Depth 6); exit 0 }' + "`r`n" + 'if ($env:MOCK_ROTATE_FAIL -eq "1") { Write-Output (@{ rotated = @(); deferred = @(); outcomes = @(@{ name = $Name; status = "failed"; reason = "no active live-roster entry" }) } | ConvertTo-Json -Compress -Depth 6); exit 5 }' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
+  Write-Utf8 "$testRoot\bin\rotate.ps1" ('param([string]$Name,[string]$Wake,[switch]$Force,[switch]$DryRun)' + "`r`n" + '[IO.File]::AppendAllText("' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt", "$Name|$Wake`n")' + "`r`n" + 'if ($env:MOCK_ROTATE_EXIT_AT -and @(Get-Content "' + $testRoot.Replace('\', '\\') + '\rotate-calls.txt").Count -eq [int]$env:MOCK_ROTATE_EXIT_AT) { [Environment]::Exit(3) }' + "`r`n" + 'if ($env:MOCK_ROTATE_DEFER -eq "1") { Write-Output (@{ rotated = @(); deferred = @("$Name`: session is mid-turn (status busy)"); outcomes = @(@{ name = $Name; status = "deferred"; reason = "session is mid-turn (status busy)" }) } | ConvertTo-Json -Compress -Depth 6); exit 0 }' + "`r`n" + 'if ($env:MOCK_ROTATE_FAIL -eq "1") { Write-Output (@{ rotated = @(); deferred = @(); outcomes = @(@{ name = $Name; status = "failed"; reason = "no active live-roster entry" }) } | ConvertTo-Json -Compress -Depth 6); exit 5 }' + "`r`n" + 'Write-Output (@{ rotated = @($Name); deferred = @(); outcomes = @(@{ name = $Name; status = "rotated"; reason = $null }) } | ConvertTo-Json -Compress -Depth 6)' + "`r`n" + 'exit 0' + "`r`n")
   function Get-RotateCalls { if (Test-Path "$testRoot\rotate-calls.txt") { @(Get-Content "$testRoot\rotate-calls.txt") } else { @() } }
   function Get-AlertLines { if (Test-Path "$testRoot\state\alerts\alerts.jsonl") { @(Get-Content "$testRoot\state\alerts\alerts.jsonl" | Where-Object { $_ }) } else { @() } }
   $wakeFixture = "$testRoot\issues-fixture.json"
@@ -1685,6 +1685,73 @@ $json = '[' + (($rows | ForEach-Object { $_ | ConvertTo-Json -Compress -Depth 6 
   Remove-Item "$testRoot\state\flags\arbiter-live"
   Set-AgentsRows $principalRows
   Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE
+
+  # ===== fleet #454: a blind tick and a stopped tick lose nothing =====
+  # Three ticks in order. A reads no sessions (the daemon read fails). C stops on its second Wake: the rotate.ps1 mock ends
+  # the watchdog process, so C runs as its own process. D is a good tick. A delivered Page must not be sent or filed again,
+  # the lead woken in C must not be woken again, and the triage watermark is the delivered line's time.
+  Write-Utf8 "$testRoot\state\flags\principal-live" 'x'
+  Write-Utf8 "$testRoot\state\flags\sentinel-off" 'wake test'
+  Remove-Item Env:FLEET_GITHUB_ISSUES_FIXTURE -ErrorAction SilentlyContinue
+  $env:FLEET_TRIAGE_ISSUES_FIXTURE = "$testRoot\triage-fixture.json"
+  Write-Utf8 "$testRoot\triage-fixture.json" '[{"number":601,"title":"Unrouted","url":"https://github.com/owner/repo/issues/601","body":"Something is off.","createdAt":"2026-09-02T00:00:00.000Z","labels":[],"assignees":[],"comments":[]}]'
+  Write-Utf8 "$testRoot\roster.json" '{"cap":6,"sessions":[{"name":"dispatcher","role":"dispatcher","parent":"cory"},{"name":"sentinel","role":"sentinel","parent":"dispatcher"},{"name":"pl-test","role":"project-lead","parent":"dispatcher","tenant":"test"},{"name":"pe-test","role":"principal","parent":"dispatcher","tenant":"test"}]}'
+  # A second tenant with its own lead, so the tick makes two frontier Wakes before the triage Wake: the stop lands inside the frontier loop.
+  (Get-Content "$testRoot\tenants\test.json" -Raw).Replace('"name":"test"', '"name":"test2"') | Set-Content "$testRoot\tenants\test2.json" -Encoding UTF8
+  $leadAt454 = (Get-Date).ToUniversalTime().AddHours(-2).ToString('o')
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"pl-test","role":"project-lead","tenant":"test","status":"active","launchedAt":"' + $leadAt454 + '"},{"name":"pl-test2","role":"project-lead","tenant":"test2","status":"active","launchedAt":"' + $leadAt454 + '"}]}')
+  $start454 = Get-EpochMs (Get-Date).AddHours(-2)
+  Set-AgentsRows ('[' + $dispRow + ',{"id":"job-p","name":"pl-test","state":"working","status":"idle","pid":13,"startedAt":' + $start454 + '},{"id":"job-p2","name":"pl-test2","state":"working","status":"idle","pid":16,"startedAt":' + $start454 + '},{"id":"job-pe","name":"pe-test","state":"working","status":"idle","pid":14,"startedAt":' + $start454 + '},{"id":"job-ic-970","name":"ic-970","state":"working","status":"idle","pid":15,"startedAt":' + $start454 + '}]')
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-p") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-p\state.json" '{"waitingFor":""}'
+  [IO.Directory]::CreateDirectory("$testRoot\profile\.claude\jobs\job-ic-970") | Out-Null
+  Write-Utf8 "$testRoot\profile\.claude\jobs\job-ic-970\state.json" ('{"needs":"approve Read: a file","updatedAt":"' + (Get-Date).ToUniversalTime().AddMinutes(-10).ToString('o') + '"}')
+  foreach ($n in 'dispatcher','pl-test','pl-test2','pe-test','ic-970') { Set-Heartbeat $n 5 }
+  $deliveredAt454 = (Get-Date).ToUniversalTime().AddMinutes(-30).ToString('o')
+  Write-Utf8 "$testRoot\state\watchdog\paged.json" ('{"permission-wait:ic-970:job-ic-970":{"firstSeen":"' + $deliveredAt454 + '","lastSeen":"' + $deliveredAt454 + '","detail":"ic-970 waits on a permission prompt","deliveredAt":"' + $deliveredAt454 + '","attempts":0,"lastAttemptAt":null,"lastError":null,"gaveUpAt":null,"url":null,"repeatedAt":null}}')
+  Remove-Item "$testRoot\state\watchdog\frontier-wake.json", "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  $resLine454 = New-ResolutionLine 15 'issue-50' 'escalated' 'implementing' 'pe-test' 'cory'
+  $leadLine454 = (Get-Date).ToUniversalTime().AddMinutes(-20).ToString('o')
+  Write-Utf8 "$testRoot\state\watch\wake-outbox.jsonl" ('{"at":"' + $leadLine454 + '","recordId":"test:issue-9","wake":"decision-needed","actor":"ic-9"}' + "`n" + '{"at":"' + $leadLine454 + '","recordId":"test2:issue-9","wake":"decision-needed","actor":"ic-9"}' + "`n" + $resLine454 + "`n")
+  $escForIc970 = { @(Get-ChildItem "$testRoot\state\escalations" -Filter '*permission-wait.json' -ErrorAction SilentlyContinue | Where-Object { (Get-Content $_.FullName -Raw) -match '"name":"ic-970"' }).Count }
+  $escBefore454 = & $escForIc970
+
+  # A: the daemon read fails, so this tick sees no session. The delivered entry must come through the blind tick unchanged.
+  $env:MOCK_CLAUDE_FAIL = '1'
+  $rA454 = Run-Watchdog
+  Remove-Item Env:MOCK_CLAUDE_FAIL
+  $pagedA454 = (Get-Content "$testRoot\state\watchdog\paged.json" -Raw) | ConvertFrom-Json
+  Assert-True ($null -ne $pagedA454.'permission-wait:ic-970:job-ic-970' -and "$($pagedA454.'permission-wait:ic-970:job-ic-970'.deliveredAt)" -eq $deliveredAt454) 'a tick that cannot read the sessions must carry its delivered entries forward unchanged'
+
+  # C: the tick stops on its second Wake (the lead from its outbox line, then the principal). The lead's Wake must be on disk first.
+  Remove-Item "$testRoot\rotate-calls.txt" -ErrorAction SilentlyContinue
+  $env:MOCK_ROTATE_EXIT_AT = '2'
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$testRoot\bin\watchdog.ps1" -NoToast | Out-Null
+  $codeC454 = $LASTEXITCODE
+  Remove-Item Env:MOCK_ROTATE_EXIT_AT
+  $callsC454 = @(Get-RotateCalls)
+  $leadsC454 = @($callsC454 | ForEach-Object { ($_ -split '\|')[0] })
+  Assert-True ($codeC454 -eq 3 -and $callsC454.Count -eq 2 -and (($leadsC454 | Sort-Object) -join ',') -eq 'pl-test,pl-test2') "the tick must stop on its second frontier Wake, after the first (exit $codeC454; calls: $($callsC454 -join ' / '))"
+  Assert-True (Test-Path "$testRoot\state\watchdog\frontier-wake.json") 'the first Wake must be recorded before the tick stops'
+
+  # D: a good tick. The lead is not woken again, the principal is woken, the delivered Page is neither sent nor filed again.
+  $callsBeforeD454 = @(Get-RotateCalls).Count
+  $pagesBeforeD454 = @(Get-Content "$testRoot\state\pages\pages.jsonl" -ErrorAction SilentlyContinue | Where-Object { $_ -match 'permission-wait:ic-970' }).Count
+  $rD454 = Run-Watchdog
+  $callsD454 = @(@(Get-RotateCalls) | Select-Object -Skip $callsBeforeD454)
+  Assert-True (@($callsD454 | Where-Object { $_ -like "$($leadsC454[0])|*" }).Count -eq 0) 'the lead whose Wake landed before the stop must not be woken again'
+  Assert-True (@($callsD454 | Where-Object { $_ -like "$($leadsC454[1])|*" }).Count -eq 1) 'the lead whose Wake did not land must be woken'
+  Assert-True (@($callsD454 | Where-Object { $_ -like 'pe-test|*' }).Count -eq 1) 'the principal whose Wake did not land must be woken'
+  $twm454 = (Get-Content "$testRoot\state\watchdog\triage-wake.json" -Raw | ConvertFrom-Json).tenants.test.outboxConsumedThrough
+  Assert-True ([DateTimeOffset]::Parse("$twm454").UtcTicks -eq [DateTimeOffset]::Parse("$(($resLine454 | ConvertFrom-Json).at)").UtcTicks) "the triage watermark must be the delivered line's time (got $twm454)"
+  Assert-True (@(Get-PagedKeys $rD454.newlyPaged) -notcontains 'permission-wait:ic-970:job-ic-970') 'a delivered Page must not be sent again after a blind tick'
+  Assert-True (@(Get-Content "$testRoot\state\pages\pages.jsonl" | Where-Object { $_ -match 'permission-wait:ic-970' }).Count -eq $pagesBeforeD454) 'no second Page line for the delivered condition'
+  Assert-True ((& $escForIc970) -eq $escBefore454) 'the escalation for the delivered condition must not be filed twice'
+
+  Remove-Item "$testRoot\state\watch\wake-outbox.jsonl", "$testRoot\state\flags\principal-live", "$testRoot\state\watchdog\paged.json", "$testRoot\state\watchdog\frontier-wake.json", "$testRoot\state\watchdog\triage-wake.json" -ErrorAction SilentlyContinue
+  Remove-Item -Recurse -Force "$testRoot\profile\.claude\jobs\job-ic-970", "$testRoot\state\heartbeats\ic-970.json", "$testRoot\tenants\test2.json", "$testRoot\state\heartbeats\pl-test2.json" -ErrorAction SilentlyContinue
+  Remove-Item Env:FLEET_TRIAGE_ISSUES_FIXTURE -ErrorAction SilentlyContinue
+  Set-AgentsRows $healthyRows
 
   # ===== Ticket 77 (ADR 0012): conditions page through the door, by priority =====
   # Reuses the local-HttpListener mock-Pushover pattern from tests/page.tests.ps1

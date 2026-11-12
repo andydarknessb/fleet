@@ -1265,6 +1265,8 @@ try {
           $escalatedIso = $null; if ($prior) { $escalatedIso = $prior.escalatedAt }
           $wakeState.stalls | Add-Member -NotePropertyName $ns.id -NotePropertyValue ([pscustomobject]@{ deliveredAt = (Now-Iso); escalatedAt = $escalatedIso }) -Force
         }
+        # fleet #454: written per rotation, not only at the tick's end: a tick stopped after this rotation must not rotate this lead again.
+        try { Write-Json $wakeStatePath $wakeState } catch {}
         # Ticket 76: a wake never toasts or POSTs; the alerts.jsonl line is the record.
         try { $wake.alert = Write-FleetWakeAudit -Kind 'frontier-wake' -Title 'Fleet watchdog: frontier wake' -Body "$leadName relaunched for $digest" -Detail ([pscustomobject]@{ tenant = $tenantName; lead = $leadName; evidence = $wake.evidence; delivered = @($lineIds); frontierIssues = @($frontierIssues); outcome = $wake.outcome }) } catch { $wake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else {
@@ -1426,7 +1428,8 @@ try {
       $pRosterRow = $null; if ($liveRoster) { $pRosterRow = @($liveRoster.sessions | Where-Object { "$($_.name)" -eq $principalName -and $_.status -eq 'active' -and $_.launchedAt } | Sort-Object { ConvertTo-UtcDateTime $_.launchedAt } -Descending)[0] }
       if ($pRosterRow) { $pLaunchedAt = ConvertTo-UtcDateTime $pRosterRow.launchedAt }
       $pConsumed = $null; if ($triageState.tenants.PSObject.Properties[$tenantName] -and $triageState.tenants.$tenantName.PSObject.Properties['outboxConsumedThrough']) { $pConsumed = ConvertTo-UtcDateTime $triageState.tenants.$tenantName.outboxConsumedThrough }
-      $null = Get-UnconsumedWakes -TenantName $tenantName -Since $pLaunchedAt -ConsumedThrough $pConsumed -SelfActor $principalName -Recipient principal -Details $pResolved
+      $pLines = New-Object System.Collections.ArrayList   # fleet #454: the delivered lines, so the watermark is their time
+      $null = Get-UnconsumedWakes -TenantName $tenantName -Since $pLaunchedAt -ConsumedThrough $pConsumed -SelfActor $principalName -Recipient principal -Details $pResolved -Lines $pLines
       foreach ($r in $pResolved) { $twake.evidence += "resolved $r" }
       if (-not $principalLive) { $twake.decision = 'shadow'; $twake.reason = 'state/flags/principal-live absent: frontier recorded, nothing launched'; $triageWakes += [pscustomobject]$twake; continue }
       if ($mode -ne 'live') { $twake.reason = "supervision mode is $mode, not live"; $triageWakes += [pscustomobject]$twake; continue }
@@ -1455,7 +1458,12 @@ try {
       $twake.outcome = if ($tRotateOut -and $tRotateOut.PSObject.Properties['outcomes']) { @($tRotateOut.outcomes | Where-Object { $_.name -eq $principalName } | Select-Object -First 1) | Select-Object -First 1 } else { Get-OneLine $tRotateRaw 200 }
       if ($tRotated) {
         $twake.decision = 'woken'
-        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest; outboxConsumedThrough = (Now-Iso) }) -Force
+        # fleet #454: the watermark is the newest delivered line's time (a line written after this tick's read is not skipped, a delivered one is not sent twice);
+        # with no line delivered the prior watermark stands.
+        $tWm = $null; if ($triageState.tenants.PSObject.Properties[$tenantName] -and $triageState.tenants.$tenantName.PSObject.Properties['outboxConsumedThrough']) { $tWm = $triageState.tenants.$tenantName.outboxConsumedThrough }
+        if ($pLines.Count -gt 0) { $tWm = (@($pLines | ForEach-Object { $_.at } | Sort-Object -Descending)[0]).ToString('o') }
+        $triageState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $tdigest; outboxConsumedThrough = $tWm }) -Force
+        try { Write-Json $triageStatePath $triageState } catch {}
         try { $twake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: triage wake' -Body "$principalName relaunched for $tdigest" -Detail ([pscustomobject]@{ tenant = $tenantName; principal = $principalName; evidence = $twake.evidence; outcome = $twake.outcome }) } catch { $twake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else {
         # fleet #359: a failed outcome means the Principal was not woken, not a boundary wait: it pages wake-failed until it clears.
@@ -1540,6 +1548,7 @@ try {
       if ($aRotated) {
         $awake.decision = 'woken'
         $arbiterState.tenants | Add-Member -NotePropertyName $tenantName -NotePropertyValue ([pscustomobject]@{ lastAt = (Now-Iso); digest = $adigest }) -Force
+        try { Write-Json $arbiterStatePath $arbiterState } catch {}   # fleet #454: per rotation, as the frontier and triage wakes
         try { $awake.alert = Write-FleetWakeAudit -Kind 'triage-wake' -Title 'Fleet watchdog: arbiter wake' -Body "$arbiterName relaunched for $adigest" -Detail ([pscustomobject]@{ tenant = $tenantName; arbiter = $arbiterName; evidence = $awake.evidence; outcome = $awake.outcome }) } catch { $awake.alert = "alert failed: $(Get-OneLine $_.Exception.Message 120)" }
       } else {
         # fleet #359: a failed outcome means the Arbiter was not woken, not a boundary wait: it pages wake-failed until it clears.
@@ -1802,6 +1811,19 @@ try {
     if ($c.key -eq 'fleet-dead') { $entryObj | Add-Member -NotePropertyName repeatedAt -NotePropertyValue $repeatedAt -Force }
     if ($prevEntry -and $prevEntry.PSObject.Properties['escalationFiledAt']) { $entryObj | Add-Member -NotePropertyName escalationFiledAt -NotePropertyValue $prevEntry.escalationFiledAt -Force }
     $nextPaged | Add-Member -NotePropertyName $c.key -NotePropertyValue $entryObj
+  }
+  # fleet #454: a tick that could not read the sessions, run the check or read the heal state cannot evaluate the families that
+  # depend on it, so they are absent from $conditions only because of the blind read. Their paged entries (delivered, given up,
+  # escalation filed) carry forward unchanged; without that the next good tick would page and file each one again.
+  $blindPrefixes = @()
+  if ($daemonReadError) { $blindPrefixes += 'escalation:', 'permission-wait:', 'launch-retry:', 'busy-stale:', 'human-wait:', 'wake-failed:', 'fleet-dead', 'sentinel-stale' }
+  if ($checkError) { $blindPrefixes += 'escalation:', 'launch-retry:', 'human-wait:' }
+  if ($healStateUnreadable) { $blindPrefixes += 'human-wait:' }
+  if ($paged -and $blindPrefixes.Count -gt 0) {
+    foreach ($bp in @($paged.PSObject.Properties)) {
+      if ($nextPaged.PSObject.Properties[$bp.Name]) { continue }
+      if (@($blindPrefixes | Where-Object { "$($bp.Name)".StartsWith($_) }).Count -gt 0) { $nextPaged | Add-Member -NotePropertyName $bp.Name -NotePropertyValue $bp.Value -Force }
+    }
   }
 
   # --- banner: rebuilt every run from current conditions; absent when healthy ---
