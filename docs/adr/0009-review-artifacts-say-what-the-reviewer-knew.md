@@ -276,11 +276,18 @@ resolves nothing itself, because it is a reader of these SHAs and the formal
 record at that head is where the guard sits.
 
 **Amended 2026-11-12 (fleet #445).** A recorded head is the full 40-character
-sha at every door that records one: `record --kind formal`, `record --kind risk`
-(`--head-sha`, and `--reviewed-sha` when given) and `attest --head`. A branch
-name, a relative ref such as `HEAD~1`, or a short sha is refused
-`FULL_SHA_REQUIRED`, exit 2, nothing written, and is not resolved for the
-caller. The bullet above that accepts an abbreviated SHA no longer applies. A
+sha of the commit itself, at every review-policy door that records one:
+`record --kind formal`, `record --kind risk` (`--head-sha`, and `--reviewed-sha`
+when given) and `attest --head`. `work-state.js review --head-sha` is not
+covered: it is the state door those commands write through, and it takes what it
+is given. A branch name, a relative ref such as `HEAD~1`, or a short sha is
+refused `FULL_SHA_REQUIRED`, exit 2, nothing written, and is not resolved for
+the caller; so is an annotated tag's sha, which peels to the commit beneath it,
+because one commit has one accepted spelling. The bullet above that accepts an
+abbreviated SHA no longer applies. For a formal record the commit check and the
+classification now run first, before the prior-finding walk and the findings
+guards, so an unknown head or a classification that fails refuses the record
+before anything is written; the trigger guard and the rest keep their order. A
 record written before this amendment may still hold an abbreviated head:
 `bin/verify-events.js` matches a prefix of seven or more characters against the
 full sha, and `record --repost` expands it in the tenant repo before it posts

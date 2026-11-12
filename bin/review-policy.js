@@ -96,68 +96,117 @@ function matchGlob(glob, filePath) {
 
 // --- classification ---
 
-// git C-quotes a name that holds a quote, a backslash, a control character or a non-ASCII byte; an octal
-// escape is one UTF-8 byte (#445).
+// git C-quotes a name that holds a quote, a backslash, a control character or a non-ASCII byte (core.quotePath): an
+// octal escape is one UTF-8 byte, and a raw character inside the quotes is UTF-8 as it stands (#445).
 const GIT_ESCAPES = Object.freeze({ a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 });
 
 function unquoteGitPath(name) {
-  if (!name.startsWith('"')) return name;
-  const bytes = [];
-  for (let i = 1; i < name.length - 1; i += 1) {
-    if (name[i] !== '\\') { bytes.push(name.charCodeAt(i)); continue; }
-    const octal = name.slice(i + 1, i + 4);
-    if (/^[0-7]{3}$/.test(octal)) { bytes.push(parseInt(octal, 8)); i += 3; } else { bytes.push(GIT_ESCAPES[name[i + 1]]); i += 1; }
+  if (name.length < 2 || !name.startsWith('"') || !name.endsWith('"')) return name;
+  const inner = name.slice(1, -1);
+  const parts = [];
+  let raw = '';
+  for (let i = 0; i < inner.length; i += 1) {
+    if (inner[i] !== '\\') { raw += inner[i]; continue; }
+    parts.push(Buffer.from(raw, 'utf8'));
+    raw = '';
+    const octal = inner.slice(i + 1, i + 4);
+    if (/^[0-7]{3}$/.test(octal)) { parts.push(Buffer.from([parseInt(octal, 8)])); i += 3; continue; }
+    const code = GIT_ESCAPES[inner[i + 1]];
+    parts.push(code === undefined ? Buffer.from(inner[i + 1] || '', 'utf8') : Buffer.from([code]));
+    i += 1;
   }
-  return Buffer.from(bytes).toString('utf8');
+  parts.push(Buffer.from(raw, 'utf8'));
+  return Buffer.concat(parts).toString('utf8');
 }
 
-// The two names on a `diff --git a/<p> b/<q>` line. A raw name may hold spaces, so the split is the one that
-// leaves an a/ side and a b/ side, and equal names (a change that is not a rename) win over the rest.
+// git's prefixes: a/ and b/ by default, c/ i/ o/ w/ under diff.mnemonicPrefix, none under diff.noprefix. A side loses
+// only a prefix that fits it, so a name with no prefix is kept. shortcut: under --no-prefix a top-level a/ or b/
+// directory reads as a prefix; classifyFromGit forces its own a/ b/ prefixes, so only a hand-made --diff file can hit it.
+const LEFT_PREFIX = /^[acio]\//;
+const RIGHT_PREFIX = /^[bciow]\//;
+const withoutPrefix = (name, prefix) => name.replace(prefix, '');
+
+// A name on a `---` or `+++` line: git's trailing tab (names with a space) and the side's prefix come off, and
+// /dev/null is no file.
+function headerName(raw, prefix) {
+  const named = unquoteGitPath(raw.trim());
+  return named === '/dev/null' ? null : withoutPrefix(named, prefix);
+}
+
+// The two names on a `diff --git <p> <q>` line. A raw name may hold spaces, so the split is the one whose sides carry
+// their prefixes, and within those the one whose names are equal (a change that is not a rename). A rename's names are
+// also in its `rename from` / `rename to` lines, exactly.
 function diffHeaderNames(line) {
   const rest = line.slice('diff --git '.length);
   const splits = [];
   for (let at = rest.indexOf(' '); at !== -1; at = rest.indexOf(' ', at + 1)) {
-    const left = unquoteGitPath(rest.slice(0, at));
-    const right = unquoteGitPath(rest.slice(at + 1));
-    if (left.startsWith('a/') && right.startsWith('b/')) splits.push([left.slice(2), right.slice(2)]);
+    splits.push([unquoteGitPath(rest.slice(0, at)), unquoteGitPath(rest.slice(at + 1))]);
   }
-  return splits.find(([left, right]) => left === right) || splits[0] || [];
+  const prefixed = splits.filter(([left, right]) => LEFT_PREFIX.test(left) && RIGHT_PREFIX.test(right));
+  const pool = prefixed.length ? prefixed : splits;
+  const same = pool.find(([left, right]) => withoutPrefix(left, LEFT_PREFIX) === withoutPrefix(right, RIGHT_PREFIX));
+  return (same ? [same] : pool).flatMap(([left, right]) => [withoutPrefix(left, LEFT_PREFIX), withoutPrefix(right, RIGHT_PREFIX)]);
 }
 
-// The paths a diff names, for a classification made from the diff alone: each `diff --git` header, and the
-// `rename from` / `rename to` lines when the diff was made with renames on (#445).
-function pathsFromDiff(diffText) {
+// #445 review: a file's name, with or without its prefix, from every line that carries one. A `diff --cc` names one path.
+// Hunks are counted: inside a hunk's `@@ -a,b +c,d @@` count an added line is content even when it reads `+++ b/x` (the
+// content `++ b/x`), so a file header is only a line outside a hunk. A combined hunk has no such count and runs to the
+// next header.
+function parseDiffText(diffText) {
+  const text = String(diffText || '').replace(/^﻿/, '');
   const paths = new Set();
-  for (const line of String(diffText || '').split(/\r?\n/)) {
-    if (line.startsWith('diff --git ')) diffHeaderNames(line).forEach((name) => paths.add(name));
-    else if (line.startsWith('rename from ')) paths.add(unquoteGitPath(line.slice('rename from '.length)));
-    else if (line.startsWith('rename to ')) paths.add(unquoteGitPath(line.slice('rename to '.length)));
-  }
-  return [...paths];
-}
-
-function parseDiff(diffText) {
   const addedByFile = new Map();
   let currentFile = null;
   let changedLines = 0;
-  for (const line of String(diffText || '').split(/\r?\n/)) {
-    if (line.startsWith('+++ ')) {
-      const named = line.slice(4).trim();
-      currentFile = named === '/dev/null' ? null : unquoteGitPath(named).replace(/^b\//, '');
-      if (currentFile && !addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
+  let hunk = null; // lines still to come in the current hunk: { old, new }, or { combined: true }
+  const addLine = (content) => {
+    if (!addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
+    addedByFile.get(currentFile).push(content);
+  };
+  for (const line of text.split(/\r?\n/)) {
+    if (hunk?.combined && !/^(?:diff |@@)/.test(line)) {
+      // Two prefix columns; a `+` in either counts as added. That over-matches, and an over-match never hides a trigger.
+      const columns = line.slice(0, 2);
+      if (columns.includes('+')) { changedLines += 1; addLine(line.slice(2)); } else if (columns.includes('-')) changedLines += 1;
       continue;
     }
-    if (line.startsWith('---')) continue;
-    if (line.startsWith('+')) {
-      changedLines += 1;
-      if (currentFile) addedByFile.get(currentFile).push(line.slice(1));
-      else {
-        if (!addedByFile.has(null)) addedByFile.set(null, []);
-        addedByFile.get(null).push(line.slice(1));
+    if (hunk && !hunk.combined && (hunk.old > 0 || hunk.new > 0) && /^(?: |\+|-|\\|$)/.test(line)) {
+      if (line.startsWith('+')) { hunk.new -= 1; changedLines += 1; addLine(line.slice(1)); } else if (line.startsWith('-')) { hunk.old -= 1; changedLines += 1; } else if (!line.startsWith('\\')) { hunk.old -= 1; hunk.new -= 1; }
+      continue;
+    }
+    hunk = null;
+    const hunkHeader = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+    if (hunkHeader) { hunk = { old: Number(hunkHeader[1] ?? 1), new: Number(hunkHeader[2] ?? 1) }; continue; }
+    if (line.startsWith('@@@')) { hunk = { combined: true }; continue; }
+    if (line.startsWith('diff --git ')) { currentFile = null; diffHeaderNames(line).forEach((name) => paths.add(name)); continue; }
+    if (line.startsWith('diff --cc ') || line.startsWith('diff --combined ')) {
+      currentFile = null;
+      paths.add(unquoteGitPath(line.replace(/^diff --(?:cc|combined) /, '')));
+      continue;
+    }
+    if (line.startsWith('+++ ')) {
+      currentFile = headerName(line.slice(4), RIGHT_PREFIX);
+      if (currentFile !== null) {
+        paths.add(currentFile);
+        if (!addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
       }
-    } else if (line.startsWith('-')) changedLines += 1;
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      const name = headerName(line.slice(4), LEFT_PREFIX);
+      if (name !== null) paths.add(name);
+      continue;
+    }
+    if (/^(?:rename|copy) (?:from|to) /.test(line)) { paths.add(unquoteGitPath(line.replace(/^(?:rename|copy) (?:from|to) /, ''))); continue; }
+    const binary = /^Binary files (.+) and (.+) differ$/.exec(line);
+    if (binary) {
+      for (const [raw, prefix] of [[binary[1], LEFT_PREFIX], [binary[2], RIGHT_PREFIX]]) {
+        const name = headerName(raw, prefix);
+        if (name !== null) paths.add(name);
+      }
+    }
   }
-  return { addedByFile, changedLines };
+  return { paths: [...paths], addedByFile, changedLines };
 }
 
 // fleet#58: a pattern matches in the case the tenant wrote it. Compiled with
@@ -176,7 +225,8 @@ function evaluateTrigger(name, { paths: pathGlobs = [], patterns = [] }, files, 
   const matches = [];
   for (const glob of pathGlobs) {
     for (const file of files) {
-      if (matchGlob(glob, file)) matches.push({ file, glob });
+      // Path globs match in any case: every tenant checkout is case-insensitive on this host (#445).
+      if (matchGlob(String(glob).toLowerCase(), String(file).toLowerCase())) matches.push({ file, glob });
     }
   }
   const excluded = (file) => file !== null && excludeGlobs.some((glob) => matchGlob(glob, file));
@@ -200,9 +250,13 @@ function classifyChange(options = {}) {
   const config = { ...DEFAULT_REVIEW_CONFIG, ...(options.config?.review || options.config || {}) };
   const excludeGlobs = config.patternExcludePaths || [];
   // A diff names its own paths: from the diff alone the file list is the diff's, and a list given with a diff is
-  // widened by it, so a Carve-out the diff touches is never missed (#445).
-  const files = [...new Set([...(options.files || []), ...pathsFromDiff(options.diffText)].map((file) => String(file).replace(/\\/g, '/')))];
-  const parsed = options.diffText !== undefined ? parseDiff(options.diffText) : null;
+  // widened by it, so a Carve-out the diff touches is never missed (#445). A diff that names no path is refused:
+  // an empty classification must not come out trivial.
+  const parsed = options.diffText !== undefined ? parseDiffText(options.diffText) : null;
+  const files = [...new Set([...(options.files || []).map((file) => unquoteGitPath(String(file)).replace(/\\/g, '/')), ...(parsed ? parsed.paths : [])])];
+  if (parsed && files.length === 0) {
+    throw new ReviewPolicyError('USAGE', 'the diff names no file path: a classification needs the file headers, the --- and +++ lines or the rename lines of a unified diff, or a file list (#445)');
+  }
   let addedByFile = parsed ? parsed.addedByFile : new Map();
   if (options.addedLines) {
     // Flat added lines with no per-file attribution: usable only when the file
@@ -251,7 +305,10 @@ function classifyFromGit(options = {}) {
   // --name-only, never --stat: --stat left-truncates long paths (ruled 2026-09-01). --no-renames -z: a moved file lists
   // both its paths, and a non-ASCII name arrives as written rather than C-quoted (#445).
   const files = git(['diff', '--name-only', '--no-renames', '-z', `${baseRef}...${headRef}`]).split('\0').filter(Boolean);
-  const diffText = git(['diff', `${baseRef}...${headRef}`]);
+  // The diff text is read as the plain unified diff the parser expects (#445): no renames (a renamed prose file shows its
+  // added lines), --text (a `-diff` attribute hides them), no external diff tool, no colour, and our own a/ b/ prefixes
+  // whatever diff.noprefix or diff.mnemonicPrefix say.
+  const diffText = git(['diff', '--no-renames', '--text', '--no-ext-diff', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', `${baseRef}...${headRef}`]);
   const headSha = git(['rev-parse', headRef]).trim();
   return { headSha, classification: classifyChange({ files, diffText, tenant, config }) };
 }
@@ -447,10 +504,16 @@ function tenantRepoPath({ root, recordId, record, repoPath }) {
   return String(configured);
 }
 
-function gitInRepo(repoPath, args) {
+function gitInRepo(repoPath, args, timeout) {
   return execFileSync('git', ['-C', repoPath, ...args], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout,
   });
+}
+
+// The fetches wait no longer than the module's gh calls do (defaultGh, 20 s), so a stalled remote cannot hold a record.
+const FETCH_TIMEOUT_MS = 20000;
+function fetchRun(git, repo) {
+  return git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args, FETCH_TIMEOUT_MS);
 }
 
 function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) {
@@ -458,14 +521,16 @@ function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) 
   const run = git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args);
   const branch = record?.assignment?.branch;
   if (branch) {
-    try { run(['fetch', '--quiet', 'origin', String(branch)]); } catch { /* offline or not yet pushed: the object may still be local */ }
+    try { fetchRun(git, repo)(['fetch', '--quiet', 'origin', String(branch)]); } catch { /* offline or not yet pushed: the object may still be local */ }
   }
   for (const { flag, sha } of shas) {
+    let resolved;
     try {
-      run(['cat-file', '-e', `${sha}^{commit}`]);
+      resolved = String(run(['rev-parse', '--verify', `${sha}^{commit}`]) || '').trim();
     } catch {
       throw new ReviewPolicyError('UNKNOWN_COMMIT', `${flag} ${sha} is not a commit in ${repo}${branch ? ` (after fetching origin/${branch})` : ''}; a review is recorded at a head that exists, never at a typed or invented SHA (fleet#67)`, { flag, sha: String(sha), repoPath: repo, branch: branch || null });
     }
+    requireCommitItself(resolved, sha, flag);
   }
   return repo;
 }
@@ -474,8 +539,15 @@ function verifyRecordedCommits({ root, recordId, record, shas, repoPath, git }) 
 // commit that stays put, and is refused rather than resolved for the caller.
 function requireFullSha(sha, flag) {
   if (!/^[0-9a-f]{40}$/.test(String(sha))) {
-    throw new ReviewPolicyError('FULL_SHA_REQUIRED', `${flag} ${sha} is not a full sha: a full 40-character sha is needed, so a branch name, a relative ref like HEAD~1 or a short sha is refused (#445)`, { flag, sha: String(sha) });
+    throw new ReviewPolicyError('FULL_SHA_REQUIRED', `${flag} ${sha} is not a full sha: a full 40-character sha is needed, so a branch name, a relative ref like HEAD~1 or a short sha is refused; take it from git rev-parse HEAD in the PR's worktree, or from gh pr view <n> --json headRefOid (#445)`, { flag, sha: String(sha) });
   }
+}
+
+// #445: a recorded head is its commit's own sha. `<sha>^{commit}` must answer the sha itself: an annotated tag is a
+// 40-hex object of its own that peels to the commit beneath it, so one commit would otherwise have two accepted spellings.
+function requireCommitItself(resolved, sha, flag) {
+  if (resolved === String(sha)) return;
+  throw new ReviewPolicyError('FULL_SHA_REQUIRED', `${flag} ${sha} is not the commit's own sha: it peels to ${resolved || 'no commit git reports'}, as an annotated tag does; a full sha of the commit itself is needed, so take git rev-parse HEAD in the PR's worktree, or gh pr view <n> --json headRefOid (#445)`, { flag, sha: String(sha), commit: resolved || null });
 }
 
 // #445: a formal review's classification is the head's own, computed against the tenant's defaultBranch: the base
@@ -485,9 +557,15 @@ function classificationAt({ root, tenant, recordId, record, repo, headSha, git }
   if (!config || !config.defaultBranch) {
     throw new ReviewPolicyError('TENANT_BASE_UNKNOWN', `cannot classify ${headSha} against the tenant's defaultBranch: ${config ? `tenant ${config.name || ''} names none` : 'no tenant file'}; a formal review records the head's own classification (#445)`, { headSha: String(headSha) });
   }
+  const base = `origin/${config.defaultBranch}`;
   const run = git ? (args) => git(args, repo) : (args) => gitInRepo(repo, args);
-  try { run(['fetch', '--quiet', 'origin', String(config.defaultBranch)]); } catch { /* offline: the base may still be local */ }
-  return classifyFromGit({ repoPath: repo, baseRef: `origin/${config.defaultBranch}`, headRef: headSha, tenant: config, config: loadConfig(root), git }).classification;
+  try { fetchRun(git, repo)(['fetch', '--quiet', 'origin', String(config.defaultBranch)]); } catch { /* offline: the base may still be local */ }
+  try {
+    run(['rev-parse', '--verify', '--quiet', `${base}^{commit}`]);
+  } catch {
+    throw new ReviewPolicyError('TENANT_BASE_MISSING', `${base} is not a commit in ${repo}: the tenant's defaultBranch ${config.defaultBranch} has no ref there to classify ${headSha} against, so nothing is recorded (#445)`, { base, repoPath: repo, headSha: String(headSha) });
+  }
+  return classifyFromGit({ repoPath: repo, baseRef: base, headRef: headSha, tenant: config, config: loadConfig(root), git }).classification;
 }
 
 // --- #115: the fleet-review commit status (ADR 0014) ------------------------
@@ -725,13 +803,15 @@ function attestPullRequest(options = {}) {
   const repo = options.repoPath || tenant.repo;
   if (!repo) throw new ReviewPolicyError('TENANT_REPO_UNKNOWN', `cannot resolve --head against a repository: pass --repo-path <tenant repo> or set "repo" in ${tenantFile}`);
   const run = options.git ? (args) => options.git(args, repo) : (args) => gitInRepo(repo, args);
-  try { run(['fetch', '--quiet', 'origin', `+refs/pull/${prNumber}/head`]); } catch { /* offline: the object may still be local */ }
+  try { fetchRun(options.git, repo)(['fetch', '--quiet', 'origin', `+refs/pull/${prNumber}/head`]); } catch { /* offline: the object may still be local */ }
+  let resolved;
   try {
-    run(['cat-file', '-e', `${headSha}^{commit}`]);
+    resolved = String(run(['rev-parse', '--verify', `${headSha}^{commit}`]) || '').trim();
   } catch {
     throw new ReviewPolicyError('UNKNOWN_COMMIT', `--head ${headSha} is not a commit in ${repo} (after fetching PR #${prNumber}); an attestation names a head that exists (fleet#67)`, { flag: '--head', sha: String(headSha), repoPath: repo });
   }
-  const head = fullSha(headSha, repo, options.git);
+  requireCommitItself(resolved, headSha, '--head');
+  const head = resolved;
   if (head.toLowerCase() !== currentHead.toLowerCase()) {
     throw new ReviewPolicyError('STALE_HEAD', `PR #${prNumber} has moved: its head is ${currentHead}, not ${head}; review ${currentHead} and attest that`, { currentHead, headSha: head });
   }
@@ -966,6 +1046,11 @@ function recordReviewArtifact(options = {}) {
       }
 
       const prior = record.review?.[kind] || null;
+      // #445 review: a link names a prior formal review. With none on the record the link has nothing to name, and it
+      // must not stand in for the risk review a trigger needs (the chain walk belongs to that prior alone).
+      if (linkedRereview && !prior) {
+        throw new ReviewPolicyError('USAGE', `--prior-artifact ${options.priorArtifact} names no prior formal review of ${recordId}; a first formal review takes no link (#445)`, { priorArtifact: String(options.priorArtifact) });
+      }
       if (prior && prior.headSha === String(headSha) && !dedupOff && !linkedRereview) {
         throw new ReviewPolicyError('ALREADY_REVIEWED', `a ${kind} review is already recorded for ${recordId} at ${headSha}`, { artifact: prior.artifact });
       }
@@ -1228,6 +1313,16 @@ function usage(message) {
   return new ReviewPolicyError('USAGE', `${message}\nusage: ${CLASSIFY_USAGE}`);
 }
 
+// A --diff file: UTF-8 with or without its byte-order mark, or UTF-16 with its own mark, which PowerShell's `>` writes
+// (#445). An odd trailing byte of UTF-16 is no character and is dropped.
+function readDiffFile(file) {
+  const bytes = fs.readFileSync(file);
+  const even = bytes.length - ((bytes.length - 2) % 2);
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2, even).toString('utf16le');
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) return Buffer.from(bytes.subarray(2, even)).swap16().toString('utf16le');
+  return bytes.toString('utf8').replace(/^﻿/, '');
+}
+
 function classifyCli(rest) {
   let args;
   try {
@@ -1263,7 +1358,7 @@ function classifyCli(rest) {
   if (args.diff && !fs.existsSync(args.diff)) throw usage(`--diff file not found: ${args.diff}`);
   return classifyChange({
     files,
-    diffText: args.diff ? fs.readFileSync(args.diff, 'utf8') : undefined,
+    diffText: args.diff ? readDiffFile(args.diff) : undefined,
     changedLines: args['changed-lines'] ? Number(args['changed-lines']) : undefined,
     tenant, config,
   });
@@ -1384,7 +1479,7 @@ if (require.main === module) {
     // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
     // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
     // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'FULL_SHA_REQUIRED', 'TENANT_BASE_UNKNOWN', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'FULL_SHA_REQUIRED', 'TENANT_BASE_UNKNOWN', 'TENANT_BASE_MISSING', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 

@@ -27,13 +27,23 @@ const { spawnSync: runGit } = require('node:child_process');
 // one. `git` is the injected runner: (args, repoPath) -> stdout, throws on a
 // non-zero exit like execFileSync does.
 function recordReviewArtifact(options) {
-  return recordAgainstRepo({ repoPath: 'E:/stub-repo', git: () => '', ...options });
+  return recordAgainstRepo({ repoPath: 'E:/stub-repo', git: everyObjectExists, ...options });
+}
+
+// The injected git runner for a repository where every object exists, whose head changed one ordinary file: `rev-parse
+// --verify <sha>^{commit}` answers the sha itself, as it does for a commit (#445: the record door checks that a head is
+// its own commit), and the diff names that file, which is no Carve-out and no trigger.
+function everyObjectExists(args) {
+  if (args[0] === 'rev-parse') return `${args[args.length - 1].replace(/\^\{commit\}$/, '')}\n`;
+  if (args[0] === 'diff') return changedFiles(['src/a.js'])(args);
+  return '';
 }
 
 // The injected git runner for a head that changed these files: the name listing
 // (NUL-separated, as classifyFromGit asks for it) and their diff, each adding one line.
 function changedFiles(files, addedLine = 'x') {
   return (args) => {
+    if (args[0] === 'rev-parse') return everyObjectExists(args);
     if (args[0] !== 'diff') return '';
     if (args.includes('--name-only')) return files.map((file) => `${file}\0`).join('');
     return files.map((file) => `diff --git a/${file} b/${file}\nnew file mode 100644\n--- /dev/null\n+++ b/${file}\n@@ -0,0 +1 @@\n+${addedLine}\n`).join('');
@@ -310,6 +320,209 @@ test('#445: a pull request that adds a carve-out file with a non-ASCII name is a
   const { classification } = classifyFromGit({ repoPath: repo, baseRef: base, tenant: TENANT });
   assert.deepEqual(classification.files, ['server/db/migrations/café.js']);
   assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+// --- #445 review: a diff alone, a listing, or a glob cannot fail open -----------
+
+test('#445 review: a diff made with --no-prefix (or diff.noprefix) names its paths, so a Carve-out it touches is never trivial', () => {
+  const diffText = [
+    'diff --git server/db/migrations/20260901_add.js server/db/migrations/20260901_add.js',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ server/db/migrations/20260901_add.js',
+    '@@ -0,0 +1 @@',
+    '+exports.up = () => {};',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/20260901_add.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: a diff with mnemonic prefixes (c/ and w/, diff.mnemonicPrefix) names its paths without them', () => {
+  const diffText = [
+    'diff --git c/server/db/migrations/x.js w/server/db/migrations/x.js',
+    '--- c/server/db/migrations/x.js',
+    '+++ w/server/db/migrations/x.js',
+    '@@ -1 +1 @@',
+    '-exports.up = 1;',
+    '+exports.up = 2;',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/x.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: a diff with only --- and +++ lines, and no diff --git header, names its paths', () => {
+  const diffText = [
+    '--- a/server/db/migrations/x.js',
+    '+++ b/server/db/migrations/x.js',
+    '@@ -0,0 +1 @@',
+    '+exports.up = () => {};',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/x.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: a combined diff --cc names its path, so a Carve-out in a merge diff is never trivial', () => {
+  const diffText = [
+    'diff --cc server/db/migrations/x.js',
+    'index 1111111,2222222..3333333',
+    '--- a/server/db/migrations/x.js',
+    '+++ b/server/db/migrations/x.js',
+    '@@@ -1,1 -1,1 +1,2 @@@',
+    '  exports.up = 1;',
+    ' +exports.up = 2;',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/x.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: a hunk whose added content opens with ++ b/ is not a file header: a destructive line after it still trips the real file', () => {
+  const diffText = [
+    'diff --git a/src/p.sql b/src/p.sql',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/p.sql',
+    '@@ -0,0 +1,2 @@',
+    '+++ b/docs/x.md',
+    '+DROP TABLE t;',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['src/p.sql']);
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires');
+  assert.equal(destructive.matches[0].file, 'src/p.sql', 'attributed to the real file, not the prose path');
+});
+
+test('#445 review: a prose file renamed to a code file that holds DROP TABLE trips the destructive trigger: the diff is made without renames', () => {
+  const root = rootDir();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
+  const git = gitIn(repo);
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  fs.writeFileSync(path.join(repo, 'docs', 'notes.md'), 'DROP TABLE is what this page warns about\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base', '--no-gpg-sign');
+  const base = git('rev-parse', 'HEAD');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  fs.renameSync(path.join(repo, 'docs', 'notes.md'), path.join(repo, 'src', 'p.js'));
+  git('add', '.');
+  git('commit', '-q', '-m', 'move', '--no-gpg-sign');
+  const { classification } = classifyFromGit({ repoPath: repo, baseRef: base, tenant: TENANT });
+  assert.ok(classification.files.includes('src/p.js'));
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['destructive']);
+});
+
+test('#445 review: a file marked -diff in .gitattributes still has its added lines read: the diff is made as text', () => {
+  const root = rootDir();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  const git = gitIn(repo);
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  fs.writeFileSync(path.join(repo, '.gitattributes'), '*.dat -diff\n');
+  fs.writeFileSync(path.join(repo, 'src', 'keep.dat'), 'kept\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'base', '--no-gpg-sign');
+  const base = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'src', 'y.dat'), 'DROP TABLE t;\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'change', '--no-gpg-sign');
+  const { classification } = classifyFromGit({ repoPath: repo, baseRef: base, tenant: TENANT });
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires on a -diff file');
+  assert.equal(destructive.matches[0].file, 'src/y.dat');
+});
+
+test('#445 review: a --files entry in git\'s quoted form is unquoted before it is matched', () => {
+  const classification = classifyChange({ files: ['"server/db/migrations/caf\\303\\251.js"'], tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/café.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: a quoted diff name that holds raw non-ASCII (core.quotePath=false) is decoded as UTF-8, not byte by byte', () => {
+  const diffText = [
+    'diff --git "a/server/db/migrations/café.js" "b/server/db/migrations/café.js"',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ "b/server/db/migrations/café.js"',
+    '@@ -0,0 +1 @@',
+    '+exports.up = () => {};',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/café.js']);
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: Carve-out and risk-trigger paths match case-insensitively: Server/DB/Migrations and .GitHub/Workflows are Carve-outs', () => {
+  const classification = classifyChange({ files: ['Server/DB/Migrations/a.js', '.GitHub/Workflows/x.yml'], tenant: TENANT });
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+  assert.deepEqual(classification.triggers[0].matches.map((match) => match.file), ['Server/DB/Migrations/a.js', '.GitHub/Workflows/x.yml']);
+});
+
+test('#445 review: a diff text with a UTF-8 byte-order mark still names its paths', () => {
+  const diffText = '﻿diff --git a/server/db/migrations/x.js b/server/db/migrations/x.js\nnew file mode 100644\n--- /dev/null\n+++ b/server/db/migrations/x.js\n@@ -0,0 +1 @@\n+x\n';
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.triggers.map((trigger) => trigger.class), ['carve-out']);
+});
+
+test('#445 review: a diff that names no path is refused USAGE, never classified trivial', () => {
+  for (const diffText of ['', 'this is not a diff\n', 'Binary-looking nothing\n']) {
+    assert.throws(() => classifyChange({ diffText, tenant: TENANT }), (error) => error.code === 'USAGE' && /names no file path/.test(error.message));
+  }
+});
+
+// The CLI reads a --diff file: a BOM, UTF-16 as PowerShell's `>` writes it, an empty file and a garbage file.
+function diffFileRun(root, bytes) {
+  const file = path.join(root, `diff-${Math.random().toString(16).slice(2)}.diff`);
+  fs.writeFileSync(file, bytes);
+  return spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'review-policy.js'), 'classify', '--root', root, '--tenant', 'endzone', '--diff', file], { encoding: 'utf8', windowsHide: true });
+}
+
+const MIGRATION_DIFF = 'diff --git a/server/db/migrations/x.js b/server/db/migrations/x.js\nnew file mode 100644\n--- /dev/null\n+++ b/server/db/migrations/x.js\n@@ -0,0 +1 @@\n+x\n';
+
+test('#445 review: classify reads a --diff file written with a UTF-8 byte-order mark', () => {
+  const run = diffFileRun(classifyRoot(), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(MIGRATION_DIFF, 'utf8')]));
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(JSON.parse(run.stdout).riskReview, true);
+});
+
+test('#445 review: classify reads a --diff file in UTF-16LE with its byte-order mark, as PowerShell redirection writes it', () => {
+  const run = diffFileRun(classifyRoot(), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(MIGRATION_DIFF, 'utf16le')]));
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(JSON.parse(run.stdout).riskReview, true);
+});
+
+test('#445 review: classify refuses an empty --diff file with USAGE, exit 2, and no answer on stdout', () => {
+  const run = diffFileRun(classifyRoot(), '');
+  assert.equal(run.status, 2, run.stderr);
+  assert.equal(run.stdout, '');
+  assert.equal(JSON.parse(run.stderr).code, 'USAGE');
+});
+
+test('#445 review: classify refuses a garbage --diff file with USAGE, exit 2, and no answer on stdout', () => {
+  const run = diffFileRun(classifyRoot(), 'not a diff at all\n');
+  assert.equal(run.status, 2, run.stderr);
+  assert.equal(run.stdout, '');
+  assert.equal(JSON.parse(run.stderr).code, 'USAGE');
+});
+
+test('#445 review: a header and its --- and +++ lines name one file once: the prefixes come off, nothing is added', () => {
+  const diffText = [
+    'diff --git a/server/db/migrations/x.js b/server/db/migrations/x.js',
+    '--- a/server/db/migrations/x.js',
+    '+++ b/server/db/migrations/x.js',
+    '@@ -1 +1 @@',
+    '-a',
+    '+b',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['server/db/migrations/x.js']);
 });
 
 // --- exactly one formal review ---
@@ -1666,6 +1879,22 @@ test('fleet#64: a first formal review at a new head does not lean on a risk arti
   );
 });
 
+test('#445 review: a --prior-artifact that names no prior formal review of the record is refused, and the migration at the new head still needs its risk review', () => {
+  const root = rootDir();
+  const { revision } = seedRiskThenReview(root, { findings: [{ file: 'src/a.jsx', claim: 'aria', severity: 'nit', category: 'style' }] });
+  const migration = changedFiles(['server/db/migrations/20260901_x.js']);
+  const base = { root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead', git: migration, noFindings: 'clean' };
+  assert.throws(
+    () => recordReviewArtifact({ ...base, idempotencyKey: 'formal-no-link', now: '2026-09-14T18:00:00.000Z' }),
+    (error) => error.code === 'RISK_REVIEW_MISSING',
+  );
+  assert.throws(
+    () => recordReviewArtifact({ ...base, priorArtifact: 'state/reviews/nope.json', idempotencyKey: 'formal-link', now: '2026-09-14T18:00:00.000Z' }),
+    (error) => error.code === 'USAGE' && /names no prior formal review/.test(error.message),
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).review.formal, undefined, 'no formal review was recorded');
+});
+
 test('fleet#64: --risk-ruling records the lead ruling in the artifact in place of the missing risk review', () => {
   const root = rootDir();
   const revision = seedRecord(root);
@@ -1824,14 +2053,15 @@ test('fleet#67: the check fetches the record\'s PR branch first and tolerates a 
   });
   const revision = workState.getRecord({ root, id: 'endzone:issue-42' }).revision;
   const calls = [];
-  const git = (args, repoPath) => { calls.push([repoPath, ...args]); if (args[0] === 'fetch') throw new Error('offline'); return ''; };
+  const git = (args, repoPath) => { calls.push([repoPath, ...args]); if (args[0] === 'fetch') throw new Error('offline'); return everyObjectExists(args); };
   const recorded = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: 'E:/tenant', git, kind: 'risk', headSha: 'c'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
   assert.ok(recorded.artifact);
   assert.deepEqual(calls[0], ['E:/tenant', 'fetch', '--quiet', 'origin', 'fleet/42-thing'], 'the PR branch is fetched so a just-pushed head resolves');
-  assert.deepEqual(calls[1], ['E:/tenant', 'cat-file', '-e', `${'c'.repeat(40)}^{commit}`]);
+  // #445: the commit is checked by its own sha: rev-parse --verify <sha>^{commit} must answer the sha.
+  assert.deepEqual(calls[1], ['E:/tenant', 'rev-parse', '--verify', `${'c'.repeat(40)}^{commit}`]);
   assert.equal(calls.length, 2, 'reviewedSha equal to headSha is resolved once');
 
-  const missing = (args) => { if (args[0] === 'cat-file') { const error = new Error('fatal: Not a valid object name'); error.status = 1; throw error; } return ''; };
+  const missing = (args) => { if (args[0] === 'rev-parse') { const error = new Error('fatal: Not a valid object name'); error.status = 1; throw error; } return ''; };
   assert.throws(
     () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: recorded.result.revision, repoPath: 'E:/tenant', git: missing, kind: 'risk', headSha: 'd'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS, idempotencyKey: 'second' }),
     (error) => error.code === 'UNKNOWN_COMMIT',
@@ -1848,7 +2078,7 @@ test('fleet#67: the repo comes from --repo-path or the tenant file; with neither
   fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
   fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ ...TENANT, repo: 'E:\\Tenant-Repo' }));
   const calls = [];
-  const recorded = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, git: (args, repoPath) => { calls.push(repoPath); return ''; }, kind: 'risk', headSha: 'c'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
+  const recorded = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, git: (args, repoPath) => { calls.push(repoPath); return everyObjectExists(args); }, kind: 'risk', headSha: 'c'.repeat(40), actor: 'ic-42', classification: RISK, findings: RISK_FINDINGS });
   assert.ok(recorded.artifact);
   assert.deepEqual([...new Set(calls)], ['E:\\Tenant-Repo'], 'the tenant file\'s repo is the default');
 });
@@ -1909,6 +2139,129 @@ test('#445: a recorded head is a full 40-character sha: a branch name, a relativ
 // The audit counted 485 findings with 12+ severity spellings and 41 blank; nothing
 // at the door checked either. Red-tell: with bin/review-policy.js reverted, the
 // `"severity":"high"` finding below writes an artifact.
+
+test('#445 review: a formal record at a head whose commit the tenant checkout does not hold is UNKNOWN_COMMIT, and writes nothing', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  const { repo } = commitIn(root);
+  const fake = 'e'.repeat(40);
+  assert.throws(
+    () => recordAgainstRepo({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'formal', headSha: fake, actor: 'project-lead',
+      findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }], idempotencyKey: 'formal-unknown', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error.code === 'UNKNOWN_COMMIT' && error.sha === fake,
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision, 'no event was written');
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
+});
+
+test('#445 review: a git failure while a formal record classifies its head writes nothing: no artifact, no event, no status', () => {
+  const root = rootDir();
+  reviewTenant(root);
+  const revision = seedRecord(root);
+  const { calls, gh } = stubGh();
+  const broken = (args) => {
+    if (args[0] === 'diff') throw new Error('fatal: simulated diff failure');
+    return everyObjectExists(args);
+  };
+  assert.throws(
+    () => recordAgainstRepo({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: 'E:/stub-repo', git: broken, gh,
+      kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
+      findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }], idempotencyKey: 'formal-broken', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => /simulated diff failure/.test(error.message),
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision, 'no event was written');
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
+  assert.equal(calls.length, 0, 'no status was posted');
+});
+
+test('#445 review: the base is origin/<defaultBranch>: a fixture where another base would classify the head differently decides on the named one', () => {
+  const root = rootDir();
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  const git = gitIn(repo);
+  git('init', '-q');
+  git('config', 'user.email', 'fleet@example.invalid');
+  git('config', 'user.name', 'fleet');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a');
+  git('add', '.');
+  git('commit', '-q', '-m', 'one', '--no-gpg-sign');
+  const first = git('rev-parse', 'HEAD');
+  fs.mkdirSync(path.join(repo, 'server', 'db', 'migrations'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'server', 'db', 'migrations', '20260901_x.js'), 'exports.up = () => {};\n');
+  git('add', '.');
+  git('commit', '-q', '-m', 'two', '--no-gpg-sign');
+  const second = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'b');
+  git('commit', '-q', '-a', '-m', 'three', '--no-gpg-sign');
+  const head = git('rev-parse', 'HEAD');
+  git('update-ref', 'refs/remotes/origin/integration', first);
+  git('update-ref', 'refs/remotes/origin/main', second);
+  const revision = seedRecord(root);
+  const findings = [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }];
+  // Against integration the head adds a migration: a Carve-out, so the formal record needs its risk review.
+  assert.throws(
+    () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'formal', headSha: head, actor: 'project-lead', findings, idempotencyKey: 'formal-integration', now: '2026-09-14T18:00:00.000Z' }),
+    (error) => error.code === 'RISK_REVIEW_MISSING' && error.triggers === 'carve-out',
+  );
+  // Against main the migration is already there: the same head classifies normal and records.
+  const recorded = recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'formal', headSha: head, actor: 'project-lead', findings, tenant: { ...TENANT, defaultBranch: 'main' }, idempotencyKey: 'formal-main', now: '2026-09-14T18:00:00.000Z' });
+  assert.equal(recorded.result.record.review.formal.headSha, head);
+  assert.deepEqual(recorded.result.record.review.formal.triggers, []);
+});
+
+test('#445 review: a missing base ref is TENANT_BASE_MISSING, naming the ref and the repo: exit 2, and nothing is written', () => {
+  const root = rootDir();
+  const { repo, head } = commitIn(root);
+  gitIn(repo)('update-ref', '-d', 'refs/remotes/origin/integration');
+  const revision = seedRecord(root);
+  const findings = [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }];
+  assert.throws(
+    () => recordAgainstRepo({ root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'formal', headSha: head, actor: 'project-lead', findings, idempotencyKey: 'formal-no-base', now: '2026-09-14T18:00:00.000Z' }),
+    (error) => error.code === 'TENANT_BASE_MISSING' && error.base === 'origin/integration' && error.message.includes('origin/integration') && error.message.includes(repo),
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision);
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const run = spawnSync(process.execPath, [bin, 'record', '--root', root, '--id', 'endzone:issue-42', '--expected-revision', String(revision), '--kind', 'formal', '--head-sha', head, '--repo-path', repo, '--actor', 'project-lead', '--no-findings', 'clean'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 2, run.stderr);
+  assert.equal(run.stdout, '');
+  assert.equal(JSON.parse(run.stderr).code, 'TENANT_BASE_MISSING');
+});
+
+test('#445 review: an annotated tag object sha is refused FULL_SHA_REQUIRED at the record door: one commit has one accepted spelling', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const { repo, head } = commitIn(root);
+  gitIn(repo)('tag', '-a', 'v1', '-m', 'release', head);
+  const tag = gitIn(repo)('rev-parse', 'v1');
+  assert.notEqual(tag, head);
+  assert.throws(
+    () => recordAgainstRepo({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, repoPath: repo, kind: 'risk', headSha: tag, actor: 'ic-42',
+      classification: RISK, findings: RISK_FINDINGS, idempotencyKey: 'risk-tag', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error.code === 'FULL_SHA_REQUIRED' && error.sha === tag && /not the commit's own sha/.test(error.message),
+  );
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).revision, revision);
+  assert.ok(!fs.existsSync(path.join(root, 'state', 'reviews')), 'no artifact was written');
+});
+
+test('#445 review: FULL_SHA_REQUIRED names the remedy: git rev-parse HEAD in the PR worktree, or gh pr view --json headRefOid', () => {
+  const root = rootDir();
+  const revision = seedRecord(root);
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: 'HEAD', actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
+      idempotencyKey: 'head-remedy', now: '2026-09-14T18:00:00.000Z',
+    }),
+    (error) => error.code === 'FULL_SHA_REQUIRED' && error.message.includes('git rev-parse HEAD') && error.message.includes('gh pr view') && error.message.includes('headRefOid'),
+  );
+});
 
 function formalAt(root, revision, findings, extra = {}) {
   return recordReviewArtifact({
@@ -2275,6 +2628,18 @@ test('#116: the artifact is held to the record door: severity enum, category, an
   refuse([1, 2], 'INVALID_ARTIFACT');
   const missing = path.join(root, 'nope.json');
   assert.throws(() => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: missing, gh }), (error) => error.code === 'INVALID_ARTIFACT');
+});
+
+test('#445 review: an attestation at an annotated tag sha is refused FULL_SHA_REQUIRED: the tag names the commit the earlier attestation names', () => {
+  const { root, repo, head, calls, gh, artifact } = attestFixture();
+  gitIn(repo)('tag', '-a', 'v1', '-m', 'release', head);
+  const tag = gitIn(repo)('rev-parse', 'v1');
+  attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact({ findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'correctness' }] }), actor: 'cory', gh });
+  assert.throws(
+    () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: tag, artifactPath: artifact({ noFindings: 'clean at the tag' }), actor: 'cory', gh }),
+    (error) => error.code === 'FULL_SHA_REQUIRED' && error.sha === tag,
+  );
+  assert.equal(statusCalls(calls).length, 1, 'the refused attestation posts no status');
 });
 
 test('#446: a second attestation at a head is refused while the earlier one has an open blocker, and accounted for once it does', () => {
