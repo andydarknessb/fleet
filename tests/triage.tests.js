@@ -152,6 +152,26 @@ test('an Approved comment from the owner after the proposal is an approval; the 
   assert.equal(edits.eligible[0].by, OWNER);
 });
 
+// #451: an approval item says whether the issue body changed after the proposal, so the Principal restates against the body it will assign.
+test('#451: an approval item carries bodyChanged, false at the proposal\'s body and true once it has changed, for a live Approval and for an expired claim', () => {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 1, bodyHash: 'hash-a', commentUrl: 'https://x/1', model: 'fable', now: '2026-09-10T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 2, bodyHash: 'hash-c', commentUrl: 'https://x/2', model: 'fable', now: '2026-09-10T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'approved', issue: 2, by: OWNER, actor: 'finalize-script', now: '2026-09-11T00:00:00.000Z' });
+  const entries = readLedger(root, 'endzone');
+  const approval = [comment(OWNER, 'Approved', '2026-09-11T00:00:00.000Z')];
+  const same = frontier([{ ...issue(1, { labels: ['triage-proposed'], comments: approval }), bodyHash: 'hash-a' }], { entries });
+  assert.equal(same.eligible[0].kind, 'approval');
+  assert.equal(same.eligible[0].bodyChanged, false);
+  const changed = frontier([{ ...issue(1, { labels: ['triage-proposed'], comments: approval }), bodyHash: 'hash-b' }], { entries });
+  assert.equal(changed.eligible[0].kind, 'approval');
+  assert.equal(changed.eligible[0].bodyChanged, true);
+  const claim = frontier([{ ...issue(2, { labels: ['triage-proposed'] }), bodyHash: 'hash-z' }], { entries });
+  assert.equal(claim.eligible[0].kind, 'approval');
+  assert.match(claim.eligible[0].reason, /claim older than 30 minutes/);
+  assert.equal(claim.eligible[0].bodyChanged, true);
+});
+
 test('decision-needed wakes are escalations only when newer than the consumed marker, newest per record, ordered after approvals and before tickets', () => {
   const root = rootDir();
   recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-05T00:00:00.000Z', now: '2026-09-05T00:00:01.000Z' });
@@ -275,6 +295,56 @@ test('the projection reports pending, awaiting-finalize, the window ratio and th
   assert.ok(projection.window.decided < projection.allTime.decided, 'the window is narrower than all time');
   const notYet = projectTriage({ entries: entries.slice(0, 10), now: '2026-08-30T00:00:00.000Z' });
   assert.equal(notYet.graduation.met, false);
+});
+
+// #451: a proposal on an issue the Watchdog's last open-issue read does not show is closed, and leaves the pending and
+// awaiting-finalize counts when the proposal predates that read. One opened after the read stays. No open set: as before.
+test('#451: pending and awaiting-finalize leave out a closed issue older than the read, and keep one opened after it', () => {
+  const entries = [
+    { kind: 'proposed', issue: 1, at: '2026-09-10T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u1', model: 'fable' },
+    { kind: 'proposed', issue: 2, at: '2026-09-10T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u2', model: 'fable' },
+    { kind: 'proposed', issue: 3, at: '2026-09-13T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u3', model: 'fable' },
+    { kind: 'proposed', issue: 4, at: '2026-09-10T00:00:00.000Z', bodyHash: 'h', commentUrl: 'u4', model: 'fable' },
+    { kind: 'approved', issue: 4, at: '2026-09-10T01:00:00.000Z', by: OWNER },
+  ];
+  const openIssues = { at: '2026-09-12T00:00:00.000Z', numbers: new Set([2]) };
+  const open = projectTriage({ entries, now: NOW, openIssues });
+  assert.deepEqual(open.pending.map((row) => row.issue), [2, 3]);
+  assert.deepEqual(open.awaitingFinalize, [], 'the approved closed issue is not awaiting finalizing');
+  const counted = projectTriage({ entries, now: NOW });
+  assert.deepEqual(counted.pending.map((row) => row.issue), [1, 2, 3], 'with no open set nothing is left out');
+  assert.deepEqual(counted.awaitingFinalize.map((row) => row.issue), [4]);
+});
+
+// #451: the open set is the Watchdog's last read, from state/watchdog/triage-frontier.json. Every issue the frontier classified is
+// open (skipped or eligible). A missing file, a missing or errored tenant entry or an unreadable file gives no open set at all.
+test('#451: readOpenIssues reads the open issues of a tenant from the Watchdog shadow, and gives none when the shadow cannot say', () => {
+  const root = rootDir();
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'no file');
+  const shadow = path.join(root, 'state', 'watchdog', 'triage-frontier.json');
+  fs.mkdirSync(path.dirname(shadow), { recursive: true });
+  const write = (body) => fs.writeFileSync(shadow, typeof body === 'string' ? body : JSON.stringify(body));
+  write('{ not json');
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'a torn file');
+  write({ at: '2026-09-12T07:45:00.1234567Z', tenants: [{ tenant: 'endzone', error: 'triage.js timed out' }, { tenant: 'nidus', skipped: [], eligible: [] }] });
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'an errored entry');
+  write({ at: '2026-09-12T07:45:00.1234567Z', tenants: [{ tenant: 'endzone', premises: { ready: 1, missing: [], malformed: [] } }] });
+  assert.equal(triage.readOpenIssues(root, 'endzone'), null, 'an entry with no classification');
+  assert.equal(triage.readOpenIssues(root, 'missing'), null, 'no entry for the tenant');
+  write({ at: '2026-09-12T07:45:00.1234567Z', tenants: [{ tenant: 'endzone', skipped: [{ number: 7, reason: 'held' }], eligible: [{ kind: 'ticket', number: 9, reason: 'unrouted' }] }] });
+  const read = triage.readOpenIssues(root, 'endzone');
+  assert.equal(read.at, '2026-09-12T07:45:00.123Z');
+  assert.deepEqual([...read.numbers].sort((a, b) => a - b), [7, 9]);
+});
+
+// #451: readOpenIssues takes the open set from the frontier's skipped and eligible lists, so every open issue must appear in one.
+test('#451: every open issue the frontier read is classified as skipped or eligible, so those numbers are the open set', () => {
+  const issues = [
+    issue(1, { labels: ['needs-triage'] }), issue(2, { labels: ['ready-for-agent'] }), issue(3, { labels: ['spec'] }),
+    issue(4, { assignees: [OWNER] }), issue(5, { openSubIssues: 1 }), issue(6, { labels: ['triage-proposed'] }),
+  ];
+  const result = frontier(issues);
+  assert.deepEqual([...result.eligible, ...result.skipped].map((row) => row.number).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6]);
 });
 
 test('computeFrontier fails closed on an unset owner login and on an unreadable GitHub; a fixture stands in for GitHub', () => {
@@ -596,6 +666,22 @@ test('#263: a changed body reopens an unmarked open proposal as a reproposal, as
   }
 });
 
+// #451: a superseded proposal with no successor is a session that died between its superseded row and its new proposal. It is
+// served as a reproposal, marker or not; the Principal records its successor directly, since the superseded row already stands.
+test('#451: a superseded proposal with no successor is served as a reproposal, marker or not, and its successor records directly', () => {
+  const world = openProposalWorld();
+  const hash = triage.normalizeIssue(issue(7, { body: OPEN_BODY })).bodyHash;
+  recordEntry({ root: world.root, tenant: 'endzone', kind: 'superseded', issue: 7, bodyHash: hash, now: '2026-09-25T00:00:00.000Z' });
+  const entries = readLedger(world.root, 'endzone');
+  for (const labels of [['needs-triage', 'triage-proposed'], ['triage-proposed'], ['needs-triage'], []]) {
+    const served = frontier([issue(7, { body: OPEN_BODY, labels })], { entries, now: '2026-09-25T01:00:00.000Z' });
+    assert.deepEqual(served.eligible.map((item) => [item.number, item.kind]), [[7, 'reproposal']], `labels [${labels}]`);
+    assert.match(served.eligible[0].reason, /superseded at 2026-09-25T00:00:00.000Z with no newer proposal/);
+    assert.equal(served.eligible[0].bodyHash, hash);
+  }
+  assert.doesNotThrow(() => recordEntry({ root: world.root, tenant: 'endzone', kind: 'proposed', issue: 7, bodyHash: hash, commentUrl: 'https://x/new', model: 'fable', now: '2026-09-25T02:00:00.000Z' }), 'the successor is recorded without a second superseded row');
+});
+
 // #268: a decision-needed wake newer than the consumed marker is served as an escalation, open proposal or not
 // (it is a decision the Principal must see). It carries the open proposal so the Principal supersedes it first.
 const WAKE = { wake: 'decision-needed', recordId: 'endzone:issue-7', at: '2026-09-20T00:00:00.000Z', evidence: 'lead needs a ruling', reason: 'stale-premise', premise: 'src/a.js: x @abc1234' };
@@ -746,7 +832,25 @@ test('#148: the projection lists 30 days of stale-premise restatements with verd
     { issue: 3, premise: `${STALE_LINE} #3`, proposedAt: '2026-09-22T00:00:00.000Z', verdict: 'rejected', ageDays: 2 },
     { issue: 4, premise: `${STALE_LINE} #4`, proposedAt: '2026-09-23T12:00:00.000Z', verdict: 'pending', ageDays: 0.5 },
   ]);
-  assert.deepEqual(fold.stalePremise.counts, { approved: 1, 'approved-with-edits': 0, rejected: 1, superseded: 0, pending: 1 });
+  assert.deepEqual(fold.stalePremise.counts, { approved: 1, 'approved-with-edits': 0, rejected: 1, superseded: 0, endorsed: 0, 'endorsed-with-edits': 0, pending: 1 });
+});
+
+// #451: an Endorsement is a Ruling the moment it is posted (ADR 0017), so an Arbiter-endorsed stale-premise proposal is settled, not pending;
+// an escalated one still waits on the owner.
+test('#451: a stale-premise proposal the Arbiter endorsed is settled in the stale tally; the open one alone is pending', () => {
+  const root = rootDir();
+  const propose = (issue, at) => recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue, bodyHash: `h${issue}`, commentUrl: `https://x/${issue}`, model: 'fable', reason: 'stale-premise', premise: `${STALE_LINE} #${issue}`, now: at });
+  propose(40, '2026-09-20T00:00:00.000Z');
+  recordEntry({ root, tenant: 'endzone', kind: 'endorsed', issue: 40, bodyHash: 'h40', commentUrl: 'https://x/40', now: '2026-09-20T01:00:00.000Z' });
+  propose(41, '2026-09-21T00:00:00.000Z');
+  propose(42, '2026-09-22T00:00:00.000Z');
+  recordEntry({ root, tenant: 'endzone', kind: 'endorsed-with-edits', issue: 42, bodyHash: 'h42', commentUrl: 'https://x/42', edits: 'tier haiku', now: '2026-09-22T01:00:00.000Z' });
+  const fold = projectTriage({ entries: readLedger(root, 'endzone'), now: '2026-09-24T00:00:00.000Z' });
+  assert.deepEqual(fold.stalePremise.rows.map((row) => [row.issue, row.verdict]), [[40, 'endorsed'], [41, 'pending'], [42, 'endorsed-with-edits']]);
+  assert.deepEqual(fold.stalePremise.counts, { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, endorsed: 1, 'endorsed-with-edits': 1, pending: 1 });
+  assert.deepEqual(fold.pending.map((row) => row.issue), [41]);
+  const notice = triage.runStalePremiseNotice({ root, now: '2026-10-21T00:00:00.000Z', dryRun: true });
+  assert.match(notice.message.body, /3 stale-premise restatement\(s\) since 2026-09-20: 0 approved, 0 approved with edits, 0 rejected, 1 pending, 2 endorsed\./);
 });
 
 test('#148: the dated notice arms on the first stale-premise entry, pages once at 30 days with the tally, and never twice', () => {
@@ -1066,6 +1170,31 @@ test('#207: a run cut short is finished by the next run: one Ruling, the labels,
     assert.deepEqual(world.ledger().slice(1).map((row) => [row.kind, row.actor]), [['approved', 'finalize-script'], ['finalized', 'finalize-script']], name);
     assert.deepEqual(world.finalize().finalized, [], `${name}: and a rerun does nothing`);
     assert.equal(world.ledger().length, 3, name);
+  }
+});
+
+// #451: a resumed claim runs the checks a first run makes (the proposal gate and the owner-commented check), unless a Ruling
+// already stands; a refusal leaves the claim standing and GitHub untouched, as a first run's refusal does.
+test('#451: a resumed claim is refused after the body was edited, the owner commented or a hold was put on, as a first run refuses it', () => {
+  const claimed = (each) => {
+    const world = finalizeWorld({ each });
+    recordEntry({ root: world.root, tenant: 'endzone', kind: 'approved', issue: 40, by: OWNER, commentUrl: approvalUrl(40), actor: 'finalize-script', now: '2026-09-11T00:00:30.000Z' });
+    return world;
+  };
+  const cases = [
+    ['the body edited', 'body-changed', () => ({ body: `${BODY}Edited later.\n`, proposedBody: BODY })],
+    ['the owner commented', 'owner-commented-after-approval', () => ({ thread: { extraComments: [{ id: 'late', url: 'https://x/late', author: OWNER, body: 'Hold on, what about the mobile view?', createdAt: '2026-09-11T00:10:00.000Z' }] } })],
+    ['the approval edited to a qualified one', 'not-exact-approval', () => ({ thread: { approval: 'Approved, but skip the second premise', approvalEditedAt: '2026-09-11T00:05:00.000Z' } })],
+    ['held', 'labels', () => ({ labels: ['needs-triage', 'triage-proposed', 'held'] })],
+  ];
+  for (const [name, reason, each] of cases) {
+    const world = claimed(each);
+    const before = JSON.stringify(world.fixtureIssue());
+    const result = world.finalize();
+    assert.deepEqual(result.finalized, [], name);
+    assert.deepEqual(result.left.map((entry) => [entry.issue, entry.reason]), [[40, reason]], name);
+    assert.equal(JSON.stringify(world.fixtureIssue()), before, `${name}: GitHub is untouched`);
+    assert.deepEqual(world.ledger().slice(1).map((row) => [row.kind, row.actor]), [['approved', 'finalize-script']], `${name}: the claim stands and nothing is finalized`);
   }
 });
 
@@ -2336,6 +2465,18 @@ test('ADR 0017: the Principal frontier shows an endorsed-with-edits row at once 
   assert.equal(stale.kind, 'endorsement');
   assert.equal(stale.withEdits, false);
   assert.match(stale.reason, /older than 30 minutes/);
+});
+
+// #451: an endorsement item says whether the body changed after the proposal, as an approval item does.
+test('#451: an endorsement item carries bodyChanged, false at the proposal\'s body and true once the body has changed', () => {
+  const world = arbiterWorld();
+  world.door({ kind: 'endorsed-with-edits', edits: 'tier haiku; owner Andy', now: '2026-09-12T11:59:00.000Z' });
+  const served = () => computeFrontier({ root: world.root, tenant: 'endzone', fixture: world.fixture, now: NOW }).eligible;
+  assert.equal(served()[0].kind, 'endorsement');
+  assert.equal(served()[0].bodyChanged, false);
+  editFixture(world, (target) => { target.body = `${BODY}Edited later.\n`; });
+  assert.equal(served()[0].kind, 'endorsement');
+  assert.equal(served()[0].bodyChanged, true);
 });
 
 test('ADR 0017: the arbiter frontier lists open proposals oldest first and drops each one that is decided, edited, held, spoken on or returned', () => {

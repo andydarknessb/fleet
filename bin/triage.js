@@ -38,6 +38,7 @@ const BOUNDED_KINDS = Object.freeze(['bounded-ready', 'veto', 'suspended']);
 // outcome kinds (and a new proposal) replace it.
 const ARBITER_OUTCOME_KINDS = Object.freeze(['endorsed', 'endorsed-with-edits', 'escalated']);
 const ARBITER_KINDS = Object.freeze([...ARBITER_OUTCOME_KINDS, 'returned']);
+const ENDORSEMENT_KINDS = Object.freeze(['endorsed', 'endorsed-with-edits']);   // ADR 0017: a Ruling the moment it is posted
 const ESCALATION_CLASSES = Object.freeze(['product-intent', 'money', 'user-promise', 'rule-change', 'disagreement']);
 const ARBITER_ACTOR = 'arbiter';
 const LEDGER_KINDS = Object.freeze(['proposed', 'approved', 'approved-with-edits', 'rejected', 'superseded', 'finalized', 'consumed', ...BOUNDED_KINDS, ...ARBITER_KINDS]);
@@ -300,7 +301,7 @@ function armStalePremiseNotice(root, entry) {
 
 function stalePremiseTally(root, since) {
   const dir = path.join(baseOf(root), 'state', 'triage');
-  const counts = { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, pending: 0 };
+  const counts = { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, endorsed: 0, 'endorsed-with-edits': 0, pending: 0 };
   const tenants = fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => name.endsWith('.jsonl')).map((name) => name.slice(0, -6)).sort() : [];
   for (const tenant of tenants) {
     for (const row of staleRows(readLedger(root, tenant))) {
@@ -319,9 +320,10 @@ function runStalePremiseNotice({ root, now, send, dryRun = false } = {}) {
   if (at < notice.dueAt) return { armed: true, due: false, sent: false, dueAt: notice.dueAt };
   const counts = stalePremiseTally(root, notice.armedAt);
   const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const endorsed = counts.endorsed + counts['endorsed-with-edits'];
   const message = {
     kind: 'dated', priority: 'normal', title: 'Fleet: rule on stale-premise restatements',
-    body: `${STALE_NOTICE_DAYS} days are up: rule whether stale-premise restatements may skip Approval (ADR 0011, spec fleet #92). ${total} stale-premise restatement(s) since ${String(notice.armedAt).slice(0, 10)}: ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}. The rows are in the digest's Triage section.`,
+    body: `${STALE_NOTICE_DAYS} days are up: rule whether stale-premise restatements may skip Approval (ADR 0011, spec fleet #92). ${total} stale-premise restatement(s) since ${String(notice.armedAt).slice(0, 10)}: ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}${endorsed ? `, ${endorsed} endorsed` : ''}. The rows are in the digest's Triage section.`,
   };
   if (dryRun) return { armed: true, due: true, sent: false, dryRun: true, message };
   let result;
@@ -416,7 +418,7 @@ function staleRows(entries) {
     if (entry.kind === 'proposed') {
       open.delete(issue);
       if (entry.reason === 'stale-premise') { const row = { issue, premise: entry.premise, proposedAt: entry.at, verdict: 'pending' }; rows.push(row); open.set(issue, row); }
-    } else if (OUTCOME_KINDS.includes(entry.kind) && open.has(issue)) {
+    } else if ((OUTCOME_KINDS.includes(entry.kind) || ENDORSEMENT_KINDS.includes(entry.kind)) && open.has(issue)) {   // #451: an escalation is still the owner's
       open.get(issue).verdict = entry.kind;
       open.delete(issue);
     }
@@ -426,8 +428,10 @@ function staleRows(entries) {
 
 // ------------------------------------------------------------ projection ----
 
-function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
+function projectTriage({ entries = [], now, windowDays, graduation, openIssues = null } = {}) {
   const at = isoOrThrow(now || new Date().toISOString(), 'now');
+  // #451: a proposal on an issue absent from the open set is closed when it predates the read; one proposed after the read stays.
+  const stillOpen = (row) => !openIssues || openIssues.numbers.has(row.issue) || !(Date.parse(row.proposed.at) < Date.parse(openIssues.at));
   const window = Number(windowDays) > 0 ? Number(windowDays) : DEFAULT_CONFIG.windowDays;
   const rule = { ...DEFAULT_CONFIG.graduation, ...(graduation || {}) };
   const sorted = [...entries].filter((entry) => entry && entry.kind).sort((left, right) => String(left.at).localeCompare(String(right.at)));
@@ -458,8 +462,8 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     else if (entry.kind === 'finalized') { if (row.outcome) row.finalized = entry; }
   }
   const rows = Object.values(byIssue).sort((left, right) => left.issue - right.issue);
-  const pending = rows.filter((row) => row.proposed && (!row.outcome || row.outcome.kind === 'escalated')).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model, ...(row.outcome ? { escalated: true } : {}), ...(row.returned ? { returned: true } : {}) }));
-  const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits', 'endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
+  const pending = rows.filter((row) => row.proposed && (!row.outcome || row.outcome.kind === 'escalated') && stillOpen(row)).map((row) => ({ issue: row.issue, since: row.proposed.at, commentUrl: row.proposed.commentUrl, model: row.proposed.model, ...(row.outcome ? { escalated: true } : {}), ...(row.returned ? { returned: true } : {}) }));
+  const awaitingFinalize = rows.filter((row) => row.outcome && ['approved', 'approved-with-edits', 'endorsed', 'endorsed-with-edits'].includes(row.outcome.kind) && !row.finalized && stillOpen(row)).map((row) => ({ issue: row.issue, outcome: row.outcome.kind, since: row.outcome.at }));
   // Spec fleet #92 (#145): proposed at one hash, finalized at another. The finalize
   // edit is expected (a restated premise), not "body changed since the proposal".
   const restated = rows.filter((row) => row.finalized && row.finalized.bodyHash && row.proposed && row.finalized.bodyHash !== row.proposed.bodyHash).map((row) => ({ issue: row.issue, proposedBodyHash: row.proposed.bodyHash, finalizedBodyHash: row.finalized.bodyHash, finalizedAt: row.finalized.at }));
@@ -481,7 +485,7 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
   const windowStats = tally(outcomes.filter((entry) => String(entry.at) >= cutoff));
   // Spec fleet #92 (#148): the stale-premise restatements of the trailing 30 days.
   const staleCutoff = new Date(new Date(at).getTime() - STALE_NOTICE_DAYS * 86400000).toISOString();
-  const staleCounts = { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, pending: 0 };
+  const staleCounts = { approved: 0, 'approved-with-edits': 0, rejected: 0, superseded: 0, endorsed: 0, 'endorsed-with-edits': 0, pending: 0 };
   const staleWindow = staleRows(sorted).filter((row) => String(row.proposedAt) >= staleCutoff).map((row) => {
     staleCounts[row.verdict] += 1;
     return { ...row, ageDays: Number(((new Date(at).getTime() - new Date(row.proposedAt).getTime()) / 86400000).toFixed(1)) };
@@ -494,6 +498,19 @@ function projectTriage({ entries = [], now, windowDays, graduation } = {}) {
     met: allTime.decided >= rule.minProposals && spanDays >= rule.minDays && allTime.unchangedRatio !== null && allTime.unchangedRatio >= rule.minUnchangedRatio,
   };
   return { at, windowDays: window, byIssue, pending, awaitingFinalize, restated, stalePremise: { days: STALE_NOTICE_DAYS, rows: staleWindow, counts: staleCounts }, docsPrs, window: windowStats, allTime, graduation: graduationState, consumedThrough, proposalsTotal: rows.filter((row) => row.proposed).length };
+}
+
+// #451: a tenant's open issues as its last Watchdog tick read them, from state/watchdog/triage-frontier.json (rewritten every tick).
+// Each tenant entry classifies every open issue the frontier read, as skipped or eligible, so those numbers are the open set. `at` is
+// the tick's start, which precedes every tenant's read: an earlier bound, so an issue opened after the read is never dropped.
+// Null when the file, the tenant's entry or its arrays are missing, unreadable or errored: the caller then counts everything, as before.
+function readOpenIssues(root, tenant) {
+  let shadow = null;
+  try { shadow = readJsonFile(path.join(baseOf(root), 'state', 'watchdog', 'triage-frontier.json'), null); } catch { return null; }
+  const entry = shadow && Array.isArray(shadow.tenants) ? shadow.tenants.find((row) => row && row.tenant === String(tenant)) : null;
+  const at = shadow ? Date.parse(shadow.at) : NaN;
+  if (!entry || entry.error || !Number.isFinite(at) || !Array.isArray(entry.skipped) || !Array.isArray(entry.eligible)) return null;
+  return { at: new Date(at).toISOString(), numbers: new Set([...entry.skipped, ...entry.eligible].map((row) => Number(row && row.number))) };
 }
 
 // --------------------------------------------------------------- GitHub ----
@@ -685,7 +702,7 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       && (row.outcome.actor === FINALIZE_ACTOR || labels.has(marker))
       && new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000) {
       const who = row.outcome.actor === FINALIZE_ACTOR ? 'finalize-script' : (row.outcome.actor || 'principal');
-      approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: row.outcome.commentUrl || null, at: row.outcome.at, withEdits: row.outcome.kind === 'approved-with-edits', edits: row.outcome.edits || null, by: row.outcome.by || owner, reason: `${who} claim older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row` });
+      approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: row.outcome.commentUrl || null, at: row.outcome.at, withEdits: row.outcome.kind === 'approved-with-edits', bodyChanged: issue.bodyHash !== row.proposed.bodyHash, edits: row.outcome.edits || null, by: row.outcome.by || owner, reason: `${who} claim older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row` });
       continue;
     }
 
@@ -714,16 +731,16 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
       if (row.outcome.kind === 'endorsed-with-edits' || declined || new Date(at).getTime() - new Date(row.outcome.at).getTime() > CLAIM_EXPIRY_MINUTES * 60000) {
         // The owner commented after the Endorsement (the door's row comes just before its Verdict comment): his words may carry the edits.
         const spokeAfter = ownerComments.filter((comment) => comment.createdAt > (verdict ? verdict.comment.createdAt : row.outcome.at)).pop();
-        endorsements.push({ kind: 'endorsement', ...(spokeAfter ? { ownerCommentUrl: spokeAfter.url } : {}), number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : declined ? `finalize script declined (${declined})` : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling only if none is newer than the Verdict, apply the labels, record finalized' });
+        endorsements.push({ kind: 'endorsement', ...(spokeAfter ? { ownerCommentUrl: spokeAfter.url } : {}), number: issue.number, title: issue.title, url: issue.url, commentUrl: verdict ? verdict.comment.url : (row.outcome.commentUrl || null), at: row.outcome.at, withEdits: row.outcome.kind === 'endorsed-with-edits', bodyChanged: issue.bodyHash !== row.proposed.bodyHash, edits: row.outcome.edits || null, by: row.outcome.actor || ARBITER_ACTOR, startAt: 'ruling', reason: (row.outcome.kind === 'endorsed-with-edits' ? 'Arbiter endorsed with edits; finalizing belongs to the Principal' : declined ? `finalize script declined (${declined})` : `Arbiter endorsement older than ${CLAIM_EXPIRY_MINUTES} minutes without a finalized row`) + '; the outcome row is already the claim made by the Arbiter, so skip the claim step: post the Ruling only if none is newer than the Verdict, apply the labels, record finalized' });
         continue;
       }
     }
 
-    // 1. An open proposal with the owner's Approved comment after it: finalize first.
+    // 1. An open proposal with the owner's Approved comment after it: finalize first. bodyChanged (#451) is the proposal gate's clause 6.
     if (proposed) {
       const approval = ownerComments.filter((comment) => comment.createdAt > approvalFloor(row) && APPROVAL_RE.test(comment.body)).pop();
       if (approval) {
-        approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: !isExactApproval(approval.body), by: approval.author, reason: 'owner approval newer than the proposal' });
+        approvals.push({ kind: 'approval', number: issue.number, title: issue.title, url: issue.url, commentUrl: approval.url, at: approval.createdAt, withEdits: !isExactApproval(approval.body), bodyChanged: issue.bodyHash !== proposed.bodyHash, by: approval.author, reason: 'owner approval newer than the proposal' });
         continue;
       }
     }
@@ -739,6 +756,10 @@ function selectTriageFrontier({ issues = [], ownerLogin, fleetIdentity = null, r
     const hasTriageLabel = [...labels].some((label) => triageLabels.has(label));
     const isRouted = [...labels].some((label) => routing.has(label));
     if (isRouted) { skipped.push({ number: issue.number, reason: `routed (${[...labels].filter((label) => routing.has(label)).join(', ')})` }); continue; }
+
+    // 1c. (#451) A superseded proposal with no successor: the session that superseded it died before proposing again. Served as a
+    // reproposal, marker or not; its superseded row is already written, so the Principal records `proposed` alone.
+    if (row && row.outcome && row.outcome.kind === 'superseded') { tickets.push({ kind: 'reproposal', number: issue.number, title: issue.title, url: issue.url, createdAt: issue.createdAt, bodyHash: issue.bodyHash, reason: `superseded at ${row.outcome.at} with no newer proposal` }); continue; }
 
     // 2. Marker present: re-propose only on a body change or the owner's ask; otherwise it is waiting.
     const ownerAsksAgain = newest && newest.author === owner && REPROPOSE_RE.test(newest.body) && (!proposed || newest.createdAt > proposed.at);
@@ -1408,16 +1429,26 @@ function runFinalize({ root, tenant, tenantConfigPath, fixture, outboxPath, now,
     finalized.push({ issue: issue.number, url: issue.url, commentUrl: approvalUrl, labels: applied });
   };
 
-  // Recovery (section 5): a claim of ours with no finalized row is a run cut short. Finish it.
+  // Recovery (section 5): a claim of ours with no finalized row is a run cut short. Finish it, after the checks a first run makes
+  // (#451: the owner-commented check and the proposal gate), unless a Ruling newer than the approval already stands: its poster passed them.
   for (const issue of sorted) {
     const row = projection.byIssue[issue.number] || null;
     if (!row || !row.proposed || !row.outcome || row.finalized) continue;
     if (row.outcome.kind !== 'approved' || row.outcome.actor !== FINALIZE_ACTOR) continue;
+    const leave = (reason, detail) => left.push(detail ? { issue: issue.number, reason, detail } : { issue: issue.number, reason });
     try {
       const proposalComment = issue.comments.find((comment) => comment.url && comment.url === row.proposed.commentUrl);
-      if (!proposalComment) { left.push({ issue: issue.number, reason: 'stale-proposal', detail: 'recovery: proposal comment not found' }); continue; }
+      if (!proposalComment) { leave('stale-proposal', 'recovery: proposal comment not found'); continue; }
       const approvalComment = issue.comments.find((comment) => comment.url && comment.url === row.outcome.commentUrl);
-      complete(issue, proposalComment, row.outcome.commentUrl || '', approvalComment ? approvalComment.createdAt : row.outcome.at);
+      const approvalAt = approvalComment ? approvalComment.createdAt : row.outcome.at;
+      const ruled = issue.comments.some((comment) => comment.createdAt > approvalAt && RULING_HEADING_RE.test(comment.body));
+      if (!ruled) {
+        if (approvalComment && !isExactApproval(approvalComment.body)) { leave('not-exact-approval'); continue; }   // clause 2, as the first run
+        if (issue.comments.some((comment) => comment.author === owner && comment.createdAt > approvalAt)) { leave('owner-commented-after-approval'); continue; }
+        const failures = proposalGate({ issue, row: { ...row, outcome: null }, proposal: proposalComment, approval: approvalComment || null, config, tenantConfig, tenant, outbox, consumedThrough: projection.consumedThrough });
+        if (failures.length) { leave(failures[0].code, failures[0].detail); continue; }
+      }
+      complete(issue, proposalComment, row.outcome.commentUrl || '', approvalAt);
     } catch (error) {
       errors.push({ issue: issue.number, message: String(error.message || error) });
     }
@@ -1590,7 +1621,7 @@ function cli(argv) {
   if (command === 'finalize') return finalizeApprovals({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], fixture: args.fixture, outboxPath: args.outbox, now: args.now });
   if (command === 'hash') return issueBodyHash({ root: args.root, tenant, tenantConfigPath: args['tenant-config'], issue: args.issue, fixture: args.fixture });
   const config = readTriageConfig(args.root);
-  const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation });
+  const projection = projectTriage({ entries: readLedger(args.root, tenant), now: args.now, windowDays: args.days ? Number(args.days) : config.windowDays, graduation: config.graduation, openIssues: readOpenIssues(args.root, tenant) });
   const { byIssue, ...summary } = projection;
   return { tenant, ...summary };
 }
@@ -1644,6 +1675,7 @@ module.exports = {
   readFixtureIssues,
   readHeldIssues,
   readLedger,
+  readOpenIssues,
   readOutbox,
   readTenantConfig,
   readTriageConfig,
