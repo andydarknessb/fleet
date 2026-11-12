@@ -294,494 +294,533 @@ if ($Manifest -and -not $DryRun) {
   }
 }
 
-# --- gates ---
-if ((Test-Paused) -and -not $Force) {
-  $p = Get-Content "$FleetHome\state\PAUSE" -Raw
-  $r = Release-ReservationOnRefusal "launch refused: PAUSE set: $("$p".Trim())"
-  Write-Output (@{ launched = $false; reason = "PAUSE set: $p"; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
-}
-# The duplicate-name guard and the cap read the same daemon list the caller may have
-# acted on; a glitched read must refuse the launch, never pass the guards empty.
-$daemon = $null
-# A short ladder (3 x 3 s, like the --bg resolve below): a kill between --bg and the roster write leaves an unrostered session, so the whole launch must stay well inside assignment.js's 90 s.
-try { $daemon = Get-DaemonSessions -Strict -Tries 3 -PollMs 3000 } catch {
-  $failClosedReason = "refusing to launch, fail closed: $($_.Exception.Message)"
-  # no release: a failed daemon read cannot tell whether a session named for this reservation exists, so it is the same unknown as the suspected-bad-read guard below and keeps the reservation; the stranded-reservation sweep (fleet#253) releases it later if no session ever acknowledges.
-  Write-Output (@{ launched = $false; reason = $failClosedReason } | ConvertTo-Json -Compress); exit 3
-}
-$fleetNames = Get-FleetNames -Live $live -Static $static
-$liveFleet = @($daemon | Where-Object { $fleetNames -contains $_.name })
-if (@($liveFleet | ForEach-Object { $_.name }) -contains $Name) {
-  # no release: a live session already holds this name and may be the one that acknowledges this very reservation in its first turn; a release would pull the assignment from under it. If no session ever acknowledges, the stranded-reservation sweep (fleet#253) finds it.
-  Write-Output (@{ launched = $false; reason = "a session named '$Name' is already running; use claude respawn" } | ConvertTo-Json -Compress); exit 3
-}
-# The list can also read WRONG (empty or partial) while the CLI exits 0. The roster's
-# job record is an independent on-disk source: if it says this name's job is still
-# working and recently updated (45 min = the fleet staleness threshold), refuse the
-# duplicate rather than trust the list that omitted it. A stale or stopped job state
-# stays launchable, so crash recovery is not blocked.
-$rosterEntry = $live.sessions | Where-Object { $_.name -eq $Name -and $_.status -eq 'active' } | Select-Object -First 1
-if ($rosterEntry -and $rosterEntry.jobId) {
-  $jobState = $null
-  try { $jobState = Get-JobState $rosterEntry.jobId } catch {}
-  if ($jobState -and "$($jobState.state)" -eq 'working') {
-    $updatedAge = $null
-    try { $updatedAge = ((Get-Date).ToUniversalTime() - ([DateTimeOffset]::Parse("$($jobState.updatedAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)).UtcDateTime).TotalMinutes } catch {}
-    if ($null -ne $updatedAge -and $updatedAge -le 45) {
-      # no release: the job for this name is working per its on-disk state, so a live session may own this reservation (same reasoning as the duplicate-name refusal above).
-      Write-Output (@{ launched = $false; reason = "job $($rosterEntry.jobId) for '$Name' is working per its on-disk state (updated $([int]$updatedAge) min ago) though the daemon list omits it; suspected bad read, refusing a duplicate launch" } | ConvertTo-Json -Compress); exit 3
+# ticket 455: one launch per name. A named mutex, keyed like the roster lock (the fleet root, then the name), covers this
+# launch from its name check to its roster write. A second launch of the name waits here, at most 120 s, then passes the
+# name check as it always did. The finally at the end of the script releases it on every exit.
+$nameLockKey = [BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($FleetHome.ToLowerInvariant()))).Replace('-', '').ToLowerInvariant()
+$nameMutex = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$nameLockKey-$Name"
+$nameHeld = $false
+try {
+  # an abandoned mutex (a launch died holding it) is ours now
+  try { $nameHeld = $nameMutex.WaitOne(120000) } catch [System.Threading.AbandonedMutexException] { $nameHeld = $true }
+  # no release: the wait ran out before this launch wrote or released anything; the launch holding the name owns what follows
+  if (-not $nameHeld) { Write-Output (@{ launched = $false; reason = "another launch of '$Name' still holds the launch lock after 120 s; nothing was touched" } | ConvertTo-Json -Compress); exit 8 }
+  # --- gates ---
+  if ((Test-Paused) -and -not $Force) {
+    $p = Get-Content "$FleetHome\state\PAUSE" -Raw
+    $r = Release-ReservationOnRefusal "launch refused: PAUSE set: $("$p".Trim())"
+    Write-Output (@{ launched = $false; reason = "PAUSE set: $p"; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
+  }
+  # The duplicate-name guard and the cap read the same daemon list the caller may have
+  # acted on; a glitched read must refuse the launch, never pass the guards empty.
+  $daemon = $null
+  # A short ladder (3 x 3 s, like the --bg resolve below): a kill between --bg and the roster write leaves an unrostered session, so the whole launch must stay well inside assignment.js's 90 s.
+  try { $daemon = Get-DaemonSessions -Strict -Tries 3 -PollMs 3000 } catch {
+    $failClosedReason = "refusing to launch, fail closed: $($_.Exception.Message)"
+    # no release: a failed daemon read cannot tell whether a session named for this reservation exists, so it is the same unknown as the suspected-bad-read guard below and keeps the reservation; the stranded-reservation sweep (fleet#253) releases it later if no session ever acknowledges.
+    Write-Output (@{ launched = $false; reason = $failClosedReason } | ConvertTo-Json -Compress); exit 3
+  }
+  $fleetNames = Get-FleetNames -Live $live -Static $static
+  $liveFleet = @($daemon | Where-Object { $fleetNames -contains $_.name })
+  if (@($liveFleet | ForEach-Object { $_.name }) -contains $Name) {
+    # no release: a live session already holds this name and may be the one that acknowledges this very reservation in its first turn; a release would pull the assignment from under it. If no session ever acknowledges, the stranded-reservation sweep (fleet#253) finds it.
+    Write-Output (@{ launched = $false; reason = "a session named '$Name' is already running; use claude respawn" } | ConvertTo-Json -Compress); exit 3
+  }
+  # The list can also read WRONG (empty or partial) while the CLI exits 0. The roster's
+  # job record is an independent on-disk source: if it says this name's job is still
+  # working and recently updated (45 min = the fleet staleness threshold), refuse the
+  # duplicate rather than trust the list that omitted it. A stale or stopped job state
+  # stays launchable, so crash recovery is not blocked.
+  $rosterEntry = $live.sessions | Where-Object { $_.name -eq $Name -and $_.status -eq 'active' } | Select-Object -First 1
+  if ($rosterEntry -and $rosterEntry.jobId) {
+    $jobState = $null
+    try { $jobState = Get-JobState $rosterEntry.jobId } catch {}
+    if ($jobState -and "$($jobState.state)" -eq 'working') {
+      $updatedAge = $null
+      try { $updatedAge = ((Get-Date).ToUniversalTime() - ([DateTimeOffset]::Parse("$($jobState.updatedAt)", [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)).UtcDateTime).TotalMinutes } catch {}
+      if ($null -ne $updatedAge -and $updatedAge -le 45) {
+        # no release: the job for this name is working per its on-disk state, so a live session may own this reservation (same reasoning as the duplicate-name refusal above).
+        Write-Output (@{ launched = $false; reason = "job $($rosterEntry.jobId) for '$Name' is working per its on-disk state (updated $([int]$updatedAge) min ago) though the daemon list omits it; suspected bad read, refusing a duplicate launch" } | ConvertTo-Json -Compress); exit 3
+      }
     }
   }
-}
-# The cap bounds concurrent worktrees and PR churn, so it counts the sessions that
-# produce them. config/cycle.json `cap.exemptNamePrefixes` (the Principal, `pe-`, and
-# the Arbiter, `ar-`; ADR 0011 / grill Q28, ADR 0017) lists the standing control-plane names that neither count
-# toward the cap nor are refused by it. Absent config = nothing is exempt.
-$capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
-if (-not $Force -and -not (Test-CapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
-  $capReason = "cap reached ($($capCounted.Count)/$($static.cap))"
-  $r = Release-ReservationOnRefusal "launch refused: $capReason"
-  Write-Output (@{ launched = $false; reason = $capReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
-}
-if ($Role -eq 'ic') {
-  if (-not $Issue) { $r = Release-ReservationOnRefusal 'launch refused: the manifest gives no issue number'; Write-Error "ICs need -Issue$($r.note)"; exit 4 }
-  $liveNames = @($liveFleet | ForEach-Object { $_.name })
-  $icsHere = @($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $Tenant -and ($liveNames -contains $_.name) })
-  if (-not $Force -and $icsHere.Count -ge [int]$t.maxIcs) {
-    $maxIcsReason = "tenant maxIcs reached ($($icsHere.Count)/$($t.maxIcs))"
-    $r = Release-ReservationOnRefusal "launch refused: $maxIcsReason"
-    Write-Output (@{ launched = $false; reason = $maxIcsReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
+  # The cap bounds concurrent worktrees and PR churn, so it counts the sessions that
+  # produce them. config/cycle.json `cap.exemptNamePrefixes` (the Principal, `pe-`, and
+  # the Arbiter, `ar-`; ADR 0011 / grill Q28, ADR 0017) lists the standing control-plane names that neither count
+  # toward the cap nor are refused by it. Absent config = nothing is exempt.
+  $capCounted = @($liveFleet | Where-Object { -not (Test-CapExempt "$($_.name)") })
+  if (-not $Force -and -not (Test-CapExempt $Name) -and $capCounted.Count -ge [int]$static.cap) {
+    $capReason = "cap reached ($($capCounted.Count)/$($static.cap))"
+    $r = Release-ReservationOnRefusal "launch refused: $capReason"
+    Write-Output (@{ launched = $false; reason = $capReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
   }
-}
-
-# --- fleet identity (#153, ADR 0015): every session acts on GitHub as the fleet's
-# --- own login. bin/identity.js reads the secret gh config directory; its env keys
-# --- (GH_CONFIG_DIR plus git's credential reset) go into the settings env block below,
-# --- which every Bash call, hook and child binary inherits. No token lands in state/.
-# --- Once any tenant names a fleetIdentity distinct from its ownerLogin the directory
-# --- is required: missing or naming another login refuses the launch (exit 3, one
-# --- high page per code), writes no settings and no session, never falls back to
-# --- Cory's keyring login. A dry run reports the refusal but never pages.
-$identityPlan = Get-FleetIdentityPlan
-# A present token is asked of GitHub once (not in a dry run, which stays offline):
-# an expired or revoked one refuses as FLEET_IDENTITY_INVALID instead of launching a
-# session whose every gh call would fail unpaged.
-if (-not $identityPlan.refusal -and -not $DryRun) {
-  $liveRefusal = Test-FleetIdentityLive $identityPlan
-  if ($liveRefusal) { $identityPlan | Add-Member -NotePropertyName refusal -NotePropertyValue $liveRefusal -Force }
-}
-if ($identityPlan.refusal) {
-  $identityReason = "$($identityPlan.refusal.code): $($identityPlan.refusal.message)"
-  $released = $false; $paged = $false
-  if (-not $DryRun) {
-    if ($Manifest) { try { Invalidate-Manifest "launch refused: $identityReason"; $released = $true } catch {} }
-    $paged = Send-FleetIdentityPageOnce -Plan $identityPlan -Source "launch.ps1 ($Name)"
-  }
-  Write-Output (@{ launched = $false; code = "$($identityPlan.refusal.code)"; reason = $identityReason; reservationReleased = $released; paged = $paged; dryRun = [bool]$DryRun } | ConvertTo-Json -Compress); exit 3
-}
-if (-not $DryRun) { [void](Send-FleetIdentityPageOnce -Plan $identityPlan -Source 'launch.ps1') }
-
-# --- per-session settings: fleet-settings + env identity ---
-$settings = Read-Json "$FleetHome\fleet-settings.json"
-$envBlock = [ordered]@{ FLEET_HOME = $FleetHome; FLEET_NAME = $Name; FLEET_ROLE = $Role; FLEET_TENANT = "$Tenant"; FLEET_PARENT = $Parent }
-if ($Issue) { $envBlock.FLEET_ISSUE = "$Issue" }
-# fleet #282: ponytail's always-on hooks stay off in every role and its subagents
-# ('(?!)' matches no agent type); the IC loads the skill explicitly instead.
-$envBlock.PONYTAIL_DEFAULT_MODE = 'off'
-$envBlock.PONYTAIL_SUBAGENT_MATCHER = '(?!)'
-# fleet #181: hooks/allowlist-gate.js gates only the sessions launched under the allowlist profile.
-if ($Permissions) { $envBlock.FLEET_PERMISSIONS = "$Permissions" }
-if ($identityPlan.env) { foreach ($identityVar in $identityPlan.env.PSObject.Properties) { $envBlock[$identityVar.Name] = "$($identityVar.Value)" } }
-if ($Manifest) {
-  $envBlock.FLEET_ASSIGNMENT_MANIFEST = (Resolve-Path -LiteralPath $Manifest).Path
-  $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId
-  $envBlock.FLEET_BASE_SHA = [string]$assignment.base.sha
-  $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
-} elseif ($recoverValidated) {
-  $envBlock.FLEET_ASSIGNMENT_MANIFEST = $recoverManifest
-  if ($WorkRecordId) { $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId }
-  if ($recoverAssignment -and "$($recoverAssignment.base.sha)") { $envBlock.FLEET_BASE_SHA = [string]$recoverAssignment.base.sha }
-  if ($recoverAssignment -and "$($recoverAssignment.branch)") { $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$recoverAssignment.branch }
-}
-$settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
-# fleet #384: only the project lead keeps the claude.ai connectors (its Supabase connector); every other role runs without them.
-$settings | Add-Member -NotePropertyName disableClaudeAiConnectors -NotePropertyValue ($Role -ne 'project-lead') -Force
-
-# --- role tool contract (ticket 06). work-state.js stays the one validated door to
-# --- durable coordination state, so every role loses direct file-editing tools on
-# --- state/work|events|archive (and, since ticket 07, state/exclusions - bin/exclusions.js
-# --- is that ledger's door - plus the digest projections, which only bin/digest.js
-# --- writes); control-plane roles additionally lose engineering
-# --- edits in tenant repos (they review and merge, ICs write); ICs lose direct
-# --- edits anywhere in fleet state. Rollback: state/flags/tool-contract-off skips
-# --- the injection without touching any launch gate.
-$fleetFwd = $FleetHome.Replace('\', '/')
-$denyRules = @()
-$toolContractOn = -not (Test-Path "$FleetHome\state\flags\tool-contract-off")
-if ($toolContractOn) {
-  foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') {
-    foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**', 'state/exclusions/**', 'state/status/DIGEST.md', 'state/status/*-status.md') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
-    if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
-  }
-  # The Principal (ADR 0011) and the Arbiter (ADR 0017) are NOT on this list: settings deny rules cannot express an
-  # allowlist, so its write boundary (docs/adr/*.md and its glossary, CONTEXT.md or GLOSSARY.md, in the tenant repo,
-  # its status file, the triage ledger, its memory; the Arbiter's bounds mirror it) is enforced by hooks/principal-guard.ps1
-  # (fleet #39), registered in fleet-settings.json for every fleet session.
-  if ($Role -in @('project-lead', 'sentinel', 'arbiter')) {
-    foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
-      $tenantRepo = $null
-      try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
-      if ($tenantRepo) { foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') { $denyRules += "$deniedTool($($tenantRepo.Replace('\', '/'))/**)" } }
+  if ($Role -eq 'ic') {
+    if (-not $Issue) { $r = Release-ReservationOnRefusal 'launch refused: the manifest gives no issue number'; Write-Error "ICs need -Issue$($r.note)"; exit 4 }
+    $liveNames = @($liveFleet | ForEach-Object { $_.name })
+    $icsHere = @($live.sessions | Where-Object { $_.status -eq 'active' -and $_.role -eq 'ic' -and $_.tenant -eq $Tenant -and ($liveNames -contains $_.name) })
+    if (-not $Force -and $icsHere.Count -ge [int]$t.maxIcs) {
+      $maxIcsReason = "tenant maxIcs reached ($($icsHere.Count)/$($t.maxIcs))"
+      $r = Release-ReservationOnRefusal "launch refused: $maxIcsReason"
+      Write-Output (@{ launched = $false; reason = $maxIcsReason; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 3
     }
   }
-}
-if ($denyRules.Count -gt 0) {
-  if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
-  $existingDeny = @()
-  if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
-  $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $denyRules) | Select-Object -Unique)) -Force
-}
 
-# --- permission profile (spec #94, ADR 0016). auto is fleet-settings.json as written.
-# --- allowlist runs acceptEdits with the checked-in config/permissions-allowlist.json:
-# --- its allow rules verbatim (tokens resolved), the fleet root as an additional
-# --- directory, and its deny rules appended after the tool contract's (deny beats
-# --- allow, so the contract is unchanged). The mode lives in the settings only; no
-# --- --permission-mode goes on the command line.
-# The profile adds the tenant repo as a directory (fleet #171: a haiku IC reads the
-# ticket's paths in the main checkout), which acceptEdits then makes editable. A deny
-# list cannot say "everything but .claude/worktrees", so the rules are generated here
-# from the checkout as it stands: every entry beside each segment of the kept path is
-# denied, the kept path itself is not. An entry created after launch is not covered.
-function Get-RepoDenyRules {
-  param([string]$Repo, [string]$Keep, [string[]]$Tools)
-  if (-not $Repo -or -not (Test-Path -LiteralPath $Repo -PathType Container)) { throw "the allowlist profile denies edits across the tenant repo '$Repo', which does not exist; refusing a launch that would leave it editable" }
-  $prefix = $Repo.Replace('\', '/').TrimEnd('/')
-  $dir = $Repo
-  $rules = @()
-  foreach ($segment in @($Keep.Replace('\', '/').Split('/') | Where-Object { $_ })) {
-    foreach ($entry in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)) {
-      if ($entry.Name -eq $segment) { continue }
-      $target = if ($entry.PSIsContainer) { "$prefix/$($entry.Name)/**" } else { "$prefix/$($entry.Name)" }
-      foreach ($tool in $Tools) { $rules += "$tool($target)" }
-    }
-    $dir = Join-Path $dir $segment
-    $prefix = "$prefix/$segment"
-    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { break }
+  # --- fleet identity (#153, ADR 0015): every session acts on GitHub as the fleet's
+  # --- own login. bin/identity.js reads the secret gh config directory; its env keys
+  # --- (GH_CONFIG_DIR plus git's credential reset) go into the settings env block below,
+  # --- which every Bash call, hook and child binary inherits. No token lands in state/.
+  # --- Once any tenant names a fleetIdentity distinct from its ownerLogin the directory
+  # --- is required: missing or naming another login refuses the launch (exit 3, one
+  # --- high page per code), writes no settings and no session, never falls back to
+  # --- Cory's keyring login. A dry run reports the refusal but never pages.
+  $identityPlan = Get-FleetIdentityPlan -NoWrite:$DryRun
+  # A present token is asked of GitHub once (not in a dry run, which stays offline):
+  # an expired or revoked one refuses as FLEET_IDENTITY_INVALID instead of launching a
+  # session whose every gh call would fail unpaged.
+  if (-not $identityPlan.refusal -and -not $DryRun) {
+    $liveRefusal = Test-FleetIdentityLive $identityPlan
+    if ($liveRefusal) { $identityPlan | Add-Member -NotePropertyName refusal -NotePropertyValue $liveRefusal -Force }
   }
-  return $rules
-}
-$allowRuleCount = 0
-if ($Permissions -eq 'allowlist') {
-  $profilePath = "$FleetHome\config\permissions-allowlist.json"
-  $permissionProfile = $null
-  try { $permissionProfile = Read-Json $profilePath } catch {}
-  if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { $r = Release-ReservationOnRefusal "launch refused: the allowlist permission profile '$profilePath' is missing or unreadable"; Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable$($r.note)"; exit 4 }
-  $profileTokens = @{ '<fleet>' = $fleetFwd; '<repo>' = "$($t.repo)".Replace('\', '/').TrimEnd('/'); '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
-  $resolveProfileRule = {
-    param([string]$Text)
-    foreach ($token in $profileTokens.Keys) { if ($profileTokens[$token]) { $Text = $Text.Replace($token, $profileTokens[$token]) } }
-    if ($Text -match '<[A-Za-z]+>') { throw "permission profile rule '$Text' names $($Matches[0]), which this launch cannot resolve (the tenant file lacks it)" }
-    return $Text
+  if ($identityPlan.refusal) {
+    $identityReason = "$($identityPlan.refusal.code): $($identityPlan.refusal.message)"
+    $released = $false; $paged = $false
+    if (-not $DryRun) {
+      if ($Manifest) { try { Invalidate-Manifest "launch refused: $identityReason"; $released = $true } catch {} }
+      $paged = Send-FleetIdentityPageOnce -Plan $identityPlan -Source "launch.ps1 ($Name)"
+    }
+    Write-Output (@{ launched = $false; code = "$($identityPlan.refusal.code)"; reason = $identityReason; reservationReleased = $released; paged = $paged; dryRun = [bool]$DryRun } | ConvertTo-Json -Compress); exit 3
+  }
+  if (-not $DryRun) { [void](Send-FleetIdentityPageOnce -Plan $identityPlan -Source 'launch.ps1') }
+
+  # --- per-session settings: fleet-settings + env identity ---
+  $settings = Read-Json "$FleetHome\fleet-settings.json"
+  $envBlock = [ordered]@{ FLEET_HOME = $FleetHome; FLEET_NAME = $Name; FLEET_ROLE = $Role; FLEET_TENANT = "$Tenant"; FLEET_PARENT = $Parent }
+  if ($Issue) { $envBlock.FLEET_ISSUE = "$Issue" }
+  # fleet #282: ponytail's always-on hooks stay off in every role and its subagents
+  # ('(?!)' matches no agent type); the IC loads the skill explicitly instead.
+  $envBlock.PONYTAIL_DEFAULT_MODE = 'off'
+  $envBlock.PONYTAIL_SUBAGENT_MATCHER = '(?!)'
+  # fleet #181: hooks/allowlist-gate.js gates only the sessions launched under the allowlist profile.
+  if ($Permissions) { $envBlock.FLEET_PERMISSIONS = "$Permissions" }
+  if ($identityPlan.env) { foreach ($identityVar in $identityPlan.env.PSObject.Properties) { $envBlock[$identityVar.Name] = "$($identityVar.Value)" } }
+  if ($Manifest) {
+    $envBlock.FLEET_ASSIGNMENT_MANIFEST = (Resolve-Path -LiteralPath $Manifest).Path
+    $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId
+    $envBlock.FLEET_BASE_SHA = [string]$assignment.base.sha
+    $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$assignment.branch
+  } elseif ($recoverValidated) {
+    $envBlock.FLEET_ASSIGNMENT_MANIFEST = $recoverManifest
+    if ($WorkRecordId) { $envBlock.FLEET_WORK_RECORD_ID = $WorkRecordId }
+    if ($recoverAssignment -and "$($recoverAssignment.base.sha)") { $envBlock.FLEET_BASE_SHA = [string]$recoverAssignment.base.sha }
+    if ($recoverAssignment -and "$($recoverAssignment.branch)") { $envBlock.FLEET_ASSIGNMENT_BRANCH = [string]$recoverAssignment.branch }
+  }
+  $settings | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]$envBlock) -Force
+  # fleet #384: only the project lead keeps the claude.ai connectors (its Supabase connector); every other role runs without them.
+  $settings | Add-Member -NotePropertyName disableClaudeAiConnectors -NotePropertyValue ($Role -ne 'project-lead') -Force
+
+  # --- role tool contract (ticket 06). work-state.js stays the one validated door to
+  # --- durable coordination state, so every role loses direct file-editing tools on
+  # --- state/work|events|archive (and, since ticket 07, state/exclusions - bin/exclusions.js
+  # --- is that ledger's door - plus the digest projections, which only bin/digest.js
+  # --- writes); control-plane roles additionally lose engineering
+  # --- edits in tenant repos (they review and merge, ICs write); ICs lose direct
+  # --- edits anywhere in fleet state. Rollback: state/flags/tool-contract-off skips
+  # --- the injection without touching any launch gate.
+  $fleetFwd = $FleetHome.Replace('\', '/')
+  $denyRules = @()
+  $toolContractOn = -not (Test-Path "$FleetHome\state\flags\tool-contract-off")
+  if ($toolContractOn) {
+    foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') {
+      foreach ($statePath in 'state/work/**', 'state/events/**', 'state/archive/**', 'state/exclusions/**', 'state/status/DIGEST.md', 'state/status/*-status.md') { $denyRules += "$deniedTool($fleetFwd/$statePath)" }
+      if ($Role -eq 'ic') { $denyRules += "$deniedTool($fleetFwd/state/**)" }
+    }
+    # The Principal (ADR 0011) and the Arbiter (ADR 0017) are NOT on this list: settings deny rules cannot express an
+    # allowlist, so its write boundary (docs/adr/*.md and its glossary, CONTEXT.md or GLOSSARY.md, in the tenant repo,
+    # its status file, the triage ledger, its memory; the Arbiter's bounds mirror it) is enforced by hooks/principal-guard.ps1
+    # (fleet #39), registered in fleet-settings.json for every fleet session.
+    if ($Role -in @('project-lead', 'sentinel', 'arbiter')) {
+      foreach ($tenantFile in @(Get-ChildItem "$FleetHome\tenants" -Filter *.json -ErrorAction SilentlyContinue)) {
+        $tenantRepo = $null
+        try { $tenantRepo = (Read-Json $tenantFile.FullName).repo } catch {}
+        if ($tenantRepo) { foreach ($deniedTool in 'Edit', 'Write', 'NotebookEdit') { $denyRules += "$deniedTool($($tenantRepo.Replace('\', '/'))/**)" } }
+      }
+    }
+  }
+  if ($denyRules.Count -gt 0) {
+    if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
+    $existingDeny = @()
+    if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
+    $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $denyRules) | Select-Object -Unique)) -Force
+  }
+
+  # --- permission profile (spec #94, ADR 0016). auto is fleet-settings.json as written.
+  # --- allowlist runs acceptEdits with the checked-in config/permissions-allowlist.json:
+  # --- its allow rules verbatim (tokens resolved), the fleet root as an additional
+  # --- directory, and its deny rules appended after the tool contract's (deny beats
+  # --- allow, so the contract is unchanged). The mode lives in the settings only; no
+  # --- --permission-mode goes on the command line.
+  # The profile adds the tenant repo as a directory (fleet #171: a haiku IC reads the
+  # ticket's paths in the main checkout), which acceptEdits then makes editable. A deny
+  # list cannot say "everything but .claude/worktrees", so the rules are generated here
+  # from the checkout as it stands: every entry beside each segment of the kept path is
+  # denied, the kept path itself is not. An entry created after launch is not covered.
+  function Get-RepoDenyRules {
+    param([string]$Repo, [string]$Keep, [string[]]$Tools)
+    if (-not $Repo -or -not (Test-Path -LiteralPath $Repo -PathType Container)) { throw "the allowlist profile denies edits across the tenant repo '$Repo', which does not exist; refusing a launch that would leave it editable" }
+    $prefix = $Repo.Replace('\', '/').TrimEnd('/')
+    $dir = $Repo
+    $rules = @()
+    foreach ($segment in @($Keep.Replace('\', '/').Split('/') | Where-Object { $_ })) {
+      foreach ($entry in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop)) {
+        if ($entry.Name -eq $segment) { continue }
+        $target = if ($entry.PSIsContainer) { "$prefix/$($entry.Name)/**" } else { "$prefix/$($entry.Name)" }
+        foreach ($tool in $Tools) { $rules += "$tool($target)" }
+      }
+      $dir = Join-Path $dir $segment
+      $prefix = "$prefix/$segment"
+      if (-not (Test-Path -LiteralPath $dir -PathType Container)) { break }
+    }
+    return $rules
+  }
+  $allowRuleCount = 0
+  if ($Permissions -eq 'allowlist') {
+    $profilePath = "$FleetHome\config\permissions-allowlist.json"
+    $permissionProfile = $null
+    try { $permissionProfile = Read-Json $profilePath } catch {}
+    if (-not $permissionProfile -or -not $permissionProfile.allow -or -not $permissionProfile.defaultMode) { $r = Release-ReservationOnRefusal "launch refused: the allowlist permission profile '$profilePath' is missing or unreadable"; Write-Error "the allowlist permission profile '$profilePath' is missing or unreadable$($r.note)"; exit 4 }
+    $profileTokens = @{ '<fleet>' = $fleetFwd; '<repo>' = "$($t.repo)".Replace('\', '/').TrimEnd('/'); '<defaultBranch>' = "$($t.defaultBranch)"; '<releaseBranch>' = "$($t.releaseBranch)" }
+    $resolveProfileRule = {
+      param([string]$Text)
+      foreach ($token in $profileTokens.Keys) { if ($profileTokens[$token]) { $Text = $Text.Replace($token, $profileTokens[$token]) } }
+      if ($Text -match '<[A-Za-z]+>') { throw "permission profile rule '$Text' names $($Matches[0]), which this launch cannot resolve (the tenant file lacks it)" }
+      return $Text
+    }
+    try {
+      $profileAllow = @($permissionProfile.allow | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
+      $profileDeny = @($permissionProfile.deny | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
+      $profileDirs = @($permissionProfile.additionalDirectories | Where-Object { $_ } | ForEach-Object { if ($_ -is [string]) { & $resolveProfileRule $_ } else { & $resolveProfileRule "$($_.dir)" } })
+      if ($permissionProfile.PSObject.Properties['repoDeny'] -and $permissionProfile.repoDeny) {
+        $profileDeny += @(Get-RepoDenyRules -Repo "$($t.repo)" -Keep "$($permissionProfile.repoDeny.keep)" -Tools @($permissionProfile.repoDeny.tools))
+      }
+    } catch { $profileMessage = "$($_.Exception.Message)"; $r = Release-ReservationOnRefusal "launch refused: $profileMessage"; Write-Error "$profileMessage$($r.note)"; exit 4 }
+    if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
+    $existingDeny = @()
+    if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
+    $settings.permissions | Add-Member -NotePropertyName defaultMode -NotePropertyValue "$($permissionProfile.defaultMode)" -Force
+    $settings.permissions | Add-Member -NotePropertyName allow -NotePropertyValue $profileAllow -Force
+    $settings.permissions | Add-Member -NotePropertyName additionalDirectories -NotePropertyValue $profileDirs -Force
+    $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $profileDeny) | Select-Object -Unique)) -Force
+    $allowRuleCount = $profileAllow.Count
+  }
+
+  $settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
+  # ticket 455: a dry run writes beside the real file (a live or stopped session reads it, and a respawn replays it), never over it.
+  $settingsWritePath = if ($DryRun) { "$FleetHome\state\sessions\$Name.settings.dry-run.json" } else { $settingsPath }
+  Write-Json $settingsWritePath $settings
+
+  # The friendly -Model token is passed to `claude --model`, but the bare 'opus'
+  # alias tracks the latest Opus (currently Opus 5), so pin 'opus' to the concrete id: an
+  # explicit -Model opus runs Opus 4.8 (ICs run Haiku 5.5 alone, fleet #350). 'fable' stays
+  # pinned (ADR 0011) so an explicit -Model fable
+  # resolves to claude-fable-5-1 and a default-Fable bump cannot move it silently; the installed
+  # CLI 2.1.269 admits claude-fable-5-1 to auto mode, verified in its model predicate
+  # 2026-09-11, so no fleet #28-style refusal. Other tokens keep their CLI aliases.
+  # An arbiter launched with no -Model runs its own pin, Opus 5.5 (owner ruling 2026-10-20,
+  # ADR 0017 amendment); the role file's `model:` agrees.
+  # A project lead launched with no -Model runs Sonnet 5.5 (owner ruling 2026-10-26; Opus
+  # 5.5 from 2026-09-23 until then), pinned for the same reason.
+  # A principal launched with no -Model runs its own pin, Sonnet 5.5 (owner ruling 2026-11-06,
+  # fleet #385; Opus 5.5 under ADR 0017 until then), at the role file's high effort.
+  # Every IC runs pinned Haiku 5.5 (owner ruling 2026-10-30, fleet #350), whatever the manifest
+  # names: the door refuses any other IC model above.
+  # The pins and role defaults live in _common.ps1 (Resolve-LaunchModel) since fleet
+  # #121: sentinel-check compares a daemon job's frozen respawnFlags against them.
+  # fleet #385: the roster records the model the caller asked for, not the pin a default launch resolved to. A row that named
+  # the resolved pin reads as a hand-set -Model to sentinel-check, which would hold the session to that pin after a pin change.
+  $requestedModel = $Model
+  $launchModel = Resolve-LaunchModel -Role $Role -Model $Model
+  $Model = $launchModel.token
+  $modelArgs = @()
+  if ($launchModel.id) { $modelArgs = @('--model', $launchModel.id) }
+
+  # The role file frontmatter declares `effort:`, but `claude --agent` does NOT read
+  # it for a top-level background session (it defaults every such session to high;
+  # e.g. sentinel.md says low yet ran at high). So parse the role file ourselves and
+  # pass the declared effort with --effort, the only lever that sticks for --bg.
+  $roleFile = "$FleetHome\agents\$Role.md"
+  # Fleet #350: an IC's effort is the one the door checked above (its manifest's, else the role file's).
+  # Fleet #394: a non-IC's effort is its tenant file's roleEffort, else the role file's.
+  $effort = if ($Role -eq 'ic') { $icEffort } else { Get-LaunchRoleEffort $Role $t }
+  $effortArgs = @()
+  if (Test-LaunchEffort $effort) { $effortArgs = @('--effort', $effort) }
+
+  # --- first-turn ceiling (ticket 06): a launch that would start over its role's
+  # --- config/cycle.json budget fails before assignment and reports the token
+  # --- contribution by source. The estimate counts the fleet-injected sources
+  # --- (prompt, role file, simulated session-start injection, settings) at ~4
+  # --- chars/token plus the configured baselineTokens; calibrating baselineTokens
+  # --- against measured cache creation is ticket 09's verification. Rollback:
+  # --- state/flags/launch-ceiling-off, or -Force.
+  $budget = $null
+  $ceiling = 0
+  $ceilings = $null
+  try { $ceilings = (Read-Json "$FleetHome\config\cycle.json").firstTurnCeilings } catch {}
+  if ($ceilings -and $ceilings.PSObject.Properties[$Role]) { $ceiling = [int]$ceilings.$Role }
+  if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-off")) {
+    $hookChars = 0
+    $hookPath = "$FleetHome\hooks\session-start.ps1"
+    if (Test-Path $hookPath) {
+      $savedEnv = @{}
+      foreach ($pair in $envBlock.GetEnumerator()) { $savedEnv[$pair.Key] = [Environment]::GetEnvironmentVariable($pair.Key) }
+      try {
+        foreach ($pair in $envBlock.GetEnumerator()) { [Environment]::SetEnvironmentVariable($pair.Key, "$($pair.Value)") }
+        $hookChars = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File $hookPath 2>$null | Out-String).Length
+      } catch {} finally {
+        foreach ($savedKey in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($savedKey, $savedEnv[$savedKey]) }
+      }
+    }
+    $roleChars = 0
+    if (Test-Path $roleFile) { $roleChars = (Get-Content $roleFile -Raw).Length }
+    $baseline = 0
+    if ($ceilings.PSObject.Properties['baselineTokens']) { $baseline = [int]$ceilings.baselineTokens }
+    $sources = [ordered]@{
+      baseline = $baseline
+      prompt = [int][Math]::Ceiling("$Prompt".Length / 4)
+      roleFile = [int][Math]::Ceiling($roleChars / 4)
+      sessionStartInjection = [int][Math]::Ceiling($hookChars / 4)
+      settings = [int][Math]::Ceiling((Get-Content $settingsWritePath -Raw).Length / 4)
+    }
+    $estimate = 0
+    foreach ($sourceTokens in $sources.Values) { $estimate += $sourceTokens }
+    $budget = [pscustomobject]@{ role = $Role; ceiling = $ceiling; estimatedTokens = $estimate; sources = [pscustomobject]$sources }
+    if ($estimate -gt $ceiling -and -not $Force) {
+      $ceilingReason = "first-turn ceiling exceeded for role '$Role': $estimate estimated tokens > $ceiling (see budget.sources)"
+      $r = Release-ReservationOnRefusal "launch refused: $ceilingReason"
+      Write-Output (@{ launched = $false; reason = $ceilingReason; budget = $budget; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress -Depth 6); exit 6
+    }
+  }
+
+  if ($DryRun) {
+    Write-Output (@{ launched = $false; dryRun = $true; launchReason = $Reason; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsWritePath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath --no-chrome <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
+    exit 0
+  }
+
+  # Trust pre-flight (fleet #104): since Claude Code 2.1.281 `claude --bg` refuses an
+  # untrusted workspace and creates no session. Checked here, after every other gate and
+  # before the worktree and branch exist, so an untrusted tenant fails closed with the fix
+  # named instead of an empty "produced no session". An assignment worktree inherits the
+  # tenant repo's trust, so the repo path is what has to be trusted.
+  # state/flags/launch-trust-check-off is the rollback if a later CLI changes the rule.
+  if (-not (Test-Path "$FleetHome\state\flags\launch-trust-check-off") -and -not (Test-WorkspaceTrusted $cwd)) {
+    $trustKey = "$cwd".Replace('\', '/')
+    $trustReason = "workspace not trusted: Claude Code 2.1.281+ refuses ``claude --bg`` in '$cwd' unless ~/.claude.json has a trusted projects key spelled exactly '$trustKey' (or an exact-case ancestor); interactive ``claude`` accepts a key that differs only in case without prompting, so if one exists, copy that entry to the exact-case key; otherwise run ``claude`` there once as Cory, accept the prompt, and relaunch (state/flags/launch-trust-check-off skips this check)"
+    $released = $false
+    if ($Manifest) { try { Invalidate-Manifest "launch refused: $trustReason"; $released = $true } catch {} }
+    Write-Output (@{ launched = $false; reason = $trustReason; cwd = $cwd; reservationReleased = $released } | ConvertTo-Json -Compress); exit 7
+  }
+
+  $worktreePath = $null
+  $createdWorktree = $false   # ticket 455: set only once `worktree add` has created the worktree in this run
+  $expectedBase = $null
+  # A failed launch must leave neither the assignment worktree nor its branch: `worktree add
+  # -b` created both, and the orphan fleet/<issue>-... branch made every retry's worktree add
+  # fail (2026-09-23, #1579 x3, pl-endzone deleted each by hand). The branch goes only while
+  # its tip is still the manifest base, so a branch that gained a commit is never discarded.
+  function Remove-FailedAssignmentWorktree {
+    if (-not $Manifest) { return }
+    # ticket 455: only a worktree this run created; one that was there before the launch is not ours to remove.
+    if ($createdWorktree -and $worktreePath -and (Test-Path -LiteralPath $worktreePath)) { & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null }
+    & git -C $t.repo worktree prune 2>$null | Out-Null
+    $branch = [string]$assignment.branch
+    if (-not $branch) { return }
+    $tip = (& git -C $t.repo rev-parse --verify --quiet "refs/heads/$branch" 2>$null | Out-String).Trim()
+    if ($tip -and $expectedBase -and $tip -eq $expectedBase) { & git -C $t.repo branch -D $branch 2>$null | Out-Null }
+  }
+  # fleet#264: is this manifest still the owner of its reservation? Returns the reason it is not, or $null.
+  # Reads the marker and the Work record the way the early checks near the top do (the .invalidated.json
+  # sidecar, state\work\active.json), and also requires the record's revision to be the one the manifest
+  # reserved: a release followed by a fresh reservation leaves the record `assigned` at a later revision.
+  function Get-ReservationRecheckFailure {
+    if (Test-Path -LiteralPath "$Manifest.invalidated.json") { return "the manifest was invalidated while this launch was preparing" }
+    try { $freshState = Read-Json "$FleetHome\state\work\active.json" } catch { return "the Work record could not be re-read ($($_.Exception.Message))" }
+    $freshProperty = if ($freshState) { $freshState.records.PSObject.Properties[$WorkRecordId] } else { $null }
+    if (-not $freshProperty) { return "Work record '$WorkRecordId' is no longer active" }
+    if ($freshProperty.Value.state -ne 'assigned') { return "Work record '$WorkRecordId' is $($freshProperty.Value.state), not assigned" }
+    if ([string]$freshProperty.Value.revision -ne [string]$assignment.workRecordRevision) { return "Work record '$WorkRecordId' moved to revision $($freshProperty.Value.revision) (the manifest reserved revision $($assignment.workRecordRevision))" }
+    if (-not (Test-RecordNamesManifest $freshProperty.Value)) { return "Work record '$WorkRecordId' no longer names this manifest" }
+    return $null
+  }
+  if ($Manifest) {
+    $baseRemote = [string]$assignment.base.remote
+    $baseRef = [string]$assignment.base.ref
+    $expectedBase = [string]$assignment.base.sha
+    if (-not $baseRemote -or -not $baseRef -or $expectedBase -notmatch '^[0-9a-fA-F]{40}$') { $r = Release-ReservationOnRefusal "launch refused: manifest has an invalid base precondition"; Write-Error "manifest '$Manifest' has an invalid base precondition$($r.note)"; exit 4 }
+    & git -C $cwd fetch $baseRemote $baseRef --prune 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch refused: could not fetch $baseRemote/$baseRef"; Write-Error "could not fetch $baseRemote/$baseRef for manifest '$Manifest'$($r.note)"; exit 4 }
+    $resolvedBase = (& git -C $cwd rev-parse "refs/remotes/$baseRemote/$baseRef" 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $resolvedBase -ne $expectedBase) { $r = Release-ReservationOnRefusal "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; Write-Error "manifest base precondition changed (expected $expectedBase, found $resolvedBase)$($r.note)"; exit 4 }
+    $worktreeParent = Join-Path $cwd '.claude\worktrees'
+    $worktreePath = Join-Path $worktreeParent "$Name-assignment"
+    # no release: a worktree already at this path is an earlier launch's. The duplicate-name and job-state guards above already said no ic-N session is live, so nothing is about to acknowledge and nothing here removes it: the janitor never removes the worktree of an open issue whose record is assigned or absent, so an operator must remove it. Releasing here would only re-offer the issue into an assign, launch, refuse loop that fails at this line every time (the reservation is what keeps the planner from doing that).
+    if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
+    New-Item -ItemType Directory -Force $worktreeParent | Out-Null
+    & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch failed: could not create the assignment worktree from $expectedBase"; Remove-FailedAssignmentWorktree; Write-Error "could not create assignment worktree from $expectedBase$($r.note)"; exit 4 }
+    $createdWorktree = $true
+    # ic.md step 6: the PR body file is .fleet-pr-body.md in the worktree root, written with
+    # the Write tool, not a heredoc into a temp directory outside the allowed directories
+    # (fleet #171, rehearsal wait 4). The repo's info/exclude, shared by every worktree,
+    # keeps it out of every commit. Best effort: a missing line only risks a stray file.
+    $commonDir = (& git -C $worktreePath rev-parse --path-format=absolute --git-common-dir 2>$null | Out-String).Trim()
+    if ($commonDir) {
+      try {
+        $excludePath = Join-Path $commonDir 'info\exclude'
+        $excludeLines = @()
+        if (Test-Path -LiteralPath $excludePath) { $excludeLines = @(Get-Content -LiteralPath $excludePath) }
+        if ($excludeLines -notcontains '/.fleet-pr-body.md') {
+          [IO.Directory]::CreateDirectory((Split-Path -Parent $excludePath)) | Out-Null
+          [IO.File]::AppendAllText($excludePath, "`n/.fleet-pr-body.md`n")
+        }
+      } catch { Write-Warning "could not add the PR body file to $excludePath ($_)" }
+    }
+    $cwd = $worktreePath
+  } elseif ($recoverCwd) {
+    # fleet #434: a recovered IC restarts in the assignment worktree its manifest launch created, not the tenant repo root.
+    $cwd = $recoverCwd
+  }
+
+  # --- launch ---
+  $before = @($daemon | ForEach-Object { $_.sessionId })
+  $beforeJobIds = @(Get-DaemonSessions -All -NoRetry | ForEach-Object { $_.id })
+  $locationPushed = $false
+  # fleet#264: the gh check, fetch and worktree add above take 10-40 s with no job and no roster row, so a
+  # release that lands in that window (the stranded-reservation sweep, #261) cannot see this launch. Look
+  # again immediately before claude --bg; an IC started on a released record only fails its ack.
+  if ($Manifest) {
+    $lateRefusal = Get-ReservationRecheckFailure
+    if ($lateRefusal) {
+      # no release: the reservation is already gone or no longer this manifest's; there is nothing to release. The worktree and branch are this launch's own and nothing can use them.
+      Remove-FailedAssignmentWorktree
+      Write-Error "launch refused right before claude --bg: $lateRefusal"; exit 4
+    }
   }
   try {
-    $profileAllow = @($permissionProfile.allow | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
-    $profileDeny = @($permissionProfile.deny | Where-Object { $_ } | ForEach-Object { & $resolveProfileRule "$($_.rule)" })
-    $profileDirs = @($permissionProfile.additionalDirectories | Where-Object { $_ } | ForEach-Object { if ($_ -is [string]) { & $resolveProfileRule $_ } else { & $resolveProfileRule "$($_.dir)" } })
-    if ($permissionProfile.PSObject.Properties['repoDeny'] -and $permissionProfile.repoDeny) {
-      $profileDeny += @(Get-RepoDenyRules -Repo "$($t.repo)" -Keep "$($permissionProfile.repoDeny.keep)" -Tools @($permissionProfile.repoDeny.tools))
-    }
-  } catch { $profileMessage = "$($_.Exception.Message)"; $r = Release-ReservationOnRefusal "launch refused: $profileMessage"; Write-Error "$profileMessage$($r.note)"; exit 4 }
-  if (-not $settings.PSObject.Properties['permissions']) { $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force }
-  $existingDeny = @()
-  if ($settings.permissions.PSObject.Properties['deny']) { $existingDeny = @($settings.permissions.deny) }
-  $settings.permissions | Add-Member -NotePropertyName defaultMode -NotePropertyValue "$($permissionProfile.defaultMode)" -Force
-  $settings.permissions | Add-Member -NotePropertyName allow -NotePropertyValue $profileAllow -Force
-  $settings.permissions | Add-Member -NotePropertyName additionalDirectories -NotePropertyValue $profileDirs -Force
-  $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue (@(@($existingDeny + $profileDeny) | Select-Object -Unique)) -Force
-  $allowRuleCount = $profileAllow.Count
-}
-
-$settingsPath = "$FleetHome\state\sessions\$Name.settings.json"
-Write-Json $settingsPath $settings
-
-# The friendly -Model token is passed to `claude --model`, but the bare 'opus'
-# alias tracks the latest Opus (currently Opus 5), so pin 'opus' to the concrete id: an
-# explicit -Model opus runs Opus 4.8 (ICs run Haiku 5.5 alone, fleet #350). 'fable' stays
-# pinned (ADR 0011) so an explicit -Model fable
-# resolves to claude-fable-5-1 and a default-Fable bump cannot move it silently; the installed
-# CLI 2.1.269 admits claude-fable-5-1 to auto mode, verified in its model predicate
-# 2026-09-11, so no fleet #28-style refusal. Other tokens keep their CLI aliases.
-# An arbiter launched with no -Model runs its own pin, Opus 5.5 (owner ruling 2026-10-20,
-# ADR 0017 amendment); the role file's `model:` agrees.
-# A project lead launched with no -Model runs Sonnet 5.5 (owner ruling 2026-10-26; Opus
-# 5.5 from 2026-09-23 until then), pinned for the same reason.
-# A principal launched with no -Model runs its own pin, Sonnet 5.5 (owner ruling 2026-11-06,
-# fleet #385; Opus 5.5 under ADR 0017 until then), at the role file's high effort.
-# Every IC runs pinned Haiku 5.5 (owner ruling 2026-10-30, fleet #350), whatever the manifest
-# names: the door refuses any other IC model above.
-# The pins and role defaults live in _common.ps1 (Resolve-LaunchModel) since fleet
-# #121: sentinel-check compares a daemon job's frozen respawnFlags against them.
-# fleet #385: the roster records the model the caller asked for, not the pin a default launch resolved to. A row that named
-# the resolved pin reads as a hand-set -Model to sentinel-check, which would hold the session to that pin after a pin change.
-$requestedModel = $Model
-$launchModel = Resolve-LaunchModel -Role $Role -Model $Model
-$Model = $launchModel.token
-$modelArgs = @()
-if ($launchModel.id) { $modelArgs = @('--model', $launchModel.id) }
-
-# The role file frontmatter declares `effort:`, but `claude --agent` does NOT read
-# it for a top-level background session (it defaults every such session to high;
-# e.g. sentinel.md says low yet ran at high). So parse the role file ourselves and
-# pass the declared effort with --effort, the only lever that sticks for --bg.
-$roleFile = "$FleetHome\agents\$Role.md"
-# Fleet #350: an IC's effort is the one the door checked above (its manifest's, else the role file's).
-# Fleet #394: a non-IC's effort is its tenant file's roleEffort, else the role file's.
-$effort = if ($Role -eq 'ic') { $icEffort } else { Get-LaunchRoleEffort $Role $t }
-$effortArgs = @()
-if (Test-LaunchEffort $effort) { $effortArgs = @('--effort', $effort) }
-
-# --- first-turn ceiling (ticket 06): a launch that would start over its role's
-# --- config/cycle.json budget fails before assignment and reports the token
-# --- contribution by source. The estimate counts the fleet-injected sources
-# --- (prompt, role file, simulated session-start injection, settings) at ~4
-# --- chars/token plus the configured baselineTokens; calibrating baselineTokens
-# --- against measured cache creation is ticket 09's verification. Rollback:
-# --- state/flags/launch-ceiling-off, or -Force.
-$budget = $null
-$ceiling = 0
-$ceilings = $null
-try { $ceilings = (Read-Json "$FleetHome\config\cycle.json").firstTurnCeilings } catch {}
-if ($ceilings -and $ceilings.PSObject.Properties[$Role]) { $ceiling = [int]$ceilings.$Role }
-if ($ceiling -gt 0 -and -not (Test-Path "$FleetHome\state\flags\launch-ceiling-off")) {
-  $hookChars = 0
-  $hookPath = "$FleetHome\hooks\session-start.ps1"
-  if (Test-Path $hookPath) {
-    $savedEnv = @{}
-    foreach ($pair in $envBlock.GetEnumerator()) { $savedEnv[$pair.Key] = [Environment]::GetEnvironmentVariable($pair.Key) }
-    try {
-      foreach ($pair in $envBlock.GetEnumerator()) { [Environment]::SetEnvironmentVariable($pair.Key, "$($pair.Value)") }
-      $hookChars = ('' | & powershell -NoProfile -ExecutionPolicy Bypass -File $hookPath 2>$null | Out-String).Length
-    } catch {} finally {
-      foreach ($savedKey in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($savedKey, $savedEnv[$savedKey]) }
-    }
-  }
-  $roleChars = 0
-  if (Test-Path $roleFile) { $roleChars = (Get-Content $roleFile -Raw).Length }
-  $baseline = 0
-  if ($ceilings.PSObject.Properties['baselineTokens']) { $baseline = [int]$ceilings.baselineTokens }
-  $sources = [ordered]@{
-    baseline = $baseline
-    prompt = [int][Math]::Ceiling("$Prompt".Length / 4)
-    roleFile = [int][Math]::Ceiling($roleChars / 4)
-    sessionStartInjection = [int][Math]::Ceiling($hookChars / 4)
-    settings = [int][Math]::Ceiling((Get-Content $settingsPath -Raw).Length / 4)
-  }
-  $estimate = 0
-  foreach ($sourceTokens in $sources.Values) { $estimate += $sourceTokens }
-  $budget = [pscustomobject]@{ role = $Role; ceiling = $ceiling; estimatedTokens = $estimate; sources = [pscustomobject]$sources }
-  if ($estimate -gt $ceiling -and -not $Force) {
-    $ceilingReason = "first-turn ceiling exceeded for role '$Role': $estimate estimated tokens > $ceiling (see budget.sources)"
-    $r = Release-ReservationOnRefusal "launch refused: $ceilingReason"
-    Write-Output (@{ launched = $false; reason = $ceilingReason; budget = $budget; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress -Depth 6); exit 6
-  }
-}
-
-if ($DryRun) {
-  Write-Output (@{ launched = $false; dryRun = $true; launchReason = $Reason; name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; model = $Model; permissions = $Permissions; allowRules = $allowRuleCount; effort = $effort; cwd = $cwd; settings = $settingsPath; prompt = $Prompt; budget = $budget; liveFleet = $liveFleet.Count; cap = $static.cap; command = "claude --bg --name $Name --agent $Role $($modelArgs -join ' ') $($effortArgs -join ' ') --settings $settingsPath --no-chrome <prompt>".Replace('  ', ' ') } | ConvertTo-Json -Compress -Depth 6)
-  exit 0
-}
-
-# Trust pre-flight (fleet #104): since Claude Code 2.1.281 `claude --bg` refuses an
-# untrusted workspace and creates no session. Checked here, after every other gate and
-# before the worktree and branch exist, so an untrusted tenant fails closed with the fix
-# named instead of an empty "produced no session". An assignment worktree inherits the
-# tenant repo's trust, so the repo path is what has to be trusted.
-# state/flags/launch-trust-check-off is the rollback if a later CLI changes the rule.
-if (-not (Test-Path "$FleetHome\state\flags\launch-trust-check-off") -and -not (Test-WorkspaceTrusted $cwd)) {
-  $trustKey = "$cwd".Replace('\', '/')
-  $trustReason = "workspace not trusted: Claude Code 2.1.281+ refuses ``claude --bg`` in '$cwd' unless ~/.claude.json has a trusted projects key spelled exactly '$trustKey' (or an exact-case ancestor); interactive ``claude`` accepts a key that differs only in case without prompting, so if one exists, copy that entry to the exact-case key; otherwise run ``claude`` there once as Cory, accept the prompt, and relaunch (state/flags/launch-trust-check-off skips this check)"
-  $released = $false
-  if ($Manifest) { try { Invalidate-Manifest "launch refused: $trustReason"; $released = $true } catch {} }
-  Write-Output (@{ launched = $false; reason = $trustReason; cwd = $cwd; reservationReleased = $released } | ConvertTo-Json -Compress); exit 7
-}
-
-$worktreePath = $null
-$expectedBase = $null
-# A failed launch must leave neither the assignment worktree nor its branch: `worktree add
-# -b` created both, and the orphan fleet/<issue>-... branch made every retry's worktree add
-# fail (2026-09-23, #1579 x3, pl-endzone deleted each by hand). The branch goes only while
-# its tip is still the manifest base, so a branch that gained a commit is never discarded.
-function Remove-FailedAssignmentWorktree {
-  if (-not $Manifest) { return }
-  if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) { & git -C $t.repo worktree remove --force $worktreePath 2>$null | Out-Null }
-  & git -C $t.repo worktree prune 2>$null | Out-Null
-  $branch = [string]$assignment.branch
-  if (-not $branch) { return }
-  $tip = (& git -C $t.repo rev-parse --verify --quiet "refs/heads/$branch" 2>$null | Out-String).Trim()
-  if ($tip -and $expectedBase -and $tip -eq $expectedBase) { & git -C $t.repo branch -D $branch 2>$null | Out-Null }
-}
-# fleet#264: is this manifest still the owner of its reservation? Returns the reason it is not, or $null.
-# Reads the marker and the Work record the way the early checks near the top do (the .invalidated.json
-# sidecar, state\work\active.json), and also requires the record's revision to be the one the manifest
-# reserved: a release followed by a fresh reservation leaves the record `assigned` at a later revision.
-function Get-ReservationRecheckFailure {
-  if (Test-Path -LiteralPath "$Manifest.invalidated.json") { return "the manifest was invalidated while this launch was preparing" }
-  try { $freshState = Read-Json "$FleetHome\state\work\active.json" } catch { return "the Work record could not be re-read ($($_.Exception.Message))" }
-  $freshProperty = if ($freshState) { $freshState.records.PSObject.Properties[$WorkRecordId] } else { $null }
-  if (-not $freshProperty) { return "Work record '$WorkRecordId' is no longer active" }
-  if ($freshProperty.Value.state -ne 'assigned') { return "Work record '$WorkRecordId' is $($freshProperty.Value.state), not assigned" }
-  if ([string]$freshProperty.Value.revision -ne [string]$assignment.workRecordRevision) { return "Work record '$WorkRecordId' moved to revision $($freshProperty.Value.revision) (the manifest reserved revision $($assignment.workRecordRevision))" }
-  if (-not (Test-RecordNamesManifest $freshProperty.Value)) { return "Work record '$WorkRecordId' no longer names this manifest" }
-  return $null
-}
-if ($Manifest) {
-  $baseRemote = [string]$assignment.base.remote
-  $baseRef = [string]$assignment.base.ref
-  $expectedBase = [string]$assignment.base.sha
-  if (-not $baseRemote -or -not $baseRef -or $expectedBase -notmatch '^[0-9a-fA-F]{40}$') { $r = Release-ReservationOnRefusal "launch refused: manifest has an invalid base precondition"; Write-Error "manifest '$Manifest' has an invalid base precondition$($r.note)"; exit 4 }
-  & git -C $cwd fetch $baseRemote $baseRef --prune 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch refused: could not fetch $baseRemote/$baseRef"; Write-Error "could not fetch $baseRemote/$baseRef for manifest '$Manifest'$($r.note)"; exit 4 }
-  $resolvedBase = (& git -C $cwd rev-parse "refs/remotes/$baseRemote/$baseRef" 2>$null | Out-String).Trim()
-  if ($LASTEXITCODE -ne 0 -or $resolvedBase -ne $expectedBase) { $r = Release-ReservationOnRefusal "manifest base precondition changed (expected $expectedBase, found $resolvedBase)"; Write-Error "manifest base precondition changed (expected $expectedBase, found $resolvedBase)$($r.note)"; exit 4 }
-  $worktreeParent = Join-Path $cwd '.claude\worktrees'
-  $worktreePath = Join-Path $worktreeParent "$Name-assignment"
-  # no release: a worktree already at this path is an earlier launch's. The duplicate-name and job-state guards above already said no ic-N session is live, so nothing is about to acknowledge and nothing here removes it: the janitor never removes the worktree of an open issue whose record is assigned or absent, so an operator must remove it. Releasing here would only re-offer the issue into an assign, launch, refuse loop that fails at this line every time (the reservation is what keeps the planner from doing that).
-  if (Test-Path -LiteralPath $worktreePath) { Write-Error "assignment worktree already exists: $worktreePath"; exit 4 }
-  New-Item -ItemType Directory -Force $worktreeParent | Out-Null
-  & git -C $cwd worktree add -b $assignment.branch $worktreePath $expectedBase 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { $r = Release-ReservationOnRefusal "launch failed: could not create the assignment worktree from $expectedBase"; Remove-FailedAssignmentWorktree; Write-Error "could not create assignment worktree from $expectedBase$($r.note)"; exit 4 }
-  # ic.md step 6: the PR body file is .fleet-pr-body.md in the worktree root, written with
-  # the Write tool, not a heredoc into a temp directory outside the allowed directories
-  # (fleet #171, rehearsal wait 4). The repo's info/exclude, shared by every worktree,
-  # keeps it out of every commit. Best effort: a missing line only risks a stray file.
-  $commonDir = (& git -C $worktreePath rev-parse --path-format=absolute --git-common-dir 2>$null | Out-String).Trim()
-  if ($commonDir) {
-    try {
-      $excludePath = Join-Path $commonDir 'info\exclude'
-      $excludeLines = @()
-      if (Test-Path -LiteralPath $excludePath) { $excludeLines = @(Get-Content -LiteralPath $excludePath) }
-      if ($excludeLines -notcontains '/.fleet-pr-body.md') {
-        [IO.Directory]::CreateDirectory((Split-Path -Parent $excludePath)) | Out-Null
-        [IO.File]::AppendAllText($excludePath, "`n/.fleet-pr-body.md`n")
-      }
-    } catch { Write-Warning "could not add the PR body file to $excludePath ($_)" }
-  }
-  $cwd = $worktreePath
-} elseif ($recoverCwd) {
-  # fleet #434: a recovered IC restarts in the assignment worktree its manifest launch created, not the tenant repo root.
-  $cwd = $recoverCwd
-}
-
-# --- launch ---
-$before = @($daemon | ForEach-Object { $_.sessionId })
-$beforeJobIds = @(Get-DaemonSessions -All -NoRetry | ForEach-Object { $_.id })
-$locationPushed = $false
-# fleet#264: the gh check, fetch and worktree add above take 10-40 s with no job and no roster row, so a
-# release that lands in that window (the stranded-reservation sweep, #261) cannot see this launch. Look
-# again immediately before claude --bg; an IC started on a released record only fails its ack.
-if ($Manifest) {
-  $lateRefusal = Get-ReservationRecheckFailure
-  if ($lateRefusal) {
-    # no release: the reservation is already gone or no longer this manifest's; there is nothing to release. The worktree and branch are this launch's own and nothing can use them.
+    Push-Location $cwd
+    $locationPushed = $true
+    # Windows PowerShell 5.1 re-parses embedded double quotes in a string passed
+    # as a native positional argument. Fleet briefs contain quoted issue titles,
+    # so argv delivery silently truncated every measured IC prompt. stdin is the
+    # CLI's prompt input as well, and preserves the exact string without another
+    # command-line parse.
+    # fleet #265: resolved once (waiting out an npm reinstall); the prompt still goes over stdin.
+    $claudeCli = Resolve-ClaudeCli -Tries 3 -PollMs 3000   # a short ladder: the strict read above already resolved once, and the launch must stay inside assignment.js's 90 s
+    $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath --no-chrome 2>&1 | Out-String
+  } catch {
+    if ($locationPushed) { Pop-Location; $locationPushed = $false }
+    # fleet#256: claude itself failing to run (not on PATH, spawn error) is a refusal too. Release first, then remove the worktree (fleet#251 order); the helper never throws, so the original error is what surfaces.
+    [void](Release-ReservationOnRefusal "launch failed: claude --bg threw: $($_.Exception.Message)")
     Remove-FailedAssignmentWorktree
-    Write-Error "launch refused right before claude --bg: $lateRefusal"; exit 4
+    if ("$($_.Exception.Message)" -match '^(claude CLI not found|FLEET_CLAUDE_CLI does not point)') { Write-Output (Get-ClaudeCliMissingJson @{ launched = $false; reason = "$($_.Exception.Message)" }); exit 6 }   # fleet #265: a CLI still missing after the bounded wait is reported as such, not as a bare exception
+    throw
+  } finally {
+    if ($locationPushed) { Pop-Location }
   }
-}
-try {
-  Push-Location $cwd
-  $locationPushed = $true
-  # Windows PowerShell 5.1 re-parses embedded double quotes in a string passed
-  # as a native positional argument. Fleet briefs contain quoted issue titles,
-  # so argv delivery silently truncated every measured IC prompt. stdin is the
-  # CLI's prompt input as well, and preserves the exact string without another
-  # command-line parse.
-  # fleet #265: resolved once (waiting out an npm reinstall); the prompt still goes over stdin.
-  $claudeCli = Resolve-ClaudeCli -Tries 3 -PollMs 3000   # a short ladder: the strict read above already resolved once, and the launch must stay inside assignment.js's 90 s
-  $out = $Prompt | & $claudeCli --bg --name $Name --agent $Role @modelArgs @effortArgs --settings $settingsPath --no-chrome 2>&1 | Out-String
-} catch {
-  if ($locationPushed) { Pop-Location; $locationPushed = $false }
-  # fleet#256: claude itself failing to run (not on PATH, spawn error) is a refusal too. Release first, then remove the worktree (fleet#251 order); the helper never throws, so the original error is what surfaces.
-  [void](Release-ReservationOnRefusal "launch failed: claude --bg threw: $($_.Exception.Message)")
-  Remove-FailedAssignmentWorktree
-  if ("$($_.Exception.Message)" -match '^(claude CLI not found|FLEET_CLAUDE_CLI does not point)') { Write-Output (Get-ClaudeCliMissingJson @{ launched = $false; reason = "$($_.Exception.Message)" }); exit 6 }   # fleet #265: a CLI still missing after the bounded wait is reported as such, not as a bare exception
-  throw
-} finally {
-  if ($locationPushed) { Pop-Location }
-}
-$row = $null
-for ($i = 0; $i -lt 20 -and -not $row; $i++) {
-  Start-Sleep -Milliseconds 750
-  $row = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
-}
-if (-not $row) {
-  $failedRow = Get-DaemonSessions -All -NoRetry |
-    Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
-    Select-Object -First 1
-  $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
-  $detail = if ($jobState -and $jobState.detail) { "$($jobState.detail)" } else { $null }
-  # When the CLI created no job at all, its own output is the only evidence (2.1.281's
-  # "Workspace not trusted" refusal reached the manifest as "produced no session ()").
-  $why = if ($detail) { $detail } else { ("$out" -replace '\s+', ' ').Trim() }
-  if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
-  # A manifest whose launch produced no session must not keep its reservation: the
-  # planner would exclude the issue as `reserved` and a fresh assign would hit
-  # RESERVATION_CONFLICT. Release it so the next decision can reserve again.
-  $released = $false
-  $releaseError = $null
-  if ($Manifest) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($why)"; $released = $true } catch { $releaseError = "$($_.Exception.Message)" } }
-  # fleet#251: the worktree goes after the release. A session that appears late still finds its
-  # assignment worktree until the reservation is actually released; the invalidated manifest
-  # then tells its ack to stop (MANIFEST_INVALIDATED). When the release failed, the worktree
-  # stays only if the assignment is demonstrably live: the record left `assigned` (a late
-  # session acknowledged) or the session list now shows the job. Otherwise it goes as before:
-  # a stranded worktree makes every relaunch exit 4 ("already exists") before it can release.
-  # An unreadable record and daemon list default to removing the worktree (the pre-#251
-  # behaviour): keeping it on no evidence is what strands every relaunch.
-  $keepWorktree = $false
-  if ($Manifest -and -not $released) {
+  $row = $null
+  for ($i = 0; $i -lt 20 -and -not $row; $i++) {
+    Start-Sleep -Milliseconds 750
+    $row = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+  }
+  $adopted = $false
+  $lateRead = $true
+  if (-not $row) {
+    # ticket 455: one read of the session list by name before any release. A session that registered after the wait is
+    # adopted, and the success path below runs as if it had appeared in time. A read that fails cannot show that no
+    # session exists, so nothing is released or removed then.
+    try { $row = Get-DaemonSessions -Strict -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1 } catch { $lateRead = $false }
+    $adopted = [bool]$row
+  }
+  if (-not $row) {
+    $failedRow = Get-DaemonSessions -All -NoRetry |
+      Where-Object { $_.name -eq $Name -and ($beforeJobIds -notcontains $_.id) } |
+      Select-Object -First 1
+    $jobState = if ($failedRow) { Get-JobState $failedRow.id } else { $null }
+    $detail = if ($jobState -and $jobState.detail) { "$($jobState.detail)" } else { $null }
+    # When the CLI created no job at all, its own output is the only evidence (2.1.281's
+    # "Workspace not trusted" refusal reached the manifest as "produced no session ()").
+    $why = if ($detail) { $detail } else { ("$out" -replace '\s+', ' ').Trim() }
+    if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
+    # A manifest whose launch produced no session must not keep its reservation: the
+    # planner would exclude the issue as `reserved` and a fresh assign would hit
+    # RESERVATION_CONFLICT. Release it so the next decision can reserve again.
+    $released = $false
+    $releaseError = $null
+    if ($Manifest -and $lateRead) { try { Invalidate-Manifest "launch failed: claude --bg produced no session ($why)"; $released = $true } catch { $releaseError = "$($_.Exception.Message)" } }
+    # fleet#251: the worktree goes after the release. A session that appears late still finds its
+    # assignment worktree until the reservation is actually released; the invalidated manifest
+    # then tells its ack to stop (MANIFEST_INVALIDATED). When the release failed, the worktree
+    # stays only if the assignment is demonstrably live: the record left `assigned` (a late
+    # session acknowledged) or the session list now shows the job. Otherwise it goes as before:
+    # a stranded worktree makes every relaunch exit 4 ("already exists") before it can release.
+    # An unreadable record and daemon list default to removing the worktree (the pre-#251
+    # behaviour): keeping it on no evidence is what strands every relaunch.
+    $keepWorktree = -not $lateRead
+    if ($Manifest -and -not $released -and $lateRead) {
+      try {
+        $node = Get-NodeExe
+        $currentRecord = (& $node "$PSScriptRoot\work-state.js" get --root $FleetHome --id $WorkRecordId 2>$null | Out-String | ConvertFrom-Json)
+        if ($currentRecord -and $currentRecord.state -and "$($currentRecord.state)" -notin @('assigned', 'released')) { $keepWorktree = $true }
+      } catch {}
+      try {
+        $lateRow = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
+        if ($lateRow) { $keepWorktree = $true }
+      } catch {}
+    }
+    if (-not $keepWorktree) { Remove-FailedAssignmentWorktree }
+    Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released; releaseError = $releaseError; worktreeKept = $keepWorktree; sessionListUnreadable = (-not $lateRead) } | ConvertTo-Json -Compress); exit 5
+  }
+
+  # --- record ---
+  # The row carries the resolved manifest path (as FLEET_ASSIGNMENT_MANIFEST does), which
+  # work-state release matches against the record's manifest to tell a live claim from a stale row.
+  $rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } elseif ($recoverValidated) { $recoverManifest } else { $Manifest }
+  $entry = [pscustomobject]@{
+    name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
+    model = $requestedModel; permissions = $Permissions; effort = $effort
+    jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $rosterManifest; workRecordId = $WorkRecordId
+    status = 'active'; launchedAt = (Now-Iso); retiredAt = $null; launchReason = $Reason
+  }
+  # fleet #359: the splice runs on the fresh roster under the lock; the $live read above only feeds the checks.
+  try {
+    Update-LiveRoster { param($r) $r.sessions = @($r.sessions | Where-Object { $_.name -ne $Name }) + @($entry) }
+  } catch {
+    $rosterError = "$($_.Exception.Message)"
+    if (-not $adopted) { throw }
+    # ticket 455: an adopted session that cannot be rostered is stopped, then released like a launch with no session.
+    try { [void](Invoke-ClaudeCli -Arguments @('stop', "$($row.id)")) } catch {}
+    $r = Release-ReservationOnRefusal "launch failed: the roster write for the adopted session '$Name' failed: $rosterError"
+    if ($r.released) { Remove-FailedAssignmentWorktree }
+    Write-Output (@{ launched = $false; reason = "the roster write for the adopted session '$Name' failed: $rosterError"; reservationReleased = $r.released; releaseError = $r.error } | ConvertTo-Json -Compress); exit 5
+  }
+
+  # 02/03: reserve the unit before returning. The roster entry now exists, so the projection
+  # derives the Work record from it immediately instead of leaving it to the next pr-watch
+  # tick up to five minutes later. In that gap the Stop hook had already dropped the issue
+  # (it reads the roster) while the planner had not (it reads Work records), so every legacy
+  # launch manufactured a planner-includes parity difference - and, worse, left a window in
+  # which the planner would offer an issue an IC was already working. A manifest launch is
+  # already reserved by `assignment.js assign`, and the projection leaves that record alone.
+  # Never fatal: the unit is launched either way, and the next tick still projects it.
+  $projected = $false
+  if ($Role -eq 'ic') {
     try {
       $node = Get-NodeExe
-      $currentRecord = (& $node "$PSScriptRoot\work-state.js" get --root $FleetHome --id $WorkRecordId 2>$null | Out-String | ConvertFrom-Json)
-      if ($currentRecord -and $currentRecord.state -and "$($currentRecord.state)" -notin @('assigned', 'released')) { $keepWorktree = $true }
-    } catch {}
-    try {
-      $lateRow = Get-DaemonSessions -NoRetry | Where-Object { $_.name -eq $Name -and ($before -notcontains $_.sessionId) } | Select-Object -First 1
-      if ($lateRow) { $keepWorktree = $true }
-    } catch {}
+      & $node "$PSScriptRoot\work-state.js" shadow --root $FleetHome --actor launch 2>&1 | Out-Null
+      $projected = ($LASTEXITCODE -eq 0)
+    } catch { $projected = $false }
   }
-  if (-not $keepWorktree) { Remove-FailedAssignmentWorktree }
-  Write-Output (@{ launched = $false; reason = "claude --bg did not produce a session named '$Name'"; detail = $detail; output = $out; reservationReleased = $released; releaseError = $releaseError; worktreeKept = $keepWorktree } | ConvertTo-Json -Compress); exit 5
+  Write-Output (@{ launched = $true; name = $Name; jobId = $row.id; sessionId = $row.sessionId; cwd = $cwd; projected = $projected; launchReason = $Reason } | ConvertTo-Json -Compress)
+  exit 0
+} finally {
+  if ($nameHeld) { $nameMutex.ReleaseMutex() }
+  $nameMutex.Dispose()
 }
-
-# --- record ---
-# The row carries the resolved manifest path (as FLEET_ASSIGNMENT_MANIFEST does), which
-# work-state release matches against the record's manifest to tell a live claim from a stale row.
-$rosterManifest = if ($Manifest) { (Resolve-Path -LiteralPath $Manifest).Path } elseif ($recoverValidated) { $recoverManifest } else { $Manifest }
-$entry = [pscustomobject]@{
-  name = $Name; role = $Role; tenant = $Tenant; parent = $Parent; issue = $Issue; cwd = $cwd
-  model = $requestedModel; permissions = $Permissions; effort = $effort
-  jobId = $row.id; sessionId = $row.sessionId; prompt = $Prompt; settings = $settingsPath; manifest = $rosterManifest; workRecordId = $WorkRecordId
-  status = 'active'; launchedAt = (Now-Iso); retiredAt = $null; launchReason = $Reason
-}
-# fleet #359: the splice runs on the fresh roster under the lock; the $live read above only feeds the checks.
-Update-LiveRoster { param($r) $r.sessions = @($r.sessions | Where-Object { $_.name -ne $Name }) + @($entry) }
-
-# 02/03: reserve the unit before returning. The roster entry now exists, so the projection
-# derives the Work record from it immediately instead of leaving it to the next pr-watch
-# tick up to five minutes later. In that gap the Stop hook had already dropped the issue
-# (it reads the roster) while the planner had not (it reads Work records), so every legacy
-# launch manufactured a planner-includes parity difference - and, worse, left a window in
-# which the planner would offer an issue an IC was already working. A manifest launch is
-# already reserved by `assignment.js assign`, and the projection leaves that record alone.
-# Never fatal: the unit is launched either way, and the next tick still projects it.
-$projected = $false
-if ($Role -eq 'ic') {
-  try {
-    $node = Get-NodeExe
-    & $node "$PSScriptRoot\work-state.js" shadow --root $FleetHome --actor launch 2>&1 | Out-Null
-    $projected = ($LASTEXITCODE -eq 0)
-  } catch { $projected = $false }
-}
-Write-Output (@{ launched = $true; name = $Name; jobId = $row.id; sessionId = $row.sessionId; cwd = $cwd; projected = $projected; launchReason = $Reason } | ConvertTo-Json -Compress)
-exit 0

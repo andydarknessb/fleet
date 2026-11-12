@@ -25,7 +25,7 @@ Assert-True ($lastInvalidate -ge 0) 'found at least one Invalidate-Manifest call
 Assert-True ($lastInvalidate -lt $rosterWrite) "the last Invalidate-Manifest call (line $($lastInvalidate + 1)) must come before the roster row is written (line $($rosterWrite + 1)): a release after that write is refused as claimed"
 
 $start = -1
-for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^if \(-not \$row\) \{') { $start = $i; break } }
+for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*if \(-not \$row\) \{') { $start = $i; break } }
 Assert-True ($start -ge 0) 'found the no-session block (if (-not $row) {)'
 $end = -1
 for ($i = $start; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '\bexit 5\b') { $end = $i; break } }
@@ -47,6 +47,13 @@ Assert-True ($block -match 'Get-DaemonSessions') 'the no-session block re-reads 
 $keepAt = $block.IndexOf('$keepWorktree')
 $removeCallAt = $block.IndexOf('Remove-FailedAssignmentWorktree')
 Assert-True ($keepAt -ge 0 -and $keepAt -lt $removeCallAt) 'the keep decision is made before the worktree removal'
+# ticket 455: the no-session block reads the session list once by name before any release.
+$lateReadAt = $block.IndexOf('Get-DaemonSessions -Strict')
+Assert-True ($lateReadAt -ge 0 -and $lateReadAt -lt $invalidateAt) 'the no-session block reads the session list once by name before it releases the reservation (ticket 455)'
+# ticket 455: the launch-name mutex waits at most 120 s; its refusal is listed in the exit table below and releases nothing.
+Assert-True (($lines -join "`n") -match 'WaitOne\(120000\)') 'the launch-name mutex waits at most 120 s (ticket 455)'
+# ticket 455: Remove-FailedAssignmentWorktree removes only a worktree this run created.
+Assert-True (($lines -join "`n") -match 'if \(\$createdWorktree -and \$worktreePath') 'the assignment worktree is removed only when this run created it (ticket 455)'
 
 $invalidateFn = ($lines | Select-String -Pattern '^function Invalidate-Manifest' -Context 0,8 | Select-Object -First 1).Context.PostContext -join "`n"
 Assert-True ($invalidateFn -notmatch 'release[^\n]*Out-Null') 'Invalidate-Manifest must not discard the release command output'
@@ -107,6 +114,7 @@ $exitRows = @(
   @{ Anchor = 'is no longer open'; Decision = 'release' }
   @{ Anchor = 'issue #\$Issue changed after'; Decision = 'release' }
   @{ Anchor = 'criteria changed after'; Decision = 'release' }
+  @{ Anchor = 'still holds the launch lock'; Decision = 'keep' }                # ticket 455: the name mutex wait ran out before this launch wrote or released anything
   @{ Anchor = 'PAUSE set'; Decision = 'release' }
   @{ Anchor = 'refusing to launch, fail closed'; Decision = 'keep' }            # a failed daemon read cannot tell whether a session exists
   @{ Anchor = 'is already running; use claude respawn'; Decision = 'keep' }     # a live session may own this reservation
@@ -127,6 +135,7 @@ $exitRows = @(
   @{ Anchor = 'Get-ClaudeCliMissingJson'; Decision = 'release' }                 # fleet #265: the catch above releases (Release-ReservationOnRefusal) before reporting the missing CLI
   @{ Anchor = 'right before claude --bg'; Decision = 'keep' }                   # fleet#264: the marker or the record moved in the window; the reservation is already gone or not ours
   @{ Anchor = 'did not produce a session'; Decision = 'release'; Window = 30 }   # the release sits at the top of a long block
+  @{ Anchor = 'the roster write for the adopted session'; Decision = 'release' } # ticket 455: an adopted session that cannot be rostered is stopped, then released
 )
 $releasePattern = 'Invalidate-Manifest|Release-ReservationOnRefusal'
 
@@ -185,7 +194,7 @@ Assert-True ($firstUse -ge 0 -and $helperEnd -lt $firstManifestRefusal) "the rel
 
 # claude itself throwing after the worktree exists is a refusal too: release first, then remove.
 $catchAt = -1
-for ($i = 0; $i -lt $lines.Count - 6; $i++) { if ($lines[$i] -match '^\} catch \{' -and (($lines[($i + 1)..($i + 4)] -join "`n") -match 'Remove-FailedAssignmentWorktree') -and (($lines[($i + 1)..($i + 6)] -join "`n") -match '\bthrow\b')) { $catchAt = $i; break } }
+for ($i = 0; $i -lt $lines.Count - 6; $i++) { if ($lines[$i] -match '^\s*\} catch \{' -and (($lines[($i + 1)..($i + 4)] -join "`n") -match 'Remove-FailedAssignmentWorktree') -and (($lines[($i + 1)..($i + 6)] -join "`n") -match '\bthrow\b')) { $catchAt = $i; break } }
 Assert-True ($catchAt -ge 0) 'found the catch that removes the worktree and rethrows when claude itself fails'
 $catchText = ($lines[$catchAt..($catchAt + 7)]) -join "`n"
 $catchRelease = $catchText.IndexOf('Release-ReservationOnRefusal'); if ($catchRelease -lt 0) { $catchRelease = $catchText.IndexOf('Invalidate-Manifest') }

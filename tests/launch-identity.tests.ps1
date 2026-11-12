@@ -58,6 +58,7 @@ try {
   $env:FLEET_IDENTITY_DIR = "$testRoot\identity"
   $env:FLEET_NO_TOAST = '1'
   $settingsFile = "$testRoot\state\sessions\pl-test.settings.json"
+  $dryFile = "$testRoot\state\sessions\pl-test.settings.dry-run.json"   # ticket 455: where a dry run writes its settings
 
   # Case 1 (today, before #152 is run): the tenant still names the owner as the fleet and
   # no identity directory exists. The launch keeps the keyring: no GH_CONFIG_DIR, no refusal.
@@ -68,7 +69,7 @@ try {
   Set-Tenant ''
   $r1 = Run-Launch ($dispatch + '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r1.dryRun -eq $true) "pre-flip with no identity must launch as before: $lastOut"
-  $env1 = (Get-Content $settingsFile -Raw | ConvertFrom-Json).env
+  $env1 = (Get-Content $dryFile -Raw | ConvertFrom-Json).env
   Assert-True (-not $env1.PSObject.Properties['GH_CONFIG_DIR']) 'with no identity directory the session carries no GH_CONFIG_DIR'
 
   # Case 2: the directory exists before the flip: the session already acts as the fleet
@@ -76,11 +77,13 @@ try {
   Set-Identity 'fleet-bot'
   $r2 = Run-Launch ($dispatch + '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r2.dryRun -eq $true) "pre-flip with the identity present must launch: $lastOut"
-  $raw2 = Get-Content $settingsFile -Raw
+  $raw2 = Get-Content $dryFile -Raw
   $env2 = ($raw2 | ConvertFrom-Json).env
   Assert-True ($env2.GH_CONFIG_DIR -eq "$testRoot\identity") "the session must read the fleet's gh config dir: $raw2"
-  Assert-True ($env2.GIT_CONFIG_SYSTEM -eq "$testRoot\identity\gitconfig" -and (Test-Path "$testRoot\identity\gitconfig")) 'git must read the fleet system gitconfig'
-  Assert-True ((Get-Content "$testRoot\identity\gitconfig" -Raw) -match '(?m)^\s*helper =\s*$' -and (Get-Content "$testRoot\identity\gitconfig" -Raw) -match 'auth git-credential') 'git pushes must authenticate through gh, not the credential manager'
+  Assert-True ($env2.GIT_CONFIG_SYSTEM -eq "$testRoot\identity\gitconfig") 'git must read the fleet system gitconfig'
+  # ticket 455: a dry run writes nothing a live session reads. Live git reads this gitconfig through GIT_CONFIG_SYSTEM, so
+  # only the real launch (Case 5) writes it.
+  Assert-True (-not (Test-Path "$testRoot\identity\gitconfig")) 'a dry run must not write the fleet gitconfig that live sessions read (ticket 455)'
   Assert-True ($raw2 -notmatch 'ghp_launch_fixture') 'the token must never be written into state/'
   Assert-True (-not $env2.PSObject.Properties['GIT_AUTHOR_NAME'] -and -not $env2.PSObject.Properties['GIT_AUTHOR_EMAIL']) 'ADR 0015: the commit author is unchanged'
 
@@ -117,6 +120,7 @@ try {
   Set-Identity 'fleet-bot'
   $r5 = Run-Launch $dispatch
   Assert-True ($lastExit -eq 5) "the right identity must pass the gate and reach the CLI: $lastOut"
+  Assert-True ((Test-Path "$testRoot\identity\gitconfig") -and (Get-Content "$testRoot\identity\gitconfig" -Raw) -match '(?m)^\s*helper =\s*$' -and (Get-Content "$testRoot\identity\gitconfig" -Raw) -match 'auth git-credential') 'git pushes must authenticate through gh, not the credential manager (the real launch writes the gitconfig)'
   Assert-True (((Get-Content $settingsFile -Raw | ConvertFrom-Json).env.GH_CONFIG_DIR) -eq "$testRoot\identity") 'the launched session must carry GH_CONFIG_DIR'
   Assert-True (-not (Test-Path "$testRoot\state\identity\paged.json")) 'a clean plan clears the page marker so the next failure pages again'
 
