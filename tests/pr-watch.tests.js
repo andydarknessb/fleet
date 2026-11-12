@@ -1480,6 +1480,40 @@ test('#406: the same hold stays while issue 20 is open, and issue 10 is not read
   assert.deepEqual(selectFrontier({ issues: [HELD_10], readyLabel: 'ready-for-agent', exclusions: exclusions.activeExclusions({ root, tenant: 'endzone' }), tenant: 'endzone' }).excluded[0].reasons.map((r) => r.code), ['frontier-exclusion']);
 });
 
+// fleet #450: a lift-only Frontier exclusion (its recheck is the owner's lift, exclusion-lifted) is released by its issue closing, with the close as evidence.
+function liftOnly(root, issue, owner = 'pl-endzone') {
+  return exclusions.addExclusion({ root, tenant: 'endzone', issue, reason: `waits on a lift for #${issue}`, evidence: 'lead note', owner, actor: owner, recheck: { event: { type: 'exclusion-lifted' } } });
+}
+
+test('#450: a lift-only Frontier exclusion on a closed issue is lifted with the close as evidence, and one on an open issue is left alone', () => {
+  const root = rootDir();
+  liftOnly(root, 10);
+  liftOnly(root, 11);
+  const f = { ...fetchers({ open: [] }), issueState: (n) => (n === 10 ? 'CLOSED' : 'OPEN') };
+  const health = watch(root, f);
+  assert.equal(health.failures, 0);
+  assert.match(health.actions.join(' '), /endzone:excl-10-1: lifted, issue #10 closed/);
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [11]);
+  const lift = exclusionRows(root).find((r) => r.kind === 'exclusion-lifted');
+  assert.equal(lift.id, 'endzone:excl-10-1');
+  assert.equal(lift.evidence, 'issue #10 is CLOSED (gh issue view)');
+});
+
+test('#450: the first tick after the deploy lifts every standing lift-only exclusion on a closed issue, reading each issue once, and a later tick reads only the open one', () => {
+  const root = rootDir();
+  for (const issue of [10, 11, 12, 13]) liftOnly(root, issue, issue % 2 ? 'pl-endzone' : 'cory');
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 14, reason: 'waits on #20 closing', evidence: 'e', owner: 'fleet', actor: 'pr-watch', recheck: { event: { type: 'issue-closed', issue: 14 } } });
+  const closed = new Set([10, 12, 13, 14]);
+  const asked = [];
+  const f = { ...fetchers({ open: [] }), issueState: (n) => { asked.push(n); return closed.has(n) ? 'CLOSED' : 'OPEN'; } };
+  watch(root, f);
+  assert.deepEqual(asked.sort((a, b) => a - b), [10, 11, 12, 13, 14], 'one read per standing issue');
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [11]);
+  asked.length = 0;
+  watch(root, f);
+  assert.deepEqual(asked, [11], 'the open one is still read, and nothing else');
+});
+
 // --- fleet #390: the watcher merges a Reconcile PR (the tenant's main into its integration branch) as a
 // merge commit when GitHub reports no conflicts and every ciGates check is green. Its Review gate passes
 // through the standing exception in config/review-exceptions.json. Every GitHub call goes through a stubbed

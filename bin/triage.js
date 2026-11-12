@@ -15,7 +15,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { WorkStateError, parseArgs } = require('./work-state');
+const { WorkStateError, parseArgs, appendLedgerRow } = require('./work-state');
 const { sha256, VETO_RE } = require('./assignment');
 const { readPremises } = require('./premises');
 
@@ -175,9 +175,7 @@ function readLedger(root, tenant) {
 }
 
 function appendEntry(root, tenant, entry) {
-  const file = ledgerPath(root, tenant);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+  appendLedgerRow(ledgerPath(root, tenant), JSON.stringify(entry));
   return entry;
 }
 
@@ -582,13 +580,18 @@ function readFixtureIssues(file) {
 
 // --------------------------------------------------------------- outbox ----
 
+// fleet #450: a corrupt line is an error, not a dropped Wake; a torn final line is an unfinished append.
 function readOutbox(file) {
   if (!fs.existsSync(file)) return [];
-  const raw = fs.readFileSync(file, 'utf8');
+  const text = fs.readFileSync(file, 'utf8');
   const records = [];
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try { records.push(JSON.parse(line)); } catch { /* a torn line is not a wake */ }
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!lines[index].trim()) continue;
+    try { records.push(JSON.parse(lines[index])); } catch {
+      if (index === lines.length - 1 && !text.endsWith('\n')) break;
+      throw new WorkStateError('CORRUPT_WAKE_OUTBOX', `invalid wake JSON in ${file} at line ${index + 1}`);
+    }
   }
   return records;
 }
@@ -614,8 +617,9 @@ function proposalOpenUnder(root, tenant, entry, now, { restatementsOnly = false 
 }
 
 // fleet #366: the issues under a lead's exclusion, for the Arbiter's escalation flag (not a hold).
+// fleet #450: a corrupt ledger throws; it never reads as nothing excluded.
 function leadHeldIssues(root, tenant, now) {
-  try { return new Set(require('./exclusions').activeExclusions({ root, tenant, now }).filter((entry) => entry.owner === `pl-${tenant}`).map((entry) => Number(entry.issue))); } catch { return new Set(); }
+  return new Set(require('./exclusions').activeExclusions({ root, tenant, now }).filter((entry) => entry.owner === `pl-${tenant}`).map((entry) => Number(entry.issue)));
 }
 
 function readHeldIssues(root, tenant, now, { restatementsOnly = false } = {}) {
@@ -624,12 +628,11 @@ function readHeldIssues(root, tenant, now, { restatementsOnly = false } = {}) {
     const skip = readJsonFile(path.join(baseOf(root), 'state', 'skip', `${tenant}.json`), null);
     if (skip && skip.issues) for (const [number, reason] of Object.entries(skip.issues)) held.set(Number(number), `skip file: ${reason}`);
   } catch { /* an unreadable skip file holds nothing; exclusions below are the structured record */ }
-  try {
-    const { activeExclusions } = require('./exclusions');
-    for (const entry of activeExclusions({ root, tenant, now }) || []) {
-      if (!proposalOpenUnder(root, tenant, entry, now, { restatementsOnly })) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
-    }
-  } catch { /* no exclusions ledger or module: nothing held there */ }
+  // fleet #450: no catch here; a missing ledger reads as empty, any other error fails the frontier.
+  const { activeExclusions } = require('./exclusions');
+  for (const entry of activeExclusions({ root, tenant, now }) || []) {
+    if (!proposalOpenUnder(root, tenant, entry, now, { restatementsOnly })) held.set(Number(entry.issue), `frontier exclusion ${entry.id}`);
+  }
   return held;
 }
 

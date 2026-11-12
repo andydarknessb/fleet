@@ -179,6 +179,40 @@ test('decision-needed wakes are escalations only when newer than the consumed ma
   assert.deepEqual(result.proposeNow, [1], 'escalations do not spend the proposal cap');
 });
 
+// fleet #450: a corrupt wake outbox line is an error, not a dropped Wake; a torn final line is an unfinished append, not a wake.
+test('#450: a corrupt wake outbox line fails the frontier naming the outbox, and a torn final line is read as no wake', () => {
+  const root = rootDir();
+  const outboxFile = path.join(root, 'state', 'watch', 'wake-outbox.jsonl');
+  const wake = `${JSON.stringify({ at: '2026-09-06T00:00:00.000Z', recordId: 'endzone:issue-602', wake: 'decision-needed', evidence: 'first' })}\n`;
+  fs.writeFileSync(outboxFile, `${wake}not json\n${wake}`);
+  const fixture = writeFixture(root, [issue(1)]);
+  assert.throws(() => computeFrontier({ root, tenant: 'endzone', fixture, now: NOW }), (error) => error.code === 'CORRUPT_WAKE_OUTBOX' && error.message.includes(outboxFile));
+  fs.writeFileSync(outboxFile, `${wake}{"at":"2026-09-07`);
+  assert.doesNotThrow(() => computeFrontier({ root, tenant: 'endzone', fixture, now: NOW }));
+});
+
+// fleet #450: an append after a torn tail reads back whole, with the new row in it (the same two cases as the exclusion ledger).
+test('#450: an append after a torn triage fragment reads back whole: the fragment is cut and the new row is the last line', () => {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-05T00:00:00.000Z', now: '2026-09-05T00:00:01.000Z' });
+  const file = triage.ledgerPath(root, 'endzone');
+  fs.appendFileSync(file, '{"schemaVersion":1,"tenant":"endzone","kind":"con');
+  assert.equal(readLedger(root, 'endzone').length, 1, 'the torn tail is skipped by the reader');
+  recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-06T00:00:00.000Z', now: '2026-09-06T00:00:01.000Z' });
+  assert.deepEqual(readLedger(root, 'endzone').map((entry) => entry.through), ['2026-09-05T00:00:00.000Z', '2026-09-06T00:00:00.000Z']);
+  assert.equal(fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length, 2, 'the fragment is cut, not kept');
+});
+
+test('#450: an append after a whole triage row that lost only its newline keeps the row and starts the new one on its own line', () => {
+  const root = rootDir();
+  recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-05T00:00:00.000Z', now: '2026-09-05T00:00:01.000Z' });
+  const file = triage.ledgerPath(root, 'endzone');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/\n$/, ''));
+  assert.deepEqual(readLedger(root, 'endzone').map((entry) => entry.through), ['2026-09-05T00:00:00.000Z'], 'the unterminated row reads as whole');
+  recordEntry({ root, tenant: 'endzone', kind: 'consumed', through: '2026-09-06T00:00:00.000Z', now: '2026-09-06T00:00:01.000Z' });
+  assert.deepEqual(readLedger(root, 'endzone').map((entry) => entry.through), ['2026-09-05T00:00:00.000Z', '2026-09-06T00:00:00.000Z']);
+});
+
 test('the ledger is typed: proposals need hash, comment and model; outcomes need a proposal and are recorded once; finalizing needs an approval', () => {
   const root = rootDir();
   assert.throws(() => recordEntry({ root, tenant: 'endzone', kind: 'ruled', issue: 1 }), { code: 'TRIAGE_INVALID' });
@@ -249,6 +283,22 @@ test('the frontier reads the skip file and active exclusions as held', () => {
   const result = computeFrontier({ root, tenant: 'endzone', fixture: writeFixture(root, [issue(1), issue(2)]), now: NOW });
   assert.deepEqual(result.eligible.map((entry) => entry.number), [1]);
   assert.match(result.skipped.find((entry) => entry.number === 2).reason, /skip file/);
+});
+
+// fleet #450: a corrupt Frontier exclusion ledger fails the frontier and serves no ticket; it is never read as nothing excluded.
+test('#450: a corrupt exclusion ledger fails the triage frontier, naming the ledger, and serves no ticket', () => {
+  const root = rootDir();
+  require('../bin/exclusions').addExclusion({ root, tenant: 'endzone', issue: 2, reason: 'parked', evidence: 'lead note', owner: 'cory', actor: 'test', recheck: { expiresAt: '2099-01-01T00:00:00.000Z' } });
+  const ledger = path.join(root, 'state', 'exclusions', 'endzone.jsonl');
+  fs.writeFileSync(ledger, `not json\n${fs.readFileSync(ledger, 'utf8')}`);
+  const fixture = writeFixture(root, [issue(1), issue(2)]);
+  assert.throws(() => computeFrontier({ root, tenant: 'endzone', fixture, now: NOW }), (error) => error.code === 'CORRUPT_EXCLUSION_LEDGER' && error.message.includes(ledger));
+  const bin = path.join(__dirname, '..', 'bin', 'triage.js');
+  let run;
+  try { run = { status: 0, stdout: execFileSync(process.execPath, [bin, 'frontier', '--root', root, '--tenant', 'endzone', '--fixture', fixture, '--now', NOW], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }; } catch (error) { run = { status: error.status, stdout: String(error.stdout || ''), stderr: String(error.stderr || '') }; }
+  assert.equal(run.status, 1);
+  assert.equal(run.stdout, '', 'no frontier is printed');
+  assert.ok(JSON.parse(run.stderr).message.includes(ledger), run.stderr);
 });
 
 test('the CLI refuses an unknown flag with exit 2 and a missing tenant as usage; a GitHub failure exits 1 with its code', () => {

@@ -134,6 +134,29 @@ test('a torn trailing line does not block the frontier; a corrupt interior line 
   assert.throws(() => readExclusions(root, 'endzone'), { code: 'CORRUPT_EXCLUSION_LEDGER' });
 });
 
+// fleet #450: a crash mid-append leaves a torn tail; the next append must not glue its row onto it.
+test('#450: an append after a torn fragment reads back whole: the fragment is cut and the new row is the last line', () => {
+  const root = rootDir();
+  addExclusion({ root, tenant: 'endzone', ...BASE, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  const file = path.join(root, 'state', 'exclusions', 'endzone.jsonl');
+  fs.appendFileSync(file, '{"schemaVersion":1,"kind":"exclusion-added","id":"endz');
+  addExclusion({ root, tenant: 'endzone', ...BASE, issue: 126, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  assert.deepEqual(readExclusions(root, 'endzone').map((entry) => entry.issue), [125, 126]);
+  assert.deepEqual(activeExclusions({ root, tenant: 'endzone' }).map((entry) => entry.issue), [125, 126]);
+  assert.equal(fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length, 2, 'the fragment is cut, not kept');
+});
+
+test('#450: an append after a whole row that lost only its newline keeps the row and starts the new one on its own line', () => {
+  const root = rootDir();
+  addExclusion({ root, tenant: 'endzone', ...BASE, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  const file = path.join(root, 'state', 'exclusions', 'endzone.jsonl');
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/\n$/, ''));
+  assert.deepEqual(readExclusions(root, 'endzone').map((entry) => entry.issue), [125], 'the unterminated row reads as whole');
+  addExclusion({ root, tenant: 'endzone', ...BASE, issue: 126, recheck: { expiresAt: '2027-01-01T00:00:00.000Z' } });
+  assert.deepEqual(readExclusions(root, 'endzone').map((entry) => entry.issue), [125, 126]);
+  assert.deepEqual(activeExclusions({ root, tenant: 'endzone' }).map((entry) => entry.issue), [125, 126]);
+});
+
 // --- fleet#4: exclusions.js fails closed on a typo'd flag ------------------
 // Before this, `parseArgs` in this binary accepted any `--flag`: a typo
 // (`--reasno`, `--evidnce`, `--tenat`) landed in a bucket nothing read and the

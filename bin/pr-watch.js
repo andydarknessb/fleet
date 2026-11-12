@@ -741,10 +741,11 @@ function recordMergedRefsExclusion({ root, tenantName, actor, exclusion, health 
 // #203: the issue closing releases the exclusion. GitHub owns that event, so each tick
 // reads the issue of every standing issue-closed exclusion of this tenant and lifts it
 // once CLOSED. An unreadable issue is retained, never read as closed.
+// fleet #450: lift-only exclusions (exclusion-lifted) are released the same way, standing ones included.
 function releaseClosedIssueExclusions({ root, tenantName, fetchers, actor, dryRun, health }) {
   let standing;
   try {
-    standing = exclusions.activeExclusions({ root, tenant: tenantName }).filter((entry) => entry.recheck?.event?.type === 'issue-closed');
+    standing = exclusions.activeExclusions({ root, tenant: tenantName }).filter((entry) => exclusions.LIFT_ONLY_RECHECK_EVENTS.includes(entry.recheck?.event?.type));
   } catch (error) {
     health.failures += 1;
     health.actions.push(`${tenantName}: exclusion ledger unreadable, releases skipped (${String(error.message || error).slice(0, 120)})`);

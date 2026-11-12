@@ -353,6 +353,22 @@ function checkEventSlot(p, event) {
   });
 }
 
+// fleet #450: a crash mid-append leaves a tail; a whole row keeps its line (newline added), a fragment is cut so the new row does not glue onto it.
+function appendLedgerRow(file, row) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (fs.existsSync(file)) {
+    const bytes = fs.readFileSync(file);
+    if (bytes.length && bytes[bytes.length - 1] !== 0x0a) {
+      const start = bytes.lastIndexOf(0x0a) + 1;
+      let whole = true;
+      try { JSON.parse(bytes.subarray(start).toString('utf8').replace(/^﻿/, '')); } catch { whole = false; }
+      if (whole) fs.appendFileSync(file, '\n', 'utf8');
+      else fs.truncateSync(file, start);
+    }
+  }
+  fs.appendFileSync(file, `${row}\n`, 'utf8');
+}
+
 function appendEvent(p, event) {
   if (checkEventSlot(p, event)) return;
   fs.mkdirSync(path.dirname(eventFile(p, event.at)), { recursive: true });
@@ -1836,6 +1852,7 @@ module.exports = {
   WorkStateError,
   abandonRecord,
   appendEvent,
+  appendLedgerRow,
   commitMutation,
   paths,
   appendWakeOutbox,
