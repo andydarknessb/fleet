@@ -1148,7 +1148,7 @@ try {
     $dormantNow = @()
     $dormSnap = $null; try { $dormSnap = Read-Json "$FleetHome\state\watchdog\dormancy.json" } catch {}
     if ($dormSnap -and $dormSnap.PSObject.Properties['tenants']) { $dormantNow = @($dormSnap.tenants.PSObject.Properties | Where-Object { $_.Value.dormant -eq $true } | ForEach-Object { $_.Name }) }
-    foreach ($pfName in @($plannerFailed.PSObject.Properties.Name)) {
+    foreach ($pfName in @($plannerFailed.PSObject.Properties | ForEach-Object { $_.Name })) {   # .Name on an empty collection is one $null in PS 5.1
       if ((-not (Test-Path "$FleetHome\tenants\$pfName.json")) -or ($dormantNow -contains $pfName) -or $wakeOff -or ($wakeSources -notcontains 'frontier')) {
         $plannerFailed.PSObject.Properties.Remove($pfName); $plannerFailedChanged = $true
       }
