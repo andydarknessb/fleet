@@ -705,17 +705,26 @@ function repostReviewStatus(options = {}) {
 // exactly as a formal record does. The head must be the PR's current head: an
 // attestation of a head the PR has moved past would stamp a tree nobody read.
 
-// #446: the newest attestation of one PR at one head, the prior a further attestation of that head accounts for.
-function latestAttestAt(root, recordId, headSha) {
-  const directory = reviewsDir(root, recordId);
-  if (!fs.existsSync(directory)) return null;
-  const names = fs.readdirSync(directory).filter((name) => /^attest-\d{3}\.json$/.test(name)).sort().reverse();
-  for (const name of names) {
-    const relative = path.posix.join('state', 'reviews', safeRecordName(recordId), name);
-    const data = readArtifact(root, relative);
-    if (data && data.headSha === headSha) return { data, path: relative };
+// #446 (#445 review): the newest attestation at one head across the tenant's pull requests, the prior a further
+// attestation of that head accounts for. The status is per sha, so the same sha under another PR number is the same
+// review; newest is by the artifact's `at`, ties by its path.
+function latestAttestAt(root, tenantName, headSha) {
+  const reviews = path.join(path.resolve(root || DEFAULT_ROOT), 'state', 'reviews');
+  if (!fs.existsSync(reviews)) return null;
+  const prefix = `${safeRecordName(tenantName)}_pr-`;
+  let newest = null;
+  for (const directory of fs.readdirSync(reviews)) {
+    if (!directory.startsWith(prefix)) continue;
+    for (const name of fs.readdirSync(path.join(reviews, directory))) {
+      if (!/^attest-\d{3}\.json$/.test(name)) continue;
+      const relative = path.posix.join('state', 'reviews', directory, name);
+      const data = readArtifact(root, relative);
+      if (!data || data.tenant !== tenantName || data.headSha !== headSha) continue;
+      const key = `${data.at || ''}\u0000${relative}`;
+      if (!newest || key > newest.key) newest = { key, data, path: relative };
+    }
   }
-  return null;
+  return newest && { data: newest.data, path: newest.path };
 }
 
 function readAttestArtifact(file) {
@@ -781,7 +790,7 @@ function attestPullRequest(options = {}) {
   // #446: the earlier attestation of this head is the prior: each of its open findings needs a resolution, as a linked
   // formal review's do, and the ones still open ride in this attestation. A statement cannot sit beside them.
   const recordId = `${tenantName}:pr-${prNumber}`;
-  const earlier = latestAttestAt(root, recordId, headSha);
+  const earlier = latestAttestAt(root, tenantName, headSha);
   const priors = earlier ? [{ data: earlier.data, path: earlier.path }] : [];
   const resolutions = options.resolutions || null;
   const ruling = checkRuling(resolutions, options.ruling);
@@ -1083,7 +1092,9 @@ function recordReviewArtifact(options = {}) {
       let priorArtifactMissing = false;
       let range = kind === 'risk' && reviewedSha !== String(headSha) ? `${reviewedSha}..${headSha}` : null;
       const resolutions = options.resolutions || null;
-      const sameHeadPassUnderFlag = dedupOff && prior && prior.headSha === String(headSha) && !options.priorArtifact;
+      // A same-head pass under the flag: a formal one that does not link its prior, or any risk one (#446 review: a risk
+      // record's --prior-artifact is no formal link, and must not skip the accounting).
+      const sameHeadPassUnderFlag = dedupOff && prior && prior.headSha === String(headSha) && (kind === 'risk' || !options.priorArtifact);
       // Every artifact whose open findings this review must account for: the
       // linked formal prior, and (fleet#43) the risk artifact the formal
       // review consumes. Each open finding needs a resolution; still-open ones

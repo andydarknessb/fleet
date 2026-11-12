@@ -912,6 +912,28 @@ test('#446: under review-dedup-off a risk review that replaces one at the same h
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).priorArtifact, carried.artifact);
 });
 
+test('#446 review: under review-dedup-off a risk record with --prior-artifact still accounts for the open blocker it replaces', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const classification = { tier: 'high-risk', triggers: [{ class: 'concurrency', matches: [{ pattern: 'FOR UPDATE', file: 'server/x.js', line: 'FOR UPDATE' }] }] };
+  const first = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision,
+    kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification,
+    findings: [{ file: 'server/x.js', claim: 'lock order', severity: 'blocker', category: 'correctness' }], now: '2026-09-10T19:00:00.000Z',
+  });
+  fs.mkdirSync(path.join(root, 'state', 'flags'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'flags', 'review-dedup-off'), 'x');
+  assert.throws(
+    () => recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: first.result.revision,
+      kind: 'risk', headSha: sha40('ddd4444'), actor: 'ic-42', classification,
+      findings: [], noFindings: 'fixed', priorArtifact: 'anything', idempotencyKey: 'risk-linked-replace', now: '2026-09-10T19:01:00.000Z',
+    }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('risk-001-f1'),
+  );
+  assert.deepEqual(fs.readdirSync(path.join(root, 'state', 'reviews', 'endzone_issue-42')), ['risk-001.json'], 'the refused replacement keeps no copy');
+});
+
 test('state/flags/review-dedup-off records a second formal review at the same head instead of refusing it', () => {
   const root = rootDir();
   const revision = seedRecord(root);
@@ -2697,6 +2719,21 @@ test('#446: an earlier attestation with nothing open does not hold a second one 
   const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
   const offline = spawnSync(process.execPath, [bin, 'attest', '--root', root, '--tenant', 'endzone', '--pr', '1601', '--head', head, '--artifact', artifact({ noFindings: 'clean' }), '--resolutions', '{"attest-003-f1":"ruled"}', '--ruling', 'https://example.invalid/ruling/1'], { encoding: 'utf8', windowsHide: true, env: { ...process.env, FLEET_GH: process.execPath } });
   assert.equal(JSON.parse(offline.stderr).code, 'PR_HEAD_UNREADABLE', offline.stderr);
+});
+
+test('#446 review: a second attestation of the same sha under another pull request number is held to the first: the newest at that head across the tenant', () => {
+  const { root, head, gh, artifact } = attestFixture();
+  const attest = (prNumber, content, extra = {}) => attestPullRequest({ root, tenantName: 'endzone', prNumber, headSha: head, artifactPath: artifact(content), actor: 'cory', gh, ...extra });
+  const blocked = attest(7, { findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'correctness' }] }, { now: '2026-11-12T10:00:00.000Z' });
+  assert.equal(blocked.status.state, 'failure');
+  assert.throws(
+    () => attest(8, { noFindings: 'clean on PR 8' }, { now: '2026-11-12T10:05:00.000Z' }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('attest-001-f1'),
+  );
+  assert.equal(fs.existsSync(path.join(root, 'state', 'reviews', 'endzone_pr-8')), false, 'the refused attestation keeps no copy under PR 8');
+  const settled = attest(8, { noFindings: 'the blocker is fixed at this head' }, { resolutions: { 'attest-001-f1': 'resolved' }, now: '2026-11-12T10:06:00.000Z' });
+  assert.equal(settled.status.state, 'success', 'the open blocker is settled, so the status follows the new artifact');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).priorArtifact, blocked.artifact);
 });
 
 test('#116: the binary attests, refuses unknown flags as USAGE, and exits 3 when the post fails', () => {

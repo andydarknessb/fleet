@@ -81,6 +81,15 @@ needs a resolution, as a linked formal review's prior does, and a still-open
 one is carried into the new artifact. Without the flag a second risk review at
 a head is refused `ALREADY_REVIEWED`, as before.
 
+**Amended 2026-11-12 (fleet #446).** An attestation (`review-policy.js attest`)
+takes the same rule at a head. A further attestation of a head needs a
+resolution for each open finding of the newest attestation at that head, and
+that newest one is looked up across the tenant's pull requests, not per pull
+request: the GitHub status is per sha, so the same sha under another PR number
+is the same review. A still-open finding is carried into the new copy, and a
+statement cannot sit beside a carried finding. With nothing open, the next
+attestation of a head is its own copy, as before.
+
 A replay says what it did not write: the result carries `ignored:
 {findings, resolutions}` when the caller supplied either, and the CLI prints
 that on stderr while still exiting 0, so a formatted summary cannot present a
