@@ -1000,7 +1000,9 @@ test('observe replays on its idempotency key and refuses a stale revision', () =
   }), /expected revision/);
 });
 
-test('the end-of-run shadow projection archives a record only after its merge was recorded', () => {
+// #448: the projection retires a record it created only from implementing, so a record the watcher
+// advanced to pr-open stays for the lead to judge. Its PR is still recorded before the projection runs.
+test('the end-of-run shadow projection keeps a record it created once past implementing, after recording its PR', () => {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'state'), { recursive: true });
   const rosterPath = path.join(root, 'state', 'roster.json');
@@ -1009,18 +1011,16 @@ test('the end-of-run shadow projection archives a record only after its merge wa
   const projected = Object.values(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records);
   assert.equal(projected.length, 1);
   const id = projected[0].id;
-  // The IC retires: its roster row is gone, but the PR merged and must be recorded first.
+  // The IC retires: its roster row is gone while the PR is open.
   fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [] }), 'utf8');
   const f = fetchers({ open: [pr({ number: 91, headRefName: 'fleet/42-slug' })] });
   watch(root, f, { shadow: true });
-  // The projection runs LAST: the record advanced (and recorded PR #91) before the
-  // roster-dropped retirement archived it - the in-flight work was not lost unseen.
   const rec = workState.getRecord({ root, id });
   assert.equal(rec.github.prNumber, 91);
+  assert.equal(rec.state, 'pr-open');
   const evs = events(root).filter((e) => e.recordId === id).map((e) => e.type);
   assert.ok(evs.indexOf('state-pr-open') >= 0, 'the advance must be recorded');
-  assert.ok(evs.indexOf('shadow-retired') >= 0, 'the roster-dropped record is archived');
-  assert.ok(evs.indexOf('state-pr-open') < evs.indexOf('shadow-retired'), 'the advance must precede the archive');
+  assert.equal(evs.indexOf('shadow-retired'), -1, 'an advanced record is the lead\'s to judge, not archived by the projection');
 });
 
 // Ticket 09: the ticket-05 lower bound (no merge without a recorded formal review) cannot
@@ -1202,6 +1202,44 @@ test('one tenant\'s failure does not blind the watcher to the others', () => {
   assert.equal(result.ok, false);
   assert.match(result.tenants['aaa-broken'].error, /JSON/);
   assert.equal(result.tenants.endzone.records, 1, 'endzone is still watched after the broken tenant');
+});
+
+// fleet #449: an unreadable or unparseable Work records file fails the tick instead of reading as no records; a
+// missing one still means no records. The scheduled tick (no --tenant) records each tenant as failed in health.json.
+test('#449: an unparseable Work records file fails a --tenant tick with exit 1 and leaves the file as it was', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-64', issue: 64, state: 'ci-wait', prNumber: 164 });
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', branchPrefix: 'fleet/', ciGates: [] }));
+  const activePath = path.join(root, 'state', 'work', 'active.json');
+  fs.writeFileSync(activePath, '{ "schemaVersion": 1, "records": {');
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'pr-watch.js'), '--root', root, '--tenant', 'endzone', '--gh', 'no-such-gh-binary', '--no-notifier', 'true'], { encoding: 'utf8' });
+  assert.equal(run.status, 1, `a tick that cannot read its Work records must exit 1: ${run.stdout}`);
+  assert.ok(JSON.parse(run.stderr.trim()).error, run.stderr);
+  assert.equal(fs.readFileSync(activePath, 'utf8'), '{ "schemaVersion": 1, "records": {', 'the unreadable file is not rewritten');
+});
+
+test('#449: an unparseable Work records file fails every tenant of the scheduled tick, and health.json counts it', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = twoTenantRoot();
+  fs.writeFileSync(path.join(root, 'state', 'work', 'active.json'), '{ "records": {');
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'pr-watch.js'), '--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true'], { encoding: 'utf8' });
+  assert.equal(run.status, 1, run.stderr);
+  const health = JSON.parse(fs.readFileSync(path.join(root, 'state', 'watch', 'health.json'), 'utf8'));
+  assert.equal(health.ok, false);
+  assert.equal(health.consecutiveFailures, 1, 'the failing-watcher Page counts failed ticks from here');
+  assert.equal(health.tenants.endzone.ok, false);
+  assert.equal(health.tenants.nidus.ok, false);
+});
+
+test('#449: a missing Work records file still means no records: the tick is healthy and watches nothing', () => {
+  const root = twoTenantRoot();
+  fs.rmSync(path.join(root, 'state', 'work', 'active.json'));
+  const result = cli(['--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true']);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.tenants.endzone.records, 0);
+  assert.equal(result.tenants.nidus.records, 0);
 });
 
 // fleet #136: the watchdog samples health.json every 15 min but the watcher ticks every 5,
@@ -1478,6 +1516,53 @@ test('#406: the same hold stays while issue 20 is open, and issue 10 is not read
   assert.deepEqual(asked, [20]);
   assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [10]);
   assert.deepEqual(selectFrontier({ issues: [HELD_10], readyLabel: 'ready-for-agent', exclusions: exclusions.activeExclusions({ root, tenant: 'endzone' }), tenant: 'endzone' }).excluded[0].reasons.map((r) => r.code), ['frontier-exclusion']);
+});
+
+// fleet #450: a lift-only Frontier exclusion (its recheck is the owner's lift, exclusion-lifted) is released by its issue closing, with the close as evidence.
+function liftOnly(root, issue, owner = 'pl-endzone') {
+  return exclusions.addExclusion({ root, tenant: 'endzone', issue, reason: `waits on a lift for #${issue}`, evidence: 'lead note', owner, actor: owner, recheck: { event: { type: 'exclusion-lifted' } } });
+}
+
+test('#450: a lift-only Frontier exclusion on a closed issue is lifted with the close as evidence, and one on an open issue is left alone', () => {
+  const root = rootDir();
+  liftOnly(root, 10);
+  liftOnly(root, 11);
+  const f = { ...fetchers({ open: [] }), issueState: (n) => (n === 10 ? 'CLOSED' : 'OPEN') };
+  const health = watch(root, f);
+  assert.equal(health.failures, 0);
+  assert.match(health.actions.join(' '), /endzone:excl-10-1: lifted, issue #10 closed/);
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [11]);
+  const lift = exclusionRows(root).find((r) => r.kind === 'exclusion-lifted');
+  assert.equal(lift.id, 'endzone:excl-10-1');
+  assert.equal(lift.evidence, 'issue #10 is CLOSED (gh issue view)');
+});
+
+test('#450: the first tick after the deploy lifts every standing lift-only exclusion on a closed issue, reading each issue once, and a later tick reads only the open one', () => {
+  const root = rootDir();
+  for (const issue of [10, 11, 12, 13]) liftOnly(root, issue, issue % 2 ? 'pl-endzone' : 'cory');
+  exclusions.addExclusion({ root, tenant: 'endzone', issue: 14, reason: 'waits on #20 closing', evidence: 'e', owner: 'fleet', actor: 'pr-watch', recheck: { event: { type: 'issue-closed', issue: 14 } } });
+  const closed = new Set([10, 12, 13, 14]);
+  const asked = [];
+  const f = { ...fetchers({ open: [] }), issueState: (n) => { asked.push(n); return closed.has(n) ? 'CLOSED' : 'OPEN'; } };
+  watch(root, f);
+  assert.deepEqual(asked.sort((a, b) => a - b), [10, 11, 12, 13, 14], 'one read per standing issue');
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [11]);
+  asked.length = 0;
+  watch(root, f);
+  assert.deepEqual(asked, [11], 'the open one is still read, and nothing else');
+});
+
+test('#450: a lift-only Frontier exclusion whose issue does not resolve or whose view fails is left standing; only a closed issue lifts it', () => {
+  const root = rootDir();
+  liftOnly(root, 10);
+  liftOnly(root, 11);
+  const f = { ...fetchers({ open: [] }), issueState: (n) => { if (n === 10) throw new Error('GraphQL: Could not resolve to an issue or pull request with the number of 10. (repository.issue)'); throw new Error('boom: issue view down'); } };
+  const health = watch(root, f);
+  assert.equal(health.failures, 0, 'a read that does not close the issue is not a failed tick');
+  assert.match(health.actions.join(' '), /endzone:excl-10-1: issue view failed, retained/);
+  assert.match(health.actions.join(' '), /endzone:excl-11-1: issue view failed, retained/);
+  assert.deepEqual(exclusions.activeExclusions({ root, tenant: 'endzone' }).map((e) => e.issue), [10, 11]);
+  assert.equal(exclusionRows(root).some((r) => r.kind === 'exclusion-lifted'), false);
 });
 
 // --- fleet #390: the watcher merges a Reconcile PR (the tenant's main into its integration branch) as a

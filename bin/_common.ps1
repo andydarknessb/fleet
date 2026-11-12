@@ -2,7 +2,35 @@
 $script:FleetHome = Split-Path -Parent $PSScriptRoot
 $script:Utf8 = New-Object System.Text.UTF8Encoding $false
 function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null } }
-function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
+# fleet #449: MoveFile with overwrite is one rename for a reader, where File.Replace left a missing or exclusively held moment.
+# A held target refuses it for a moment (UnauthorizedAccessException): retried up to 2 s; a read-only target throws at once.
+# Microsoft.VisualBasic loads on first use (about 50 ms), so a process that only reads JSON pays nothing.
+function Write-Json {
+  param($Path, $Obj)
+  if (-not ('Microsoft.VisualBasic.FileIO.FileSystem' -as [type])) { Add-Type -AssemblyName Microsoft.VisualBasic }
+  $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+  try {
+    [IO.File]::WriteAllText($temporary, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8)
+    $giveUpAt = (Get-Date).AddSeconds(2)
+    while ($true) {
+      try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::MoveFile($temporary, $Path, $true)
+        return
+      } catch {
+        # A held and a read-only target are both 0x80070005, so the read-only attribute decides; a directory target is 0x80131620.
+        $cause = $_.Exception
+        if ($cause.InnerException) { $cause = $cause.InnerException }
+        $readOnly = [IO.File]::Exists($Path) -and (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReadOnly) -ne 0)
+        $held = ($cause -is [UnauthorizedAccessException]) -and -not $readOnly
+        if (-not $held -or (Get-Date) -ge $giveUpAt) { throw }
+        Start-Sleep -Milliseconds 25
+      }
+    }
+  } catch {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
 function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
 # WS5 cutover (fleet #82, spec #194): while this flag stands the dispatcher is retired;

@@ -520,15 +520,15 @@ test('a merge-review record that has already retired still records through the d
   assert.equal(send.calls.length, 1);
 });
 
-test('fleet#99: a merged record later escalated and abandoned is skipped, not refused on every sweep', () => {
+// #448: an escalation keeps the state it came from, and a merged record's escalation cannot be abandoned,
+// so no abandoned merge-review record reaches the sweep any more (the fleet#99 case this used to test).
+test('fleet#99 and #448: a merged record that was escalated cannot be abandoned', () => {
   const root = rootDir();
   const merged = seedMerged(root, { issue: 65, prNumber: 165 });
   const escalated = workState.transitionRecord({ root, id: merged.id, to: 'escalated', expectedRevision: merged.revision, idempotencyKey: 'esc-65', actor: 'test', evidence: 'retirement blocked', now: at() });
-  workState.abandonRecord({ root, id: merged.id, expectedRevision: escalated.revision, idempotencyKey: 'abandon-65', actor: 'cory', reason: 'gone', now: at() });
-  assert.deepEqual(findPendingMergedWithoutReview({ root, now: at() }), []);
-  const send = sender();
-  assert.deepEqual(runNotifier({ root, live: true, send, now: at() }).handled.filter((h) => h.recordId === merged.id), []);
-  assert.equal(send.calls.length, 0);
+  assert.throws(() => workState.abandonRecord({ root, id: merged.id, expectedRevision: escalated.revision, idempotencyKey: 'abandon-65', actor: 'cory', reason: 'gone', now: at() }),
+    (error) => error.code === 'INVALID_ABANDON');
+  assert.equal(workState.getRecord({ root, id: merged.id }).state, 'escalated');
 });
 
 test('a message that fails the pointer fixture is never sent and is recorded as a failed delivery', () => {
@@ -668,6 +668,27 @@ test('notify: a targeted correct invocation through cli() passes --record/--sequ
   const result = cli(['--root', root, '--record', id, '--sequence', String(sequence), '--dry-run']);
   assert.deepEqual(result.handled.map((h) => [h.recordId, h.sequence, h.outcome]), [[id, sequence, 'shadow']]);
   assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'notify.log.jsonl')), false, '--dry-run reached runNotifier: the sweep log was never written');
+});
+
+// fleet #449: an unreadable or unparseable Work records file fails the sweep (exit 1) instead of reading as no decisions;
+// a missing one still means none.
+test('#449: notify: an unparseable Work records file fails the sweep with exit 1, prints nothing, and logs nothing', () => {
+  const bin = path.join(__dirname, '..', 'bin', 'notify.js');
+  const root = notifyRoot();
+  seed(root);
+  fs.writeFileSync(path.join(root, 'state', 'work', 'active.json'), '{ "records": {');
+  const run = spawnSync(process.execPath, [bin, '--root', root], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 1, run.stdout);
+  assert.equal(run.stdout, '');
+  assert.ok(JSON.parse(run.stderr.trim()).error, run.stderr);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'shadow.jsonl')), false, 'no would-be page is logged for a sweep that could not read its records');
+});
+
+test('#449: notify: a missing Work records file still means no decisions to notify', () => {
+  const root = notifyRoot();
+  seed(root);
+  fs.rmSync(path.join(root, 'state', 'work', 'active.json'));
+  assert.deepEqual(cli(['--root', root]).handled, []);
 });
 
 test('notify: the process exits 2 on a refusal and writes the refusal to stderr, no JSON answer on stdout', () => {

@@ -44,6 +44,11 @@ function isMergeReviewEvent(event) {
 const DEFAULT_ROOT = path.resolve(__dirname, '..');
 const LOCK_WAIT_MS = 10;
 const LOCK_STALE_MS = 60 * 1000;
+// #447: a lock older than LOCK_FORCE_BREAK_MS is broken whatever its pid says (a pid can be reused), and a
+// caller that has waited LOCK_WAIT_MAX_MS throws LOCK_TIMEOUT. The longest work done under the lock today is a
+// 15 s GitHub call (reconcilePullRequest), so 120 s and 180 s leave room for it.
+const LOCK_FORCE_BREAK_MS = 120 * 1000;
+const LOCK_WAIT_MAX_MS = 180 * 1000;
 // #234: Windows answers EPERM/EACCES/EBUSY for a lock or rename target that is delete-pending.
 // The lock treats them as contended, but throws once they have persisted for LOCK_TRANSIENT_MAX_MS of
 // wall time (a Windows wait is ~16 ms, so a wait count would stall every door call for over a minute),
@@ -102,24 +107,29 @@ function readJson(file, fallback = null) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function writeAtomicJson(file, value) {
+// `p` (#447 follow-up) names the lock this write is made under: the lock is checked between writing the temporary
+// file and renaming it over the target, so nothing after the check but the rename itself.
+function writeAtomicJson(file, value, p) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  renameWithRetry(temporary, file);
+  renameWithRetry(temporary, file, p);
 }
 
-function writeAtomicText(file, value) {
+function writeAtomicText(file, value, p) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temporary, value, 'utf8');
-  renameWithRetry(temporary, file);
+  renameWithRetry(temporary, file, p);
 }
 
 // #234: a rename onto a file another process just opened or replaced can report EPERM/EBUSY on Windows.
-function renameWithRetry(from, to) {
+// Each attempt asserts the lock first (#447 follow-up): a retry sleeps, so the lock may be lost meanwhile. A refused
+// attempt removes the temporary file, as a failed rename does.
+function renameWithRetry(from, to, p) {
   for (let attempt = 0; ; attempt += 1) {
     try {
+      if (p) assertLockHeld(p);
       fs.renameSync(from, to);
       return;
     } catch (error) {
@@ -137,8 +147,8 @@ function sleepBriefly() {
   Atomics.wait(new Int32Array(buffer), 0, 0, LOCK_WAIT_MS);
 }
 
-// #235: only remove a lock file if it is still the file this holder created. Under the breaker mutex a live
-// lock is never moved or removed by anyone else, so the stat-then-rm gap here has no actor.
+// #235: only remove a lock file this holder created. A holder past LOCK_FORCE_BREAK_MS is an actor (#447), so this
+// stat-then-rm gap is not closed; assertLockHeld guards the holder's writes instead.
 function releaseLock(file, handle) {
   let mine = false;
   try { mine = fs.fstatSync(handle, { bigint: true }).ino === fs.statSync(file, { bigint: true }).ino; } catch {}
@@ -146,11 +156,14 @@ function releaseLock(file, handle) {
   if (mine) fs.rmSync(file, { force: true, maxRetries: 5, retryDelay: 10 });
 }
 
-// A lock (or breaker lock) is breakable when it is older than LOCK_STALE_MS and its owner is gone.
+// A lock (or breaker lock) is breakable when it is older than LOCK_STALE_MS and its owner is gone, or
+// older than LOCK_FORCE_BREAK_MS whatever its owner says (#447).
 function breakable(file) {
   try {
     const stat = fs.statSync(file, { bigint: true });
-    if (Date.now() - Number(stat.mtimeMs) <= LOCK_STALE_MS) return false;
+    const age = Date.now() - Number(stat.mtimeMs);
+    if (age <= LOCK_STALE_MS) return false;
+    if (age > LOCK_FORCE_BREAK_MS) return true;
     // #234: an empty or partial lock file has no owner to find; treat it as ownerless.
     let owner = {};
     // Only a parse failure means ownerless; an EPERM read of a live owner's lock must retry, not break it.
@@ -165,8 +178,29 @@ function breakable(file) {
   }
 }
 
+// #447 follow-up: a holder frozen past LOCK_FORCE_BREAK_MS can wake after its lock was broken and retaken, and
+// its stale copy would roll every writer back. Before each write under the lock, one stat confirms the lock on
+// disk is still the file this holder created (the file-id test releaseLock uses); if not, nothing is written.
+// A stat that fails counts as lost, which refuses the write rather than risking a stale one.
+function assertLockHeld(p) {
+  if (p.lockIno === undefined) return; // not taken through withLock: a direct appendEvent call, as tests make
+  let ino = null;
+  // A transient stat error is retried for the lock's transient bound (#234); ENOENT or any other error is lost at once.
+  const since = Date.now();
+  for (;;) {
+    try { ino = fs.statSync(p.lock, { bigint: true }).ino; break; } catch (error) {
+      if (!TRANSIENT_FS_CODES.has(error.code) || Date.now() - since > LOCK_TRANSIENT_MAX_MS) break;
+      sleepBriefly();
+    }
+  }
+  if (ino !== p.lockIno) {
+    throw new WorkStateError('LOCK_LOST', `the state lock at ${p.lock} was broken and taken by another holder; the outcome is unknown: retry the call with the same idempotency key (a same-key retry replays as success if the write landed)`, { lock: p.lock });
+  }
+}
+
 function withLock(root, callback) {
   const p = ensureLayout(root);
+  const waitStartedAt = Date.now();
   let handle;
   let transientSince;
   let breakTransientSince;
@@ -181,6 +215,11 @@ function withLock(root, callback) {
         if (Date.now() - transientSince > LOCK_TRANSIENT_MAX_MS) throw error;
       } else {
         transientSince = undefined;
+      }
+      // #447: every wait passes through here, so one check bounds the whole wait (breaker mutex included).
+      const waitedMs = Date.now() - waitStartedAt;
+      if (waitedMs > LOCK_WAIT_MAX_MS) {
+        throw new WorkStateError('LOCK_TIMEOUT', `timed out after waiting ${Math.round(waitedMs / 1000)} s for the state lock at ${p.lock}`, { lock: p.lock, waitedMs });
       }
       if (!breakable(p.lock)) {
         breakTransientSince = undefined;
@@ -217,6 +256,7 @@ function withLock(root, callback) {
       let removed = false;
       try {
         fs.writeFileSync(breakHandle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+        // Gap, not closed (#447 follow-up): the lock can be released and retaken between this re-judgement and the rm.
         if (breakable(p.lock)) {
           fs.rmSync(p.lock, { force: true });
           removed = true;
@@ -238,6 +278,8 @@ function withLock(root, callback) {
     }
     try {
       fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+      // #447 follow-up: the file id this holder created, which assertLockHeld compares before every write.
+      p.lockIno = fs.fstatSync(handle, { bigint: true }).ino;
     } catch (error) {
       releaseLock(p.lock, handle);
       throw error;
@@ -245,7 +287,10 @@ function withLock(root, callback) {
     break;
   }
   try {
-    if (!fs.existsSync(p.active)) writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
+    if (!fs.existsSync(p.active)) {
+      assertLockHeld(p);
+      writeAtomicJson(p.active, { schemaVersion: 1, records: {} }, p);
+    }
     recoverPendingUnlocked(p);
     archiveExpiredEvents(p, new Date().toISOString());
     return callback(p);
@@ -259,23 +304,29 @@ function activeState(p) {
 }
 
 function saveActive(p, state) {
-  writeAtomicJson(p.active, state);
+  writeAtomicJson(p.active, state, p);
 }
 
 function eventFile(p, timestamp) {
   return path.join(p.events, `${String(timestamp).slice(0, 10)}.jsonl`);
 }
 
-function eventLines(p) {
+// Unarchived days live in state/events/, archived ones in state/events/archive/. `online` lists only the
+// former; lineage checks list both. Days sort by file name, so an archived day precedes a later one (#448).
+function eventDayFiles(p, { online = false } = {}) {
   if (!fs.existsSync(p.events)) return [];
   const files = [];
-  for (const directory of [p.events, path.join(p.events, 'archive')]) {
+  for (const directory of online ? [p.events] : [p.events, path.join(p.events, 'archive')]) {
     if (!fs.existsSync(directory)) continue;
     for (const name of fs.readdirSync(directory).filter((entry) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry))) {
       files.push(path.join(directory, name));
     }
   }
-  files.sort();
+  return files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+}
+
+function eventLines(p, { online = false } = {}) {
+  const files = eventDayFiles(p, { online });
   const events = [];
   for (const file of files) {
     const text = fs.readFileSync(file, 'utf8');
@@ -287,6 +338,7 @@ function eventLines(p) {
       } catch {
         if (index !== lines.length - 1 || text.endsWith('\n')) throw new WorkStateError('CORRUPT_EVENT_LOG', `invalid event JSON in ${file}`);
         const lastNewline = text.lastIndexOf('\n');
+        assertLockHeld(p);
         fs.writeFileSync(file, text.slice(0, lastNewline + 1), 'utf8');
         break;
       }
@@ -321,6 +373,7 @@ function archiveExpiredEvents(p, now) {
   for (const file of fs.readdirSync(p.events).filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))) {
     const date = new Date(`${file.slice(0, 10)}T23:59:59.999Z`).getTime();
     if (date >= cutoff) continue;
+    assertLockHeld(p);
     fs.mkdirSync(archiveDir, { recursive: true });
     fs.renameSync(path.join(p.events, file), path.join(archiveDir, file));
   }
@@ -331,8 +384,11 @@ function archiveExpiredEvents(p, now) {
 // (replayIfKnown) before any event is built, and a reserve starts that map fresh, so a
 // caller may reuse a key in a later attempt. Matching keys across the whole lineage
 // silently dropped nidus:issue-4's seq-8 abandon (2026-09-28) and wedged the record.
+// #448: the slot check reads unarchived days only. A record's sequence never goes back over its archived
+// lineage (a fresh record over one is refused by the archive, release and abandon snapshots), so no
+// archived slot is ever the one a new event takes.
 function existingEvent(p, recordId, sequence) {
-  return eventLines(p).find((event) => event.recordId === recordId && event.sequence === sequence) || null;
+  return eventLines(p, { online: true }).find((event) => event.recordId === recordId && event.sequence === sequence) || null;
 }
 
 // fleet#251: a (recordId, sequence) match used to be dropped silently, which hid a
@@ -353,9 +409,47 @@ function checkEventSlot(p, event) {
   });
 }
 
+// fleet #450 review: the cut is made on one descriptor, and only while the file is the size the tail was read at.
+function settleTail(fd, p) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const size = fs.fstatSync(fd).size;
+    if (!size) return '';
+    const bytes = Buffer.alloc(size);
+    fs.readSync(fd, bytes, 0, size, 0);
+    if (bytes[size - 1] === 0x0a) return '';
+    const start = bytes.lastIndexOf(0x0a) + 1;
+    let whole = true;
+    try { JSON.parse(bytes.subarray(start).toString('utf8').replace(/^\uFEFF/, '')); } catch { whole = false; }
+    // The window left is the gap between this size check and the cut.
+    if (fs.fstatSync(fd).size !== size) continue;   // another writer appended: read the tail again
+    if (whole) return '\n';   // a whole row missing its newline keeps its line
+    if (p) assertLockHeld(p);   // #447 follow-up: the cut is a write under the lock, checked just before it
+    fs.ftruncateSync(fd, start);
+    return '';
+  }
+  // Still moving after three reads: cutting could erase another writer's row, so only start this one on its own line.
+  return '\n';
+}
+
+// fleet #450: a crash mid-append leaves a tail; a whole row keeps its line (newline added), a fragment is cut so the new row does not glue onto it.
+// `p` is set for the Work record's own wake outbox (#447 follow-up): the lock is checked before the row is appended.
+function appendLedgerRow(file, row, p) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let prefix = '';
+  if (fs.existsSync(file)) {
+    const fd = fs.openSync(file, 'r+');
+    try { prefix = settleTail(fd, p); } finally { fs.closeSync(fd); }
+  }
+  if (p) assertLockHeld(p);
+  fs.appendFileSync(file, `${prefix}${row}\n`, 'utf8');
+}
+
+// #447 follow-up: the lock is checked first and the slot second, so an event the breaker's recovery appended while
+// this holder was frozen is seen as a replay. Nothing sits between the slot check and the append.
 function appendEvent(p, event) {
-  if (checkEventSlot(p, event)) return;
   fs.mkdirSync(path.dirname(eventFile(p, event.at)), { recursive: true });
+  assertLockHeld(p);
+  if (checkEventSlot(p, event)) return;
   fs.appendFileSync(eventFile(p, event.at), `${JSON.stringify(event)}\n`, 'utf8');
 }
 
@@ -413,33 +507,38 @@ function recordEventFiles(p, record) {
   }))];
 }
 
+// The early assert stops the work before the full-ledger read in recordEventFiles; the lock is checked again late,
+// inside writeAtomicJson, after that read.
 function archiveRecord(p, record) {
+  assertLockHeld(p);
   writeAtomicJson(archiveFile(p, record.id), {
     schemaVersion: 1,
     archivedAt: record.updatedAt,
     record,
     eventFiles: recordEventFiles(p, record),
-  });
+  }, p);
   cleanupEphemeral(p, record);
 }
 
 function storeReleasedRecord(p, record) {
+  assertLockHeld(p);
   writeAtomicJson(releaseFile(p, record.id), {
     schemaVersion: 1,
     releasedAt: record.updatedAt,
     record,
     eventFiles: recordEventFiles(p, record),
-  });
+  }, p);
   cleanupEphemeral(p, record);
 }
 
 function storeAbandonedRecord(p, record) {
+  assertLockHeld(p);
   writeAtomicJson(abandonFile(p, record.id), {
     schemaVersion: 1,
     abandonedAt: record.updatedAt,
     record,
     eventFiles: recordEventFiles(p, record),
-  });
+  }, p);
   cleanupEphemeral(p, record);
 }
 
@@ -458,6 +557,7 @@ function preserveReusableSnapshot(p, reusable) {
     throw new WorkStateError(missingCode, `reusable ${reusable.kind} snapshot for '${reusable.record.id}' disappeared`);
   }
   if (fs.existsSync(destination)) throw new WorkStateError(historyCode, `reusable ${reusable.kind} history already exists for '${reusable.record.id}' sequence ${reusable.record.eventSequence}`);
+  assertLockHeld(p);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.renameSync(source, destination);
 }
@@ -542,6 +642,7 @@ function recoverPendingUnlocked(p) {
       fs.mkdirSync(collidedDir, { recursive: true });
       // A unique name: an earlier quarantined journal of the same file name is evidence too.
       const quarantined = path.join(collidedDir, `${file.replace(/\.json$/, '')}.${Date.now()}.${process.pid}.${fs.readdirSync(collidedDir).length}.json`);
+      assertLockHeld(p);
       fs.renameSync(journalPath, quarantined);
       throw new WorkStateError('EVENT_SEQUENCE_COLLISION', `${error.message}; the pending journal was moved to ${quarantined}`, { recordId: error.recordId, sequence: error.sequence, existing: error.existing, attempted: error.attempted, quarantined });
     }
@@ -552,12 +653,14 @@ function recoverPendingUnlocked(p) {
       if (current && current.revision <= journal.event.revision) delete active.records[journal.recordId];
     }
     else if (!existing || existing.revision < journal.afterRecord.revision) active.records[journal.recordId] = journal.afterRecord;
+    assertLockHeld(p);
     saveActive(p, active);
     appendEvent(p, journal.event);
     if (journal.supersedeReusable) preserveReusableSnapshot(p, journal.supersedeReusable);
     if (journal.releasedRecord) storeReleasedRecord(p, journal.releasedRecord);
     if (journal.abandonedRecord) storeAbandonedRecord(p, journal.abandonedRecord);
     if (journal.archiveRecord) archiveRecord(p, journal.archiveRecord);
+    assertLockHeld(p);
     fs.rmSync(journalPath, { force: true });
   }
 }
@@ -566,12 +669,16 @@ function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archive
   // fleet#251: refuse a colliding event before the journal or the record is written, so a
   // refused mutation leaves nothing behind for recovery to trip over.
   checkEventSlot(p, event);
+  assertLockHeld(p);
   const journalPath = pendingFile(p, recordId, event.idempotencyKey);
-  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable });
+  writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable }, p);
   if (killPoint === 'after-journal') throw new WorkStateError('KILL_POINT', 'stopped after journal write');
   const active = activeState(p);
   if (afterRecord === null) delete active.records[recordId];
   else active.records[recordId] = afterRecord;
+  // #447 follow-up: a loss from here on leaves the journal in place. The next holder's recovery completes the
+  // mutation, so the caller's same-key retry replays it rather than writing twice.
+  assertLockHeld(p);
   saveActive(p, active);
   if (killPoint === 'after-record') throw new WorkStateError('KILL_POINT', 'stopped after record replacement');
   appendEvent(p, event);
@@ -580,6 +687,7 @@ function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archive
   if (releasedRecord) storeReleasedRecord(p, releasedRecord);
   if (abandonedRecord) storeAbandonedRecord(p, abandonedRecord);
   if (recordToArchive) archiveRecord(p, recordToArchive);
+  assertLockHeld(p);
   fs.rmSync(journalPath, { force: true });
   return afterRecord || releasedRecord || abandonedRecord || recordToArchive;
 }
@@ -657,8 +765,9 @@ function hasReservationEvidence(reservations) {
 
 function reservationPathRoot(value) {
   let normalized = String(value).trim().replaceAll('\\', '/').replace(/^\.\/+/, '').replace(/\/{2,}/g, '/');
+  // #448: a wildcard reserves the folder it sits in, so cut back to the last separator before it.
   const wildcard = normalized.search(/[?*\[\]{}]/);
-  if (wildcard >= 0) normalized = normalized.slice(0, wildcard);
+  if (wildcard >= 0) normalized = normalized.slice(0, normalized.lastIndexOf('/', wildcard) + 1);
   normalized = path.posix.normalize(normalized).replace(/^\.\/+/, '').replace(/\/+$/, '');
   return normalized === '.' ? '' : normalized;
 }
@@ -968,7 +1077,11 @@ function abandonRecord(options = {}) {
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
-    if (['merged', 'retiring'].includes(record.state)) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state} and must complete retirement`);
+    // #448: an escalated record keeps the state it came from in prior_state, and that state decides.
+    const stateBefore = record.state === 'escalated' ? record.prior_state : record.state;
+    if (['merged', 'retiring'].includes(stateBefore)) {
+      throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state === 'escalated' ? `escalated from ${stateBefore}` : record.state} and must complete retirement`);
+    }
     if (isUntouchedReservation(record, eventLines(p))) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
     const now = isoNow(options.now);
     const actor = options.actor || 'fleet-operator';
@@ -1138,7 +1251,7 @@ function transitionRecord(options = {}) {
       let out = result;
       if (from && DECISION_STATES.includes(from)) out = { ...out, resolved: appendResolutionWake({ root, p, record, key, options, from, to: target, result }) };
       return DECISION_STATES.includes(target)
-        ? { ...out, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
+        ? { ...out, paged: appendWakeOutbox({ root, p, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
         : out;
     };
     const replay = replayIfKnown(record, key);
@@ -1352,7 +1465,7 @@ function decisionRaisedBy(p, recordId, from, beforeSequence) {
 // The resolution line for a record leaving a decision state, by transition or by
 // abandon (#204): keyed `<key>:resolution`, so a replay repairs it and never doubles it.
 function appendResolutionWake({ root, p, record, key, options, from, to, result }) {
-  return appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
+  return appendWakeOutbox({ root, p, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
 }
 
 // Idempotent by (recordId, idempotencyKey): the door that commits a decision
@@ -1361,15 +1474,16 @@ function appendResolutionWake({ root, p, record, key, options, from, to, result 
 // was written, which is the caller's cue to launch the page. `actor` is the
 // writer's provenance (fleet#141): the watchdog's frontier wake does not wake a
 // lead for a decision-needed line that lead wrote itself.
-function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, from, to, raisedBy, now } = {}) {
+function appendWakeOutbox({ root, p, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, from, to, raisedBy, now } = {}) {
   if (outboxHasWake(root, recordId, idempotencyKey)) return false;
   const file = wakeOutboxFile(root);
+  if (p) assertLockHeld(p);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
   // wake record); the outbox line names the wake in its own field.
   const text = String(evidence || '').replace(/^wake:[a-z-]+;\s*/, '');
   const line = { at: isoNow(now), recordId, revision, eventSequence, wake, idempotencyKey, ...(actor ? { actor } : {}), ...(reason ? { reason, premise } : {}), ...(from ? { from, to } : {}), ...(raisedBy ? { raisedBy } : {}), evidence: text };
-  fs.appendFileSync(file, `${JSON.stringify(line)}\n`, 'utf8');
+  appendLedgerRow(file, JSON.stringify(line), p);
   return true;
 }
 
@@ -1596,7 +1710,8 @@ function projectStatus(options = {}) {
       if (fs.existsSync(output) && !fs.readFileSync(output, 'utf8').startsWith(STATUS_MARKER)) {
         throw new WorkStateError('OUTPUT_NOT_GENERATED', `refusing to overwrite ${output}: not a file this projection generated (it does not start with ${JSON.stringify(STATUS_MARKER)})`, { output });
       }
-      writeAtomicText(output, content);
+      assertLockHeld(p);
+      writeAtomicText(output, content, p);
     }
     return { output, content };
   });
@@ -1606,6 +1721,9 @@ function shadowProject(options = {}) {
   const root = asRoot(options.root);
   return withLock(root, (p) => {
     const rosterPath = rosterPathFor(p, options.rosterPath);
+    // #448: a roster that is not there is an error, never an empty roster, which would retire every record
+    // this projection created.
+    if (!fs.existsSync(rosterPath)) throw new WorkStateError('ROSTER_MISSING', `shadow projection needs the roster at ${rosterPath}`, { rosterPath });
     const desired = new Map([...rosterClaims(p, rosterPath)].map(([id, row]) => [id, { row, rosterStatus: String(row.status).toLowerCase() }]));
     const active = activeState(p);
     const rosterEvidence = path.relative(p.base, rosterPath);
@@ -1615,11 +1733,12 @@ function shadowProject(options = {}) {
       // one the lead created by hand) still has to be able to finish. Once its IC has left
       // the roster with the unit merged (or already retiring), the projection completes the
       // retirement whatever created it; otherwise such a record sits in active state forever
-      // and pins its issue `reserved` in the planner's frontier. Any other record without a
-      // roster row (assigned, implementing, pr-open, review, hold, escalated) is still the
-      // lead's to judge; a projector never archives one of those.
+      // and pins its issue `reserved` in the planner's frontier. A record this projection
+      // created retires only from implementing (#448); any other record without a roster row
+      // (assigned, pr-open, review, hold, escalated) is still the lead's to judge.
       const terminalRetirement = ['merged', 'retiring'].includes(record.state);
-      if (record.evidence?.roster !== rosterEvidence && !terminalRetirement) continue;
+      const projectionMade = record.evidence?.roster === rosterEvidence;
+      if (!terminalRetirement && !(projectionMade && record.state === 'implementing')) continue;
       const manifestRetirement = terminalRetirement && Boolean(record.manifestPath);
       const eventType = manifestRetirement ? 'assignment-retired' : 'shadow-retired';
       const now = isoNow(options.now);
@@ -1836,12 +1955,14 @@ module.exports = {
   WorkStateError,
   abandonRecord,
   appendEvent,
+  appendLedgerRow,
   commitMutation,
   paths,
   appendWakeOutbox,
   cli,
   createRecord,
   enteringEvent,
+  eventDayFiles, // #448 follow-up: rotation-policy lists the day files in the store's order
   getRecord,
   hasReservationEvidence,
   isForeignRecord,

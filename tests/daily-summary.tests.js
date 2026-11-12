@@ -545,6 +545,23 @@ test('#299: a proposal with no outcome is listed oldest first and sends on a qui
   assert.match(buildSummary({ root, now: NOW }).body, /^Proposals awaiting Approval, endzone: #100 \(since 12h\), .* and 2 more$/m, 'the line names at most ten issues');
 });
 
+// #451: a proposal on an issue the Watchdog's last open-issue read no longer shows, and proposed before that read, is closed and
+// not listed; one proposed after the read stays. A missing shadow file, or an errored tenant entry, lists everything as before.
+test('#451: a proposal on an issue closed before the Watchdog\'s last read is not listed; a missing or errored read lists it', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'state', 'triage'), { recursive: true });
+  const proposed = (issue, at) => JSON.stringify({ schemaVersion: 1, kind: 'proposed', tenant: 'endzone', issue, at, bodyHash: 'h', commentUrl: 'u' });
+  fs.writeFileSync(path.join(root, 'state', 'triage', 'endzone.jsonl'), `${[proposed(12, hoursAgo(3)), proposed(15, hoursAgo(3)), proposed(16, minutesAgo(5))].join('\n')}\n`);
+  const shadow = path.join(root, 'state', 'watchdog', 'triage-frontier.json');
+  fs.mkdirSync(path.dirname(shadow), { recursive: true });
+  fs.writeFileSync(shadow, JSON.stringify({ at: hoursAgo(1), tenants: [{ tenant: 'endzone', skipped: [{ number: 12, reason: 'awaiting approval' }], eligible: [] }] }));
+  assert.match(buildSummary({ root, now: NOW }).body, /^Proposals awaiting Approval, endzone: #12 \(since 3h\), #16 \(since 5m\)$/m, 'issue 15 is closed and not listed; 16 opened after the read stays');
+  fs.writeFileSync(shadow, JSON.stringify({ at: hoursAgo(1), tenants: [{ tenant: 'endzone', error: 'triage.js timed out' }] }));
+  assert.match(buildSummary({ root, now: NOW }).body, /#15 \(since 3h\)/, 'an errored read lists everything');
+  fs.unlinkSync(shadow);
+  assert.match(buildSummary({ root, now: NOW }).body, /#12 \(since 3h\).*#15 \(since 3h\).*#16 \(since 5m\)/, 'no read lists everything');
+});
+
 test('#299: a human-wait condition with its paged detail sends one "Waiting on you" line; a missing paged entry costs the detail only', () => {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'state', 'watchdog'), { recursive: true });

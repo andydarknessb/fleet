@@ -230,6 +230,16 @@ test('cli: a correct invocation still works, matching the direct call byte-for-b
   assert.deepEqual(viaCli.offset, direct.offset);
 });
 
+// fleet #449: a Digest write whose rename fails (the output path is a directory) leaves no temporary file behind.
+test('#449: a failed Digest write removes its temporary file', () => {
+  const root = rootDir();
+  walk(root, 1, ['pr-open', 'ci-wait', 'escalated']);
+  const output = path.join(root, 'blocked');
+  fs.mkdirSync(output);
+  assert.throws(() => projectDigest({ root, now: '2026-09-01T08:00:00.000Z', output }), /rename/);
+  assert.deepEqual(fs.readdirSync(root).filter((name) => name.endsWith('.tmp')), [], 'no temporary file is left beside the Digest output');
+});
+
 // Spec fleet #92 / #143: one line per tenant counting the open ready tickets with
 // no `## Premises`, read from the watchdog's triage shadow (stamped with its time).
 test('#143: the Triage section counts open ready tickets without a Premises section', () => {
@@ -242,6 +252,24 @@ test('#143: the Triage section counts open ready tickets without a Premises sect
   }));
   const line = missingLine(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content);
   assert.equal(line, '- endzone: 2 of 10 open ready-for-agent ticket(s) without `## Premises` (#1440, #1441); malformed: #1609 (census 2026-09-24T07:45:00.000Z).');
+});
+
+// #451: the Triage section leaves out a proposal on a closed issue, against the Watchdog's last open-issue read, and says when that read was.
+test('#451: the Triage section leaves out a proposal on a closed issue, and stamps the read it used', () => {
+  const root = rootDir();
+  const { recordEntry } = require('../bin/triage');
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 12, bodyHash: 'h', commentUrl: 'https://x/12', model: 'fable', now: '2026-09-20T00:00:00.000Z' });
+  recordEntry({ root, tenant: 'endzone', kind: 'proposed', issue: 13, bodyHash: 'h', commentUrl: 'https://x/13', model: 'fable', now: '2026-09-23T00:00:00.000Z' });
+  const triageSection = () => section(projectDigest({ root, now: '2026-09-24T08:00:00.000Z', dryRun: true }).content, 'Triage (advisory Principal, ADR 0011)');
+  assert.match(triageSection(), /^- endzone: 2 proposal\(s\) awaiting approval, 0 approved awaiting finalizing, 2 proposed in all;/m);
+  fs.mkdirSync(path.join(root, 'state', 'watchdog'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'watchdog', 'triage-frontier.json'), JSON.stringify({
+    at: '2026-09-24T07:45:00.000Z', tenants: [{ tenant: 'endzone', skipped: [{ number: 13, reason: 'awaiting approval' }], eligible: [] }],
+  }));
+  const content = triageSection();
+  assert.match(content, /^- endzone: 1 proposal\(s\) awaiting approval, 0 approved awaiting finalizing, 2 proposed in all;.*; open issues read 2026-09-24T07:45:00\.000Z, closed ones left out\.$/m);
+  assert.match(content, /^  - #13 proposed 2026-09-23T00:00:00\.000Z - https:\/\/x\/13$/m);
+  assert.doesNotMatch(content, /#12 proposed/);
 });
 
 // Spec fleet #92 / #148: 30 days of stale-premise restatements, counted by verdict

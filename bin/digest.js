@@ -13,7 +13,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const workState = require('./work-state');
 const { readExclusions, projectExclusions } = require('./exclusions');
-const { readLedger: readTriageLedger, projectTriage, readTriageConfig, staleNoticePath } = require('./triage');
+const { readLedger: readTriageLedger, projectTriage, readOpenIssues, readTriageConfig, staleNoticePath } = require('./triage');
 
 const CREATION_TYPES = Object.freeze(['assignment-reserved', 'work-created', 'shadow-projected']);
 const RETIRED_TYPES = Object.freeze(['assignment-released', 'assignment-retired', 'shadow-retired']);
@@ -144,10 +144,11 @@ function renderRow(row) {
 function staleHeadline(stale) {
   if (!stale) return '';
   const counts = stale.counts;
-  return `; stale-premise restatements (last ${stale.days} days): ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}`;
+  const endorsed = counts.endorsed + counts['endorsed-with-edits'];
+  return `; stale-premise restatements (last ${stale.days} days): ${counts.approved} approved, ${counts['approved-with-edits']} approved with edits, ${counts.rejected} rejected, ${counts.pending} pending${counts.superseded ? `, ${counts.superseded} superseded` : ''}${endorsed ? `, ${endorsed} endorsed` : ''}`;
 }
 
-function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus, staleNotice, offset, configs }) {
+function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageByTenant, openByTenant, premisesCensus, staleNotice, offset, configs }) {
   const lastEvent = events[events.length - 1] || null;
   const lines = [];
   lines.push(scope === 'fleet' ? '# Fleet digest' : `# ${scope} status`);
@@ -210,7 +211,9 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageBy
     if (!fold) { lines.push(`- ${tenant}: no triage ledger.`); continue; }
     const ratio = (value) => (value === null || value === undefined ? 'n/a' : `${Math.round(value * 100)}%`);
     const gate = fold.graduation;
-    lines.push(`- ${tenant}: ${fold.pending.length} proposal(s) awaiting approval, ${fold.awaitingFinalize.length} approved awaiting finalizing, ${fold.proposalsTotal} proposed in all; last ${fold.windowDays} days: ${fold.window.decided} decided, ${fold.window.unchanged} approved unchanged (${ratio(fold.window.unchangedRatio)}), ${fold.window.withEdits} with edits, ${fold.window.rejected} rejected; graduation ${gate.met ? 'MET' : 'not met'} (${gate.decided}/${gate.minProposals} decided over ${gate.spanDays}/${gate.minDays} days at ${ratio(gate.unchangedRatio)} of ${ratio(gate.minUnchangedRatio)}); decision-needed wakes consumed through ${fold.consumedThrough || 'never'}${staleHeadline(fold.stalePremise)}.`);
+    // #451: the open set the Watchdog's read gave is stamped with its time, as the census is, so the same file rebuilds the same bytes.
+    const openNote = openByTenant?.[tenant] ? `; open issues read ${openByTenant[tenant].at}, closed ones left out` : '';
+    lines.push(`- ${tenant}: ${fold.pending.length} proposal(s) awaiting approval, ${fold.awaitingFinalize.length} approved awaiting finalizing, ${fold.proposalsTotal} proposed in all; last ${fold.windowDays} days: ${fold.window.decided} decided, ${fold.window.unchanged} approved unchanged (${ratio(fold.window.unchangedRatio)}), ${fold.window.withEdits} with edits, ${fold.window.rejected} rejected; graduation ${gate.met ? 'MET' : 'not met'} (${gate.decided}/${gate.minProposals} decided over ${gate.spanDays}/${gate.minDays} days at ${ratio(gate.unchangedRatio)} of ${ratio(gate.minUnchangedRatio)}); decision-needed wakes consumed through ${fold.consumedThrough || 'never'}${staleHeadline(fold.stalePremise)}${openNote}.`);
     for (const row of fold.pending) lines.push(`  - #${row.issue} proposed ${row.since}${row.commentUrl ? ` - ${row.commentUrl}` : ''}`);
     for (const row of fold.awaitingFinalize) lines.push(`  - #${row.issue} ${row.outcome} ${row.since}, not yet finalized`);
     // fleet#49: Principal docs PRs have no lead and no Work record; Cory merges them from here.
@@ -247,8 +250,14 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageBy
 function writeAtomic(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporary, content, 'utf8');
-  fs.renameSync(temporary, file);
+  try {
+    fs.writeFileSync(temporary, content, 'utf8');
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    // fleet #449: a failed write or rename leaves no temporary file beside the Digest.
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function projectDigest(options = {}) {
@@ -278,10 +287,13 @@ function projectDigest(options = {}) {
   const offset = { events: eventsOffset, exclusions: exclusionsOffset };
   const triageConfig = readTriageConfig(base);
   const triageByTenant = {};
+  const openByTenant = {};
   for (const tenant of tenantNames) {
-    triageByTenant[tenant] = projectTriage({ entries: readTriageLedger(base, tenant), now: options.now, windowDays: triageConfig.windowDays, graduation: triageConfig.graduation });
+    const openIssues = readOpenIssues(base, tenant);
+    if (openIssues) openByTenant[tenant] = openIssues;
+    triageByTenant[tenant] = projectTriage({ entries: readTriageLedger(base, tenant), now: options.now, windowDays: triageConfig.windowDays, graduation: triageConfig.graduation, openIssues });
   }
-  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, premisesCensus: readPremisesCensus(base), staleNotice: readStaleNotice(base), offset, configs });
+  const content = render({ scope: options.tenant ? String(options.tenant) : 'fleet', tenantNames, rows, events, exclusionsByTenant, triageByTenant, openByTenant, premisesCensus: readPremisesCensus(base), staleNotice: readStaleNotice(base), offset, configs });
   const output = options.output ? path.resolve(options.output) : path.join(base, 'state', 'status', options.tenant ? `${options.tenant}-status.md` : 'DIGEST.md');
   if (!options.dryRun) writeAtomic(output, content);
   return { output, content, offset };

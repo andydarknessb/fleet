@@ -49,7 +49,10 @@ stale criteria.
   manifest-reserved record once its IC has left the roster with the unit
   merged (or already retiring), so the planner's active-assignment count
   cannot pin the frontier shut after two or three merges. An in-flight record
-  without a roster row is never archived by a projector.
+  without a roster row is never archived by a projector. Amended 2026-11-12
+  (fleet #448): the one exception is a record the shadow projection itself
+  created that is still `implementing`; from any later in-flight state it is
+  the lead's to judge, and a missing roster is an error, never an empty one.
 - The planner derives component, schema, migration-prefix, and test-resource
   reservations from paths and table names in the issue body and comments. It
   pins that complete criteria snapshot in the manifest, rehydrates older active

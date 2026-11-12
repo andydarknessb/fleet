@@ -9,7 +9,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { STATES, WorkStateError, readEvents, parseArgs } = require('./work-state');
+const { STATES, WorkStateError, readEvents, parseArgs, appendLedgerRow } = require('./work-state');
 
 // A recheck event of this type is never looked up in the Fleet ledger: it means
 // "only a lift releases this exclusion". `exclusion-lifted` is the owner's lift.
@@ -50,9 +50,7 @@ function readExclusions(root, tenant) {
 }
 
 function appendEntry(root, tenant, entry) {
-  const file = ledgerPath(root, tenant);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, `${JSON.stringify(entry)}\n`, 'utf8');
+  appendLedgerRow(ledgerPath(root, tenant), JSON.stringify(entry));
   return entry;
 }
 

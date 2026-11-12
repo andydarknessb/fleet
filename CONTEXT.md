@@ -411,7 +411,7 @@ The fleet records one itself when it observes a merged PR whose linkage is an
 explained `Refs` (prose after it on the line, or on the next non-empty line): owned by the fleet, its recheck event is the issue closing,
 which the watcher observes and lifts.
 A lead's lift-only exclusion older than an open proposal, or any lead's exclusion older than a stale-premise restatement, blocks the launch and nothing more: the Principal and the Arbiter still see the proposal (fleet #362, #366).
-A lead's exclusion that only a lift releases (`exclusion-lifted`) and that still stands 24 hours after a finalize newer than it pages once from the daily run; nothing lifts it but the lead (fleet #367). One rechecked on an issue closing is the watcher's to lift and never pages (fleet #406).
+A lead's exclusion that only a lift releases (`exclusion-lifted`) and that still stands 24 hours after a finalize newer than it pages once from the daily run; the lead lifts it, or the PR watcher once its issue is closed (fleet #450). One rechecked on an issue closing is the watcher's to lift and never pages (fleet #406).
 GitHub labels, assignees, dependencies, and sub-issue structure take
 precedence whenever they can express the condition.
 _Avoid_: hold (a reviewed PR waiting for Cory), skip, blocked
