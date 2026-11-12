@@ -284,8 +284,9 @@ function validatePointerMessage(message) {
 // reason to page again.
 function findPendingDecisions({ root, tenant, recordId, sequence } = {}) {
   const base = baseOf(root);
-  let active;
-  try { active = JSON.parse(fs.readFileSync(path.join(base, 'state', 'work', 'active.json'), 'utf8')); } catch { active = { records: {} }; }
+  // A missing Work records file is no records; an unreadable or unparseable one fails the sweep (fleet #449).
+  const activeFile = path.join(base, 'state', 'work', 'active.json');
+  const active = fs.existsSync(activeFile) ? JSON.parse(fs.readFileSync(activeFile, 'utf8')) : { records: {} };
   const events = workState.readEvents(base);
   const pending = [];
   const records = Object.values(active.records || {})

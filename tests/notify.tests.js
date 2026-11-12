@@ -670,6 +670,27 @@ test('notify: a targeted correct invocation through cli() passes --record/--sequ
   assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'notify.log.jsonl')), false, '--dry-run reached runNotifier: the sweep log was never written');
 });
 
+// fleet #449: an unreadable or unparseable Work records file fails the sweep (exit 1) instead of reading as no decisions;
+// a missing one still means none.
+test('#449: notify: an unparseable Work records file fails the sweep with exit 1, prints nothing, and logs nothing', () => {
+  const bin = path.join(__dirname, '..', 'bin', 'notify.js');
+  const root = notifyRoot();
+  seed(root);
+  fs.writeFileSync(path.join(root, 'state', 'work', 'active.json'), '{ "records": {');
+  const run = spawnSync(process.execPath, [bin, '--root', root], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 1, run.stdout);
+  assert.equal(run.stdout, '');
+  assert.ok(JSON.parse(run.stderr.trim()).error, run.stderr);
+  assert.equal(fs.existsSync(path.join(root, 'state', 'notify', 'shadow.jsonl')), false, 'no would-be page is logged for a sweep that could not read its records');
+});
+
+test('#449: notify: a missing Work records file still means no decisions to notify', () => {
+  const root = notifyRoot();
+  seed(root);
+  fs.rmSync(path.join(root, 'state', 'work', 'active.json'));
+  assert.deepEqual(cli(['--root', root]).handled, []);
+});
+
 test('notify: the process exits 2 on a refusal and writes the refusal to stderr, no JSON answer on stdout', () => {
   const bin = path.join(__dirname, '..', 'bin', 'notify.js');
   const root = notifyRoot();

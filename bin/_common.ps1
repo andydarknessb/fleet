@@ -2,7 +2,28 @@
 $script:FleetHome = Split-Path -Parent $PSScriptRoot
 $script:Utf8 = New-Object System.Text.UTF8Encoding $false
 function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null } }
-function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
+# fleet #449: the JSON is renamed over the target, so a reader sees the old file or the new one, never part of one;
+# a rename a reader holds open is retried 5 times, 10 ms apart, as work-state.js does (#234).
+function Write-Json {
+  param($Path, $Obj)
+  $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+  try {
+    [IO.File]::WriteAllText($temporary, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8)
+    for ($attempt = 0; ; $attempt++) {
+      try {
+        # [NullString]::Value, not $null: PowerShell 5.1 passes $null as "" and File.Replace rejects an empty backup path.
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) } else { [IO.File]::Move($temporary, $Path) }
+        return
+      } catch {
+        if ($attempt -ge 5) { throw }
+        Start-Sleep -Milliseconds 10
+      }
+    }
+  } catch {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
 function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
 # WS5 cutover (fleet #82, spec #194): while this flag stands the dispatcher is retired;

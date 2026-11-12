@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop'
 # lose each other's rows. Covers: two concurrent writers keep every row (Update-LiveRoster in bin/_common.ps1);
 # retire.ps1 driven end to end leaves a row that now holds a newer launch's job (or no row) untouched, because the
 # mock CLI's `stop` swaps the roster in between retire's two writes; and launch.ps1 / retire.ps1 never call
-# Save-LiveRoster directly.
+# Save-LiveRoster directly. fleet #449: Write-Json renames a temporary file over roster.json, so a reader sees the old
+# roster or the new one, never part of one, and a failed write leaves no temporary file behind.
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
 function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
@@ -34,6 +35,18 @@ for ($i = 1; $i -le $Count; $i++) {
 }
 '@
 
+# fleet #449: rewrites roster.json with 1, 2, ... 60 rows through Write-Json, then one write onto a directory, which must throw.
+$atomicWriterSource = @'
+param([string]$Dir, [int]$Writes)
+. "$PSScriptRoot\_common.ps1"
+for ($i = 1; $i -le $Writes; $i++) {
+  $sessions = @(1..$i | ForEach-Object { [pscustomobject]@{ name = "row-$_"; status = 'active'; prompt = ('p' * 12000) } })
+  Write-Json "$Dir\roster.json" ([pscustomobject]@{ sessions = $sessions })
+}
+New-Item -ItemType Directory -Path "$Dir\blocked" | Out-Null
+try { Write-Json "$Dir\blocked" ([pscustomobject]@{ a = 1 }); Write-Output 'no-throw' } catch { Write-Output 'threw' }
+'@
+
 $writers = @()
 try {
   # Case 1: two overlapping writers on one FleetHome: all 30 rows survive.
@@ -58,6 +71,38 @@ try {
   $rows = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions)
   $distinct = @($rows | ForEach-Object { $_.name } | Sort-Object -Unique)
   Assert-True ($rows.Count -eq 30 -and $distinct.Count -eq 30) "two concurrent writers must keep all 30 rows, got $($rows.Count) rows and $($distinct.Count) distinct names"
+
+  # Case 1b (fleet #449): Write-Json replaces roster.json by rename. A child writer rewrites the roster while this process
+  # reads it in a loop: every read that opens the file parses as one whole roster, and no temporary file is left behind.
+  $atomicDir = Join-Path $testRoot 'atomic'
+  $atomicFile = "$atomicDir\roster.json"
+  [IO.Directory]::CreateDirectory($atomicDir) | Out-Null
+  Write-Utf8 "$testRoot\bin\atomic-writer.ps1" $atomicWriterSource
+  Write-Utf8 $atomicFile '{"sessions":[]}'
+  $atomicWriter = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$testRoot\bin\atomic-writer.ps1`" -Dir `"$atomicDir`" -Writes 60" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$testRoot\atomic-writer.out" -RedirectStandardError "$testRoot\atomic-writer.err"
+  $null = $atomicWriter.Handle
+  $writers += [pscustomobject]@{ tag = 'atomic'; process = $atomicWriter }
+  $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+  $reads = 0; $partial = @(); $stopReadingBy = (Get-Date).AddSeconds(8)
+  while (-not $atomicWriter.HasExited -and (Get-Date) -lt $stopReadingBy) {
+    try {
+      $stream = [IO.File]::Open($atomicFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+      try { $text = (New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $stream.Dispose() }
+    } catch { continue }   # a read that cannot open the file says nothing about its content
+    $reads++
+    $roster = $null
+    try { $roster = ConvertFrom-Json -InputObject $text } catch { }
+    if ($null -eq $roster -or -not $roster.PSObject.Properties['sessions']) { $partial += $text; continue }
+  }
+  Assert-True ($atomicWriter.WaitForExit(8000)) "the atomic writer did not finish within 8 s"
+  Assert-True ($atomicWriter.ExitCode -eq 0) "the atomic writer exited $($atomicWriter.ExitCode): $(Get-Content "$testRoot\atomic-writer.err" -Raw)"
+  Assert-True ((Get-Content "$testRoot\atomic-writer.out" -Raw) -match 'threw') 'a Write-Json whose rename fails must throw, not swallow the failure'
+  Assert-True ($reads -gt 0) 'the reader never read roster.json while it was written'
+  Assert-True ($partial.Count -eq 0) "a reader saw $($partial.Count) of $reads reads as part of a roster (first one $($partial[0].Length) characters)"
+  $finalRows = @((Get-Content $atomicFile -Raw | ConvertFrom-Json).sessions).Count
+  Assert-True ($finalRows -eq 60) "the last write must be the roster that stands, got $finalRows rows"
+  $temporaries = @(Get-ChildItem -LiteralPath $atomicDir -Force -Filter '*.tmp')
+  Assert-True ($temporaries.Count -eq 0) "no temporary file may be left behind: $($temporaries.Name -join ', ')"
 
   # Case 2-4: retire.ps1 end to end. The mock CLI's `stop` copies $retireRoot\swap.json over the roster, so retire's
   # second write (after stop) meets whatever a newer launch, or nothing, left in its place.

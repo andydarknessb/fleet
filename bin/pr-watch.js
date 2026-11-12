@@ -603,8 +603,9 @@ function runWatch({ root, tenantName, tenantConfig, fetchers, actor = 'pr-watch'
   };
 
   const formalReviewWake = !fs.existsSync(path.join(base, 'state', 'flags', 'merge-review-wake-off'));
-  let active;
-  try { active = JSON.parse(fs.readFileSync(path.join(base, 'state', 'work', 'active.json'), 'utf8')); } catch { active = { records: {} }; }
+  // A missing Work records file is no records; an unreadable or unparseable one fails the tick (fleet #449).
+  const activeFile = path.join(base, 'state', 'work', 'active.json');
+  const active = fs.existsSync(activeFile) ? JSON.parse(fs.readFileSync(activeFile, 'utf8')) : { records: {} };
   const records = Object.values(active.records || {})
     .filter((r) => r.tenant === tenantName && WATCH_STATES.includes(r.state))
     .sort((a, b) => a.issue - b.issue);

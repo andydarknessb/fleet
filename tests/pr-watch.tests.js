@@ -1204,6 +1204,44 @@ test('one tenant\'s failure does not blind the watcher to the others', () => {
   assert.equal(result.tenants.endzone.records, 1, 'endzone is still watched after the broken tenant');
 });
 
+// fleet #449: an unreadable or unparseable Work records file fails the tick instead of reading as no records; a
+// missing one still means no records. The scheduled tick (no --tenant) records each tenant as failed in health.json.
+test('#449: an unparseable Work records file fails a --tenant tick with exit 1 and leaves the file as it was', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = rootDir();
+  seed(root, { id: 'endzone:issue-64', issue: 64, state: 'ci-wait', prNumber: 164 });
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ name: 'endzone', github: 'owner/repo', branchPrefix: 'fleet/', ciGates: [] }));
+  const activePath = path.join(root, 'state', 'work', 'active.json');
+  fs.writeFileSync(activePath, '{ "schemaVersion": 1, "records": {');
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'pr-watch.js'), '--root', root, '--tenant', 'endzone', '--gh', 'no-such-gh-binary', '--no-notifier', 'true'], { encoding: 'utf8' });
+  assert.equal(run.status, 1, `a tick that cannot read its Work records must exit 1: ${run.stdout}`);
+  assert.ok(JSON.parse(run.stderr.trim()).error, run.stderr);
+  assert.equal(fs.readFileSync(activePath, 'utf8'), '{ "schemaVersion": 1, "records": {', 'the unreadable file is not rewritten');
+});
+
+test('#449: an unparseable Work records file fails every tenant of the scheduled tick, and health.json counts it', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = twoTenantRoot();
+  fs.writeFileSync(path.join(root, 'state', 'work', 'active.json'), '{ "records": {');
+  const run = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'pr-watch.js'), '--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true'], { encoding: 'utf8' });
+  assert.equal(run.status, 1, run.stderr);
+  const health = JSON.parse(fs.readFileSync(path.join(root, 'state', 'watch', 'health.json'), 'utf8'));
+  assert.equal(health.ok, false);
+  assert.equal(health.consecutiveFailures, 1, 'the failing-watcher Page counts failed ticks from here');
+  assert.equal(health.tenants.endzone.ok, false);
+  assert.equal(health.tenants.nidus.ok, false);
+});
+
+test('#449: a missing Work records file still means no records: the tick is healthy and watches nothing', () => {
+  const root = twoTenantRoot();
+  fs.rmSync(path.join(root, 'state', 'work', 'active.json'));
+  const result = cli(['--root', root, '--gh', 'no-such-gh-binary', '--no-notifier', 'true']);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.tenants.endzone.records, 0);
+  assert.equal(result.tenants.nidus.records, 0);
+});
+
 // fleet #136: the watchdog samples health.json every 15 min but the watcher ticks every 5,
 // so the watcher itself counts its consecutive failed ticks, overall and per tenant, and a
 // healthy tick resets the count. A single-tenant (--tenant) run carries the same count.
