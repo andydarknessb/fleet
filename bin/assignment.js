@@ -17,6 +17,7 @@ const {
   reservationBaseline,
   reservationConflicts: workReservationConflicts,
   reserveRecord,
+  samePath,
   transitionRecord,
 } = require('./work-state');
 const { PREMISES_HEADING, PremisesError, checkPremises, fencedLines, readPremises } = require('./premises');
@@ -852,6 +853,8 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
   if (root) {
     const record = getRecord({ root, id: workRecordId });
     if (record.state !== 'assigned') throw new WorkStateError('INVALID_LAUNCH', `Work record '${workRecordId}' is ${record.state}, not assigned`);
+    // fleet #437: a manifest starts only the Work record it was reserved with; refused with no release and no sidecar.
+    if (!record.manifestPath || !samePath(path.resolve(manifestPath), record.manifestPath, root)) throw new WorkStateError('INVALID_LAUNCH', `Work record '${workRecordId}' was not reserved with manifest '${manifestPath}'`);
   }
   if (githubRepo) {
     const current = queryGithubIssues({ repo: githubRepo, readyLabel: manifest.readyLabel || 'ready-for-agent', runner, fetchDetails: true }).find((issue) => issue.number === manifest.issue.number);

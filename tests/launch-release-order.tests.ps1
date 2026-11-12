@@ -81,6 +81,7 @@ $exitRows = @(
   @{ Anchor = 'is not pending acknowledgment'; Decision = 'keep' }              # acknowledged, invalidated or unreadable: not ours
   @{ Anchor = 'does not match -WorkRecordId'; Decision = 'keep' }               # caller named another record
   @{ Anchor = 'was invalidated'; Decision = 'keep' }                            # already released (checked first so a replayed release never overwrites the marker)
+  @{ Anchor = 'was not reserved with'; Decision = 'keep' }                      # fleet #437: the record names another manifest (or none): not this manifest's reservation
   @{ Anchor = 'no tenant file for'; Nth = 1; Decision = 'release' }             # the manifest's tenant has no file
   @{ Anchor = 'no static roster entry'; Decision = 'keep' }                     # -FromRoster is not a manifest launch
   @{ Anchor = 'missing -\$req'; Decision = 'release' }
