@@ -40,7 +40,7 @@ tickets still go to Cory's sessions.
 - A red `master` stops deploys and nothing else. The fleet keeps running the
   last commit that passed.
 - The known contention flake (the work-state mutex test under a parallel run)
-  means the aggregate runner runs suites one at a time.
+  means the aggregate runner runs one suite at a time per host.
   Status note: #234 found the flake is a Windows lock race (EPERM on a delete-pending
   lock file) that reproduces serially, not only under load; the work-state lock now
   waits it out. The one-suite-at-a-time rule still stands.
@@ -52,6 +52,11 @@ tickets still go to Cory's sessions.
   and only then can the original check-then-remove race recur. The same holds for a
   holder stalled 60 s between creating the lock and writing its pid (an empty lock reads
   as ownerless).
+  Amended 2026-11-12 (fleet #444): the rule was always about one host. CI runs the suites
+  as three shards (`config/ci-shards.json`) on three runners, each running its suites one
+  at a time through the aggregate runner, so the rule holds per host; the shards cut the
+  wall-clock time of the run: 61 minutes serially in the master run of 2026-11-12, against
+  the Watchdog shard alone at about 28 minutes.
 - `state/` stays outside all of this: it is not in the repository and no ref
   move touches it. A change that needs a state migration ships the migration
   as a script Cory runs, never as a side effect of the advance.

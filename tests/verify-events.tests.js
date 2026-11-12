@@ -296,14 +296,15 @@ test('ruling 2026-09-24: `head: "unrecorded"` acknowledges only a record with no
 });
 
 // The shipped file is the Ruling of record: #1241/#1263 (retro review) plus the
-// 2026-09-24 ruling's three classes, plus #1599 (Ruling 2026-10-09, merged at a fix-up head). Adding a record means adding a ruling.
+// 2026-09-24 ruling's three classes, plus #1599 (Ruling 2026-10-09, merged at a fix-up head), plus statelite #171 and nidus #316
+// (Cory's own merges, ruling 2026-11-12, fleet #439). Adding a record means adding a ruling.
 test('#114: every shipped exception names a head and a ruling, and the set is the ruled one', () => {
   const shipped = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'config', 'review-exceptions.json'), 'utf8'));
-  const ruled = [1241, 1263, 601, 602, 615, 619, 620, 633, 636, 641, 642, 733, 769, 787, 883, 1312, 1578, 1599].map((n) => `endzone:issue-${n}`);
+  const ruled = [1241, 1263, 601, 602, 615, 619, 620, 633, 636, 641, 642, 733, 769, 787, 883, 1312, 1578, 1599].map((n) => `endzone:issue-${n}`).concat(['statelite:issue-171', 'nidus:issue-316']);
   assert.deepEqual(shipped.exceptions.map((e) => e.recordId).sort(), ruled.sort());
   for (const entry of shipped.exceptions) {
     assert.match(entry.head, /^([0-9a-f]{40}|unrecorded)$/, entry.recordId);
-    assert.match(entry.ruling, /#1545|Ruling 2026-09-24|Ruling 2026-10-09/, entry.recordId);
+    assert.match(entry.ruling, /#1545|Ruling 2026-09-24|Ruling 2026-10-09|Cory's ruling 2026-11-12/, entry.recordId);
   }
 });
 
