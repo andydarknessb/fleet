@@ -109,7 +109,7 @@ try {
   Assert-True ($rows.Count -eq 30 -and $distinct.Count -eq 30) "two concurrent writers must keep all 30 rows, got $($rows.Count) rows and $($distinct.Count) distinct names"
 
   # Case 1b (fleet #449): Write-Json replaces roster.json by rename. A child writer rewrites the roster while this process
-  # reads it in a loop: every read that opens the file parses as one whole roster, and no temporary file is left behind.
+  # reads it in a loop: every read parses as one whole roster, none finds the file missing or throws, and no temporary file is left behind.
   $atomicDir = Join-Path $testRoot 'atomic'
   $atomicFile = "$atomicDir\roster.json"
   [IO.Directory]::CreateDirectory($atomicDir) | Out-Null
@@ -118,18 +118,18 @@ try {
   $atomicWriter = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$testRoot\bin\atomic-writer.ps1`" -Dir `"$atomicDir`" -Writes 60" -WindowStyle Hidden -PassThru -RedirectStandardOutput "$testRoot\atomic-writer.out" -RedirectStandardError "$testRoot\atomic-writer.err"
   $null = $atomicWriter.Handle
   $writers += [pscustomobject]@{ tag = 'atomic'; process = $atomicWriter }
-  $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-  $reads = 0; $partial = @(); $stopReadingBy = (Get-Date).AddSeconds(8)
+  # The reader takes Read-Json's own steps (Test-Path, Get-Content -Raw, ConvertFrom-Json), so it sees what the fleet's readers see.
+  $reads = 0; $partial = @(); $missing = 0; $threw = @(); $stopReadingBy = (Get-Date).AddSeconds(8)
   while (-not $atomicWriter.HasExited -and (Get-Date) -lt $stopReadingBy) {
-    try {
-      $stream = [IO.File]::Open($atomicFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
-      try { $text = (New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)).ReadToEnd() } finally { $stream.Dispose() }
-    } catch { continue }   # a read that cannot open the file says nothing about its content
+    if (-not (Test-Path $atomicFile)) { $missing++; continue }
+    try { $text = Get-Content $atomicFile -Raw -Encoding UTF8 } catch { $threw += $_.Exception.Message; continue }
     $reads++
     $roster = $null
-    try { $roster = ConvertFrom-Json -InputObject $text } catch { }
-    if ($null -eq $roster -or -not $roster.PSObject.Properties['sessions']) { $partial += $text; continue }
+    try { $roster = $text | ConvertFrom-Json } catch { }
+    if ($null -eq $roster -or -not $roster.PSObject.Properties['sessions']) { $partial += "$text"; continue }
   }
+  Assert-True ($missing -eq 0) "a read found roster.json missing $missing time(s) while the writer ran"
+  Assert-True ($threw.Count -eq 0) "a read threw $($threw.Count) time(s) while the writer ran; the first: $($threw[0])"
   Assert-True ($atomicWriter.WaitForExit(8000)) "the atomic writer did not finish within 8 s"
   Assert-True ($atomicWriter.ExitCode -eq 0) "the atomic writer exited $($atomicWriter.ExitCode): $(Get-Content "$testRoot\atomic-writer.err" -Raw)"
   Assert-True ((Get-Content "$testRoot\atomic-writer.out" -Raw) -match 'threw') 'a Write-Json whose rename fails must throw, not swallow the failure'
