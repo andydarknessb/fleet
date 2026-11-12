@@ -721,11 +721,15 @@ try {
   # --- never treated as ours and never overwritten; a CLOSED issue's failures are history.
   # --- fleet #452: state/watchdog/launch-held.json keeps, per tenant/issue, the newest failed
   # --- launch the Watchdog's Hold covers. A lifted Hold stays lifted: a trip only holds an
-  # --- issue for a failed launch newer than that one. An unreadable record is never reset to
-  # --- empty (that would re-write every lifted Hold): the trip pages and writes nothing.
+  # --- issue for a failed launch newer than that one. An unparseable record is moved aside, as a
+  # --- corrupt paged.json is, and the tick carries on with no records (fleet #452 review 5b): a lifted
+  # --- Hold still inside the window is written once more, the accepted migration cost.
   $heldPath = "$FleetHome\state\watchdog\launch-held.json"
-  $held = $null; $heldUnreadable = $false
-  try { $held = Read-Json $heldPath } catch { $heldUnreadable = $true }
+  $held = $null
+  try { $held = Read-Json $heldPath } catch {
+    if (-not $Verify) { try { Move-Item $heldPath "$heldPath.corrupt-$($now.ToString('yyyyMMddTHHmmssZ'))" -Force } catch {} }
+  }
+  # An empty, whitespace-only or null file reads as no records (Read-Json gives $null), so it needs no branch.
   if (-not $held) { $held = [pscustomobject]@{} }
   $heldChanged = $false
   # fleet #452: paged.json as this tick found it. A Hold's Page is carried the way every other condition's is:
@@ -760,8 +764,6 @@ try {
         try { $skip = Read-Json $skipPath } catch { $skipReadable = $false }
         if (-not $skipReadable) {
           $ev.disposition = 'skip-unreadable-paged'
-        } elseif ($heldUnreadable) {
-          $ev.disposition = 'held-state-unreadable-paged'   # no Hold written: a lifted one would come back
         } else {
           if (-not $skip) { $skip = [pscustomobject]@{ issues = [pscustomobject]@{}; prs = [pscustomobject]@{} } }
           if ($null -eq $skip.issues) { $skip | Add-Member -NotePropertyName issues -NotePropertyValue ([pscustomobject]@{}) -Force }
@@ -812,14 +814,13 @@ try {
     $tripEvals += $ev
   }
   # fleet #452: a record whose failure has left the window covers nothing any more (every failure still in it is newer), so it goes and the map cannot grow.
-  if (-not $heldUnreadable) {
-    foreach ($hp in @($held.PSObject.Properties)) {
-      $hpAt = ConvertTo-UtcDateTime $hp.Value.startedAt
-      if (-not $hpAt -or $hpAt -lt $windowStart) { $held.PSObject.Properties.Remove($hp.Name); $heldChanged = $true }
-    }
-    # Written after the skip writes above: a Hold with no record is re-recorded next tick (already-held), but a record with no Hold would read as lifted.
-    if ($heldChanged -and -not $Verify) { Write-Json $heldPath $held }
+  foreach ($hp in @($held.PSObject.Properties)) {
+    $hpAt = ConvertTo-UtcDateTime $hp.Value.startedAt
+    if (-not $hpAt -or $hpAt -lt $windowStart) { $held.PSObject.Properties.Remove($hp.Name); $heldChanged = $true }
   }
+  # Written after the skip writes above: a Hold with no record is re-recorded next tick (already-held), but a record with no Hold would read as lifted.
+  # Guarded like the other state writes: a throw here must not end the tick before its pages and dead-man ping.
+  if ($heldChanged -and -not $Verify) { try { Write-Json $heldPath $held } catch {} }
 
   # --- live supervision (ticket 08b): what the Sentinel session used to do with the
   # --- report. launchNeeded (a name the daemon has no job for) goes through the one
@@ -1851,10 +1852,21 @@ try {
   # fleet #454: a tick that could not read the sessions, run the check or read the heal state cannot evaluate the families that
   # depend on it, so they are absent from $conditions only because of the blind read. Their paged entries (delivered, given up,
   # escalation filed) carry forward unchanged; without that the next good tick would page and file each one again.
+  # fleet #454 (review 1): the sentinel-check child reads the sessions too. When only it could not, the Watchdog's own read is
+  # good and only what the child decides (escalation, the respawn half of launch-retry, human-wait) is blind.
+  $childBlind = [bool]($check -and $check.PSObject.Properties['daemonReadError'] -and $check.daemonReadError)
+  $sessionBlind = [bool]$daemonReadError -or $childBlind   # also gates notified.json below (review 4)
   $blindPrefixes = @()
-  if ($daemonReadError) { $blindPrefixes += 'escalation:', 'permission-wait:', 'launch-retry:', 'busy-stale:', 'human-wait:', 'wake-failed:', 'fleet-dead', 'sentinel-stale' }
+  if ($daemonReadError) { $blindPrefixes += 'escalation:', 'permission-wait:', 'launch-retry:', 'busy-stale:', 'human-wait:', 'wake-failed:', 'fleet-dead', 'sentinel-stale', 'double-actor' }
+  elseif ($childBlind) { $blindPrefixes += 'escalation:', 'launch-retry:', 'human-wait:', 'double-actor' }
   if ($checkError) { $blindPrefixes += 'escalation:', 'launch-retry:', 'human-wait:' }
   if ($healStateUnreadable) { $blindPrefixes += 'human-wait:' }
+  # fleet #453 (review 2): the triage frontier is read only where the wake would act. A tick that did not read it (PAUSE, or a shadow
+  # mode, which a blind daemon read forces) keeps a delivered entry; a switched-off wake (no live flag, triage-wake-off) drops it.
+  if (-not $triageOff) {
+    if ((Test-PrincipalLive) -and ($paused -or $mode -ne 'live')) { $blindPrefixes += 'triage-frontier-unreadable:principal:' }
+    if ((Test-ArbiterLive) -and ($paused -or $mode -ne 'live')) { $blindPrefixes += 'triage-frontier-unreadable:arbiter:' }
+  }
   if ($paged -and $blindPrefixes.Count -gt 0) {
     foreach ($bp in @($paged.PSObject.Properties)) {
       if ($nextPaged.PSObject.Properties[$bp.Name]) { continue }
@@ -1878,9 +1890,12 @@ try {
     } else {
       Remove-Item $bannerPath -ErrorAction SilentlyContinue
     }
-    $nextNotified = [pscustomobject]@{}
-    foreach ($k in $currentRespawnKeys) { $nextNotified | Add-Member -NotePropertyName $k -NotePropertyValue (Now-Iso) -Force }
-    Write-Json $notifiedPath $nextNotified
+    # fleet #454 (review 4): a session-blind tick cannot see which respawns it made, so it leaves notified.json as it was; the next good tick dedupes against it.
+    if (-not $sessionBlind) {
+      $nextNotified = [pscustomobject]@{}
+      foreach ($k in $currentRespawnKeys) { $nextNotified | Add-Member -NotePropertyName $k -NotePropertyValue (Now-Iso) -Force }
+      Write-Json $notifiedPath $nextNotified
+    }
 
     # Second pass: side effects. A NEW escalation-carrying condition files its one
     # escalation file here (never re-filed while it stands) and its path becomes the
