@@ -24,7 +24,9 @@ jobs:
   suites:
     name: suites
     runs-on: windows-latest
-    timeout-minutes: 60
+    # 90, above the runner's own per-suite kill (-SuiteTimeoutMinutes 60): a hung suite is killed
+    # first and its tail printed; at 60 the job would cut it with no tail printed.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

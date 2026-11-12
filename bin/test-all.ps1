@@ -47,9 +47,10 @@ $powershell = Join-Path $PSHOME 'powershell.exe'
 if (-not (Test-Path $powershell)) { $powershell = 'powershell' }
 
 # -Filter and -Exclude are lists: an array in process, or one comma-separated token from the
-# command line (powershell -File binds one token per parameter). Suite file names have no commas.
-$Filter = @($Filter | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
-$Exclude = @($Exclude | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+# command line (powershell -File binds one token per parameter). Suite file names have no commas;
+# each name is trimmed, so `a*, b*` names both.
+$Filter = @($Filter | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$Exclude = @($Exclude | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 function Test-Named { param([string]$Name, [string[]]$Patterns) @($Patterns | Where-Object { $Name -like $_ }).Count -gt 0 }
 $suites = @(Get-ChildItem -Path $TestsDir -File | Where-Object {
     ($_.Name -like '*.tests.js' -or $_.Name -like '*.tests.ps1') -and (Test-Named $_.Name $Filter) -and -not (Test-Named $_.Name $Exclude)
