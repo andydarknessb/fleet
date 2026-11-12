@@ -171,7 +171,8 @@ function ensureGitConfig(dir, { env = process.env, runner } = {}) {
   return file;
 }
 
-function launchPlan({ root, env = process.env } = {}) {
+// ticket 455: a dry run plans with writeGitConfig false, so the gitconfig live sessions read through GIT_CONFIG_SYSTEM is left alone.
+function launchPlan({ root, env = process.env, writeGitConfig = true } = {}) {
   const base = path.resolve(root || path.resolve(__dirname, '..'));
   const tenants = readTenants(base);
   const shared = tenants.find((tenant) => tenant.fleetIdentity && tenant.ownerLogin && sameLogin(tenant.fleetIdentity, tenant.ownerLogin));
@@ -190,7 +191,7 @@ function launchPlan({ root, env = process.env } = {}) {
   }
   return {
     required, present: read.present, login: read.login, dir, problem: read.problem,
-    refusal, env: read.present && !refusal ? (ensureGitConfig(dir, { env }), sessionEnv(dir)) : {},
+    refusal, env: read.present && !refusal ? (writeGitConfig && ensureGitConfig(dir, { env }), sessionEnv(dir)) : {},
   };
 }
 
@@ -211,7 +212,7 @@ function defaultGhUser() {
   return execFileSync(process.env.FLEET_GH || 'gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 20000 }).trim();
 }
 
-const FLAGS = { check: ['root', 'tenant', 'login'], plan: ['root'] };
+const FLAGS = { check: ['root', 'tenant', 'login'], plan: ['root', 'no-write'] };
 
 function parseFlags(command, argv) {
   const allowed = FLAGS[command];
@@ -234,7 +235,7 @@ function cli(argv, { ghUser = defaultGhUser, env = process.env } = {}) {
   const args = parseFlags(command, rest);
   const root = path.resolve(args.root || path.resolve(__dirname, '..'));
   if (command === 'plan') {
-    const plan = launchPlan({ root, env });
+    const plan = launchPlan({ root, env, writeGitConfig: args['no-write'] !== 'true' });
     return { ...plan, exitCode: plan.refusal ? 3 : 0 };
   }
   const tenantName = args.tenant || env.FLEET_TENANT;

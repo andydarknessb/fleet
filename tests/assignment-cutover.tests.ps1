@@ -154,7 +154,7 @@ try {
   Assert-True ((Get-Content "$testRoot\bin\recover.ps1" -Raw) -match '-Prompt \$e\.prompt -Recover') 'recover.ps1 must pass -Recover when it relaunches an IC'
   # fleet #434: the recovered session's settings carry the manifest and Work record its roster row recorded (a dry run
   # writes the settings file, never the row). The fixture's manifest file does not exist, so nothing else is read from it.
-  $env7e = (Get-Content "$testRoot\state\sessions\ic-101.settings.json" -Raw | ConvertFrom-Json).env
+  $env7e = (Get-Content "$testRoot\state\sessions\ic-101.settings.dry-run.json" -Raw | ConvertFrom-Json).env
   Assert-True ("$($env7e.FLEET_ASSIGNMENT_MANIFEST)" -eq 'state/manifests/assignment-101.json' -and "$($env7e.FLEET_WORK_RECORD_ID)" -eq 'test:issue-101') "fleet #434: a -Recover dry run's settings carry the roster row's manifest and Work record id: $(($env7e | ConvertTo-Json -Compress))"
   # -Recover exempts ONLY this guard: PAUSE still stops it, even for a genuine recovery.
   Write-Utf8 "$testRoot\state\PAUSE" 'testing'
@@ -174,7 +174,7 @@ try {
   Assert-True (@($manifest.ciGates) -contains 'test-build' -and (@($manifest.testPlan) -join ' ') -match 'unit: npm test' -and @($manifest.adrPaths) -contains 'docs/adr/0002-one-launch-door.md') 'the manifest must carry the tenant checks, CI gates, and the ADR pointer'
   $r8b = Run-Script 'launch.ps1' @('-Manifest', $r8.manifestPath, '-DryRun')
   Assert-True ($lastExit -eq 0 -and $r8b.dryRun -eq $true -and $r8b.name -eq 'ic-101') "a manifest launch must pass the door: $lastOut"
-  Assert-True ((Get-Content "$testRoot\state\sessions\ic-101.settings.json" -Raw) -match 'FLEET_WORK_RECORD_ID') 'the manifest launch must carry the Work record identity into the session'
+  Assert-True ((Get-Content "$testRoot\state\sessions\ic-101.settings.dry-run.json" -Raw) -match 'FLEET_WORK_RECORD_ID') 'the manifest launch must carry the Work record identity into the session'
   # Regression (2026-09-11): the prompt's ack command is pasted into the Bash tool; backslash paths
   # collapse there (C:UsersCory...). The dry run reports the prompt so this can be checked.
   Assert-True ([bool]$r8b.prompt -and $r8b.prompt -match 'assignment\.js ack') "the dry run must report the manifest prompt: $lastOut"

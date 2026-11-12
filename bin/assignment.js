@@ -640,6 +640,8 @@ function buildManifest({ issue, tenant, tenantConfig = {}, readyLabel, parent = 
   model = icModel(model);
   effort = icEffort(effort);
   permissions = icPermissions(model, permissions);
+  // ticket 455: the base precondition launch.ps1 refuses (a remote, a ref and a 40-hex sha) is refused here, before the manifest is written or reserved.
+  if (!base || !base.remote || !base.ref || !/^[0-9a-f]{40}$/i.test(String(base.sha ?? ''))) throw new WorkStateError('INVALID_BASE', `invalid base precondition: the base needs a remote, a ref and a 40-hex sha, got remote '${base?.remote ?? ''}', ref '${base?.ref ?? ''}', sha '${base?.sha ?? ''}'`);
   const normalized = normalizeIssue(issue);
   if (normalized.commentsTruncated) throw new WorkStateError('INCOMPLETE_ISSUE_CRITERIA', `issue #${normalized.number} has more comments than the assignment query can pin`);
   const createdAt = now || new Date().toISOString();
@@ -887,6 +889,10 @@ function launchReservedAssignment({ manifestPath, workRecordId, root, launchScri
     if (refusal && refusal.reason) parts.push(`launch refused: ${refusal.reason}`);
     if (refusal && 'reservationReleased' in refusal) parts.push(`reservationReleased=${refusal.reservationReleased}`);
     if (refusal && refusal.releaseError) parts.push(`releaseError=${refusal.releaseError}`);
+    // ticket 455 review: what launch.ps1 kept, so the lead sees why the next launch of this issue will be refused.
+    if (refusal && refusal.worktreeKept) parts.push('worktreeKept=true');
+    if (refusal && refusal.sessionListUnreadable) parts.push('sessionListUnreadable=true (the session list could not be read after the wait; nothing was released)');
+    if (refusal && refusal.sessionStopFailed) parts.push(`sessionStopFailed=true (job ${refusal.jobId}; claude stop did not succeed)`);
     if (stderr) parts.push(stderr);
     if (!parts.length) parts.push(String(error.message || error));
     throw new WorkStateError('LAUNCH_FAILED', parts.join('; '), { exitCode: error.status ?? null, refusal, stderr, timedOut });

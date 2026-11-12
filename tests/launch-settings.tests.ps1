@@ -5,6 +5,8 @@ $ErrorActionPreference = 'Stop'
 
 function Assert-True { param([bool]$Condition, [string]$Message) if (-not $Condition) { throw $Message } }
 function Write-Utf8 { param([string]$Path, [string]$Text) [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding $false)) }
+# ticket 455: every file under state/ with its size and write time, so a dry run's writes can be listed by diff.
+function Get-StateSnapshot { @(Get-ChildItem -LiteralPath "$testRoot\state" -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" } | Sort-Object) }
 
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("fleet-launch-settings-test-" + [guid]::NewGuid().ToString('N'))
@@ -48,9 +50,18 @@ try {
   $rootFwd = $testRoot.Replace('\', '/')
 
   # Case 1: a control-plane role gets the state-door and tenant-repo denials.
+  # ticket 455: a dry run writes its settings beside the real file, never over it. The live pl-test settings (a stopped
+  # session respawns with them) must survive, and the dry run's only write under state/ is its own .dry-run file.
+  Write-Utf8 "$testRoot\state\sessions\pl-test.settings.json" '{"env":{"FLEET_NAME":"pl-test","FLEET_LIVE":"yes"}}'
+  $liveBefore = Get-Content "$testRoot\state\sessions\pl-test.settings.json" -Raw
+  $stateBefore1 = Get-StateSnapshot
   $r1 = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-DryRun')
+  $changed1 = @(Compare-Object -ReferenceObject $stateBefore1 -DifferenceObject (Get-StateSnapshot) | ForEach-Object { $_.InputObject })
+  Assert-True ((Get-Content "$testRoot\state\sessions\pl-test.settings.json" -Raw) -eq $liveBefore) 'a dry run must not overwrite the settings file a live or stopped session reads'
+  Assert-True ($changed1.Count -eq 1 -and $changed1[0] -like '*\state\sessions\pl-test.settings.dry-run.json|*') "a dry run writes nothing under state/ but its own .dry-run settings file (changed: $($changed1 -join '; '))"
+  Assert-True ("$($r1.settings)" -eq "$testRoot\state\sessions\pl-test.settings.dry-run.json") "the dry run names the file it wrote (got $($r1.settings))"
   Assert-True ($r1.dryRun -eq $true) 'the dry run must report itself'
-  $settings1 = Get-Content "$testRoot\state\sessions\pl-test.settings.json" -Raw | ConvertFrom-Json
+  $settings1 = Get-Content "$testRoot\state\sessions\pl-test.settings.dry-run.json" -Raw | ConvertFrom-Json
   $deny1 = @($settings1.permissions.deny)
   Assert-True ($deny1 -contains "Edit($rootFwd/state/work/**)") 'a project lead must lose direct Edit on state/work'
   Assert-True ($deny1 -contains "Write($rootFwd/state/events/**)") 'a project lead must lose direct Write on state/events'
@@ -66,7 +77,7 @@ try {
   # Case 2: an IC keeps tenant-repo tools but loses every direct fleet-state write.
   $r2 = Run-Launch @('-Role', 'ic', '-Name', 'ic-42', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '42', '-Prompt', 'Implement issue 42.', '-DryRun')
   Assert-True ($r2.dryRun -eq $true) 'the IC dry run must report itself'
-  $deny2 = @((Get-Content "$testRoot\state\sessions\ic-42.settings.json" -Raw | ConvertFrom-Json).permissions.deny)
+  $deny2 = @((Get-Content "$testRoot\state\sessions\ic-42.settings.dry-run.json" -Raw | ConvertFrom-Json).permissions.deny)
   Assert-True ($deny2 -contains "Edit($rootFwd/state/**)") 'an IC must lose direct edits across fleet state'
   Assert-True (-not ($deny2 -contains "Edit($repoFwd/**)")) 'an IC must keep engineering tools in the tenant repo'
 
@@ -74,7 +85,7 @@ try {
   Write-Utf8 "$testRoot\state\flags\tool-contract-off" 'rollback'
   $r2b = Run-Launch @('-Role', 'project-lead', '-Name', 'pl-test', '-Tenant', 'test', '-Parent', 'cory', '-Prompt', 'Start your duties.', '-DryRun')
   Assert-True ($r2b.dryRun -eq $true) 'the flagged dry run must still pass the gates'
-  $settings2b = Get-Content "$testRoot\state\sessions\pl-test.settings.json" -Raw | ConvertFrom-Json
+  $settings2b = Get-Content "$testRoot\state\sessions\pl-test.settings.dry-run.json" -Raw | ConvertFrom-Json
   Assert-True (-not $settings2b.permissions.PSObject.Properties['deny']) 'tool-contract-off must skip the deny injection'
   Assert-True ($null -ne $r2b.budget) 'tool-contract-off must not disable the ceiling estimate'
   Remove-Item "$testRoot\state\flags\tool-contract-off"
@@ -101,16 +112,16 @@ try {
   foreach ($case in $envCases) {
     $re = Run-Launch $case.Args
     Assert-True ($re.dryRun -eq $true) "the $($case.Name) dry run under the real fleet settings must pass the gates (got: $re)"
-    $gotEnv = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).autoMode.environment)
+    $gotEnv = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.dry-run.json" -Raw | ConvertFrom-Json).autoMode.environment)
     Assert-True (($gotEnv.Count -eq $srcEnv.Count) -and (@(for ($i = 0; $i -lt $srcEnv.Count; $i++) { $gotEnv[$i] -ceq $srcEnv[$i] }) -notcontains $false)) "$($case.Name) per-session settings must carry the environment statement verbatim"
-    $gotAllow = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).autoMode.allow)
+    $gotAllow = @((Get-Content "$testRoot\state\sessions\$($case.Name).settings.dry-run.json" -Raw | ConvertFrom-Json).autoMode.allow)
     Assert-True (($gotAllow.Count -eq $srcAllow.Count) -and (@(for ($i = 0; $i -lt $srcAllow.Count; $i++) { $gotAllow[$i] -ceq $srcAllow[$i] }) -notcontains $false)) "$($case.Name) per-session settings must carry the allow rules verbatim"
     # Ponytail is enabled by the fleet's own settings, not only by Cory's user settings.
-    $gotPlugins = (Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).enabledPlugins
+    $gotPlugins = (Get-Content "$testRoot\state\sessions\$($case.Name).settings.dry-run.json" -Raw | ConvertFrom-Json).enabledPlugins
     Assert-True ($gotPlugins.'ponytail@ponytail' -eq $true) "$($case.Name) per-session settings must enable ponytail@ponytail"
     # fleet #384 (owner ruling 5): Cory's personal plugins are off by id, the fleet's two stay on, plugin sync is off and
     # Remote Control is on, and only the project lead keeps the claude.ai connectors (its Supabase connector).
-    $gotSettings = Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json
+    $gotSettings = Get-Content "$testRoot\state\sessions\$($case.Name).settings.dry-run.json" -Raw | ConvertFrom-Json
     $wantPlugins = @{ 'ponytail@ponytail' = $true; 'mattpocock-skills@claude-plugins-official' = $true; 'i-have-adhd@i-have-adhd' = $false; 'humanizer@humanizer' = $false; 'impeccable@impeccable' = $false }
     Assert-True (@($gotSettings.enabledPlugins.PSObject.Properties).Count -eq $wantPlugins.Count) "$($case.Name) per-session settings must name exactly the fleet's plugins (got $($gotSettings.enabledPlugins | ConvertTo-Json -Compress))"
     foreach ($plugin in $wantPlugins.Keys) { Assert-True ($gotSettings.enabledPlugins.PSObject.Properties[$plugin].Value -eq $wantPlugins[$plugin]) "$($case.Name) per-session settings must set $plugin to $($wantPlugins[$plugin])" }
@@ -119,7 +130,7 @@ try {
     if ($case.Role -eq 'project-lead') { Assert-True ($gotSettings.disableClaudeAiConnectors -eq $false) "$($case.Name) must keep the claude.ai connectors" } else { Assert-True ($gotSettings.disableClaudeAiConnectors -eq $true) "$($case.Name) must run without the claude.ai connectors" }
     Assert-True ("$($re.command)" -match '--no-chrome') "$($case.Name) must launch with --no-chrome (got: $($re.command))"
     # Its hooks stay off: only the IC loads it, by invoking the skill (fleet #282).
-    $gotSessionEnv = (Get-Content "$testRoot\state\sessions\$($case.Name).settings.json" -Raw | ConvertFrom-Json).env
+    $gotSessionEnv = (Get-Content "$testRoot\state\sessions\$($case.Name).settings.dry-run.json" -Raw | ConvertFrom-Json).env
     Assert-True ($gotSessionEnv.PONYTAIL_DEFAULT_MODE -eq 'off') "$($case.Name) must start with ponytail's always-on hook off"
     Assert-True ($gotSessionEnv.PONYTAIL_SUBAGENT_MATCHER -eq '(?!)') "$($case.Name) must keep ponytail's hook out of its subagents"
   }
@@ -187,7 +198,7 @@ exit $LASTEXITCODE
   $rh = Run-Launch @('-Role', 'ic', '-Name', 'ic-999', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '999', '-Prompt', 'Do the thing.', '-DryRun')
   Assert-True ($rh.dryRun -eq $true -and $rh.model -eq 'haiku' -and $rh.permissions -eq 'auto' -and $rh.allowRules -eq 0) "an IC with no -Model dry-runs on Haiku under auto (got: $rh)"
   Assert-True ("$($rh.command)" -match '--model claude-haiku-5-5 --effort xhigh ') "an IC runs pinned claude-haiku-5-5 at the role file effort (got: $($rh.command))"
-  $haikuAutoSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.json" -Raw | ConvertFrom-Json
+  $haikuAutoSettings = Get-Content "$testRoot\state\sessions\ic-999.settings.dry-run.json" -Raw | ConvertFrom-Json
   Assert-True ($haikuAutoSettings.permissions.defaultMode -eq 'auto' -and $haikuAutoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a haiku IC under auto runs defaultMode auto, marked auto so the allowlist gate passes it (fleet #181)'
   Assert-True (-not $haikuAutoSettings.permissions.PSObject.Properties['allow'] -and -not $haikuAutoSettings.permissions.PSObject.Properties['additionalDirectories']) 'the haiku IC under auto carries no allow list and no additional directories'
   Assert-True (-not $haikuAutoSettings.PSObject.Properties['apiKeyHelper'] -and -not $haikuAutoSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'an IC keeps the Anthropic API: no base URL and no apiKeyHelper'
@@ -225,11 +236,14 @@ exit $LASTEXITCODE
   foreach ($d in 'src', '.git', '.claude\worktrees\ic-77-assignment\src') { [IO.Directory]::CreateDirectory("$repoPath\$d") | Out-Null }
   Write-Utf8 "$repoPath\package.json" '{}'
   Write-Utf8 "$repoPath\.claude\settings.json" '{}'
+  $stateBeforeRm = Get-StateSnapshot
   $rm = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
+  $changedRm = @(Compare-Object -ReferenceObject $stateBeforeRm -DifferenceObject (Get-StateSnapshot) | ForEach-Object { $_.InputObject })
+  Assert-True ($changedRm.Count -eq 1 -and $changedRm[0] -like '*\state\sessions\ic-77.settings.dry-run.json|*') "a manifest dry run writes nothing under state/ but its own .dry-run settings (changed: $($changedRm -join '; '))"
   Assert-True ($rm.dryRun -eq $true -and $rm.model -eq 'haiku') "an allowlist haiku manifest dry-runs on the verified CLI (got: $rm)"
   Assert-True ($rm.permissions -eq 'allowlist' -and $rm.allowRules -eq @($profile.allow).Count) "the dry run names the profile and its allow rule count (got $($rm.permissions)/$($rm.allowRules))"
   Assert-True (-not ("$($rm.command)" -match '--permission-mode')) 'the permission mode is never passed on the command line'
-  $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
+  $haikuSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.dry-run.json" -Raw | ConvertFrom-Json
   Assert-True ($haikuSettings.permissions.defaultMode -eq 'acceptEdits') 'the allowlist settings run acceptEdits'
   Assert-True ($haikuSettings.env.FLEET_PERMISSIONS -eq 'allowlist') 'the env names the profile, which hooks/allowlist-gate.js keys on (fleet #181)'
   $expectedAllow = @($profile.allow | ForEach-Object { "$($_.rule)".Replace('<fleet>', $rootFwd).Replace('<repo>', $repoFwd) })
@@ -302,7 +316,7 @@ exit $LASTEXITCODE
   $rda = Run-Launch @('-Manifest', $manifestPath, '-DryRun')
   Assert-True ($rda.dryRun -eq $true -and $rda.model -eq 'haiku' -and $rda.permissions -eq 'auto') "a haiku manifest under auto dry-runs on any CLI (got: $rda)"
   Assert-True ("$($rda.command)" -match '--model claude-haiku-5-5 --effort xhigh ') "a manifest without an effort runs at the role file effort (got: $($rda.command))"
-  $autoSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.json" -Raw | ConvertFrom-Json
+  $autoSettings = Get-Content "$testRoot\state\sessions\ic-77.settings.dry-run.json" -Raw | ConvertFrom-Json
   Assert-True ($autoSettings.permissions.defaultMode -eq 'auto' -and $autoSettings.env.FLEET_PERMISSIONS -eq 'auto') 'a haiku IC under auto runs defaultMode auto'
   Assert-True ($rda.allowRules -eq 0 -and -not $autoSettings.permissions.PSObject.Properties['allow']) 'a haiku IC under auto carries no allow list'
   Assert-True (-not $autoSettings.PSObject.Properties['apiKeyHelper'] -and -not $autoSettings.env.PSObject.Properties['ANTHROPIC_BASE_URL']) 'a haiku IC keeps the Anthropic API'
@@ -336,7 +350,7 @@ exit $LASTEXITCODE
   Assert-True ("$($rp.command)" -match '--model claude-sonnet-5-5 ') 'a principal with no -Model must run the pinned Sonnet 5.5 id (owner ruling 2026-11-06, fleet #385)'
   Assert-True ("$($rp.command)" -match '--effort high') 'a principal must run at the role file effort'
   Assert-True ($rp.budget.ceiling -eq 30000) 'the principal ceiling must come from config/cycle.json'
-  $denyP = @((Get-Content "$testRoot\state\sessions\pe-test.settings.json" -Raw | ConvertFrom-Json).permissions.deny)
+  $denyP = @((Get-Content "$testRoot\state\sessions\pe-test.settings.dry-run.json" -Raw | ConvertFrom-Json).permissions.deny)
   Assert-True (-not ($denyP -contains "Edit($repoFwd/**)")) 'a principal must NOT carry the blanket tenant-repo denial: hooks/principal-guard.ps1 enforces its allowlist (fleet #39)'
   Assert-True ($denyP -contains "Edit($rootFwd/state/work/**)") 'a principal still loses the direct state-door writes'
   $rpf = Run-Launch @('-Role', 'principal', '-Name', 'pe-test', '-Tenant', 'test', '-Parent', 'dispatcher', '-Prompt', 'Propose triage.', '-Model', 'fable', '-DryRun')
