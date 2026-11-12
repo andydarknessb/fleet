@@ -629,13 +629,18 @@ function tenantFor(root, name) {
   return loadTenant(root, name);
 }
 
-// #445 round 2: a tenant has one name. `--tenant Endzone` opens tenants/endzone.json on NTFS, but the record ids, the
-// review and attestation directories and work-state's record keys are built from the name as it was typed. So the door
-// takes the name the tenant's file declares, once, and every path and comparison uses that; a file that declares none
-// answers the requested name lowercased.
-function canonicalTenantName(config, requested) {
-  const declared = config && typeof config.name === 'string' ? config.name.trim() : '';
-  return declared || String(requested).toLowerCase();
+// #445 round 3: a tenant is keyed by its file name, as work-state keys it (readTenantConfigs takes the base name of
+// tenants/*.json) and as record ids are built (`<name>:issue-N`). The name a caller types is matched to that file name
+// without regard to case, as NTFS matches it, and the name on disk is the canonical one. The directory is listed, not
+// the file read: a tenant file the door never needs stays unread, and its declared `name` is not an alias. Null when no
+// tenant file has that name.
+function canonicalTenantName(root, requested) {
+  const wanted = String(requested || '');
+  let entries;
+  try { entries = fs.readdirSync(path.join(path.resolve(root || DEFAULT_ROOT), 'tenants')); } catch { return null; }
+  const names = entries.filter((entry) => entry.endsWith('.json')).map((entry) => entry.slice(0, -'.json'.length));
+  if (names.includes(wanted)) return wanted;
+  return names.filter((name) => name.toLowerCase() === wanted.toLowerCase()).sort()[0] || null;
 }
 
 // The record id with its tenant part canonical. An id whose tenant has no file is left as it was given.
@@ -643,9 +648,8 @@ function canonicalRecordId(root, recordId) {
   const id = String(recordId);
   const colon = id.indexOf(':');
   if (colon <= 0) return id;
-  const requested = id.slice(0, colon);
-  const config = tenantFor(root, requested);
-  return config ? `${canonicalTenantName(config, requested)}${id.slice(colon)}` : id;
+  const canonical = canonicalTenantName(root, id.slice(0, colon));
+  return canonical ? `${canonical}${id.slice(colon)}` : id;
 }
 
 // The status API wants the full SHA; a head recorded before fleet#67 may be
@@ -746,7 +750,8 @@ function readAttestation(root, relative) {
   const file = path.join(path.resolve(root || DEFAULT_ROOT), relative);
   if (fs.statSync(file).size === 0) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    // A byte-order mark is no part of the JSON (loadTenant strips it too); a file saved with one is still read (#445 round 3).
+    return JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
   } catch (error) {
     throw new ReviewPolicyError('ATTESTATION_UNREADABLE', `${relative} is not readable JSON (${error.message}); it might hold the open finding that blocks this attestation, so nothing is attested (#445 review)`, { path: relative });
   }
@@ -820,11 +825,10 @@ function attestPullRequest(options = {}) {
   if (!headSha || headSha === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --head <sha>');
   requireFullSha(headSha, '--head');
   if (!artifactPath || artifactPath === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --artifact <path>');
-  const tenantFile = path.join(root, 'tenants', `${requestedTenant}.json`);
-  if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${requestedTenant}': ${tenantFile} does not exist`);
-  const tenant = loadTenant(root, requestedTenant);
-  // #445 round 2: the tenant's canonical name, once at the door: the paths and the comparisons below all use it.
-  const tenantName = canonicalTenantName(tenant, requestedTenant);
+  // The tenant's name is its file's, once at the door (#445 round 3): the paths and comparisons below all use it.
+  const tenantName = canonicalTenantName(root, requestedTenant);
+  if (!tenantName) throw new ReviewPolicyError('USAGE', `unknown tenant '${requestedTenant}': ${path.join(root, 'tenants', `${requestedTenant}.json`)} does not exist`);
+  const tenant = loadTenant(root, tenantName);
   if (typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) {
     throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenantName} names no reviewStatus; there is no status to attest`);
   }
@@ -1399,8 +1403,9 @@ function classifyCli(rest) {
   // answer it could give is riskReview:false, which is a false negative by
   // construction, not an answer.
   if (!args.tenant || args.tenant === 'true') throw usage('--tenant <name> is required');
-  const tenant = loadTenant(root, args.tenant);
-  const tenantName = canonicalTenantName(tenant, args.tenant);
+  // The tenant's name is its file's (#445 round 3). An unknown name is read as typed, so loadTenant refuses it as before.
+  const tenantName = canonicalTenantName(root, args.tenant) || args.tenant;
+  const tenant = loadTenant(root, tenantName);
   const carveOuts = Array.isArray(tenant.carveOuts) ? tenant.carveOuts.length : 0;
   const triggers = tenant.riskTriggers && typeof tenant.riskTriggers === 'object' ? Object.keys(tenant.riskTriggers).length : 0;
   if (carveOuts === 0 && triggers === 0) {

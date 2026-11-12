@@ -664,6 +664,26 @@ test('a normal PR never gets a risk review recorded; a triggered one gets exactl
 
 // --- revision re-review ---
 
+test('#445 round 3: plan-rereview reads a record whose tenant file cannot be parsed, or names its owner as its fleet identity, as it did before the canonical name', () => {
+  const brokenTenants = [
+    '{"name": "endzone", ',
+    JSON.stringify({ ...TENANT, fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' }),
+  ];
+  for (const broken of brokenTenants) {
+    const root = rootDir();
+    const revision = seedRecord(root);
+    const first = recordReviewArtifact({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'formal', headSha: sha40('aaa1111'), actor: 'project-lead',
+      classification: { tier: 'normal', triggers: [] }, findings: [{ file: 'src/a.js', claim: 'x', severity: 'major', category: 'correctness' }],
+      idempotencyKey: 'formal-plan-broken', now: '2026-11-12T12:00:00.000Z',
+    });
+    fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), broken);
+    const plan = planRereview({ root, recordId: 'endzone:issue-42', headSha: sha40('ccc3333') });
+    assert.equal(plan.priorArtifact, first.artifact);
+    assert.deepEqual(plan.unresolved.map((finding) => finding.id), ['formal-001-f1']);
+  }
+});
+
 test('a revision re-review links the prior findings and carries only unresolved or new material', () => {
   const root = rootDir();
   let revision = seedRecord(root);
@@ -773,6 +793,24 @@ test('a clean carve-out reaches hold, pages exactly once, and cannot merge witho
     }),
     (error) => error.code === 'MISSING_GITHUB_RECONCILIATION',
   );
+});
+
+test('#445 round 3: hold parks a record whose tenant file cannot be parsed, or names its owner as its fleet identity, as it did before the canonical name', () => {
+  const brokenTenants = [
+    '{"name": "endzone", ',
+    JSON.stringify({ ...TENANT, fleetIdentity: 'andydarknessb', ownerLogin: 'andydarknessb' }),
+  ];
+  for (const broken of brokenTenants) {
+    const root = rootDir();
+    const revision = seedRecord(root);
+    fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), broken);
+    const held = holdRecord({
+      root, recordId: 'endzone:issue-42', expectedRevision: revision,
+      reason: 'carve-out PR #77 reviewed clean; waits for Cory', actor: 'project-lead',
+      idempotencyKey: 'hold-broken-tenant', now: '2026-09-01T03:00:00.000Z', notifier: () => {},
+    });
+    assert.equal(held.result.record.state, 'hold');
+  }
 });
 
 test('hold requires a PR on the record: an issue-only record cannot be parked', () => {
@@ -2869,6 +2907,49 @@ test('#446 round 2: a differently-cased --tenant is the same tenant: an attestat
   const settled = attest('ENDZONE', 1602, { noFindings: 'the blocker is fixed at this head' }, { resolutions: { 'attest-001-f1': 'resolved' } });
   assert.equal(settled.artifact, 'state/reviews/endzone_pr-1602/attest-001.json', 'written under the canonical directory');
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).tenant, 'endzone');
+});
+
+test('#445 round 3: a tenant is keyed by its file name: a declared name that differs from it changes nothing, and records land under the file name', () => {
+  const root = rootDir();
+  fs.mkdirSync(path.join(root, 'tenants'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tenants', 'endzone.json'), JSON.stringify({ ...TENANT, name: 'Endzone-Empire' }));
+  const revision = seedRecord(root, { state: 'implementing' });
+  const risk = recordReviewArtifact({
+    root, recordId: 'endzone:issue-42', expectedRevision: revision, kind: 'risk', headSha: sha40('aaa1111'), actor: 'ic-42',
+    classification: RISK, findings: [], noFindings: 'examined the accessibility angle; nothing to fix',
+    idempotencyKey: 'risk-declared-name', now: '2026-11-12T11:00:00.000Z',
+  });
+  assert.equal(risk.artifact, 'state/reviews/endzone_issue-42/risk-001.json');
+  assert.equal(workState.getRecord({ root, id: 'endzone:issue-42' }).review.risk.artifact, risk.artifact);
+});
+
+test('#446 round 3: an attestation names the tenant by its file name: under a declared name that differs from it, an earlier blocker still holds the next attestation', () => {
+  const { root, head, repo, gh, artifact } = attestFixture();
+  reviewTenant(root, { repo, name: 'Endzone-Empire' });
+  const attest = (tenantName, prNumber, content, extra = {}) => attestPullRequest({ root, tenantName, prNumber, headSha: head, artifactPath: artifact(content), actor: 'cory', gh, ...extra });
+  const blocked = attest('endzone', 1601, { findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'correctness' }] });
+  assert.equal(blocked.artifact, 'state/reviews/endzone_pr-1601/attest-001.json');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, blocked.artifact), 'utf8')).tenant, 'endzone');
+  assert.throws(
+    () => attest('endzone', 1602, { noFindings: 'clean on PR 1602' }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('attest-001-f1'),
+  );
+  assert.throws(
+    () => attest('Endzone-Empire', 1601, { noFindings: 'clean' }),
+    (error) => error.code === 'USAGE' && /unknown tenant/.test(error.message),
+    'the declared name is not an alias for the file',
+  );
+});
+
+test('#446 round 3: an attestation file saved with a byte-order mark and an open blocker is read, and holds the next attestation', () => {
+  const { root, head, gh, artifact } = attestFixture();
+  const first = attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact({ findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'correctness' }] }), actor: 'cory', gh });
+  const file = path.join(root, first.artifact);
+  fs.writeFileSync(file, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), fs.readFileSync(file)]));
+  assert.throws(
+    () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1602, headSha: head, artifactPath: artifact({ noFindings: 'clean on PR 1602' }), actor: 'cory', gh }),
+    (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('attest-001-f1'),
+  );
 });
 
 test('#446 round 2: a zero-byte attestation file in a tenant directory is skipped: an attestation for another PR at the sha still goes through', () => {
