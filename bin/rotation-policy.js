@@ -56,16 +56,9 @@ function rotationConfig(root) {
   return merged;
 }
 
+// #448 follow-up: the store's day-file order (archived and unarchived days by name), not a sort by full path.
 function listEventFiles(root) {
-  const eventsDir = path.join(asRoot(root), 'state', 'events');
-  const files = [];
-  for (const directory of [eventsDir, path.join(eventsDir, 'archive')]) {
-    if (!fs.existsSync(directory)) continue;
-    for (const name of fs.readdirSync(directory).filter((entry) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry))) {
-      files.push(path.join(directory, name));
-    }
-  }
-  return files.sort();
+  return workState.eventDayFiles(workState.paths(root));
 }
 
 function readEvents(root) {

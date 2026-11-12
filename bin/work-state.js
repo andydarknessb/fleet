@@ -280,9 +280,9 @@ function eventFile(p, timestamp) {
   return path.join(p.events, `${String(timestamp).slice(0, 10)}.jsonl`);
 }
 
-// Unarchived days live in state/events/, archived ones in state/events/archive/. `online` reads only the
-// former; lineage checks read both. Days sort by file name, so an archived day precedes a later one (#448).
-function eventLines(p, { online = false } = {}) {
+// Unarchived days live in state/events/, archived ones in state/events/archive/. `online` lists only the
+// former; lineage checks list both. Days sort by file name, so an archived day precedes a later one (#448).
+function eventDayFiles(p, { online = false } = {}) {
   if (!fs.existsSync(p.events)) return [];
   const files = [];
   for (const directory of online ? [p.events] : [p.events, path.join(p.events, 'archive')]) {
@@ -291,7 +291,11 @@ function eventLines(p, { online = false } = {}) {
       files.push(path.join(directory, name));
     }
   }
-  files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+  return files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
+}
+
+function eventLines(p, { online = false } = {}) {
+  const files = eventDayFiles(p, { online });
   const events = [];
   for (const file of files) {
     const text = fs.readFileSync(file, 'utf8');
@@ -1870,6 +1874,7 @@ module.exports = {
   cli,
   createRecord,
   enteringEvent,
+  eventDayFiles, // #448 follow-up: rotation-policy lists the day files in the store's order
   getRecord,
   hasReservationEvidence,
   isForeignRecord,

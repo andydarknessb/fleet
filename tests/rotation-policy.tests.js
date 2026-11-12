@@ -55,6 +55,20 @@ test('offset counts events across live and archived files and tracks per-record 
   assert.equal(offset.files.length, 2);
 });
 
+// #448 follow-up: the day files come back in date order, archived before unarchived, the way the store reads them.
+test('offset lists an archived day before a later unarchived one', () => {
+  const root = rootDir();
+  write(root, 'state/events/2026-09-01.jsonl',
+    eventLine({ recordId: 'endzone:issue-1', sequence: 1, at: '2026-09-01T10:00:00.000Z' }));
+  write(root, 'state/events/archive/2026-08-01.jsonl',
+    eventLine({ recordId: 'endzone:issue-9', sequence: 4, at: '2026-08-01T10:00:00.000Z' }));
+  const offset = policy.captureOffset({ root, now: NOW });
+  assert.deepEqual(offset.files.map((entry) => entry.file), [
+    path.join('state', 'events', 'archive', '2026-08-01.jsonl'),
+    path.join('state', 'events', '2026-09-01.jsonl'),
+  ]);
+});
+
 test('offset skips a torn trailing line instead of failing', () => {
   const root = rootDir();
   write(root, 'state/events/2026-09-01.jsonl',
