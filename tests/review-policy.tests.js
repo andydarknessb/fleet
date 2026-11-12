@@ -396,6 +396,71 @@ test('#445 review: a hunk whose added content opens with ++ b/ is not a file hea
   assert.equal(destructive.matches[0].file, 'src/p.sql', 'attributed to the real file, not the prose path');
 });
 
+test('#445 round 2: a +DROP TABLE line the header count does not cover is still read: the third added line of a +1 hunk trips the real file', () => {
+  const diffText = [
+    'diff --git a/src/p.sql b/src/p.sql',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/p.sql',
+    '@@ -0,0 +1 @@',
+    '+SELECT 1;',
+    '+SELECT 2;',
+    '+DROP TABLE t;',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires');
+  assert.equal(destructive.matches[0].file, 'src/p.sql');
+});
+
+test('#445 round 2: a hunk header of +0,0 followed by +DROP TABLE still trips the real file', () => {
+  const diffText = [
+    'diff --git a/src/p.sql b/src/p.sql',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/p.sql',
+    '@@ -0,0 +0,0 @@',
+    '+DROP TABLE t;',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires');
+  assert.equal(destructive.matches[0].file, 'src/p.sql');
+});
+
+test('#445 round 2: a --- and +++ pair with no hunk header still reads the added lines that follow it', () => {
+  const diffText = ['--- /dev/null', '+++ b/src/p.sql', '+DROP TABLE t;'].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['src/p.sql']);
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires');
+  assert.equal(destructive.matches[0].file, 'src/p.sql');
+});
+
+test('#445 round 2: a bare +DROP TABLE line given with a file list still trips the destructive trigger', () => {
+  const classification = classifyChange({ files: ['src/p.sql'], diffText: '+DROP TABLE t;\n', tenant: TENANT });
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires on the bare added line');
+});
+
+test('#445 round 2: a +++ b/ line after a hunk count runs out is content, not a file header: the destructive line after it still trips the real file', () => {
+  const diffText = [
+    'diff --git a/src/p.sql b/src/p.sql',
+    'new file mode 100644',
+    '--- /dev/null',
+    '+++ b/src/p.sql',
+    '@@ -0,0 +1 @@',
+    '+SELECT 1;',
+    '+++ b/docs/x.md',
+    '+DROP TABLE t;',
+  ].join('\n');
+  const classification = classifyChange({ diffText, tenant: TENANT });
+  assert.deepEqual(classification.files, ['src/p.sql']);
+  const destructive = classification.triggers.find((trigger) => trigger.class === 'destructive');
+  assert.ok(destructive, 'the destructive pattern fires');
+  assert.equal(destructive.matches[0].file, 'src/p.sql', 'attributed to the real file, not the prose path');
+});
+
 test('#445 review: a prose file renamed to a code file that holds DROP TABLE trips the destructive trigger: the diff is made without renames', () => {
   const root = rootDir();
   const repo = path.join(root, 'repo');
@@ -445,6 +510,7 @@ test('#445 review: a head equal to its base changes nothing: classifyFromGit cla
   assert.deepEqual(classification.files, []);
   assert.deepEqual(classification.triggers, []);
   assert.equal(classification.tier, 'trivial');
+  assert.equal(classification.emptyChange, true, 'the answer says why it has no files');
 });
 
 test('#445 review: a --files entry in git\'s quoted form is unquoted before it is matched', () => {
@@ -2208,6 +2274,34 @@ test('#445 review: a git failure while a formal record classifies its head write
   assert.equal(calls.length, 0, 'no status was posted');
 });
 
+test('#445 round 2: a differently-cased tenant in a record id is the same record: a risk and a formal record land in the canonical one', () => {
+  const root = rootDir();
+  const revision = seedRecord(root, { state: 'implementing' });
+  const risk = recordReviewArtifact({
+    root, recordId: 'Endzone:issue-42', expectedRevision: revision, kind: 'risk', headSha: sha40('aaa1111'), actor: 'ic-42',
+    classification: RISK, findings: [], noFindings: 'examined the accessibility angle; nothing to fix',
+    idempotencyKey: 'risk-cased', now: '2026-11-12T10:00:00.000Z',
+  });
+  assert.equal(risk.artifact, 'state/reviews/endzone_issue-42/risk-001.json');
+  let current = risk.result.revision;
+  ['pr-open', 'ci-wait', 'review'].forEach((to, index) => {
+    current = workState.transitionRecord({
+      root, id: 'endzone:issue-42', to, expectedRevision: current, idempotencyKey: `cased-${to}`,
+      actor: 'test', evidence: 'seed', now: `2026-11-12T10:0${2 + index}:00.000Z`,
+    }).revision;
+  });
+  const formal = recordReviewArtifact({
+    root, recordId: 'ENDZONE:issue-42', expectedRevision: current, kind: 'formal', headSha: sha40('bbb2222'), actor: 'project-lead',
+    classification: { tier: 'normal', triggers: [] }, findings: [{ file: 'src/a.js', claim: 'x', severity: 'nit', category: 'style' }],
+    idempotencyKey: 'formal-cased', now: '2026-11-12T10:01:00.000Z',
+  });
+  assert.equal(formal.artifact, 'state/reviews/endzone_issue-42/formal-001.json');
+  const record = workState.getRecord({ root, id: 'endzone:issue-42' });
+  assert.equal(record.review.risk.artifact, risk.artifact);
+  assert.equal(record.review.formal.artifact, formal.artifact);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'state', 'reviews')), ['endzone_issue-42'], 'one directory, under the canonical name');
+});
+
 test('#445 review: a formal record at a head its base already holds is not refused for that: the change is empty and nothing triggers', () => {
   const root = rootDir();
   const revision = seedRecord(root);
@@ -2755,6 +2849,53 @@ test('#446 review: a second attestation of the same sha under another pull reque
   const settled = attest(8, { noFindings: 'the blocker is fixed at this head' }, { resolutions: { 'attest-001-f1': 'resolved' }, now: '2026-11-12T10:06:00.000Z' });
   assert.equal(settled.status.state, 'success', 'the open blocker is settled, so the status follows the new artifact');
   assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).priorArtifact, blocked.artifact);
+});
+
+test('#446 round 2: a differently-cased --tenant is the same tenant: an attestation under Endzone or ENDZONE is refused as the same-case call is, for the same PR and for another PR at the same sha', () => {
+  const { root, head, calls, gh, artifact } = attestFixture();
+  const attest = (tenantName, prNumber, content, extra = {}) => attestPullRequest({ root, tenantName, prNumber, headSha: head, artifactPath: artifact(content), actor: 'cory', gh, ...extra });
+  attest('endzone', 1601, { findings: [{ file: 'a.js', claim: 'x', severity: 'blocker', category: 'correctness' }] });
+  for (const tenantName of ['endzone', 'Endzone', 'ENDZONE']) {
+    for (const prNumber of [1601, 1602]) {
+      assert.throws(
+        () => attest(tenantName, prNumber, { noFindings: 'clean' }),
+        (error) => error.code === 'UNRESOLVED_FINDINGS_UNACCOUNTED' && error.message.includes('attest-001-f1'),
+        `${tenantName} on PR ${prNumber}`,
+      );
+    }
+  }
+  assert.equal(statusCalls(calls).length, 1, 'no refused attestation posted a status');
+  assert.deepEqual(fs.readdirSync(path.join(root, 'state', 'reviews')), ['endzone_pr-1601'], 'no directory was made under a cased name');
+  const settled = attest('ENDZONE', 1602, { noFindings: 'the blocker is fixed at this head' }, { resolutions: { 'attest-001-f1': 'resolved' } });
+  assert.equal(settled.artifact, 'state/reviews/endzone_pr-1602/attest-001.json', 'written under the canonical directory');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, settled.artifact), 'utf8')).tenant, 'endzone');
+});
+
+test('#446 round 2: a zero-byte attestation file in a tenant directory is skipped: an attestation for another PR at the sha still goes through', () => {
+  const { root, head, gh, artifact } = attestFixture();
+  const directory = path.join(root, 'state', 'reviews', 'endzone_pr-9');
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'attest-001.json'), '');
+  const attested = attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: artifact({ noFindings: 'clean' }), actor: 'cory', gh });
+  assert.equal(attested.artifact, 'state/reviews/endzone_pr-1601/attest-001.json');
+  assert.equal(attested.status.state, 'success');
+});
+
+test('#446 round 2: an attestation file that does not parse is refused ATTESTATION_UNREADABLE, exit 2, naming the file, and nothing is written', () => {
+  const { root, head, gh, artifact } = attestFixture();
+  const directory = path.join(root, 'state', 'reviews', 'endzone_pr-9');
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(path.join(directory, 'attest-001.json'), '{"tenant": "endzone", "headSha": ');
+  const clean = artifact({ noFindings: 'clean' });
+  assert.throws(
+    () => attestPullRequest({ root, tenantName: 'endzone', prNumber: 1601, headSha: head, artifactPath: clean, actor: 'cory', gh }),
+    (error) => error.code === 'ATTESTATION_UNREADABLE' && error.path === 'state/reviews/endzone_pr-9/attest-001.json' && error.message.includes('endzone_pr-9/attest-001.json'),
+  );
+  assert.equal(fs.existsSync(path.join(root, 'state', 'reviews', 'endzone_pr-1601')), false, 'nothing was written');
+  const bin = path.join(__dirname, '..', 'bin', 'review-policy.js');
+  const run = spawnSync(process.execPath, [bin, 'attest', '--root', root, '--tenant', 'endzone', '--pr', '1601', '--head', head, '--artifact', clean], { encoding: 'utf8', windowsHide: true });
+  assert.equal(run.status, 2, run.stderr);
+  assert.equal(JSON.parse(run.stderr).code, 'ATTESTATION_UNREADABLE');
 });
 
 test('#116: the binary attests, refuses unknown flags as USAGE, and exits 3 when the post fails', () => {

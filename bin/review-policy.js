@@ -159,6 +159,7 @@ function parseDiffText(diffText) {
   let currentFile = null;
   let changedLines = 0;
   let hunk = null; // lines still to come in the current hunk: { old, new }, or { combined: true }
+  let previousHeader = ''; // the last line read outside a hunk: a `+++` is a file header only right after `--- ` or `diff `
   const addLine = (content) => {
     if (!addedByFile.has(currentFile)) addedByFile.set(currentFile, []);
     addedByFile.get(currentFile).push(content);
@@ -175,6 +176,8 @@ function parseDiffText(diffText) {
       continue;
     }
     hunk = null;
+    const afterHeader = /^(?:--- |diff )/.test(previousHeader);
+    previousHeader = line;
     const hunkHeader = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
     if (hunkHeader) { hunk = { old: Number(hunkHeader[1] ?? 1), new: Number(hunkHeader[2] ?? 1) }; continue; }
     if (line.startsWith('@@@')) { hunk = { combined: true }; continue; }
@@ -184,7 +187,7 @@ function parseDiffText(diffText) {
       paths.add(unquoteGitPath(line.replace(/^diff --(?:cc|combined) /, '')));
       continue;
     }
-    if (line.startsWith('+++ ')) {
+    if (line.startsWith('+++ ') && afterHeader) {
       currentFile = headerName(line.slice(4), RIGHT_PREFIX);
       if (currentFile !== null) {
         paths.add(currentFile);
@@ -204,7 +207,11 @@ function parseDiffText(diffText) {
         const name = headerName(raw, prefix);
         if (name !== null) paths.add(name);
       }
+      continue;
     }
+    // #445 round 2: a +/- line no counted hunk claims is content of the current file, so a hunk whose count is short or
+    // missing cannot hide what it adds. Over-matching never hides a trigger.
+    if (line.startsWith('+')) { changedLines += 1; addLine(line.slice(1)); } else if (line.startsWith('-')) changedLines += 1;
   }
   return { paths: [...paths], addedByFile, changedLines };
 }
@@ -313,7 +320,10 @@ function classifyFromGit(options = {}) {
   // An empty listing with an empty diff is a true answer, no file changed, so it classifies with no files and no trigger.
   // The refusal of an empty diff is for a diff text a caller supplied, which is the one case this is not (#445).
   const emptyChange = files.length === 0 && diffText === '';
-  return { headSha, classification: classifyChange(emptyChange ? { files, changedLines: 0, tenant, config } : { files, diffText, tenant, config }) };
+  if (emptyChange) {
+    return { headSha, classification: { ...classifyChange({ files, changedLines: 0, tenant, config }), emptyChange: true } };
+  }
+  return { headSha, classification: classifyChange({ files, diffText, tenant, config }) };
 }
 
 // --- findings artifacts ---
@@ -619,6 +629,25 @@ function tenantFor(root, name) {
   return loadTenant(root, name);
 }
 
+// #445 round 2: a tenant has one name. `--tenant Endzone` opens tenants/endzone.json on NTFS, but the record ids, the
+// review and attestation directories and work-state's record keys are built from the name as it was typed. So the door
+// takes the name the tenant's file declares, once, and every path and comparison uses that; a file that declares none
+// answers the requested name lowercased.
+function canonicalTenantName(config, requested) {
+  const declared = config && typeof config.name === 'string' ? config.name.trim() : '';
+  return declared || String(requested).toLowerCase();
+}
+
+// The record id with its tenant part canonical. An id whose tenant has no file is left as it was given.
+function canonicalRecordId(root, recordId) {
+  const id = String(recordId);
+  const colon = id.indexOf(':');
+  if (colon <= 0) return id;
+  const requested = id.slice(0, colon);
+  const config = tenantFor(root, requested);
+  return config ? `${canonicalTenantName(config, requested)}${id.slice(colon)}` : id;
+}
+
 // The status API wants the full SHA; a head recorded before fleet#67 may be
 // abbreviated, so it is expanded in the tenant repo when that repo answers.
 function fullSha(sha, repoPath, git) {
@@ -684,7 +713,7 @@ function postReviewStatus({ root, tenant, headSha, artifact, artifactPath, gh, n
 
 function repostReviewStatus(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId } = options;
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId) throw new ReviewPolicyError('USAGE', '--repost needs --id <record>');
   const record = workState.getRecord({ root, id: recordId });
   const formal = record.review?.formal;
@@ -711,6 +740,18 @@ function repostReviewStatus(options = {}) {
 // #446 (#445 review): the newest attestation at one head across the tenant's pull requests, the prior a further
 // attestation of that head accounts for. The status is per sha, so the same sha under another PR number is the same
 // review; newest is by the artifact's `at`, ties by its path.
+// #445 round 2: a zero-byte file is an artifact a crash left behind (writeArtifactExclusive takes the name before it
+// writes); it holds no finding and is skipped. A file that does not parse might hold the blocker, so it refuses.
+function readAttestation(root, relative) {
+  const file = path.join(path.resolve(root || DEFAULT_ROOT), relative);
+  if (fs.statSync(file).size === 0) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new ReviewPolicyError('ATTESTATION_UNREADABLE', `${relative} is not readable JSON (${error.message}); it might hold the open finding that blocks this attestation, so nothing is attested (#445 review)`, { path: relative });
+  }
+}
+
 function latestAttestAt(root, tenantName, headSha) {
   const reviews = path.join(path.resolve(root || DEFAULT_ROOT), 'state', 'reviews');
   if (!fs.existsSync(reviews)) return null;
@@ -721,7 +762,7 @@ function latestAttestAt(root, tenantName, headSha) {
     for (const name of fs.readdirSync(path.join(reviews, directory))) {
       if (!/^attest-\d{3}\.json$/.test(name)) continue;
       const relative = path.posix.join('state', 'reviews', directory, name);
-      const data = readArtifact(root, relative);
+      const data = readAttestation(root, relative);
       if (!data || data.tenant !== tenantName || data.headSha !== headSha) continue;
       const key = `${data.at || ''}\u0000${relative}`;
       if (!newest || key > newest.key) newest = { key, data, path: relative };
@@ -771,16 +812,19 @@ function readAttestArtifact(file) {
 
 function attestPullRequest(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { tenantName, headSha, artifactPath, actor } = options;
+  const { headSha, artifactPath, actor } = options;
+  const requestedTenant = options.tenantName;
   const prNumber = Number(options.prNumber);
-  if (!tenantName || tenantName === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
+  if (!requestedTenant || requestedTenant === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --tenant <name>');
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new ReviewPolicyError('USAGE', 'attest needs --pr <number>');
   if (!headSha || headSha === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --head <sha>');
   requireFullSha(headSha, '--head');
   if (!artifactPath || artifactPath === 'true') throw new ReviewPolicyError('USAGE', 'attest needs --artifact <path>');
-  const tenantFile = path.join(root, 'tenants', `${tenantName}.json`);
-  if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${tenantName}': ${tenantFile} does not exist`);
-  const tenant = loadTenant(root, tenantName);
+  const tenantFile = path.join(root, 'tenants', `${requestedTenant}.json`);
+  if (!fs.existsSync(tenantFile)) throw new ReviewPolicyError('USAGE', `unknown tenant '${requestedTenant}': ${tenantFile} does not exist`);
+  const tenant = loadTenant(root, requestedTenant);
+  // #445 round 2: the tenant's canonical name, once at the door: the paths and the comparisons below all use it.
+  const tenantName = canonicalTenantName(tenant, requestedTenant);
   if (typeof tenant.reviewStatus !== 'string' || !tenant.reviewStatus.trim()) {
     throw new ReviewPolicyError('NO_REVIEW_STATUS', `tenant ${tenantName} names no reviewStatus; there is no status to attest`);
   }
@@ -995,7 +1039,9 @@ function afterFormalRecorded({ root, recordId, record, headSha, verifiedRepo, wr
 
 function recordReviewArtifact(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId, kind, headSha, actor } = options;
+  const { kind, headSha, actor } = options;
+  // The tenant part of the id is canonical before anything is read or written: work-state keys records by the exact id.
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
   requireFullSha(headSha, '--head-sha');
   if (!['formal', 'risk'].includes(kind)) throw new ReviewPolicyError('INVALID_REVIEW_KIND', `unknown review kind '${kind}'`);
@@ -1248,7 +1294,8 @@ function recordReviewArtifact(options = {}) {
 
 function planRereview(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId, headSha } = options;
+  const { headSha } = options;
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId || !headSha) throw new ReviewPolicyError('USAGE', 'recordId and headSha are required');
   const record = workState.getRecord({ root, id: recordId });
   const prior = record.review?.formal;
@@ -1268,7 +1315,8 @@ function planRereview(options = {}) {
 
 function holdRecord(options = {}) {
   const root = path.resolve(options.root || DEFAULT_ROOT);
-  const { recordId, reason, actor } = options;
+  const { reason, actor } = options;
+  const recordId = options.recordId ? canonicalRecordId(root, options.recordId) : options.recordId;
   if (!recordId || !reason) throw new ReviewPolicyError('USAGE', 'recordId and reason are required');
   const key = options.idempotencyKey || `hold:${recordId}`;
   const result = workState.transitionRecord({
@@ -1352,10 +1400,11 @@ function classifyCli(rest) {
   // construction, not an answer.
   if (!args.tenant || args.tenant === 'true') throw usage('--tenant <name> is required');
   const tenant = loadTenant(root, args.tenant);
+  const tenantName = canonicalTenantName(tenant, args.tenant);
   const carveOuts = Array.isArray(tenant.carveOuts) ? tenant.carveOuts.length : 0;
   const triggers = tenant.riskTriggers && typeof tenant.riskTriggers === 'object' ? Object.keys(tenant.riskTriggers).length : 0;
   if (carveOuts === 0 && triggers === 0) {
-    throw new ReviewPolicyError('EMPTY_TENANT', `tenant "${args.tenant}" declares no carveOuts and no riskTriggers; a classification against it could only ever answer riskReview:false`);
+    throw new ReviewPolicyError('EMPTY_TENANT', `tenant "${tenantName}" declares no carveOuts and no riskTriggers; a classification against it could only ever answer riskReview:false`);
   }
   const config = loadConfig(root);
   if (args.repo) {
@@ -1493,7 +1542,7 @@ if (require.main === module) {
     // INVALID_FINDING (#117) likewise: the finding and the allowed values are named.
     // STALE_HEAD, INVALID_ARTIFACT and NO_REVIEW_STATUS (#116, attest) likewise.
     // PR_HEAD_UNREADABLE is a failed call (gh did not answer), exit 1.
-    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'FULL_SHA_REQUIRED', 'TENANT_BASE_UNKNOWN', 'TENANT_BASE_MISSING', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
+    process.exitCode = ['USAGE', 'EMPTY_TENANT', 'INVALID_REVIEW_STATE', 'EMPTY_FINDINGS', 'FINDING_CARRIES_OUTCOME', 'REVIEWED_SHA_MISMATCH', 'FULL_SHA_REQUIRED', 'TENANT_BASE_UNKNOWN', 'TENANT_BASE_MISSING', 'ATTESTATION_UNREADABLE', 'RISK_REVIEW_MISSING', 'RULING_REQUIRED', 'UNKNOWN_COMMIT', 'TENANT_REPO_UNKNOWN', 'INVALID_FINDING', 'STALE_HEAD', 'INVALID_ARTIFACT', 'NO_REVIEW_STATUS'].includes(error.code) ? 2 : 1;
   }
 }
 
