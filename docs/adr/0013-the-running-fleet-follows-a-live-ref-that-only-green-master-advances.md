@@ -40,7 +40,7 @@ tickets still go to Cory's sessions.
 - A red `master` stops deploys and nothing else. The fleet keeps running the
   last commit that passed.
 - The known contention flake (the work-state mutex test under a parallel run)
-  means the aggregate runner runs suites one at a time per host.
+  means the aggregate runner runs one suite at a time per host.
   Status note: #234 found the flake is a Windows lock race (EPERM on a delete-pending
   lock file) that reproduces serially, not only under load; the work-state lock now
   waits it out. The one-suite-at-a-time rule still stands.
