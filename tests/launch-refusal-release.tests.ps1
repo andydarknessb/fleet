@@ -99,19 +99,21 @@ try {
   #   state:<s>    = move the Work record MOCK_GH_RECORD_ID to state <s> in MOCK_GH_ACTIVE_PATH
   #   revision:<n> = keep it `assigned` but at revision <n>
   #   missing      = delete the record from active.json (the shape after a release that archived it)
+  #   manifestPath:<p> = point the record's manifestPath at <p> (a manifest it was not reserved with) (fleet #437)
   $mutateLines = @(
     "'use strict';",
     "const fs = require('fs');",
     "module.exports = function applyMutation() {",
     "  const mutate = process.env.MOCK_GH_MUTATE || '';",
     "  if (mutate === 'marker') fs.writeFileSync(process.env.MOCK_GH_MARKER_PATH, JSON.stringify({ schemaVersion: 1, manifestId: 'mock', invalidatedAt: '2026-09-30T00:00:00.000Z', reason: 'mock release in the window' }));",
-    "  if (/^(state|revision):/.test(mutate) || mutate === 'missing') {",
+    "  if (/^(state|revision|manifestPath):/.test(mutate) || mutate === 'missing') {",
     "    const file = process.env.MOCK_GH_ACTIVE_PATH;",
     "    const active = JSON.parse(fs.readFileSync(file, 'utf8'));",
     "    const id = process.env.MOCK_GH_RECORD_ID;",
     "    const [kind, value] = mutate.split(':');",
     "    if (kind === 'missing') delete active.records[id];",
     "    else if (kind === 'state') active.records[id].state = value;",
+    "    else if (kind === 'manifestPath') active.records[id].manifestPath = value;",
     "    else active.records[id].revision = Number(value);",
     "    fs.writeFileSync(file, JSON.stringify(active));",
     "  }",
@@ -290,6 +292,11 @@ try {
   $c10 = Test-LateRefusal 29 'revision:7' 'agents' 'movedtorevision7' 'revision case'
   Assert-True ((Get-RecordState 29) -eq 'assigned' -and (Get-Record 29).revision -eq 7 -and -not (Get-Marker $c10.Manifest)) 'revision case: record untouched, no marker written by the launch'
 
+  # fleet #437: still `assigned` at the manifest's revision but now naming another manifest (a re-reservation landed
+  # just before claude --bg): the late re-check refuses it, and the launch releases and writes nothing.
+  $c31 = Test-LateRefusal 31 'manifestPath:other.json' 'agents' 'nolongernamesthismanifest' 'manifest-path case'
+  Assert-True ((Get-RecordState 31) -eq 'assigned' -and (Get-Record 31).revision -eq $c31.Before.revision -and (Get-Record 31).manifestPath -eq 'other.json' -and -not (Get-Marker $c31.Manifest)) 'manifest-path case: record untouched, no marker written by the launch'
+
   # Case 12 (the early check): the record is already `assigned` at another revision than the manifest reserved
   # (a lead's escalate -> assigned round trip bumps it on the same manifest). Refused before any gh call, fetch or
   # worktree work, with no release.
@@ -306,6 +313,22 @@ try {
   Assert-True (-not (Test-Path "$testRoot\gh-calls.log")) 'the early revision check refuses before any gh call'
   Assert-True ((Get-BgCalls) -eq 0 -and -not (Test-Path "$repoPath\.claude\worktrees\ic-34-assignment") -and -not (Invoke-Git @('branch', '--list', 'fleet/*34*'))) 'the early revision check creates no worktree and calls no claude --bg'
   Assert-True ((Get-RecordState 34) -eq 'assigned' -and (Get-Record 34).revision -eq ($manifestRevision + 2) -and -not (Get-Marker $m34)) 'the early revision check releases nothing and writes no marker'
+
+  # fleet #437: the launch door starts only the manifest its Work record was reserved with. A byte copy of a reserved
+  # manifest at another path is refused by the early check (no release, no marker, no claude --bg), and the real
+  # manifest for the same record still passes the record checks (a dry run reaches its success output).
+  Clear-ActiveRecords
+  $m36 = Reserve-Manifest 36 $baseSha
+  $copy36 = "$testRoot\copy-36.json"
+  Copy-Item $m36 $copy36
+  $revision36 = (Get-Record 36).revision
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $copy36, '-WorkRecordId', 'test:issue-36'))
+  Assert-True ($lastExit -eq 4 -and $lastFlat -match 'wasnotreservedwithmanifest') "a copy of a reserved manifest is refused by the early check (exit 4, naming the reservation): exit $lastExit $lastOut"
+  Assert-True ((Get-RecordState 36) -eq 'assigned' -and (Get-Record 36).revision -eq $revision36 -and -not (Get-Marker $copy36) -and -not (Get-Marker $m36)) 'the copy refusal leaves the record assigned at its revision, with no marker on either file'
+  Assert-True ((Get-BgCalls) -eq 0) 'a copy of a reserved manifest never reaches claude --bg'
+  $r36 = Run-Launch @('-Manifest', $m36, '-WorkRecordId', 'test:issue-36', '-DryRun')
+  Assert-True ($lastExit -eq 0 -and $r36 -and $r36.dryRun -eq $true) "the real manifest for the same record passes the record checks: exit $lastExit $lastOut"
 
   # Case 11: the control. With nothing changed in the window the same launch reaches `claude --bg` (the
   # mock claude starts no session, so it then fails as it always did): the re-check does not refuse every launch.

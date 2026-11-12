@@ -166,6 +166,49 @@ test('assignment creates one immutable manifest and reserves a Work record', () 
   assert.throws(() => launchReservedAssignment({ root, manifestPath: result.manifestPath, workRecordId: manifest.workRecordId, dryRun: true }), (error) => error.code === 'ASSIGNMENT_ALREADY_ACKNOWLEDGED');
 });
 
+// fleet #437: the launch door starts only the manifest a Work record was reserved with. A hand-written
+// manifest for a record reserved with none, and a byte copy of a reserved manifest at another path, are
+// refused, and the refusal leaves the record and both files untouched (no invalidation sidecar).
+test('launch refuses a manifest the Work record was not reserved with', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-44', tenant: 'endzone', issue: 44, idempotencyKey: 'reserve-44', now: '2026-09-01T00:00:00.000Z' });
+  const before = getRecord({ root, id: 'endzone:issue-44' });
+  const handWritten = path.join(root, 'hand-written.json');
+  fs.writeFileSync(handWritten, `${JSON.stringify({ id: 'hand-44', workRecordId: 'endzone:issue-44', status: 'pending-ack', workRecordRevision: before.revision, issue: { number: 44 }, tenant: 'endzone' })}\n`);
+  assert.throws(() => launchReservedAssignment({ root, manifestPath: handWritten, workRecordId: 'endzone:issue-44', dryRun: true }), (error) => error.code === 'INVALID_LAUNCH');
+  const after = getRecord({ root, id: 'endzone:issue-44' });
+  assert.equal(after.state, 'assigned');
+  assert.equal(after.revision, before.revision);
+  assert.equal(fs.existsSync(`${handWritten}.invalidated.json`), false);
+
+  const reservedRoot = rootDir();
+  const result = reserveAssignment({
+    root: reservedRoot,
+    issue: issue(45),
+    tenant: 'endzone',
+    tenantConfig: { branchPrefix: 'fleet/', defaultBranch: 'integration' },
+    readyLabel: 'ready-for-agent',
+    base: { remote: 'origin', ref: 'integration', sha: 'a'.repeat(40) },
+    parent: 'pl-endzone',
+    model: 'haiku',
+    risk: 'standard',
+    tokenBudget: 25000,
+    contextHeadings: ['Draft workflow'],
+    adrPaths: ['docs/adr/0002-one-launch-door.md'],
+    testPlan: ['node --test tests/assignment.tests.js'],
+    ciGates: ['test-build'],
+    now: '2026-09-01T00:00:00.000Z',
+  });
+  const reserved = getRecord({ root: reservedRoot, id: 'endzone:issue-45' });
+  const copy = path.join(reservedRoot, 'copy.json');
+  fs.copyFileSync(result.manifestPath, copy);
+  assert.throws(() => launchReservedAssignment({ root: reservedRoot, manifestPath: copy, workRecordId: 'endzone:issue-45', dryRun: true }), (error) => error.code === 'INVALID_LAUNCH');
+  assert.deepEqual(getRecord({ root: reservedRoot, id: 'endzone:issue-45' }), reserved);
+  assert.equal(fs.existsSync(`${copy}.invalidated.json`), false);
+  assert.equal(fs.existsSync(`${result.manifestPath}.invalidated.json`), false);
+  assert.equal(launchReservedAssignment({ root: reservedRoot, manifestPath: result.manifestPath, workRecordId: 'endzone:issue-45', dryRun: true }).dryRun, true);
+});
+
 // fleet #426: an --adr-paths entry must be a file at the base the manifest records. The
 // tenant checkout is a real repo with one commit, and `head` is the base assign reads.
 function adrRepo(files) {

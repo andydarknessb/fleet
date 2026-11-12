@@ -95,6 +95,7 @@ $exitRows = @(
   @{ Anchor = 'no tenant file for'; Nth = 2; Decision = 'release' }
   @{ Anchor = 'is not assigned'; Decision = 'keep' }                            # the record is not ours to release
   @{ Anchor = 'but the manifest reserved revision'; Decision = 'keep' }         # fleet#264: assigned at another revision (escalate -> assigned round trip): not this manifest's reservation
+  @{ Anchor = 'was not reserved with'; Decision = 'keep' }                      # fleet #437: the record names another manifest (or none): not this manifest's reservation
   @{ Anchor = "at the tenant's maxIcs"; Decision = 'release' }
   @{ Anchor = 'assignment past the second requires'; Decision = 'release' }
   @{ Anchor = 'reason = \$icReason'; Decision = 'release' }                 # an IC on a model but Haiku 5.5, or at an effort but xhigh or max (fleet #350)

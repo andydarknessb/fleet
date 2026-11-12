@@ -1864,6 +1864,7 @@ module.exports = {
   reservationOverlaps,
   reservationValuesOverlap,
   reserveRecord,
+  samePath, // fleet #437: launchReservedAssignment checks the record names the manifest it launches
   shadowProject,
   transitionRecord,
   sendBackCount,
