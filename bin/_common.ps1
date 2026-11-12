@@ -2,7 +2,34 @@
 $script:FleetHome = Split-Path -Parent $PSScriptRoot
 $script:Utf8 = New-Object System.Text.UTF8Encoding $false
 function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null } }
-function Write-Json { param($Path, $Obj) [IO.File]::WriteAllText($Path, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8) }
+# fleet #449: the JSON is renamed over the target, so a reader sees the old file or the new one, never part of one.
+# A reader holding the target fails the rename (a sharing violation) for a moment: retried up to 2 s, since a reader holds
+# the file for milliseconds and the bound only stops a stuck one. Any other error throws at once.
+function Write-Json {
+  param($Path, $Obj)
+  $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+  try {
+    [IO.File]::WriteAllText($temporary, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8)
+    $giveUpAt = (Get-Date).AddSeconds(2)
+    while ($true) {
+      try {
+        # [NullString]::Value, not $null: PowerShell 5.1 passes $null as "" and File.Replace rejects an empty backup path.
+        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) } else { [IO.File]::Move($temporary, $Path) }
+        return
+      } catch {
+        # ERROR_SHARING_VIOLATION (32) is the held target; a directory target is IOException 0x800700B7 and throws at once.
+        $cause = $_.Exception
+        if ($cause.InnerException) { $cause = $cause.InnerException }
+        $held = ($cause -is [IO.IOException]) -and (($cause.HResult -band 0xFFFF) -eq 32)
+        if (-not $held -or (Get-Date) -ge $giveUpAt) { throw }
+        Start-Sleep -Milliseconds 25
+      }
+    }
+  } catch {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    throw
+  }
+}
 function Get-StaticRoster { Read-Json "$FleetHome\roster.json" }
 function Test-SentinelOff { Test-Path "$FleetHome\state\flags\sentinel-off" }
 # WS5 cutover (fleet #82, spec #194): while this flag stands the dispatcher is retired;

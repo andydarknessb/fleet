@@ -230,6 +230,16 @@ test('cli: a correct invocation still works, matching the direct call byte-for-b
   assert.deepEqual(viaCli.offset, direct.offset);
 });
 
+// fleet #449: a Digest write whose rename fails (the output path is a directory) leaves no temporary file behind.
+test('#449: a failed Digest write removes its temporary file', () => {
+  const root = rootDir();
+  walk(root, 1, ['pr-open', 'ci-wait', 'escalated']);
+  const output = path.join(root, 'blocked');
+  fs.mkdirSync(output);
+  assert.throws(() => projectDigest({ root, now: '2026-09-01T08:00:00.000Z', output }), /rename/);
+  assert.deepEqual(fs.readdirSync(root).filter((name) => name.endsWith('.tmp')), [], 'no temporary file is left beside the Digest output');
+});
+
 // Spec fleet #92 / #143: one line per tenant counting the open ready tickets with
 // no `## Premises`, read from the watchdog's triage shadow (stamped with its time).
 test('#143: the Triage section counts open ready tickets without a Premises section', () => {

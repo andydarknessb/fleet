@@ -247,8 +247,14 @@ function render({ scope, tenantNames, rows, events, exclusionsByTenant, triageBy
 function writeAtomic(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporary, content, 'utf8');
-  fs.renameSync(temporary, file);
+  try {
+    fs.writeFileSync(temporary, content, 'utf8');
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    // fleet #449: a failed write or rename leaves no temporary file beside the Digest.
+    try { fs.rmSync(temporary, { force: true }); } catch {}
+    throw error;
+  }
 }
 
 function projectDigest(options = {}) {
