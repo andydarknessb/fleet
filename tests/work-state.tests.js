@@ -669,14 +669,48 @@ function staleLock(root, content, ageMs = 10 * 60 * 1000) {
   return lock;
 }
 
-test('a stale lock with empty or partial content is broken instead of wedging every call', () => {
+// #447 follow-up (review): the 60 s rule has its own cases at 90 s, short of the 120 s age that breaks a lock
+// whatever its owner. The waits are bounded, so a rule that only breaks at 120 s fails here, not by the clock.
+function boundWaits(probe, message) {
+  probe.onWait = () => { if (probe.waits > 50) throw new Error(message); return 'timed-out'; };
+}
+
+test('a stale lock with empty or partial content is broken at once, short of the 120 s age', () => {
   for (const content of ['', '{"pid":']) {
     const root = rootDir();
     makeRecord(root);
-    const lock = staleLock(root, content);
-    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    const lock = staleLock(root, content, 90 * 1000);
+    withFsFault('statSync', () => null, (probe) => {
+      boundWaits(probe, 'waited on a 90 s lock with no owner pid');
+      assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+      assert.equal(probe.waits, 0, 'broken on the first try');
+    });
     assert.equal(fs.existsSync(lock), false);
   }
+});
+
+test('a stale lock whose owner pid is dead is broken at once, short of the 120 s age', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }), 90 * 1000);
+  withFsFault('statSync', () => null, (probe) => {
+    boundWaits(probe, 'waited on a 90 s lock whose owner is dead');
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.equal(probe.waits, 0, 'broken on the first try');
+  });
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('a stale lock whose owner pid is alive is not broken short of the 120 s age', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const lock = staleLock(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 90 * 1000);
+  withFsFault('openSync', countBreakerOpens, (probe) => {
+    probe.onWait = () => { if (probe.waits === 50) fs.rmSync(lock, { force: true }); return 'timed-out'; };
+    assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
+    assert.ok(probe.waits >= 50, `waits: ${probe.waits}`);
+    assert.equal(probe.breakerOpens, undefined, 'the breaker mutex was never opened for a live owner');
+  });
 });
 
 test('breaking a stale lock forgives a delete-pending removal that reports EPERM', () => {
@@ -741,8 +775,11 @@ test('breaking a stale lock forgives a lock that reads as EPERM', () => {
   // Under 120 s (#447): an older lock is broken on its age, so its owner is never read.
   const lock = staleLock(root, JSON.stringify({ pid: 2147483646, at: '2026-01-01T00:00:00.000Z' }), 90 * 1000);
   withFsFault('readFileSync', (target, probe) => (isLock(target) && probe.failures < 2 ? 'EPERM' : null), (probe) => {
+    boundWaits(probe, 'waited on a 90 s lock with a dead owner after its read was forgiven');
     assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
     assert.equal(probe.failures, 2);
+    // Each EPERM read is one wait; the third read finds the dead owner and breaks the lock.
+    assert.equal(probe.waits, 2);
   });
   assert.equal(fs.existsSync(lock), false);
 });
@@ -1037,15 +1074,30 @@ test('#448: the slot check reads only unarchived days, and a lineage check still
   assert.equal(lineageReads.includes(path.join(events, 'archive', '2026-07-01.jsonl')), true, 'the untouched-reservation lineage read still covers the archive');
 });
 
-test('#448: a new event never takes a (record, sequence) slot that an archived day holds', () => {
+// #448: the slot check reads only unarchived days, which is safe only if no door can start a fresh sequence-1
+// record over an id whose lineage is archived. Each door below is driven at that id and must refuse it.
+test('#448: no door starts a fresh record over an id whose lineage sits in an archived day', () => {
   const root = rootDir();
-  makeRecord(root, { now: '2026-07-01T00:00:00.000Z' });
+  // The whole lineage is on the July day: created as retiring, then retired, so the record and its day are archived.
+  makeRecord(root, { state: 'retiring', now: '2026-07-01T00:00:00.000Z' });
+  move(root, 'endzone:issue-42', 1, 'retired', 'retire', 'evidence archived', '2026-07-01T00:00:01.000Z');
   archiveOldDays(root);
-  move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'assignment acknowledged', '2026-09-01T00:00:01.000Z');
-  move(root, 'endzone:issue-42', 2, 'pr-open', 'pr', 'PR #77 opened', '2026-09-01T00:00:02.000Z');
-  // The archived day holds sequence 1; a slot check that scans only online days is safe because the
-  // record's own sequence never goes back over its lineage.
-  assert.deepEqual(readEvents(root).map((event) => event.sequence).sort((a, b) => a - b), [1, 2, 3]);
+  assert.equal(fs.existsSync(path.join(paths(root).events, 'archive', '2026-07-01.jsonl')), true);
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [{ name: 'ic-42', role: 'ic', tenant: 'endzone', issue: 42, status: 'active', sessionId: 's42' }] }));
+  const ledger = readEvents(root);
+
+  assert.throws(() => createRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, state: 'assigned', actor: 'test', idempotencyKey: 'fresh-create', now: '2026-09-01T00:00:01.000Z' }),
+    (error) => error.code === 'RECORD_ARCHIVED');
+  assert.throws(() => reserveRecord({ root, id: 'endzone:issue-42', tenant: 'endzone', issue: 42, manifestPath: 'm42', reservations: {}, idempotencyKey: 'fresh-reserve', now: '2026-09-01T00:00:02.000Z' }),
+    (error) => error.code === 'RECORD_ARCHIVED');
+  const projected = shadowProject({ root, rosterPath, now: '2026-09-01T00:00:03.000Z' });
+  assert.deepEqual(projected.projected, []);
+  assert.deepEqual(projected.skipped, [{ id: 'endzone:issue-42', name: 'ic-42', reason: 'archive' }]);
+
+  assert.deepEqual(readEvents(root), ledger, 'no refused door wrote an event, so no slot was taken');
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).state, 'retired');
 });
 
 // Ticket 05: review recording through the one state door.
@@ -2003,11 +2055,20 @@ test('#447: a lock older than 120 s is broken under the breaker mutex even when 
 test('#447: a lock younger than 120 s with a live owner is never broken', () => {
   const root = rootDir();
   makeRecord(root);
+  // Starts at 100 s and waits until the lock's own age, on the stubbed clock, reaches 119 s; only then does the
+  // holder let go. Counting waits would not do: the real time a wait takes is on the clock too.
   const lock = staleLock(root, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 100 * 1000);
   withFsFault('openSync', countBreakerOpens, (probe) => {
-    probe.onWait = () => { if (probe.waits === 50) fs.rmSync(lock, { force: true }); return 'timed-out'; };
+    probe.onWait = () => {
+      const age = Date.now() - Number(fs.statSync(lock, { bigint: true }).mtimeMs);
+      if (age >= 119 * 1000) {
+        probe.ageAtRelease = age;
+        fs.rmSync(lock, { force: true });
+      }
+      return 'timed-out';
+    };
     assert.equal(getRecord({ root, id: 'endzone:issue-42' }).revision, 1);
-    assert.ok(probe.waits >= 50, `waits: ${probe.waits}`);
+    assert.ok(probe.ageAtRelease >= 119 * 1000 && probe.ageAtRelease < 120 * 1000, `age at release: ${probe.ageAtRelease} ms after ${probe.waits} waits, breaker opens ${probe.breakerOpens}`);
     assert.equal(probe.breakerOpens, undefined, 'the breaker mutex was never opened for a young live lock');
   });
 });
@@ -2028,6 +2089,97 @@ test('#447: a caller that has waited 180 s throws LOCK_TIMEOUT naming the lock a
     assert.throws(() => getRecord({ root, id: 'endzone:issue-42' }), (error) => error.code === 'LOCK_TIMEOUT'
       && error.message.includes(lock) && error.waitedMs >= 180 * 1000 && error.waitedMs < 185 * 1000);
   });
+});
+
+// #447 follow-up: every file under state/ except the lock, read as text, so a refused write is provably absent.
+function stateFiles(root) {
+  const files = {};
+  const walk = (directory) => {
+    for (const name of fs.readdirSync(directory)) {
+      const file = path.join(directory, name);
+      if (fs.statSync(file).isDirectory()) walk(file);
+      else files[path.relative(root, file)] = fs.readFileSync(file, 'utf8');
+    }
+  };
+  walk(path.join(root, 'state'));
+  delete files[path.join('state', 'work', '.lock')];
+  return files;
+}
+
+// #447 follow-up: stands in for a breaker. Once the journal's rename completes, another holder takes the lock,
+// which is where a holder frozen inside commitMutation wakes up.
+function takeLockAfterJournal(lock, content) {
+  const rename = fs.renameSync;
+  let taken = false;
+  fs.renameSync = function swapping(from, to) {
+    const result = rename.call(this, from, to);
+    if (!taken && String(to).includes(`${path.sep}pending${path.sep}`)) {
+      taken = true;
+      fs.rmSync(lock, { force: true });
+      fs.writeFileSync(lock, content);
+    }
+    return result;
+  };
+  return () => { fs.renameSync = rename; };
+}
+
+test('#447 follow-up: a holder whose lock another holder took refuses its write with LOCK_LOST and writes nothing', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock } = paths(root);
+  const before = stateFiles(root);
+  const otherHolder = JSON.stringify({ pid: 2147483646, at: '2026-09-01T00:00:00.000Z' });
+  const restore = takeLockAfterJournal(lock, otherHolder);
+  try {
+    assert.throws(() => move(root, 'endzone:issue-42', 1, 'implementing', 'stale-ack', 'ack', '2026-09-01T00:00:01.000Z'),
+      (error) => error.code === 'LOCK_LOST' && error.message.includes(lock));
+  } finally {
+    restore();
+  }
+  assert.deepEqual(stateFiles(root), before, 'active.json, the ledger and every other state file are byte-identical');
+  assert.equal(fs.readFileSync(lock, 'utf8'), otherHolder, 'the other holder still has its lock');
+});
+
+test('#447 follow-up: a commit under its own lock still writes and releases the lock', () => {
+  const root = rootDir();
+  makeRecord(root);
+  assert.equal(move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'ack', '2026-09-01T00:00:01.000Z').record.state, 'implementing');
+  assert.equal(fs.existsSync(paths(root).lock), false);
+});
+
+test('#447 follow-up: the CLI exits 1 with LOCK_LOST on stderr when another holder took its lock', () => {
+  const root = rootDir();
+  makeRecord(root);
+  const { lock } = paths(root);
+  // The same take-over as takeLockAfterJournal, preloaded into the CLI child from a scratch directory.
+  const preload = path.join(rootDir(), 'take-lock.js');
+  fs.writeFileSync(preload, `const fs = require('node:fs');
+const path = require('node:path');
+const rename = fs.renameSync;
+let taken = false;
+fs.renameSync = function swapping(from, to) {
+  const result = rename.call(this, from, to);
+  if (!taken && String(to).includes(path.sep + 'pending' + path.sep)) {
+    taken = true;
+    fs.rmSync(process.env.TAKEN_LOCK, { force: true });
+    fs.writeFileSync(process.env.TAKEN_LOCK, '{"pid":2147483646,"at":"2026-01-01T00:00:00.000Z"}');
+  }
+  return result;
+};
+`);
+  const script = path.resolve(__dirname, '..', 'bin', 'work-state.js');
+  let failure;
+  try {
+    execFileSync(process.execPath, ['-r', preload, script, 'transition', '--root', root, '--id', 'endzone:issue-42', '--to', 'implementing',
+      '--expected-revision', '1', '--idempotency-key', 'stale-ack', '--now', '2026-09-01T00:00:01.000Z'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, TAKEN_LOCK: lock } });
+  } catch (error) { failure = error; }
+  assert.ok(failure, 'expected the CLI to refuse the write');
+  assert.equal(failure.status, 1);
+  assert.equal(JSON.parse(failure.stderr).code, 'LOCK_LOST');
+  // Read without the door: getRecord would wait out the other holder's lock, which is still there.
+  assert.equal(JSON.parse(fs.readFileSync(paths(root).active, 'utf8')).records['endzone:issue-42'].revision, 1, 'nothing was written');
+  assert.match(fs.readFileSync(lock, 'utf8'), /"pid":2147483646/, 'the other holder still has its lock');
 });
 
 test('#235: a contender stalled after judging the lock stale re-judges it under the breaker mutex', async () => {

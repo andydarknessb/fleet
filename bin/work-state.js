@@ -142,8 +142,8 @@ function sleepBriefly() {
   Atomics.wait(new Int32Array(buffer), 0, 0, LOCK_WAIT_MS);
 }
 
-// #235: only remove a lock file if it is still the file this holder created. Under the breaker mutex a live
-// lock is never moved or removed by anyone else, so the stat-then-rm gap here has no actor.
+// #235: only remove a lock file this holder created. A holder past LOCK_FORCE_BREAK_MS is an actor (#447), so this
+// stat-then-rm gap is not closed; assertLockHeld guards the holder's writes instead.
 function releaseLock(file, handle) {
   let mine = false;
   try { mine = fs.fstatSync(handle, { bigint: true }).ino === fs.statSync(file, { bigint: true }).ino; } catch {}
@@ -170,6 +170,19 @@ function breakable(file) {
   } catch (error) {
     if (['ENOENT', 'EPERM', 'EBUSY'].includes(error.code)) return false;
     throw error;
+  }
+}
+
+// #447 follow-up: a holder frozen past LOCK_FORCE_BREAK_MS can wake after its lock was broken and retaken, and
+// its stale copy would roll every writer back. Before each write under the lock, one stat confirms the lock on
+// disk is still the file this holder created (the file-id test releaseLock uses); if not, nothing is written.
+// A stat that fails counts as lost, which refuses the write rather than risking a stale one.
+function assertLockHeld(p) {
+  if (p.lockIno === undefined) return; // not taken through withLock: a direct appendEvent call, as tests make
+  let ino = null;
+  try { ino = fs.statSync(p.lock, { bigint: true }).ino; } catch {}
+  if (ino !== p.lockIno) {
+    throw new WorkStateError('LOCK_LOST', `the state lock at ${p.lock} was broken and taken by another holder; the write was refused`, { lock: p.lock });
   }
 }
 
@@ -231,6 +244,7 @@ function withLock(root, callback) {
       let removed = false;
       try {
         fs.writeFileSync(breakHandle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+        // Gap, not closed (#447 follow-up): the lock can be released and retaken between this re-judgement and the rm.
         if (breakable(p.lock)) {
           fs.rmSync(p.lock, { force: true });
           removed = true;
@@ -252,6 +266,8 @@ function withLock(root, callback) {
     }
     try {
       fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), 'utf8');
+      // #447 follow-up: the file id this holder created, which assertLockHeld compares before every write.
+      p.lockIno = fs.fstatSync(handle, { bigint: true }).ino;
     } catch (error) {
       releaseLock(p.lock, handle);
       throw error;
@@ -259,7 +275,10 @@ function withLock(root, callback) {
     break;
   }
   try {
-    if (!fs.existsSync(p.active)) writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
+    if (!fs.existsSync(p.active)) {
+      assertLockHeld(p);
+      writeAtomicJson(p.active, { schemaVersion: 1, records: {} });
+    }
     recoverPendingUnlocked(p);
     archiveExpiredEvents(p, new Date().toISOString());
     return callback(p);
@@ -307,6 +326,7 @@ function eventLines(p, { online = false } = {}) {
       } catch {
         if (index !== lines.length - 1 || text.endsWith('\n')) throw new WorkStateError('CORRUPT_EVENT_LOG', `invalid event JSON in ${file}`);
         const lastNewline = text.lastIndexOf('\n');
+        assertLockHeld(p);
         fs.writeFileSync(file, text.slice(0, lastNewline + 1), 'utf8');
         break;
       }
@@ -341,6 +361,7 @@ function archiveExpiredEvents(p, now) {
   for (const file of fs.readdirSync(p.events).filter((name) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))) {
     const date = new Date(`${file.slice(0, 10)}T23:59:59.999Z`).getTime();
     if (date >= cutoff) continue;
+    assertLockHeld(p);
     fs.mkdirSync(archiveDir, { recursive: true });
     fs.renameSync(path.join(p.events, file), path.join(archiveDir, file));
   }
@@ -394,6 +415,7 @@ function appendLedgerRow(file, row) {
 
 function appendEvent(p, event) {
   if (checkEventSlot(p, event)) return;
+  assertLockHeld(p);
   fs.mkdirSync(path.dirname(eventFile(p, event.at)), { recursive: true });
   fs.appendFileSync(eventFile(p, event.at), `${JSON.stringify(event)}\n`, 'utf8');
 }
@@ -453,6 +475,7 @@ function recordEventFiles(p, record) {
 }
 
 function archiveRecord(p, record) {
+  assertLockHeld(p);
   writeAtomicJson(archiveFile(p, record.id), {
     schemaVersion: 1,
     archivedAt: record.updatedAt,
@@ -463,6 +486,7 @@ function archiveRecord(p, record) {
 }
 
 function storeReleasedRecord(p, record) {
+  assertLockHeld(p);
   writeAtomicJson(releaseFile(p, record.id), {
     schemaVersion: 1,
     releasedAt: record.updatedAt,
@@ -473,6 +497,7 @@ function storeReleasedRecord(p, record) {
 }
 
 function storeAbandonedRecord(p, record) {
+  assertLockHeld(p);
   writeAtomicJson(abandonFile(p, record.id), {
     schemaVersion: 1,
     abandonedAt: record.updatedAt,
@@ -497,6 +522,7 @@ function preserveReusableSnapshot(p, reusable) {
     throw new WorkStateError(missingCode, `reusable ${reusable.kind} snapshot for '${reusable.record.id}' disappeared`);
   }
   if (fs.existsSync(destination)) throw new WorkStateError(historyCode, `reusable ${reusable.kind} history already exists for '${reusable.record.id}' sequence ${reusable.record.eventSequence}`);
+  assertLockHeld(p);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.renameSync(source, destination);
 }
@@ -581,6 +607,7 @@ function recoverPendingUnlocked(p) {
       fs.mkdirSync(collidedDir, { recursive: true });
       // A unique name: an earlier quarantined journal of the same file name is evidence too.
       const quarantined = path.join(collidedDir, `${file.replace(/\.json$/, '')}.${Date.now()}.${process.pid}.${fs.readdirSync(collidedDir).length}.json`);
+      assertLockHeld(p);
       fs.renameSync(journalPath, quarantined);
       throw new WorkStateError('EVENT_SEQUENCE_COLLISION', `${error.message}; the pending journal was moved to ${quarantined}`, { recordId: error.recordId, sequence: error.sequence, existing: error.existing, attempted: error.attempted, quarantined });
     }
@@ -591,12 +618,14 @@ function recoverPendingUnlocked(p) {
       if (current && current.revision <= journal.event.revision) delete active.records[journal.recordId];
     }
     else if (!existing || existing.revision < journal.afterRecord.revision) active.records[journal.recordId] = journal.afterRecord;
+    assertLockHeld(p);
     saveActive(p, active);
     appendEvent(p, journal.event);
     if (journal.supersedeReusable) preserveReusableSnapshot(p, journal.supersedeReusable);
     if (journal.releasedRecord) storeReleasedRecord(p, journal.releasedRecord);
     if (journal.abandonedRecord) storeAbandonedRecord(p, journal.abandonedRecord);
     if (journal.archiveRecord) archiveRecord(p, journal.archiveRecord);
+    assertLockHeld(p);
     fs.rmSync(journalPath, { force: true });
   }
 }
@@ -605,20 +634,25 @@ function commitMutation(p, { recordId, beforeRecord, afterRecord, event, archive
   // fleet#251: refuse a colliding event before the journal or the record is written, so a
   // refused mutation leaves nothing behind for recovery to trip over.
   checkEventSlot(p, event);
+  assertLockHeld(p);
   const journalPath = pendingFile(p, recordId, event.idempotencyKey);
   writeAtomicJson(journalPath, { recordId, beforeRecord, afterRecord, event, archiveRecord: recordToArchive, releasedRecord, abandonedRecord, supersedeReusable });
   if (killPoint === 'after-journal') throw new WorkStateError('KILL_POINT', 'stopped after journal write');
   const active = activeState(p);
   if (afterRecord === null) delete active.records[recordId];
   else active.records[recordId] = afterRecord;
+  // #447 follow-up: lost before the record write, the journal is this call's only write, so it goes with the refusal.
+  try { assertLockHeld(p); } catch (error) { fs.rmSync(journalPath, { force: true }); throw error; }
   saveActive(p, active);
   if (killPoint === 'after-record') throw new WorkStateError('KILL_POINT', 'stopped after record replacement');
+  // Lost after the record write, the journal stays: the next holder's recovery completes this event.
   appendEvent(p, event);
   if (killPoint === 'after-event') throw new WorkStateError('KILL_POINT', 'stopped after event append');
   if (supersedeReusable) preserveReusableSnapshot(p, supersedeReusable);
   if (releasedRecord) storeReleasedRecord(p, releasedRecord);
   if (abandonedRecord) storeAbandonedRecord(p, abandonedRecord);
   if (recordToArchive) archiveRecord(p, recordToArchive);
+  assertLockHeld(p);
   fs.rmSync(journalPath, { force: true });
   return afterRecord || releasedRecord || abandonedRecord || recordToArchive;
 }
@@ -1182,7 +1216,7 @@ function transitionRecord(options = {}) {
       let out = result;
       if (from && DECISION_STATES.includes(from)) out = { ...out, resolved: appendResolutionWake({ root, p, record, key, options, from, to: target, result }) };
       return DECISION_STATES.includes(target)
-        ? { ...out, paged: appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
+        ? { ...out, paged: appendWakeOutbox({ root, p, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'decision-needed', idempotencyKey: key, evidence: options.evidence, actor: options.actor, reason: options.reason, premise: options.premise, now: options.now }) }
         : out;
     };
     const replay = replayIfKnown(record, key);
@@ -1396,7 +1430,7 @@ function decisionRaisedBy(p, recordId, from, beforeSequence) {
 // The resolution line for a record leaving a decision state, by transition or by
 // abandon (#204): keyed `<key>:resolution`, so a replay repairs it and never doubles it.
 function appendResolutionWake({ root, p, record, key, options, from, to, result }) {
-  return appendWakeOutbox({ root, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
+  return appendWakeOutbox({ root, p, recordId: record.id, revision: result.revision, eventSequence: result.eventSequence, wake: 'resolution', idempotencyKey: `${key}:resolution`, evidence: options.evidence || options.reason, actor: options.actor, from, to, raisedBy: decisionRaisedBy(p, record.id, from, result.eventSequence), now: options.now });
 }
 
 // Idempotent by (recordId, idempotencyKey): the door that commits a decision
@@ -1405,9 +1439,10 @@ function appendResolutionWake({ root, p, record, key, options, from, to, result 
 // was written, which is the caller's cue to launch the page. `actor` is the
 // writer's provenance (fleet#141): the watchdog's frontier wake does not wake a
 // lead for a decision-needed line that lead wrote itself.
-function appendWakeOutbox({ root, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, from, to, raisedBy, now } = {}) {
+function appendWakeOutbox({ root, p, recordId, revision, eventSequence, wake, idempotencyKey, evidence, actor, reason, premise, from, to, raisedBy, now } = {}) {
   if (outboxHasWake(root, recordId, idempotencyKey)) return false;
   const file = wakeOutboxFile(root);
+  if (p) assertLockHeld(p);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // A transition's evidence carries a `wake:<kind>; ` prefix (the ledger's own
   // wake record); the outbox line names the wake in its own field.
@@ -1640,6 +1675,7 @@ function projectStatus(options = {}) {
       if (fs.existsSync(output) && !fs.readFileSync(output, 'utf8').startsWith(STATUS_MARKER)) {
         throw new WorkStateError('OUTPUT_NOT_GENERATED', `refusing to overwrite ${output}: not a file this projection generated (it does not start with ${JSON.stringify(STATUS_MARKER)})`, { output });
       }
+      assertLockHeld(p);
       writeAtomicText(output, content);
     }
     return { output, content };
