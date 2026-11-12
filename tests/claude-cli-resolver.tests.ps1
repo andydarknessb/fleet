@@ -245,7 +245,8 @@ try {
   $clock.Stop()
   Assert-True ($null -ne $msg -and $msg -match 'claude CLI not found' -and $clock.Elapsed.TotalSeconds -lt 2.0) "Get-DaemonSessions -Tries 2 -PollMs 100 must override the env ladder (took $($clock.Elapsed.TotalSeconds)s): $msg"
   $strictLine = @(Get-Content "$sourceRoot\bin\launch.ps1" | Where-Object { $_ -match 'Get-DaemonSessions -Strict' -and $_ -notmatch '^\s*#' })
-  Assert-True ($strictLine.Count -eq 1 -and $strictLine[0] -match '-Tries \d' -and $strictLine[0] -match '-PollMs \d') "launch.ps1's strict daemon read must use a short ladder: $($strictLine -join ' | ')"
+  # ticket 455: the one read after the wait (before any release) is a strict single attempt; the up-front read keeps its short ladder.
+  Assert-True ($strictLine.Count -eq 2 -and $strictLine[0] -match '-Tries \d' -and $strictLine[0] -match '-PollMs \d' -and $strictLine[1] -match '-NoRetry') "launch.ps1's strict daemon reads must be the short-ladder read and the single late read: $($strictLine -join ' | ')"
 
   # Case 17 (QA #275 finding 5): no -StdinText means no redirected stdin. A [string] parameter defaulting to $null is '', and
   # `$null -ne ''` made every bounded child get an empty stdin file; an explicit -StdinText still redirects.

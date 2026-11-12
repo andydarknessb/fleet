@@ -142,6 +142,16 @@ try {
     "const args = process.argv.slice(2);",
     "const daemonFile = path.join(__dirname, '..', 'mock-agents.json');",
     "fs.appendFileSync(path.join(__dirname, '..', 'claude-calls.log'), args.join(' ') + '\n');",
+    "if (args[0] === 'stop' && process.env.MOCK_STOP_FAIL === '1') process.exit(9);",
+    "const lateFile = path.join(__dirname, '..', 'late-row.json');",
+    "if (args[0] === '--bg' && process.env.MOCK_LATE_ROW) fs.writeFileSync(lateFile, JSON.stringify({ name: args[args.indexOf('--name') + 1], calls: 0 }));",
+    "if (args[0] === 'agents' && !args.includes('--all') && process.env.MOCK_LATE_ROW && fs.existsSync(lateFile)) {",
+    "  // ticket 455: the 21st list read after --bg is the launch's late read (the poll loop makes 20 and sees nothing); MOCK_LATE_ROW=fail makes that read fail",
+    "  const late = JSON.parse(fs.readFileSync(lateFile, 'utf8'));",
+    "  late.calls += 1; fs.writeFileSync(lateFile, JSON.stringify(late));",
+    "  if (late.calls === 21 && process.env.MOCK_LATE_ROW === 'fail') { process.stderr.write('mock: the list read failed'); process.exit(9); }",
+    "  if (late.calls === 21) { const rows = JSON.parse(fs.readFileSync(daemonFile, 'utf8')); rows.push({ id: 'job-late-' + late.name, name: late.name, state: 'working', status: 'idle', pid: 22, sessionId: 'sess-late-' + late.name, startedAt: Date.now() }); fs.writeFileSync(daemonFile, JSON.stringify(rows)); }",
+    "}",
     "if (args[0] === 'agents') {",
     "  if (process.env.MOCK_MUTATE_AT === 'agents' && args.includes('--all')) {",
     "    fs.appendFileSync(path.join(__dirname, '..', 'mutate-saw-worktree.log'), String(fs.existsSync(process.env.MOCK_WORKTREE_PATH)) + '\n');",
@@ -297,6 +307,125 @@ try {
   $c31 = Test-LateRefusal 31 'manifestPath:other.json' 'agents' 'nolongernamesthismanifest' 'manifest-path case'
   Assert-True ((Get-RecordState 31) -eq 'assigned' -and (Get-Record 31).revision -eq $c31.Before.revision -and (Get-Record 31).manifestPath -eq 'other.json' -and -not (Get-Marker $c31.Manifest)) 'manifest-path case: record untouched, no marker written by the launch'
 
+  # ticket 455: two launches of one name are serialised. This test takes the name's launch mutex (keyed like the roster lock:
+  # the SHA-1 of the fleet root, then the name) while a second launch of the same name runs. The second must wait and touch
+  # nothing; once the test lets go it reaches the name check, sees the first launch's session, and is refused, leaving the
+  # first launch's worktree, roster row and reservation as they were.
+  Clear-ActiveRecords
+  $m48 = Reserve-Manifest 48 $baseSha
+  $lockKey = [BitConverter]::ToString([System.Security.Cryptography.SHA1]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($testRoot.ToLowerInvariant()))).Replace('-', '').ToLowerInvariant()
+  $nameMutex = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$lockKey-ic-48"
+  Assert-True ($nameMutex.WaitOne(0)) 'the test takes the name mutex first'
+  $firstWorktree = "$repoPath\.claude\worktrees\ic-48-assignment"
+  [IO.Directory]::CreateDirectory($firstWorktree) | Out-Null
+  Write-Utf8 "$firstWorktree\first.txt" 'the first launch'
+  Write-Utf8 "$testRoot\mock-agents.json" '[{"id":"job-first","name":"ic-48","state":"working","status":"idle","pid":21,"sessionId":"sess-first","startedAt":1756000000000}]'
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"ic-48","role":"ic","tenant":"test","parent":"pl-test","issue":48,"cwd":' + ($firstWorktree | ConvertTo-Json) + ',"status":"active","jobId":"job-first","sessionId":"sess-first","manifest":' + ($m48 | ConvertTo-Json) + ',"workRecordId":"test:issue-48"}]}')
+  $rosterBefore48 = Get-Content "$testRoot\state\roster.json" -Raw
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $waitOut = "$testRoot\second-launch.out"
+  $second = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$testRoot\run-launch.ps1", '-Manifest', $m48, '-WorkRecordId', 'test:issue-48') -PassThru -WindowStyle Hidden -RedirectStandardOutput $waitOut
+  $null = $second.Handle   # caches the handle so ExitCode survives the exit
+  Start-Sleep -Seconds 8
+  Assert-True (-not $second.HasExited) 'a second launch of the name waits while the first holds the name mutex'
+  Assert-True ((Get-BgCalls) -eq 0 -and (Get-RecordState 48) -eq 'assigned' -and (Get-Content "$testRoot\state\roster.json" -Raw) -eq $rosterBefore48 -and (Test-Path "$firstWorktree\first.txt")) 'while it waits, the second launch has touched nothing'
+  $nameMutex.ReleaseMutex(); $nameMutex.Dispose()
+  Assert-True ($second.WaitForExit(60000)) 'the second launch finishes once the name mutex is released'
+  $secondText = Get-Content $waitOut -Raw
+  Assert-True ($second.ExitCode -eq 3 -and "$secondText" -match 'already running') "the second launch is refused at the name check (exit $($second.ExitCode)): $secondText"
+  Assert-True ((Get-BgCalls) -eq 0 -and (Get-RecordState 48) -eq 'assigned' -and (Get-Content "$testRoot\state\roster.json" -Raw) -eq $rosterBefore48 -and (Test-Path "$firstWorktree\first.txt") -and -not (Get-Marker $m48)) 'the refused second launch removes nothing the first launch made and releases nothing'
+  Remove-Item -LiteralPath $firstWorktree -Recurse -Force
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  # ticket 455 review: the lock wait is 10 s. A launch that holds the name longer than that is not waited for: the second
+  # launch is refused with exit 8 (launchInFlight) and touches nothing. The test holds the name's mutex until that refusal lands.
+  Clear-ActiveRecords
+  $m53 = Reserve-Manifest 53 $baseSha
+  $nameMutex53 = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$lockKey-ic-53"
+  Assert-True ($nameMutex53.WaitOne(0)) 'the test takes the ic-53 name mutex first'
+  $first53 = "$repoPath\.claude\worktrees\ic-53-assignment"
+  [IO.Directory]::CreateDirectory($first53) | Out-Null
+  Write-Utf8 "$first53\first.txt" 'the first launch'
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"ic-53","role":"ic","tenant":"test","parent":"pl-test","issue":53,"cwd":' + ($first53 | ConvertTo-Json) + ',"status":"active","jobId":"job-first-53","sessionId":"sess-first-53","manifest":' + ($m53 | ConvertTo-Json) + ',"workRecordId":"test:issue-53"}]}')
+  $roster53 = Get-Content "$testRoot\state\roster.json" -Raw
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $out53 = "$testRoot\held-launch.out"
+  $waiter53 = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$testRoot\run-launch.ps1", '-Manifest', $m53, '-WorkRecordId', 'test:issue-53') -PassThru -WindowStyle Hidden -RedirectStandardOutput $out53
+  $null = $waiter53.Handle
+  $clock53 = [Diagnostics.Stopwatch]::StartNew()
+  $exited53 = $waiter53.WaitForExit(40000)
+  $clock53.Stop()
+  $nameMutex53.ReleaseMutex(); $nameMutex53.Dispose()
+  $text53 = "$(Get-Content $out53 -Raw)"
+  Assert-True ($exited53 -and $waiter53.ExitCode -eq 8 -and $text53 -match '"launchInFlight":true' -and $text53 -match 'in flight') "a launch that waits out the 10 s bound is refused with exit 8, launchInFlight and the in-flight reason (exit $($waiter53.ExitCode)): $text53"
+  Assert-True ($clock53.Elapsed.TotalSeconds -ge 9.5) "the refusal comes after the 10 s bound, not before it (after $($clock53.Elapsed.TotalSeconds) s)"
+  Assert-True ((Get-BgCalls) -eq 0 -and (Get-RecordState 53) -eq 'assigned' -and (Get-Content "$testRoot\state\roster.json" -Raw) -eq $roster53 -and (Test-Path "$first53\first.txt") -and -not (Get-Marker $m53)) 'the refused waiter touched nothing: no claude call, the reservation, the roster and the first worktree as they were, no marker'
+  Remove-Item -LiteralPath $first53 -Recurse -Force
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  # ticket 455 review: a launch lock that cannot be created or taken (here a mutex whose ACL denies this user) refuses with its
+  # own JSON (exit 9) and keeps the reservation: nothing was touched.
+  Clear-ActiveRecords
+  $m55 = Reserve-Manifest 55 $baseSha
+  $denySec55 = New-Object System.Security.AccessControl.MutexSecurity
+  $denySec55.AddAccessRule((New-Object System.Security.AccessControl.MutexAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User, [System.Security.AccessControl.MutexRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Deny)))
+  $created55 = $false
+  $denied55 = New-Object System.Threading.Mutex -ArgumentList $false, "Global\fleet-launch-$lockKey-ic-55", ([ref]$created55), $denySec55
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $r55 = Run-Launch @('-Manifest', $m55, '-WorkRecordId', 'test:issue-55')
+  $denied55.Dispose()
+  Assert-True ($lastExit -eq 9 -and $r55 -and $r55.launchLockFailed -eq $true -and $r55.launched -eq $false -and (Get-RecordState 55) -eq 'assigned' -and -not (Get-Marker $m55) -and (Get-BgCalls) -eq 0 -and -not (Test-Path "$repoPath\.claude\worktrees\ic-55-assignment")) "a launch lock that cannot be taken refuses with its own JSON (exit 9), keeps the reservation and touches nothing (exit $lastExit): $lastOut"
+
+  # ticket 455 review: the roster is read again once the launch lock is held. A row another launch wrote while this one
+  # waited, with a fresh working job behind it, is what the in-lock guard must see: the launch refuses as a suspected bad read.
+  Clear-ActiveRecords
+  $m57 = Reserve-Manifest 57 $baseSha
+  $nameMutex57 = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$lockKey-ic-57"
+  Assert-True ($nameMutex57.WaitOne(0)) 'the test takes the ic-57 name mutex first'
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  $job57 = "$testRoot\profile\.claude\jobs\job-57"
+  [IO.Directory]::CreateDirectory($job57) | Out-Null
+  Write-Utf8 "$job57\state.json" ('{"state":"working","updatedAt":"' + (Get-Date).ToUniversalTime().ToString('o') + '"}')
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $out57 = "$testRoot\waited-57.out"
+  $waiter57 = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$testRoot\run-launch.ps1", '-Manifest', $m57, '-WorkRecordId', 'test:issue-57') -PassThru -WindowStyle Hidden -RedirectStandardOutput $out57
+  $null = $waiter57.Handle
+  Start-Sleep -Seconds 4
+  Write-Utf8 "$testRoot\state\roster.json" ('{"sessions":[{"name":"ic-57","role":"ic","tenant":"test","parent":"pl-test","issue":57,"status":"active","jobId":"job-57","sessionId":"sess-57","manifest":' + ($m57 | ConvertTo-Json) + ',"workRecordId":"test:issue-57"}]}')
+  $nameMutex57.ReleaseMutex(); $nameMutex57.Dispose()
+  Assert-True ($waiter57.WaitForExit(60000)) 'the waiter finishes once the ic-57 lock is released'
+  $text57 = "$(Get-Content $out57 -Raw)"
+  Assert-True ($waiter57.ExitCode -eq 3 -and $text57 -match 'suspected bad read') "a row written while the launch waited is seen by the in-lock guard (exit $($waiter57.ExitCode)): $text57"
+  Assert-True ((Get-BgCalls) -eq 0 -and (Get-RecordState 57) -eq 'assigned') 'the guarded launch starts no claude session and releases nothing'
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item -LiteralPath $job57 -Recurse -Force
+
+  # ticket 455 review: a -Recover waits for the launch lock like any launch. When the roster row it recovers changes while
+  # it waits, it is refused rather than restarted on the row it read before the wait.
+  $wt58 = "$testRoot\recover-58"
+  [IO.Directory]::CreateDirectory($wt58) | Out-Null
+  Write-Utf8 "$wt58\.git" 'gitdir: fixture'
+  Clear-ActiveRecords
+  $m58 = Reserve-Manifest 58 $baseSha
+  $row58 = '{"sessions":[{"name":"ic-58","role":"ic","tenant":"test","parent":"pl-test","issue":58,"cwd":' + ($wt58 | ConvertTo-Json) + ',"status":"active","jobId":"JOB","sessionId":"sess-58","manifest":' + ($m58 | ConvertTo-Json) + ',"workRecordId":"test:issue-58","permissions":"auto","effort":"xhigh","prompt":"Implement issue 58."}]}'
+  Write-Utf8 "$testRoot\state\roster.json" $row58.Replace('JOB', 'job-58-old')
+  $nameMutex58 = New-Object System.Threading.Mutex $false, "Global\fleet-launch-$lockKey-ic-58"
+  Assert-True ($nameMutex58.WaitOne(0)) 'the test takes the ic-58 name mutex first'
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $out58 = "$testRoot\recover-58.out"
+  $waiter58 = Start-Process -FilePath 'powershell' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$testRoot\run-launch.ps1", '-Role', 'ic', '-Name', 'ic-58', '-Tenant', 'test', '-Parent', 'pl-test', '-Issue', '58', '-Prompt', 'implement-58', '-Recover', '-Reason', 'recover') -PassThru -WindowStyle Hidden -RedirectStandardOutput $out58
+  $null = $waiter58.Handle
+  Start-Sleep -Seconds 4
+  Write-Utf8 "$testRoot\state\roster.json" $row58.Replace('JOB', 'job-58-new')
+  $nameMutex58.ReleaseMutex(); $nameMutex58.Dispose()
+  Assert-True ($waiter58.WaitForExit(60000)) 'the recovery finishes once the ic-58 lock is released'
+  $text58 = "$(Get-Content $out58 -Raw)"
+  Assert-True ($waiter58.ExitCode -eq 3 -and $text58 -match 'changed while this recovery waited for the launch lock' -and (Get-BgCalls) -eq 0) "a recovery whose roster row changed while it waited is refused, not restarted on the old row (exit $($waiter58.ExitCode)): $text58"
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item -LiteralPath $wt58 -Recurse -Force
+
   # Case 12 (the early check): the record is already `assigned` at another revision than the manifest reserved
   # (a lead's escalate -> assigned round trip bumps it on the same manifest). Refused before any gh call, fetch or
   # worktree work, with no release.
@@ -313,6 +442,64 @@ try {
   Assert-True (-not (Test-Path "$testRoot\gh-calls.log")) 'the early revision check refuses before any gh call'
   Assert-True ((Get-BgCalls) -eq 0 -and -not (Test-Path "$repoPath\.claude\worktrees\ic-34-assignment") -and -not (Invoke-Git @('branch', '--list', 'fleet/*34*'))) 'the early revision check creates no worktree and calls no claude --bg'
   Assert-True ((Get-RecordState 34) -eq 'assigned' -and (Get-Record 34).revision -eq ($manifestRevision + 2) -and -not (Get-Marker $m34)) 'the early revision check releases nothing and writes no marker'
+
+  # ticket 455: a manifest with an invalid value is refused by assign before any reservation exists: no Work record and no
+  # manifest file, so there is nothing for a launch to release. (assign builds and checks the manifest before it reserves.)
+  Clear-ActiveRecords
+  $fixture49 = "$testRoot\issues-49.json"
+  Write-Utf8 $fixture49 ('[{"number":49,"title":"Refusal fixture","url":"https://github.com/owner/repo/issues/49","body":' + ("Change ``src/fixture-49.js``." | ConvertTo-Json) + ',"createdAt":"2026-09-01T00:00:00.000Z","state":"OPEN","labels":["ready-for-agent"],"assignees":[]}]')
+  # ticket 455 (ruling): every value launch.ps1 refuses from the manifest alone is refused by assign too. The base cases
+  # (launch.ps1's invalid base precondition: a remote, a ref and a 40-hex sha) pass --fixture, which takes the base as given.
+  $noDefault = "$testRoot\tenants\nodefault.json"
+  Write-Utf8 $noDefault ('{"name":"test","github":"owner/repo","readyLabel":"ready-for-agent","branchPrefix":"fleet/","maxIcs":2,"repo":' + ($repoPath | ConvertTo-Json) + '}')
+  $testTenant = "$testRoot\tenants\test.json"
+  foreach ($bad in @(
+      @{ Label = '--model deepseek'; Expect = 'Haiku 5\.5 only'; Args = @('--tenant-config', $testTenant, '--base-sha', $baseSha, '--model', 'deepseek') },
+      @{ Label = '--effort high'; Expect = 'xhigh or max'; Args = @('--tenant-config', $testTenant, '--base-sha', $baseSha, '--effort', 'high') },
+      @{ Label = '--permissions bogus'; Expect = 'unknown permission profile'; Args = @('--tenant-config', $testTenant, '--base-sha', $baseSha, '--permissions', 'bogus') },
+      @{ Label = '--base-sha bbb (not 40 hex)'; Expect = 'invalid base precondition'; Args = @('--tenant-config', $testTenant, '--base-sha', 'bbb') },
+      @{ Label = 'a tenant with no defaultBranch (no ref)'; Expect = 'invalid base precondition'; Args = @('--tenant-config', $noDefault, '--base-sha', $baseSha) }
+    )) {
+    $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $badOut = & node "$testRoot\bin\assignment.js" assign --root $testRoot --tenant test --fixture $fixture49 --parent pl-test @($bad.Args) 2>&1 | Out-String; $badCode = $LASTEXITCODE }
+    finally { $ErrorActionPreference = $eap }
+    Assert-True ($badCode -ne 0 -and $badOut -match $bad.Expect -and $null -eq (Get-RecordState 49) -and @(Get-ChildItem "$testRoot\state\manifests" -Filter '*issue-49*' -ErrorAction SilentlyContinue).Count -eq 0) "assign refuses $($bad.Label) before any reservation exists, naming it (exit $badCode): $badOut"
+  }
+
+  # ticket 455: a worktree that existed before this launch is not this launch's to remove: the launch refuses at its
+  # existence check (exit 4) and removes nothing.
+  Clear-ActiveRecords
+  $m50 = Reserve-Manifest 50 $baseSha
+  $existing50 = "$repoPath\.claude\worktrees\ic-50-assignment"
+  [IO.Directory]::CreateDirectory($existing50) | Out-Null
+  Write-Utf8 "$existing50\earlier.txt" 'an earlier launch'
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $m50, '-WorkRecordId', 'test:issue-50'))
+  Assert-True ($lastExit -eq 4 -and $lastFlat -match 'assignmentworktreealreadyexists' -and (Test-Path "$existing50\earlier.txt") -and (Get-RecordState 50) -eq 'assigned' -and -not (Get-Marker $m50) -and (Get-BgCalls) -eq 0) "a worktree that existed before the launch is refused and left alone (exit $lastExit): $lastOut"
+  Remove-Item -LiteralPath $existing50 -Recurse -Force
+
+  # ticket 455 review: a worktree add that exits non-zero but leaves the worktree and its branch behind (a failing post-checkout
+  # hook) is cleaned up: the worktree and the branch are gone and the reservation is released. A fresh reservation for the
+  # issue is then not refused for an existing worktree.
+  Clear-ActiveRecords
+  $m51 = Reserve-Manifest 51 $baseSha
+  $hook51 = "$repoPath\.git\hooks\post-checkout"
+  Write-Utf8 $hook51 "#!/bin/sh`nexit 1`n"
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  [void](Run-Launch @('-Manifest', $m51, '-WorkRecordId', 'test:issue-51'))
+  $wt51 = "$repoPath\.claude\worktrees\ic-51-assignment"
+  $branches51 = Invoke-Git @('branch', '--list', 'fleet/*51*')
+  $worktrees51 = Invoke-Git @('worktree', 'list', '--porcelain')
+  Assert-True ($lastExit -eq 4 -and -not (Test-Path $wt51) -and -not $branches51 -and $worktrees51 -notmatch 'ic-51-assignment' -and (Get-RecordState 51) -ne 'assigned' -and [bool](Get-Marker $m51)) "a worktree add that fails after creating the worktree leaves neither the worktree nor the branch behind (exit $lastExit): $lastOut"
+  Remove-Item $hook51 -ErrorAction SilentlyContinue
+  $m51b = Reserve-Manifest 51 $baseSha
+  $env:MOCK_BG_ROW = '1'
+  try { $r51 = Run-Launch @('-Manifest', $m51b, '-WorkRecordId', 'test:issue-51') } finally { Remove-Item Env:MOCK_BG_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 0 -and $r51 -and $r51.launched -eq $true -and $lastFlat -notmatch 'assignmentworktreealreadyexists') "a fresh reservation for the issue is not refused for an existing worktree (exit $lastExit): $lastOut"
+  Invoke-Git @('worktree', 'remove', '--force', $wt51)
+  foreach ($leftover in @(Invoke-Git @('branch', '--list', 'fleet/*51*') -split [char]10 | ForEach-Object { $_.Trim().TrimStart('*').Trim() } | Where-Object { $_ })) { Invoke-Git @('branch', '-D', $leftover) }
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
 
   # fleet #437: the launch door starts only the manifest its Work record was reserved with. A byte copy of a reserved
   # manifest at another path is refused by the early check (no release, no marker, no claude --bg), and the real
@@ -358,6 +545,68 @@ try {
   Assert-True ((Get-BgCalls) -eq 1) "control: an untouched reservation still reaches claude --bg: $lastOut"
   # fleet #384: the real background launch carries --no-chrome (the mock claude logs its argv).
   Assert-True (@(Get-Content "$testRoot\claude-calls.log" | Where-Object { $_ -match '^--bg ' -and $_ -match ' --no-chrome(\s|$)' }).Count -eq 1) 'the claude --bg call must carry --no-chrome'
+  # ticket 455: no session appears within the wait and the one read of the list after it finds none, so the launch
+  # releases the reservation and removes the worktree it created, as it always has.
+  Assert-True ($lastExit -eq 5 -and (Get-RecordState 30) -ne 'assigned' -and [bool](Get-Marker $m30) -and -not (Test-Path "$repoPath\.claude\worktrees\ic-30-assignment")) "a launch whose session never registers is released and its worktree removed (exit $lastExit): $lastOut"
+
+  # ticket 455: a session that registers after the wait (only the launch's late read sees it) is adopted: the launch
+  # rosters it and keeps the reservation and the worktree, exactly as if it had appeared in time.
+  Clear-ActiveRecords
+  $m45 = Reserve-Manifest 45 $baseSha
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $env:MOCK_LATE_ROW = '1'
+  try { $r45 = Run-Launch @('-Manifest', $m45, '-WorkRecordId', 'test:issue-45') } finally { Remove-Item Env:MOCK_LATE_ROW -ErrorAction SilentlyContinue }
+  $rows45 = @((Get-Content "$testRoot\state\roster.json" -Raw | ConvertFrom-Json).sessions | Where-Object { $_.name -eq 'ic-45' -and $_.status -eq 'active' })
+  Assert-True ($lastExit -eq 0 -and $r45 -and $r45.launched -eq $true -and $rows45.Count -eq 1 -and "$($rows45[0].jobId)" -eq 'job-late-ic-45') "a session that registers after the wait is adopted and rostered (exit $lastExit): $lastOut"
+  Assert-True ((Get-RecordState 45) -eq 'assigned' -and -not (Get-Marker $m45) -and (Test-Path "$repoPath\.claude\worktrees\ic-45-assignment")) 'the adopted launch keeps its reservation and its worktree, and writes no marker'
+
+  # ticket 455: an adopted session whose roster row cannot be written is stopped, then released like a launch with no session.
+  Clear-ActiveRecords
+  $m46 = Reserve-Manifest 46 $baseSha
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $rosterFile = "$testRoot\state\roster.json"
+  $rosterBefore = Get-Content $rosterFile -Raw
+  $env:MOCK_LATE_ROW = '1'
+  [IO.File]::SetAttributes($rosterFile, [IO.FileAttributes]::ReadOnly)
+  try { [void](Run-Launch @('-Manifest', $m46, '-WorkRecordId', 'test:issue-46')) }
+  finally { Remove-Item Env:MOCK_LATE_ROW -ErrorAction SilentlyContinue; [IO.File]::SetAttributes($rosterFile, [IO.FileAttributes]::Normal) }
+  Assert-True ($lastExit -eq 5 -and $lastFlat -match 'therosterwritefortheadoptedsession') "an adopted session whose roster write fails exits 5 naming it: exit $lastExit $lastOut"
+  Assert-True (@(Get-Content "$testRoot\claude-calls.log" | Where-Object { $_ -eq 'stop job-late-ic-46' }).Count -eq 1) 'an adopted session that cannot be rostered is stopped (claude stop <job>)'
+  Assert-True ((Get-RecordState 46) -ne 'assigned' -and "$((Get-Marker $m46).reason)" -match 'roster write') "the adopted session's reservation is released, the marker naming the roster write: $(Get-Marker $m46 | ConvertTo-Json -Compress)"
+  Assert-True (-not (Test-Path "$repoPath\.claude\worktrees\ic-46-assignment") -and (Get-Content $rosterFile -Raw) -eq $rosterBefore) 'the released adopted launch removes its worktree and leaves the roster as it was'
+
+  # ticket 455 review: a claude stop that does not succeed keeps the adopted session's reservation and worktree, since the
+  # session may still run in that worktree. Nothing is released, and the JSON and the refusal text say so.
+  Clear-ActiveRecords
+  $m56 = Reserve-Manifest 56 $baseSha
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $rosterBefore56 = Get-Content $rosterFile -Raw
+  $env:MOCK_LATE_ROW = '1'
+  $env:MOCK_STOP_FAIL = '1'
+  [IO.File]::SetAttributes($rosterFile, [IO.FileAttributes]::ReadOnly)
+  try { $r56 = Run-Launch @('-Manifest', $m56, '-WorkRecordId', 'test:issue-56') }
+  finally { Remove-Item Env:MOCK_LATE_ROW, Env:MOCK_STOP_FAIL -ErrorAction SilentlyContinue; [IO.File]::SetAttributes($rosterFile, [IO.FileAttributes]::Normal) }
+  Assert-True ($lastExit -eq 5 -and $r56 -and $r56.sessionStopFailed -eq $true -and "$($r56.jobId)" -eq 'job-late-ic-56' -and $r56.reservationReleased -eq $false -and $r56.worktreeKept -eq $true) "a stop that does not succeed is named and keeps the reservation and the worktree (exit $lastExit): $lastOut"
+  Assert-True ($lastFlat -match 'claudestopjob-late-ic-56didnotsucceed') "the refusal text names the failed stop and its job: $lastOut"
+  Assert-True ((Get-RecordState 56) -eq 'assigned' -and -not (Get-Marker $m56) -and (Test-Path "$repoPath\.claude\worktrees\ic-56-assignment") -and (Get-Content $rosterFile -Raw) -eq $rosterBefore56) 'the kept launch writes no marker, releases nothing, and leaves the roster as it was'
+  Invoke-Git @('worktree', 'remove', '--force', "$repoPath\.claude\worktrees\ic-56-assignment")
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+
+  # ticket 455: a list read after the wait that fails cannot show that no session exists, so the launch keeps the
+  # reservation and the worktree and releases nothing; the stranded-reservation sweep owns it from here.
+  Clear-ActiveRecords
+  $m47 = Reserve-Manifest 47 $baseSha
+  Remove-Item "$testRoot\claude-calls.log" -ErrorAction SilentlyContinue
+  $env:MOCK_LATE_ROW = 'fail'
+  try { $r47 = Run-Launch @('-Manifest', $m47, '-WorkRecordId', 'test:issue-47') } finally { Remove-Item Env:MOCK_LATE_ROW -ErrorAction SilentlyContinue }
+  Assert-True ($lastExit -eq 5 -and $r47 -and $r47.sessionListUnreadable -eq $true -and $r47.reservationReleased -eq $false) "an unreadable list after the wait is named and releases nothing (exit $lastExit): $lastOut"
+  Assert-True ((Get-RecordState 47) -eq 'assigned' -and -not (Get-Marker $m47) -and (Test-Path "$repoPath\.claude\worktrees\ic-47-assignment")) 'the unreadable launch keeps the record assigned, its worktree, and writes no marker'
+  # The adopted and unreadable launches above leave daemon rows and roster rows that later cases must not count.
+  Write-Utf8 "$testRoot\mock-agents.json" '[]'
+  Write-Utf8 "$testRoot\state\roster.json" '{"sessions":[]}'
+  Remove-Item "$testRoot\late-row.json" -ErrorAction SilentlyContinue
+
 
   # Fleet #350 (ruling 12): a manifest naming the retired deepseek tier is refused at the door and its
   # reservation released. The -Model ValidateSet has no deepseek, so the manifest's model must not go through it.

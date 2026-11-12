@@ -741,7 +741,7 @@ function Get-FleetIdentityCacheKey {
   return ($parts -join ';')
 }
 function Get-FleetIdentityPlan {
-  param([switch]$Cached, [int]$TimeoutSec = 15)
+  param([switch]$Cached, [int]$TimeoutSec = 15, [switch]$NoWrite)   # ticket 455: -NoWrite (a dry run) leaves the gitconfig live sessions read as it is
   $cacheFile = "$FleetHome\state\identity\plan-cache.json"
   $key = $null
   if ($Cached) {
@@ -751,7 +751,8 @@ function Get-FleetIdentityPlan {
   }
   $out = $null
   try {
-    $bounded = Invoke-BoundedExe -FilePath (Get-NodeExe) -ArgumentList @("$FleetHome\bin\identity.js", 'plan', '--root', "$FleetHome") -TimeoutSec $TimeoutSec -Name 'identity.js plan'
+    $planArgs = @("$FleetHome\bin\identity.js", 'plan', '--root', "$FleetHome"); if ($NoWrite) { $planArgs += '--no-write' }
+    $bounded = Invoke-BoundedExe -FilePath (Get-NodeExe) -ArgumentList $planArgs -TimeoutSec $TimeoutSec -Name 'identity.js plan'
     $out = if ($bounded.timedOut) { "timed out after $TimeoutSec s" } elseif ($bounded.startError) { $bounded.startError } else { "$($bounded.stdout)$($bounded.stderr)" }
   } catch { $out = "$($_.Exception.Message)" }
   $plan = ConvertFrom-LastJsonLine $out
