@@ -520,15 +520,15 @@ test('a merge-review record that has already retired still records through the d
   assert.equal(send.calls.length, 1);
 });
 
-test('fleet#99: a merged record later escalated and abandoned is skipped, not refused on every sweep', () => {
+// #448: an escalation keeps the state it came from, and a merged record's escalation cannot be abandoned,
+// so no abandoned merge-review record reaches the sweep any more (the fleet#99 case this used to test).
+test('fleet#99 and #448: a merged record that was escalated cannot be abandoned', () => {
   const root = rootDir();
   const merged = seedMerged(root, { issue: 65, prNumber: 165 });
   const escalated = workState.transitionRecord({ root, id: merged.id, to: 'escalated', expectedRevision: merged.revision, idempotencyKey: 'esc-65', actor: 'test', evidence: 'retirement blocked', now: at() });
-  workState.abandonRecord({ root, id: merged.id, expectedRevision: escalated.revision, idempotencyKey: 'abandon-65', actor: 'cory', reason: 'gone', now: at() });
-  assert.deepEqual(findPendingMergedWithoutReview({ root, now: at() }), []);
-  const send = sender();
-  assert.deepEqual(runNotifier({ root, live: true, send, now: at() }).handled.filter((h) => h.recordId === merged.id), []);
-  assert.equal(send.calls.length, 0);
+  assert.throws(() => workState.abandonRecord({ root, id: merged.id, expectedRevision: escalated.revision, idempotencyKey: 'abandon-65', actor: 'cory', reason: 'gone', now: at() }),
+    (error) => error.code === 'INVALID_ABANDON');
+  assert.equal(workState.getRecord({ root, id: merged.id }).state, 'escalated');
 });
 
 test('a message that fails the pointer fixture is never sent and is recorded as a failed delivery', () => {

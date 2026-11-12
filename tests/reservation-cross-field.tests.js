@@ -49,6 +49,14 @@ test('reservationOverlaps still compares non-path fields only against themselves
   assert.deepEqual(reservationOverlaps({ components: ['src/widgets/a'] }, { testResources: ['src/widgets/a-v2/x.test.js'] }), []);
 });
 
+// #448: a wildcard reserves the folder it sits in, not the text before the wildcard, so two patterns
+// naming files in one folder overlap and two folders apart do not.
+test('#448: two wildcard patterns in the same folder overlap; patterns in sibling folders do not', () => {
+  assert.equal(reservationOverlaps({ components: ['src/components/Button*.jsx'] }, { components: ['src/components/Card*.jsx'] }).length, 1);
+  assert.equal(reservationOverlaps({ components: ['src/components/Button*.jsx'] }, { components: ['src/components/Button.jsx'] }).length, 1);
+  assert.deepEqual(reservationOverlaps({ components: ['src/components/*.jsx'] }, { components: ['src/widgets/*.jsx'] }), []);
+});
+
 test('proofFor reports a cross-field conflict naming both fields, in either direction', () => {
   const records = (leftField, rightField) => [
     { issue: 1313, reservations: { [leftField]: [DIR] } },

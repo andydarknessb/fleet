@@ -1000,7 +1000,9 @@ test('observe replays on its idempotency key and refuses a stale revision', () =
   }), /expected revision/);
 });
 
-test('the end-of-run shadow projection archives a record only after its merge was recorded', () => {
+// #448: the projection retires a record it created only from implementing, so a record the watcher
+// advanced to pr-open stays for the lead to judge. Its PR is still recorded before the projection runs.
+test('the end-of-run shadow projection keeps a record it created once past implementing, after recording its PR', () => {
   const root = rootDir();
   fs.mkdirSync(path.join(root, 'state'), { recursive: true });
   const rosterPath = path.join(root, 'state', 'roster.json');
@@ -1009,18 +1011,16 @@ test('the end-of-run shadow projection archives a record only after its merge wa
   const projected = Object.values(JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8')).records);
   assert.equal(projected.length, 1);
   const id = projected[0].id;
-  // The IC retires: its roster row is gone, but the PR merged and must be recorded first.
+  // The IC retires: its roster row is gone while the PR is open.
   fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [] }), 'utf8');
   const f = fetchers({ open: [pr({ number: 91, headRefName: 'fleet/42-slug' })] });
   watch(root, f, { shadow: true });
-  // The projection runs LAST: the record advanced (and recorded PR #91) before the
-  // roster-dropped retirement archived it - the in-flight work was not lost unseen.
   const rec = workState.getRecord({ root, id });
   assert.equal(rec.github.prNumber, 91);
+  assert.equal(rec.state, 'pr-open');
   const evs = events(root).filter((e) => e.recordId === id).map((e) => e.type);
   assert.ok(evs.indexOf('state-pr-open') >= 0, 'the advance must be recorded');
-  assert.ok(evs.indexOf('shadow-retired') >= 0, 'the roster-dropped record is archived');
-  assert.ok(evs.indexOf('state-pr-open') < evs.indexOf('shadow-retired'), 'the advance must precede the archive');
+  assert.equal(evs.indexOf('shadow-retired'), -1, 'an advanced record is the lead\'s to judge, not archived by the projection');
 });
 
 // Ticket 09: the ticket-05 lower bound (no merge without a recorded formal review) cannot

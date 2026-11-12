@@ -280,16 +280,18 @@ function eventFile(p, timestamp) {
   return path.join(p.events, `${String(timestamp).slice(0, 10)}.jsonl`);
 }
 
-function eventLines(p) {
+// Unarchived days live in state/events/, archived ones in state/events/archive/. `online` reads only the
+// former; lineage checks read both. Days sort by file name, so an archived day precedes a later one (#448).
+function eventLines(p, { online = false } = {}) {
   if (!fs.existsSync(p.events)) return [];
   const files = [];
-  for (const directory of [p.events, path.join(p.events, 'archive')]) {
+  for (const directory of online ? [p.events] : [p.events, path.join(p.events, 'archive')]) {
     if (!fs.existsSync(directory)) continue;
     for (const name of fs.readdirSync(directory).filter((entry) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry))) {
       files.push(path.join(directory, name));
     }
   }
-  files.sort();
+  files.sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
   const events = [];
   for (const file of files) {
     const text = fs.readFileSync(file, 'utf8');
@@ -345,8 +347,11 @@ function archiveExpiredEvents(p, now) {
 // (replayIfKnown) before any event is built, and a reserve starts that map fresh, so a
 // caller may reuse a key in a later attempt. Matching keys across the whole lineage
 // silently dropped nidus:issue-4's seq-8 abandon (2026-09-28) and wedged the record.
+// #448: the slot check reads unarchived days only. A record's sequence never goes back over its archived
+// lineage (a fresh record over one is refused by the archive, release and abandon snapshots), so no
+// archived slot is ever the one a new event takes.
 function existingEvent(p, recordId, sequence) {
-  return eventLines(p).find((event) => event.recordId === recordId && event.sequence === sequence) || null;
+  return eventLines(p, { online: true }).find((event) => event.recordId === recordId && event.sequence === sequence) || null;
 }
 
 // fleet#251: a (recordId, sequence) match used to be dropped silently, which hid a
@@ -671,8 +676,9 @@ function hasReservationEvidence(reservations) {
 
 function reservationPathRoot(value) {
   let normalized = String(value).trim().replaceAll('\\', '/').replace(/^\.\/+/, '').replace(/\/{2,}/g, '/');
+  // #448: a wildcard reserves the folder it sits in, so cut back to the last separator before it.
   const wildcard = normalized.search(/[?*\[\]{}]/);
-  if (wildcard >= 0) normalized = normalized.slice(0, wildcard);
+  if (wildcard >= 0) normalized = normalized.slice(0, normalized.lastIndexOf('/', wildcard) + 1);
   normalized = path.posix.normalize(normalized).replace(/^\.\/+/, '').replace(/\/+$/, '');
   return normalized === '.' ? '' : normalized;
 }
@@ -982,7 +988,11 @@ function abandonRecord(options = {}) {
     if (Number(options.expectedRevision) !== record.revision) throw new WorkStateError('STALE_REVISION', `expected revision ${options.expectedRevision}, current revision ${record.revision}`, { currentRevision: record.revision });
     const reason = String(options.reason || '').trim();
     if (!reason) throw new WorkStateError('MISSING_ABANDON_REASON', 'abandonment requires a reason');
-    if (['merged', 'retiring'].includes(record.state)) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state} and must complete retirement`);
+    // #448: an escalated record keeps the state it came from in prior_state, and that state decides.
+    const stateBefore = record.state === 'escalated' ? record.prior_state : record.state;
+    if (['merged', 'retiring'].includes(stateBefore)) {
+      throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is ${record.state === 'escalated' ? `escalated from ${stateBefore}` : record.state} and must complete retirement`);
+    }
     if (isUntouchedReservation(record, eventLines(p))) throw new WorkStateError('INVALID_ABANDON', `record '${record.id}' is an untouched reservation and must be released`);
     const now = isoNow(options.now);
     const actor = options.actor || 'fleet-operator';
@@ -1620,6 +1630,9 @@ function shadowProject(options = {}) {
   const root = asRoot(options.root);
   return withLock(root, (p) => {
     const rosterPath = rosterPathFor(p, options.rosterPath);
+    // #448: a roster that is not there is an error, never an empty roster, which would retire every record
+    // this projection created.
+    if (!fs.existsSync(rosterPath)) throw new WorkStateError('ROSTER_MISSING', `shadow projection needs the roster at ${rosterPath}`, { rosterPath });
     const desired = new Map([...rosterClaims(p, rosterPath)].map(([id, row]) => [id, { row, rosterStatus: String(row.status).toLowerCase() }]));
     const active = activeState(p);
     const rosterEvidence = path.relative(p.base, rosterPath);
@@ -1629,11 +1642,12 @@ function shadowProject(options = {}) {
       // one the lead created by hand) still has to be able to finish. Once its IC has left
       // the roster with the unit merged (or already retiring), the projection completes the
       // retirement whatever created it; otherwise such a record sits in active state forever
-      // and pins its issue `reserved` in the planner's frontier. Any other record without a
-      // roster row (assigned, implementing, pr-open, review, hold, escalated) is still the
-      // lead's to judge; a projector never archives one of those.
+      // and pins its issue `reserved` in the planner's frontier. A record this projection
+      // created retires only from implementing (#448); any other record without a roster row
+      // (assigned, pr-open, review, hold, escalated) is still the lead's to judge.
       const terminalRetirement = ['merged', 'retiring'].includes(record.state);
-      if (record.evidence?.roster !== rosterEvidence && !terminalRetirement) continue;
+      const projectionMade = record.evidence?.roster === rosterEvidence;
+      if (!terminalRetirement && !(projectionMade && record.state === 'implementing')) continue;
       const manifestRetirement = terminalRetirement && Boolean(record.manifestPath);
       const eventType = manifestRetirement ? 'assignment-retired' : 'shadow-retired';
       const now = isoNow(options.now);

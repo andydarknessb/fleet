@@ -145,6 +145,16 @@ test('reservation conflicts are path-aware on component segment boundaries', () 
   assert.equal(sibling.record.issue, 1151);
 });
 
+// #448: a wildcard component pattern reserves its folder, so a second pattern in that folder conflicts.
+test('#448: a wildcard component reservation conflicts with another pattern in the same folder', () => {
+  const root = rootDir();
+  reserveRecord({ root, id: 'endzone:issue-1160', tenant: 'endzone', issue: 1160, reservations: { components: ['src/components/Button*.jsx'] }, idempotencyKey: 'reserve-1160', now: '2026-09-10T00:00:00.000Z' });
+  assert.throws(
+    () => reserveRecord({ root, id: 'endzone:issue-1161', tenant: 'endzone', issue: 1161, reservations: { components: ['src/components/Card*.jsx'] }, idempotencyKey: 'reserve-1161', now: '2026-09-10T00:00:01.000Z' }),
+    (error) => error.code === 'RESERVATION_CONFLICT' && error.conflicts[0].recordId === 'endzone:issue-1160',
+  );
+});
+
 test('a third reservation accepts verified legacy reservation subjects and rejects their conflicts', () => {
   const root = rootDir();
   reserveRecord({ root, id: 'endzone:issue-40', tenant: 'endzone', issue: 40, manifestPath: 'm40', reservations: {}, idempotencyKey: 'reserve-40', now: '2026-09-01T00:00:00.000Z' });
@@ -411,6 +421,32 @@ test('an escalated touched assignment can be abandoned and reserved again with a
   assert.deepEqual(events.map((event) => event.sequence), [1, 2, 3, 4, 5]);
   assert.equal(events[3].type, 'assignment-abandoned');
   assert.equal(events[3].changes.reason, 'IC stopped on an account usage limit before writing code');
+});
+
+// #448: an escalation keeps the state it came from in prior_state, and abandon judges that state.
+test('#448: abandon refuses an escalated record whose prior_state was merged or retiring', () => {
+  const root = rootDir();
+  makeRecord(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'ack', '2026-09-01T00:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 'pr', 'PR #77 opened', '2026-09-01T00:00:02.000Z');
+  move(root, 'endzone:issue-42', 3, 'ci-wait', 'ci', 'CI pending', '2026-09-01T00:00:03.000Z');
+  move(root, 'endzone:issue-42', 4, 'review', 'review', 'CI settled', '2026-09-01T00:00:04.000Z');
+  const merged = move(root, 'endzone:issue-42', 5, 'merged', 'merged', 'GitHub merge evidence', '2026-09-01T00:00:05.000Z');
+  const escalated = move(root, 'endzone:issue-42', merged.revision, 'escalated', 'escalate-merged', 'Cory decision', '2026-09-01T00:00:06.000Z');
+  assert.equal(getRecord({ root, id: 'endzone:issue-42' }).prior_state, 'merged');
+  assert.throws(() => abandonRecord({ root, id: 'endzone:issue-42', expectedRevision: escalated.revision, idempotencyKey: 'abandon-merged', reason: 'stale', now: '2026-09-01T00:00:07.000Z' }),
+    (error) => error.code === 'INVALID_ABANDON' && /escalated from merged/.test(error.message));
+
+  makeRecord(root, { id: 'endzone:issue-43', issue: 43, github: { issueNumber: 43, prNumber: 78 }, idempotencyKey: 'create-43' });
+  move(root, 'endzone:issue-43', 1, 'implementing', 'ack-43', 'ack', '2026-09-01T00:00:01.000Z');
+  move(root, 'endzone:issue-43', 2, 'pr-open', 'pr-43', 'PR #78 opened', '2026-09-01T00:00:02.000Z');
+  move(root, 'endzone:issue-43', 3, 'ci-wait', 'ci-43', 'CI pending', '2026-09-01T00:00:03.000Z');
+  move(root, 'endzone:issue-43', 4, 'review', 'review-43', 'CI settled', '2026-09-01T00:00:04.000Z');
+  const mergedRetiring = move(root, 'endzone:issue-43', 5, 'merged', 'merged-43', 'GitHub merge evidence', '2026-09-01T00:00:05.000Z');
+  const retiring = move(root, 'endzone:issue-43', mergedRetiring.revision, 'retiring', 'retiring-43', 'retirement started', '2026-09-01T00:00:06.000Z');
+  const escalatedRetiring = move(root, 'endzone:issue-43', retiring.revision, 'escalated', 'escalate-retiring', 'Cory decision', '2026-09-01T00:00:07.000Z');
+  assert.throws(() => abandonRecord({ root, id: 'endzone:issue-43', expectedRevision: escalatedRetiring.revision, idempotencyKey: 'abandon-retiring', reason: 'stale', now: '2026-09-01T00:00:08.000Z' }),
+    (error) => error.code === 'INVALID_ABANDON' && /escalated from retiring/.test(error.message));
 });
 
 test('abandon requires a touched attempt and a reason, while the abandoned attempt consumes no assignment slot', () => {
@@ -818,6 +854,51 @@ test('shadow projection reconciles roster retirement and removal', () => {
   assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-550.json')), true);
 });
 
+// #448: a record the projection created is retired from implementing or a terminal state only. The rule
+// is the #448 spec; ADR 0006 (roster projection) names merged and retiring, so it is the one out of step.
+test('#448: the shadow projection retires its own record only from implementing or a terminal state', () => {
+  const root = rootDir();
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  const rows = [601, 602, 603, 604].map((issue) => ({ name: `ic-${issue}`, role: 'ic', tenant: 'endzone', issue, status: 'active', sessionId: `s${issue}` }));
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: rows }));
+  shadowProject({ root, rosterPath, now: '2026-09-04T00:00:00.000Z' });
+  move(root, 'endzone:issue-602', 1, 'pr-open', 'pr-602', 'PR opened', '2026-09-04T00:00:01.000Z');
+  move(root, 'endzone:issue-603', 1, 'pr-open', 'pr-603', 'PR opened', '2026-09-04T00:00:01.000Z');
+  move(root, 'endzone:issue-603', 2, 'review', 'review-603', 'CI settled', '2026-09-04T00:00:02.000Z');
+  let revision = 1;
+  for (const to of ['pr-open', 'ci-wait', 'review']) {
+    revision = move(root, 'endzone:issue-604', revision, to, `t-604-${to}`, 'PR progress', '2026-09-04T00:00:03.000Z').revision;
+  }
+  move(root, 'endzone:issue-604', revision, 'merged', 'merged-604', 'GitHub merge evidence', '2026-09-04T00:00:04.000Z');
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [] }));
+
+  const result = shadowProject({ root, rosterPath, now: '2026-09-04T00:01:00.000Z' });
+  assert.equal(result.projected.length, 0);
+  const active = JSON.parse(fs.readFileSync(path.join(root, 'state', 'work', 'active.json'), 'utf8'));
+  assert.deepEqual(Object.keys(active.records), ['endzone:issue-602', 'endzone:issue-603'], 'pr-open and review are the lead\'s to judge');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-601.json')), true, 'implementing is retired');
+  assert.equal(fs.existsSync(path.join(root, 'state', 'archive', 'work-endzone_issue-604.json')), true, 'merged is retired');
+  const last = (id) => readEvents(root).filter((event) => event.recordId === id).pop();
+  assert.equal(last('endzone:issue-601').type, 'shadow-retired');
+  assert.equal(last('endzone:issue-604').type, 'shadow-retired');
+});
+
+// #448: a roster that is not there is an error, never an empty roster: an empty one would retire every
+// record the projection created.
+test('#448: a missing roster is an error, and the projection retires nothing', () => {
+  const root = rootDir();
+  const rosterPath = path.join(root, 'state', 'roster.json');
+  fs.mkdirSync(path.dirname(rosterPath), { recursive: true });
+  fs.writeFileSync(rosterPath, JSON.stringify({ sessions: [{ name: 'ic-701', role: 'ic', tenant: 'endzone', issue: 701, status: 'active', sessionId: 's701' }] }));
+  shadowProject({ root, rosterPath, now: '2026-09-04T00:00:00.000Z' });
+  fs.rmSync(rosterPath);
+  assert.throws(() => shadowProject({ root, rosterPath, now: '2026-09-04T00:01:00.000Z' }), (error) => error.code === 'ROSTER_MISSING');
+  assert.throws(() => shadowProject({ root, now: '2026-09-04T00:01:00.000Z' }), (error) => error.code === 'ROSTER_MISSING', 'the default roster path too');
+  assert.equal(getRecord({ root, id: 'endzone:issue-701' }).state, 'implementing');
+  assert.equal(readEvents(root).filter((event) => event.type === 'shadow-retired').length, 0);
+});
+
 test('status projection rebuilds deterministically and retirement cleans ephemeral material', () => {
   const root = rootDir();
   const settings = path.join(root, 'state', 'sessions', 'ic-42.settings.json');
@@ -913,6 +994,58 @@ test('old event partitions move to the archive after thirty days, once the ledge
   fs.writeFileSync(path.join(root, 'state', 'verify', 'last.json'), JSON.stringify({ pass: true, at: new Date(Date.now() + 1000).toISOString() }));
   getRecord({ root, id: 'endzone:issue-42' });
   assert.equal(fs.existsSync(path.join(root, 'state', 'events', 'archive', '2026-07-01.jsonl')), true);
+});
+
+// #448: archived days are read in date order, and only lineage checks read the archive. A verified
+// archive of the day in July, then events in September, is the layout that exposed the path sort.
+function archiveOldDays(root) {
+  // The July day is dated in the past and the verdict stamped now, so the verdict postdates only the
+  // archived day: a later write to a September day stays online (the verdict cannot bless it).
+  const july = path.join(paths(root).events, '2026-07-01.jsonl');
+  const past = new Date('2026-07-01T00:00:00.000Z');
+  fs.utimesSync(july, past, past);
+  fs.mkdirSync(path.join(root, 'state', 'verify'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'state', 'verify', 'last.json'), JSON.stringify({ pass: true, at: new Date().toISOString() }));
+  getRecord({ root, id: 'endzone:issue-42' });
+}
+
+test('#448: events from archived and unarchived days come back in date order', () => {
+  const root = rootDir();
+  makeRecord(root, { now: '2026-07-01T00:00:00.000Z' });
+  archiveOldDays(root);
+  assert.equal(fs.existsSync(path.join(paths(root).events, 'archive', '2026-07-01.jsonl')), true);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'assignment acknowledged', '2026-09-01T00:00:01.000Z');
+  assert.deepEqual(readEvents(root).map((event) => event.at.slice(0, 10)), ['2026-07-01', '2026-09-01']);
+});
+
+test('#448: the slot check reads only unarchived days, and a lineage check still reads the archive', () => {
+  const root = rootDir();
+  const { events } = paths(root);
+  makeRecord(root, { now: '2026-07-01T00:00:00.000Z' });
+  archiveOldDays(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'assignment acknowledged', '2026-09-01T00:00:01.000Z');
+  const slotReads = [];
+  withFsFault('readFileSync', (target) => { slotReads.push(path.resolve(String(target))); return null; }, () => {
+    move(root, 'endzone:issue-42', 2, 'pr-open', 'pr', 'PR #77 opened', '2026-09-01T00:00:02.000Z');
+  });
+  assert.equal(slotReads.includes(path.join(events, '2026-09-01.jsonl')), true, 'the slot check reads the unarchived day');
+  assert.equal(slotReads.includes(path.join(events, 'archive', '2026-07-01.jsonl')), false, 'the slot check skips the archived day');
+  const lineageReads = [];
+  withFsFault('readFileSync', (target) => { lineageReads.push(path.resolve(String(target))); return null; }, () => {
+    abandonRecord({ root, id: 'endzone:issue-42', expectedRevision: 3, idempotencyKey: 'abandon-42', reason: 'session lost', now: '2026-09-01T00:00:03.000Z' });
+  });
+  assert.equal(lineageReads.includes(path.join(events, 'archive', '2026-07-01.jsonl')), true, 'the untouched-reservation lineage read still covers the archive');
+});
+
+test('#448: a new event never takes a (record, sequence) slot that an archived day holds', () => {
+  const root = rootDir();
+  makeRecord(root, { now: '2026-07-01T00:00:00.000Z' });
+  archiveOldDays(root);
+  move(root, 'endzone:issue-42', 1, 'implementing', 'ack', 'assignment acknowledged', '2026-09-01T00:00:01.000Z');
+  move(root, 'endzone:issue-42', 2, 'pr-open', 'pr', 'PR #77 opened', '2026-09-01T00:00:02.000Z');
+  // The archived day holds sequence 1; a slot check that scans only online days is safe because the
+  // record's own sequence never goes back over its lineage.
+  assert.deepEqual(readEvents(root).map((event) => event.sequence).sort((a, b) => a - b), [1, 2, 3]);
 });
 
 // Ticket 05: review recording through the one state door.
