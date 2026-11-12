@@ -2,25 +2,26 @@
 $script:FleetHome = Split-Path -Parent $PSScriptRoot
 $script:Utf8 = New-Object System.Text.UTF8Encoding $false
 function Read-Json { param($Path) if (Test-Path $Path) { Get-Content $Path -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null } }
-# fleet #449: the JSON is renamed over the target, so a reader sees the old file or the new one, never part of one.
-# A reader holding the target fails the rename (a sharing violation) for a moment: retried up to 2 s, since a reader holds
-# the file for milliseconds and the bound only stops a stuck one. Any other error throws at once.
+# fleet #449: MoveFile with overwrite is one rename for a reader, where File.Replace left a missing or exclusively held moment.
+# A held target refuses it for a moment (UnauthorizedAccessException): retried up to 2 s; a read-only target throws at once.
+# Microsoft.VisualBasic loads on first use (about 50 ms), so a process that only reads JSON pays nothing.
 function Write-Json {
   param($Path, $Obj)
+  if (-not ('Microsoft.VisualBasic.FileIO.FileSystem' -as [type])) { Add-Type -AssemblyName Microsoft.VisualBasic }
   $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
   try {
     [IO.File]::WriteAllText($temporary, ($Obj | ConvertTo-Json -Depth 8), $script:Utf8)
     $giveUpAt = (Get-Date).AddSeconds(2)
     while ($true) {
       try {
-        # [NullString]::Value, not $null: PowerShell 5.1 passes $null as "" and File.Replace rejects an empty backup path.
-        if ([IO.File]::Exists($Path)) { [IO.File]::Replace($temporary, $Path, [NullString]::Value) } else { [IO.File]::Move($temporary, $Path) }
+        [Microsoft.VisualBasic.FileIO.FileSystem]::MoveFile($temporary, $Path, $true)
         return
       } catch {
-        # ERROR_SHARING_VIOLATION (32) is the held target; a directory target is IOException 0x800700B7 and throws at once.
+        # A held and a read-only target are both 0x80070005, so the read-only attribute decides; a directory target is 0x80131620.
         $cause = $_.Exception
         if ($cause.InnerException) { $cause = $cause.InnerException }
-        $held = ($cause -is [IO.IOException]) -and (($cause.HResult -band 0xFFFF) -eq 32)
+        $readOnly = [IO.File]::Exists($Path) -and (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReadOnly) -ne 0)
+        $held = ($cause -is [UnauthorizedAccessException]) -and -not $readOnly
         if (-not $held -or (Get-Date) -ge $giveUpAt) { throw }
         Start-Sleep -Milliseconds 25
       }
