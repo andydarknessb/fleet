@@ -684,13 +684,13 @@ test('a revision record whose PR is live again re-enters pr-open', () => {
   assert.equal(record(root).state, 'pr-open');
 });
 
-test('a draft conversion is paused work: no action, no escalation, no wake', () => {
+test('a draft in pr-open is paused work: no action, no escalation, no wake', () => {
   const root = rootDir();
-  seed(root);
-  watch(root, fetchers());
+  // ci-wait is not paused work since #461: a draft there returns to revision (see the #461 test).
+  seed(root, { state: 'pr-open' });
   const before = events(root).length;
   watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, statusCheckRollup: GREEN }) }));
-  assert.equal(record(root).state, 'ci-wait');
+  assert.equal(record(root).state, 'pr-open');
   assert.equal(events(root).length, before);
   assert.equal(outbox(root).length, 0);
 });
@@ -860,7 +860,68 @@ test('fleet#63: a PR returned to draft at the reviewed head walks the record rev
   assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
 });
 
-test('fleet#63: a held PR set to draft stays in hold; only review returns to the IC', () => {
+test('#461: a PR returned to draft while ci-wait walks the record ci-wait -> revision so the IC can record its risk review at the new head', () => {
+  const root = rootDir();
+  seed(root, { state: 'ci-wait' });
+  // The watcher observes the old head with gates pending, so the draft below moves a cached head.
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: [check('g1', 'IN_PROGRESS', ''), check('g2', 'QUEUED', '')] })], viewResult: view({ body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'ci-wait');
+  // The IC drafts mid-CI: the draft drops out of the open list; the view says OPEN + isDraft at the pushed head.
+  const drafted = fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: 'def456' }) });
+  watch(root, drafted);
+  const rec = record(root);
+  assert.equal(rec.state, 'revision', 'a draft in ci-wait is back with the IC, not parked in ci-wait at a stale head');
+  assert.equal(rec.github.prNumber, 77, 'the PR number survives the return');
+  assert.equal(workState.sendBackCount(rec), 0, 'a ci-wait draft is not a send-back');
+  assert.deepEqual(outbox(root), [], 'the draft is the IC own act; nobody is woken');
+  // Idempotent: the same draft view on the next tick does nothing.
+  watch(root, drafted);
+  assert.equal(record(root).state, 'revision');
+  // The IC re-readies at the new head: revision -> pr-open -> ci-wait -> review, one step per tick.
+  const readied = fetchers({ open: [pr({ headRefOid: 'def456', statusCheckRollup: GREEN })], viewResult: view({ headRefOid: 'def456', statusCheckRollup: GREEN, body: 'Closes #42' }) });
+  watch(root, readied);
+  assert.equal(record(root).state, 'pr-open');
+  watch(root, readied);
+  assert.equal(record(root).state, 'ci-wait');
+  watch(root, readied);
+  assert.equal(record(root).state, 'review');
+  assert.deepEqual(outbox(root).map((w) => w.wake), ['checks-settled']);
+});
+
+test('#461: a draft while ci-wait after two send-backs still walks to revision; the send-back limit is review\'s alone', () => {
+  const root = rootDir();
+  seed(root, { state: 'review' });
+  watch(root, fetchers({ open: [pr({ statusCheckRollup: GREEN })], viewResult: view({ body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'review');
+  // Send-back 1: the lead drafts the reviewed head.
+  watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'revision');
+  assert.equal(workState.sendBackCount(record(root)), 1);
+  // The IC pushes green at a new head: revision -> pr-open -> ci-wait -> review, one step per tick.
+  const greenAt = (headRefOid) => fetchers({ open: [pr({ headRefOid, statusCheckRollup: GREEN })], viewResult: view({ headRefOid, statusCheckRollup: GREEN, body: 'Closes #42' }) });
+  watch(root, greenAt('def456'));
+  watch(root, greenAt('def456'));
+  watch(root, greenAt('def456'));
+  assert.equal(record(root).state, 'review');
+  // Send-back 2: the lead drafts again.
+  watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: 'def456', statusCheckRollup: GREEN, body: 'Closes #42' }) }));
+  assert.equal(record(root).state, 'revision');
+  assert.equal(workState.sendBackCount(record(root)), 2);
+  // The IC pushes a new head with gates pending: revision -> pr-open -> ci-wait.
+  const pendingAt = (headRefOid) => fetchers({ open: [pr({ headRefOid, statusCheckRollup: [check('g1', 'IN_PROGRESS', ''), check('g2', 'QUEUED', '')] })], viewResult: view({ headRefOid, body: 'Closes #42' }) });
+  watch(root, pendingAt('ghi789'));
+  watch(root, pendingAt('ghi789'));
+  assert.equal(record(root).state, 'ci-wait');
+  assert.equal(workState.sendBackCount(record(root)), 2);
+  // The IC drafts mid-CI: a ci-wait draft is not a send-back, so the review-only limit does not apply.
+  const before = outbox(root).length;
+  watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, headRefOid: 'ghi789' }) }));
+  assert.equal(record(root).state, 'revision', 'a ci-wait draft walks to revision even after two send-backs');
+  assert.equal(workState.sendBackCount(record(root)), 2);
+  assert.equal(outbox(root).length, before, 'no decision-needed wake: the send-back limit is review-only');
+});
+
+test('fleet#63: a held PR set to draft stays in hold; review and ci-wait return to the IC', () => {
   const root = rootDir();
   seed(root, { state: 'hold' });
   watch(root, fetchers({ open: [], viewResult: view({ isDraft: true, statusCheckRollup: GREEN, body: 'Closes #42' }) }));

@@ -286,20 +286,21 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
       return { actions: mergedChain(hopsTo(state, 'merged'), viewPr, prNumber, 'observed merged', { formalReviewMissing: reviewMissing, issue: record.issue, repo }) };
     }
     if (viewIsOpen && viewPr.isDraft) {
-      // fleet#63: a lead returns a PR to its IC with `gh pr ready --undo` and the
-      // head does not move, so the fleet#34 new-head walk below never fires and the
-      // record reads review until the IC pushes. The IC-hosted risk review is
-      // accepted only in implementing/revision/pr-open, so a fix that must be
-      // recorded before the push deadlocks. A draft PR while review is the lead's
-      // return: walk review -> revision here (a legal edge, no wake). The lead
-      // records its formal review before drafting, since formal is review-only.
+      // fleet#63: from review a draft PR is the lead's return. The lead drafts with
+      // `gh pr ready --undo` and the head does not move, so the fleet#34 new-head walk
+      // below never fires and the record reads review until the IC pushes. The IC-hosted
+      // risk review is accepted only in implementing/revision/pr-open, so a fix that must
+      // be recorded before the push deadlocks. The lead records its formal review before
+      // drafting, since formal is review-only. The walk is a legal edge with no wake.
+      // #461: from ci-wait a draft PR is the IC's own act mid-CI, not a send-back. Left in
+      // ci-wait, the record kept a stale head where no risk review records; it walks to revision.
       // hold stays parked: a held PR is Cory's merge, not rework.
-      if (state === 'review') {
-        // #118: the state door refuses a third send-back (SEND_BACK_LIMIT). The
+      if (state === 'review' || state === 'ci-wait') {
+        // #118: from review the state door refuses a third send-back (SEND_BACK_LIMIT). The
         // draft is the lead's third return, so it becomes the decision the door
         // asks for, once, rather than a transition that fails every tick.
         const sendBacks = workState.sendBackCount(record);
-        if (sendBacks >= workState.SEND_BACK_LIMIT - 1) {
+        if (state === 'review' && sendBacks >= workState.SEND_BACK_LIMIT - 1) {
           return {
             actions: [{
               kind: 'transition', to: 'escalated',
@@ -311,7 +312,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
         return {
           actions: [{
             kind: 'transition', to: 'revision',
-            evidence: `PR #${prNumber} returned to draft at ${String(viewPr.headRefOid).slice(0, 12)} while review; back with the IC`,
+            evidence: `PR #${prNumber} returned to draft at ${String(viewPr.headRefOid).slice(0, 12)} while ${state}; back with the IC`,
             wake: null,
           }],
         };
