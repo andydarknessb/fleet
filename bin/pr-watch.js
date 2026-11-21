@@ -294,12 +294,13 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
       // return: walk review -> revision here (a legal edge, no wake). The lead
       // records its formal review before drafting, since formal is review-only.
       // hold stays parked: a held PR is Cory's merge, not rework.
-      if (state === 'review') {
+      // #461: an IC that drafts mid-CI and pushes left the record at a stale head in ci-wait, where no risk review records; ci-wait returns the same way.
+      if (state === 'review' || state === 'ci-wait') {
         // #118: the state door refuses a third send-back (SEND_BACK_LIMIT). The
         // draft is the lead's third return, so it becomes the decision the door
         // asks for, once, rather than a transition that fails every tick.
         const sendBacks = workState.sendBackCount(record);
-        if (sendBacks >= workState.SEND_BACK_LIMIT - 1) {
+        if (state === 'review' && sendBacks >= workState.SEND_BACK_LIMIT - 1) {
           return {
             actions: [{
               kind: 'transition', to: 'escalated',
@@ -311,7 +312,7 @@ function planRecord({ record, openPr, viewPr, policy, branchPrefix, repo, formal
         return {
           actions: [{
             kind: 'transition', to: 'revision',
-            evidence: `PR #${prNumber} returned to draft at ${String(viewPr.headRefOid).slice(0, 12)} while review; back with the IC`,
+            evidence: `PR #${prNumber} returned to draft at ${String(viewPr.headRefOid).slice(0, 12)} while ${state}; back with the IC`,
             wake: null,
           }],
         };
